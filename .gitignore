@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+
+# Env
+.env
+
+# OS
+.DS_Store
+
+
+# Data 
+*.csv
+*.parquet
+*.db
+
+# log
+*.log
+
+
+# claude
+docs/superpowers/
