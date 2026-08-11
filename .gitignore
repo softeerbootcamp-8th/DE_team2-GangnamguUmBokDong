@@ -19,6 +19,13 @@ __pycache__/
 # log
 *.log
 
+# Airflow (AIRFLOW_HOME=airflow/ 로 컨테이너에서 생성되는 런타임 산출물)
+airflow/logs/
+airflow/airflow.cfg
+airflow/airflow-webserver.pid
+airflow/webserver_config.py
+airflow/standalone_admin_password.txt
+
 
 # claude
 docs/superpowers/
