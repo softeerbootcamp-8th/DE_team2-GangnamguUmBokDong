@@ -1,7 +1,7 @@
 PROJECTS := collector apps/api airflow ml/predict ml/training ml/feature libs/core
 COMPOSE = docker compose --env-file .env -f ops/compose/docker-compose.yml
 
-.PHONY: sync-all lint test bootstrap up down logs ps
+.PHONY: sync-all lint test bootstrap up down logs ps seed
 
 sync-all:
 	@for p in $(PROJECTS); do \
@@ -37,3 +37,6 @@ logs:
 
 ps:
 	$(COMPOSE) ps
+
+seed:
+	cd apps/api && uv run python seed_gold.py
