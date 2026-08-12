@@ -1,0 +1,14 @@
+# airflow/ 프로젝트를 저장소의 다른 uv 프로젝트와 동일한 방식(uv sync + uv run)으로
+# 구동하기 위한 이미지. 저장소 전체는 빌드 시 포함하지 않고 런타임에 /workspace로
+# bind mount한다 (docker-compose.yml 참고) — 코드 변경 시 이미지 재빌드가 필요 없다.
+FROM python:3.11-slim
+
+RUN pip install --no-cache-dir uv
+
+WORKDIR /workspace
+
+COPY ops/compose/airflow-entrypoint.sh /usr/local/bin/airflow-entrypoint.sh
+RUN chmod +x /usr/local/bin/airflow-entrypoint.sh
+
+ENTRYPOINT ["airflow-entrypoint.sh"]
+CMD ["webserver"]

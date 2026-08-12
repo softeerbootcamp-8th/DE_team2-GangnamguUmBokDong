@@ -12,6 +12,31 @@
 
 `apps/web`은 React(Node.js) 프로젝트라 uv/Python과 무관합니다. npm/pnpm으로 별도 관리합니다.
 
+## 로컬 인프라 띄우기 (Postgres / MinIO / Airflow)
+
+`airflow`, `apps`, `ml`, `collector`가 공통으로 의존하는 인프라(Postgres, MinIO, Airflow)는 `ops/compose`의 docker compose로 관리합니다. 최초 1회 아래 명령이면 충분합니다.
+
+```bash
+make bootstrap
+```
+
+`.env`가 없으면 `.env.example`에서 자동으로 복사하고, Postgres / MinIO / Airflow(webserver+scheduler)를 기동합니다. 완료되면 아래 주소로 접속할 수 있습니다.
+
+- Postgres: `localhost:5432` (앱 DB: `app`, Airflow 메타데이터 DB: `airflow` — 인스턴스 하나에 분리 생성됨)
+- MinIO 콘솔: `http://localhost:9001`
+- Airflow 웹서버: `http://localhost:8080`
+
+이후에는 아래 명령으로 다룹니다.
+
+```bash
+make up      # 기동
+make down    # 종료
+make logs    # 로그 확인
+make ps      # 상태 확인
+```
+
+**중요**: `apps/api`, `apps/web`, `collector`, `ml/*`는 compose에 포함되어 있지 않습니다. 지금처럼 각자 `uv run`/`npm run`으로 로컬에서 직접 실행하고, 위 인프라(Postgres/MinIO)에만 연결해서 씁니다. Airflow만 예외적으로 컨테이너로 뜨는데, DAG 안에서 다른 프로젝트가 필요하면 저장소 전체가 마운트된 컨테이너 안에서 `cd collector && uv run python main.py`처럼 그대로 호출합니다 — 별도 이미지를 만들 필요는 없습니다.
+
 ## 사전 준비
 
 uv가 설치되어 있는지 확인합니다.
