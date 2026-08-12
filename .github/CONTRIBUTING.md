@@ -85,14 +85,14 @@ GitHub에서 **`develop`을 타겟으로** Pull Request를 생성합니다.
 `타입: 설명` 형식으로 작성합니다.
 
 ```
-feat: 로그인 기능 구현
+feature: 로그인 기능 구현
 fix: 회원가입 이메일 중복 검증 추가
 refactor: 장바구니 계산 로직 함수 분리
 ```
 
 | 타입 | 사용하는 경우 |
 | --- | --- |
-| `feat` | 새 기능 추가 |
+| `feature` | 새 기능 추가 |
 | `modify` | 코드 수정 |
 | `fix` | 버그 수정 |
 | `refactor` | 기능 변화 없이 코드 구조 개선 |
@@ -195,7 +195,7 @@ PR을 합칠 때는 **Squash merge**를 사용합니다. 작업 중 만든 여�
 `develop`에는 커밋 하나로 깔끔하게 남습니다.
 
 ```
-feat: 로그인 기능 구현
+feature: 로그인 기능 구현
 ```
 
 - GitHub PR 화면에서 머지 버튼의 **"Squash and merge"** 를 선택합니다.
