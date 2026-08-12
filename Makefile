@@ -1,6 +1,7 @@
 PROJECTS := collector apps/api airflow ml/predict ml/training ml/feature libs/core
+COMPOSE = docker compose --env-file .env -f ops/compose/docker-compose.yml
 
-.PHONY: sync-all lint test
+.PHONY: sync-all lint test bootstrap up down logs ps
 
 sync-all:
 	@for p in $(PROJECTS); do \
@@ -21,3 +22,18 @@ test:
 		code=$$?; \
 		if [ $$code -ne 0 ] && [ $$code -ne 5 ]; then exit $$code; fi; \
 	done
+
+bootstrap:
+	./ops/bootstrap/bootstrap.sh
+
+up:
+	$(COMPOSE) up -d --build
+
+down:
+	$(COMPOSE) down
+
+logs:
+	$(COMPOSE) logs -f
+
+ps:
+	$(COMPOSE) ps
