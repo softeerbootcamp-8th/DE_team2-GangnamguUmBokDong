@@ -75,7 +75,21 @@ class RowVerdict(Enum):
 
 @dataclass(frozen=True, slots=True)
 class Issue:
-    """컬럼 하나의 판정 결과. 컬럼 정책의 두 번째 인자로 그대로 전달된다."""
+    """컬럼 하나의 판정 결과. 컬럼 정책의 두 번째 인자로 그대로 전달된다.
+
+    엔진이 정책에 넘기는 `value`와 이 객체의 `raw_value`는 다르다.
+
+    | kind | 정책이 받는 value |
+    | --- | --- |
+    | MISSING | 정규화된 `None` (원시값은 `raw_value`에만 남는다) |
+    | TYPE_ERROR | 캐스팅에 실패한 원시값 |
+    | OUTLIER | 캐스팅에 성공한 값 |
+
+    `MISSING`에서 원시값을 넘기지 않는 이유는 `optional_missing`의 기본값이
+    `keep_null`이기 때문이다. `""`나 센티널을 그대로 통과시키면 그 값이 int 컬럼의
+    silver로 들어가 Parquet 스키마가 깨지고, `_row_status`는 `ok`로 남아 흔적도
+    남지 않는다.
+    """
 
     column: str
     kind: IssueKind

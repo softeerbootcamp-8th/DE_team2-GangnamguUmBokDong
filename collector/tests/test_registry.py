@@ -48,6 +48,15 @@ def test_row_policy_round_trip(clean_registry):
     assert get_row_policy("t_row") is always_keep
 
 
+def test_row_decorator_returns_original_function(clean_registry):
+    @row_policy("t_row_keep")
+    def always_keep(row, issues, ctx, params):
+        return RowVerdict.KEEP
+
+    # 래핑하지 않으므로 테스트가 직접 호출할 수 있다
+    assert always_keep({}, [], None, None) is RowVerdict.KEEP
+
+
 def test_duplicate_column_policy_is_rejected(clean_registry):
     @policy("t_dup")
     def first(value, issue, row, ctx):
@@ -88,6 +97,19 @@ def test_unknown_column_policy_message_lists_registered_names(clean_registry):
 def test_unknown_row_policy_raises(clean_registry):
     with pytest.raises(UnknownPolicyError, match="t_missing"):
         get_row_policy("t_missing")
+
+
+def test_unknown_row_policy_message_lists_registered_names(clean_registry):
+    @row_policy("t_registered_row")
+    def known(row, issues, ctx, params):
+        return RowVerdict.KEEP
+
+    with pytest.raises(UnknownPolicyError) as excinfo:
+        get_row_policy("t_typo_row")
+
+    message = str(excinfo.value)
+    assert "t_typo_row" in message
+    assert "t_registered_row" in message  # 고치는 주체는 사람이다 — 목록을 보여준다
 
 
 def test_registries_are_not_crossed(clean_registry):

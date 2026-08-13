@@ -14,13 +14,16 @@
 
 ## 컬럼 정책 7종 — `(value, issue, row, ctx) -> tuple[Any, Action]`
 
+엔진이 넘기는 `value`는 `MISSING`이면 정규화된 `None`, `TYPE_ERROR`면 캐스팅 실패
+원시값, `OUTLIER`면 캐스팅된 값이다. 원시값은 항상 `issue.raw_value`에 있다.
+
 | 이름 | 반환값 | Action | repaired | 방어 가드 |
 | --- | --- | --- | --- | --- |
 | `keep_null` | 원래 값 그대로 | KEEP | 아니오 | — |
 | `set_null` | None | KEEP | 예 | — |
 | `fill_zero` | 0 | KEEP | 예 | `TYPE_ERROR` 제외 |
 | `fill_default` | spec에 선언된 기본값 | KEEP | 예 | `TYPE_ERROR` 제외 |
-| `clip_to_range` | 정상 범위의 경계로 자른 값 | KEEP | 예 | `TYPE_ERROR` · `MISSING` · 범위 미선언 제외 |
+| `clip_to_range` | 정상 범위의 경계로 자른 값 | KEEP | 예 | `TYPE_ERROR` · `MISSING` · `range` 미선언 · `min`/`max` 부분 선언 제외 |
 | `drop_row` | — | DROP_ROW | — (행 폐기) | — |
 | `fail_batch` | — | FAIL_BATCH | — (배치 실패) | — |
 
@@ -28,8 +31,8 @@
 
 정책은 값의 타입을 되짚지 않고 **`issue.kind`를 본다.** `clip_to_range` · `fill_zero` ·
 `fill_default`는 `TYPE_ERROR`일 때 `(None, Action.KEEP)`을 돌려준다. `clip_to_range`는
-`if issue.kind is not IssueKind.OUTLIER or issue.spec.range is None` 한 줄로
-`TYPE_ERROR` · `MISSING` · `range` 미선언 세 경우를 함께 막는다.
+가드 한 줄로 `TYPE_ERROR` · `MISSING` · `range` 미선언 · `min`/`max` 부분 선언 네 경우를
+함께 막는다.
 
 결과적으로 `set_null`과 같은 효과가 되어 Parquet 스키마가 깨지지 않고, 규칙을 새로 만들지
 않고 구현 안에서 흡수된다.
@@ -104,13 +107,20 @@ def fill_default(value: Any, issue: Issue, row: dict, ctx: RunContext) -> tuple[
 def clip_to_range(value: Any, issue: Issue, row: dict, ctx: RunContext) -> tuple[Any, Action]:
     """값을 정상 범위의 경계로 잘라낸다.
 
-    가드 한 줄이 세 경우를 막는다 — 캐스팅 실패 값(TYPE_ERROR), 결측값(`on_missing`에
-    이 정책을 걸 수 있다), `range`를 선언하지 않은 컬럼(enum만 쓰는 PTY 같은 경우).
-    `range`가 있으면 `min`·`max`가 모두 있다고 가정한다(부분 range의 허용 여부는 #2가 정한다).
+    가드 한 줄이 네 경우를 막는다 — 캐스팅 실패 값(TYPE_ERROR), 결측값(`on_missing`에
+    이 정책을 걸 수 있다), `range`를 선언하지 않은 컬럼(enum만 쓰는 PTY 같은 경우),
+    그리고 `min`·`max` 중 하나만 선언된 부분 range다. 마지막 경우를 코드로 막는 것은
+    부분 range의 허용 여부가 #2의 결정이고, 허용되면 `min(max(value, None), ...)`이
+    TypeError로 배치를 죽이기 때문이다.
     """
-    if issue.kind is not IssueKind.OUTLIER or issue.spec.range is None:
-        return None, Action.KEEP
     bounds = issue.spec.range
+    if (
+        issue.kind is not IssueKind.OUTLIER
+        or bounds is None
+        or bounds.min is None
+        or bounds.max is None
+    ):
+        return None, Action.KEEP
     return min(max(value, bounds.min), bounds.max), Action.KEEP
 
 
@@ -158,4 +168,3 @@ def drop_if_issue_count_exceeds(
 def keep_always(row: dict, issues: list[Issue], ctx: RunContext, params: None) -> RowVerdict:
     """항상 유지한다."""
     return RowVerdict.KEEP
-

@@ -337,6 +337,10 @@ columns:
        → ③ 범위·enum 판정
 ```
 
+**엔진이 정책에 넘기는 `value`는 `kind`에 따라 다르다** — `MISSING`이면 정규화된
+`None`, `TYPE_ERROR`면 캐스팅에 실패한 원시값, `OUTLIER`면 캐스팅에 성공한 값이다.
+캐스팅 전 원시값은 언제나 `Issue.raw_value`에 남는다.
+
 `types`는 "이 타입으로 해석 가능해야 한다"는 뜻이다. 서울 API는 숫자도 문자열로 주므로, 해석에 성공하면 **캐스팅된 값이 silver에 들어간다**(정규화 겸용). 실패하면 `TYPE_ERROR`로 판정한다.
 
 판정 결과는 `Issue(column, kind, required, raw_value, spec)`이고, `kind`는 `MISSING | TYPE_ERROR | OUTLIER` 중 하나다. 이 타입들은 `validation/types.py`에 모아 둔다. registry · policies · engine · loader 네 곳이 공유하는 어휘이므로 레지스트리와 분리한다.
@@ -370,9 +374,15 @@ class Action(Enum):
 @policy("clip_to_range")
 def clip_to_range(value: Any, issue: Issue, row: dict, ctx: RunContext) -> tuple[Any, Action]:
     """값을 정상 범위의 경계로 잘라낸다."""
-    if issue.kind is not IssueKind.OUTLIER or issue.spec.range is None:
-        return None, Action.KEEP          # 캐스팅 실패 · 결측 · range 미선언을 함께 막는다
-    return min(max(value, issue.spec.range.min), issue.spec.range.max), Action.KEEP
+    bounds = issue.spec.range
+    if (
+        issue.kind is not IssueKind.OUTLIER
+        or bounds is None
+        or bounds.min is None
+        or bounds.max is None
+    ):
+        return None, Action.KEEP          # 캐스팅 실패 · 결측 · range 미선언 · 부분 range를 함께 막는다
+    return min(max(value, bounds.min), bounds.max), Action.KEEP
 ```
 
 **초기 컬럼 정책 함수** (소스 무관, 전부 `validation/policies.py`)

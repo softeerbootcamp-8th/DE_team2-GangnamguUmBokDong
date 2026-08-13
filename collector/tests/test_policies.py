@@ -20,7 +20,13 @@ from validation.policies import (
     keep_null,
     set_null,
 )
-from validation.registry import policy_names, row_policy_names
+from validation.registry import (
+    get_policy,
+    get_row_policy,
+    get_row_policy_params_model,
+    policy_names,
+    row_policy_names,
+)
 from validation.types import Action, IssueKind, RowVerdict
 
 
@@ -36,10 +42,54 @@ def test_all_column_policies_are_registered():
     }
 
 
-def test_keep_null_returns_value_unchanged(make_issue, ctx):
+@pytest.mark.parametrize(
+    ("name", "fn"),
+    [
+        ("keep_null", keep_null),
+        ("set_null", set_null),
+        ("fill_zero", fill_zero),
+        ("fill_default", fill_default),
+        ("clip_to_range", clip_to_range),
+        ("drop_row", drop_row),
+        ("fail_batch", fail_batch),
+    ],
+)
+def test_column_policy_name_resolves_to_the_right_function(name, fn):
+    # 엔진은 이름으로만 정책에 도달한다. 데코레이터 이름이 뒤바뀌어도
+    # 직접 호출 테스트는 전부 통과하므로 이 단정이 유일한 방어다.
+    assert get_policy(name) is fn
+
+
+@pytest.mark.parametrize(
+    ("name", "fn"),
+    [
+        ("drop_if_any_required_issue", drop_if_any_required_issue),
+        ("drop_if_issue_count_exceeds", drop_if_issue_count_exceeds),
+        ("keep_always", keep_always),
+    ],
+)
+def test_row_policy_name_resolves_to_the_right_function(name, fn):
+    assert get_row_policy(name) is fn
+
+
+def test_row_policy_params_models_are_registered():
+    # #2 loader가 이 값으로 config의 row_params를 검증한다.
+    assert get_row_policy_params_model("drop_if_issue_count_exceeds") is IssueCountParams
+    # None은 "등록됐고 params를 받지 않는다"는 뜻이다 — 미등록(예외)과 구별된다.
+    assert get_row_policy_params_model("drop_if_any_required_issue") is None
+    assert get_row_policy_params_model("keep_always") is None
+
+
+def test_keep_null_keeps_missing_as_none(make_issue, ctx):
+    # MISSING이면 엔진이 정규화된 None을 넘긴다. 원시값은 issue.raw_value에 있다.
     issue = make_issue(IssueKind.MISSING, raw="")
-    # 값을 바꾸지 않으므로 엔진의 repaired 판정에서 제외된다
-    assert keep_null("", issue, {}, ctx) == ("", Action.KEEP)
+    assert keep_null(None, issue, {}, ctx) == (None, Action.KEEP)
+
+
+def test_keep_null_returns_value_unchanged(make_issue, ctx):
+    # 값을 바꾸지 않는 것이 이 정책의 본질이다 — 엔진의 repaired 판정에서 제외된다.
+    issue = make_issue(IssueKind.OUTLIER, raw="250")
+    assert keep_null(250, issue, {}, ctx) == (250, Action.KEEP)
 
 
 def test_set_null_replaces_value(make_issue, ctx):
@@ -114,6 +164,27 @@ def test_clip_to_range_defends_missing_range(make_spec, make_issue, ctx):
     assert clip_to_range(9, issue, {}, ctx) == (None, Action.KEEP)
 
 
+def test_clip_to_range_defends_partial_range_without_max(make_spec, make_issue, ctx):
+    # 부분 range 허용 여부는 #2의 결정이다. 허용되더라도 여기서 죽지 않아야 한다.
+    spec = make_spec(range=(0, None))
+    issue = make_issue(IssueKind.OUTLIER, spec=spec, raw="250")
+    assert clip_to_range(250, issue, {}, ctx) == (None, Action.KEEP)
+
+
+def test_clip_to_range_defends_partial_range_without_min(make_spec, make_issue, ctx):
+    spec = make_spec(range=(None, 200))
+    issue = make_issue(IssueKind.OUTLIER, spec=spec, raw="-5")
+    assert clip_to_range(-5, issue, {}, ctx) == (None, Action.KEEP)
+
+
+def test_clip_to_range_passes_enum_violation_that_is_within_range(make_spec, make_issue, ctx):
+    # range와 enum 동시 선언 허용 여부는 #2의 결정이다. 허용되면 enum 위반이면서
+    # range 안인 값은 교정되지 않고 통과한다 — #2가 금지해야 할 조합의 표적.
+    spec = make_spec(range=(0, 200), enum=(0, 1, 2))
+    issue = make_issue(IssueKind.OUTLIER, spec=spec, raw="100")
+    assert clip_to_range(100, issue, {}, ctx) == (100, Action.KEEP)
+
+
 def test_drop_row_returns_drop_action(make_issue, ctx):
     issue = make_issue(IssueKind.MISSING, raw=None)
     assert drop_row(None, issue, {}, ctx) == (None, Action.DROP_ROW)
@@ -155,6 +226,12 @@ def test_drop_if_issue_count_exceeds_drops_above_threshold(make_issue, ctx):
 def test_drop_if_issue_count_exceeds_keeps_at_threshold(make_issue, ctx):
     # 경계값 — "넘으면" 폐기이므로 같으면 유지다
     issues = [make_issue(IssueKind.OUTLIER, raw="1") for _ in range(3)]
+    params = IssueCountParams(max_issues=3)
+    assert drop_if_issue_count_exceeds({}, issues, ctx, params) is RowVerdict.KEEP
+
+
+def test_drop_if_issue_count_exceeds_keeps_below_threshold(make_issue, ctx):
+    issues = [make_issue(IssueKind.OUTLIER, raw="1")]
     params = IssueCountParams(max_issues=3)
     assert drop_if_issue_count_exceeds({}, issues, ctx, params) is RowVerdict.KEEP
 
