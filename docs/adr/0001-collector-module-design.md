@@ -74,6 +74,8 @@ Airflow 재시도는 태스크를 처음부터 다시 돌리는데, 5분 주기 
 ## 결과
 재시도해도 원래 시점의 데이터를 잃지 않고 API 호출도 아낀다. 이미 완료된 실행은 아무것도 하지 않고 끝난다.
 
+> **[ADR 0004](./0004-partial-fetch-and-backfill.md)에서 분기가 하나 늘어남.** 완결된 window에 누락 조각이 남아 있으면 `--backfill`이 그 조각만 채우고 재처리한다. 멱등 키는 그대로다.
+
 ---
 
 # 실행 상태와 품질 집계를 S3 manifest에 남긴다
@@ -99,6 +101,8 @@ config의 `max_drop_ratio`를 넘으면 배치를 FAILED로, 이내면 PARTIAL�
 
 ## 결과
 API가 망가진 경우와 자잘한 결측을 구분해 대응할 수 있다.
+
+> **[ADR 0004](./0004-partial-fetch-and-backfill.md)에서 게이트가 둘로 늘어남.** `max_drop_ratio`는 폐기만 판정하고, 수집 누락은 `max_missing_ratio`가 따로 본다. 이 항목의 규칙은 폐기 게이트에 그대로 유효하다.
 
 ---
 

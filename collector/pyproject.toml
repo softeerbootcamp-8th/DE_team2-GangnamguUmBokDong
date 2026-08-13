@@ -2,10 +2,22 @@
 name = "collector"
 version = "0.1.0"
 requires-python = "==3.11.*"
-dependencies = ["core"]
+dependencies = [
+    "boto3>=1.43.69",
+    "core",
+    "httpx>=0.28.1",
+    "pyarrow>=25.0.1",
+    "pydantic>=2.13.4",
+    "pyyaml>=6.0.3",
+]
 
 [tool.uv]
 package = false
 
 [tool.uv.sources]
 core = { path = "../libs/core", editable = true }
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
