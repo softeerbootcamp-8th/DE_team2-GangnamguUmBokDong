@@ -22,7 +22,7 @@
 | 3 | `feature/collector-policy-registry` | 계약 타입, `@policy`·`@row_policy` 데코레이터(params 모델 등록), 공통 정책 함수 10종 | `validation/types.py`<br>`validation/registry.py`<br>`validation/policies.py` | 1 |
 | 4 | `feature/collector-storage-manifest` | 경로 규칙(**조각 키 기반**), bronze 조각 쓰기·읽기·정리, **`_retry_queue` 마커 I/O**, MinIO 입출력, 상태 어휘와 manifest 스키마(**완결도 필드**) | `storage.py`<br>`manifest.py` | 1 |
 | 5 | `feature/collector-validation-engine` | 판정 3단계, 4분면 정책 디스패치, 행 정책, 결과 집계 | `validation/engine.py` | 2·3 |
-| 6 | `feature/collector-seoul-adapter` | 어댑터 프로토콜(**`FetchResult` yield**), **실패 3범주·라운드 재시도·`fetch_budget`·서킷브레이커**, 서울 어댑터(`RESULT.CODE` 검사·페이지네이션) | `adapters/base.py`<br>`adapters/seoul_openapi.py` | 2 |
+| 6 | `feature/collector-seoul-adapter` | 어댑터 프로토콜(**`FetchResult` yield**), **실패 3범주·라운드 재시도·`fetch_budget`**, 서울 어댑터(`RESULT.CODE` 검사·페이지네이션) | `adapters/base.py`<br>`adapters/seoul_openapi.py` | 2 |
 | 7 | `feature/collector-pipeline` | 조각 즉시 저장 루프를 포함한 fetch→bronze→validate→silver 오케스트레이션, **재개 분기 4가지**, **게이트 2종과 완결도 집계** | `pipeline.py` | 4·5·6 |
 | 8 | `feature/collector-cli-logging` | CLI 인자 파싱(**`--backfill`**), 구조화 로그 고정 필드 주입 | `main.py`<br>`logging_setup.py` | 7 |
 | 9 | `feature/collector-kma-adapter` | 기상청 어댑터 — 격자 반복 호출과 long→wide pivot | `adapters/kma_apihub.py` | 6 |

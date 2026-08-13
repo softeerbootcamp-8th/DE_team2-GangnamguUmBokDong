@@ -46,6 +46,11 @@ YAML에 적힌 **문자열을 실제 함수로 바꾸는 지점**이다. "새 �
   비어 있다. 이 보장은 `validation/__init__.py`가 맡는다.
 - 정책 이름은 manifest의 `policy_actions` 키로 남는다. 이름을 바꾸면 과거 manifest와
   대조가 끊기므로 개명은 신중히 한다.
+
+
+registry.py는 YAML에 적힌 정책 이름(문자열)을 @policy/@row_policy로 등록된 실제 함수로 매핑·조회해주는, 
+엔진과 정책 구현을 분리시키는 이름 레지스트리다.
+
 """
 
 from __future__ import annotations
@@ -64,7 +69,7 @@ RowPolicyFn = Callable[[dict, list[Issue], RunContext, Any], RowVerdict]
 
 
 class UnknownPolicyError(ValueError):
-    """등록되지 않은 정책 이름을 조회했다. #2에서 config_error로 매핑된다."""
+    """등록되지 않은 정책 이름을 조회했다."""
 
 
 class DuplicatePolicyError(ValueError):
