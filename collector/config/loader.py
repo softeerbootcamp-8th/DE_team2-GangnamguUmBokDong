@@ -1,4 +1,6 @@
-"""YAML 로드 + 스키마 검증 + 정책 이름 존재 검증 + SHA-256 해시.
+"""
+데이터 수집을 시작하기 전에 YAML 설정 파일의 오타와 논리적 오류를 걸러내서 잘못된 실행을 차단하는 스크립트
+YAML 로드 + 스키마 검증 + 정책 이름 존재 검증 + SHA-256 해시.
 
 ## 이 모듈의 역할
 
@@ -62,3 +64,104 @@
 - 이 모듈은 `validation.registry`만 참조하면 되고 계약 타입은 필요 없다. `types.py`를
   import하지 않는 것이 정상이다.
 """
+
+from __future__ import annotations
+
+import hashlib
+from pathlib import Path
+
+import yaml
+from pydantic import ValidationError
+
+from config.schema import SourceConfig
+from validation.registry import (
+    get_row_policy_params_model,
+    is_policy_registered,
+    is_row_policy_registered,
+    policy_names,
+    row_policy_names,
+)
+
+
+class ConfigError(ValueError):
+    """구조는 맞지만 레지스트리 조회로만 알 수 있는 오류
+    (정책 이름 오타, row_params 오타, source_id 불일치)."""
+
+
+def load(source_id: str, base_dir: Path = Path("sources")) -> SourceConfig:
+    """`{base_dir}/{source_id}.yaml`을 읽어 검증된 `SourceConfig`로 바꾼다."""
+    raw_bytes = (base_dir / f"{source_id}.yaml").read_bytes()
+    config_version = f"sha256:{hashlib.sha256(raw_bytes).hexdigest()}"
+
+    raw = yaml.safe_load(raw_bytes)
+    config = SourceConfig.model_validate(raw)
+
+    errors: list[str] = []
+    if config.source_id != source_id:
+        errors.append(
+            f"파일명 '{source_id}'와 YAML 안의 source_id '{config.source_id}'가 다르다"
+        )
+    errors += _check_policy_names(config)
+    errors += _check_row_params(config)
+    if errors:
+        raise ConfigError("\n".join(errors))
+
+    return config.model_copy(update={"config_version": config_version})
+
+
+def _check_policy_names(config: SourceConfig) -> list[str]:
+    """4분면·컬럼 오버라이드·row 정책 이름이 레지스트리에 등록돼 있는지 6곳을 확인한다."""
+    errors: list[str] = []
+
+    quadrants = {
+        "policies.required_missing": config.policies.required_missing,
+        "policies.required_outlier": config.policies.required_outlier,
+        "policies.optional_missing": config.policies.optional_missing,
+        "policies.optional_outlier": config.policies.optional_outlier,
+    }
+    for location, name in quadrants.items():
+        if not is_policy_registered(name):
+            errors.append(_unregistered_message(location, name, policy_names()))
+
+    for column_name, spec in config.columns.items():
+        for field in ("on_missing", "on_outlier"):
+            name = getattr(spec, field)
+            if name is not None and not is_policy_registered(name):
+                location = f"columns.{column_name}.{field}"
+                errors.append(_unregistered_message(location, name, policy_names()))
+
+    if config.policies.row is not None and not is_row_policy_registered(config.policies.row):
+        errors.append(
+            _unregistered_message("policies.row", config.policies.row, row_policy_names())
+        )
+
+    return errors
+
+
+def _unregistered_message(location: str, name: str, registered: tuple[str, ...]) -> str:
+    """미등록 정책 이름 오류 메시지를 만든다."""
+    listed = ", ".join(registered) or "(없음)"
+    return f"{location}: '{name}'이 등록돼 있지 않다. 등록된 이름: {listed}"
+
+
+def _check_row_params(config: SourceConfig) -> list[str]:
+    """row 정책에 등록된 params 모델로 `policies.row_params`를 검증한다."""
+    row_name = config.policies.row
+    if row_name is None or not is_row_policy_registered(row_name):
+        return []  # 미등록 이름은 _check_policy_names가 이미 보고한다
+
+    params_model = get_row_policy_params_model(row_name)
+    row_params = config.policies.row_params
+
+    if params_model is None:
+        if row_params is not None:
+            return [
+                f"policies.row_params: '{row_name}'은 params를 받지 않는데 row_params가 주어졌다: {row_params}"
+            ]
+        return []
+
+    try:
+        params_model.model_validate(row_params or {})
+    except ValidationError as exc:
+        return [f"policies.row_params: '{row_name}'의 params 형식이 아니다: {exc}"]
+    return []
