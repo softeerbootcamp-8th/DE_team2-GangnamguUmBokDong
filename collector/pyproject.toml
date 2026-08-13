@@ -22,3 +22,7 @@ dev = [
     "moto[s3]>=5.2.2",
     "pytest>=9.1.1",
 ]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
