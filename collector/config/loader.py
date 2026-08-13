@@ -62,3 +62,32 @@
 - 이 모듈은 `validation.registry`만 참조하면 되고 계약 타입은 필요 없다. `types.py`를
   import하지 않는 것이 정상이다.
 """
+
+from __future__ import annotations
+
+import hashlib
+from pathlib import Path
+
+import yaml
+
+from config.schema import SourceConfig
+
+
+class ConfigError(ValueError):
+    """구조는 맞지만 레지스트리 조회로만 알 수 있는 오류(정책 이름 오타, row_params
+    오타, source_id 불일치)."""
+
+
+def load(source_id: str, base_dir: Path = Path("sources")) -> SourceConfig:
+    raw_bytes = (base_dir / f"{source_id}.yaml").read_bytes()
+    config_version = f"sha256:{hashlib.sha256(raw_bytes).hexdigest()}"
+
+    raw = yaml.safe_load(raw_bytes)
+    config = SourceConfig.model_validate(raw)
+
+    if config.source_id != source_id:
+        raise ConfigError(
+            f"파일명 '{source_id}'와 YAML 안의 source_id '{config.source_id}'가 다르다"
+        )
+
+    return config.model_copy(update={"config_version": config_version})
