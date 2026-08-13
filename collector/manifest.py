@@ -8,10 +8,11 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from enum import Enum, IntEnum
-from typing import Annotated
+from typing import Annotated, Literal
 
-from pydantic import BeforeValidator, PlainSerializer
+from pydantic import BaseModel, BeforeValidator, ConfigDict, PlainSerializer
 
 import storage
 
@@ -49,3 +50,75 @@ class FailureReason(str, Enum):
     STORAGE_ERROR = "storage_error"
     QUALITY_GATE = "quality_gate"
     CONFIG_ERROR = "config_error"
+
+
+class BronzeArtifacts(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    prefix: str
+    parts: tuple[str, ...] = ()
+
+
+class Artifacts(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    bronze: BronzeArtifacts | None = None
+    silver: str | None = None
+    quarantine: str | None = None
+
+
+class Counts(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    expected: int | None = None
+    fetched: int = 0
+    kept: int = 0
+    repaired: int = 0
+    dropped: int = 0
+
+
+class Missing(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    parts: tuple[str, ...] = ()
+    rows: int | None = None
+    basis: Literal["rows", "parts"] = "rows"
+
+
+class ColumnIssueCount(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    missing: int = 0
+    outlier: int = 0
+    type_error: int = 0
+
+
+class Manifest(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    source_id: str
+    window_start: datetime
+    window_end: datetime
+    status: RunStatus
+    stage: StageField
+    failure_reason: FailureReason | None = None
+    attempt: int = 1
+    revision: int = 0
+    started_at: datetime
+    ended_at: datetime | None = None
+    duration_ms: int | None = None
+    artifacts: Artifacts = Artifacts()
+    counts: Counts = Counts()
+    missing: Missing = Missing()
+    drop_ratio: float | None = None
+    completeness: float | None = None
+    backfill_status: Literal["pending", "expired"] | None = None
+    column_issues: dict[str, ColumnIssueCount] = {}
+    policy_actions: dict[str, int] = {}
+    config_version: str
+
+
+def load(source_id: str, window_start: datetime) -> Manifest | None:
+    data = storage.read_manifest(source_id, window_start)
+    return None if data is None else Manifest.model_validate(data)
+
+
+def save(manifest: Manifest) -> None:
+    storage.write_manifest(
+        manifest.source_id, manifest.window_start, manifest.model_dump(mode="json")
+    )
