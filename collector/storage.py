@@ -18,6 +18,7 @@ from typing import Sequence
 
 import boto3
 import pyarrow.parquet as pq
+from botocore.exceptions import ClientError
 
 
 def _client():
@@ -100,3 +101,57 @@ def write_quarantine(source_id: str, window_start: datetime, rows: list[dict]) -
     body = "\n".join(json.dumps(row, ensure_ascii=False) for row in rows) + "\n"
     _client().put_object(Bucket=_bucket(), Key=key, Body=body.encode("utf-8"))
     return key
+
+
+def _manifest_key(source_id: str, window_start: datetime) -> str:
+    return (
+        f"_manifest/{source_id}/dt={window_start:%Y-%m-%d}/hh={window_start:%H}/"
+        f"{window_start:%H%M}.json"
+    )
+
+
+def _retry_marker_key(source_id: str, window_start: datetime) -> str:
+    return f"_retry_queue/{source_id}/{window_start.isoformat()}.json"
+
+
+def _get_json(key: str) -> dict | None:
+    try:
+        body = _client().get_object(Bucket=_bucket(), Key=key)["Body"].read()
+    except ClientError as exc:
+        if exc.response["Error"]["Code"] == "NoSuchKey":
+            return None
+        raise
+    return json.loads(body)
+
+
+def write_manifest(source_id: str, window_start: datetime, data: dict) -> None:
+    key = _manifest_key(source_id, window_start)
+    _client().put_object(Bucket=_bucket(), Key=key, Body=json.dumps(data).encode("utf-8"))
+
+
+def read_manifest(source_id: str, window_start: datetime) -> dict | None:
+    return _get_json(_manifest_key(source_id, window_start))
+
+
+def write_retry_marker(source_id: str, window_start: datetime, data: dict) -> None:
+    key = _retry_marker_key(source_id, window_start)
+    _client().put_object(Bucket=_bucket(), Key=key, Body=json.dumps(data).encode("utf-8"))
+
+
+def list_retry_markers(source_id: str) -> list[dict]:
+    client = _client()
+    bucket = _bucket()
+    prefix = f"_retry_queue/{source_id}/"
+
+    paginator = client.get_paginator("list_objects_v2")
+    markers = []
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            body = client.get_object(Bucket=bucket, Key=obj["Key"])["Body"].read()
+            markers.append(json.loads(body))
+    return markers
+
+
+def delete_retry_marker(source_id: str, window_start: datetime) -> None:
+    key = _retry_marker_key(source_id, window_start)
+    _client().delete_object(Bucket=_bucket(), Key=key)

@@ -8,7 +8,18 @@ import boto3
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from storage import clear_bronze, read_bronze, write_bronze_part, write_quarantine, write_silver
+from storage import (
+    clear_bronze,
+    delete_retry_marker,
+    list_retry_markers,
+    read_bronze,
+    read_manifest,
+    write_bronze_part,
+    write_manifest,
+    write_quarantine,
+    write_retry_marker,
+    write_silver,
+)
 from tests.conftest import TEST_BUCKET
 
 WINDOW_START = datetime(2026, 8, 12, 14, 10, tzinfo=UTC)
@@ -125,3 +136,48 @@ class TestWriteQuarantine:
         body = _s3().get_object(Bucket=TEST_BUCKET, Key=key)["Body"].read().decode()
         lines = [json.loads(line) for line in body.strip().split("\n")]
         assert lines == rows
+
+
+class TestManifestRawIO:
+    def test_write_then_read_round_trip(self):
+        data = {"source_id": "test_source", "status": "succeeded"}
+
+        write_manifest("test_source", WINDOW_START, data)
+        result = read_manifest("test_source", WINDOW_START)
+
+        assert result == data
+
+    def test_read_missing_returns_none(self):
+        assert read_manifest("never_written", WINDOW_START) is None
+
+
+class TestRetryMarkerRawIO:
+    def test_write_then_list(self):
+        write_retry_marker(
+            "test_source", WINDOW_START, {"source_id": "test_source", "attempts": 1}
+        )
+
+        result = list_retry_markers("test_source")
+
+        assert result == [{"source_id": "test_source", "attempts": 1}]
+
+    def test_list_only_returns_matching_source(self):
+        write_retry_marker("source_a", WINDOW_START, {"source_id": "source_a"})
+        write_retry_marker("source_b", WINDOW_START, {"source_id": "source_b"})
+
+        result = list_retry_markers("source_a")
+
+        assert result == [{"source_id": "source_a"}]
+
+    def test_list_with_no_markers_returns_empty(self):
+        assert list_retry_markers("no_markers_here") == []
+
+    def test_delete_removes_marker(self):
+        write_retry_marker("test_source", WINDOW_START, {"source_id": "test_source"})
+
+        delete_retry_marker("test_source", WINDOW_START)
+
+        assert list_retry_markers("test_source") == []
+
+    def test_delete_nonexistent_does_not_raise(self):
+        delete_retry_marker("never_written", WINDOW_START)
