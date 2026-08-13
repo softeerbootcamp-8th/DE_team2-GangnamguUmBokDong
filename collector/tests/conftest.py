@@ -1,18 +1,24 @@
-"""#3 테스트 공용 픽스처.
+"""#3·#4 테스트 공용 픽스처.
 
 `ColumnSpecStub`은 #2가 만들 `config.schema.ColumnSpec`의 자리를 메우는 스텁이다.
 **#2에서 `ColumnSpec`이 확정되면 이 스텁을 실제 모델로 교체한다** — 방치하면 정책
 테스트가 실물과 어긋난 채 초록불이 된다.
+
+storage.py·manifest.py 테스트가 공유하는 moto S3 환경 픽스처도 함께 둔다.
 """
 
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
+import boto3
 import pytest
+from moto import mock_aws
 
 from validation import registry
 from validation.types import Issue, RunContext
+
+TEST_BUCKET = "test-bucket"
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,3 +84,18 @@ def clean_registry():
     registry._POLICIES.update(saved_policies)
     registry._ROW_POLICIES.clear()
     registry._ROW_POLICIES.update(saved_row_policies)
+
+
+@pytest.fixture(autouse=True)
+def _s3_env(monkeypatch):
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "testing")
+    monkeypatch.delenv("S3_ENDPOINT_URL", raising=False)
+    monkeypatch.setenv("S3_BUCKET", TEST_BUCKET)
+
+
+@pytest.fixture(autouse=True)
+def _bucket():
+    with mock_aws():
+        boto3.client("s3", region_name="us-east-1").create_bucket(Bucket=TEST_BUCKET)
+        yield

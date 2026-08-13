@@ -3,8 +3,8 @@ name = "collector"
 version = "0.1.0"
 requires-python = "==3.11.*"
 dependencies = [
-    "boto3>=1.43.69",
     "core",
+    "boto3>=1.43.69",
     "httpx>=0.28.1",
     "pyarrow>=25.0.1",
     "pydantic>=2.13.4",
@@ -19,6 +19,7 @@ core = { path = "../libs/core", editable = true }
 
 [dependency-groups]
 dev = [
+    "moto[s3]>=5.2.2",
     "pytest>=9.1.1",
 ]
 
