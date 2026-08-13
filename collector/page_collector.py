@@ -1,7 +1,7 @@
 """Page-based collection helpers."""
 
-from collections.abc import Callable
 import time
+from collections.abc import Callable
 
 
 class PageCollectionError(Exception):

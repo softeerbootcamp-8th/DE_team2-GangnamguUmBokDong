@@ -5,7 +5,6 @@ import sys
 
 from sources.bike import fetch_bike_page
 
-
 SUPPORTED_SOURCES = ("bike",)
 
 

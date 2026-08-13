@@ -4,9 +4,7 @@ import os
 
 import requests
 
-
 SEOUL_API_BASE_URL = "http://openapi.seoul.go.kr:8088"
-
 BIKE_SERVICE_NAME = "bikeList"
 
 BIKE_RESPONSE_KEY = "rentBikeStatus"

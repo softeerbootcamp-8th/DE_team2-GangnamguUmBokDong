@@ -1,8 +1,8 @@
 """Collector execution result models."""
 
+import json
 from dataclasses import asdict, dataclass
 from enum import StrEnum
-import json
 
 
 class CollectionStatus(StrEnum):
