@@ -7,6 +7,7 @@ from unittest.mock import MagicMock
 from zoneinfo import ZoneInfo
 
 import pytest
+
 from adapters.base import (
     DuplicateAdapterError,
     FetchErrorKind,

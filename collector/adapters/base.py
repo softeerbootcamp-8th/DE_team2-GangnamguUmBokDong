@@ -123,6 +123,7 @@ from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
     import httpx
+
     from config.schema import SourceConfig
 
 

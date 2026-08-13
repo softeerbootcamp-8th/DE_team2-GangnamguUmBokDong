@@ -90,9 +90,9 @@ from adapters.base import FetchResult, adapter, classify_http_status
 
 if TYPE_CHECKING:
     import httpx
-    from config.schema import SourceConfig
 
     from adapters.base import Window
+    from config.schema import SourceConfig
 
 _BASE_URL = "https://apihub.kma.go.kr/api/typ02/openApi/VilageFcstInfoService_2.0"
 _NUM_OF_ROWS = 1000  # 격자 하나당 한 시각의 관측·예보 항목 수를 넉넉히 덮는 상한

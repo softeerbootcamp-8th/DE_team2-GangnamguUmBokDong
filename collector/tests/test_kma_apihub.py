@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo
 
 import httpx
 import pytest
+
 from adapters.base import FetchErrorKind, Window
 from adapters.kma_apihub import KmaApiHubAdapter
 
