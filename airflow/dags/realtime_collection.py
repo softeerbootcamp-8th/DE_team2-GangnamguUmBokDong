@@ -83,3 +83,34 @@ DAG 내부에서 다음을 하지 않는다.
 Airflow Graph에서 source Task가 같은 레벨에 존재해야 한다.
 동시에 실행 가능한 상태인지 확인한다.
 """
+
+
+
+"""5분 주기 실시간 Collector 실행 DAG."""
+
+import pendulum
+from airflow import DAG
+from airflow.timetables.trigger import CronTriggerTimetable
+
+from config.schedules import REALTIME_CRON, TIMEZONE
+from config.sources import REALTIME_SOURCES
+from orchestration.collector_task import build_collector_task
+
+with DAG(
+    dag_id="realtime_collection",
+    schedule=CronTriggerTimetable(
+        REALTIME_CRON,
+        timezone=TIMEZONE,
+    ),
+    start_date=pendulum.datetime(
+        2026,
+        8,
+        13,
+        tz=TIMEZONE,
+    ),
+    catchup=False,
+    max_active_runs=1,
+    tags=["collection", "realtime"],
+) as dag:
+    for source_id in REALTIME_SOURCES:
+        build_collector_task(source_id)
