@@ -1,8 +1,5 @@
 """YAML 로드 + 스키마 검증 + 정책 이름 존재 검증 + SHA-256 해시.
 
-구현 예정: docs/collector/implementation-issues.md #2
-설계 근거: docs/collector/implementation-plan.md 4절 (config 스키마)
-
 ## 이 모듈의 역할
 
 `sources/{source_id}.yaml` 한 개를 읽어 **검증이 끝난** `SourceConfig`로 바꾸는 단일
