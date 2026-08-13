@@ -37,3 +37,6 @@ airflow/standalone_admin_password.txt
 
 # Claude
 docs/superpowers/
+
+# collector tests
+collector/tests/
