@@ -7,7 +7,6 @@ from unittest.mock import MagicMock
 from zoneinfo import ZoneInfo
 
 import pytest
-
 from adapters.base import (
     DuplicateAdapterError,
     FetchErrorKind,
@@ -16,6 +15,7 @@ from adapters.base import (
     Window,
     adapter,
     adapter_names,
+    classify_http_status,
     fetch_with_rounds,
     get_adapter,
     is_adapter_registered,
@@ -130,6 +130,27 @@ def test_adapter_names_are_sorted(clean_adapter_registry):
 
     names = adapter_names()
     assert names.index("t_a") < names.index("t_b")
+
+
+def test_classify_http_status_treats_2xx_as_success():
+    assert classify_http_status(200) is None
+    assert classify_http_status(204) is None
+
+
+def test_classify_http_status_treats_429_and_5xx_as_transient():
+    assert classify_http_status(429) is FetchErrorKind.TRANSIENT
+    assert classify_http_status(500) is FetchErrorKind.TRANSIENT
+    assert classify_http_status(503) is FetchErrorKind.TRANSIENT
+
+
+def test_classify_http_status_treats_401_and_403_as_fatal():
+    assert classify_http_status(401) is FetchErrorKind.FATAL
+    assert classify_http_status(403) is FetchErrorKind.FATAL
+
+
+def test_classify_http_status_treats_other_4xx_as_permanent():
+    assert classify_http_status(400) is FetchErrorKind.PERMANENT
+    assert classify_http_status(404) is FetchErrorKind.PERMANENT
 
 
 def test_fetch_with_rounds_collects_all_successes_in_one_round(window):

@@ -1,8 +1,4 @@
-"""기상청 API 허브 어댑터 — 소스 2종이 공유한다.
-
-구현 예정: docs/collector/implementation-issues.md #9
-설계 근거: docs/collector/implementation-plan.md 3절 (어댑터 계약)
-          docs/collector/implementation-plan.md 8절 (부분 실패와 백필)
+"""기상청 API 허브 어댑터 
 
 ## 공유하는 소스 2종
 
@@ -74,6 +70,108 @@
 - 실패 범주 판정은 base의 규칙을 따른다. HTTP 상태 기반이며, 인증 실패는 `FATAL`이라
   격자 20개를 헛되이 돌지 않는다.
 
-검증(계획서 12절): long → wide pivot이 관측 항목을 컬럼으로 올바르게 펴는지, 격자
-일부가 빠진 조각 목록에서도 나머지가 정상 변환되는지 확인한다.
+## base_date · base_time — window을 그대로 쓴다 (발표 주기 보정 없음)
+`window.window_start`를 가공 없이 `%Y%m%d`·`%H%M`으로 포맷해 요청한다. 기상청 발표
+주기(초단기실황은 매시 40분 발표 등)와 트리거 시각이 어긋나면 `resultCode`가 "아직
+미발표"를 뜻하는 값으로 와도 **이 어댑터는 그 값을 보지 않는다** — 실패 범주는
+`classify_http_status`가 다루는 HTTP 상태로만 정해지고(HTTP 200이면 무조건 성공), 본문
+내용은 검사하지 않는다. 발표 시각과 트리거 시각을 맞추는 책임은 전부 Airflow DAG
+스케줄에 있다. 어댑터가 기상청 발표 스케줄이라는 도메인 지식을 갖지 않기 위한
+선택이다.
 """
+
+from __future__ import annotations
+
+import json
+import os
+from typing import TYPE_CHECKING
+
+from adapters.base import FetchResult, adapter, classify_http_status
+
+if TYPE_CHECKING:
+    import httpx
+    from config.schema import SourceConfig
+
+    from adapters.base import Window
+
+_BASE_URL = "https://apihub.kma.go.kr/api/typ02/openApi/VilageFcstInfoService_2.0"
+_NUM_OF_ROWS = 1000  # 격자 하나당 한 시각의 관측·예보 항목 수를 넉넉히 덮는 상한
+
+
+def _api_key() -> str:
+    # 조각 키(grid-{nx}x{ny})에는 이 값이 섞이지 않는다
+    return os.environ["KMA_APIHUB_KEY"]
+
+
+def _extract(body: dict, root_key: str) -> list[dict]:
+    """`root_key`의 점 표기 경로를 따라가 행 배열을 꺼낸다. 경로가 없으면 빈 리스트."""
+    node: object = body
+    for segment in root_key.split("."):
+        if not isinstance(node, dict):
+            return []
+        node = node.get(segment)
+    return node if isinstance(node, list) else []
+
+
+@adapter("kma_apihub")
+class KmaApiHubAdapter:
+    """기상청 API 허브 공용 격자 반복 어댑터."""
+
+    @staticmethod
+    def fetch(
+        config: SourceConfig,
+        window: Window,
+        *,
+        client: httpx.Client,
+        skip: frozenset[str] = frozenset(),
+        expected_total: int | None = None,
+    ):
+        params = config.adapter_params
+        endpoint = params["endpoint"]
+        # 발표 주기 보정 없이 window_start를 그대로 쓴다, 정합은 Airflow 스케줄의 책임.
+        base_date = window.window_start.strftime("%Y%m%d")
+        base_time = window.window_start.strftime("%H%M")
+
+        for nx, ny in params["grids"]:
+            key = f"grid-{nx:03d}x{ny:03d}"
+            if key in skip:
+                continue
+
+            url = (
+                f"{_BASE_URL}/{endpoint}?authKey={_api_key()}&dataType=JSON"
+                f"&numOfRows={_NUM_OF_ROWS}&pageNo=1"
+                f"&base_date={base_date}&base_time={base_time}&nx={nx}&ny={ny}"
+            )
+            response = client.get(url)
+
+            category = classify_http_status(response.status_code)
+            if category is None:
+                yield FetchResult(key=key, payload=response.content, error=None, expected_total=None)
+            elif category.value == "fatal":
+                # 인증키 오류 등 확정적 원인인 경우, 나머지 격자를 헛되이 부르지 않고 즉시 중단.
+                yield FetchResult(key=key, payload=None, error=category, expected_total=None)
+                return
+            else:  # TRANSIENT 또는 PERMANENT, 이 격자만 실패로 보고하고 나머지는 계속
+                yield FetchResult(key=key, payload=None, error=category, expected_total=None)
+
+    @staticmethod
+    def normalize(chunks: list[bytes], config: SourceConfig) -> list[dict]:
+        """long 조각들을 pivot 설정에 따라 wide로 합친다."""
+        root_key = config.adapter_params["root_key"]
+        pivot = config.adapter_params["pivot"]
+        key_field, value_field = pivot["key"], pivot["value"]
+
+        groups: dict[tuple, dict] = {}
+        order: list[tuple] = []
+        for chunk in chunks:
+            body = json.loads(chunk)
+            for item in _extract(body, root_key):
+                group_key = tuple(
+                    sorted((k, v) for k, v in item.items() if k not in (key_field, value_field))
+                )
+                if group_key not in groups:
+                    groups[group_key] = dict(group_key)
+                    order.append(group_key)
+                groups[group_key][item[key_field]] = item[value_field]
+
+        return [groups[k] for k in order]
