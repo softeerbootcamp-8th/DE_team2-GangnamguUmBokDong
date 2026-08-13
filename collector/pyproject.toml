@@ -3,8 +3,8 @@ name = "collector"
 version = "0.1.0"
 requires-python = "==3.11.*"
 dependencies = [
-    "boto3>=1.43.69",
     "core",
+    "boto3>=1.43.69",
     "httpx>=0.28.1",
     "pyarrow>=25.0.1",
     "pydantic>=2.13.4",

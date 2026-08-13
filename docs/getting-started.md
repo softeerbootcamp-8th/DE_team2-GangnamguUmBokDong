@@ -24,7 +24,7 @@ make bootstrap
 
 - Postgres: `localhost:5432` (앱 DB: `app`, Airflow 메타데이터 DB: `airflow` — 인스턴스 하나에 분리 생성됨)
 - MinIO 콘솔: `http://localhost:9001`
-- Airflow 웹서버: `http://localhost:8080`
+- Airflow 웹서버: `http://localhost:8081`
 
 이후에는 아래 명령으로 다룹니다.
 
