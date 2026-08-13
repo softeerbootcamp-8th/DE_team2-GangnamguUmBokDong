@@ -10,11 +10,14 @@ Manifest·RetryMarker로의 변환)은 manifest.py의 몫이다.
 from __future__ import annotations
 
 import gzip
+import io
+import json
 import os
 from datetime import datetime
 from typing import Sequence
 
 import boto3
+import pyarrow.parquet as pq
 
 
 def _client():
@@ -73,3 +76,27 @@ def clear_bronze(source_id: str, window_start: datetime) -> None:
         client.delete_objects(
             Bucket=bucket, Delete={"Objects": [{"Key": k} for k in keys]}
         )
+
+
+def _layer_key(layer: str, source_id: str, window_start: datetime, ext: str) -> str:
+    return (
+        f"{layer}/{source_id}/dt={window_start:%Y-%m-%d}/hh={window_start:%H}/"
+        f"{window_start:%H%M}.{ext}"
+    )
+
+
+def write_silver(source_id: str, window_start: datetime, table) -> str:
+    key = _layer_key("silver", source_id, window_start, "parquet")
+    buffer = io.BytesIO()
+    pq.write_table(table, buffer)
+    _client().put_object(Bucket=_bucket(), Key=key, Body=buffer.getvalue())
+    return key
+
+
+def write_quarantine(source_id: str, window_start: datetime, rows: list[dict]) -> str | None:
+    if not rows:
+        return None
+    key = _layer_key("quarantine", source_id, window_start, "jsonl")
+    body = "\n".join(json.dumps(row, ensure_ascii=False) for row in rows) + "\n"
+    _client().put_object(Bucket=_bucket(), Key=key, Body=body.encode("utf-8"))
+    return key

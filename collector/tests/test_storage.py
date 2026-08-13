@@ -1,11 +1,14 @@
 """storage.py의 S3 I/O를 moto로 검증한다."""
 
 import gzip
+import json
 from datetime import UTC, datetime
 
 import boto3
+import pyarrow as pa
+import pyarrow.parquet as pq
 
-from storage import clear_bronze, read_bronze, write_bronze_part
+from storage import clear_bronze, read_bronze, write_bronze_part, write_quarantine, write_silver
 from tests.conftest import TEST_BUCKET
 
 WINDOW_START = datetime(2026, 8, 12, 14, 10, tzinfo=UTC)
@@ -78,3 +81,47 @@ class TestClearBronze:
 
     def test_clear_on_empty_prefix_does_not_raise(self):
         clear_bronze("nonexistent_source", WINDOW_START)
+
+
+class TestWriteSilver:
+    def test_writes_parquet_and_returns_key(self):
+        table = pa.table({"stationId": ["ST-1", "ST-2"], "rackTotCnt": [10, 20]})
+
+        key = write_silver("test_source", WINDOW_START, table)
+
+        assert key == "silver/test_source/dt=2026-08-12/hh=14/1410.parquet"
+        body = _s3().get_object(Bucket=TEST_BUCKET, Key=key)["Body"].read()
+        roundtrip = pq.read_table(pa.BufferReader(body))
+        assert roundtrip.to_pydict() == table.to_pydict()
+
+    def test_overwrites_same_key_on_second_call(self):
+        table1 = pa.table({"x": [1]})
+        table2 = pa.table({"x": [1, 2]})
+
+        key1 = write_silver("test_source", WINDOW_START, table1)
+        key2 = write_silver("test_source", WINDOW_START, table2)
+
+        assert key1 == key2
+        body = _s3().get_object(Bucket=TEST_BUCKET, Key=key1)["Body"].read()
+        assert pq.read_table(pa.BufferReader(body)).num_rows == 2
+
+
+class TestWriteQuarantine:
+    def test_empty_rows_writes_nothing_and_returns_none(self):
+        result = write_quarantine("test_source", WINDOW_START, [])
+
+        assert result is None
+        listed = _s3().list_objects_v2(
+            Bucket=TEST_BUCKET, Prefix="quarantine/test_source/"
+        )
+        assert listed.get("KeyCount", 0) == 0
+
+    def test_nonempty_rows_writes_jsonl(self):
+        rows = [{"stationId": "ST-1", "_issues": ["missing:rackTotCnt"]}, {"stationId": "ST-2"}]
+
+        key = write_quarantine("test_source", WINDOW_START, rows)
+
+        assert key == "quarantine/test_source/dt=2026-08-12/hh=14/1410.jsonl"
+        body = _s3().get_object(Bucket=TEST_BUCKET, Key=key)["Body"].read().decode()
+        lines = [json.loads(line) for line in body.strip().split("\n")]
+        assert lines == rows
