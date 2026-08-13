@@ -12,26 +12,27 @@
 `Action` · `Issue` · `RowVerdict` · `RunContext`는 `validation/types.py`에서,
 데코레이터는 `validation/registry.py`에서 가져온다.
 
-## 컬럼 정책 7종 — `(value, spec, row, ctx) -> tuple[Any, Action]`
+## 컬럼 정책 7종 — `(value, issue, row, ctx) -> tuple[Any, Action]`
 
-| 이름 | 반환값 | Action | repaired |
-| --- | --- | --- | --- |
-| `keep_null` | 원래 값 그대로 | KEEP | 아니오 |
-| `set_null` | None | KEEP | 예 |
-| `fill_zero` | 0 | KEEP | 예 |
-| `fill_default` | spec에 선언된 기본값 | KEEP | 예 |
-| `clip_to_range` | 정상 범위의 경계로 자른 값 | KEEP | 예 |
-| `drop_row` | — | DROP_ROW | — (행 폐기) |
-| `fail_batch` | — | FAIL_BATCH | — (배치 실패) |
+| 이름 | 반환값 | Action | repaired | 방어 가드 |
+| --- | --- | --- | --- | --- |
+| `keep_null` | 원래 값 그대로 | KEEP | 아니오 | — |
+| `set_null` | None | KEEP | 예 | — |
+| `fill_zero` | 0 | KEEP | 예 | `TYPE_ERROR` 제외 |
+| `fill_default` | spec에 선언된 기본값 | KEEP | 예 | `TYPE_ERROR` 제외 |
+| `clip_to_range` | 정상 범위의 경계로 자른 값 | KEEP | 예 | `TYPE_ERROR` · `MISSING` · 범위 미선언 제외 |
+| `drop_row` | — | DROP_ROW | — (행 폐기) | — |
+| `fail_batch` | — | FAIL_BATCH | — (배치 실패) | — |
 
 ### 교정형 정책은 캐스팅 실패 값을 방어한다
 
-`clip_to_range` · `fill_zero` · `fill_default`는 값이 `spec.types`로 해석되지 않는
-경우를 만날 수 있다. 4분면 기본값이 교정형으로 설정된 소스에서 `TYPE_ERROR`가 이쪽으로
-디스패치되기 때문이다(계획서 5절).
+정책은 값의 타입을 되짚지 않고 **`issue.kind`를 본다.** `clip_to_range` · `fill_zero` ·
+`fill_default`는 `TYPE_ERROR`일 때 `(None, Action.KEEP)`을 돌려준다. `clip_to_range`는
+`if issue.kind is not IssueKind.OUTLIER or issue.spec.range is None` 한 줄로
+`TYPE_ERROR` · `MISSING` · `range` 미선언 세 경우를 함께 막는다.
 
-이때는 `(None, Action.KEEP)`을 반환한다. 결과적으로 `set_null`과 같은 효과가 되어
-Parquet 스키마가 깨지지 않고, 규칙을 새로 만들지 않고 구현 안에서 흡수된다.
+결과적으로 `set_null`과 같은 효과가 되어 Parquet 스키마가 깨지지 않고, 규칙을 새로 만들지
+않고 구현 안에서 흡수된다.
 
 ## 행 정책 3종 — `(row, issues, ctx, params) -> RowVerdict`
 
@@ -56,3 +57,69 @@ params가 없는 정책도 시그니처는 4인자로 통일하고 `params`를 �
 검증(계획서 12절): 정책 함수 10종을 각각 단위 테스트한다. 교정형 3종은 캐스팅 실패 값을
 넣어 `(None, KEEP)`이 나오는지도 함께 확인한다.
 """
+
+from __future__ import annotations
+
+from typing import Any
+
+from validation.registry import policy
+from validation.types import Action, Issue, IssueKind, RunContext
+
+
+@policy("keep_null")
+def keep_null(value: Any, issue: Issue, row: dict, ctx: RunContext) -> tuple[Any, Action]:
+    """값을 바꾸지 않고 유지한다. 교정이 아니므로 `_row_status`는 ok로 남는다."""
+    return value, Action.KEEP
+
+
+@policy("set_null")
+def set_null(value: Any, issue: Issue, row: dict, ctx: RunContext) -> tuple[Any, Action]:
+    """값을 None으로 교체한다."""
+    return None, Action.KEEP
+
+
+@policy("fill_zero")
+def fill_zero(value: Any, issue: Issue, row: dict, ctx: RunContext) -> tuple[Any, Action]:
+    """값을 0으로 채운다. 해석 불가한 값에는 적용하지 않는다."""
+    if issue.kind is IssueKind.TYPE_ERROR:
+        return None, Action.KEEP
+    return 0, Action.KEEP
+
+
+@policy("fill_default")
+def fill_default(value: Any, issue: Issue, row: dict, ctx: RunContext) -> tuple[Any, Action]:
+    """spec에 선언된 기본값으로 채운다.
+
+    `default`를 선언하지 않은 컬럼에서는 None이 되어 `set_null`과 같은 효과다.
+    로드 시점에 막을지는 #2의 결정이다.
+    """
+    if issue.kind is IssueKind.TYPE_ERROR:
+        return None, Action.KEEP
+    return issue.spec.default, Action.KEEP
+
+
+@policy("clip_to_range")
+def clip_to_range(value: Any, issue: Issue, row: dict, ctx: RunContext) -> tuple[Any, Action]:
+    """값을 정상 범위의 경계로 잘라낸다.
+
+    가드 한 줄이 세 경우를 막는다 — 캐스팅 실패 값(TYPE_ERROR), 결측값(`on_missing`에
+    이 정책을 걸 수 있다), `range`를 선언하지 않은 컬럼(enum만 쓰는 PTY 같은 경우).
+    `range`가 있으면 `min`·`max`가 모두 있다고 가정한다(부분 range의 허용 여부는 #2가 정한다).
+    """
+    if issue.kind is not IssueKind.OUTLIER or issue.spec.range is None:
+        return None, Action.KEEP
+    bounds = issue.spec.range
+    return min(max(value, bounds.min), bounds.max), Action.KEEP
+
+
+@policy("drop_row")
+def drop_row(value: Any, issue: Issue, row: dict, ctx: RunContext) -> tuple[Any, Action]:
+    """이 행을 silver에서 제외하고 quarantine으로 보낸다."""
+    return value, Action.DROP_ROW
+
+
+@policy("fail_batch")
+def fail_batch(value: Any, issue: Issue, row: dict, ctx: RunContext) -> tuple[Any, Action]:
+    """배치 전체를 실패로 만든다. 스키마 계약 위반처럼 데이터 전체를 의심할 때만 쓴다."""
+    return value, Action.FAIL_BATCH
+
