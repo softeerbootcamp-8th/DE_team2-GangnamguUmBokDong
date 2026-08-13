@@ -70,14 +70,23 @@ def get_status() -> dict:
 
 @app.get("/alerts", response_model=list[Alert])
 def list_alerts() -> list[dict]:
-    """전체 대여소의 재배치 우선순위 알림을 urgency_score 내림차순으로 반환한다."""
+    """전체 대여소의 재배치 우선순위 알림을 urgency_score 내림차순으로 반환한다.
+
+    대여소마다 재고 이력·예측치를 따로 조회하면 대여소 수만큼 쿼리가 늘어나므로
+    (N+1), 두 데이터 다 전체 대여소를 대상으로 한 번씩만 조회해 sta_id별로 나눠 쓴다.
+    """
     now = queries.now_utc()
+    stations = queries.fetch_stations()
+    sta_ids = [station["sta_id"] for station in stations]
+    stock_history_by_station = queries.fetch_all_stock_history(sta_ids, now)
+    raw_points_by_station = queries.fetch_all_forecast_points(sta_ids, now)
+
     alerts = []
-    for station in queries.fetch_stations():
+    for station in stations:
         current = station["parking_bike_tot_cnt"]
         hold_cnt = station["hold_cnt"]
-        stock_history = queries.fetch_stock_history(station["sta_id"], now)
-        raw_points = queries.fetch_forecast_points(station["sta_id"], now)
+        stock_history = stock_history_by_station[station["sta_id"]]
+        raw_points = raw_points_by_station[station["sta_id"]]
         points = enrich_forecast_points(current, hold_cnt, raw_points)
 
         score, minutes, action_type = urgency_score(current, hold_cnt, stock_history, points, now)
