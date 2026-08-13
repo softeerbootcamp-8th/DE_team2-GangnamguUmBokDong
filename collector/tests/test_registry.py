@@ -2,7 +2,6 @@
 
 import pytest
 from pydantic import BaseModel
-
 from validation.registry import (
     DuplicatePolicyError,
     UnknownPolicyError,
