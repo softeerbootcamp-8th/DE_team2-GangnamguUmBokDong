@@ -1,16 +1,27 @@
 """정책 함수는 순수 함수다. 로그도 S3도 없다."""
 
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+from pydantic import ValidationError
+
 from validation.policies import (
+    IssueCountParams,
     clip_to_range,
+    drop_if_any_required_issue,
+    drop_if_issue_count_exceeds,
     drop_row,
     fail_batch,
     fill_default,
     fill_zero,
+    keep_always,
     keep_null,
     set_null,
 )
-from validation.registry import policy_names
-from validation.types import Action, IssueKind
+from validation.registry import policy_names, row_policy_names
+from validation.types import Action, IssueKind, RowVerdict
 
 
 def test_all_column_policies_are_registered():
@@ -111,3 +122,73 @@ def test_drop_row_returns_drop_action(make_issue, ctx):
 def test_fail_batch_returns_fail_action(make_issue, ctx):
     issue = make_issue(IssueKind.TYPE_ERROR, raw="junk")
     assert fail_batch("junk", issue, {}, ctx) == ("junk", Action.FAIL_BATCH)
+
+
+def test_all_row_policies_are_registered():
+    assert set(row_policy_names()) >= {
+        "drop_if_any_required_issue",
+        "drop_if_issue_count_exceeds",
+        "keep_always",
+    }
+
+
+def test_drop_if_any_required_issue_drops_on_required(make_spec, make_issue, ctx):
+    issues = [make_issue(IssueKind.MISSING, spec=make_spec(required=True), raw=None)]
+    assert drop_if_any_required_issue({}, issues, ctx, None) is RowVerdict.DROP
+
+
+def test_drop_if_any_required_issue_keeps_optional_only(make_issue, ctx):
+    issues = [make_issue(IssueKind.OUTLIER, raw="250")]  # spec 기본값 required=False
+    assert drop_if_any_required_issue({}, issues, ctx, None) is RowVerdict.KEEP
+
+
+def test_drop_if_any_required_issue_keeps_clean_row(ctx):
+    assert drop_if_any_required_issue({}, [], ctx, None) is RowVerdict.KEEP
+
+
+def test_drop_if_issue_count_exceeds_drops_above_threshold(make_issue, ctx):
+    issues = [make_issue(IssueKind.OUTLIER, raw="1") for _ in range(4)]
+    params = IssueCountParams(max_issues=3)
+    assert drop_if_issue_count_exceeds({}, issues, ctx, params) is RowVerdict.DROP
+
+
+def test_drop_if_issue_count_exceeds_keeps_at_threshold(make_issue, ctx):
+    # 경계값 — "넘으면" 폐기이므로 같으면 유지다
+    issues = [make_issue(IssueKind.OUTLIER, raw="1") for _ in range(3)]
+    params = IssueCountParams(max_issues=3)
+    assert drop_if_issue_count_exceeds({}, issues, ctx, params) is RowVerdict.KEEP
+
+
+def test_keep_always_keeps(make_issue, ctx):
+    issues = [make_issue(IssueKind.MISSING, raw=None)]
+    assert keep_always({}, issues, ctx, None) is RowVerdict.KEEP
+
+
+def test_issue_count_params_rejects_field_name_typo():
+    # #2 loader의 3단계 검증이 `max_issue: 3` 오타를 잡을 수 있는 근거가 이 설정이다
+    with pytest.raises(ValidationError):
+        IssueCountParams(max_issue=3)
+
+
+def test_issue_count_params_rejects_negative():
+    with pytest.raises(ValidationError):
+        IssueCountParams(max_issues=-1)
+
+
+def test_importing_registry_alone_populates_policies():
+    """등록은 import 부수효과다. 패키지 __init__이 그 보장을 맡는다."""
+    code = (
+        "from validation.registry import policy_names, row_policy_names; "
+        "print(','.join(policy_names() + row_policy_names()))"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=Path(__file__).resolve().parent.parent,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    names = result.stdout.strip().split(",")
+    assert "clip_to_range" in names
+    assert "keep_always" in names

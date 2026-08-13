@@ -62,8 +62,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from validation.registry import policy
-from validation.types import Action, Issue, IssueKind, RunContext
+from pydantic import BaseModel, ConfigDict, Field
+
+from validation.registry import policy, row_policy
+from validation.types import Action, Issue, IssueKind, RowVerdict, RunContext
 
 
 @policy("keep_null")
@@ -122,4 +124,38 @@ def drop_row(value: Any, issue: Issue, row: dict, ctx: RunContext) -> tuple[Any,
 def fail_batch(value: Any, issue: Issue, row: dict, ctx: RunContext) -> tuple[Any, Action]:
     """배치 전체를 실패로 만든다. 스키마 계약 위반처럼 데이터 전체를 의심할 때만 쓴다."""
     return value, Action.FAIL_BATCH
+
+
+class IssueCountParams(BaseModel):
+    """`drop_if_issue_count_exceeds`의 인자.
+
+    `extra="forbid"`가 핵심이다 — #2의 loader가 이 모델로 config의 `row_params`를
+    검증하므로, 이것이 없으면 `max_issue: 3` 같은 필드명 오타가 런타임까지 살아남는다.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    max_issues: int = Field(ge=0)
+
+
+@row_policy("drop_if_any_required_issue")
+def drop_if_any_required_issue(
+    row: dict, issues: list[Issue], ctx: RunContext, params: None
+) -> RowVerdict:
+    """필수 컬럼에 문제가 하나라도 있으면 행을 폐기한다."""
+    return RowVerdict.DROP if any(issue.required for issue in issues) else RowVerdict.KEEP
+
+
+@row_policy("drop_if_issue_count_exceeds", params=IssueCountParams)
+def drop_if_issue_count_exceeds(
+    row: dict, issues: list[Issue], ctx: RunContext, params: IssueCountParams
+) -> RowVerdict:
+    """이슈 개수가 임계값을 넘으면 행을 폐기한다."""
+    return RowVerdict.DROP if len(issues) > params.max_issues else RowVerdict.KEEP
+
+
+@row_policy("keep_always")
+def keep_always(row: dict, issues: list[Issue], ctx: RunContext, params: None) -> RowVerdict:
+    """항상 유지한다."""
+    return RowVerdict.KEEP
 
