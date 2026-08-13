@@ -8,6 +8,7 @@ collector→gold를 채우는 실제 ETL이 아직 없어서, apps/api를 로컬
 from datetime import timedelta
 
 from core.db import get_connection
+
 from queries import now_utc
 
 # 대여소 마스터 + 재고 이력(stock_history: (몇 분 전, 그때 재고))

@@ -1,6 +1,7 @@
-import queries
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+
+import queries
 from schemas import (
     Alert,
     ForecastResponse,
