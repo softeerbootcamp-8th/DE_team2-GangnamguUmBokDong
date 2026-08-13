@@ -69,9 +69,11 @@ import hashlib
 from pathlib import Path
 
 import yaml
+from pydantic import ValidationError
 
 from config.schema import SourceConfig
 from validation.registry import (
+    get_row_policy_params_model,
     is_policy_registered,
     is_row_policy_registered,
     policy_names,
@@ -97,6 +99,7 @@ def load(source_id: str, base_dir: Path = Path("sources")) -> SourceConfig:
             f"파일명 '{source_id}'와 YAML 안의 source_id '{config.source_id}'가 다르다"
         )
     errors += _check_policy_names(config)
+    errors += _check_row_params(config)
     if errors:
         raise ConfigError("\n".join(errors))
 
@@ -134,3 +137,26 @@ def _check_policy_names(config: SourceConfig) -> list[str]:
 def _unregistered_message(location: str, name: str, registered: tuple[str, ...]) -> str:
     listed = ", ".join(registered) or "(없음)"
     return f"{location}: '{name}'이 등록돼 있지 않다. 등록된 이름: {listed}"
+
+
+def _check_row_params(config: SourceConfig) -> list[str]:
+    row_name = config.policies.row
+    if row_name is None or not is_row_policy_registered(row_name):
+        return []  # 미등록 이름은 _check_policy_names가 이미 보고한다
+
+    params_model = get_row_policy_params_model(row_name)
+    row_params = config.policies.row_params
+
+    if params_model is None:
+        if row_params is not None:
+            return [
+                f"policies.row_params: '{row_name}'은 params를 받지 않는데 "
+                f"row_params가 주어졌다: {row_params}"
+            ]
+        return []
+
+    try:
+        params_model.model_validate(row_params or {})
+    except ValidationError as exc:
+        return [f"policies.row_params: '{row_name}'의 params 형식이 아니다: {exc}"]
+    return []

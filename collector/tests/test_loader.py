@@ -125,3 +125,69 @@ class TestLoadPolicyNameValidation:
         base_dir = _write(tmp_path, "test_source", broken)
         with pytest.raises(ConfigError, match="keep_null"):
             load("test_source", base_dir=base_dir)
+
+
+WITH_ROW_POLICY = VALID_YAML.replace(
+    "  optional_outlier: set_null\n",
+    "  optional_outlier: set_null\n  row: drop_if_issue_count_exceeds\n",
+)
+
+
+class TestLoadRowParamsValidation:
+    def test_row_policy_missing_required_params_raises(self, tmp_path):
+        base_dir = _write(tmp_path, "test_source", WITH_ROW_POLICY)
+        with pytest.raises(ConfigError, match="row_params"):
+            load("test_source", base_dir=base_dir)
+
+    def test_row_policy_with_correct_params_passes(self, tmp_path):
+        content = WITH_ROW_POLICY.replace(
+            "  row: drop_if_issue_count_exceeds\n",
+            "  row: drop_if_issue_count_exceeds\n  row_params: {max_issues: 3}\n",
+        )
+        base_dir = _write(tmp_path, "test_source", content)
+        config = load("test_source", base_dir=base_dir)
+        assert config.policies.row == "drop_if_issue_count_exceeds"
+        assert config.policies.row_params == {"max_issues": 3}
+
+    def test_row_policy_with_wrong_param_field_raises(self, tmp_path):
+        content = WITH_ROW_POLICY.replace(
+            "  row: drop_if_issue_count_exceeds\n",
+            "  row: drop_if_issue_count_exceeds\n  row_params: {max_issue: 3}\n",
+        )
+        base_dir = _write(tmp_path, "test_source", content)
+        with pytest.raises(ConfigError, match="row_params"):
+            load("test_source", base_dir=base_dir)
+
+    def test_row_policy_without_params_model_rejects_extra_row_params(self, tmp_path):
+        content = VALID_YAML.replace(
+            "  optional_outlier: set_null\n",
+            "  optional_outlier: set_null\n  row: keep_always\n  row_params: {max_issues: 3}\n",
+        )
+        base_dir = _write(tmp_path, "test_source", content)
+        with pytest.raises(ConfigError, match="row_params"):
+            load("test_source", base_dir=base_dir)
+
+    def test_row_policy_without_params_model_and_without_row_params_passes(self, tmp_path):
+        content = VALID_YAML.replace(
+            "  optional_outlier: set_null\n", "  optional_outlier: set_null\n  row: keep_always\n"
+        )
+        base_dir = _write(tmp_path, "test_source", content)
+        config = load("test_source", base_dir=base_dir)
+        assert config.policies.row == "keep_always"
+        assert config.policies.row_params is None
+
+
+class TestLoadAggregatesAllErrorKinds:
+    def test_policy_name_and_row_params_errors_both_reported(self, tmp_path):
+        content = VALID_YAML.replace(
+            "required_missing: drop_row", "required_missing: drp_row"
+        ).replace(
+            "  optional_outlier: set_null\n",
+            "  optional_outlier: set_null\n  row: drop_if_issue_count_exceeds\n",
+        )
+        base_dir = _write(tmp_path, "test_source", content)
+        with pytest.raises(ConfigError) as exc_info:
+            load("test_source", base_dir=base_dir)
+        message = str(exc_info.value)
+        assert "drp_row" in message
+        assert "row_params" in message
