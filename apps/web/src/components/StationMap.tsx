@@ -1,6 +1,6 @@
 import "leaflet/dist/leaflet.css";
 import L from "leaflet";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { CircleMarker, MapContainer, Marker, TileLayer, Tooltip, useMapEvents } from "react-leaflet";
 import type { ActionType, Alert, StationSummary } from "../api";
 
@@ -13,6 +13,7 @@ const MAX_RADIUS = 20;
 const CLICK_PADDING = 10; // 시각적 마커보다 이만큼 더 넓게 클릭을 받는다
 const SELECTED_BORDER = "#0b0b0b";
 const IDLE_BORDER = "#fcfcfb";
+const MAX_VISIBLE_MARKERS = 300; // 현재 화면 범위 안에 이보다 많으면 덜 급한 것부터 숨긴다
 
 // 지도를 확대하면 도로·건물이 커지는데 마커만 화면 픽셀 크기 그대로 고정돼
 // 있으면 상대적으로 쪼그라들어 보여서 부자연스럽다. BASE_ZOOM보다 4레벨
@@ -56,6 +57,9 @@ function markerColor(alert: Alert | undefined): string {
   const actionType: ActionType = alert?.action_type ?? "normal";
   if (actionType === "normal") return DIVERGING_NEUTRAL;
   const target = actionType === "supply_needed" ? DIVERGING_RED : DIVERGING_BLUE;
+  // 두 방향의 실측 점수 분포가 원래부터 비대칭이다(공급필요는 대부분 저점,
+  // 회수필요는 고르게 분포) — 곡선을 씌우면 이미 흐린 공급필요가 더 안 보이게
+  // 될 뿐이라, 절대 점수를 그대로 선형으로 매핑한다.
   const t = Math.min(1, Math.max(0, (alert?.urgency_score ?? 0) / 100));
   return mixHex(DIVERGING_NEUTRAL, target, t);
 }
@@ -65,28 +69,61 @@ function markerRadius(alert: Alert | undefined): number {
   return MIN_RADIUS + (score / 100) * (MAX_RADIUS - MIN_RADIUS);
 }
 
-// 재고 수 라벨의 배경색. 마커 자체(채우기 색)는 우선순위 방향을 보여주니까,
-// 이 라벨은 "지금 이 순간 실제로 얼마나 비었거나 찼는지"를 따로 보여주는
-// 용도로 둔다. 진짜 심한 경우(20% 이하/80% 이상)만 색을 칠하고, 평범한
-// 범위는 그냥 흰 배경으로 둬서 정말 심각한 것만 눈에 띄게 한다.
-function currentStatusColor(station: StationSummary): string | null {
-  const ratio = station.parking_bike_tot_cnt / station.hold_cnt;
-  if (ratio <= 0.2) return DIVERGING_RED;
-  if (ratio >= 0.8) return DIVERGING_BLUE;
-  return null;
-}
-
-// 라벨을 마커 위 고정 픽셀만큼 띄우면, 줌에 따라 마커가 커질 때 라벨이 커진
-// 마커 안에 파묻힌다. 그 마커의 실제 반지름(markerRadius) 기준으로 띄우는
-// 거리를 같이 계산해서 항상 마커 위 여백에 떠 있게 한다.
-function countIcon(count: number, tintColor: string | null, markerRadiusPx: number) {
-  const colorStyle = tintColor ? `background:${tintColor};color:#fff;border-color:${tintColor};` : "";
-  const offset = markerRadiusPx + 12;
+// 재고 수는 마커 밖에 별도 라벨로 띄우지 않고 마커 안에 바로 적는다. 마커가
+// 회색인데 라벨만 빨강/파랑으로 따로 떠 있으면 둘이 서로 다른 걸 가리키는
+// 것처럼 헷갈리므로, 그냥 마커 채우기색 위에 흰 숫자만 얹는다. 채우기색이
+// 옅은 회색일 때도 읽히도록 짙은 그림자를 살짝 깔아 대비를 보정한다. 글자
+// 크기는 마커 반지름에 비례해서, 마커가 커지고 작아질 때 같이 커지고 작아진다.
+function countIcon(count: number, markerRadiusPx: number) {
+  const fontSize = Math.max(9, Math.round(markerRadiusPx * 0.8));
+  const boxSize = Math.round(markerRadiusPx * 2);
+  // line-height로 세로 중앙을 맞추면 폰트마다 글자 위아래 여백(ascent/descent)이
+  // 달라서 결국 몇 px씩 어긋난다 — 원이 작을수록 그 몇 px이 원 크기 대비 크게
+  // 보였다. 대신 마커 지름만큼 박스를 잡고 flex로 정가운데 맞추면 폰트 메트릭과
+  // 무관하게 항상 박스 중심(=마커 중심)에 글자가 온다.
   return L.divIcon({
     className: "marker-count-label",
-    html: `<span style="${colorStyle}transform:translate(-50%, -${offset}px);">${count}</span>`,
+    html: `<div style="width:${boxSize}px;height:${boxSize}px;transform:translate(-50%, -50%);font-size:${fontSize}px;">${count}</div>`,
     iconSize: [0, 0],
   });
+}
+
+// 서울 전역 대여소를 다 그리면 원이 겹쳐서 안 읽힌다. urgency_score가 높은
+// (우선순위가 급한) 대여소일수록 먼저 살아남게 순위를 매겨둔다. 정렬은
+// stations/alerts가 바뀔 때만 다시 하고, 화면이 바뀔 때는 이미 정렬된 배열을
+// 거르기만 한다.
+function rankByUrgency(stations: StationSummary[], alertsByStation: Map<number, Alert>): StationSummary[] {
+  return [...stations].sort((a, b) => {
+    const scoreA = alertsByStation.get(a.sta_id)?.urgency_score ?? -1;
+    const scoreB = alertsByStation.get(b.sta_id)?.urgency_score ?? -1;
+    if (scoreB !== scoreA) return scoreB - scoreA;
+    return a.sta_id - b.sta_id;
+  });
+}
+
+// 전역 순위만으로 자르면, 특정 동네를 확대해도 그 동네 대여소들이 전역 순위에
+// 못 들면 화면에 아무것도 안 보이는 문제가 생긴다. 그래서 먼저 "지금 화면에
+// 보이는 범위(bounds) 안"으로만 좁히고, 그 안에서도 너무 많으면(MAX_VISIBLE_MARKERS)
+// 그때서야 순위로 자른다 — 어떤 동네를 봐도 그 지역 대여소는 항상 보이고, 화면
+// 안이 정말 붐빌 때만(줌아웃해서 서울 전체가 보일 때 등) 덜 급한 것부터 숨는다.
+function visibleStations(
+  ranked: StationSummary[],
+  bounds: L.LatLngBounds | null,
+  keepStationId: number | null,
+): StationSummary[] {
+  const inView = bounds ? ranked.filter((s) => bounds.contains([s.lat, s.lon])) : ranked;
+  if (inView.length <= MAX_VISIBLE_MARKERS) return inView;
+
+  const top = inView.slice(0, MAX_VISIBLE_MARKERS);
+  // 선택된 대여소는 순위권 밖으로 밀려나도 화면에서 사라지면 안 된다(리스트에서
+  // 골랐는데 지도에서 안 보이면 혼란스럽다). 없으면 마지막 자리를 양보해서 넣는다.
+  if (keepStationId !== null && !top.some((s) => s.sta_id === keepStationId)) {
+    const kept = inView.find((s) => s.sta_id === keepStationId);
+    if (kept) {
+      top[top.length - 1] = kept;
+    }
+  }
+  return top;
 }
 
 interface Props {
@@ -98,16 +135,31 @@ interface Props {
 
 function StationMarkers({ stations, alerts, selectedStationId, onSelect }: Props) {
   const [zoom, setZoom] = useState(DEFAULT_ZOOM);
+  const [bounds, setBounds] = useState<L.LatLngBounds | null>(null);
   // zoomend가 아니라 zoom을 듣는다. zoom은 줌 애니메이션이 진행되는 동안
   // 프레임마다(줌 버튼처럼 순간 전환일 때도 포함) 계속 발생해서, 마커 크기가
   // 애니메이션 도중에도 실시간으로 따라 커지고 작아진다. zoomend만 들으면
   // 애니메이션이 다 끝난 뒤에야 한 번에 크기가 바뀌어 뚝뚝 끊겨 보인다.
+  // 화면 범위(bounds)는 반대로 moveend에서만 갱신한다 — 팬/줌 도중 매 프레임
+  // 갱신할 필요가 없고(끝난 뒤 한 번이면 충분), 그때마다 필터링을 다시 하면 낭비다.
   const map = useMapEvents({
     zoom: () => setZoom(map.getZoom()),
+    moveend: () => setBounds(map.getBounds()),
   });
+  useEffect(() => {
+    setBounds(map.getBounds());
+  }, [map]);
   const scale = zoomScale(zoom);
   const showCounts = zoom >= COUNT_LABEL_MIN_ZOOM;
-  const alertsByStation = new Map(alerts.map((alert) => [alert.sta_id, alert]));
+  const alertsByStation = useMemo(() => new Map(alerts.map((alert) => [alert.sta_id, alert])), [alerts]);
+
+  // urgency_score 정렬은 stations/alerts가 바뀔 때만 다시 계산한다. 화면 범위가
+  // 바뀔 때는(팬/줌) 이미 정렬된 배열을 거르기만 한다.
+  const ranked = useMemo(() => rankByUrgency(stations, alertsByStation), [stations, alertsByStation]);
+  const visible = useMemo(
+    () => visibleStations(ranked, bounds, selectedStationId),
+    [ranked, bounds, selectedStationId],
+  );
 
   // stations는 15초마다 폴링으로 새 배열이 들어오는데, 그때마다 이 effect가
   // 다시 돌면 선택을 바꾸지 않았는데도 지도가 계속 재이동한다. ref로 최신
@@ -131,7 +183,7 @@ function StationMarkers({ stations, alerts, selectedStationId, onSelect }: Props
       {/* 마커 자체보다 넓게 깔아 두는 투명 클릭 영역. 시각적 마커 밑에 먼저 그려야
           마커 위에서의 호버가 그대로 툴팁을 띄우고, 마커 밖 여백(CLICK_PADDING)만
           이 레이어가 받아서 대충 눌러도 선택되게 한다. */}
-      {stations.map((station) => {
+      {visible.map((station) => {
         const alert = alertsByStation.get(station.sta_id);
         return (
           <CircleMarker
@@ -143,7 +195,7 @@ function StationMarkers({ stations, alerts, selectedStationId, onSelect }: Props
           />
         );
       })}
-      {stations.map((station) => {
+      {visible.map((station) => {
         const isSelected = station.sta_id === selectedStationId;
         const alert = alertsByStation.get(station.sta_id);
         const radius = markerRadius(alert) * scale;
@@ -168,13 +220,13 @@ function StationMarkers({ stations, alerts, selectedStationId, onSelect }: Props
         );
       })}
       {showCounts &&
-        stations.map((station) => {
+        visible.map((station) => {
           const alert = alertsByStation.get(station.sta_id);
           return (
             <Marker
               key={`count-${station.sta_id}`}
               position={[station.lat, station.lon]}
-              icon={countIcon(station.parking_bike_tot_cnt, currentStatusColor(station), markerRadius(alert) * scale)}
+              icon={countIcon(station.parking_bike_tot_cnt, markerRadius(alert) * scale)}
               interactive={false}
             />
           );
