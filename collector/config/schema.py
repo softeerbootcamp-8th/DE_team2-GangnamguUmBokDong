@@ -1,11 +1,10 @@
-"""SourceConfig / ColumnSpec / Policies pydantic 모델.
+"""데이터 소스 설정 파일(sources/{source_id}.yaml)의 구조를 정의하고 검증(Validation)하는 Pydantic 모델.
+SourceConfig / ColumnSpec / Policies pydantic 모델.
 
 `sources/{source_id}.yaml`이 가질 수 있는 모양을 못박는다. 구조적으로 말이 안 되는
 조합(부분 range, range+enum 동시 선언, backfill 조합 오류)은 여기서 pydantic
 validator로 막는다. 레지스트리 조회가 필요한 검증(정책 이름 존재, row_params)은
 `config/loader.py`가 맡는다.
-
-설계 근거: docs/superpowers/specs/2026-08-13-collector-config-loader-design.md
 """
 
 from __future__ import annotations
@@ -38,8 +37,8 @@ Duration = Annotated[timedelta, BeforeValidator(_parse_duration)]
 
 
 class Range(BaseModel):
-    """컬럼의 정상 범위. `min`·`max` 둘 다 필수다 — 부분 선언은 loader가 아니라
-    필드 정의 자체로 거부한다."""
+    """컬럼의 정상 범위. `min`·`max` 둘 다 필수
+    부분 선언은 loader가 아니라 필드 정의 자체로 거부"""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -48,7 +47,7 @@ class Range(BaseModel):
 
 
 class ColumnSpec(BaseModel):
-    """컬럼 하나의 스펙. `range`와 `enum`은 배타적으로만 쓴다."""
+    """컬럼 하나의 스펙. `range`와 `enum`은 배타적으로만 사용"""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -62,18 +61,23 @@ class ColumnSpec(BaseModel):
 
     @model_validator(mode="after")
     def _range_xor_enum(self) -> ColumnSpec:
+        """`range`와 `enum`을 동시에 선언한 spec을 막는다."""
         if self.range is not None and self.enum is not None:
             raise ValueError("range와 enum을 동시에 선언할 수 없다")
         return self
 
 
 class Schedule(BaseModel):
+    """수집 주기."""
+
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     interval: Duration
 
 
 class Storage(BaseModel):
+    """bronze·silver 저장 형식과 파티션 키."""
+
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     bronze_format: str
@@ -82,6 +86,8 @@ class Storage(BaseModel):
 
 
 class Quality(BaseModel):
+    """배치를 버릴지 판단하는 완결도 기준."""
+
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     max_drop_ratio: float = Field(ge=0, le=1)
@@ -90,12 +96,16 @@ class Quality(BaseModel):
 
 
 class Fetch(BaseModel):
+    """API 호출 예산. `budget`이 없으면 `SourceConfig.effective_fetch_budget`이 기본값을 계산한다."""
+
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     budget: Duration | None = None
 
 
 class Backfill(BaseModel):
+    """`_retry_queue` 백필 대상 여부와 만료 기준."""
+
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     enabled: bool = False
@@ -103,12 +113,15 @@ class Backfill(BaseModel):
 
     @model_validator(mode="after")
     def _max_age_required_when_enabled(self) -> Backfill:
+        """`enabled=true`인데 `max_age`가 없는 조합을 막는다."""
         if self.enabled and self.max_age is None:
             raise ValueError("backfill.enabled=true면 max_age가 필수다")
         return self
 
 
 class Policies(BaseModel):
+    """4분면 기본 정책 이름과, 선택적인 행 정책·그 params."""
+
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     required_missing: str
@@ -120,6 +133,8 @@ class Policies(BaseModel):
 
 
 class SourceConfig(BaseModel):
+    """`sources/{source_id}.yaml` 한 개에 대응하는 검증된 설정."""
+
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     source_id: str
@@ -136,6 +151,7 @@ class SourceConfig(BaseModel):
     config_version: str = ""
 
     def effective_fetch_budget(self) -> timedelta:
+        """`fetch.budget`이 없으면 주기의 절반과 30분 중 작은 값을 기본 예산으로 쓴다."""
         if self.fetch and self.fetch.budget:
             return self.fetch.budget
         return min(self.schedule.interval / 2, timedelta(minutes=30))
