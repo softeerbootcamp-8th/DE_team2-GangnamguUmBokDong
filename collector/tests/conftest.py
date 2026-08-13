@@ -1,48 +1,42 @@
-"""#3·#4 테스트 공용 픽스처.
+"""#2·#3·#4 테스트 공용 픽스처.
 
-`ColumnSpecStub`은 #2가 만들 `config.schema.ColumnSpec`의 자리를 메우는 스텁이다.
-**#2에서 `ColumnSpec`이 확정되면 이 스텁을 실제 모델로 교체한다** — 방치하면 정책
-테스트가 실물과 어긋난 채 초록불이 된다.
+`make_spec`은 `ColumnSpec.model_construct()`로 만든다 — 일반 생성자를 쓰면 validator가
+돌아서 `range`의 부분 선언이나 `range`+`enum` 동시 선언 같은 "일부러 위반된" spec을
+만들 수 없다. 정책 함수(#3)의 방어 코드는 이런 잘못된 spec에서도 안전한지를 테스트해야
+하므로, 이 픽스처만 validator를 우회한다. 실제 YAML 로딩 경로(config.loader.load)는
+`SourceConfig.model_validate`를 쓰므로 이 우회와 무관하게 여전히 막힌다.
 
 storage.py·manifest.py 테스트가 공유하는 moto S3 환경 픽스처도 함께 둔다.
 """
 
-from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any
 
 import boto3
 import pytest
 from moto import mock_aws
 
+from config.schema import ColumnSpec, Range
 from validation import registry
 from validation.types import Issue, RunContext
 
 TEST_BUCKET = "test-bucket"
 
 
-@dataclass(frozen=True, slots=True)
-class RangeStub:
-    min: Any
-    max: Any
-
-
-@dataclass(frozen=True, slots=True)
-class ColumnSpecStub:
-    types: tuple[str, ...] = ("int",)
-    required: bool = False
-    range: RangeStub | None = None
-    enum: tuple[Any, ...] | None = None
-    default: Any = None
-
-
 @pytest.fixture
 def make_spec():
-    """ColumnSpec 스텁을 만든다. `range=(0, 200)` 처럼 튜플로 주면 RangeStub으로 감싼다."""
+    """ColumnSpec을 만든다. `range=(0, 200)`처럼 튜플로 주면 Range로 감싼다."""
 
     def _make(types=("int",), required=False, range=None, enum=None, default=None):
-        bounds = RangeStub(*range) if isinstance(range, tuple) else range
-        return ColumnSpecStub(types=types, required=required, range=bounds, enum=enum, default=default)
+        bounds = Range.model_construct(min=range[0], max=range[1]) if isinstance(range, tuple) else range
+        return ColumnSpec.model_construct(
+            types=tuple(types),
+            required=required,
+            range=bounds,
+            enum=enum,
+            default=default,
+            on_missing=None,
+            on_outlier=None,
+        )
 
     return _make
 
