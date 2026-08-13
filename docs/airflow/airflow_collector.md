@@ -1,1156 +1,828 @@
-# Airflow ↔ Collector 연동 설계
+# Airflow ↔ Collector 구성 및 스케줄링 설계
 
 ## 1. 목적
 
-이 문서는 우리 시스템에서 Airflow가 `collector`를 어떻게 실행하고, 실행 상태를 어떻게 판단하며, 실패와 재시도를 어디에서 책임지는지 정리한다.
+이 문서는 우리 시스템에서 **Airflow가 Collector를 어떻게 스케줄링하고 실행하는지**, 그리고 AWS EC2를 **4대로 분리하는 경우와 3대로 통합하는 경우의 차이**를 정리한다.
 
-핵심 원칙은 다음과 같다.
+다루는 내용은 다음 네 가지로 한정한다.
 
-> **Airflow는 작업의 시점과 순서를 관리하고, Collector는 실제 데이터 수집·Bronze 저장·정제·Silver 저장을 수행한다.**
-
-Airflow DAG 안에 API 수집 로직을 직접 작성하지 않는다. 데이터 소스별 수집·검증·저장 규칙은 `collector/`에 두고, Airflow는 Collector의 실행 인터페이스만 호출한다.
-
----
-
-## 2. 전체 AWS 시스템에서의 위치
-
-이 프로젝트의 기준 실행 환경은 로컬이 아니라 **AWS**다. 자원이 계획대로 할당되는 경우 각 역할을 다음과 같이 분리한다.
-
-```text
-External API
-    │
-    ▼
-┌──────────────────┐
-│   Collector EC2  │
-│                  │
-│ API 호출          │
-│ Bronze 저장       │
-│ Transform / QC   │
-│ Silver 저장       │
-└───────┬──────────┘
-        │
-        ├──────────────▶ S3 Bronze
-        │
-        └──────────────▶ S3 Silver
-                              │
-              ┌───────────────┴────────────────┐
-              │                                │
-              ▼                                ▼
-     ┌──────────────────┐            ┌──────────────────┐
-     │  Inference EC2   │            │       EMR        │
-     │                  │            │                  │
-     │ 최신 Silver 조회   │            │ Feature Mart     │
-     │ Feature 구성      │            │ Model Training   │
-     │ 모델 추론          │            │ Batch Processing │
-     └────────┬─────────┘            └────────┬─────────┘
-              │                                │
-              │                                ▼
-              │                           S3 Model /
-              │                           Feature Mart
-              │
-              ▼
-        ┌─────────────┐
-        │  Gold RDS   │
-        └──────┬──────┘
-               │
-               ▼
-        ┌─────────────┐
-        │ Backend EC2 │
-        │   FastAPI   │
-        └──────┬──────┘
-               │
-               ▼
-            Client
-
-
-                 ┌────────────────────┐
-                 │     Airflow EC2    │
-                 │                    │
-                 │ Schedule           │
-                 │ Dependency         │
-                 │ Retry              │
-                 │ Monitoring         │
-                 └─────────┬──────────┘
-                           │
-          ┌────────────────┼───────────────────┐
-          │                │                   │
-          ▼                ▼                   ▼
-   Collector EC2     Inference EC2           EMR
-     수집 실행          추론 실행        피처마트/학습 실행
-```
-
-즉 Airflow EC2는 데이터를 직접 처리하지 않고, AWS에 분리되어 있는 실행 컴포넌트를 오케스트레이션한다.
-
-```text
-Airflow EC2
-= Orchestrator
-
-Collector EC2
-= Collection + Bronze + Silver
-
-Inference EC2
-= Online/Periodic Inference
-
-EMR
-= Feature Mart + Model Training + Heavy Batch
-
-S3 Bronze / Silver
-= Data Lake
-
-RDS Gold
-= Serving Store
-
-Backend EC2
-= FastAPI Serving
-```
-
-이 문서에서는 그중 **Airflow EC2가 Collector EC2를 어떻게 실행하고 상태를 전달받는지**를 중심으로 설명한다.
+1. Airflow의 Collector 스케줄링 역할
+2. EC2 4대 구성과 3대 구성 비교
+3. EC2 3대 구성에서 Airflow와 Collector의 실행 방식
+4. EC2 4대 구성에서 Airflow와 Collector의 원격 실행 방식 비교: SSH vs SSM
 
 ---
 
-## 3. Airflow와 Collector의 책임 분리
+## 2. Airflow의 Collector 스케줄링 역할
 
-### Airflow가 책임지는 것
+Airflow는 데이터를 직접 수집하거나 정제하는 컴포넌트가 아니다.
 
-Airflow는 **언제, 어떤 순서로, 몇 번 실행할 것인지**를 책임진다.
-
-- 5분 단위 수집 스케줄
-- 데이터 소스별 DAG 또는 Task 구성
-- Task dependency 관리
-- Collector 프로세스 실행
-- Collector의 종료 코드 확인
-- Task-level retry
-- timeout 관리
-- 실패 로그 확인
-- downstream 추론 Task 실행 여부 결정
-- backfill / 재처리 실행
-
-예를 들면 다음 흐름이다.
+Airflow의 역할은 **Collector가 언제 실행되어야 하는지 결정하고, 실행을 요청하고, 성공/실패에 따라 다음 작업을 제어하는 것**이다.
 
 ```text
-collect_bike
-    ├─ success → collect/weather 등 다음 흐름 진행
-    └─ failure → Airflow retry / DAG failure
+Airflow
+= Scheduler + Orchestrator
+
+Collector
+= 실제 수집 작업을 수행하는 Worker Application
 ```
 
-### Collector가 책임지는 것
+### 2.1 역할 분리
 
-Collector는 **한 번 실행되었을 때 데이터 한 작업을 정확하게 완료하는 것**을 책임진다.
+| 구분 | Airflow | Collector |
+| --- | --- | --- |
+| 실행 시각 결정 | 담당 | 담당하지 않음 |
+| 주기 관리 | 담당 | 담당하지 않음 |
+| Task dependency | 담당 | 담당하지 않음 |
+| Task-level retry | 담당 | 담당하지 않음 |
+| timeout 관리 | 담당 | 담당하지 않음 |
+| Collector 실행 요청 | 담당 | 요청을 받아 실행 |
+| 외부 API 호출 | 담당하지 않음 | 담당 |
+| pagination | 담당하지 않음 | 담당 |
+| API page retry | 담당하지 않음 | 담당 |
+| 데이터 저장/정제 | 담당하지 않음 | 담당 |
+| 최종 성공/실패 반환 | 결과를 판정 | exit code로 반환 |
 
-- 외부 API 호출
-- API 응답 코드 검증
-- pagination 처리
-- 페이지별 원본 응답 S3 Bronze 저장
-- transform
-- 타입·결측·이상치 validation
-- S3 Silver Parquet 저장
-- API page 단위 재시도
-- exponential backoff + jitter
-- `run_id`, `page_no`, `attempt_no` 관리
-- 수집 결과 요약 로그 출력
-- 최종 성공/실패에 따른 process exit code 반환
-
-중요한 점은 **API 재시도와 Airflow Task 재시도가 서로 다른 레벨의 재시도**라는 것이다.
-
-```text
-Airflow Task Retry
-└── Collector 전체 실행 재시도
-    └── Collector 내부 API Page Retry
-        └── 동일 1000건 Page 최대 3회 API 호출
-```
-
-Collector 내부에서 해결 가능한 API 일시 오류는 Collector가 먼저 처리한다. Collector가 최종적으로 작업을 완료하지 못했을 때만 non-zero exit code를 반환하여 Airflow Task를 실패시킨다.
-
----
-
-## 4. AWS에서 Airflow EC2와 Collector EC2 연결 방식
-
-운영 기준에서는 Airflow와 Collector가 서로 다른 EC2에 존재한다.
-
-```text
-┌──────────────────────┐
-│      Airflow EC2     │
-│                      │
-│ Scheduler            │
-│ DAG                  │
-│ Task State           │
-└──────────┬───────────┘
-           │
-           │ remote execution
-           ▼
-┌──────────────────────┐
-│     Collector EC2    │
-│                      │
-│ repository           │
-│ collector/.venv      │
-│ collector/main.py    │
-└──────────────────────┘
-```
-
-이때 권장 연결 방식은 **AWS Systems Manager(SSM) Run Command**다.
-
-```text
-Airflow EC2
-    │
-    │ ssm:SendCommand
-    ▼
-AWS Systems Manager
-    │
-    ▼
-Collector EC2
-    │
-    │ shell command
-    ▼
-cd <repository>/collector
-uv run python main.py --source ... --run-id ...
-```
-
-SSHOperator도 사용할 수 있지만 본 프로젝트의 기본 설계로 두지 않는다.
-
-SSM을 우선하는 이유는 다음과 같다.
-
-- Airflow EC2에 SSH private key를 보관할 필요가 없다.
-- Collector EC2의 22번 포트를 Airflow에 열 필요가 없다.
-- IAM Role 기반으로 실행 권한을 제한할 수 있다.
-- 명령 실행 ID와 실행 상태를 AWS API로 조회할 수 있다.
-- 실행 결과를 Airflow Task 성공/실패와 연결하기 쉽다.
-
-따라서 운영 실행 계약은 다음과 같다.
+즉 Airflow DAG 안에 실제 API 수집 로직을 작성하지 않는다.
 
 ```text
 Airflow DAG
-   │
-   │ run_id + source
-   ▼
-SSM SendCommand
-   │
-   ▼
-Collector CLI
-   │
-   ├─ exit 0     → SSM Success → Airflow success
-   └─ exit != 0  → SSM Failed  → Airflow failure/retry
-```
-
-Airflow가 Collector의 내부 Python 함수를 직접 import하지 않는다. Collector는 별도의 EC2에서 독립된 애플리케이션으로 실행한다.
-
----
-
-## 5. 왜 직접 import보다 CLI 실행을 권장하는가
-
-현재 프로젝트에서 `airflow/`와 `collector/`는 서로 독립된 uv 프로젝트이고, 운영 환경에서는 서로 다른 EC2에 배포된다.
-
-따라서 Airflow가 Collector의 내부 Python 모듈을 직접 import하면 다음 문제가 생긴다.
-
-```text
-Airflow Environment
     │
-    ├─ collector dependency까지 필요
-    ├─ package path 조정 필요
-    ├─ dependency 충돌 가능
-    └─ 두 프로젝트의 배포 경계가 흐려짐
-```
-
-반대로 CLI 실행 방식은 다음처럼 분리된다.
-
-```text
-Airflow Environment
-    │
-    │ command
+    │ Collector 실행
     ▼
-Collector Environment
+Collector
     │
-    ├─ collector/pyproject.toml
-    ├─ collector/uv.lock
-    └─ collector/.venv
+    ├─ API 호출
+    ├─ 내부 재시도
+    ├─ 데이터 처리
+    └─ exit code 반환
+          │
+          ▼
+       Airflow
+          │
+          ├─ success → 다음 Task
+          └─ failure → Airflow retry / DAG failure
 ```
 
-따라서 Collector dependency가 바뀌어도 Airflow dependency에는 영향을 주지 않는다.
+### 2.2 5분 주기 수집 예시
 
----
+5분마다 실행하는 수집 작업이라면 Airflow가 논리적인 실행 시각을 관리한다.
 
-## 6. Collector 실행 인터페이스
+```text
+09:00 DAG Run
+   ↓
+Collector 실행
+   ↓
+성공/실패 확인
 
-Airflow와 안정적으로 연결하려면 Collector가 명확한 CLI 인터페이스를 가져야 한다.
+09:05 DAG Run
+   ↓
+Collector 실행
+   ↓
+성공/실패 확인
 
-권장 형태는 다음과 같다.
+09:10 DAG Run
+   ↓
+Collector 실행
+   ↓
+성공/실패 확인
+```
+
+Airflow는 Collector에 최소한 다음과 같은 실행 정보를 전달한다.
+
+```text
+source
+run_id
+필요한 경우 base_dttm
+```
+
+예:
 
 ```bash
 uv run python main.py \
   --source bike \
-  --run-id 20260812T194000
+  --run-id 20260813T090000
 ```
 
-필요하면 다음 옵션까지 확장할 수 있다.
+Collector는 작업이 성공하면 `exit 0`, 최종 실패하면 non-zero exit code를 반환한다.
 
 ```text
---source
-    bike
-    weather
-    hotspot_population
-    grid_population
-    event
-    rental_history
+Collector exit 0
+→ Airflow Task success
 
---run-id
-    Airflow가 생성한 논리 실행 ID
-
---base-dttm
-    해당 수집 작업의 기준 시각
-
---start-page
-    부분 재처리가 필요한 경우 시작 page
-
---end-page
-    부분 재처리가 필요한 경우 종료 page
+Collector exit != 0
+→ Airflow Task failure
+→ 필요 시 Airflow Task retry
 ```
 
-단, 평상시 운영에서는 Airflow가 페이지 단위를 직접 관리하지 않는다. 페이지 단위 처리는 Collector의 책임으로 둔다.
+### 2.3 재시도 책임
+
+재시도는 두 계층으로 나눈다.
+
+```text
+Airflow Task Retry
+└─ Collector 전체 실행 재시도
+   └─ Collector 내부 API Page Retry
+```
+
+- API 요청 자체의 일시적인 오류는 Collector 내부에서 처리한다.
+- Collector 전체 실행이 최종적으로 실패한 경우 Airflow가 Task 단위로 재시도한다.
+
+이렇게 역할을 나누면 DAG가 API 세부 구현에 종속되지 않는다.
+
+---
+
+## 3. EC2 4대 구성과 3대 구성 비교
+
+우리 시스템에서 EC2를 역할별로 완전히 분리하면 다음과 같이 4대를 사용할 수 있다.
+
+### 3.1 EC2 4대 구성
+
+```text
+EC2 #1
+Airflow
+
+EC2 #2
+Collector
+
+EC2 #3
+Inference
+
+EC2 #4
+Backend
+```
+
+이 경우 Airflow와 Collector가 서로 다른 EC2에 있으므로 **원격 실행 방식이 필요하다.**
+
+```text
+Airflow EC2
+    │
+    │ SSM 또는 SSH
+    ▼
+Collector EC2
+```
+
+### 3.2 EC2 3대 구성
+
+Airflow와 Collector를 하나의 EC2에 배치하면 다음과 같다.
+
+```text
+EC2 #1
+Airflow + Collector
+
+EC2 #2
+Inference
+
+EC2 #3
+Backend
+```
+
+이 경우 Airflow와 Collector가 같은 EC2에 있으므로 원격 통신이 필요하지 않다.
 
 ```text
 Airflow
-└── source=hotspot_population 실행
-    └── Collector
-        ├── page 1
-        ├── page 2
-        ├── ...
-        └── page N
-```
-
----
-
-## 7. run_id 전달 방식
-
-`run_id`는 Airflow와 Collector를 연결하는 가장 중요한 식별자다.
-
-우리 시스템에서 `run_id`는 **5분 논리 작업의 기준 시각**을 의미한다.
-
-예:
-
-```text
-20260812T194000
-```
-
-Airflow Task retry, Collector API retry, 재처리가 발생하더라도 동일한 논리 작업이라면 같은 `run_id`를 사용한다.
-
-```text
-Airflow DAG Run
-run_id = 20260812T194000
-
-    └── Collector
-        ├── page 1 attempt 1
-        ├── page 2 attempt 1
-        ├── page 3 attempt 1 → fail
-        └── page 3 attempt 2 → success
-```
-
-S3에는 다음처럼 저장할 수 있다.
-
-```text
-bronze/{source}/{YYYY}/{MM}/{DD}/{run_id}/{page_no}_{attempt_no}.json
-silver/{source}/{YYYY}/{MM}/{DD}/{run_id}/{page_no}.parquet
-```
-
-이렇게 하면 Airflow 로그와 S3 객체를 `run_id` 하나로 추적할 수 있다.
-
----
-
-## 8. 성공/실패 전달 방식
-
-Airflow와 Collector 사이에서 가장 단순하고 확실한 통신 규칙은 **process exit code**다.
-
-### 성공
-
-Collector가 모든 예상 Page에 대해 Bronze와 Silver 저장까지 완료하면:
-
-```text
-exit code = 0
-```
-
-Airflow는 Task를 `success`로 처리하고 다음 Task를 실행한다.
-
-### 실패
-
-최대 재시도 이후에도 API 또는 저장 작업이 완료되지 않으면:
-
-```text
-exit code != 0
-```
-
-Airflow는 해당 Task를 `failed`로 판단한다.
-
-예:
-
-```python
-import sys
-
-
-def main() -> None:
-    try:
-        run_collection()
-    except Exception:
-        logger.exception("collection failed")
-        sys.exit(1)
-
-    sys.exit(0)
-```
-
-Collector는 실패를 `print`만 하고 정상 종료하면 안 된다.
-
-```text
-잘못된 방식
-오류 로그 출력 → exit 0
-
-올바른 방식
-오류 로그 출력 → exit 1
-```
-
-그래야 Airflow가 실패를 정확하게 감지할 수 있다.
-
----
-
-## 9. 로그 연결
-
-Collector는 실행 중 로그를 표준 출력(stdout/stderr)으로 남긴다.
-
-```text
-Collector logger
-      │
-      ▼
-stdout / stderr
-      │
-      ▼
-BashOperator
-      │
-      ▼
-Airflow Task Log
-```
-
-권장 로그 필드는 다음과 같다.
-
-```text
-run_id
-source
-page_no
-attempt_no
-status
-start_time
-end_time
-expected_count
-received_count
-valid_count
-invalid_count
-bronze_key
-silver_key
-error_type
-error_message
-```
-
-예:
-
-```text
-run_id=20260812T194000
-source=bike
-page_no=3
-attempt_no=2
-status=success
-received_count=1000
-bronze_key=bronze/bike/2026/08/12/20260812T194000/3_2.json
-silver_key=silver/bike/2026/08/12/20260812T194000/3.parquet
-```
-
-이 구조를 사용하면 Airflow UI에서 실패 Task를 클릭했을 때 Collector 내부의 어떤 Page에서 문제가 발생했는지 바로 확인할 수 있다.
-
----
-
-## 10. 재시도 구조
-
-우리 시스템에서는 재시도를 두 단계로 나눈다.
-
-### 10.1 Collector 내부 Retry
-
-API Page 단위의 일시적인 오류는 Collector 내부에서 처리한다.
-
-```text
-API Page Request
-      │
-      ├─ 성공 → Bronze → Transform → Silver
-      │
-      └─ 실패
-           │
-           ├─ exponential backoff + jitter
-           ├─ retry
-           ├─ 최대 3회 (최초 호출 포함)
-           └─ 모두 실패 → Collector failure
-```
-
-재시도 단위는 개별 row가 아니라 해당 row가 포함된 **최대 1000건 API Page 전체**다.
-
-### 10.2 Airflow Task Retry
-
-Collector 전체 프로세스가 실패했을 경우 Airflow가 Task 자체를 다시 실행한다.
-
-예:
-
-```python
-from datetime import timedelta
-
-collect_bike = BashOperator(
-    task_id="collect_bike",
-    bash_command="...",
-    retries=2,
-    retry_delay=timedelta(minutes=1),
-    execution_timeout=timedelta(minutes=4),
-)
-```
-
-Airflow retry에서도 같은 논리 실행의 `run_id`를 유지한다.
-
-Collector는 이미 정상 저장된 Page를 확인하여 불필요하게 다시 처리하지 않거나, 재처리되더라도 최종 Silver가 멱등적으로 동일한 위치에 기록되도록 설계한다.
-
----
-
-## 11. AWS 전체 DAG 권장 구조
-
-수집 주기와 컴퓨팅 역할이 다르기 때문에 모든 작업을 하나의 거대한 DAG로 묶기보다는 **운영 목적별 DAG로 분리**하는 것을 권장한다.
-
-### 11.1 실시간/준실시간 수집 DAG
-
-```text
-realtime_collection_5m
-
-Airflow EC2
     │
-    ├─ SSM → Collector EC2: bike
-    ├─ SSM → Collector EC2: hotspot_population
-    └─ 필요한 최신 데이터 수집 확인
-                 │
-                 ▼
-         trigger inference
-                 │
-                 ▼
-       SSM → Inference EC2
-                 │
-                 ▼
-              Gold RDS
-```
-
-### 11.2 날씨 수집 DAG
-
-날씨의 실제 갱신 주기에 맞춰 별도 DAG로 둘 수 있다.
-
-```text
-weather_collection
-
-Airflow EC2
-    │
-    └─ SSM → Collector EC2: weather
-                    │
-                    ▼
-               S3 Silver
-```
-
-### 11.3 일 단위 수집/정리 DAG
-
-```text
-daily_collection_and_compaction
-
-Airflow EC2
-    │
-    ├─ SSM → Collector EC2: event
-    ├─ SSM → Collector EC2: grid_population
-    └─ Bronze daily compaction
-                    │
-                    ▼
-               S3 Bronze/Silver
-```
-
-### 11.4 Feature Mart DAG
-
-```text
-feature_mart
-
-Airflow EC2
-    │
-    │ EMR Job 제출
+    │ local process
     ▼
-EMR
-    │
-    ├─ S3 Silver 장기 데이터 조회
-    ├─ 대규모 Join / Aggregation
-    └─ Feature Mart 생성
-                    │
-                    ▼
-             S3 Feature Mart
+Collector
 ```
 
-### 11.5 Model Training DAG
+### 3.3 전체 비교
 
-```text
-model_training
-
-Airflow EC2
-    │
-    │ EMR Job 제출
-    ▼
-EMR
-    │
-    ├─ Feature Mart 조회
-    ├─ 모델 학습
-    ├─ 모델 평가
-    └─ 모델 Artifact 저장
-                    │
-                    ▼
-                S3 Models
-                    │
-                    ▼
-             Inference EC2
-```
-
-Airflow는 EC2/EMR 사이에 실제 데이터를 전달하지 않는다. 실제 데이터는 S3에 저장하고 Airflow는 실행 순서와 작은 메타데이터만 관리한다.
+| 비교 항목 | EC2 4대 | EC2 3대 |
+| --- | --- | --- |
+| 구성 | Airflow / Collector / Inference / Backend 분리 | Airflow+Collector / Inference / Backend |
+| Airflow와 Collector 물리적 분리 | **분리** | 같은 EC2 |
+| Airflow → Collector 실행 | **원격 실행 필요** | **로컬 실행** |
+| SSM/SSH 필요 여부 | 필요 | 불필요 |
+| 구조 단순성 | 보통 | **높음** |
+| 자원 활용률 | 낮아질 수 있음 | **높아질 수 있음** |
+| 장애 격리 | **높음** | 낮음 |
+| 독립 Scaling | **높음** | Airflow와 Collector는 함께 자원 사용 |
+| 독립 배포 | **유리** | 코드/환경을 분리하면 상당 부분 가능 |
+| 운영 복잡도 | 높음 | **낮음** |
+| 현재 프로젝트 규모 적합성 | 좋음 | **높음** |
 
 ---
 
-## 12. 권장 폴더 구조
+## 4. EC2 4대 구성의 장단점
 
-현재 `collector/`에는 실행 코드가 아직 없으므로 다음과 같이 시작할 수 있다.
+### 장점 1. 장애 격리
 
-```text
-collector/
-├── pyproject.toml
-├── uv.lock
-├── main.py
-├── bike.py
-├── weather.py
-├── hotspot_population.py
-├── grid_population.py
-├── event.py
-└── rental_history.py
-```
-
-공통 로직은 `libs/core`로 분리한다.
+Airflow와 Collector가 다른 EC2에 있으므로 Collector의 자원 문제가 Airflow 서버에 직접 영향을 주지 않는다.
 
 ```text
-libs/core/src/core/
-├── s3.py
-├── logging.py
-├── retry.py
-├── quality.py
-└── time.py
+Collector EC2
+Memory 부족 / CPU 과부하 / 프로세스 장애
+
+        ↓
+
+Airflow EC2
+계속 동작 가능
 ```
 
-그리고 Airflow 쪽은 다음 정도만 유지한다.
+반대로 Airflow EC2에 문제가 발생하더라도 Collector EC2 자체는 별도 서버로 유지된다.
 
-```text
-airflow/
-├── pyproject.toml
-├── uv.lock
-└── dags/
-    ├── realtime_collection.py
-    ├── daily_collection.py
-    └── training.py
-```
+### 장점 2. 자원을 독립적으로 조절 가능
 
-핵심은 DAG 파일에 다음 로직을 넣지 않는 것이다.
-
-```text
-API URL 조립
-JSON parsing
-S3 key 생성
-데이터 validation
-Parquet 변환
-```
-
-이 로직은 모두 Collector 또는 `libs/core`에 있어야 한다.
-
----
-
-## 13. 로컬 환경의 역할
-
-로컬 Docker Compose 환경은 **운영 아키텍처가 아니라 개발·통합 테스트용 축소 환경**이다.
-
-개발자는 로컬에서 다음을 검증할 수 있다.
-
-```text
-Airflow Container
-→ Collector CLI 실행
-→ MinIO Bronze/Silver
-```
-
-하지만 실제 운영 흐름은 다음이다.
+Collector 부하가 커지면 Collector EC2만 확장할 수 있다.
 
 ```text
 Airflow EC2
-→ SSM
+2~4 vCPU / 4~8 GB
+
+Collector EC2
+4 vCPU / 8 GB
+        ↓
+8 vCPU / 16 GB
+```
+
+Airflow 자원을 불필요하게 같이 증가시킬 필요가 없다.
+
+### 장점 3. 배포 경계가 명확함
+
+```text
+Airflow 변경
+→ Airflow EC2 배포
+
+Collector 변경
+→ Collector EC2 배포
+```
+
+역할별 운영과 장애 분석이 명확하다.
+
+### 단점 1. Airflow 전용 EC2의 자원 활용률이 낮을 수 있음
+
+Airflow는 주로 스케줄링과 상태 관리를 담당하므로 현재 프로젝트 규모에서는 전용 EC2의 CPU가 상당 시간 idle일 수 있다.
+
+### 단점 2. 원격 실행 계층이 추가됨
+
+Airflow가 다른 EC2의 Collector를 실행해야 하므로 다음과 같은 연결 방식이 필요하다.
+
+```text
+Airflow EC2
+→ SSM 또는 SSH
 → Collector EC2
-→ S3 Bronze/Silver
 ```
 
-따라서 로컬에서 `BashOperator`로 Collector를 실행하는 것은 SSM 연동 전에 Collector CLI와 DAG 계약을 빠르게 검증하기 위한 테스트 방법일 뿐, 최종 운영 연결 방식이 아니다.
+이 때문에 IAM, SSM Agent 또는 SSH Key와 같은 추가 운영 요소가 생긴다.
 
 ---
 
-## 14. Airflow EC2 → Collector EC2 실행 상세
+## 5. EC2 3대 구성의 장단점
 
-Airflow DAG는 AWS SDK 또는 Airflow AWS Provider를 통해 SSM Run Command를 요청한다.
+### 장점 1. Airflow ↔ Collector 실행이 단순함
 
-논리 흐름은 다음과 같다.
+같은 EC2이므로 원격 실행 계층이 필요 없다.
 
 ```text
-1. Airflow DAG Run 시작
-2. 논리 run_id 결정
-3. source 결정
-4. SSM SendCommand 호출
-5. Collector EC2에서 collector CLI 실행
-6. SSM command_id 반환
-7. Airflow가 command 상태 polling
-8. Success / Failed / TimedOut 확인
-9. Airflow Task 상태 결정
-10. 성공한 경우 downstream 실행
+Airflow
+→ BashOperator / local subprocess
+→ Collector CLI
 ```
 
-예시 명령은 다음과 같다.
+따라서 다음 요소가 필요하지 않다.
+
+```text
+SSM SendCommand
+SSM command_id polling
+SSH connection
+SSH private key
+원격 접속용 Security Group 설정
+```
+
+### 장점 2. 자원 활용률을 높일 수 있음
+
+Airflow는 지속적으로 무거운 연산을 하지 않고, Collector도 5분 주기로 일정 시간 동안 실행되는 batch workload다.
+
+예:
+
+```text
+09:00 Collector 시작
+09:00 ~ 09:01 수집/처리
+09:01 ~ 09:05 Collector idle
+
+Airflow Scheduler는 계속 실행
+```
+
+이 경우 Airflow와 Collector를 서로 다른 작은 EC2 두 대에 두는 것보다 하나의 EC2에서 CPU와 Memory를 공유하는 편이 효율적일 수 있다.
+
+### 장점 3. 운영 복잡도가 감소함
+
+```text
+EC2 관리 대수
+4 → 3
+
+Airflow ↔ Collector 원격 통신
+제거
+```
+
+즉 EC2 한 대만 줄어드는 것이 아니라 Airflow와 Collector 사이의 원격 실행 계층도 함께 사라진다.
+
+### 단점 1. 장애 격리가 약해짐
+
+Collector가 과도한 Memory를 사용하면 같은 EC2에서 실행 중인 Airflow Scheduler에도 영향을 줄 수 있다.
+
+```text
+Collector Memory 급증
+    ↓
+EC2 Memory Pressure
+    ↓
+Airflow Scheduler 영향 가능
+```
+
+EC2 자체에 장애가 발생하면 다음 두 컴포넌트가 동시에 중단된다.
+
+```text
+Airflow
++
+Collector
+```
+
+### 단점 2. 자원을 독립적으로 조절하기 어려움
+
+Collector 부하 때문에 EC2를 확장하면 Airflow가 사용하는 자원까지 함께 증가한다.
+
+```text
+Airflow + Collector EC2
+4 vCPU / 8 GB
+        ↓
+8 vCPU / 16 GB
+```
+
+### 3대 구성을 사용해도 코드와 환경은 분리
+
+같은 EC2에 배치한다고 해서 Airflow와 Collector를 하나의 Python project로 합치지 않는다.
+
+```text
+/app/project/
+
+├── airflow/
+│   ├── pyproject.toml
+│   ├── uv.lock
+│   └── .venv
+│
+└── collector/
+    ├── pyproject.toml
+    ├── uv.lock
+    └── .venv
+```
+
+즉 다음 원칙을 유지한다.
+
+```text
+물리적 배치
+Airflow + Collector = 같은 EC2
+
+논리적 구조
+Airflow ≠ Collector
+```
+
+이렇게 하면 나중에 EC2를 4대로 다시 분리해도 Collector 애플리케이션 자체는 그대로 유지할 수 있다.
+
+---
+
+## 6. EC2 3대일 때 Airflow와 Collector 실행 방식
+
+3대 구성에서는 Airflow와 Collector가 같은 EC2에 있으므로 **BashOperator 또는 local subprocess 방식**을 사용한다.
+
+### 구조
+
+```text
+┌──────────────────────────────────┐
+│              EC2 #1              │
+│                                  │
+│  Airflow Scheduler               │
+│         │                        │
+│         │ BashOperator           │
+│         ▼                        │
+│  Collector CLI                   │
+│                                  │
+└──────────────────────────────────┘
+```
+
+Airflow는 Collector의 Python 함수를 직접 import하기보다 독립된 CLI를 호출한다.
 
 ```bash
 cd /app/DE_team2-GangnamguUmBokDong/collector
 uv run python main.py \
   --source bike \
-  --run-id 20260812T194000
+  --run-id 20260813T090000
 ```
 
-Collector EC2에는 배포된 Git repository와 `collector` 전용 uv 환경이 존재한다고 가정한다.
+### 직접 import 대신 CLI를 사용하는 이유
+
+같은 EC2에 있더라도 두 애플리케이션의 dependency를 분리하기 위해서다.
+
+```text
+Airflow Environment
+        │
+        │ shell command
+        ▼
+Collector Environment
+```
+
+Collector dependency가 변경되어도 Airflow 환경에 직접 영향을 주지 않는다.
+
+### 성공/실패 전달
+
+Collector process의 exit code를 Airflow가 직접 확인한다.
+
+```text
+Collector exit 0
+→ BashOperator success
+→ Airflow Task success
+
+Collector exit != 0
+→ BashOperator failure
+→ Airflow Task failure/retry
+```
+
+### 3대 구성의 핵심 장점
+
+원격 실행 계층 없이 다음 구조만으로 동작한다.
+
+```text
+Airflow Scheduler
+→ Collector CLI
+→ exit code
+→ Airflow Task 상태
+```
+
+현재 프로젝트 규모에서 구현과 운영이 가장 단순한 방식이다.
 
 ---
 
-## 15. AWS 권장 전체 실행 구조
+## 7. EC2 4대일 때 Airflow와 Collector 실행 방식
 
-```text
-                         ┌──────────────────────┐
-                         │      Airflow EC2     │
-                         │                      │
-                         │ Scheduler / DAG      │
-                         │ Dependency / Retry   │
-                         └──────┬───────┬───────┘
-                                │       │
-                         SSM    │       │ EMR Job API
-                                │       │
-                ┌───────────────┘       └──────────────┐
-                ▼                                      ▼
-       ┌──────────────────┐                   ┌──────────────────┐
-       │   Collector EC2  │                   │       EMR        │
-       │                  │                   │                  │
-       │ API Collection   │                   │ Feature Mart     │
-       │ Transform / QC   │                   │ Model Training   │
-       └────────┬─────────┘                   └────────┬─────────┘
-                │                                      │
-                ▼                                      ▼
-       ┌──────────────────┐                   ┌──────────────────┐
-       │ S3 Bronze/Silver │◀─────────────────▶│ S3 Mart / Models │
-       └────────┬─────────┘                   └────────┬─────────┘
-                │                                      │
-                └──────────────┐             ┌─────────┘
-                               ▼             ▼
-                         ┌──────────────────┐
-                         │  Inference EC2   │
-                         │                  │
-                         │ Model Load       │
-                         │ Prediction       │
-                         └────────┬─────────┘
-                                  │
-                                  ▼
-                            ┌─────────────┐
-                            │  Gold RDS   │
-                            └──────┬──────┘
-                                   │
-                                   ▼
-                            ┌─────────────┐
-                            │ Backend EC2 │
-                            │   FastAPI   │
-                            └──────┬──────┘
-                                   │
-                                   ▼
-                                Client
-```
+4대 구성에서는 Airflow와 Collector가 서로 다른 EC2에 있으므로 원격 실행 방식이 필요하다.
 
-이 구조에서 컴퓨팅 역할은 다음처럼 고정한다.
+주요 후보는 다음 두 가지다.
 
-| 컴포넌트 | 역할 |
-| --- | --- |
-| Airflow EC2 | 전체 워크플로 오케스트레이션 |
-| Collector EC2 | 외부 API 수집, Bronze/Silver 생성 |
-| Inference EC2 | 주기적 모델 추론 및 Gold 생성 |
-| EMR | Feature Mart 생성, 모델 학습, 대규모 Batch |
-| S3 Bronze | 원본 API 응답 보존 |
-| S3 Silver | 정제·검증된 장기 데이터 |
-| S3 Mart/Models | 학습 Feature와 모델 Artifact |
-| RDS Gold | 서비스용 최신 예측·재배치 결과 |
-| Backend EC2 | FastAPI 기반 Gold 조회·제공 |
+1. SSHOperator
+2. AWS Systems Manager(SSM) Run Command
 
 ---
 
-## 16. Airflow가 각 컴퓨팅 자원을 호출하는 방식
+## 7.1 SSHOperator 방식
 
-Airflow는 컴포넌트별로 실행 방식을 구분한다.
+### 구조
 
 ```text
+Airflow EC2
+    │
+    │ SSH
+    │ TCP 22
+    ▼
 Collector EC2
-Airflow → SSM Run Command → Collector CLI
-
-Inference EC2
-Airflow → SSM Run Command → Predict CLI
-
-EMR
-Airflow → EMR Step / Job 제출 → 상태 Sensor/확인
-
-Gold RDS
-Airflow가 직접 데이터를 생성하지 않음
-Inference EC2가 결과를 Write
-
-Backend EC2
-상시 서비스 프로세스이므로 일반적인 주기 DAG에서 실행하지 않음
+    │
+    ▼
+Collector CLI
 ```
 
-Airflow가 모든 컴퓨팅의 코드를 직접 실행하는 것이 아니라 각 실행 환경에 **명령 또는 Job을 제출하고 완료 상태를 관찰**하는 형태로 통일한다.
+Airflow가 Collector EC2에 직접 SSH 로그인한 뒤 명령을 실행한다.
+
+```text
+Airflow
+→ SSH connection
+→ cd collector
+→ uv run python main.py ...
+→ remote process exit code
+→ Airflow Task 상태
+```
+
+### 장점
+
+- 구현이 단순하다.
+- Airflow의 `SSHOperator`를 바로 사용할 수 있다.
+- 원격 프로세스의 stdout/stderr를 확인하기 쉽다.
+- 원격 명령의 exit code를 Airflow Task 성공/실패와 직접 연결하기 쉽다.
+- 빠른 PoC에 적합하다.
+
+### 단점
+
+- Airflow가 Collector에 로그인하기 위한 SSH credential이 필요하다.
+- SSH private key를 안전하게 저장하고 관리해야 한다.
+- Collector EC2의 22번 포트를 Airflow EC2에서 접근 가능하도록 열어야 한다.
+- Security Group, SSH User, known_hosts, host/IP 등을 관리해야 한다.
+- SSH key 유출 및 key rotation을 고려해야 한다.
+
+### SSH Key가 필요한 이유
+
+SSH는 Airflow가 Collector EC2에 **직접 로그인하는 방식**이기 때문이다.
+
+```text
+Airflow EC2
+   │
+   │ private key로 인증
+   ▼
+Collector EC2 SSH Server
+```
+
+따라서 서버 접근 Credential 관리가 필요하다.
 
 ---
 
-## 15. AWS 권장 구조
+## 7.2 AWS SSM Run Command 방식
+
+### 구조
 
 ```text
-┌──────────────────────────────────────┐
-│              Airflow EC2            │
-│                                      │
-│ Scheduler                            │
-│ DAG                                  │
-│ Retry / Dependency                   │
-└──────────────────┬───────────────────┘
-                   │
-                   │ SSM Run Command
-                   ▼
-┌──────────────────────────────────────┐
-│          Collection EC2             │
-│                                      │
-│ Git Repository                       │
-│ collector/.venv                      │
-│                                      │
-│ uv run python main.py                │
-└──────────────┬───────────┬───────────┘
-               │           │
-               │           │
-               ▼           ▼
-          External API    S3
-                       ┌────────┐
-                       │ Bronze │
-                       └────────┘
-                           │
-                           ▼
-                       ┌────────┐
-                       │ Silver │
-                       └────────┘
+Airflow EC2
+    │
+    │ IAM Role
+    │ ssm:SendCommand
+    ▼
+AWS Systems Manager
+    │
+    ▼
+Collector EC2 SSM Agent
+    │
+    ▼
+Collector CLI
 ```
 
-Collector 종료 후 Airflow는 SSM Command 상태를 확인한다.
+Airflow가 Collector 서버에 직접 로그인하는 것이 아니라 AWS Systems Manager에 명령 실행을 요청한다.
 
 ```text
-Pending
-  ↓
-InProgress
-  ↓
-Success / Failed / TimedOut
-```
-
-`Success`일 때만 downstream Task를 실행한다.
-
----
-
-## 16. Airflow에서 SSM을 사용할 때의 논리 흐름
-
-```text
-1. DAG 시작
-2. run_id 생성
-3. SSM SendCommand 호출
-4. Collection EC2에서 Collector 실행
-5. command_id 반환
-6. Airflow가 command status 확인
-7. Collector exit 0 → SSM Success
-8. Collector exit != 0 → SSM Failed
-9. Airflow Task 성공/실패 판정
-10. 성공 시 다음 Task 실행
-```
-
-의사코드로 표현하면 다음과 같다.
-
-```python
-command_id = ssm.send_command(
-    instance_id=COLLECTOR_INSTANCE_ID,
-    command=(
-        "cd /app/DE_team2-GangnamguUmBokDong/collector && "
-        "uv run python main.py "
-        f"--source bike --run-id {run_id}"
-    ),
-)
-
-status = wait_for_ssm_command(command_id)
-
-if status != "Success":
-    raise AirflowException(f"collector failed: {status}")
-```
-
-실제 구현 시 SSM 호출과 polling 로직은 별도 공통 함수 또는 Operator로 분리하는 것이 좋다.
-
----
-
-## 17. Airflow와 Collector 사이에 전달하지 말아야 할 것
-
-Airflow XCom으로 실제 수집 데이터를 전달하지 않는다.
-
-잘못된 구조:
-
-```text
-Collector
-   ↓
-수천~수만 row JSON
-   ↓
-XCom
-   ↓
-다음 Task
-```
-
-권장 구조:
-
-```text
-Collector
-   ↓
-S3 Bronze / Silver
-
-Airflow XCom
-   ↓
-run_id
-S3 key
-row count
-status 같은 작은 metadata만 전달
-```
-
-데이터 전달은 S3를 사용하고, Airflow는 제어 정보만 전달한다.
-
----
-
-## 18. 보안과 설정값 관리
-
-Airflow DAG 코드에 API Key, AWS Access Key, SSH Key 등을 직접 적지 않는다.
-
-로컬에서는 `.env`를 사용하고, 운영 환경에서는 IAM Role / Airflow Connection / AWS Secrets Manager 등의 방식으로 분리한다.
-
-특히 AWS에서는 가능하면 다음처럼 구성한다.
-
-```text
-Airflow EC2 IAM Role
-└─ ssm:SendCommand
-└─ ssm:GetCommandInvocation
-
-Collection EC2 IAM Role
-└─ S3 Bronze/Silver Write
-└─ 필요한 Secret Read
-```
-
-즉 Airflow가 S3에 직접 모든 데이터를 쓰는 권한을 갖기보다 각 컴포넌트가 필요한 최소 권한만 가진다.
-
----
-
-## 19. 장애 시 동작
-
-### Collector 내부 API 실패
-
-```text
-API 실패
-  ↓
-Collector page retry
-  ↓
-최대 3회 실패
-  ↓
-Collector exit 1
-  ↓
-Airflow Task failure
-  ↓
-Airflow Task retry
-```
-
-재시도 시 `attempt_no`가 증가한 Bronze 원본은 별도 객체로 남긴다.
-
-### Airflow 장애
-
-Airflow 자체가 잠시 중단되더라도 이미 S3에 저장된 Bronze/Silver는 유지된다. Airflow 복구 후 동일 `run_id`를 기준으로 재처리할 수 있어야 한다.
-
----
-
-## 20. 구현 순서
-
-AWS 운영 구조를 최종 목표로 두되, 실행 인터페이스부터 작은 단위로 검증한다.
-
-### 1단계 — Collector CLI 확정
-
-```text
-uv run python main.py --source bike --run-id ...
-```
-
-Collector EC2에서 Airflow 없이 단독으로 실행 가능해야 한다.
-
-### 2단계 — Airflow EC2 → Collector EC2 SSM 연결
-
-```text
-Airflow DAG
+Airflow
 → SSM SendCommand
-→ Collector EC2
-→ collector CLI
-→ S3 Bronze/Silver
+→ command_id
+→ Collector EC2에서 CLI 실행
+→ SSM Command Status
+→ Airflow Task 상태
 ```
 
-여기까지가 Airflow-Collector 연동의 첫 번째 완료 기준이다.
+### 장점
 
-### 3단계 — 실패/재시도/로그 연결
+- SSH private key가 필요 없다.
+- Collector EC2의 inbound 22번 포트를 열 필요가 없다.
+- IAM Role과 IAM Policy로 실행 권한을 관리할 수 있다.
+- `command_id`를 통해 원격 명령 실행 상태를 추적할 수 있다.
+- EC2 IP가 변경되어도 Instance ID 또는 tag 기반으로 대상을 지정할 수 있다.
+- AWS 내부 운영 방식과 자연스럽게 결합된다.
+
+### 단점
+
+- SSH보다 초기 설정이 많다.
+- Collector EC2가 SSM managed node로 동작해야 한다.
+- SSM Agent와 필요한 IAM Role을 설정해야 한다.
+- `SendCommand` 이후 작업이 완료될 때까지 command status를 확인하는 polling 로직이 필요하다.
+
+### SSM에서 SSH Key가 필요 없는 이유
+
+SSM은 서버 로그인 방식이 아니다.
 
 ```text
-Collector page retry
-Collector exit code
-SSM command status
-Airflow task retry
-run_id
-structured log
+Airflow EC2
+   │
+   │ IAM Role
+   ▼
+AWS Systems Manager
+   │
+   ▼
+Collector EC2 SSM Agent
 ```
 
-을 연결한다.
+AWS IAM이 Airflow EC2가 특정 Collector EC2에 명령을 실행할 권한이 있는지를 판단한다.
 
-### 4단계 — Inference EC2 연결
+따라서 다음 정보를 Airflow 서버에 저장하지 않아도 된다.
 
 ```text
-Collection 완료
-→ Airflow
-→ SSM
-→ Inference EC2
-→ S3 Silver 조회
-→ Gold RDS Write
+.pem private key
+SSH password
+SSH login credential
 ```
-
-### 5단계 — EMR Feature Mart 연결
-
-```text
-Airflow
-→ EMR Job
-→ S3 Silver
-→ Feature Mart
-→ S3
-```
-
-### 6단계 — EMR Model Training 연결
-
-```text
-Airflow
-→ EMR Training Job
-→ Feature Mart
-→ Model Artifact
-→ S3 Models
-```
-
-### 7단계 — End-to-End 운영 검증
-
-```text
-External API
-→ Collector EC2
-→ S3 Bronze/Silver
-→ Inference EC2
-→ RDS Gold
-→ Backend EC2
-→ Client
-
-S3 Silver
-→ EMR Feature Mart
-→ EMR Training
-→ S3 Model
-→ Inference EC2
-```
-
-전체 경로를 Airflow에서 관찰할 수 있도록 한다.
 
 ---
 
-## 21. 최종 권장안
+## 8. SSH와 SSM 상세 비교
 
-우리 프로젝트의 기준 아키텍처는 **AWS에서 컴포넌트를 역할별로 분리한 구조**다.
+### 8.1 구현 난이도
+
+| 항목 | SSHOperator | SSM Run Command |
+| --- | --- | --- |
+| 초기 구현 난이도 | **낮음** | 중간 |
+| 이유 | SSH Connection과 command 설정으로 바로 실행 가능 | IAM, SSM Agent, SendCommand, status polling 필요 |
+| 별도 Worker/API 서버 | 불필요 | 불필요 |
+
+PoC 관점에서는 SSH가 더 빠르다.
 
 ```text
-Airflow EC2
-    │
-    ├─ SSM → Collector EC2
-    │            │
-    │            ├─ External API
-    │            ├─ S3 Bronze
-    │            └─ S3 Silver
-    │
-    ├─ SSM → Inference EC2
-    │            │
-    │            ├─ S3 Silver 조회
-    │            ├─ S3 Model 조회
-    │            └─ RDS Gold Write
-    │
-    └─ EMR Job → Feature Mart / Model Training
-                 │
-                 ├─ S3 Silver Read
-                 └─ S3 Mart / Model Write
-
-RDS Gold
-    │
-    ▼
-Backend EC2 (FastAPI)
-    │
-    ▼
-Client
+SSH
+Airflow → SSHOperator → command
 ```
 
-최종적으로 기억해야 할 경계는 다음과 같다.
+SSM은 다음 준비 과정이 추가된다.
+
+```text
+IAM Role
+→ SSM Agent
+→ Managed Node
+→ SendCommand
+→ command_id
+→ status polling
+```
+
+---
+
+### 8.2 인증과 Credential
+
+| 항목 | SSHOperator | SSM Run Command |
+| --- | --- | --- |
+| 인증 방식 | SSH Private Key / Password | **AWS IAM Role** |
+| 장기 Key 관리 | **필요** | 불필요 |
+| Key rotation | 고려 필요 | SSH Key rotation 불필요 |
+| AWS IAM 통합 | 제한적 | **매우 자연스러움** |
+
+SSM은 IAM 기반이므로 Airflow EC2에 장기 SSH private key를 저장하지 않는다는 장점이 있다.
+
+---
+
+### 8.3 네트워크와 보안
+
+| 항목 | SSHOperator | SSM Run Command |
+| --- | --- | --- |
+| Collector inbound port | **22 필요** | **불필요** |
+| Airflow → Collector 직접 TCP 연결 | 필요 | 불필요 |
+| Security Group SSH 규칙 | 필요 | 불필요 |
+| Private subnet 배치 | 가능 | **더 자연스러움** |
+
+SSH:
 
 ```text
 Airflow EC2
-= Schedule + Dependency + Task Retry + Monitoring
-
+   │
+   │ TCP 22
+   ▼
 Collector EC2
-= API + Page Retry + Bronze + Transform + Validation + Silver
-
-Inference EC2
-= 최신 Silver + Model → Prediction → Gold
-
-EMR
-= 장기 Silver → Feature Mart → Training
-
-S3
-= Bronze / Silver / Feature Mart / Model Artifact 저장 계층
-
-RDS Gold
-= 서비스용 결과 저장소
-
-Backend EC2
-= Gold 조회 및 API Serving
 ```
 
-Airflow와 Collector 사이의 핵심 실행 계약은 다음이다.
+SSM:
 
 ```text
-run_id
-+ source
-+ SSM command_id
-+ process exit code
-+ structured log
+Airflow EC2 → AWS SSM
+Collector EC2 SSM Agent → AWS SSM
 ```
 
-그리고 데이터는 Airflow를 통과하지 않는다.
+SSM에서는 Airflow가 Collector의 SSH Port로 직접 접근하지 않는다.
+
+---
+
+### 8.4 작업 완료 상태 확인
+
+| 항목 | SSHOperator | SSM Run Command |
+| --- | --- | --- |
+| 실행 시작 | SSH command 실행 | `SendCommand` |
+| 실행 식별자 | SSH Task 자체 | `command_id` |
+| 완료 확인 | 원격 process exit code | SSM Command Status |
+| 상태 확인 난이도 | **매우 낮음** | 낮음~중간 |
+
+SSH는 원격 프로세스가 끝나면 바로 exit code를 받을 수 있다.
 
 ```text
-Control Plane
-Airflow → SSM / EMR Job
-
-Data Plane
-External API → Collector → S3
-S3 → Inference / EMR
-Inference → RDS Gold
-RDS Gold → Backend API
+command
+→ exit 0 / exit 1
+→ Airflow success / failure
 ```
 
-이 구분을 유지하면 각 컴퓨팅 리소스가 독립적으로 장애·확장될 수 있고, 향후 AWS 자원 할당이 줄어들어 일부 EC2 역할을 합치더라도 애플리케이션의 책임 경계와 실행 인터페이스는 그대로 유지할 수 있다.
+SSM은 다음 과정을 거친다.
+
+```text
+SendCommand
+→ command_id
+→ Pending
+→ InProgress
+→ Success / Failed / TimedOut
+→ Airflow success / failure
+```
+
+따라서 상태 확인 자체는 둘 다 가능하지만 SSH가 더 직접적이고, SSM은 한 단계의 상태 조회가 추가된다.
+
+---
+
+### 8.5 운영 복잡도
+
+| 운영 요소 | SSHOperator | SSM Run Command |
+| --- | --- | --- |
+| SSH private key | 관리 필요 | 불필요 |
+| SSH User | 관리 필요 | 불필요 |
+| known_hosts | 관리 필요 | 불필요 |
+| Port 22 | 관리 필요 | 불필요 |
+| IAM Policy | 일부 필요 가능 | **필수** |
+| SSM Agent | 불필요 | **필수** |
+| command status polling | 불필요 | 필요 |
+
+즉 다음과 같은 차이가 있다.
+
+```text
+SSH
+초기 구현은 단순
+→ 운영하면서 Key / User / Port / Host 관리 필요
+
+SSM
+초기 설정은 조금 복잡
+→ 이후 IAM과 AWS API 중심으로 운영
+```
+
+---
+
+### 8.6 최종 비교
+
+| 평가 항목 | SSHOperator | SSM Run Command |
+| --- | --- | --- |
+| 초기 구현 속도 | **매우 좋음** | 좋음 |
+| 구현 난이도 | **낮음** | 중간 |
+| SSH Key 관리 | 필요 | **불필요** |
+| Inbound 22번 Port | 필요 | **불필요** |
+| IAM 기반 권한 관리 | 보통 | **매우 좋음** |
+| 실행 완료 추적 | **매우 쉬움** | 좋음 |
+| 장기 운영 보안 | 보통 | **좋음** |
+| AWS 환경 적합성 | 좋음 | **매우 좋음** |
+| PoC 적합성 | **매우 높음** | 높음 |
+| 현재 프로젝트 운영 적합성 | 높음 | **매우 높음** |
+
+4 EC2 구조를 선택한다면 최종 우선순위는 다음과 같다.
+
+```text
+1순위: AWS SSM Run Command
+2순위: SSHOperator
+```
+
+SSH는 구현이 더 빠르지만, AWS 운영 환경에서는 **SSH Key와 inbound 22번 포트를 별도로 관리하지 않고 IAM 기반으로 권한과 실행 상태를 관리할 수 있다는 점에서 SSM을 기본 방식으로 선택한다.**
+
+---
+
+## 9. 최종 판단
+
+### EC2 자원이 충분한 경우
+
+```text
+EC2 #1 Airflow
+EC2 #2 Collector
+EC2 #3 Inference
+EC2 #4 Backend
+```
+
+Airflow와 Collector를 물리적으로 분리한다.
+
+```text
+Airflow EC2
+    │
+    │ SSM Run Command
+    ▼
+Collector EC2
+```
+
+장애 격리와 독립 Scaling이 가장 중요할 때 적합하다.
+
+### 현재 규모에서 자원 효율과 단순성을 우선하는 경우
+
+```text
+EC2 #1 Airflow + Collector
+EC2 #2 Inference
+EC2 #3 Backend
+```
+
+Airflow와 Collector를 같은 EC2에 배치한다.
+
+```text
+Airflow
+    │
+    │ BashOperator / local subprocess
+    ▼
+Collector CLI
+```
+
+현재 프로젝트 규모에서는 이 구조가 자원 효율과 구현 단순성 측면에서 더 현실적인 선택일 수 있다.
+
+### 공통 원칙
+
+3대 또는 4대 중 어떤 구성을 선택하더라도 Airflow와 Collector의 **논리적 책임과 코드 환경은 분리**한다.
+
+```text
+Airflow
+= Schedule / Dependency / Retry / Monitoring
+
+Collector
+= 실제 데이터 수집 작업
+```
+
+따라서 물리적 배치는 자원 상황에 따라 변경할 수 있다.
+
+```text
+현재 3 EC2
+Airflow + Collector
+        │
+        │ 필요 시 분리
+        ▼
+
+향후 4 EC2
+Airflow EC2
+    │
+    │ SSM
+    ▼
+Collector EC2
+```
+
+즉 **애플리케이션은 논리적으로 분리하고, 물리적 EC2 배치만 현재 자원 규모와 운영 요구사항에 맞게 선택한다.**
