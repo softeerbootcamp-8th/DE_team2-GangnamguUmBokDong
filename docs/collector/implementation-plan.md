@@ -337,9 +337,15 @@ columns:
        → ③ 범위·enum 판정
 ```
 
+**엔진이 정책에 넘기는 `value`는 `kind`에 따라 다르다** — `MISSING`이면 정규화된
+`None`, `TYPE_ERROR`면 캐스팅에 실패한 원시값, `OUTLIER`면 캐스팅에 성공한 값이다.
+캐스팅 전 원시값은 언제나 `Issue.raw_value`에 남는다.
+
 `types`는 "이 타입으로 해석 가능해야 한다"는 뜻이다. 서울 API는 숫자도 문자열로 주므로, 해석에 성공하면 **캐스팅된 값이 silver에 들어간다**(정규화 겸용). 실패하면 `TYPE_ERROR`로 판정한다.
 
 판정 결과는 `Issue(column, kind, required, raw_value, spec)`이고, `kind`는 `MISSING | TYPE_ERROR | OUTLIER` 중 하나다. 이 타입들은 `validation/types.py`에 모아 둔다. registry · policies · engine · loader 네 곳이 공유하는 어휘이므로 레지스트리와 분리한다.
+이 `Issue`는 집계용 기록이 아니라 **컬럼 정책의 두 번째 인자로 그대로 전달된다.**
+정책이 `issue.kind`를 볼 수 있어야 교정형 정책이 캐스팅 실패 값을 방어할 수 있다.
 
 ### TYPE_ERROR의 디스패치
 
@@ -349,7 +355,11 @@ columns:
 
 - missing 계열로 보내면 깨진다. `optional_missing`의 기본값 `keep_null`은 값을 그대로 두는 정책이고, 캐스팅 실패 값은 원본 문자열이다. silver 스키마가 config `types`로 고정된 상태에서 `"31.6xyz"`를 int 컬럼에 쓸 수 없다. outlier 계열은 `optional_outlier`가 `set_null`이라 자연히 정리된다.
 - 오버라이드를 제외하는 이유는 `clip_to_range` · `fill_zero`처럼 값을 교정하는 정책이 **캐스팅되지 않은 값에는 적용 자체가 불가능**하기 때문이다. `on_outlier`는 "타입은 맞지만 범위를 벗어난 값"을 겨냥한 설정이다.
-- 4분면 기본값 자체가 교정형인 경우가 남는다. 교정형 정책이 해석 불가능한 값을 받으면 `(None, Action.KEEP)`을 반환해 방어한다. `set_null`과 같은 효과가 되므로 규칙을 늘리지 않는다.
+- 4분면 기본값 자체가 교정형인 경우가 남는다. 교정형 정책은 `issue.kind`가 `TYPE_ERROR`이면
+`(None, Action.KEEP)`을 반환해 방어한다. `set_null`과 같은 효과가 되므로 규칙을 늘리지 않는다.
+값의 타입을 다시 검사하지 않고 `kind`를 보는 이유는, 엔진이 이미 수행한 캐스팅 판정을
+정책이 되짚으면 두 곳의 기준이 어긋날 수 있기 때문이다. `clip_to_range`는 같은 가드로
+결측값과 `range` 미선언 컬럼까지 함께 막는다.
 
 `column_issues` 집계에는 `type_error`를 **별도 항목으로 유지한다.** 디스패치는 outlier와 합치지만 집계는 구분해야 원인을 추적할 수 있다.
 
@@ -362,9 +372,17 @@ class Action(Enum):
     FAIL_BATCH = "fail_batch"  # 배치 전체 실패
 
 @policy("clip_to_range")
-def clip_to_range(value: Any, spec: ColumnSpec, row: dict, ctx: RunContext) -> tuple[Any, Action]:
+def clip_to_range(value: Any, issue: Issue, row: dict, ctx: RunContext) -> tuple[Any, Action]:
     """값을 정상 범위의 경계로 잘라낸다."""
-    return min(max(value, spec.range.min), spec.range.max), Action.KEEP
+    bounds = issue.spec.range
+    if (
+        issue.kind is not IssueKind.OUTLIER
+        or bounds is None
+        or bounds.min is None
+        or bounds.max is None
+    ):
+        return None, Action.KEEP          # 캐스팅 실패 · 결측 · range 미선언 · 부분 range를 함께 막는다
+    return min(max(value, bounds.min), bounds.max), Action.KEEP
 ```
 
 **초기 컬럼 정책 함수** (소스 무관, 전부 `validation/policies.py`)

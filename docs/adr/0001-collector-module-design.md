@@ -164,7 +164,8 @@ silver에 `_row_status`(ok·repaired) 컬럼 하나만 추가하고 이슈 상�
 정책 함수가 컬럼마다 다르고 행 전체도 봐야 하므로 pandas 벡터화와는 맞지 않는다.
 
 ## 결정
-행을 dict로 순회하며 정책 함수에 `(value, spec, row, ctx)`를 넘긴다.
+행을 dict로 순회하며 정책 함수에 `(value, issue, row, ctx)`를 넘긴다. `Issue`가 컬럼 스펙을
+품고 있어(`issue.spec`) 인자 개수는 그대로이고, 정책은 `issue.kind`로 자신이 왜 호출됐는지 안다.
 
 ## 결과
 정책 함수가 단순해진다. 현재 데이터 규모에서는 성능도 충분하다.

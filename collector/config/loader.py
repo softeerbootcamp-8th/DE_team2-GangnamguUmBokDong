@@ -1,8 +1,5 @@
 """YAML 로드 + 스키마 검증 + 정책 이름 존재 검증 + SHA-256 해시.
 
-구현 예정: docs/collector/implementation-issues.md #2
-설계 근거: docs/collector/implementation-plan.md 4절 (config 스키마)
-
 ## 이 모듈의 역할
 
 `sources/{source_id}.yaml` 한 개를 읽어 **검증이 끝난** `SourceConfig`로 바꾸는 단일
@@ -54,9 +51,10 @@
 
 ## 주의
 
-- 레지스트리는 데코레이터가 실행돼야 채워진다. `validation.policies`가 import되지
-  않은 상태에서 2 · 3단계를 돌리면 **모든** 이름이 "미등록"으로 실패한다. import 시점
-  의존성을 loader 안에서 명시적으로 보장한다.
+- 레지스트리는 데코레이터가 실행돼야 채워진다. 이 보장은 loader가 아니라
+  `validation/__init__.py`가 맡는다 — 패키지를 import하면 `policies`가 함께 로드되므로
+  레지스트리가 비어 있는 상태가 존재하지 않는다. loader는 `validation.registry`의 조회
+  함수를 그냥 부르면 된다.
 - 에러 메시지 품질이 이 모듈의 기능이다. 어느 파일 · 어느 컬럼 · 어떤 이름이
   틀렸는지와 **등록된 이름 목록**을 함께 보여준다. 고치는 주체는 사람이다.
 - `config_version`은 manifest에 기록되어 "이 silver가 어떤 정책으로 만들어졌는지"를
