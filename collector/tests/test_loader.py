@@ -79,3 +79,49 @@ class TestLoadStructuralFailure:
         base_dir = _write(tmp_path, "test_source", broken)
         with pytest.raises(Exception):  # pydantic ValidationError
             load("test_source", base_dir=base_dir)
+
+
+class TestLoadPolicyNameValidation:
+    def test_unknown_quadrant_policy_raises(self, tmp_path):
+        broken = VALID_YAML.replace("required_missing: drop_row", "required_missing: drp_row")
+        base_dir = _write(tmp_path, "test_source", broken)
+        with pytest.raises(ConfigError, match="drp_row"):
+            load("test_source", base_dir=base_dir)
+
+    def test_unknown_column_override_raises(self, tmp_path):
+        broken = VALID_YAML.replace(
+            "    required: true\n", "    required: true\n    on_outlier: clip_to_rnge\n"
+        )
+        base_dir = _write(tmp_path, "test_source", broken)
+        with pytest.raises(ConfigError, match="clip_to_rnge"):
+            load("test_source", base_dir=base_dir)
+
+    def test_unknown_row_policy_raises(self, tmp_path):
+        broken = VALID_YAML.replace(
+            "  optional_outlier: set_null\n",
+            "  optional_outlier: set_null\n  row: drp_if_any_required_issue\n",
+        )
+        base_dir = _write(tmp_path, "test_source", broken)
+        with pytest.raises(ConfigError, match="drp_if_any_required_issue"):
+            load("test_source", base_dir=base_dir)
+
+    def test_null_row_policy_skips_validation(self, tmp_path):
+        base_dir = _write(tmp_path, "test_source", VALID_YAML)
+        config = load("test_source", base_dir=base_dir)
+        assert config.policies.row is None
+
+    def test_multiple_policy_errors_all_reported(self, tmp_path):
+        broken = VALID_YAML.replace(
+            "required_missing: drop_row", "required_missing: drp_row"
+        ).replace("required_outlier: drop_row", "required_outlier: drp_row2")
+        base_dir = _write(tmp_path, "test_source", broken)
+        with pytest.raises(ConfigError) as exc_info:
+            load("test_source", base_dir=base_dir)
+        assert "drp_row" in str(exc_info.value)
+        assert "drp_row2" in str(exc_info.value)
+
+    def test_error_message_lists_registered_names(self, tmp_path):
+        broken = VALID_YAML.replace("required_missing: drop_row", "required_missing: drp_row")
+        base_dir = _write(tmp_path, "test_source", broken)
+        with pytest.raises(ConfigError, match="keep_null"):
+            load("test_source", base_dir=base_dir)

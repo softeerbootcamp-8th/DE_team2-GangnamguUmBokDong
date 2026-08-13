@@ -71,6 +71,12 @@ from pathlib import Path
 import yaml
 
 from config.schema import SourceConfig
+from validation.registry import (
+    is_policy_registered,
+    is_row_policy_registered,
+    policy_names,
+    row_policy_names,
+)
 
 
 class ConfigError(ValueError):
@@ -85,9 +91,46 @@ def load(source_id: str, base_dir: Path = Path("sources")) -> SourceConfig:
     raw = yaml.safe_load(raw_bytes)
     config = SourceConfig.model_validate(raw)
 
+    errors: list[str] = []
     if config.source_id != source_id:
-        raise ConfigError(
+        errors.append(
             f"파일명 '{source_id}'와 YAML 안의 source_id '{config.source_id}'가 다르다"
         )
+    errors += _check_policy_names(config)
+    if errors:
+        raise ConfigError("\n".join(errors))
 
     return config.model_copy(update={"config_version": config_version})
+
+
+def _check_policy_names(config: SourceConfig) -> list[str]:
+    errors: list[str] = []
+
+    quadrants = {
+        "policies.required_missing": config.policies.required_missing,
+        "policies.required_outlier": config.policies.required_outlier,
+        "policies.optional_missing": config.policies.optional_missing,
+        "policies.optional_outlier": config.policies.optional_outlier,
+    }
+    for location, name in quadrants.items():
+        if not is_policy_registered(name):
+            errors.append(_unregistered_message(location, name, policy_names()))
+
+    for column_name, spec in config.columns.items():
+        for field in ("on_missing", "on_outlier"):
+            name = getattr(spec, field)
+            if name is not None and not is_policy_registered(name):
+                location = f"columns.{column_name}.{field}"
+                errors.append(_unregistered_message(location, name, policy_names()))
+
+    if config.policies.row is not None and not is_row_policy_registered(config.policies.row):
+        errors.append(
+            _unregistered_message("policies.row", config.policies.row, row_policy_names())
+        )
+
+    return errors
+
+
+def _unregistered_message(location: str, name: str, registered: tuple[str, ...]) -> str:
+    listed = ", ".join(registered) or "(없음)"
+    return f"{location}: '{name}'이 등록돼 있지 않다. 등록된 이름: {listed}"
