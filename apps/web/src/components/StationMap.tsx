@@ -126,6 +126,16 @@ function visibleStations(
   return top;
 }
 
+// 원(SVG)과 숫자 라벨(divIcon)은 Leaflet에서 서로 다른 레이어(pane)에 그려진다.
+// 라벨 pane이 원 pane보다 항상 위에 있는 건 상관없는데, 그 안에서의 순서 기준이
+// 서로 다르면(원은 그린 순서, 라벨은 Leaflet 기본값인 화면 y좌표) 어떤 대여소는
+// 원이 다른 원에 덮였는데 숫자만 둥둥 떠 있는 것처럼 보인다. 그래서 원·라벨 둘 다
+// 이 우선순위(선택된 대여소가 최우선, 그다음 urgency_score)로 쌓이게 맞춘다.
+function zPriority(alert: Alert | undefined, isSelected: boolean): number {
+  if (isSelected) return Infinity;
+  return alert?.urgency_score ?? -1;
+}
+
 interface Props {
   stations: StationSummary[];
   alerts: Alert[];
@@ -152,6 +162,8 @@ function StationMarkers({ stations, alerts, selectedStationId, onSelect }: Props
   const scale = zoomScale(zoom);
   const showCounts = zoom >= COUNT_LABEL_MIN_ZOOM;
   const alertsByStation = useMemo(() => new Map(alerts.map((alert) => [alert.sta_id, alert])), [alerts]);
+  const priorityOf = (station: StationSummary) =>
+    zPriority(alertsByStation.get(station.sta_id), station.sta_id === selectedStationId);
 
   // urgency_score 정렬은 stations/alerts가 바뀔 때만 다시 계산한다. 화면 범위가
   // 바뀔 때는(팬/줌) 이미 정렬된 배열을 거르기만 한다.
@@ -160,6 +172,50 @@ function StationMarkers({ stations, alerts, selectedStationId, onSelect }: Props
     () => visibleStations(ranked, bounds, selectedStationId),
     [ranked, bounds, selectedStationId],
   );
+  // SVG는 나중에 그린 요소가 위에 쌓인다. 우선순위가 높은(급하거나 선택된)
+  // 대여소의 원이 겹쳤을 때 항상 위로 오도록, 낮은 우선순위부터 그리는 순서로
+  // 뒤집어둔다(라벨의 zIndexOffset도 같은 zPriority를 쓴다 — 위 zPriority 참고).
+  const stackOrder = useMemo(
+    () => [...visible].sort((a, b) => priorityOf(a) - priorityOf(b)),
+    [visible, alertsByStation, selectedStationId],
+  );
+
+  // z-order를 맞춰도, 작은 원이 큰 원에 완전히 덮여서 화면에 안 보이는데 그
+  // 대여소의 숫자 라벨은 (다른 pane이라) 여전히 그려지는 문제가 남는다 —
+  // "원 없는 숫자"가 떠 있는 것처럼 보인다. 화면 픽셀 좌표로 "내 중심이 위에
+  // 그려진 다른 원 안에 들어있는지"를 계산해서, 그러면 라벨 자체를 안 그린다.
+  //
+  // 반드시 stackOrder를 그대로 뒤집어서 써야 한다 — 여기서 별도로 다시
+  // 정렬하면, urgency_score가 같은(동점) 대여소들의 순서가 stackOrder와
+  // 어긋날 수 있다(정렬은 안정적이지만 오름차순/내림차순을 따로 계산하면
+  // 동점 순서가 반대로 나온다). 그러면 실제로는 위에 그려진 원인데 겹침
+  // 판정에서는 아래로 취급돼서, 위에 있는 쪽의 라벨이 반대로 사라진다.
+  const occludedStationIds = useMemo(() => {
+    if (!showCounts) return new Set<number>();
+    const withPixel = stackOrder.map((station) => {
+      const alert = alertsByStation.get(station.sta_id);
+      return {
+        sta_id: station.sta_id,
+        point: map.latLngToContainerPoint([station.lat, station.lon]),
+        radius: markerRadius(alert) * scale,
+      };
+    });
+    const topToBottom = [...withPixel].reverse();
+    const occluded = new Set<number>();
+    for (let i = 1; i < topToBottom.length; i++) {
+      const station = topToBottom[i];
+      for (let j = 0; j < i; j++) {
+        const higher = topToBottom[j];
+        const dx = station.point.x - higher.point.x;
+        const dy = station.point.y - higher.point.y;
+        if (Math.sqrt(dx * dx + dy * dy) < higher.radius) {
+          occluded.add(station.sta_id);
+          break;
+        }
+      }
+    }
+    return occluded;
+  }, [stackOrder, alertsByStation, scale, map, showCounts]);
 
   // stations는 15초마다 폴링으로 새 배열이 들어오는데, 그때마다 이 effect가
   // 다시 돌면 선택을 바꾸지 않았는데도 지도가 계속 재이동한다. ref로 최신
@@ -183,7 +239,7 @@ function StationMarkers({ stations, alerts, selectedStationId, onSelect }: Props
       {/* 마커 자체보다 넓게 깔아 두는 투명 클릭 영역. 시각적 마커 밑에 먼저 그려야
           마커 위에서의 호버가 그대로 툴팁을 띄우고, 마커 밖 여백(CLICK_PADDING)만
           이 레이어가 받아서 대충 눌러도 선택되게 한다. */}
-      {visible.map((station) => {
+      {stackOrder.map((station) => {
         const alert = alertsByStation.get(station.sta_id);
         return (
           <CircleMarker
@@ -195,7 +251,7 @@ function StationMarkers({ stations, alerts, selectedStationId, onSelect }: Props
           />
         );
       })}
-      {visible.map((station) => {
+      {stackOrder.map((station) => {
         const isSelected = station.sta_id === selectedStationId;
         const alert = alertsByStation.get(station.sta_id);
         const radius = markerRadius(alert) * scale;
@@ -220,17 +276,25 @@ function StationMarkers({ stations, alerts, selectedStationId, onSelect }: Props
         );
       })}
       {showCounts &&
-        visible.map((station) => {
-          const alert = alertsByStation.get(station.sta_id);
-          return (
-            <Marker
-              key={`count-${station.sta_id}`}
-              position={[station.lat, station.lon]}
-              icon={countIcon(station.parking_bike_tot_cnt, markerRadius(alert) * scale)}
-              interactive={false}
-            />
-          );
-        })}
+        visible
+          .filter((station) => !occludedStationIds.has(station.sta_id))
+          .map((station) => {
+            const alert = alertsByStation.get(station.sta_id);
+            const priority = priorityOf(station);
+            return (
+              <Marker
+                key={`count-${station.sta_id}`}
+                position={[station.lat, station.lon]}
+                icon={countIcon(station.parking_bike_tot_cnt, markerRadius(alert) * scale)}
+                // Leaflet Marker는 기본적으로 화면 y좌표가 낮을수록(아래쪽일수록)
+                // 위로 오게 z-index를 매긴다. 원 쌓임 순서(zPriority)와 안 맞으면
+                // 자기 원은 덮였는데 숫자만 남는 상황이 생기므로, 같은 우선순위를
+                // 화면 y좌표보다 훨씬 큰 오프셋으로 줘서 그 기본 규칙을 덮어씌운다.
+                zIndexOffset={Number.isFinite(priority) ? Math.round(priority * 1000) : 1_000_000}
+                interactive={false}
+              />
+            );
+          })}
     </>
   );
 }
