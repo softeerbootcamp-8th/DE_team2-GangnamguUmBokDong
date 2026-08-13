@@ -16,6 +16,7 @@ import boto3
 import pytest
 from moto import mock_aws
 
+from adapters import base as adapter_base
 from config.schema import ColumnSpec, Range
 from validation import registry
 from validation.types import Issue, RunContext
@@ -80,6 +81,15 @@ def clean_registry():
     registry._POLICIES.update(saved_policies)
     registry._ROW_POLICIES.clear()
     registry._ROW_POLICIES.update(saved_row_policies)
+
+
+@pytest.fixture
+def clean_adapter_registry():
+    """어댑터 레지스트리도 전역 상태다. 테스트가 등록한 이름이 다른 테스트로 새지 않게 복원한다."""
+    saved = dict(adapter_base._ADAPTERS)
+    yield adapter_base
+    adapter_base._ADAPTERS.clear()
+    adapter_base._ADAPTERS.update(saved)
 
 
 @pytest.fixture(autouse=True)

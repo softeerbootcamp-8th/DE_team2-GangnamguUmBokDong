@@ -1,10 +1,4 @@
-"""Adapter 프로토콜(fetch / normalize), 어댑터 레지스트리, 라운드 재시도.
-
-구현 예정: docs/collector/implementation-issues.md #6
-설계 근거: docs/collector/implementation-plan.md 3절 (어댑터 계약)
-          docs/collector/implementation-plan.md 8절 (부분 실패와 백필)
-          docs/adr/0003-bronze-streaming-and-scaling-boundaries.md
-          docs/adr/0004-partial-fetch-and-backfill.md
+"""Adapter 프로토콜(fetch, normalize), 어댑터 레지스트리, 라운드 재시도.
 
 ## 이 모듈의 역할
 
@@ -14,8 +8,8 @@
 
 ## 정의할 타입
 
-- `Window` — `window_start` · `window_end`(UTC aware). 멱등 키의 절반이고
-  `window_end`는 config의 `schedule.interval`로 계산된 값이 들어온다.
+- `Window` — `window_start` · `window_end`(KST aware, `ZoneInfo("Asia/Seoul")`).
+  멱등 키의 절반이고 `window_end`는 config의 `schedule.interval`로 계산된 값이 들어온다.
 - `RawChunk` — **호출 한 번의 응답 원본**. 이 값 하나가 bronze 조각 하나
   (`part={chunk_key}.json.gz`)가 된다. 가공되지 않은 그대로여야 한다.
 - `FetchErrorKind` — `TRANSIENT` · `PERMANENT` · `FATAL` (아래 참고)
@@ -58,8 +52,8 @@
 | `FATAL` | 401 · 403 · 서울 `INFO-100`(인증키 오류) | X — **fetch 전체 즉시 중단** |
 
 `FATAL`을 분리하는 이유는 **모든 조각이 같은 인증키를 쓰기 때문**이다. 하나가 401이면
-나머지도 401이라 20개 × 6회를 헛되이 부르게 된다. 원인이 확정적인데 서킷브레이커
-발동을 기다릴 이유가 없다.
+나머지도 401이라 20개 × 6회를 헛되이 부르게 된다. 원인이 확정적인데 나머지를 다 불러볼
+이유가 없다.
 
 ## 구현할 것
 
@@ -76,12 +70,9 @@
         ↓
       남은 것은 누락 확정 → pipeline이 게이트 판정
 
-- **안전장치 셋** — 전부 여기서만 정하고 어댑터마다 다시 구현하지 않는다.
+- **안전장치 둘** — 전부 여기서만 정하고 어댑터마다 다시 구현하지 않는다.
   - `fetch_budget` — window 하나의 fetch 전체 예산. **새 호출을 시작하기 직전에만**
     판정해 진행 중인 호출은 끝까지 둔다.
-  - 서킷브레이커 — 연속 실패 5회면 라운드를 더 돌지 않고 종료. 비율이 아니라 연속
-    횟수인 이유는 조각 3개짜리 소스에서 1개 실패가 33%라 비율 기준이 정상 상황에
-    발동하기 때문이다.
   - 라운드 간 대기 — 15s → 30s. 조각이 3개뿐이면 라운드 0이 1~2초에 끝나 간격을 벌지
     못한다.
 - 호출 단위 백오프 — **2회로 줄인다.** 라운드가 얹히므로 그대로 두면 총 시도가
@@ -90,8 +81,8 @@
 - httpx 클라이언트 구성(타임아웃 기본값 등)도 여기서 만들어 어댑터가 주입받게 한다.
   테스트에서 `httpx.MockTransport`를 끼울 수 있어야 한다.
 
-라운드 수 · 대기 · 브레이커 임계는 **config가 아니라 이 모듈의 상수**다. 소스별로 다를
-이유가 없고, 설정 키를 늘리면 소스 YAML 7개에 그대로 곱해진다.
+라운드 수 · 대기는 **config가 아니라 이 모듈의 상수**다. 소스별로 다를 이유가 없고,
+설정 키를 늘리면 소스 YAML 7개에 그대로 곱해진다.
 
 ## 계약 규칙 (어겨지면 설계가 무너지는 지점)
 
@@ -119,6 +110,205 @@
 `asyncio.run`을 어댑터 `fetch` 안에 가둔다. 프로토콜을 동기로 유지하므로 pipeline ·
 manifest · 재개 분기는 바뀌지 않는다. 근거는 ADR 0003 마지막 항목.
 
-검증(계획서 12절): `httpx.MockTransport`로 3범주 분류, 라운드 재투입(429 → 성공),
-서킷브레이커(연속 5회), `fetch_budget` 초과 시 새 호출 중단을 확인한다.
 """
+
+from __future__ import annotations
+
+import time
+from collections.abc import Callable, Iterator
+from dataclasses import dataclass
+from datetime import datetime
+from enum import Enum
+from typing import TYPE_CHECKING, Protocol
+
+if TYPE_CHECKING:
+    import httpx
+
+    from config.schema import SourceConfig
+
+
+@dataclass(frozen=True, slots=True)
+class Window:
+    """수집 대상 시간 창. `window_start`·`window_end`는 KST(Asia/Seoul) aware."""
+
+    window_start: datetime
+    window_end: datetime
+
+
+class FetchErrorKind(Enum):
+    """조각 실패 범주. 라운드 재투입 여부를 결정한다."""
+
+    TRANSIENT = "transient"
+    PERMANENT = "permanent"
+    FATAL = "fatal"
+
+
+@dataclass(frozen=True, slots=True)
+class FetchResult:
+    """조각 하나의 결과. 성공이든 실패든 이 타입으로 나온다."""
+
+    key: str
+    payload: bytes | None
+    error: FetchErrorKind | None
+    expected_total: int | None
+
+
+class Adapter(Protocol):
+    """API 제공처 하나에 대응하는 fetch/normalize 계약.
+
+    구현은 인스턴스 상태가 필요 없으므로 클래스에 `staticmethod`로 둔다 — 레지스트리는
+    클래스 자체를 등록하고, 조회한 클래스를 인스턴스화하지 않고 바로 호출한다.
+    """
+
+    @staticmethod
+    def fetch(
+        config: SourceConfig,
+        window: Window,
+        *,
+        client: httpx.Client,
+        skip: frozenset[str] = frozenset(),
+        expected_total: int | None = None,
+    ) -> Iterator[FetchResult]: ...
+
+    @staticmethod
+    def normalize(chunks: list[bytes], config: SourceConfig) -> list[dict]: ...
+
+
+class UnknownAdapterError(ValueError):
+    """등록되지 않은 어댑터 이름을 조회했다."""
+
+
+class DuplicateAdapterError(ValueError):
+    """같은 이름을 두 번 등록했다. 조용히 덮어쓰면 어느 어댑터가 돌았는지 알 수 없다."""
+
+
+_ADAPTERS: dict[str, type] = {}
+
+
+def adapter(name: str) -> Callable[[type], type]:
+    """어댑터를 이름으로 등록한다. 원본 클래스를 그대로 반환한다(래핑하지 않는다)."""
+
+    def register(cls: type) -> type:
+        if name in _ADAPTERS:
+            raise DuplicateAdapterError(
+                f"어댑터 '{name}'이 이미 등록돼 있다: {_ADAPTERS[name].__qualname__}"
+            )
+        _ADAPTERS[name] = cls
+        return cls
+
+    return register
+
+
+def get_adapter(name: str) -> type:
+    """등록된 어댑터를 이름으로 조회한다."""
+    try:
+        return _ADAPTERS[name]
+    except KeyError:
+        listed = ", ".join(adapter_names()) or "(없음)"
+        raise UnknownAdapterError(
+            f"어댑터 '{name}'이 등록돼 있지 않다. 등록된 이름: {listed}"
+        ) from None
+
+
+def is_adapter_registered(name: str) -> bool:
+    """어댑터 이름이 등록돼 있는지 본다. 인스턴스를 만들지 않는다."""
+    return name in _ADAPTERS
+
+
+def adapter_names() -> tuple[str, ...]:
+    """등록된 어댑터 이름을 정렬된 튜플로 반환한다."""
+    return tuple(sorted(_ADAPTERS))
+
+
+@dataclass(frozen=True, slots=True)
+class FetchRoundResult:
+    """라운드 오케스트레이션의 최종 결과."""
+
+    chunks: dict[str, bytes]
+    missing: dict[str, FetchErrorKind]
+    expected_total: int | None
+
+
+ROUND_WAITS_SECONDS = (15, 30)
+"""라운드 0→1 대기, 라운드 1→2 대기."""
+
+MAX_ROUNDS = len(ROUND_WAITS_SECONDS) + 1
+
+
+def fetch_with_rounds(
+    fetch_fn,
+    config,
+    window,
+    *,
+    client,
+    skip=frozenset(),
+    expected_total=None,
+    sleep_fn=time.sleep,
+    now_fn=time.monotonic,
+    on_chunk=None,
+):
+    """실패분을 모아 재순회하는 공통 라운드 루프. pipeline이 호출하고 어댑터는 알지 못한다."""
+    collected: dict[str, bytes] = {}
+    permanent: dict[str, FetchErrorKind] = {}
+    # 라운드 시작 시점에 매번 {}로 비운다 
+    # TRANSIENT로 실패한 조각들을 모아두는 dict
+    transient: dict[str, FetchErrorKind] = {}
+    # fetch_budget: window 하나의 fetch 전체에 걸리는 예산. 라운드나 호출 단위가 아니라 시작된 시점부터 흐르는 마감시한.
+    deadline = now_fn() + config.effective_fetch_budget().total_seconds()
+
+    for round_index in range(MAX_ROUNDS):
+        # 라운드 1·2는 재시도할 TRANSIENT가 없으면 돌 이유가 없다(라운드 0은 항상 돈다).
+        if round_index > 0 and not transient:
+            break
+        # 새 라운드를 시작하기 직전에만 예산을 보아서 이미 시작된 라운드는 끝까지 진행한다.
+        if now_fn() >= deadline:
+            break
+
+        # skip = 이미 확보한 조각 + 재시도해도 소용없다고 확정된 조각
+        # TRANSIENT만 skip에서 빠져 있어야 하고, 이번 라운드가 그것만 재순회한다.
+        round_skip = frozenset(skip) | collected.keys() | permanent.keys()
+        transient = {}
+        aborted = False  # FATAL로 이번 fetch 전체를 접었는지
+
+        iterator = fetch_fn(config, window, client=client, skip=round_skip, expected_total=expected_total)
+        # 새 호출을 시작하기 직전에만 budget을 체크한다.
+        while True:
+            if now_fn() >= deadline:
+                aborted = True
+                break
+            try:
+                result = next(iterator)
+            except StopIteration:
+                break
+
+            # expected_total은 알 수 있는 소스의 첫 조각에만 실려 온다. 
+            # 한 번 채워지면 이후 라운드·백필에 그대로 되돌려주므로 여기서 덮어쓰지 않는다.
+            if expected_total is None and result.expected_total is not None:
+                expected_total = result.expected_total
+
+            if result.error is None:
+                collected[result.key] = result.payload
+                if on_chunk is not None:
+                    on_chunk(result.key, result.payload)  # pipeline이 즉시 bronze에 쓴다
+            elif result.error is FetchErrorKind.FATAL:
+                # 모든 조각이 같은 인증키를 쓰므로 하나가 FATAL이면 나머지도 뻔하다.
+                # 라운드를 더 돌 이유가 없어 즉시 전체를 접는다.
+                permanent[result.key] = result.error
+                aborted = True
+                break
+            elif result.error is FetchErrorKind.PERMANENT:
+                permanent[result.key] = result.error  # 이 조각만 누락 확정, 재시도 안 함
+            else:  # TRANSIENT
+                transient[result.key] = result.error  # 다음 라운드가 다시 시도한다
+
+        if aborted:
+            break
+        # 마지막 라운드 뒤에는 대기하지 않는다.
+        # transient가 비었을 때도 대기하지 않는다.
+        if round_index < len(ROUND_WAITS_SECONDS) and transient:
+            sleep_fn(ROUND_WAITS_SECONDS[round_index])
+
+    # 여기까지 남은 transient는 라운드를 다 써버려서 더 재시도하지 못하는 것들이다.
+    # permanent와 합쳐 이번 실행에서 못 받은 조각으로 pipeline에 돌려준다.
+    missing = {**permanent, **transient}
+    return FetchRoundResult(chunks=collected, missing=missing, expected_total=expected_total)
