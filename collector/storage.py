@@ -1,96 +1,200 @@
 """S3/MinIO 입출력과 경로 규칙 생성.
 
-구현 예정: docs/collector/implementation-issues.md #4
-설계 근거: docs/collector/implementation-plan.md 6절 (경로 규칙)
-          docs/collector/implementation-plan.md 8절 (부분 실패와 백필)
-          docs/adr/0003-bronze-streaming-and-scaling-boundaries.md
-          docs/adr/0004-partial-fetch-and-backfill.md
-
-## 이 모듈의 역할
-
-객체 저장소와 이야기하는 **유일한 창구**다. 경로 문자열을 만드는 곳도 여기 하나뿐이다.
-pipeline · manifest는 경로를 조립하지 않고 이 모듈에 요청한다.
-
-## 경로 규칙
-
-    bronze             bronze/{source_id}/dt={date}/hh={hour}/{HHMM}/part={chunk_key}.json.gz
-    silver·quarantine  {layer}/{source_id}/dt={date}/hh={hour}/{HHMM}.{ext}
-    _manifest          _manifest/{source_id}/dt={date}/hh={hour}/{HHMM}.json
-    _retry_queue       _retry_queue/{source_id}/{window_start}.json
-
-- **bronze만** window마다 디렉토리를 하나 더 갖는다. 조각으로 저장되기 때문이다.
-- `dt` · `hh` · `HHMM`은 모두 `window_start`에서 파생된다. 멱등 키가
-  `(source_id, window_start)`이므로 **같은 키는 항상 같은 경로**로 떨어지고, 재실행이
-  이전 결과를 덮어쓴다.
-- `_retry_queue`만 날짜 파티션이 없다. 백필 잡이 소스별 prefix 하나만 LIST해서 대상을
-  얻어야 하기 때문이다.
-
-## 조각 키
-
-`{chunk_key}`는 **요청을 식별하는 키**이고 어댑터가 만든다.
-
-    part=page-00001-01000.json.gz     서울 — 페이지 인덱스 범위
-    part=grid-060x127.json.gz         기상청 — 격자 좌표
-
-순번(`part={NNN}`)을 쓰지 않는 이유는 실행 간에 안정적이지 않기 때문이다.
-`list_total_count`가 변하면 같은 번호가 다른 페이지 범위를 가리켜 백필이 조각을 지목할
-수 없다. **읽는 순서는 파일명이 아니라 manifest의 `artifacts.bronze.parts` 목록이
-정한다** — 순번이 맡던 역할은 원래 그쪽에 있었다.
-
-## 구현할 것
-
-- `write_bronze_part(source_id, window_start, chunk_key, chunk)` — 응답 조각 하나를 원본
-  그대로(무손실) + gzip으로 올린다. `fetch`가 조각을 흘려보낼 때마다 호출된다.
-  정규화하거나 필드를 고르지 않는다.
-- `read_bronze(artifacts.bronze)` — 조각을 **`parts` 목록 순서로** 읽어 목록으로
-  돌려준다. 반환 형태가 `write_bronze_part`에 넘어온 조각과 **왕복 일치**해야
-  `normalize`가 그대로 동작한다. **`parts`에 없는 객체는 읽지 않는다** — 이 규칙이 백필
-  모드에서 `clear_bronze`를 생략해도 유령 조각이 섞이지 않게 막는다.
-- `clear_bronze(source_id, window_start)` — 재개 전에 그 window의 bronze prefix를
-  비운다. 조각 수가 실행마다 달라질 수 있어(5조각 → 3조각) 유령 조각이 남는다.
-  **백필 모드에서는 호출하지 않는다.** 기존 조각을 살리는 것이 목적이다.
-- `write_silver` — pyarrow로 Parquet **파일 하나**를 쓴다. `_row_status` 메타 컬럼을
-  포함하고, 컬럼 타입은 검증 엔진이 캐스팅한 결과를 따른다.
-  게이트(`max_missing_ratio` · `max_drop_ratio`)를 넘긴 배치에서는 **호출되지
-  않는다**(pipeline이 판정을 먼저 한다). 그 경우 `artifacts.silver`는 null로 남는다.
-  백필이 갱신할 때는 **같은 경로에 덮어쓴다** — 추가 파일을 만들지 않는다.
-- `write_quarantine` — 폐기된 행을 JSONL로 쓴다. **폐기 행이 0건이면 호출하지 않고
-  객체도 만들지 않는다.** 5분 주기 소스 3종이면 빈 객체가 하루 864개 쌓이고, 대부분의
-  실행은 폐기 0건이다. `artifacts.quarantine`이 null인지로 폐기 여부를 알 수 있고
-  `counts.dropped`와 교차 검증도 된다. 이 파일을 읽는 쪽은 부재를 정상으로 처리한다.
-- **`_retry_queue` 마커 I/O** — `write_retry_marker` · `list_retry_markers(source_id)` ·
-  `delete_retry_marker`. 마커는 백필 대상 인덱스다(계획서 8.5절).
-- boto3 클라이언트 구성 — 엔드포인트 · 액세스 키 · 버킷은 환경변수에서 읽는다
-  (`.env.example` 참고). MinIO(로컬)와 S3를 같은 코드로 다룬다.
-
-## 마커는 인덱스, manifest는 진실
-
-    _retry_queue/{source_id}/{window_start}.json
-    { "source_id": ..., "window_start": ..., "missing_parts": ["page-02001-02765"],
-      "first_failed_at": ..., "expires_at": ..., "attempts": 3 }
-
-manifest 전수 스캔은 대상 소스 5종 기준 하루 442개, 보관 7일이면 3,094개를 매 실행마다
-훑는다. 마커는 **스캔 비용이 실패 건수에 비례**하고 평상시에는 LIST 한 번에 빈 결과다.
-
-이 모듈은 마커를 **쓰고 읽고 지울 뿐 판단하지 않는다.** 백필 잡은 마커로 후보를 얻은 뒤
-반드시 manifest를 읽어 실제 상태를 확인하므로, 마커가 잔존하거나 유실돼도 오동작이
-아니라 스킵 또는 백필 누락으로만 이어진다. 마커 쓰기 실패의 최악은 "백필을 안 하는
-것"이지 잘못된 데이터가 아니다.
-
-## 주의
-
-- **조각이 존재하는 것과 bronze가 완결된 것은 다르다.** 이 모듈은 조각을 쓰고 읽을 뿐
-  완결 여부를 판단하지 않는다. 실행 진행도는 manifest의 `stage`가, 조각이 다 모였는지는
-  `completeness` · `missing`이 표현한다.
-- manifest **직렬화**는 manifest.py, manifest **I/O**는 이 모듈이다. 역할을 섞지 않는다.
-- 쓰기는 실패할 수 있는 지점이다. 예외를 삼키지 말고 올려 pipeline이 `stage`와
-  `failure_reason=storage_error`를 남기게 한다. silver 쓰기 실패가 bronze 재사용 재개의
-  주요 시나리오다.
-- 조각 키가 파일명이 되므로 **인증키 같은 비밀이 섞이지 않게** 한다. 키를 만드는 것은
-  어댑터지만 경로로 굳는 곳은 여기다.
-
-검증(계획서 12절): 조각 왕복 일치(`parts` 순서 포함), `parts`에 없는 객체를 무시하는지,
-`clear_bronze`(5조각 → 3조각 재실행에서 유령 조각이 남지 않는지), 마커 생성·삭제를
-확인한다. `make up`으로 MinIO를 띄우면 bronze 조각 수가 API 호출 수와 일치하는지,
-silver · manifest가 하나씩 생겼는지 콘솔에서 볼 수 있다.
+S3와 연결되는 창구다. 경로 문자열을 만드는 곳도 여기 하나뿐이다.
+dict·bytes 단위로만 주고받고, 그 값이 무엇을 뜻하는지는 해석하지 않는다.
 """
+
+from __future__ import annotations
+
+import gzip
+import io
+import json
+import os
+from collections.abc import Sequence
+from datetime import datetime
+
+import boto3
+import pyarrow.parquet as pq
+from botocore.exceptions import ClientError
+
+
+def _client():
+    """S3 호환 클라이언트를 생성한다."""
+    return boto3.client(
+        "s3",
+        endpoint_url=os.environ.get("S3_ENDPOINT_URL") or None,
+        aws_access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
+        aws_secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
+    )
+
+
+def _bucket() -> str:
+    """대상 S3 버킷 이름을 환경 변수에서 읽어 반환한다."""
+    return os.environ["S3_BUCKET"]
+
+
+def _bronze_prefix(source_id: str, window_start: datetime) -> str:
+    """bronze 조각들이 모이는 공통 prefix를 만든다."""
+    return (
+        f"bronze/{source_id}/dt={window_start:%Y-%m-%d}/hh={window_start:%H}/"
+        f"{window_start:%H%M}/"
+    )
+
+
+def _bronze_part_key(source_id: str, window_start: datetime, chunk_key: str) -> str:
+    """bronze 조각 하나의 전체 키를 만든다."""
+    return f"{_bronze_prefix(source_id, window_start)}part={chunk_key}.json.gz"
+
+
+def write_bronze_part(
+    source_id: str, window_start: datetime, chunk_key: str, chunk: bytes
+) -> None:
+    """bronze 조각을 gzip으로 압축해 저장한다."""
+    key = _bronze_part_key(source_id, window_start, chunk_key)
+    _client().put_object(Bucket=_bucket(), Key=key, Body=gzip.compress(chunk))
+
+
+def read_bronze(source_id: str, window_start: datetime, parts: Sequence[str]) -> list[bytes]:
+    """지정된 bronze 조각들을 읽어 압축을 해제한 뒤 순서대로 반환한다.
+
+    args:
+        source_id: 데이터 소스 식별자
+        window_start: 조각들이 속한 수집 윈도우 시작 시각
+        parts: 읽을 조각들의 chunk_key 목록
+    returns:
+        각 조각의 압축 해제된 원본 bytes 목록 (parts와 같은 순서)
+    """
+    client = _client()
+    result = []
+    for chunk_key in parts:
+        key = _bronze_part_key(source_id, window_start, chunk_key)
+        body = client.get_object(Bucket=_bucket(), Key=key)["Body"].read()
+        result.append(gzip.decompress(body))
+    return result
+
+
+def clear_bronze(source_id: str, window_start: datetime) -> None:
+    """해당 윈도우의 bronze 조각을 모두 삭제한다."""
+    client = _client()
+    bucket = _bucket()
+    prefix = _bronze_prefix(source_id, window_start)
+
+    # list_objects_v2는 한 번에 최대 1000개까지만 반환하므로 paginator로 전체 조각을 모은다.
+    paginator = client.get_paginator("list_objects_v2")
+    keys = [
+        obj["Key"]
+        for page in paginator.paginate(Bucket=bucket, Prefix=prefix)
+        for obj in page.get("Contents", [])
+    ]
+    if keys:
+        # delete_objects는 빈 Objects 리스트를 받으면 에러가 나므로 키가 있을 때만 호출한다.
+        # (참고: delete_objects 한 번에 삭제 가능한 키도 최대 1000개이므로,
+        #  조각 수가 1000개를 넘는 윈도우에서는 배치 분할이 필요하다.)
+        client.delete_objects(
+            Bucket=bucket, Delete={"Objects": [{"Key": k} for k in keys]}
+        )
+
+
+def _layer_key(layer: str, source_id: str, window_start: datetime, ext: str) -> str:
+    """silver·quarantine처럼 윈도우당 파일 하나로 떨어지는 계층의 키를 만든다."""
+    return (
+        f"{layer}/{source_id}/dt={window_start:%Y-%m-%d}/hh={window_start:%H}/"
+        f"{window_start:%H%M}.{ext}"
+    )
+
+
+def write_silver(source_id: str, window_start: datetime, table: pq.Table) -> str:
+    """silver 테이블을 parquet으로 직렬화해 저장하고, 저장된 키를 반환한다."""
+    key = _layer_key("silver", source_id, window_start, "parquet")
+    buffer = io.BytesIO()
+    pq.write_table(table, buffer)
+    _client().put_object(Bucket=_bucket(), Key=key, Body=buffer.getvalue())
+    return key
+
+
+def write_quarantine(source_id: str, window_start: datetime, rows: list[dict]) -> str | None:
+    """검증에 실패한 row들을 jsonl로 저장하고, 저장된 키를 반환한다.
+
+    args:
+        source_id: 데이터 소스 식별자
+        window_start: row들이 속한 수집 윈도우 시작 시각
+        rows: 격리할 row 목록. 비어 있으면 아무것도 쓰지 않는다.
+    returns:
+        저장된 객체의 키. rows가 비어 있으면 None.
+    """
+    if not rows:
+        return None
+    key = _layer_key("quarantine", source_id, window_start, "jsonl")
+    body = "\n".join(json.dumps(row, ensure_ascii=False) for row in rows) + "\n"
+    _client().put_object(Bucket=_bucket(), Key=key, Body=body.encode("utf-8"))
+    return key
+
+
+def _manifest_key(source_id: str, window_start: datetime) -> str:
+    """해당 윈도우의 manifest 객체 키를 만든다."""
+    return (
+        f"_manifest/{source_id}/dt={window_start:%Y-%m-%d}/hh={window_start:%H}/"
+        f"{window_start:%H%M}.json"
+    )
+
+
+def _retry_marker_key(source_id: str, window_start: datetime) -> str:
+    """해당 윈도우의 retry marker 객체 키를 만든다."""
+    return f"_retry_queue/{source_id}/{window_start.isoformat()}.json"
+
+
+def _get_json(key: str) -> dict | None:
+    """주어진 키의 JSON 객체를 읽는다. 키가 없으면 None을 반환한다.
+
+    args:
+        key: 읽을 객체의 전체 키
+    returns:
+        파싱된 JSON dict, 객체가 없으면 None
+    raises:
+        ClientError: NoSuchKey가 아닌 다른 S3 오류가 발생했을 때
+    """
+    try:
+        body = _client().get_object(Bucket=_bucket(), Key=key)["Body"].read()
+    except ClientError as exc:
+        if exc.response["Error"]["Code"] == "NoSuchKey":
+            return None
+        raise
+    return json.loads(body)
+
+
+def write_manifest(source_id: str, window_start: datetime, data: dict) -> None:
+    """해당 윈도우의 manifest를 JSON으로 저장한다."""
+    key = _manifest_key(source_id, window_start)
+    _client().put_object(Bucket=_bucket(), Key=key, Body=json.dumps(data).encode("utf-8"))
+
+
+def read_manifest(source_id: str, window_start: datetime) -> dict | None:
+    """해당 윈도우의 manifest를 읽는다. 없으면 None을 반환한다."""
+    return _get_json(_manifest_key(source_id, window_start))
+
+
+def write_retry_marker(source_id: str, window_start: datetime, data: dict) -> None:
+    """해당 윈도우의 retry marker를 JSON으로 저장한다."""
+    key = _retry_marker_key(source_id, window_start)
+    _client().put_object(Bucket=_bucket(), Key=key, Body=json.dumps(data).encode("utf-8"))
+
+
+def list_retry_markers(source_id: str) -> list[dict]:
+    """해당 소스에 쌓인 retry marker를 모두 읽어 반환한다."""
+    client = _client()
+    bucket = _bucket()
+    prefix = f"_retry_queue/{source_id}/"
+
+    paginator = client.get_paginator("list_objects_v2")
+    markers = []
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            body = client.get_object(Bucket=bucket, Key=obj["Key"])["Body"].read()
+            markers.append(json.loads(body))
+    return markers
+
+
+def delete_retry_marker(source_id: str, window_start: datetime) -> None:
+    """해당 윈도우의 retry marker를 삭제한다."""
+    key = _retry_marker_key(source_id, window_start)
+    _client().delete_object(Bucket=_bucket(), Key=key)
