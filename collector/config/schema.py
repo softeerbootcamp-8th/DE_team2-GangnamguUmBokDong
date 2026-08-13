@@ -65,3 +65,44 @@ class ColumnSpec(BaseModel):
         if self.range is not None and self.enum is not None:
             raise ValueError("range와 enum을 동시에 선언할 수 없다")
         return self
+
+
+class Schedule(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    interval: Duration
+
+
+class Storage(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    bronze_format: str
+    silver_format: str
+    partition: tuple[str, ...] = Field(min_length=1)
+
+
+class Quality(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    max_drop_ratio: float = Field(ge=0, le=1)
+    max_missing_ratio: float = Field(default=0.0, ge=0, le=1)
+    allow_empty: bool = False
+
+
+class Fetch(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    budget: Duration | None = None
+
+
+class Backfill(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    enabled: bool = False
+    max_age: Duration | None = None
+
+    @model_validator(mode="after")
+    def _max_age_required_when_enabled(self) -> Backfill:
+        if self.enabled and self.max_age is None:
+            raise ValueError("backfill.enabled=true면 max_age가 필수다")
+        return self
