@@ -9,7 +9,8 @@
 storage.py·manifest.py 테스트가 공유하는 moto S3 환경 픽스처도 함께 둔다.
 """
 
-from datetime import UTC, datetime
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import boto3
 import pytest
@@ -20,6 +21,7 @@ from validation import registry
 from validation.types import Issue, RunContext
 
 TEST_BUCKET = "test-bucket"
+KST = ZoneInfo("Asia/Seoul")
 
 
 @pytest.fixture
@@ -62,8 +64,8 @@ def make_issue(make_spec):
 def ctx():
     return RunContext(
         source_id="bike_station_realtime",
-        window_start=datetime(2026, 8, 12, 14, 10, tzinfo=UTC),
-        window_end=datetime(2026, 8, 12, 14, 15, tzinfo=UTC),
+        window_start=datetime(2026, 8, 12, 14, 10, tzinfo=KST),
+        window_end=datetime(2026, 8, 12, 14, 15, tzinfo=KST),
         attempt=1,
     )
 
