@@ -150,8 +150,7 @@ def _check_row_params(config: SourceConfig) -> list[str]:
     if params_model is None:
         if row_params is not None:
             return [
-                f"policies.row_params: '{row_name}'은 params를 받지 않는데 "
-                f"row_params가 주어졌다: {row_params}"
+                f"policies.row_params: '{row_name}'은 params를 받지 않는데 row_params가 주어졌다: {row_params}"
             ]
         return []
 

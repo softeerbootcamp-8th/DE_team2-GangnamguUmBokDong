@@ -147,21 +147,21 @@ class TestBackfill:
 
 
 def _minimal_source_config(**overrides):
-    base = dict(
-        source_id="test_source",
-        description="test",
-        adapter="seoul_openapi",
-        schedule={"interval": "5m"},
-        storage={"bronze_format": "json", "silver_format": "parquet", "partition": ["dt", "hh"]},
-        quality={"max_drop_ratio": 0.05},
-        policies={
+    base = {
+        "source_id": "test_source",
+        "description": "test",
+        "adapter": "seoul_openapi",
+        "schedule": {"interval": "5m"},
+        "storage": {"bronze_format": "json", "silver_format": "parquet", "partition": ["dt", "hh"]},
+        "quality": {"max_drop_ratio": 0.05},
+        "policies": {
             "required_missing": "drop_row",
             "required_outlier": "drop_row",
             "optional_missing": "keep_null",
             "optional_outlier": "set_null",
         },
-        columns={"stationId": {"types": ["str"], "required": True}},
-    )
+        "columns": {"stationId": {"types": ["str"], "required": True}},
+    }
     base.update(overrides)
     return SourceConfig.model_validate(base)
 

@@ -3,6 +3,7 @@
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from config.loader import ConfigError, load
 
@@ -77,7 +78,7 @@ class TestLoadStructuralFailure:
     def test_missing_required_field_raises(self, tmp_path):
         broken = VALID_YAML.replace("adapter: seoul_openapi\n", "")
         base_dir = _write(tmp_path, "test_source", broken)
-        with pytest.raises(Exception):  # pydantic ValidationError
+        with pytest.raises(ValidationError):
             load("test_source", base_dir=base_dir)
 
 
