@@ -18,7 +18,7 @@
 | # | 브랜치 | 내용 | 주요 산출 | 선행 |
 | --- | --- | --- | --- | --- |
 | 1 | `chore/collector-deps` | `httpx`·`pyyaml`·`pydantic`·`pyarrow`·`boto3` 의존성 추가와 디렉토리 스켈레톤 | `pyproject.toml` | — |
-| 2 | `feature/collector-config-loader` | config 스키마, YAML 로드, 정책 이름·`row_params` 검증, SHA-256 해시 | `config/schema.py`<br>`config/loader.py`<br>*(후속)* `tests/conftest.py`의 `ColumnSpecStub`을 실제 `ColumnSpec`으로 교체 | 1 |
+| 2 | `feature/collector-config-loader` | config 스키마, YAML 로드, 정책 이름·`row_params` 검증, SHA-256 해시 | `config/schema.py`<br>`config/loader.py`<br>*(후속)* `tests/conftest.py`의 `ColumnSpecStub`을 실제 `ColumnSpec`으로 교체 | 1·3 |
 | 3 | `feature/collector-policy-registry` | 계약 타입, `@policy`·`@row_policy` 데코레이터(params 모델 등록), 공통 정책 함수 10종 | `validation/types.py`<br>`validation/registry.py`<br>`validation/policies.py` | 1 |
 | 4 | `feature/collector-storage-manifest` | 경로 규칙(**조각 키 기반**), bronze 조각 쓰기·읽기·정리, **`_retry_queue` 마커 I/O**, MinIO 입출력, 상태 어휘와 manifest 스키마(**완결도 필드**) | `storage.py`<br>`manifest.py` | 1 |
 | 5 | `feature/collector-validation-engine` | 판정 3단계, 4분면 정책 디스패치, 행 정책, 결과 집계 | `validation/engine.py` | 2·3 |
@@ -66,10 +66,11 @@
 
 ```
 #1 deps
- ├─ #3 policy ─ #2 config ──┬─ #5 engine ──┐
- ├─ #4 storage ─────────────┼─ #7 pipeline ─ #8 cli ─┐
- └─ #2 ─ #6 seoul ──────────┘                        ├─ #10 configs ─ #11 backfill
-                  └─ #9 kma ─────────────────────────────┘
+ ├─ #3 policy ──┬─ #5 engine ──┐
+ ├─ #2 config ──┘              │
+ ├─ #4 storage ────────────────┼─ #7 pipeline ─ #8 cli ─┐
+ └─ #2 ─ #6 seoul ─────────────┘                        ├─ #10 configs ─ #11 backfill
+                  └─ #9 kma ────────────────────────────┘
 ```
 
 #1 병합 직후 #3·#4를 나눠 잡고, #3이 끝나면 #2를 잡는 것이 가장 빠르다. #2~#5는 네트워크와 S3 없이 순수 단위 테스트로 끝난다.
