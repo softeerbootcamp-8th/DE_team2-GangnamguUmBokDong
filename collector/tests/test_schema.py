@@ -63,6 +63,14 @@ class TestRange:
         with pytest.raises(ValidationError):
             Range(min=0, max=200, step=1)
 
+    def test_min_equal_to_max_is_allowed(self):
+        r = Range(min=100, max=100)
+        assert r.min == r.max == 100
+
+    def test_min_greater_than_max_rejected(self):
+        with pytest.raises(ValidationError):
+            Range(min=100, max=0)
+
 
 class TestColumnSpec:
     def test_minimal(self):

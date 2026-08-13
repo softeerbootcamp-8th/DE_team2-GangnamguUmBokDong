@@ -45,6 +45,13 @@ class Range(BaseModel):
     min: float
     max: float
 
+    @model_validator(mode="after")
+    def _min_le_max(self) -> Range:
+        """`min`이 `max`보다 큰 range를 막는다."""
+        if self.min > self.max:
+            raise ValueError(f"range.min({self.min})이 range.max({self.max})보다 클 수 없다")
+        return self
+
 
 class ColumnSpec(BaseModel):
     """컬럼 하나의 스펙. `range`와 `enum`은 배타적으로만 사용"""
