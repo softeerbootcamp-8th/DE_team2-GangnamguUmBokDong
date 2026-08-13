@@ -119,3 +119,41 @@ Airflow retries=2이므로 최초 실행을 포함해 최대 3번 실행된다.
 - run_id Jinja template 확인
 - exit code가 BashOperator 상태로 전달되는지 확인
 """
+
+
+
+"""Collector Task 생성 공통 모듈."""
+
+from datetime import timedelta
+
+from airflow.operators.bash import BashOperator
+
+COLLECTOR_DIR = "/workspace/collector"
+
+COLLECTOR_RUN_ID = (
+    "{{ logical_date.in_timezone('Asia/Seoul')"
+    ".strftime('%Y%m%dT%H%M%S') }}"
+)
+
+
+def build_collector_task(source: str) -> BashOperator:
+    """Collector CLI를 실행하는 BashOperator를 생성한다.
+
+    Args:
+        source: Collector에서 지원하는 source 식별자.
+
+    Returns:
+        BashOperator: source별 Collector 실행 Task.
+    """
+    return BashOperator(
+        task_id=f"collect_{source}",
+        bash_command=(
+            f"cd {COLLECTOR_DIR} && "
+            "env -u VIRTUAL_ENV uv run python main.py "
+            f"--source {source} "
+            f"--run-id {COLLECTOR_RUN_ID}"
+        ),
+        retries=2,
+        retry_delay=timedelta(seconds=30),
+        execution_timeout=timedelta(minutes=4),
+    )
