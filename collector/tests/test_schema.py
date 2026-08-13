@@ -5,7 +5,18 @@ from datetime import timedelta
 import pytest
 from pydantic import ValidationError
 
-from config.schema import Backfill, ColumnSpec, Fetch, Quality, Range, Schedule, Storage, _parse_duration
+from config.schema import (
+    Backfill,
+    ColumnSpec,
+    Fetch,
+    Policies,
+    Quality,
+    Range,
+    Schedule,
+    SourceConfig,
+    Storage,
+    _parse_duration,
+)
 
 
 class TestParseDuration:
@@ -133,3 +144,61 @@ class TestBackfill:
     def test_enabled_with_max_age_ok(self):
         b = Backfill(enabled=True, max_age="7d")
         assert b.max_age == timedelta(days=7)
+
+
+def _minimal_source_config(**overrides):
+    base = dict(
+        source_id="test_source",
+        description="test",
+        adapter="seoul_openapi",
+        schedule={"interval": "5m"},
+        storage={"bronze_format": "json", "silver_format": "parquet", "partition": ["dt", "hh"]},
+        quality={"max_drop_ratio": 0.05},
+        policies={
+            "required_missing": "drop_row",
+            "required_outlier": "drop_row",
+            "optional_missing": "keep_null",
+            "optional_outlier": "set_null",
+        },
+        columns={"stationId": {"types": ["str"], "required": True}},
+    )
+    base.update(overrides)
+    return SourceConfig.model_validate(base)
+
+
+class TestPolicies:
+    def test_row_optional(self):
+        p = Policies(
+            required_missing="drop_row",
+            required_outlier="drop_row",
+            optional_missing="keep_null",
+            optional_outlier="set_null",
+        )
+        assert p.row is None
+        assert p.row_params is None
+
+
+class TestSourceConfig:
+    def test_minimal_valid(self):
+        config = _minimal_source_config()
+        assert config.source_id == "test_source"
+        assert config.adapter_params == {}
+        assert config.config_version == ""
+
+    def test_forbids_extra_top_level_key(self):
+        with pytest.raises(ValidationError):
+            _minimal_source_config(unknown_key="x")
+
+    def test_effective_fetch_budget_derives_when_unset(self):
+        config = _minimal_source_config(schedule={"interval": "10m"})
+        assert config.effective_fetch_budget() == timedelta(minutes=5)
+
+    def test_effective_fetch_budget_caps_at_30_minutes(self):
+        config = _minimal_source_config(schedule={"interval": "3h"})
+        assert config.effective_fetch_budget() == timedelta(minutes=30)
+
+    def test_effective_fetch_budget_uses_explicit_value(self):
+        config = _minimal_source_config(
+            schedule={"interval": "10m"}, fetch={"budget": "2m30s"}
+        )
+        assert config.effective_fetch_budget() == timedelta(minutes=2, seconds=30)

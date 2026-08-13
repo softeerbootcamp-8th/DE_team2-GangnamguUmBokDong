@@ -106,3 +106,36 @@ class Backfill(BaseModel):
         if self.enabled and self.max_age is None:
             raise ValueError("backfill.enabled=true면 max_age가 필수다")
         return self
+
+
+class Policies(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    required_missing: str
+    required_outlier: str
+    optional_missing: str
+    optional_outlier: str
+    row: str | None = None
+    row_params: dict[str, Any] | None = None
+
+
+class SourceConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    source_id: str
+    description: str
+    adapter: str
+    adapter_params: dict[str, Any] = {}
+    schedule: Schedule
+    storage: Storage
+    quality: Quality
+    fetch: Fetch | None = None
+    backfill: Backfill | None = None
+    policies: Policies
+    columns: dict[str, ColumnSpec]
+    config_version: str = ""
+
+    def effective_fetch_budget(self) -> timedelta:
+        if self.fetch and self.fetch.budget:
+            return self.fetch.budget
+        return min(self.schedule.interval / 2, timedelta(minutes=30))
