@@ -1,0 +1,62 @@
+const API_BASE = import.meta.env.VITE_API_BASE ?? "http://localhost:8000";
+
+export type ActionType = "supply_needed" | "retrieval_needed" | "normal";
+
+export interface StationSummary {
+  sta_id: number;
+  sta_nm: string;
+  gu: string;
+  lat: number;
+  lon: number;
+  hold_cnt: number;
+  parking_bike_tot_cnt: number;
+  shared_rate: number;
+  base_dttm: string;
+}
+
+export interface StationDetail extends StationSummary {
+  sta_addr: string;
+}
+
+export interface ForecastPoint {
+  predicted_dttm: string;
+  predicted_rent_cnt: number;
+  predicted_return_cnt: number;
+  predicted_bikes: number;
+  action_type: ActionType;
+}
+
+export interface ForecastResponse {
+  sta_id: number;
+  base_dttm: string;
+  points: ForecastPoint[];
+  reasons: string[];
+}
+
+export interface Alert {
+  sta_id: number;
+  sta_nm: string;
+  action_type: ActionType;
+  urgency_score: number;
+  minutes_until_critical: number;
+}
+
+export interface StatusResponse {
+  base_dttm: string;
+}
+
+async function getJson<T>(path: string): Promise<T> {
+  const res = await fetch(`${API_BASE}${path}`);
+  if (!res.ok) {
+    throw new Error(`${path} 요청 실패: ${res.status}`);
+  }
+  return res.json() as Promise<T>;
+}
+
+export const api = {
+  stations: () => getJson<StationSummary[]>("/stations"),
+  station: (id: number) => getJson<StationDetail>(`/stations/${id}`),
+  forecast: (id: number) => getJson<ForecastResponse>(`/stations/${id}/forecast`),
+  alerts: () => getJson<Alert[]>("/alerts"),
+  status: () => getJson<StatusResponse>("/status"),
+};

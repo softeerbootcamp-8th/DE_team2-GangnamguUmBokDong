@@ -6,6 +6,12 @@ __pycache__/
 
 # Env
 .env
+.env.local
+
+# Node (apps/web)
+node_modules/
+dist/
+.vite/
 
 # OS
 .DS_Store
