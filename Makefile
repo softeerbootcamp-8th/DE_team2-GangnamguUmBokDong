@@ -16,13 +16,16 @@ lint:
 	done
 
 test:
-	@for p in $(PROJECTS); do \
+	@for p in $(LOCAL_TEST_PROJECTS); do \
 		echo "==> $$p"; \
 		(cd $$p && uv run --with pytest pytest -q); \
 		code=$$?; \
 		if [ $$code -ne 0 ] && [ $$code -ne 5 ]; then exit $$code; fi; \
 	done
-
+	@echo "==> airflow"
+	@$(COMPOSE) exec -T airflow-scheduler \
+		sh -lc 'cd /workspace/airflow && uv run pytest -q'
+		
 bootstrap:
 	./ops/bootstrap/bootstrap.sh
 
