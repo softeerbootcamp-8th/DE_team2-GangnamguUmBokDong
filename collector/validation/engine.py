@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from config.schema import ColumnSpec, Policies, SourceConfig
+
 from validation.registry import get_policy, get_row_policy, get_row_policy_params_model
 from validation.types import Action, Issue, IssueKind, RowVerdict, RunContext
 
