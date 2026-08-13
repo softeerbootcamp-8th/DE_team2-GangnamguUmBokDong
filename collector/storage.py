@@ -13,8 +13,8 @@ import gzip
 import io
 import json
 import os
+from collections.abc import Sequence
 from datetime import datetime
-from typing import Sequence
 
 import boto3
 import pyarrow.parquet as pq

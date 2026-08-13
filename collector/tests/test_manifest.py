@@ -12,11 +12,15 @@ from manifest import (
     FailureReason,
     Manifest,
     Missing,
+    RetryMarker,
     RunStatus,
     Stage,
     StageField,
+    clear_retry_marker,
     load,
+    load_retry_markers,
     save,
+    save_retry_marker,
 )
 
 WINDOW_START = datetime(2026, 8, 12, 14, 10, tzinfo=UTC)
@@ -24,15 +28,15 @@ WINDOW_END = datetime(2026, 8, 12, 14, 15, tzinfo=UTC)
 
 
 def _minimal_manifest(**overrides) -> Manifest:
-    base = dict(
-        source_id="test_source",
-        window_start=WINDOW_START,
-        window_end=WINDOW_END,
-        status=RunStatus.PARTIAL,
-        stage=Stage.COMPLETED,
-        started_at=WINDOW_START,
-        config_version="sha256:abc",
-    )
+    base = {
+        "source_id": "test_source",
+        "window_start": WINDOW_START,
+        "window_end": WINDOW_END,
+        "status": RunStatus.PARTIAL,
+        "stage": Stage.COMPLETED,
+        "started_at": WINDOW_START,
+        "config_version": "sha256:abc",
+    }
     base.update(overrides)
     return Manifest.model_validate(base)
 
@@ -151,3 +155,46 @@ class TestLoadSave:
 
     def test_load_missing_returns_none(self):
         assert load("never_saved", WINDOW_START) is None
+
+
+class TestRetryMarker:
+    def test_save_then_load_round_trip(self):
+        marker = RetryMarker(
+            source_id="test_source",
+            window_start=WINDOW_START,
+            missing_parts=["page-002"],
+            first_failed_at=WINDOW_START,
+            expires_at=WINDOW_END,
+        )
+
+        save_retry_marker(marker)
+        loaded = load_retry_markers("test_source")
+
+        assert loaded == [marker]
+
+    def test_default_attempts_is_one(self):
+        marker = RetryMarker(
+            source_id="test_source",
+            window_start=WINDOW_START,
+            missing_parts=["page-002"],
+            first_failed_at=WINDOW_START,
+            expires_at=WINDOW_END,
+        )
+        assert marker.attempts == 1
+
+    def test_clear_removes_marker(self):
+        marker = RetryMarker(
+            source_id="test_source",
+            window_start=WINDOW_START,
+            missing_parts=["page-002"],
+            first_failed_at=WINDOW_START,
+            expires_at=WINDOW_END,
+        )
+        save_retry_marker(marker)
+
+        clear_retry_marker("test_source", WINDOW_START)
+
+        assert load_retry_markers("test_source") == []
+
+    def test_load_with_no_markers_returns_empty_list(self):
+        assert load_retry_markers("no_markers_here") == []

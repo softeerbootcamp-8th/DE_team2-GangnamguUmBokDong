@@ -122,3 +122,28 @@ def save(manifest: Manifest) -> None:
     storage.write_manifest(
         manifest.source_id, manifest.window_start, manifest.model_dump(mode="json")
     )
+
+
+class RetryMarker(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    source_id: str
+    window_start: datetime
+    missing_parts: tuple[str, ...]
+    first_failed_at: datetime
+    expires_at: datetime
+    attempts: int = 1
+
+
+def save_retry_marker(marker: RetryMarker) -> None:
+    storage.write_retry_marker(
+        marker.source_id, marker.window_start, marker.model_dump(mode="json")
+    )
+
+
+def load_retry_markers(source_id: str) -> list[RetryMarker]:
+    return [RetryMarker.model_validate(d) for d in storage.list_retry_markers(source_id)]
+
+
+def clear_retry_marker(source_id: str, window_start: datetime) -> None:
+    storage.delete_retry_marker(source_id, window_start)
