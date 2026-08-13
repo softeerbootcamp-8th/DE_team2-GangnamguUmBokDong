@@ -5,6 +5,11 @@ requires-python = "==3.11.*"
 dependencies = [
     "core",
     "requests>=2.34.2",
+    "boto3>=1.43.69",
+    "httpx>=0.28.1",
+    "pyarrow>=25.0.1",
+    "pydantic>=2.13.4",
+    "pyyaml>=6.0.3",
 ]
 
 [tool.uv]
@@ -12,3 +17,8 @@ package = false
 
 [tool.uv.sources]
 core = { path = "../libs/core", editable = true }
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]

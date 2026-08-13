@@ -11,10 +11,11 @@
 5. [검증 엔진](#5-검증-엔진)
 6. [상태 어휘와 manifest](#6-상태-어휘와-manifest)
 7. [재개 로직](#7-재개-로직)
-8. [로깅](#8-로깅)
-9. [실행 인터페이스](#9-실행-인터페이스)
-10. [구현 순서](#10-구현-순서)
-11. [검증 방법](#11-검증-방법)
+8. [부분 실패와 백필](#8-부분-실패와-백필)
+9. [로깅](#9-로깅)
+10. [실행 인터페이스](#10-실행-인터페이스)
+11. [구현 순서](#11-구현-순서)
+12. [검증 방법](#12-검증-방법)
 
 ---
 
@@ -34,16 +35,31 @@
 
 **설계 목표: 소스가 늘어도 공통 코드는 바뀌지 않는다.** 상태 어휘·재개·검증·manifest·로깅은 소스와 무관하게 완전히 동일하고, 소스마다 달라지는 것은 **fetch 어댑터 + YAML config** 뿐이다.
 
-수집 흐름은 한 프로세스 안에서 완결된다.
+수집 흐름은 한 프로세스 안에서 완결된다. **bronze는 응답이 도착할 때마다 조각으로 즉시
+저장하고, 검증과 silver는 window 전체를 모아 배치로 처리한다.**
 
 ```
-fetch() → raw(메모리) ─┬→ bronze/  (API 응답 원본, 무손실)
+       ┌─ 호출 1 → 응답 도착 ─→ bronze/…/1410/part=000.json.gz   (즉시 저장)
+fetch ─┼─ 호출 2 → 응답 도착 ─→ bronze/…/1410/part=001.json.gz
+       └─ 호출 N → 응답 도착 ─→ bronze/…/1410/part=00N.json.gz
+              │
+              └─ 조각은 메모리에도 계속 쌓인다 → window 전체가 모인 상태
                        │
-                       └→ normalize() → rows → 검증·정책 적용 ─┬→ silver/     (정제본, Parquet)
-                                                              └→ quarantine/ (폐기된 행 + 사유, JSONL)
+                       └→ normalize() → rows → 검증·정책 적용 ─┬→ silver/     (Parquet 1개)
+                                                              └→ quarantine/ (JSONL)
 
                                                    → _manifest/ (실행 상태·집계·아티팩트 경로)
 ```
+
+조각을 저장한 뒤에도 원본을 메모리에서 놓지 않으므로 **피크 메모리는 줄지 않는다.**
+이 방식이 노리는 것은 메모리가 아니라 ① 중간에 죽어도 받은 응답이 S3에 남는 것,
+② 실패 원인을 응답 원본으로 확인할 수 있는 것, ③ 큰 응답의 업로드 실패 범위를 조각
+하나로 좁히는 것이다. 근거는 [ADR 0003](../adr/0003-bronze-streaming-and-scaling-boundaries.md).
+
+**조각 하나가 실패해도 window 전체를 버리지 않는다.** 실패분은 라운드로 재시도하고, 그래도
+남으면 누락을 기록한 채 성공분으로 silver까지 진행한다. 시간 파라미터가 있는 소스는 별도
+백필 잡이 나중에 채워 넣는다. 근거는 [ADR 0004](../adr/0004-partial-fetch-and-backfill.md),
+상세는 [8절](#8-부분-실패와-백필).
 
 ---
 
@@ -52,6 +68,18 @@ fetch() → raw(메모리) ─┬→ bronze/  (API 응답 원본, 무손실)
 | 항목 | 결정 |
 | --- | --- |
 | bronze | API 응답 **원본 그대로** 무손실 저장. 정책이 바뀌어도 재수집 없이 재처리 가능 |
+| bronze 저장 시점 | **응답이 도착할 때마다 조각으로 즉시 저장.** 마지막에 몰아 쓰지 않는다 |
+| bronze 완결 판정 | `stage`는 **실행 진행도**만 뜻한다. 조각이 다 모였는지는 `completeness` · `missing`이 표현한다 |
+| 조각 실패 재시도 | 즉시 중단하지 않고 실패분을 모아 **최대 3라운드** 재시도 (라운드 간 15s → 30s 대기) |
+| 실패 분류 | `TRANSIENT`(재투입) · `PERMANENT`(그 조각만 포기) · `FATAL`(fetch 즉시 중단) |
+| fetch 안전장치 | `fetch_budget`(window 단위 시간 예산) · 서킷브레이커(연속 5회 실패) |
+| fetch 부분 실패 | 라운드 후에도 남은 누락은 **기록하고 진행한다.** `max_missing_ratio` 게이트가 판정 |
+| silver 저장 시점 | **window 전체를 모아 배치로 1회.** Parquet 파일 1개 |
+| 게이트 2종 | 수집(`max_missing_ratio`)과 폐기(`max_drop_ratio`)는 **독립.** `drop_ratio` 분모는 `fetched` |
+| 품질 게이트 실패 | 어느 쪽이든 초과 시 **silver를 쓰지 않는다.** `artifacts.silver = null` |
+| 완결도 | `completeness = kept / expected`를 manifest에 **정보로** 기록(게이트 아님) |
+| 빈 quarantine | 폐기 행이 0건이면 **객체를 만들지 않는다.** `artifacts.quarantine = null` |
+| 병렬화 경계 | 프로세스는 window 단위 그대로. 필요해지면 `fetch` **내부만** async로 (프로세스를 호출 단위로 쪼개지 않는다) |
 | 검증 정책 배치 | **소스 기본 4분면 + 컬럼별 오버라이드** |
 | 정책 2단계 | ① 컬럼 정책이 값 교정 → ② 행 정책이 최종 판정 (행 정책은 선택, 생략 시 스킵) |
 | 실패 시 재개 | **단계 체크포인트 + 멱등 재실행.** bronze가 있으면 fetch 스킵 |
@@ -61,8 +89,13 @@ fetch() → raw(메모리) ─┬→ bronze/  (API 응답 원본, 무손실)
 | 코드 위치 | **`collector/` 단독.** 소비자가 생기면 그때 `libs/core`로 승격 |
 | config 형식 | **YAML + 기동 시 검증.** 함수는 문자열 이름 → 레지스트리 조회 |
 | 행 처리 | **행 단위 dict 순회.** pandas 벡터화 아님 |
-| 어댑터 계약 | `fetch`(원본 획득) + `normalize`(행 = 레코드 변환) **2단계.** 소스별 응답 구조 차이를 여기서 흡수 |
+| 어댑터 계약 | `fetch`(`FetchResult`를 흘려보냄) + `normalize`(행 = 레코드 변환) **2단계.** 소스별 응답 구조 차이를 여기서 흡수 |
+| 실패 전달 | 어댑터는 예외가 아니라 **값**(`FetchResult.error`)으로 실패를 알린다. 라운드 · 백필은 어댑터 밖에서 돈다 |
+| 저장 책임 | 조각을 S3에 쓰는 것은 **pipeline**이다. 어댑터는 저장소를 알지 못한다 |
 | 어댑터 개수 | API **제공처 단위** 2개로 소스 7개를 모두 수용 |
+| 조각 ID | 파일명은 **요청 파생 키**(`part=page-00001-01000` · `part=grid-060x127`). 읽는 순서는 manifest `parts`가 결정 |
+| 백필 | 시간 파라미터가 있는 소스만(`backfill.enabled`). 마커로 대상 인덱싱, **나이 기준** 만료 |
+| 백필 갱신 | silver를 같은 경로에 **덮어쓰고** `revision` 증가. 하류는 window 단위 **멱등 재처리** |
 
 ---
 
@@ -74,13 +107,14 @@ fetch() → raw(메모리) ─┬→ bronze/  (API 응답 원본, 무손실)
 collector/
 ├── main.py                   # CLI 진입점 (인자 파싱 → pipeline 호출)
 ├── pipeline.py               # fetch→bronze→validate→silver 오케스트레이션 + 재개 분기
-├── manifest.py               # manifest 스키마, 읽기/쓰기, 상태 어휘(RunStatus/Stage)
+├── manifest.py               # manifest 스키마, 읽기/쓰기, 상태 어휘(RunStatus/Stage/FailureReason)
 ├── storage.py                # S3/MinIO 입출력, 경로 규칙 생성
 ├── logging_setup.py          # 구조화 로그 설정 (고정 필드 주입)
 ├── config/
 │   ├── schema.py             # SourceConfig / ColumnSpec / Policies (pydantic)
-│   └── loader.py             # YAML 로드 + 스키마 검증 + 정책 이름 검증 + 해시
+│   └── loader.py             # YAML 로드 + 스키마 검증 + 정책 이름·row_params 검증 + 해시
 ├── validation/
+│   ├── types.py              # Action / Issue / RowVerdict / RunContext (공유 계약 타입)
 │   ├── registry.py           # @policy / @row_policy 데코레이터, 이름→함수 매핑
 │   ├── policies.py           # 공통 정책 함수 구현체 (소스 무관)
 │   └── engine.py             # 행 순회 → 판정 → 정책 디스패치 → 결과 집계
@@ -101,13 +135,48 @@ collector/
 어댑터는 두 단계로 나뉜다. **소스마다 다른 응답 구조를 흡수하는 것이 어댑터의 책임**이고, 검증 엔진은 항상 "행 = 레코드"인 `list[dict]`만 받는다.
 
 ```python
-class Adapter(Protocol):
-    def fetch(self, config: SourceConfig, window: Window) -> RawResponse:
-        """API를 호출해 원본 응답을 그대로 반환한다. bronze에 이 값이 저장된다."""
+@dataclass(frozen=True)
+class FetchResult:
+    key: str                        # 조각 식별 키 (page-00001-01000 · grid-060x127)
+    payload: RawChunk | None        # 성공 시 원본 응답
+    error: FetchErrorKind | None    # 실패 시 TRANSIENT | PERMANENT | FATAL
+    expected_total: int | None      # 소스가 알려주는 전체 행 수 (첫 조각에만)
 
-    def normalize(self, raw: RawResponse) -> list[dict]:
-        """원본 응답을 행 = 레코드 형태로 변환한다."""
+
+class Adapter(Protocol):
+    def fetch(self, config: SourceConfig, window: Window, *,
+              skip: frozenset[str] = frozenset(),
+              expected_total: int | None = None) -> Iterator[FetchResult]:
+        """API를 호출해 조각을 하나씩 흘려보낸다.
+
+        한 번의 호출 = 한 조각이다. 응답을 가공하지 않으며, 조각을 S3에 저장하는 것은
+        pipeline의 책임이다. 어댑터는 저장소를 알지 못한다.
+
+        실패는 예외가 아니라 error가 채워진 FetchResult로 알린다. 라운드 재시도와
+        백필을 어댑터 밖에서 돌리기 위해서다. FATAL만 즉시 중단 신호로 쓴다.
+        """
+
+    def normalize(self, chunks: list[RawChunk]) -> list[dict]:
+        """조각 목록을 행 = 레코드 형태로 변환한다."""
 ```
+
+`fetch`가 값을 반환하지 않고 `yield`하는 이유는 **저장 책임을 어댑터에서 떼어내기
+위해서**다. 어댑터가 `storage`를 직접 부르면 어댑터 단위 테스트에 S3 목이 필요해지고,
+"어댑터는 네트워크만 안다"는 경계가 무너진다.
+
+`skip`은 **이미 확보한 조각 키**다. 라운드 재순회와 백필이 같은 인자를 쓴다. 어댑터는
+해당 키의 호출을 건너뛴다.
+
+`expected_total`은 서울 API가 첫 페이지를 skip해도 계획을 세울 수 있게 하는 힌트다.
+라운드 0에서 어댑터가 `list_total_count`를 실어 보내면 pipeline이 기억했다가 다음
+라운드·백필에 되돌려준다. 이 값이 그대로 manifest의 `counts.expected`가 되어 완결도
+계산에 쓰인다. 기상청처럼 전체 행 수를 알 수 없는 소스는 `None`이다.
+
+**어댑터가 예외 대신 값으로 실패를 알리는 이유**는 라운드 루프가 어댑터 밖에 있기
+때문이다. 예외로 올리면 첫 실패에서 이터레이터가 끊겨 나머지 조각을 시도할 수 없다.
+
+`normalize`는 조각 하나가 아니라 **조각 목록 전체**를 받는다. 서울 API는 페이지를 이어
+붙이고, 기상청은 격자별 응답을 pivot 그룹 키로 합쳐야 하므로 조각을 가로질러 봐야 한다.
 
 기상청 응답은 기온·습도·풍속이 **각각 별도 행으로 쌓인 long format**이라 `normalize`에서 pivot이 필요하다.
 
@@ -129,7 +198,8 @@ class Adapter(Protocol):
 - **응답 코드 검사**: 서울 API는 HTTP 200으로 응답하면서 본문에 에러 코드를 담는다. `rentBikeStatus.RESULT.CODE`가 `INFO-000`이 아니면 실패로 처리한다.
 - **페이지네이션**: 서울 API는 `list_total_count`와 `{시작}/{끝}` 인덱스로 순회한다. 한 번에 최대 1,000건.
 - **반복 호출**: 기상청은 격자(`nx`, `ny`)마다 별도 호출이 필요하다. 서울 전역을 커버할 격자 목록은 `adapter_params.grids`에 둔다.
-- **재시도**: 타임아웃·429·5xx는 지수 백오프로 재시도한다.
+- **재시도**: 호출 단위로 짧은 백오프 2회. 그 위에 조각 집합 단위 라운드가 얹히므로 백오프 횟수는 줄여 잡는다([8절](#8-부분-실패와-백필)).
+- **실패 범주 판정**: HTTP 상태와 응답 본문 코드를 `TRANSIENT` · `PERMANENT` · `FATAL` 중 하나로 매핑한다. 서울 API의 `RESULT.CODE`처럼 제공처마다 다른 규약이 여기서 흡수된다.
 
 ---
 
@@ -155,8 +225,17 @@ storage:
   partition: [dt, hh]               # dt=YYYY-MM-DD/hh=HH
 
 quality:
-  max_drop_ratio: 0.05              # 초과 시 PARTIAL이 아니라 FAILED
+  max_drop_ratio: 0.05              # 폐기 비율. 분모는 fetched. 초과 시 PARTIAL이 아니라 FAILED
+  max_missing_ratio: 0.0            # 수집 누락 비율. 기본 0.0 = 조각 하나만 빠져도 FAILED
   allow_empty: false                # 행 0건이면 FAILED (행사 소스는 true)
+
+fetch:                              # 선택. 생략하면 전부 기본값
+  budget: 2m30s                     # window 하나의 fetch 전체 예산
+                                    # 미지정 시 min(interval × 0.5, 30m)
+
+backfill:                           # 선택. 생략하면 enabled: false
+  enabled: false                    # 이 소스는 스냅샷 API라 과거 시점을 못 받는다
+  max_age: null                     # enabled: true일 때만 의미가 있다
 
 policies:                           # 4분면 기본값
   required_missing: drop_row
@@ -164,6 +243,9 @@ policies:                           # 4분면 기본값
   optional_missing:  keep_null
   optional_outlier:  set_null
   row: null                         # 행 정책 (선택). null이면 이 단계 스킵
+  row_params: null                  # 행 정책에 넘길 인자 (선택)
+                                    # 예: row: drop_if_issue_count_exceeds
+                                    #     row_params: { max_issues: 3 }
 
 columns:                            # 실제 API 응답 기준 (전 필드가 문자열로 내려온다)
   stationId:
@@ -209,11 +291,37 @@ columns:
   PTY: { types: [int],   enum: [0, 1, 2, 3, 5, 6, 7] }     # 강수형태
 ```
 
+### 신규 키의 기본값은 전부 "현행 동작"이다
+
+`max_missing_ratio` · `fetch` · `backfill` 세 키는 모두 **생략 가능**하고, 생략했을 때의 동작이 부분 실패 허용 이전과 같다. `max_missing_ratio: 0.0`은 조각 하나만 빠져도 FAILED이고 `backfill.enabled`의 기본값은 `false`다. 이렇게 두면 "소스를 추가할 때 YAML 하나만 쓰면 된다"는 목표가 유지되고, 부분 성공을 받아들일 소스만 명시적으로 연다.
+
+소스별 권장 초기값이다. 조각 수가 적은 소스에서는 비율 게이트가 사실상 이진 스위치라는 점을 감안한다(따릉이 실시간은 3페이지라 1개 실패 = 27~36%). 그래도 비율로 통일하는 이유는 `list_total_count`가 변하면 조각 수도 달라져 절대 개수 임계치가 더 불안정하기 때문이다.
+
+| 소스 | `max_missing_ratio` | `backfill.enabled` | `max_age` |
+| --- | --- | --- | --- |
+| 따릉이 실시간 대여정보 | 0.0 | false | — |
+| 서울 실시간 인구 데이터 | 0.0 | false | — |
+| 기상청 초단기 실황·예보 | 0.1 | true | 6h |
+| 기상청 단기예보 | 0.1 | true | 24h |
+| 따릉이 대여이력 | 0.05 | true | 7d |
+| 서울 생활인구(250m) | 0.05 | true | 7d |
+| 문화행사·공연행사 | 0.05 | true | 7d |
+
+`backfill.enabled`가 소스마다 다른 이유는 [8절](#8-부분-실패와-백필)에 있다. 시간 파라미터가 없는 API는 나중에 호출하면 그때 시점 데이터가 오므로 채워 넣을 수 없다.
+
+라운드 수 · 라운드 간 대기 · 서킷브레이커 임계는 **config에 노출하지 않는다.** 소스별로 다를 이유가 없고, 설정 키를 늘리면 소스 YAML 7개에 그대로 곱해진다. `adapters/base.py` 상수로 두고 필요해지면 그때 연다.
+
 `loader.py`는 로드 시점에 다음을 수행한다.
 
 1. pydantic 스키마 검증
 2. `on_missing`·`on_outlier`·`row`에 적힌 이름이 레지스트리에 실제로 등록돼 있는지 검증
-3. 파일 내용 SHA-256을 `config_version`으로 계산
+3. `row_params`를 해당 행 정책에 등록된 params 모델로 검증
+4. `backfill.enabled: true`인데 `max_age`가 없는 경우를 오류로 막는다
+5. 파일 내용 SHA-256을 `config_version`으로 계산
+
+3단계는 두 방향 모두 오류로 막는다 — params 모델이 있는 정책인데 `row_params`가 없거나 필드가 틀린 경우, 그리고 params를 받지 않는 정책에 `row_params`가 들어온 경우다. 이 단계가 없으면 `max_issue: 3` 같은 오타가 런타임까지 살아남는다.
+
+4단계가 필요한 이유는 `max_age` 없는 백필이 만료되지 않아 마커가 영원히 쌓이기 때문이다. 기본값을 주지 않고 오류로 막는 것은 소스마다 API 보관 기간이 다르고, 잘못된 기본값은 "만료된 줄 알았는데 계속 도는" 조용한 낭비가 되기 때문이다.
 
 **config 오타는 수집이 시작되기 전에 죽는다.**
 
@@ -231,7 +339,19 @@ columns:
 
 `types`는 "이 타입으로 해석 가능해야 한다"는 뜻이다. 서울 API는 숫자도 문자열로 주므로, 해석에 성공하면 **캐스팅된 값이 silver에 들어간다**(정규화 겸용). 실패하면 `TYPE_ERROR`로 판정한다.
 
-판정 결과는 `Issue(column, kind, required, raw_value, spec)`이고, `kind`는 `MISSING | TYPE_ERROR | OUTLIER` 중 하나다.
+판정 결과는 `Issue(column, kind, required, raw_value, spec)`이고, `kind`는 `MISSING | TYPE_ERROR | OUTLIER` 중 하나다. 이 타입들은 `validation/types.py`에 모아 둔다. registry · policies · engine · loader 네 곳이 공유하는 어휘이므로 레지스트리와 분리한다.
+
+### TYPE_ERROR의 디스패치
+
+4분면은 `missing` · `outlier` 2축뿐이므로 `TYPE_ERROR`의 목적지를 정해야 한다.
+
+**`TYPE_ERROR`는 outlier 계열로 보낸다.** 단 컬럼별 `on_outlier` 오버라이드는 적용하지 않고 소스 4분면 기본값(`required_outlier` · `optional_outlier`)만 쓴다.
+
+- missing 계열로 보내면 깨진다. `optional_missing`의 기본값 `keep_null`은 값을 그대로 두는 정책이고, 캐스팅 실패 값은 원본 문자열이다. silver 스키마가 config `types`로 고정된 상태에서 `"31.6xyz"`를 int 컬럼에 쓸 수 없다. outlier 계열은 `optional_outlier`가 `set_null`이라 자연히 정리된다.
+- 오버라이드를 제외하는 이유는 `clip_to_range` · `fill_zero`처럼 값을 교정하는 정책이 **캐스팅되지 않은 값에는 적용 자체가 불가능**하기 때문이다. `on_outlier`는 "타입은 맞지만 범위를 벗어난 값"을 겨냥한 설정이다.
+- 4분면 기본값 자체가 교정형인 경우가 남는다. 교정형 정책이 해석 불가능한 값을 받으면 `(None, Action.KEEP)`을 반환해 방어한다. `set_null`과 같은 효과가 되므로 규칙을 늘리지 않는다.
+
+`column_issues` 집계에는 `type_error`를 **별도 항목으로 유지한다.** 디스패치는 outlier와 합치지만 집계는 구분해야 원인을 추적할 수 있다.
 
 ### 정책 계약
 
@@ -255,10 +375,27 @@ def clip_to_range(value: Any, spec: ColumnSpec, row: dict, ctx: RunContext) -> t
 
 `drop_if_any_required_issue` · `drop_if_issue_count_exceeds` · `keep_always`
 
+행 정책은 `params`를 네 번째 인자로 받는다. 파라미터를 쓰지 않는 정책도 같은 시그니처를 유지해 엔진이 정책마다 호출 방식을 분기하지 않게 한다.
+
 ```python
 @row_policy("drop_if_any_required_issue")
-def drop_if_any_required_issue(row: dict, issues: list[Issue], ctx: RunContext) -> RowVerdict:
+def drop_if_any_required_issue(
+    row: dict, issues: list[Issue], ctx: RunContext, params: None
+) -> RowVerdict:
     """필수 컬럼에 문제가 하나라도 있으면 행을 폐기한다."""
+```
+
+파라미터가 필요한 정책은 pydantic 모델을 함께 등록한다. `loader.py`가 이 모델로 config의 `row_params`를 검증한다.
+
+```python
+class IssueCountParams(BaseModel):
+    max_issues: int
+
+@row_policy("drop_if_issue_count_exceeds", params=IssueCountParams)
+def drop_if_issue_count_exceeds(
+    row: dict, issues: list[Issue], ctx: RunContext, params: IssueCountParams
+) -> RowVerdict:
+    """이슈 개수가 임계값을 넘으면 행을 폐기한다."""
 ```
 
 새 정책이 필요하면 **함수 하나를 추가하고 YAML에서 이름으로 부른다.** 엔진 코드는 건드리지 않는다.
@@ -279,13 +416,30 @@ def drop_if_any_required_issue(row: dict, issues: list[Issue], ctx: RunContext) 
 | 상태 | 의미 |
 | --- | --- |
 | `RUNNING` | 실행 중 (시작 시 기록) |
-| `SUCCEEDED` | silver까지 완료, 폐기된 행 없음 |
-| `PARTIAL` | silver까지 완료, 일부 행 quarantine (`drop_ratio <= max_drop_ratio`) |
-| `FAILED` | 단계 실패, 또는 `drop_ratio > max_drop_ratio`, 또는 `allow_empty=false`인데 0건 |
+| `SUCCEEDED` | silver까지 완료, 폐기된 행 없고 누락된 조각도 없음 |
+| `PARTIAL` | silver까지 완료, 일부 행 quarantine **또는 일부 조각 누락** (두 게이트 모두 이내) |
+| `FAILED` | 단계 실패, 또는 게이트 초과(`max_drop_ratio` · `max_missing_ratio`), 또는 `allow_empty=false`인데 0건 |
 | `EMPTY` | 행 0건이지만 `allow_empty=true`라 정상 |
 | `SKIPPED` | 같은 멱등 키가 이미 `completed` — 아무것도 하지 않고 종료 |
 
-`Stage`(재개 근거): `fetched` → `bronze_written` → `validated` → `completed`
+`Stage`(재개 근거): `bronze_written` → `validated` → `completed`
+
+**`fetched` 단계는 두지 않는다.** 조각을 도착 즉시 저장하므로 실행이 `fetch₁ → save₁ → fetch₂ → save₂ → …`로 흐르고, 마지막 조각을 저장한 순간 두 상태가 동시에 달성된다. 도달할 수 없는 중간 단계를 어휘에 남기지 않는다.
+
+**`stage`는 실행이 어디까지 갔는지만 뜻한다.** 조각이 다 모였는지는 `completeness` · `missing`이 따로 표현하므로, `stage=completed`이면서 불완전한 window가 존재한다. `bronze_written`은 이제 "계획한 조각을 전부 받았다"가 아니라 "이번 실행이 fetch 단계를 마쳤다"는 뜻이고, 마쳤다는 판정에는 라운드 소진 · 예산 초과 · 서킷브레이커가 모두 포함된다.
+
+`FailureReason`(선택, `FAILED`일 때만): 재시도가 의미 있는 실패인지 구분한다.
+
+| 값 | 의미 | 재시도가 도움이 되는가 |
+| --- | --- | --- |
+| `fetch_error` | API 호출 실패, `max_missing_ratio` 초과, `FATAL`(인증 오류) | 예 (`FATAL`은 키를 고친 뒤) |
+| `storage_error` | bronze·silver·quarantine 쓰기 실패 | 예 |
+| `quality_gate` | `max_drop_ratio` 초과, 0건인데 `allow_empty=false`, `FAIL_BATCH` | **아니오** |
+| `config_error` | 스키마·정책 이름·`row_params` 검증 실패 | 아니오 |
+
+`quality_gate` 실패는 같은 bronze에 같은 config를 적용하므로 재개해도 결과가 같다. config를 고쳐 재처리해야 한다. status를 늘리지 않고 사유만 부가 정보로 남기므로 재개 분기는 이 필드를 보지 않는다.
+
+**게이트가 곧 `failure_reason`을 결정한다.** 수집 게이트에 걸리면 `fetch_error`(재시도·백필로 회복), 폐기 게이트에 걸리면 `quality_gate`(config 수정)다. 두 게이트를 하나로 합치지 않은 이유가 이것이다 — 합치면 71%라는 결과만 보고 재시도할 실패인지 config를 고칠 실패인지 판단할 수 없다.
 
 ```json
 {
@@ -294,15 +448,23 @@ def drop_if_any_required_issue(row: dict, issues: list[Issue], ctx: RunContext) 
   "window_end":   "2026-08-12T14:15:00Z",
   "status": "PARTIAL",
   "stage":  "completed",
+  "failure_reason": null,
   "attempt": 2,
+  "revision": 1,
   "started_at": "...", "ended_at": "...", "duration_ms": 4310,
   "artifacts": {
-    "bronze":     "s3://.../bronze/bike_station_realtime/dt=2026-08-12/hh=14/1410.json.gz",
+    "bronze": {
+      "prefix": "s3://.../bronze/bike_station_realtime/dt=2026-08-12/hh=14/1410/",
+      "parts":  ["page-00001-01000", "page-01001-02000", "page-02001-02765"]
+    },
     "silver":     "s3://.../silver/bike_station_realtime/dt=2026-08-12/hh=14/1410.parquet",
     "quarantine": "s3://.../quarantine/bike_station_realtime/dt=2026-08-12/hh=14/1410.jsonl"
   },
-  "counts": { "fetched": 2765, "kept": 2740, "repaired": 31, "dropped": 25 },
-  "drop_ratio": 0.009,
+  "counts": { "expected": 2765, "fetched": 2765, "kept": 2740, "repaired": 31, "dropped": 25 },
+  "missing": { "parts": [], "rows": 0, "basis": "rows" },
+  "drop_ratio":   0.009,
+  "completeness": 0.991,
+  "backfill_status": null,
   "column_issues": {
     "stationId":         { "missing": 25, "outlier": 0,  "type_error": 0 },
     "parkingBikeTotCnt": { "missing": 3,  "outlier": 28, "type_error": 0 }
@@ -312,13 +474,56 @@ def drop_if_any_required_issue(row: dict, issues: list[Issue], ctx: RunContext) 
 }
 ```
 
+### 수집 완결도 필드
+
+`counts.expected`부터 `completeness`까지가 **무엇이 빠졌는지**를 남기는 자리다. 부분 성공을 허용하면서도 침묵한 손실을 만들지 않기 위해 존재한다.
+
+| 필드 | 의미 |
+| --- | --- |
+| `counts.expected` | 소스가 알려준 전체 행 수. 서울은 `list_total_count`, 기상청은 `null` |
+| `missing.parts` | 끝내 받지 못한 조각 키 목록. 백필이 이 목록을 지목해 채운다 |
+| `missing.rows` | 누락 행 수(`expected - fetched`). `expected`가 `null`이면 `null` |
+| `missing.basis` | `rows`(행 기준) 또는 `parts`(조각 기준). 기상청은 `parts` |
+| `completeness` | `kept / expected`. **게이트가 아니라 정보다** |
+| `revision` | silver 내용이 바뀐 횟수. 백필로 재작성될 때마다 +1 |
+| `backfill_status` | `null`(해당 없음) · `pending`(마커 존재) · `expired`(만료) |
+
+`revision`과 `attempt`를 구분한다. `attempt`는 **실행 횟수**이고 `revision`은 **silver 내용이 바뀐 횟수**다. 실패한 재실행은 `attempt`만 올리고 `revision`은 그대로다. 하류가 재처리 여부를 판단할 때 보는 값은 `revision`이다.
+
+`completeness`를 게이트로 쓰지 않는 이유는 두 게이트(`max_missing_ratio` · `max_drop_ratio`)가 이미 각 단계를 막고 있기 때문이다. 세 번째 임계치를 두면 소스 7개마다 튜닝할 값이 하나 더 늘어난다. 대신 게이트 둘을 각각 통과했는데 손실이 곱해져 최종 68%가 되는 경우를 하류가 알 수 있게 값만 남긴다.
+
 `config_version`은 **이 silver가 어떤 정책으로 만들어졌는지**를 남긴다. 나중에 범위 기준을 바꾸면 이 해시로 재처리 대상을 골라낼 수 있다.
 
-경로 규칙은 `storage.py` 한 곳에서만 만든다.
+`artifacts`의 세 항목은 형태와 null 가능 여부가 다르다.
+
+| 키 | 형태 | null이 되는 경우 |
+| --- | --- | --- |
+| `bronze` | `{prefix, parts}` | `bronze_written` 미도달 |
+| `silver` | 단일 키 | 게이트(`max_missing_ratio` · `max_drop_ratio`) 초과로 silver를 쓰지 않았을 때 |
+| `quarantine` | 단일 키 | 폐기 행이 0건이라 객체를 만들지 않았을 때 |
+
+`bronze`가 조각 목록을 갖는 이유는 `read_bronze`가 무엇을 어떤 순서로 읽어야 하는지 알아야 하고, S3 LIST에 의존하지 않도록 명시적으로 기록하기 때문이다. **`parts`에 없는 조각은 읽지 않는다** — 이 규칙이 백필 모드에서 `clear_bronze`를 생략해도 유령 조각이 섞이지 않게 막는다. `quarantine`은 폐기 0건인 실행이 대부분이므로 빈 객체를 만들지 않는다 — 5분 주기 소스 3종이면 하루 864개가 쌓인다. 이 파일을 읽는 쪽은 부재를 정상으로 처리한다.
+
+경로 규칙은 `storage.py` 한 곳에서만 만든다. bronze는 조각으로 저장되므로 window마다
+디렉토리를 하나 더 갖는다.
 
 ```
-{layer}/{source_id}/dt={date}/hh={hour}/{HHMM}.{ext}
+bronze              bronze/{source_id}/dt={date}/hh={hour}/{HHMM}/part={chunk_key}.json.gz
+silver·quarantine   {layer}/{source_id}/dt={date}/hh={hour}/{HHMM}.{ext}
+_manifest           _manifest/{source_id}/dt={date}/hh={hour}/{HHMM}.json
+_retry_queue        _retry_queue/{source_id}/{window_start}.json
 ```
+
+`{chunk_key}`는 **요청을 식별하는 키**다. 어댑터가 요청 파라미터에서 만든다.
+
+```
+part=page-00001-01000.json.gz     서울 — 페이지 인덱스 범위
+part=grid-060x127.json.gz         기상청 — 격자 좌표
+```
+
+순번(`part={NNN}`)을 쓰지 않는 이유는 실행 간에 안정적이지 않기 때문이다. `list_total_count`가 2,765에서 2,770으로 변하면 마지막 페이지 범위가 달라져 같은 번호가 다른 요청을 가리키고, 그러면 백필이 조각을 지목할 수 없다. 순번이 맡던 **순서 보장은 이미 `artifacts.bronze.parts` 목록이 하고 있으므로** 잃는 것이 없다. 페이지 인덱스를 제로 패딩하면 문자열 정렬도 호출 순서와 일치하고, 기상청 격자는 pivot 그룹 키에 `nx`·`ny`가 들어가 순서와 무관하다.
+
+`_retry_queue`는 백필 대상 인덱스다([8절](#8-부분-실패와-백필)).
 
 ---
 
@@ -328,51 +533,276 @@ def drop_if_any_required_issue(row: dict, issues: list[Issue], ctx: RunContext) 
 manifest = manifest.load(source_id, window_start)   # 없으면 None
 
 if manifest and manifest.stage == Stage.COMPLETED and not force:
-    return SKIPPED                                          # 멱등 — 재실행해도 안전
-if manifest and manifest.stage >= Stage.BRONZE_WRITTEN and not force:
-    raw = storage.read_bronze(manifest.artifacts.bronze)     # fetch 건너뛰기
-else:
-    raw = adapter.fetch(config, window)
-    storage.write_bronze(raw)
+    if backfill and manifest.missing.parts:                   # ← 분기 4 (백필)
+        have   = set(manifest.artifacts.bronze.parts)         # clear_bronze 하지 않는다
+        chunks = storage.read_bronze(manifest.artifacts.bronze)
+        new, missing = fetch_with_rounds(                     # 누락 조각만 호출
+            adapter, config, window,
+            skip=have, expected_total=manifest.counts.expected)
+        chunks += new
+        manifest.update(parts=have | new.keys(), missing=missing)
+    else:
+        return SKIPPED                                        # 멱등 — 재실행해도 안전
 
-rows = adapter.normalize(raw)                                # 원본 → 행 = 레코드
-# 이후 검증 → silver → manifest 갱신
+elif manifest and manifest.stage >= Stage.BRONZE_WRITTEN and not force:
+    chunks = storage.read_bronze(manifest.artifacts.bronze)   # 조각을 순서대로 읽는다
+
+else:
+    storage.clear_bronze(source_id, window_start)             # 이전 실행의 조각을 비운다
+    chunks, missing = fetch_with_rounds(adapter, config, window)   # 8절 — 라운드·저장 포함
+    manifest.update(stage=Stage.BRONZE_WRITTEN, parts=[...], missing=missing)
+
+rows = adapter.normalize(chunks)                              # 항상 다시 수행
+# 이후 게이트 → 검증 → silver → manifest 갱신 (백필이면 revision +1)
 ```
+
+분기는 넷이다.
+
+| # | 조건 | 동작 |
+| --- | --- | --- |
+| 1 | `stage=completed` & 누락 없음 & `!force` | SKIPPED |
+| 2 | `stage>=bronze_written` & `!force` | bronze 재사용 |
+| 3 | 그 외 (또는 `--force`) | `clear_bronze` + 전체 fetch |
+| 4 | `stage=completed` & 누락 존재 & `--backfill` | **`clear_bronze` 없이 누락 조각만 fetch → 기존 조각과 합쳐 전체 재처리 → silver 덮어쓰기, `revision` +1** |
+
+`stage`를 `bronze_written`으로 올리는 것은 **fetch 단계를 마친 뒤**다. 라운드를 소진했든
+예산이 끝났든 서킷브레이커가 걸렸든, 더 이상 호출하지 않기로 결정한 시점이다. 그 전에 죽으면
+조각이 S3에 남아 있어도 미완결로 취급되고 재실행은 fetch부터 다시 한다. **조각 단위 재개는
+백필 모드에서만 한다.**
+
+`clear_bronze`가 필요한 이유는 조각 수가 실행마다 달라질 수 있기 때문이다. 1회차에 5조각,
+2회차에 3조각이 나오면 이전 조각 2개가 유령으로 남는다. **백필 모드는 예외다** — 기존 조각을
+살리는 것이 목적이고, 유령 조각은 "`parts`에 없는 조각은 읽지 않는다"는 규칙이 막는다.
 
 `normalize`는 bronze 재사용 여부와 무관하게 **항상 다시 수행한다.** 네트워크를 타지 않는 순수 변환이라 비용이 없고, bronze가 정규화 전 원본을 담고 있으므로 이 편이 단순하다.
 
 실시간 API(5분 주기)는 몇 분만 지나도 그 시점 데이터를 영영 받을 수 없다. silver 저장에서 실패했을 때 fetch부터 다시 하면 **지금 시점의 다른 데이터로 덮어쓰게 되므로**, bronze 재사용이 재개의 핵심이다. `--force`는 이 분기를 무시하고 처음부터 다시 수행한다.
 
 ```
-1회차:  fetch ✓ → bronze ✓ → 정제 ✓ → silver ✗ (S3 오류)   manifest: stage=validated, status=FAILED
-2회차:  fetch ⤳ skip (bronze 재사용) → 정제 ✓ → silver ✓    manifest: stage=completed, status=PARTIAL
+1회차:  bronze ✓ (조각 3개) → 정제 ✓ → silver ✗ (S3 오류)
+        manifest: stage=validated, status=FAILED, failure_reason=storage_error
+2회차:  fetch ⤳ skip (bronze 재사용) → 정제 ✓ → silver ✓
+        manifest: stage=completed, status=PARTIAL
 ```
 
 ---
 
-## 8. 로깅
+## 8. 부분 실패와 백필
+
+> 근거는 [ADR 0004](../adr/0004-partial-fetch-and-backfill.md).
+
+한 window를 여러 번 호출하는데 그중 일부만 실패했을 때, **성공분을 버리지 않고 실패분만 다시 받는다.** 세 단계로 나뉜다 — 실행 안에서 라운드로 재시도하고, 그래도 남으면 누락을 기록한 채 진행하며, 시간 파라미터가 있는 소스는 별도 잡이 나중에 채운다.
+
+### 8.1 라운드 재시도
+
+```
+라운드 0 : 전체 조각 순회 → 성공분 즉시 bronze 저장, 실패분 수집
+  ↓ 대기 15s
+라운드 1 : TRANSIENT 실패분만 재순회
+  ↓ 대기 30s
+라운드 2 : 남은 TRANSIENT 실패분만 재순회
+  ↓
+남은 것은 누락 확정 → 완결도 게이트
+```
+
+**핵심은 재시도 횟수가 아니라 시간 간격이다.** 호출 단위 백오프는 수 초 안에서 움직이는데, 조각 실패의 주된 원인인 429는 그 시간 스케일에서 풀리지 않고 오히려 rate limit 창을 연장시킨다. 라운드 방식은 다른 조각을 받는 동안 자연히 수십 초를 벌고 그 뒤에 다시 시도한다.
+
+부수 효과로 **실패 위치에 따른 불공평**도 사라진다. 기존에는 page 0에서 실패하면 그 window에 대해 API를 사실상 한 번 부르고 끝났고, page 19에서 실패하면 20번 부르고 끝났다.
+
+라운드를 넣으면 총 시도가 `라운드 × 호출당 백오프`로 곱해지므로 **호출당 백오프는 2회로 줄인다.** 총 시도는 3회에서 6회로 늘지만 시간 분포가 2초에서 45초 이상으로 넓어진다. `Retry-After` 헤더가 오면 항상 존중하고, 그 값이 남은 예산을 넘으면 해당 조각을 이번 실행에서 포기한다.
+
+### 8.2 실패 3범주
+
+| 범주 | 해당 | 라운드 재투입 | 비고 |
+| --- | --- | --- | --- |
+| `TRANSIENT` | 타임아웃, 429, 5xx, 서울 `ERROR-5xx` | O | |
+| `PERMANENT` | 400, 404 | X | 그 조각만 누락 확정 |
+| `FATAL` | 401·403, 서울 `INFO-100`(인증키 오류) | X | **fetch 전체 즉시 중단** |
+
+`FATAL`을 분리하는 이유는 **모든 조각이 같은 인증키를 쓰기 때문**이다. page 0이 401이면 나머지도 401이므로, 20개 조각 × 6회 = 120번을 부르고 아무것도 성공하지 못한다. 서킷브레이커가 결국 잡지만 원인이 확정적인데 기다릴 이유가 없다. `FATAL`은 게이트도 백필도 타지 않고 `failure_reason=fetch_error`로 즉시 끝난다 — 재시도도 백필도 무의미하고 키를 고쳐 `--force`로 재실행할 문제다.
+
+`PERMANENT`를 분리하는 이유는 확정된 실패를 세 라운드 반복하지 않기 위해서다.
+
+서울 API의 **`INFO-200`(해당 데이터 없음)은 빈 결과로 성공 처리한다.** 실패로 보면 정상 상황이 누락으로 집계되어 완결도가 왜곡된다.
+
+### 8.3 안전장치 셋
+
+| 장치 | 값 | 초과 시 |
+| --- | --- | --- |
+| `fetch_budget` | `min(interval × 0.5, 30m)` 기본, 소스별 오버라이드 | 새 호출 중단(진행 중인 호출은 마무리) → 게이트 |
+| 서킷브레이커 | 연속 실패 5회 | 라운드를 더 돌지 않고 fetch 종료 → 게이트 |
+| 라운드 간 대기 | 15s → 30s | — |
+
+**`fetch_budget`은 window 하나의 fetch 단계 전체 예산이다.** 호출 하나의 응답 대기 상한(httpx timeout)과는 층이 다르다.
+
+```
+window (interval 5m)
+└─ fetch_budget 2m30s ────────── window 하나의 fetch 전체
+   ├─ 라운드 0
+   │  └─ 조각 page-00001-01000
+   │     ├─ 시도 1 ── httpx timeout 10s
+   │     └─ 시도 2 ── httpx timeout 10s
+   ├─ 대기 15s
+   └─ 라운드 1 …
+```
+
+호출 단위 제한만으로는 전체 시간을 통제할 수 없다. 480페이지가 전부 타임아웃이면 호출당 10초씩 지켜도 480 × 10s × 2회 = 160분이 된다. 측정은 fetch 진입 시각부터이고 `normalize` 이후는 예산 밖이다(네트워크를 타지 않아 결정적이고, 프로세스 전체 상한은 Airflow 태스크 타임아웃이 담당한다). 판정은 **새 호출을 시작하기 직전에만** 하므로 진행 중인 호출은 끝까지 두고 거의 다 받은 응답을 버리지 않는다.
+
+**서킷브레이커를 비율이 아닌 연속 실패로 판정하는 이유**는 비율이 조각 수에 따라 의미가 달라지기 때문이다. 조각 3개짜리에서 1개 실패는 33%라 정상 상황에 발동하고, 480개짜리에서는 100개가 실패해도 미발동한다. 연속 5회는 조각 수가 적은 소스에서 사실상 발동하지 않지만 그런 소스는 헛수고 규모 자체가 작다.
+
+발동 시 **다음 라운드로 넘어가지 않는다.** 연속 5개 실패는 개별 조각 문제가 아니라 서비스 상태 문제이고, 15초 뒤 라운드가 성공할 가능성이 낮다.
+
+**라운드 간 대기**가 필요한 이유는 조각 3개짜리 소스에서 라운드 0이 1~2초 만에 끝나기 때문이다. 대기가 없으면 "다른 일을 하며 시간을 번다"는 이점이 사라진다.
+
+### 8.4 게이트와 완결도
+
+부분 성공은 **모든 소스에서 허용**하되 `max_missing_ratio`가 판정한다. 기본값 `0.0`이므로 명시적으로 열지 않은 소스는 조각 하나만 빠져도 FAILED다.
+
+```
+fetch 종료 (라운드 소진 · 예산 초과 · 서킷브레이커)
+   ↓
+성공 조각으로 missing_ratio 계산
+   ↓
+   ├─ max_missing_ratio 이내 → normalize → 검증 → max_drop_ratio 판정 → silver
+   │                            status=PARTIAL, 종료 코드 0
+   └─ 초과 → silver 쓰지 않음, status=FAILED, failure_reason=fetch_error, 종료 코드 non-zero
+```
+
+**두 게이트는 독립이고 `drop_ratio`의 분모는 `fetched`를 유지한다.** 분모를 `expected`로 바꾸면 수집이 완전한 평상시에는 두 계산이 같고 **장애 때만 폐기율이 튀는 지표**가 된다. 운영자가 "폐기율이 왜 튀었지? 정책이 잘못됐나?" 하고 엉뚱한 곳을 보게 된다.
+
+대가로 부분 수집 시 폐기 게이트가 다소 엄격해진다. 2,765행 중 2,000행만 받고 110행을 폐기하면 `110/2000 = 5.5%`로 임계 5%를 넘지만 원본 기준으로는 4.0%다. 이 오차는 **통과시킬 것을 막는 안전한 방향**이고, 막힌 window는 백필 대상으로 회복 가능하다. 게다가 `max_missing_ratio` 기본값 `0.0`에서는 누락이 있는 순간 수집 게이트에서 이미 죽으므로 **누락을 명시적으로 연 소스에서만** 발생한다.
+
+**종료 코드는 부분 성공에서 0이다.** 부분 성공도 `stage=completed`로 끝나므로 non-zero를 반환해 Airflow가 retry를 돌려도 재개 분기 1번이 즉시 `SKIPPED`로 빠진다. 재시도가 할 일이 없는데 태스크만 실패로 뜨는 셈이라, 채워 넣는 일은 백필 잡에 맡기고 가시성은 WARN 로그 · manifest · 마커로 확보한다.
+
+### 8.5 백필
+
+**백필은 과거 시점을 지정할 수 있는 API에만 성립한다.**
+
+| 소스 | 시간 파라미터 | `backfill.enabled` |
+| --- | --- | --- |
+| 따릉이 실시간 대여정보 | 없음(`{시작}/{끝}`은 페이지 인덱스) | `false` |
+| 서울 실시간 인구 데이터 | 없음 | `false` |
+| 기상청 초단기 · 단기예보 | `base_date` · `base_time` | `true` |
+| 따릉이 대여이력 · 생활인구 · 문화행사 | 날짜 지정 | `true` |
+
+따릉이 실시간 API는 현재 상태만 돌려준다. 14:10 window의 조각을 15:00에 다시 부르면 **15:00 시점 데이터**가 오므로 채워 넣으면 백필이 아니라 오염이다. `false`인 소스는 부분 성공을 허용하되 그 window를 **불완전 확정**으로 남긴다 — 5분 뒤 다음 window가 오므로 회복 가능한 손실이지만, 시점이 섞인 행은 하류가 알아채기 어려워 ML 피처까지 조용히 흘러간다.
+
+#### 대상 발견 — 마커는 인덱스, manifest는 진실
+
+```json
+// _retry_queue/{source_id}/{window_start}.json
+{ "source_id": "bike_rental_history", "window_start": "2026-08-12T14:10:00Z",
+  "missing_parts": ["page-02001-02765"],
+  "first_failed_at": "2026-08-12T14:10:31Z",
+  "expires_at": "2026-08-19T14:10:00Z",
+  "attempts": 3 }
+```
+
+manifest 전수 스캔은 대상 소스 5종 기준 하루 442개, 보관 7일이면 3,094개를 매 실행마다 훑는다. 마커는 **스캔 비용이 실패 건수에 비례**하고 평상시에는 LIST 한 번에 빈 결과다.
+
+백필 잡은 마커로 후보를 얻은 뒤 **반드시 manifest를 읽어 실제 상태를 확인한다.** 그러면 두 곳에 상태가 있는 대가가 무해해진다.
+
+| 어긋난 상황 | 결과 |
+| --- | --- |
+| 마커는 있는데 manifest는 완결 | 걸러지고 마커 삭제 |
+| 마커 삭제 실패로 잔존 | 다음 잡이 스킵 (멱등) |
+| 마커 생성 실패 | 백필 안 됨 — 이미 불완전 확정된 건이라 상태가 나빠지지 않음 |
+
+마커 생성 실패의 최악이 "백필을 안 하는 것"이지 잘못된 데이터가 아니므로, 마커 쓰기를 실행 성공 여부에 묶지 않아도 된다.
+
+**게이트 초과로 FAILED가 된 window도 마커를 남긴다.** bronze 조각은 남아 있으므로 백필이 채우면 완결시킬 수 있다. FAILED를 제외하면 가장 많이 빠진 window가 백필 대상에서 빠지는 모순이 생긴다.
+
+#### 만료 — 나이 기준
+
+`backfill.max_age`로 판정한다. 실제 제약이 시간이기 때문이다 — 기상청 허브 보관 기간, 서울 API 과거 조회 범위가 물리적 상한이고 그걸 넘으면 몇 번을 시도하든 못 받는다. 시도 횟수는 잡 주기에 따라 의미가 달라지므로 게이트로 쓰지 않고 마커에 기록만 한다("3일째 매시간 실패 중"을 운영자가 알 수 있게).
+
+만료 시 마커를 삭제하고 manifest에 `backfill_status: expired`를 남긴다. `completeness`가 최종값으로 굳는다.
+
+#### silver 갱신 — 덮어쓰기 + revision
+
+bronze 조각이 보완되면 그 window를 처음부터 다시 처리해 **같은 경로에 덮어쓰고** `revision`을 올린다.
+
+```
+14:10  실행 → 조각 2/3 성공 → silver(1,982행, completeness 0.72), revision 1
+             → _retry_queue 마커, 종료 코드 0
+16:00  백필 → 누락 조각만 호출 → bronze 보완 → 전체 재처리
+             → silver 덮어쓰기(2,740행, completeness 1.0), revision 2, 마커 삭제
+```
+
+추가 파일로 append하지 않는 이유는 "window 하나 = Parquet 하나"가 깨지면 하류가 디렉토리 스캔과 dedup을 떠안기 때문이다. 재처리 비용은 사실상 없다 — `normalize`와 검증은 네트워크를 타지 않는 순수 연산이고, "`normalize`는 bronze 재사용 여부와 무관하게 항상 다시 수행한다"는 결정이 이미 있다.
+
+**하류 계약**: silver는 불변이 아니다. window 단위로 교체될 수 있고, 하류는 `revision`을 보고 멱등 재처리한다.
+
+백필 자체가 부분 실패해도 된다. 5개 중 3개만 채웠으면 silver를 갱신하고(`revision` +1, `completeness` 상승) 마커의 `missing_parts`를 남은 2개로 줄여 유지한다. **백필은 한 번에 완결될 필요가 없다.**
+
+#### 실행 형태
+
+Airflow에 소스별이 아닌 **단일 DAG 하나**를 둔다. `_retry_queue/`를 LIST하고 대상마다 아래를 호출한다.
+
+```bash
+uv run python main.py --source {source_id} --window-start {window_start} --backfill
+```
+
+백필 잡은 collector 로직을 복제하지 않고 재개 분기 4번을 부르는 얇은 껍데기다. **DAG 주기와 소스별 `max_age` 확정은 DAG 구현 시점의 과제다.**
+
+---
+
+## 9. 로깅
 
 배치당 몇 줄, **행당 0줄**. 행 상세는 quarantine 파일이 담당한다 (2,765행 × 288회/일이면 로그가 터진다).
 
+조각마다 로그를 남기지도 않는다. 아래 3줄이 한 배치의 정상 출력 전부다.
+
 ```
-INFO  source_id=bike_station_realtime window=2026-08-12T14:10Z stage=fetched  rows=2765 ms=1203
-INFO  source_id=… stage=bronze_written key=s3://…/1410.json.gz bytes=482113
-WARN  source_id=… stage=validated status=PARTIAL kept=2740 repaired=31 dropped=25 drop_ratio=0.009
-INFO  source_id=… stage=completed key=s3://…/1410.parquet
+INFO  source_id=bike_station_realtime window=2026-08-12T14:10Z stage=bronze_written parts=3/3 rounds=1 rows=2765 bytes=482113 ms=1203
+WARN  source_id=… stage=validated status=PARTIAL kept=2740 repaired=31 dropped=25 drop_ratio=0.009 completeness=0.991
+INFO  source_id=… stage=completed revision=1 key=s3://…/1410.parquet
+```
+
+첫 줄이 fetch 완료와 bronze 완료를 한꺼번에 알린다 — `Stage`에 `fetched`가 없으므로 조각 저장이 끝난 시점 한 줄로 통합하고, `parts`로 **받은 조각 / 계획한 조각**을, `rounds`로 라운드 수를 남긴다. 라운드마다 로그를 남기지는 않는다.
+
+누락이 발생하면 첫 줄이 WARN이 되고 무엇이 빠졌는지 붙는다.
+
+```
+WARN  source_id=… stage=bronze_written parts=2/3 rounds=3 missing=page-02001-02765 missing_rows=765 completeness=0.717
+```
+
+실패 시에는 `failure_reason`을 붙인다.
+
+```
+ERROR source_id=… stage=validated status=FAILED failure_reason=quality_gate dropped=412 drop_ratio=0.149
+ERROR source_id=… stage=bronze_written status=FAILED failure_reason=fetch_error missing_ratio=0.638 reason=circuit_breaker
+```
+
+백필 실행은 `revision` 변화를 남긴다.
+
+```
+INFO  source_id=… mode=backfill parts=1 filled=page-02001-02765 revision=1→2 completeness=0.717→1.0
 ```
 
 `logging_setup.py`가 `source_id`·`window`·`attempt`를 고정 필드로 주입해 모든 로그에 자동으로 붙인다.
 
 ---
 
-## 9. 실행 인터페이스
+## 10. 실행 인터페이스
 
 ```bash
 cd collector
-uv run python main.py --source bike_station_realtime --window-start 2026-08-12T14:10:00Z [--force]
+uv run python main.py --source bike_station_realtime --window-start 2026-08-12T14:10:00Z [--force] [--backfill]
 ```
 
 Airflow는 소스별 태스크에서 `data_interval_start`를 `--window-start`로 넘긴다. `window_end`는 config의 `schedule.interval`로 계산한다. **collector 자체는 스케줄을 모른다.**
+
+`--force`와 `--backfill`은 목적이 반대다.
+
+| 플래그 | 의미 | bronze |
+| --- | --- | --- |
+| `--force` | 재개 분기를 무시하고 처음부터 다시 | `clear_bronze` 후 전체 재수집 |
+| `--backfill` | 완결된 window의 **누락 조각만** 채움 | 기존 조각 유지, 빠진 것만 호출 |
+
+둘을 함께 주는 것은 `--force`와 같으므로 오류로 막는다. 백필 DAG가 호출하는 쪽은 `--backfill`이다([8.5절](#85-백필)).
+
+**종료 코드**: `SUCCEEDED` · `PARTIAL` · `EMPTY` · `SKIPPED`는 0, `FAILED`는 non-zero다. 누락이 있어도 게이트를 통과했으면 `PARTIAL`이므로 0이다 — 부분 성공은 `stage=completed`로 끝나 재실행해도 `SKIPPED`로 빠지므로 Airflow retry가 할 일이 없고, 채우는 일은 백필 잡이 맡는다.
 
 **추가 의존성**: `httpx` · `pyyaml` · `pydantic` · `pyarrow` · `boto3`
 
@@ -387,26 +817,27 @@ Airflow는 소스별 태스크에서 `data_interval_start`를 `--window-start`�
 
 ---
 
-## 10. 구현 순서
+## 11. 구현 순서
 
 각 단계는 테스트를 먼저 작성한다.
 
 | 순서 | 대상 | 내용 |
 | --- | --- | --- |
-| 1 | config 스키마 + 로더 | pydantic 모델, YAML 로드, 정책 이름 존재 검증, 해시 |
-| 2 | 정책 레지스트리 + 공통 정책 함수 | 데코레이터 등록, 함수 10종 |
+| 1 | config 스키마 + 로더 | pydantic 모델, YAML 로드, 정책 이름·`row_params` 검증, 해시 |
+| 2 | 계약 타입 + 정책 레지스트리 + 공통 정책 함수 | `types.py`, 데코레이터 등록(params 모델 포함), 함수 10종 |
 | 3 | 검증 엔진 | 판정 3단계, 4분면 × 정책 디스패치, 행 정책, 집계 |
-| 4 | storage + manifest | 경로 규칙, MinIO 읽기/쓰기, 상태 어휘 |
-| 5 | 어댑터 base + `seoul_openapi` | `fetch`/`normalize` 프로토콜, `RESULT.CODE` 검사, 페이지네이션, 재시도 |
-| 6 | pipeline | 4단계 오케스트레이션 + 재개 분기 |
-| 7 | main.py + 로깅 | CLI, 구조화 로그 |
+| 4 | storage + manifest | 경로 규칙(조각 키), bronze 조각 쓰기·읽기·정리, `_retry_queue` 마커 I/O, 상태 어휘, 완결도 필드 |
+| 5 | 어댑터 base + `seoul_openapi` | `FetchResult` 계약, 실패 3범주, 라운드·예산·서킷브레이커, `RESULT.CODE` 검사, 페이지네이션 |
+| 6 | pipeline | 4단계 오케스트레이션 + 재개 분기 4가지 + 게이트 2종 |
+| 7 | main.py + 로깅 | CLI(`--force` · `--backfill`), 구조화 로그 |
 | 8 | 소스 YAML 확장 | 1개로 end-to-end 검증 → 나머지 6개 추가 (+ `kma_apihub` 어댑터의 격자 반복·pivot) |
+| 9 | 백필 DAG | `_retry_queue` LIST → `--backfill` 호출. 주기와 소스별 `max_age` 확정 |
 
-1~3단계는 네트워크와 S3 없이 순수 단위 테스트로 끝난다.
+1~3단계는 네트워크와 S3 없이 순수 단위 테스트로 끝난다. 9단계는 8단계까지 끝나야 실제 마커로 검증할 수 있다.
 
 ---
 
-## 11. 검증 방법
+## 12. 검증 방법
 
 ### 단위 테스트
 
@@ -414,11 +845,35 @@ Airflow는 소스별 태스크에서 `data_interval_start`를 `--window-start`�
 cd collector && uv run pytest
 ```
 
-- 정책 함수 10종 각각
-- 검증 엔진: (필수/선택) × (결측/이상치/타입오류) 6조합 × 정책별 기대 동작
-- 재개: manifest `stage`별 분기 (없음 / `bronze_written` / `completed` / `--force`)
+- 정책 함수 10종 각각. 교정형 3종(`clip_to_range`·`fill_zero`·`fill_default`)은 캐스팅
+  실패 값을 넣어 `(None, KEEP)`이 나오는지도 확인
+- config 로더: 정책 이름 오타, `row_params` 필드 오타, params를 받지 않는 정책에
+  `row_params`가 온 경우가 모두 로드 시점에 죽는지
+- 검증 엔진: (필수/선택) × (결측/이상치/타입오류) 6조합 × 정책별 기대 동작.
+  타입오류 2조합은 컬럼 `on_outlier`가 있어도 4분면 기본값이 적용되는지 함께 확인
+- 재개: manifest `stage`별 분기 5가지 (없음 / `bronze_written` / `completed` / `--force` /
+  `completed` + 누락 + `--backfill`)
 - 어댑터 `fetch`: `httpx.MockTransport`로 페이지네이션·재시도·`RESULT.CODE` 에러 처리 검증
 - 어댑터 `normalize`: 기상청 long → wide pivot이 관측 항목을 컬럼으로 올바르게 펴는지 검증
+- bronze 조각 왕복: 저장한 조각들을 `read_bronze`로 읽은 결과가 `fetch`가 흘려보낸 원본과
+  **순서까지** 같은지 검증
+- `clear_bronze`: 조각 수가 줄어든 재실행(5조각 → 3조각)에서 유령 조각이 남지 않는지 검증
+
+부분 실패·백필 관련([8절](#8-부분-실패와-백필))
+
+- 라운드: 라운드 0에서 429 → 라운드 1에서 성공하는 시나리오가 `completeness 1.0`으로
+  끝나는지. 3라운드를 모두 실패하면 누락으로 확정되는지
+- 실패 3범주: `TRANSIENT`는 재투입되고, `PERMANENT`는 라운드에서 제외되며, `FATAL`은
+  게이트·마커 없이 즉시 종료되는지
+- 서킷브레이커: 연속 5회 실패 후 남은 조각을 호출하지 않는지
+- `fetch_budget`: 초과 시 새 호출을 시작하지 않고 진행 중 호출만 마무리하는지
+- 게이트 조합: `max_missing_ratio` × `max_drop_ratio` 통과/초과 4조합. 기본값 `0.0`에서
+  기존과 동일하게 조각 하나만 빠져도 FAILED인지
+- 조각 키: 서울 페이지 범위·기상청 격자 키 생성, `skip`으로 호출이 실제로 생략되는지,
+  제로 패딩 정렬이 호출 순서와 일치하는지
+- `INFO-200`: 빈 결과로 성공 처리되어 누락에 집계되지 않는지
+- 마커: 불완전 종료 시 생성되고, 백필 성공 시 삭제되며, 만료 시 `backfill_status=expired`가
+  남는지. 마커가 잔존해도 manifest 확인으로 스킵되는지
 
 ### end-to-end (MinIO 로컬)
 
@@ -427,12 +882,26 @@ make up   # 또는 ops/compose/docker-compose.yml
 cd collector && uv run python main.py --source bike_station_realtime --window-start <최근 5분 경계>
 ```
 
-MinIO 콘솔에서 `bronze/` · `silver/` · `_manifest/` 3개 객체가 생겼는지, manifest의 `counts`가 실제 행 수와 맞는지 확인한다.
+MinIO 콘솔에서 `bronze/`의 조각 수가 API 호출 수와 일치하는지, `silver/` · `_manifest/`가 각각 하나씩 생겼는지, manifest의 `counts`가 실제 행 수와 맞는지 확인한다.
 
 ### 재개 검증
 
-silver 쓰기 직전에 예외를 주입해 실행한다. manifest가 `stage=validated`, `status=FAILED`로 남는지 확인한 뒤 재실행해서, 로그에 `stage=fetched`가 **없고** bronze 재사용으로 완료되는지 확인한다.
+silver 쓰기 직전에 예외를 주입해 실행한다. manifest가 `stage=validated`, `status=FAILED`, `failure_reason=storage_error`로 남는지 확인한 뒤 재실행해서, 로그에 `stage=bronze_written`이 **없고** bronze 재사용으로 완료되는지 확인한다.
+
+### 부분 실패·백필 검증
+
+조각 하나를 강제 실패시키고 `max_missing_ratio: 0.4`로 실행한다.
+
+1. silver가 생기고 manifest에 `completeness < 1.0` · `missing.parts`가 남는지. **종료 코드가 0인지**
+2. `_retry_queue/`에 마커가 생겼는지
+3. `main.py --source X --window-start Y --backfill` 실행 → 로그로 **누락 조각만** 호출됐는지 확인.
+   silver가 같은 경로에 덮어써지고 `revision: 2` · `completeness: 1.0`이 되며 마커가 삭제되는지
+4. 백필을 한 번 더 실행 → manifest 확인 후 스킵되는지(멱등)
+5. `max_missing_ratio: 0.0`으로 되돌려 같은 실패를 재현 → `FAILED` · `failure_reason=fetch_error` ·
+   silver 미생성, 그런데도 **마커는 생성**되는지
 
 ### 목표 달성 검증
 
 두 번째 서울 열린데이터광장 소스(예: 문화행사)를 **YAML 파일 하나만 추가**해서 동작시킨다. 공통 코드에 한 줄도 손대지 않고 성공하면 설계 목표가 충족된 것이다.
+
+이번 변경으로 늘어난 config 키 3개(`max_missing_ratio` · `fetch` · `backfill`)가 **전부 생략 가능하고, 생략했을 때 기존과 같이 동작하는지**도 함께 확인한다. 그렇지 않으면 새 소스를 추가할 때마다 채워야 할 칸이 늘어난 것이다.

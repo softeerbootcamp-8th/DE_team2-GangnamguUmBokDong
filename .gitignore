@@ -3,9 +3,17 @@ __pycache__/
 *.pyc
 .venv/
 *.egg-info/
+.pytest_cache/
+.ruff_cache/
 
 # Env
 .env
+.env.local
+
+# Node (apps/web)
+node_modules/
+dist/
+.vite/
 
 # OS
 .DS_Store
