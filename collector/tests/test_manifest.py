@@ -3,6 +3,8 @@
 from datetime import UTC, datetime
 
 import pytest
+from pydantic import BaseModel, ValidationError
+
 from manifest import (
     Artifacts,
     ColumnIssueCount,
@@ -20,7 +22,6 @@ from manifest import (
     save,
     save_retry_marker,
 )
-from pydantic import BaseModel, ValidationError
 
 WINDOW_START = datetime(2026, 8, 12, 14, 10, tzinfo=UTC)
 WINDOW_END = datetime(2026, 8, 12, 14, 15, tzinfo=UTC)

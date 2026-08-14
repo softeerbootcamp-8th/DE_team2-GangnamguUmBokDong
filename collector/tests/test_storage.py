@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 import boto3
 import pyarrow as pa
 import pyarrow.parquet as pq
+
 from storage import (
     clear_bronze,
     delete_retry_marker,

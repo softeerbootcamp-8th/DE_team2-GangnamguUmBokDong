@@ -3,6 +3,7 @@
 from dataclasses import FrozenInstanceError
 
 import pytest
+
 from validation.types import Action, Issue, IssueKind, RowVerdict, RunContext
 
 

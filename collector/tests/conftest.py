@@ -13,8 +13,9 @@ from datetime import UTC, datetime
 
 import boto3
 import pytest
-from config.schema import ColumnSpec, Range
 from moto import mock_aws
+
+from config.schema import ColumnSpec, Range
 from validation import registry
 from validation.types import Issue, RunContext
 
