@@ -5,6 +5,7 @@ from datetime import timedelta
 from airflow.operators.bash import BashOperator
 from airflow.timetables.trigger import CronTriggerTimetable
 
+from callbacks.task_callbacks import log_task_failure, log_task_retry
 from config.schedules import REALTIME_CRON, TIMEZONE
 from config.sources import REALTIME_SOURCES
 from dags.realtime_collection import dag
@@ -47,3 +48,6 @@ def test_collector_task_execution_contract() -> None:
     assert "logical_date" in task.bash_command
 
     assert "--run-id" not in task.bash_command
+
+    assert task.on_retry_callback == log_task_retry
+    assert task.on_failure_callback == log_task_failure

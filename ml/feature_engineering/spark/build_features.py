@@ -116,9 +116,14 @@ def _add_rental_lag_rolling(spark: SparkSession, df: DataFrame, rolling_parquet_
 
     df = df.withColumn("_hour_ts_unix", F.unix_timestamp("hour_ts"))
     w_order = Window.partitionBy("station_id").orderBy("_hour_ts_unix")
+    tick_seconds = config.GRID_TICK_MINUTES * 60
     for window in config.ROLLING_WINDOWS:
-        # rental_visible[T]는 이미 [T-30분,...) 이전 정보만 쓰므로 shift 불필요 — 현재 행(0) 포함
-        w_roll = w_order.rangeBetween(-(window - 1) * HOUR_SECONDS, 0)
+        # rental_visible[T]는 이미 [T-30분,...) 이전 정보만 쓰므로 shift 불필요 — 현재 행(0) 포함.
+        # 그리드가 5분 tick이므로 "window시간 폭"을 맞추려면 window*HOUR_SECONDS에서 tick 하나(5분)를
+        # 빼야 한다 — (window-1)*HOUR_SECONDS만 쓰면(시간 단위 그리드 시절 공식) tick 하나만큼
+        # 창이 좁아진다(예: window=3이면 실제로는 2시간짜리 평균이 되는 버그, predict_single.py의
+        # (target_ts-window, target_ts] 정의와 어긋남 — inference/tests/dev_rental_censoring_cross_parity.py 참고).
+        w_roll = w_order.rangeBetween(-(window * HOUR_SECONDS - tick_seconds), 0)
         df = df.withColumn(f"rental_roll_mean_{window}h", F.avg("rental_visible").over(w_roll))
         df = df.withColumn(f"rental_roll_std_{window}h", F.stddev("rental_visible").over(w_roll))
 
