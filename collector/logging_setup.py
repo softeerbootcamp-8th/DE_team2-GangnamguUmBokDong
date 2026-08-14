@@ -1,20 +1,8 @@
 """구조화 로그 설정 — 고정 필드(source_id·window·attempt) 주입.
 
-
-## 구현할 것
-
-- `source_id` · `window` · `attempt`를 **모든 로그 레코드에 자동으로 붙인다.**
-  `logging.LoggerAdapter`나 `logging.Filter` 중 하나로 구현하고, 호출부가 매번 같은
-  필드를 다시 적지 않게 한다.
-- 출력은 컨테이너 stdout으로 보낸다. 형식은 `key=value` 평문에서 시작한다
-  (JSON으로 바꿀지는 수집기를 붙이는 시점에 결정한다).
-- 레벨 규칙 — 정상 단계는 INFO, `PARTIAL`은 WARN, `FAILED`는 ERROR.
-
-## 출력량 규칙: 배치당 몇 줄, 행당 0줄
-
-2,765행 × 288회/일이면 행 단위 로그는 로그를 터뜨린다. **행 상세는 quarantine 파일이
-담당한다.** 조각마다, 그리고 라운드마다 로그를 남기지도 않는다. 아래 3줄이 한 배치의
-정상 출력 전부다.
+행 상세는 quarantine 파일이 담당한다.
+조각마다, 그리고 라운드마다 로그를 남기지도 않는다. 
+아래 3줄이 한 배치의 정상 출력 전부다.
 
     INFO  source_id=bike_station_realtime window=2026-08-12T14:10Z
           stage=bronze_written parts=3/3 rounds=1 rows=2765 bytes=482113 ms=1203
@@ -22,10 +10,6 @@
           dropped=25 drop_ratio=0.009 completeness=0.991
     INFO  source_id=… stage=completed revision=1 key=s3://…/1410.parquet
 
-`stage` 값은 manifest의 `Stage`와 같은 어휘를 쓴다. `fetched`는 없다 — 조각을 도착 즉시
-저장하므로 fetch 완료와 bronze 완료가 같은 시점이고, 위 첫 줄이 그 둘을 한꺼번에 알린다.
-`parts`는 **받은 조각 / 계획한 조각**이고 `rounds`는 라운드 수다. 라운드별 로그 대신
-이 두 값으로 재시도가 있었는지 알 수 있다.
 
 누락이 발생하면 첫 줄이 WARN이 되고 무엇이 빠졌는지 붙는다.
 
@@ -46,20 +30,8 @@
     INFO  source_id=… mode=backfill parts=1 filled=page-02001-02765
           revision=1→2 completeness=0.717→1.0
 
-## 구현 방향
-
-- `configure_logging(source_id, window_start, attempt)`은 **root 로거**에 핸들러를
-  붙인다. `pipeline.py`는 그냥 `logging.getLogger(__name__)`으로 자기 이름의 로거를
-  얻어 쓰면 되고, 전파(`propagate`)를 타고 올라와 root의 핸들러에서 고정 필드가
-  주입된다 — 모듈마다 로거를 따로 설정할 필요가 없다.
-- 고정 필드 주입은 `logging.Filter`가 담당하고, 나머지 필드는 호출부가 `extra=`로
-  넘긴 값을 포매터가 `key=value`로 이어붙인다.
-- 인증키 마스킹도 여기 한 곳에서 한다 — 최종 로그 줄 문자열에서 `key=`류 쿼리
-  파라미터 값을 정규식으로 가려, 예외 메시지에 URL이 실려도 키가 새지 않게 막는다.
-  (어댑터마다 마스킹을 반복하지 않기 위해 이 모듈에 모았다.)
 
 ## 주의
-
 - boto3 · httpx의 기본 로거가 시끄러우면 레벨을 따로 낮춘다.
 """
 
@@ -73,13 +45,18 @@ from datetime import datetime
 _FIXED_FIELDS = ("source_id", "window", "attempt")
 _STANDARD_ATTRS = frozenset(vars(logging.LogRecord("", 0, "", 0, "", (), None)).keys()) | {"message", "asctime"}
 
-# 서울/기상청 API 모두 인증키를 쿼리 파라미터로 받는다. 값만 가리고 키 이름은 남긴다.
-_SECRET_PARAM_RE = re.compile(r"(?i)([?&](?:service|auth)?key=)[^&\s'\"]+")
+# 기상청 API는 인증키를 쿼리 파라미터로 받고, 서울 API는 경로 세그먼트로 받는다.
+# 1. 쿼리 파라미터 형태 (?key=..., &ServiceKey=...)
+_SECRET_QUERY_RE = re.compile(r"(?i)([?&](?:service|auth)?key=)[^&\s'\"]+")
+# 2. 경로 파라미터 형태 (openapi.seoul.go.kr:8088/{key}/...)
+_SECRET_PATH_RE = re.compile(r"(?i)(openapi\.seoul\.go\.kr:8088/)[^/\s'\"]+")
 
 
 def _redact(text: str) -> str:
-    """URL 쿼리 파라미터에 실린 인증키 값을 가린다."""
-    return _SECRET_PARAM_RE.sub(r"\1***", text)
+    """URL 쿼리 파라미터와 경로에 실린 인증키 값을 가린다."""
+    text = _SECRET_QUERY_RE.sub(r"\1***", text)
+    text = _SECRET_PATH_RE.sub(r"\1***", text)
+    return text
 
 
 class _ContextFilter(logging.Filter):
@@ -115,8 +92,7 @@ class _KeyValueFormatter(logging.Formatter):
         for field in _FIXED_FIELDS:
             if hasattr(record, field):
                 parts.append(f"{field}={getattr(record, field)}")
-        # 표준 LogRecord 속성(pathname·lineno 등)을 뺀 나머지가 `extra=`로 넘어온
-        # 호출부 필드다. dict 순서가 삽입 순서를 보존하므로 넘긴 순서 그대로 붙는다.
+
         for key, value in vars(record).items():
             if key in _FIXED_FIELDS or key in _STANDARD_ATTRS:
                 continue
@@ -134,8 +110,7 @@ def configure_logging(
 ) -> logging.Logger:
     """source_id·window·attempt를 모든 로그에 자동으로 붙이는 root 로거를 설정한다.
 
-    `main.py`가 pipeline을 부르기 **전에** 호출해야 pipeline이 남기는 로그에도
-    고정 필드가 붙는다.
+    `main.py`가 pipeline을 부르기 전에 호출해야 pipeline이 남기는 로그에도 고정 필드가 붙는다.
 
     args:
         source_id: 이번 실행의 소스 id.

@@ -1,96 +1,36 @@
 """기상청 API 허브 어댑터 
 
-## 공유하는 소스 2종
-
+## 데이터 소스
 기상청 초단기 실황·예보(10분) · 기상청 단기예보(3시간).
 
-## adapter_params
-
-- `endpoint` — 호출할 엔드포인트(예: `getUltraSrtNcst`)
-- `root_key` — 행 배열 경로(예: `response.body.items.item`)
-- `pivot` — long → wide 변환 기준(예: `{key: category, value: obsrValue}`)
-- `grids` — 서울을 커버할 격자 목록(예: `[[60, 127], [61, 127]]`)
-
-## fetch 구현할 것 — 격자마다 yield
-
-- **격자 반복** — 기상청은 격자(`nx`, `ny`)마다 별도 호출이 필요하다. `grids`를 순서대로
-  돌며 각 격자의 응답 원본을 그대로 `yield`한다. 조각 저장은 pipeline이 맡는다.
-- `skip`에 든 조각 키는 호출하지 않는다. **격자는 config에 고정이라 계획을 미리 세울 수
-  있으므로** 서울 어댑터와 달리 첫 호출 없이도 남은 조각을 알 수 있다.
-- `expected_total`은 **`None`이다.** 이 API는 전체 행 수를 미리 알려주지 않는다. 그래서
-  완결도가 행이 아니라 **조각 기준**(성공 격자 / 계획 격자)으로 계산되고, manifest의
-  `missing.basis`가 `parts`가 된다. 격자당 행 수가 일정하므로 행 기준과 거의 같은 값이
-  나온다.
-- `base_date` · `base_time`은 window로 계산한다. 발표 주기와 window 경계가 어긋날 때
-  어느 발표분을 집을지는 #9에서 확정한다.
-- 격자 수만큼 호출이 선형으로 늘어난다. 격자 목록을 코드에 박지 않고 config에 두는
-  이유가 이것이다. 동시 호출이 필요해지면 base의 async 클라이언트를 쓰되 `asyncio.run`은
-  이 `fetch` 안에 가둔다(ADR 0003).
-
-## 조각 키
-
-    part=grid-060x127.json.gz
-    part=grid-061x127.json.gz
-
-`grid-{nx:03d}x{ny:03d}` 형식이다. **격자는 서로 독립이라 순서가 결과에 영향을 주지
-않는다** — pivot 그룹 키에 `nx`·`ny`가 들어가므로 어떤 순서로 읽어도 같은 silver가
-나온다. 페이지네이션과 달리 이어 붙이는 개념이 없기 때문이다.
-
-격자 목록이 config에 고정이므로 조각 키도 실행 간에 안정적이다. 백필이 지목하기 가장
-쉬운 소스다.
-
-## normalize 구현할 것 — long → wide pivot
-
-기상청 응답은 기온 · 습도 · 풍속이 **각각 별도 행으로 쌓인 long format**이다.
-
-    # 원본 (bronze 조각에 저장되는 형태)
-    {"category": "T1H", "obsrValue": "31.6", "nx": 60, "ny": 127, ...}
-    {"category": "REH", "obsrValue": "42",   ...}
-
-    # normalize 결과 (검증 엔진이 받는 형태)
-    {"baseDate": ..., "baseTime": ..., "nx": 60, "ny": 127,
-     "T1H": "31.6", "REH": "42", "WSD": "3.2", "PTY": "0", ...}
-
-- **조각 목록 전체를 가로질러** 처리한다. 그룹 키는 `(baseDate, baseTime, nx, ny)`이고,
-  같은 키의 행들을 한 행으로 합쳐 `pivot.key`의 값을 컬럼명으로, `pivot.value`의 값을
-  값으로 올린다.
-- 예보 엔드포인트는 값 필드가 `fcstValue`이고 예보 시각(`fcstDate` · `fcstTime`)이
-  그룹 키에 추가된다. **코드 분기가 아니라 `pivot` 설정으로 흡수한다.**
-- **격자가 빠져 있어도 동작해야 한다.** 부분 수집된 window는 격자 몇 개가 없는 채로
-  들어오고, 그 격자의 행이 결과에서 빠질 뿐이다. 그룹 키 기반이라 자연히 성립한다.
-
-이 정규화 덕분에 config가 `T1H` · `REH`처럼 컬럼별로 서로 다른 정상 범위를 선언할 수
-있고, 검증 엔진에는 조건부 range 같은 개념이 필요 없어진다.
+expected_total은 None이다. 이 API는 전체 행 수를 미리 알려주지 않는다. 
+그래서 완결도가 행이 아니라 (성공 격자 / 계획 격자)으로 계산되고, manifest의 missing.basis가 parts가 된다. 
+base_date` · `base_time`은 window로 계산한다. 
 
 ## 주의
-
 - 인증키는 `KMA_APIHUB_KEY`에서 읽고 로그 · bronze에 남지 않게 마스킹한다.
 - 캐스팅은 검증 엔진의 `types`가 담당한다. pivot은 구조만 바꾸고 값은 문자열 그대로
   둔다.
-- 실패 범주 판정은 base의 규칙을 따른다. HTTP 상태 기반이며, 인증 실패는 `FATAL`이라
-  격자 20개를 헛되이 돌지 않는다.
+- 실패 범주 판정은 base의 규칙을 따른다. 
 
-## base_date · base_time — window을 그대로 쓴다 (발표 주기 보정 없음)
-`window.window_start`를 가공 없이 `%Y%m%d`·`%H%M`으로 포맷해 요청한다. 기상청 발표
-주기(초단기실황은 매시 40분 발표 등)와 트리거 시각이 어긋나면 `resultCode`가 "아직
-미발표"를 뜻하는 값으로 와도 **이 어댑터는 그 값을 보지 않는다** — 실패 범주는
-`classify_http_status`가 다루는 HTTP 상태로만 정해지고(HTTP 200이면 무조건 성공), 본문
-내용은 검사하지 않는다. 발표 시각과 트리거 시각을 맞추는 책임은 전부 Airflow DAG
-스케줄에 있다. 어댑터가 기상청 발표 스케줄이라는 도메인 지식을 갖지 않기 위한
-선택이다.
+## time_rule을 통한 자체 보정 지원
+- `hourly`: 초단기실황 (매시 정각. 예: 14:40 -> 14:00)
+- `half_hourly`: 초단기예보 (매시 30분. 예: 14:40 -> 14:30)
+- `vilage_fcst`: 단기예보 (02, 05, 08...시 정각. 예: 05:05 -> 02:00)
 """
 
 from __future__ import annotations
 
 import json
 import os
+from datetime import datetime, timedelta
 from typing import TYPE_CHECKING
 
-from adapters.base import FetchResult, adapter, classify_http_status
+import httpx
+
+from adapters.base import FetchErrorKind, FetchResult, adapter, classify_http_status
 
 if TYPE_CHECKING:
-    import httpx
-
     from adapters.base import Window
     from config.schema import SourceConfig
 
@@ -99,12 +39,57 @@ _NUM_OF_ROWS = 1000  # 격자 하나당 한 시각의 관측·예보 항목 수�
 
 
 def _api_key() -> str:
-    # 조각 키(grid-{nx}x{ny})에는 이 값이 섞이지 않는다
     return os.environ["KMA_APIHUB_KEY"]
 
 
+def _classify_result_code(code: str | None) -> FetchErrorKind | None:
+    """본문의 resultCode를 실패 범주로 매핑한다."""
+    if not isinstance(code, str):
+        return FetchErrorKind.PERMANENT
+
+    if code == "00":
+        return None  # NORMAL_SERVICE (성공)
+    if code in {"03", "04", "05", "22"}:
+        # 03: 데이터 없음(미발표), 04: HTTP 에러, 05: 연결 실패, 22: 제한 초과
+        return FetchErrorKind.TRANSIENT 
+    if code in {"20", "21", "30", "31", "32", "33"}:
+        # 20, 21, 30, 31, 32, 33: 인증/권한 에러
+        return FetchErrorKind.FATAL 
+  
+    return FetchErrorKind.PERMANENT 
+
+
+def _adjust_base_time(dt: datetime, rule: str | None) -> datetime:
+    """기상청 API가 허용하는 가장 최근의 base_time으로 내림한다."""
+    if not rule:
+        return dt
+        
+    if rule == "hourly":
+        # 매시 정각 (초단기실황. 예: 14:40 -> 14:00)
+        return dt.replace(minute=0, second=0, microsecond=0)
+        
+    if rule == "half_hourly":
+        # 매시 30분 (초단기예보. 예: 14:20 -> 13:30, 14:40 -> 14:30)
+        if dt.minute < 30:
+            return (dt - timedelta(hours=1)).replace(minute=30, second=0, microsecond=0)
+        return dt.replace(minute=30, second=0, microsecond=0)
+        
+    if rule == "vilage_fcst":
+        # 단기예보: 02:00, 05:00, 08:00, 11:00, 14:00, 17:00, 20:00, 23:00
+        # API 발표는 기준시간 + 10분부터 이루어지므로, 현재 10분 미만이면 한 턴 앞당겨야 함
+        eval_dt = dt if dt.minute >= 10 else dt - timedelta(hours=1)
+        if eval_dt.hour < 2:
+            return (eval_dt - timedelta(days=1)).replace(hour=23, minute=0, second=0, microsecond=0)
+        
+        k = (eval_dt.hour - 2) // 3
+        base_hour = 2 + 3 * k
+        return eval_dt.replace(hour=base_hour, minute=0, second=0, microsecond=0)
+        
+    raise ValueError(f"알 수 없는 time_rule: {rule}")
+
+
 def _extract(body: dict, root_key: str) -> list[dict]:
-    """`root_key`의 점 표기 경로를 따라가 행 배열을 꺼낸다. 경로가 없으면 빈 리스트."""
+    """root_key의 점 표기 경로를 따라가 행 배열을 꺼낸다. 경로가 없으면 빈 리스트."""
     node: object = body
     for segment in root_key.split("."):
         if not isinstance(node, dict):
@@ -128,9 +113,12 @@ class KmaApiHubAdapter:
     ):
         params = config.adapter_params
         endpoint = params["endpoint"]
-        # 발표 주기 보정 없이 window_start를 그대로 쓴다, 정합은 Airflow 스케줄의 책임.
-        base_date = window.window_start.strftime("%Y%m%d")
-        base_time = window.window_start.strftime("%H%M")
+        time_rule = params.get("time_rule")
+        
+        # time_rule 규칙에 따라 API 유효 시각으로 보정
+        adjusted_time = _adjust_base_time(window.window_start, time_rule)
+        base_date = adjusted_time.strftime("%Y%m%d")
+        base_time = adjusted_time.strftime("%H%M")
 
         for nx, ny in params["grids"]:
             key = f"grid-{nx:03d}x{ny:03d}"
@@ -142,21 +130,44 @@ class KmaApiHubAdapter:
                 f"&numOfRows={_NUM_OF_ROWS}&pageNo=1"
                 f"&base_date={base_date}&base_time={base_time}&nx={nx}&ny={ny}"
             )
-            response = client.get(url)
+            try:
+                response = client.get(url)
+            except httpx.RequestError:
+                yield FetchResult(key=key, payload=None, error=FetchErrorKind.TRANSIENT, expected_total=None)
+                continue
 
             category = classify_http_status(response.status_code)
-            if category is None:
-                yield FetchResult(key=key, payload=response.content, error=None, expected_total=None)
-            elif category.value == "fatal":
-                # 인증키 오류 등 확정적 원인인 경우, 나머지 격자를 헛되이 부르지 않고 즉시 중단.
+            if category is FetchErrorKind.FATAL:
+                # HTTP 레벨의 인증키 오류 등 확정적 원인인 경우, 즉시 중단.
                 yield FetchResult(key=key, payload=None, error=category, expected_total=None)
                 return
-            else:  # TRANSIENT 또는 PERMANENT, 이 격자만 실패로 보고하고 나머지는 계속
+            elif category is not None:
+                # HTTP 상태 5xx (TRANSIENT) 또는 4xx (PERMANENT)
                 yield FetchResult(key=key, payload=None, error=category, expected_total=None)
+                continue
+
+            # HTTP 200 OK일 경우 본문의 resultCode 확인
+            try:
+                body = json.loads(response.content)
+                if not isinstance(body, dict):
+                    raise TypeError("응답이 JSON 객체가 아님")
+                result_code = body.get("response", {}).get("header", {}).get("resultCode")
+            except (json.JSONDecodeError, TypeError):
+                yield FetchResult(key=key, payload=None, error=FetchErrorKind.TRANSIENT, expected_total=None)
+                continue
+
+            api_category = _classify_result_code(result_code)
+            if api_category is None:
+                yield FetchResult(key=key, payload=response.content, error=None, expected_total=None)
+            elif api_category is FetchErrorKind.FATAL:
+                yield FetchResult(key=key, payload=None, error=api_category, expected_total=None)
+                return
+            else:  # TRANSIENT 또는 PERMANENT
+                yield FetchResult(key=key, payload=None, error=api_category, expected_total=None)
 
     @staticmethod
     def normalize(chunks: list[bytes], config: SourceConfig) -> list[dict]:
-        """long 조각들을 pivot 설정에 따라 wide로 합친다."""
+        """조각들을 pivot 설정에 따라 합친다."""
         root_key = config.adapter_params["root_key"]
         pivot = config.adapter_params["pivot"]
         key_field, value_field = pivot["key"], pivot["value"]

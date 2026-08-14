@@ -10,7 +10,7 @@
   --border: rgba(11, 11, 11, 0.1);
 
   --series-1: #2a78d6;
-  --series-2: #eb6834;
+  --series-stock: #1f9d55;
   --diverging-red: #e34948;
   --diverging-blue: #2a78d6;
   --diverging-neutral: #f0efec;
@@ -35,7 +35,7 @@
     --border: rgba(255, 255, 255, 0.1);
 
     --series-1: #3987e5;
-    --series-2: #d95926;
+    --series-stock: #34c876;
     --diverging-red: #e66767;
     --diverging-blue: #3987e5;
     --diverging-neutral: #383835;
@@ -177,19 +177,19 @@ body {
   box-shadow: none;
 }
 
-.marker-count-label span {
-  display: inline-block;
-  /* transform(위로 띄우는 거리)은 StationMap.tsx의 countIcon()이 마커 반지름에
-     맞춰 인라인 스타일로 매번 계산해서 넣는다. 줌에 따라 마커 크기가 바뀌므로
-     여기서 고정값을 주면 마커가 커졌을 때 라벨이 안에 파묻힌다. */
-  font-size: 11px;
+.marker-count-label div {
+  /* width/height/transform/font-size는 StationMap.tsx의 countIcon()이 마커
+     반지름에 맞춰 인라인 스타일로 매번 계산해서 넣는다. flex 중앙정렬로 폰트
+     메트릭과 무관하게 항상 박스(=마커) 정가운데에 글자가 오게 한다. 마커
+     채우기색이 옅은 회색일 때도 읽히도록 짙은 그림자로 대비를 보정한다. */
+  display: flex;
+  align-items: center;
+  justify-content: center;
   font-weight: 700;
-  color: var(--text-primary);
-  background: var(--surface-1);
-  padding: 1px 4px;
-  border-radius: 4px;
-  border: 1px solid var(--border);
+  color: #fff;
+  text-shadow: 0 0 2px rgba(0, 0, 0, 0.7), 0 0 1px rgba(0, 0, 0, 0.7);
   white-space: nowrap;
+  pointer-events: none;
 }
 
 /* 알림 리스트 */

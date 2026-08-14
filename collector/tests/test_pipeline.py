@@ -253,6 +253,29 @@ class TestBackfillBranch:
         assert result.revision == 2
         assert set(result.artifacts.bronze.parts) == {"a", "b"}
 
+    def test_backfill_fetches_missing_even_if_stage_is_bronze_written(self, scripted_adapter, client):
+        scripted_adapter.results = [
+            [
+                FetchResult(key="a", payload=_chunk("a"), error=None, expected_total=2),
+                FetchResult(key="b", payload=None, error=FetchErrorKind.PERMANENT, expected_total=None),
+            ]
+        ]
+        # max_missing_ratio를 0.0으로 두면 조각 하나라도 누락 시 FAILED / BRONZE_WRITTEN이 된다.
+        config = _config(quality=Quality(max_drop_ratio=1.0, max_missing_ratio=0.0, allow_empty=True))
+        first = pipeline.execute_window(config, WINDOW_START, client=client, sleep_fn=lambda s: None)
+        assert first.status == RunStatus.FAILED
+        assert first.stage == Stage.BRONZE_WRITTEN
+        assert first.missing.parts == ("b",)
+        assert first.revision == 0
+
+        scripted_adapter.results = [[FetchResult(key="b", payload=_chunk("b"), error=None, expected_total=None)]]
+        result = pipeline.execute_window(config, WINDOW_START, client=client, backfill=True)
+
+        assert result.status == RunStatus.SUCCEEDED
+        assert result.missing.parts == ()
+        assert result.revision == 1
+        assert set(result.artifacts.bronze.parts) == {"a", "b"}
+
     def test_backfill_without_missing_is_a_noop_skip(self, scripted_adapter, client):
         scripted_adapter.results = [[FetchResult(key="a", payload=_chunk("a"), error=None, expected_total=None)]]
         config = _config()
