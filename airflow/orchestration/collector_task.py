@@ -57,29 +57,22 @@ def build_collector_task(source_id: str) -> BashOperator:
         on_retry_callback=log_task_retry,
         on_failure_callback=log_task_failure,
     )
-def build_backfill_task(
-    source_id: str,
-    window_start: str,
-) -> BashOperator:
-    """Collector의 누락 조각 Backfill Task를 생성한다.
-
-    Args:
-        source_id: Collector YAML에 정의된 source 식별자.
-        window_start: 복구할 원래 수집 window 시작 시각.
-
-    Returns:
-        Collector backfill CLI를 실행하는 BashOperator.
-    """
-    return BashOperator(
-        task_id="backfill_collector",
+def build_backfill_task(targets):
+    """Collector Backfill Task를 동적으로 생성한다."""
+    return BashOperator.partial(
+        task_id="run_backfill",
         bash_command=(
             f"cd {COLLECTOR_DIR} && "
             "env -u VIRTUAL_ENV uv run python main.py "
-            f"--source {source_id} "
-            f"--window-start '{window_start}' "
+            '--source "$SOURCE_ID" '
+            '--window-start "$WINDOW_START" '
             "--backfill"
         ),
         retries=2,
         retry_delay=timedelta(seconds=30),
         execution_timeout=timedelta(minutes=4),
+        on_retry_callback=log_task_retry,
+        on_failure_callback=log_task_failure,
+    ).expand(
+        env=targets,
     )

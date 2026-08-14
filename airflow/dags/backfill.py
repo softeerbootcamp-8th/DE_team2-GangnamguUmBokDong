@@ -8,8 +8,16 @@ import subprocess
 import pendulum
 from airflow.decorators import dag, task
 
+from orchestration.collector_task import build_backfill_task
+
 COLLECTOR_DIR = "/workspace/collector"
-BACKFILL_SOURCE_ID = "bike_station_realtime"
+BACKFILL_SOURCE_IDS = (
+    "bike_rental_history",
+    "cultural_event",
+    "living_population_grid",
+    "weather_ultra_short_term",
+    "weather_short_term_forecast",
+)
 
 
 @dag(
@@ -24,57 +32,41 @@ def collector_backfill():
     """Collector가 제공하는 백필 대상 목록을 받아 대상별 복구 작업을 실행한다."""
 
     @task
-    def list_backfill_targets(source_id: str) -> list[dict[str, str]]:
-        """Collector CLI에서 백필 대상 목록을 조회한다.
+    def list_backfill_targets(
+        source_ids: tuple[str, ...],
+    ) -> list[dict[str, str]]:
+        """Collector CLI에서 모든 백필 대상 목록을 조회한다.
 
         Args:
-            source_id: Collector YAML에 정의된 source 식별자.
+            source_ids: Backfill이 활성화된 Collector source 식별자 목록.
 
         Returns:
-            source_id와 window_start만 포함한 백필 대상 목록.
+            source_id와 window_start를 포함한 전체 백필 대상 목록.
         """
-        result = subprocess.run(
-            [
-                "uv",
-                "run",
-                "python",
-                "main.py",
-                "--list-backfill-targets",
-                "--source",
-                source_id,
-            ],
-            cwd=COLLECTOR_DIR,
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        return json.loads(result.stdout)
+        targets: list[dict[str, str]] = []
 
-    @task
-    def run_backfill(target: dict[str, str]) -> None:
-        """백필 대상 하나에 대해 Collector의 --backfill 실행을 요청한다.
+        for source_id in source_ids:
+            result = subprocess.run(
+                [
+                    "uv",
+                    "run",
+                    "python",
+                    "main.py",
+                    "--list-backfill-targets",
+                    "--source",
+                    source_id,
+                ],
+                cwd=COLLECTOR_DIR,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            targets.extend(json.loads(result.stdout))
 
-        Args:
-            target: source_id와 window_start를 포함한 백필 대상.
-        """
-        subprocess.run(
-            [
-                "uv",
-                "run",
-                "python",
-                "main.py",
-                "--source",
-                target["source_id"],
-                "--window-start",
-                target["window_start"],
-                "--backfill",
-            ],
-            cwd=COLLECTOR_DIR,
-            check=True,
-        )
+        return targets
 
-    targets = list_backfill_targets(BACKFILL_SOURCE_ID)
-    run_backfill.expand(target=targets)
+    targets = list_backfill_targets(BACKFILL_SOURCE_IDS)
+    build_backfill_task(targets)
 
 
 dag = collector_backfill()
