@@ -34,11 +34,11 @@ import json
 import os
 from typing import TYPE_CHECKING
 
+import httpx
+
 from adapters.base import FetchErrorKind, FetchResult, adapter
 
 if TYPE_CHECKING:
-    import httpx
-
     from config.schema import SourceConfig
 
 _BASE_URL = "http://openapi.seoul.go.kr:8088"
