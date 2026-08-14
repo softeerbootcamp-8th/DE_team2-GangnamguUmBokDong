@@ -137,6 +137,8 @@ from manifest import (
 )
 from validation.engine import BatchValidationFailed, validate_batch
 from validation.types import RunContext
+from config.schema import SourceConfig
+
 
 _HTTP_TIMEOUT_SECONDS = 10.0
 _KST = ZoneInfo("Asia/Seoul")
