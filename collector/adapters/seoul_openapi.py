@@ -95,7 +95,11 @@ class SeoulOpenApiAdapter:
         page_size = params["page_size"]
 
         # . 기준으로 문자열을 쪼개서 앞부분만 떼어낸다.
-        wrapper_key = params["root_key"].split(".", 1)[0]
+                # "SeoulRtd.citydata_ppltn" 처럼 마침표가 포함된 단일 키가 응답의 최상단에 존재할 수 있다.
+        if params["root_key"] in {"SeoulRtd.citydata_ppltn"}:
+            wrapper_key = params["root_key"]
+        else:
+            wrapper_key = params["root_key"].split(".", 1)[0]
         
         path_suffix_template = params.get("path_suffix", "")
         suffix = ""
@@ -174,7 +178,11 @@ class SeoulOpenApiAdapter:
         네트워크를 타지 않는 순수 함수이다. bronze에서 다시 읽어 언제든 재호출된다.
         """
         root_key = config.adapter_params["root_key"]
-        wrapper_key, _, row_path = root_key.partition(".")
+                if root_key in {"SeoulRtd.citydata_ppltn"}:
+            wrapper_key = root_key
+            row_path = ""
+        else:
+            wrapper_key, _, row_path = root_key.partition(".")
 
         rows: list[dict] = []
         for chunk in chunks:

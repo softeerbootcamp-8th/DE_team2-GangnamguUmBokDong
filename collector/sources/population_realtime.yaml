@@ -1,31 +1,15 @@
 source_id: population_realtime
-description: 서울 실시간 인구 데이터
-
+description: "\uC11C\uC6B8 \uC2E4\uC2DC\uAC04 \uC778\uAD6C \uB370\uC774\uD130"
 adapter: seoul_openapi
-adapter_params:
-  service: citydata_ppltn
-  page_size: 1000
-  root_key: citydata_ppltn.row
-
-schedule:
-  interval: 5m
-
+adapter_params: {service: citydata_ppltn, page_size: 1000, root_key: SeoulRtd.citydata_ppltn}
+schedule: {interval: 5m}
 storage:
   bronze_format: json
   silver_format: parquet
   partition: [dt, hh]
-
-quality:
-  max_drop_ratio: 0.05
-  max_missing_ratio: 0.0
-  allow_empty: false
-
-policies:
-  required_missing: drop_row
-  required_outlier: drop_row
-  optional_missing: keep_null
-  optional_outlier: set_null
-
+quality: {max_drop_ratio: 0.05, max_missing_ratio: 0.05, allow_empty: false}
+policies: {required_missing: drop_row, required_outlier: drop_row, optional_missing: keep_null,
+  optional_outlier: set_null}
 columns:
   AREA_NM:
     types: [str]
@@ -35,16 +19,16 @@ columns:
     required: true
   AREA_CONGEST_LVL:
     types: [str]
-    enum: ["여유", "보통", "약간 붐빔", "붐빔"]
+    enum: ["\uC5EC\uC720", "\uBCF4\uD1B5", "\uC57D\uAC04 \uBD90\uBE54", "\uBD90\uBE54"]
   AREA_PPLTN_MIN:
     types: [int]
-    range: { min: 0, max: 500000 }
+    range: {min: 0, max: 500000}
   AREA_PPLTN_MAX:
     types: [int]
-    range: { min: 0, max: 500000 }
+    range: {min: 0, max: 500000}
   MALE_PPLTN_RATE:
     types: [float]
-    range: { min: 0, max: 100 }
+    range: {min: 0, max: 100}
   FEMALE_PPLTN_RATE:
     types: [float]
-    range: { min: 0, max: 100 }
+    range: {min: 0, max: 100}
