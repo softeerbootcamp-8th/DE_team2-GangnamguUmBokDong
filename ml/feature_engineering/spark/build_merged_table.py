@@ -46,7 +46,11 @@ from pyspark.sql import functions as F
 from pyspark.sql.types import ByteType, FloatType, ShortType
 
 from . import config
-from .rolling_window_features import _seconds_to_ntz, _unix_seconds_ntz, lookup_count_at_ticks
+from .rolling_window_features import (
+    _seconds_to_ntz,
+    _unix_seconds_ntz,
+    lookup_count_at_ticks,
+)
 
 # src/build_merged_table.py의 NATIVE_COLUMN_DTYPES와 동일한 근거(값 범위 실측)로
 # 매핑한 Spark 타입 — bike_count 0~478, rental/return_count 0~245, humidity 13~100

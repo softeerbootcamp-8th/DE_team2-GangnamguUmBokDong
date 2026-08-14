@@ -11,7 +11,7 @@ train-serve skew와 같은 종류의 사고(두 경로가 조용히 다른 값�
 """
 
 import json
-from functools import lru_cache
+from functools import cache
 
 import lightgbm as lgb
 import numpy as np
@@ -24,7 +24,7 @@ from .paths import MODELS_DIR
 BOOSTER_SUFFIXES = ["poisson", "q10", "q50", "q90"]
 
 
-@lru_cache(maxsize=None)
+@cache
 def load_boosters(model_name: str) -> dict[str, lgb.Booster]:
     """model_name의 booster 4개(poisson, q10, q50, q90)를 로드한다.
 
@@ -48,7 +48,7 @@ def load_boosters(model_name: str) -> dict[str, lgb.Booster]:
     }
 
 
-@lru_cache(maxsize=None)
+@cache
 def load_conformal_correction(model_name: str) -> float:
     """학습 시 저장해둔 split-conformal 보정값을 불러온다.
 

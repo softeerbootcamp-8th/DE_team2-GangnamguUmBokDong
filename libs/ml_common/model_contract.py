@@ -83,8 +83,7 @@ _CYCLICAL_FEATURE_DTYPES = {"hour_sin": "float32", "hour_cos": "float32", "dow_s
 FEATURE_COLUMN_DTYPES = {
     col: (
         NATIVE_COLUMN_DTYPES[col] if col in NATIVE_COLUMN_DTYPES
-        else _CYCLICAL_FEATURE_DTYPES[col] if col in _CYCLICAL_FEATURE_DTYPES
-        else "float32"  # 나머지는 전부 LAG_ROLLING_FEATURE_COLUMNS
+        else _CYCLICAL_FEATURE_DTYPES.get(col, "float32")  # 나머지는 전부 LAG_ROLLING_FEATURE_COLUMNS
     )
     for col in FEATURE_COLUMNS
     if col != "station_id"

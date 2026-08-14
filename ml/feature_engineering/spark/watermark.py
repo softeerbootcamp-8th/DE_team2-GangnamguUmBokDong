@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 
 def read_watermark(path: str) -> dict | None:
@@ -42,7 +42,7 @@ def write_watermark(path: str, max_hour_ts: str, params: dict) -> dict:
     record = {
         "max_hour_ts": max_hour_ts,
         "params": params,
-        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "updated_at": datetime.now(UTC).isoformat(),
     }
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
