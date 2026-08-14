@@ -178,7 +178,7 @@ class SeoulOpenApiAdapter:
         네트워크를 타지 않는 순수 함수이다. bronze에서 다시 읽어 언제든 재호출된다.
         """
         root_key = config.adapter_params["root_key"]
-                if root_key in {"SeoulRtd.citydata_ppltn"}:
+        if root_key in {"SeoulRtd.citydata_ppltn"}:
             wrapper_key = root_key
             row_path = ""
         else:
