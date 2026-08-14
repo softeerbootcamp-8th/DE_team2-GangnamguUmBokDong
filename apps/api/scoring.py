@@ -1,9 +1,21 @@
+import math
 from datetime import datetime
 
 # 우선순위 점수 계산용 임계값. 실측치가 나오면 팀 확인 후 확정해야 한다.
 RESPONSE_LAG_MIN = 30  # 트럭 출동~도착 소요시간
 HALF_LIFE_MIN = 60  # 대응 여유시간이 이만큼 늘어날 때마다 시급성 점수가 절반이 됨
 FIRST_FORECAST_MIN = 60  # 예측 데이터는 1시간 뒤부터만 존재(그 이전은 추세로 메꿈)
+
+# 심각도(정원 대비 초과/부족량 비율 -> 0~1) 변환 곡선의 스케일. 비율이 이 값만큼
+# 쌓일 때마다 남은 여유가 지수적으로 줄어든다(1 - e^(-ratio/SEVERITY_SCALE)).
+# 실측 데이터(서울 전역 2,746곳)로 몇 가지 값을 대입해보고, 비율 1(정원만큼
+# 초과/부족)이 40점대, 비율 4 이상(정원의 4배 이상)이 90점대로 나오는 이 값을
+# 골랐다. 고정 배수에서 상한을 자르는 클램프 대신 점근 곡선을 쓴 이유는, 클램프를
+# 쓰면 특정 배수를 넘는 순간부터 아무리 더 심해져도 점수가 그대로라 실측에서
+# 회수필요 대여소의 35%가 똑같이 100점에 뭉쳐 있었기 때문이다(정원 2배 초과 =
+# 클램프 상한). 점근 곡선은 상한이 없어서 극단치(실측 최대 22배)끼리도 계속
+# 구분된다.
+SEVERITY_SCALE = 1.5
 
 
 def enrich_forecast_points(current_stock: int, hold_cnt: int, raw_points: list[dict]) -> list[dict]:
@@ -69,21 +81,30 @@ def _forecast_time_to_critical(points: list[dict]) -> tuple[float, int, str] | N
     return None
 
 
-def _net_demand(point: dict, action_type: str) -> int:
-    if action_type == "supply_needed":
-        return point["predicted_rent_cnt"] - point["predicted_return_cnt"]
-    return point["predicted_return_cnt"] - point["predicted_rent_cnt"]
+def _max_overshoot(current: int, hold_cnt: int, points: list[dict]) -> int:
+    """지금부터 예측 구간 전체에서 정원을 가장 크게 넘는 지점을 찾는다.
+    predicted_bikes는 위쪽을 막지 않으므로(비콘 기반이라 반납이 안 막힘) 그대로
+    읽으면 된다. 지금 당장이 아니라 나중에 더 심해지는 경우(추세로 채워지는
+    중)까지 포함하도록 현재 재고도 후보에 넣는다."""
+    peak = max(current, *(p["predicted_bikes"] for p in points)) if points else current
+    return max(0, peak - hold_cnt)
 
 
-def _cumulative_deficit(current_stock: int, points: list[dict], index: int) -> int:
-    """공급필요 전용. 재고는 0 밑으로 못 내려가게 막혀있어서(클램프), 그 시점의
-    predicted_bikes만 보면 얼마나 부족한지 크기를 알 수 없다. 막지 않았다면 얼마나
-    마이너스로 내려갔을지를 다시 계산한다. 회수필요는 반대로 위쪽을 막지 않으므로
-    predicted_bikes에서 바로 읽으면 된다."""
-    stock = current_stock
-    for i in range(index + 1):
-        stock += points[i]["predicted_return_cnt"] - points[i]["predicted_rent_cnt"]
-    return max(0, -stock)
+def _max_deficit(current: int, points: list[dict]) -> int:
+    """지금부터 예측 구간 전체에서 재고가 0 밑으로 가장 깊이 내려가는 지점을
+    찾는다. predicted_bikes는 0 밑을 클램프해서 못 쓰므로(재고가 실제로
+    마이너스일 순 없어서), 원본 대여·반납량으로 다시 누적해서 클램프 없이 계산한다."""
+    stock = current
+    worst = min(current, 0)
+    for point in points:
+        stock += point["predicted_return_cnt"] - point["predicted_rent_cnt"]
+        worst = min(worst, stock)
+    return max(0, -worst)
+
+
+def _severity(ratio: float) -> float:
+    """정원 대비 초과/부족 비율(ratio)을 0~1 심각도로 바꾼다. SEVERITY_SCALE 참고."""
+    return 1 - math.exp(-ratio / SEVERITY_SCALE)
 
 
 def urgency_score(
@@ -100,47 +121,38 @@ def urgency_score(
     쓴다. 트럭이 도착하는 데 RESPONSE_LAG_MIN이 걸리므로, 그보다 짧게 남은
     시간은 "대응 여유가 없음"으로 취급해 전부 최대 긴급도로 묶는다.
 
-    심각도: 공급필요는 재고가 0 밑으로 못 내려가게 막혀있어 실측만으로는 얼마나
-    부족한지 알 수 없으므로, 즉시위험이면 가장 이른 예측 포인트의 순수요로,
-    예측감지면 클램프 없이 뒀을 때의 마이너스분을 다시 계산해서 쓴다. 회수필요는
-    정원 위로는 막지 않으므로(비콘 기반이라 반납 자체는 안 막힘) 실측 재고나
-    predicted_bikes에서 정원을 뺀 실제 초과분을 그대로 쓴다.
+    심각도: 지금부터 예측 구간 전체에서 가장 심해지는 지점(회수필요는 정원을
+    가장 크게 넘는 지점, 공급필요는 클램프 없이 뒀을 때 가장 깊이 마이너스로
+    내려가는 지점)을 찾아 정원 대비 비율로 바꾸고, 그 비율을 `_severity`로
+    0~1 사이 값으로 변환한다. 어느 시급성 경로(즉시위험/추세감지/예측감지)로
+    감지됐는지와 무관하게 항상 같은 방식으로 계산해서, 두 action_type의 점수가
+    같은 기준으로 비교 가능하다.
     """
     if current <= 0:
-        time_to_critical, source, action_type, forecast_index = 0.0, "immediate", "supply_needed", None
+        time_to_critical, action_type = 0.0, "supply_needed"
     elif current >= hold_cnt:
-        time_to_critical, source, action_type, forecast_index = 0.0, "immediate", "retrieval_needed", None
+        time_to_critical, action_type = 0.0, "retrieval_needed"
     else:
         candidates = []
         trend = _trend_time_to_critical(current, hold_cnt, stock_history, now)
         if trend is not None:
-            candidates.append((trend[0], "trend", trend[1], None))
+            candidates.append(trend)
         forecast = _forecast_time_to_critical(points)
         if forecast is not None:
-            minutes, index, forecast_action = forecast
-            candidates.append((minutes, "forecast", forecast_action, index))
+            minutes, _index, forecast_action = forecast
+            candidates.append((minutes, forecast_action))
         if not candidates:
             return 0.0, 12 * 60, "normal"
-        time_to_critical, source, action_type, forecast_index = min(candidates, key=lambda c: c[0])
+        time_to_critical, action_type = min(candidates, key=lambda c: c[0])
 
     slack = max(0.0, time_to_critical - RESPONSE_LAG_MIN)
     time_factor = 2 ** (-slack / HALF_LIFE_MIN)
 
-    if source == "immediate" and action_type == "retrieval_needed":
-        overshoot = current - hold_cnt  # 실측으로 바로 알 수 있는 값
-        impact_factor = min(1.0, overshoot / hold_cnt)
-    elif source == "forecast" and action_type == "retrieval_needed":
-        overshoot = points[forecast_index]["predicted_bikes"] - hold_cnt
-        impact_factor = min(1.0, overshoot / hold_cnt)
-    elif source == "forecast" and action_type == "supply_needed":
-        deficit = _cumulative_deficit(current, points, forecast_index)
-        impact_factor = min(1.0, deficit / hold_cnt)
+    if action_type == "retrieval_needed":
+        ratio = _max_overshoot(current, hold_cnt, points) / hold_cnt
     else:
-        # 즉시위험(공급필요)/추세감지: 위험 시점의 실측·예측 데이터가 아직 없어
-        # 가장 이른 예측 포인트의 순수요로 대신한다. 예측 자체가 없으면(배치가
-        # 아직 안 돌았으면) 심각도를 매길 근거가 없어 0으로 둔다.
-        net = _net_demand(points[0], action_type) if points else 0
-        impact_factor = min(1.0, max(0, net) / hold_cnt)
+        ratio = _max_deficit(current, points) / hold_cnt
+    impact_factor = _severity(ratio)
 
     score = round(100 * time_factor * impact_factor, 1)
     return score, round(time_to_critical), action_type
