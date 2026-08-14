@@ -1,5 +1,7 @@
-PROJECTS := collector apps/api airflow ml/predict ml/training ml/feature libs/core
-COMPOSE = docker compose --env-file .env -f ops/compose/docker-compose.yml
+PROJECTS := collector apps/api airflow ml/inference ml/training ml/feature_engineering libs/core libs/ml_common
+LOCAL_TEST_PROJECTS := collector apps/api ml/inference ml/training ml/feature_engineering libs/core libs/ml_common
+
+COMPOSE = docker compose $(if $(wildcard .env),--env-file .env,) -f ops/compose/docker-compose.yml
 
 .PHONY: sync-all lint test bootstrap up down logs ps seed
 
@@ -16,13 +18,16 @@ lint:
 	done
 
 test:
-	@for p in $(PROJECTS); do \
+	@for p in $(LOCAL_TEST_PROJECTS); do \
 		echo "==> $$p"; \
 		(cd $$p && uv run --with pytest pytest -q); \
 		code=$$?; \
 		if [ $$code -ne 0 ] && [ $$code -ne 5 ]; then exit $$code; fi; \
 	done
-
+	@echo "==> airflow"
+	@$(COMPOSE) exec -T airflow-scheduler \
+		sh -lc 'cd /workspace/airflow && uv run pytest -q'
+		
 bootstrap:
 	./ops/bootstrap/bootstrap.sh
 

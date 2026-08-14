@@ -36,40 +36,34 @@ manifest 마감 → (불완전하면) 백필 마커.
 
 | # | 조건 | 동작 |
 | --- | --- | --- |
-| 1 | `stage=completed` & 누락 없음 & `!force` | SKIPPED |
-| 2 | `stage>=bronze_written` & `!force` | bronze 재사용 |
+| 1 | `stage=completed` & 누락 없음 | `SKIPPED` 반환 (백필 모드 포함) |
+| 4 | `stage >= bronze_written` & 누락 존재 & `--backfill` | 기존 bronze 유지 + 누락 조각만 fetch → 전체 재처리 → `revision` +1 |
+| 2 | `stage >= bronze_written` (일반 실행) | 기존 bronze 로드 (fetch 건너뜀) |
 | 3 | 그 외 (또는 `--force`) | `clear_bronze` + 전체 fetch |
-| 4 | `stage=completed` & 누락 존재 & `--backfill` | 누락 조각만 fetch → 전체 재처리 → `revision` +1 |
 
-- **조각 저장은 pipeline의 책임이다.** 어댑터는 `yield`만 하고 저장소를 알지 못한다.
+- 조각 저장은 pipeline의 책임이다. 어댑터는 `yield`만 하고 저장소를 알지 못한다.
   파일명이 되는 조각 키는 어댑터가 만들어 `FetchResult.key`로 넘긴다.
-- **`stage`는 fetch 단계를 마친 뒤에 올린다.** 라운드를 소진했든 예산이 끝났든,
-  더 이상 호출하지 않기로 결정한 시점이다. 그 전에 죽으면 조각이
-  S3에 남아도 미완결로 취급된다.
-- **`stage`는 실행 진행도만 뜻한다.** 조각이 다 모였는지는 `completeness` · `missing`이
-  따로 표현하므로 `stage=completed`이면서 불완전한 window가 존재한다.
-- `clear_bronze`가 필요한 이유는 조각 수가 실행마다 달라질 수 있기 때문이다(5조각 →
-  3조각). **백필 모드는 예외다** — 기존 조각을 살리는 것이 목적이고, 유령 조각은
-  "manifest `parts`에 없는 조각은 읽지 않는다"는 규칙이 막는다.
-- `normalize`는 bronze 재사용 여부와 **무관하게 항상** 수행한다. 네트워크를 타지 않는
-  순수 변환이라 비용이 없고, bronze가 정규화 전 원본을 담고 있으므로 이 편이 단순하다.
-- `--force`는 위 분기를 모두 무시하고 fetch부터 다시 한다. `--backfill`과는 목적이
-  반대이므로 함께 주면 오류로 막는다.
-- 조각을 저장한 뒤에도 메모리에서 놓지 않는다. 검증은 window 전체가 모인 뒤 배치로
-  수행하므로 피크 메모리는 줄지 않는다(ADR 0003).
+- `stage`는 fetch 단계를 마친 뒤에 올린다. 라운드를 소진했든 예산이 끝났든, 더 이상 호출하지 않기로 결정한 시점이다. 
+  그 전에 죽으면 조각이 S3에 남아도 미완결로 취급된다.
+- `stage`는 실행 진행도만 뜻한다. 조각이 다 모였는지는 `completeness` · `missing`이 따로 표현하므로 
+  `stage=completed`이면서 불완전한 window가 존재한다.
+- `clear_bronze`가 필요한 이유는 조각 수가 실행마다 달라질 수 있기 때문이다
+   **백필 모드는 예외다** — 기존 조각을 살리는 것이 목적이고, 유령 조각은 "manifest `parts`에 없는 조각은 읽지 않는다"는 규칙이 막는다.
+- `normalize`는 bronze 재사용 여부와 **무관하게 항상** 수행한다. 네트워크를 타지 않는 순수 변환이라 비용이 없고, 
+   bronze가 정규화 전 원본을 담고 있으므로 이 편이 단순하다.
+- `--force`는 위 분기를 모두 무시하고 fetch부터 다시 한다. `--backfill`과는 목적이 반대이므로 함께 주면 오류로 막는다.
+- 조각을 저장한 뒤에도 메모리에서 놓지 않는다. 검증은 window 전체가 모인 뒤 배치로 수행하므로 피크 메모리는 줄지 않는다
 
-**bronze 재사용이 재개의 핵심인 이유**: 실시간 API(5분 주기)는 몇 분만 지나도 그 시점
-데이터를 영영 받을 수 없다. silver 저장에서 실패했을 때 fetch부터 다시 하면 지금 시점의
-**다른 데이터로 덮어쓰게 된다.**
+bronze 재사용이 재개의 핵심인 이유: 실시간 API(5분 주기)는 몇 분만 지나도 그 시점 데이터를 영영 받을 수 없다. 
+저장에서 실패했을 때 fetch부터 다시 하면 지금 시점의 다른 데이터로 덮어쓰게 된다.
 
     1회차: bronze ✓ → 정제 ✓ → silver ✗   stage=validated, status=FAILED
     2회차: fetch ⤳ skip(bronze 재사용) → 정제 ✓ → silver ✓   stage=completed, PARTIAL
 
-## 조각 실패 처리 (계획서 8절)
+## 조각 실패 처리
 
-**조각 하나가 실패해도 window 전체를 버리지 않는다.** 라운드 루프 자체는 `adapters/base`
-의 공통 유틸이 돌리고, pipeline은 성공 조각을 즉시 저장하는 콜백과 종료 후 판정을
-담당한다.
+조각 하나가 실패해도 window 전체를 버리지 않는다. 라운드 루프 자체는 `adapters/base`의 공통 유틸이 돌리고, 
+pipeline은 성공 조각을 즉시 저장하는 콜백과 종료 후 판정을 담당한다.
 
     fetch 종료 (라운드 소진 · fetch_budget 초과)
        ↓
@@ -78,7 +72,7 @@ manifest 마감 → (불완전하면) 백필 마커.
        ├─ max_missing_ratio 이내 → normalize → 검증 → max_drop_ratio 판정 → silver
        └─ 초과 → silver 쓰지 않음, FAILED, failure_reason=fetch_error
 
-`FATAL`(인증 오류)만 예외다. 게이트도 마커도 타지 않고 `fetch_error`로 즉시 끝낸다 —
+`FATAL`(인증 오류)만 예외다. 게이트도 마커도 타지 않고 `fetch_error`로 즉시 끝낸다 
 재시도도 백필도 무의미하고 키를 고쳐 `--force`로 재실행할 문제다.
 
 ## status 결정 규칙
@@ -95,44 +89,34 @@ manifest 마감 → (불완전하면) 백필 마커.
 | S3 쓰기 실패 | `FAILED` | `storage_error` |
 | 정책이 `FAIL_BATCH` 반환 | `FAILED` | `quality_gate` |
 
-**게이트에 걸리면 silver를 쓰지 않는다.** `artifacts.silver`는 null로 남는다. 검증을
-배치로 하는 이유가 판정을 쓰기 전에 할 수 있다는 것이므로 그 이점을 쓴다. FAILED
-window에 silver가 존재하면 하류가 manifest를 확인하지 않고 읽을 위험이 있다.
+**게이트에 걸리면 silver를 쓰지 않는다.** `artifacts.silver`는 null로 남는다. 
+검증을 배치로 하는 이유가 판정을 쓰기 전에 할 수 있다는 것이므로 그 이점을 쓴다.
+FAILED window에 silver가 존재하면 하류가 manifest를 확인하지 않고 읽을 위험이 있다.
 
 quarantine은 이 경우에도 쓴다. 왜 실패했는지 분석하려면 폐기된 행이 필요하고,
 quarantine은 하류 소비 대상이 아니다. 반대로 **폐기 행이 0건이면 객체를 만들지 않는다.**
 
-**두 게이트는 독립이고 `drop_ratio`의 분모는 `fetched`다.** `expected`로 바꾸면 수집이
-완전한 평상시에는 차이가 없고 장애 때만 폐기율이 튀는 지표가 된다. 부분 수집 시 폐기
-게이트가 다소 엄격해지는 대가가 남지만 통과시킬 것을 막는 안전한 방향이다.
+**두 게이트는 독립이고 `drop_ratio`의 분모는 `fetched`다.**  
 
-`quality_gate` 실패는 재시도해도 결과가 같다(같은 bronze + 같은 config). config를 고쳐
-재처리해야 하므로 manifest의 `failure_reason`으로 구분해 남긴다. 반면 `fetch_error`는
-백필로 회복 가능하다.
+`quality_gate` 실패는 재시도해도 결과가 같다(같은 bronze, 같은 config). 
+config를 고쳐 재처리해야 하므로 manifest의 `failure_reason`으로 구분해 남긴다. 
+반면 `fetch_error`는 백필로 회복 가능하다.
 
 ## 백필 마커
 
-`backfill.enabled`이고 누락이 남았으면 `_retry_queue/{source_id}/{window_start}.json`을
-쓴다. **게이트 초과로 FAILED가 된 window도 쓴다** — bronze 조각은 남아 있으므로 백필이
-채우면 완결시킬 수 있고, FAILED를 제외하면 가장 많이 빠진 window가 대상에서 빠진다.
-
+`backfill.enabled`이고 누락이 남았으면 `_retry_queue/{source_id}/{window_start}.json`을 쓴다. 
+**게이트 초과로 FAILED가 된 window도 쓴다**
 백필로 완결되면 마커를 지운다. 부분적으로만 채웠으면 `missing_parts`를 줄여 유지한다.
 **백필은 한 번에 완결될 필요가 없다.**
 
 ## 주의
 
-- 예외를 삼키지 않는다. manifest에 `FAILED` · 도달한 `stage` · `failure_reason`을 남긴
-  뒤 호출자에게 올려 종료 코드로 이어지게 한다.
-- **부분 성공의 종료 코드는 0이다.** `stage=completed`로 끝나 재실행하면 분기 1에서
-  `SKIPPED`로 빠지므로 Airflow retry가 할 일이 없다. 채우는 일은 백필 잡이 맡는다.
+- 예외를 삼키지 않는다. manifest에 `FAILED` · 도달한 `stage` · `failure_reason`을 남긴 뒤 호출자에게 올려 종료 코드로 이어지게 한다.
+- **부분 성공의 종료 코드는 0이다.** `stage=completed`로 끝나 재실행하면 분기 1에서 `SKIPPED`로 빠지므로 Airflow retry가 할 일이 없다. 채우는 일은 백필 잡이 맡는다.
 - `attempt` 증가는 manifest 모듈이 담당한다. pipeline은 상태 전이만 지시한다.
-  `revision`은 **silver를 실제로 쓴 경우에만** 올린다 — `attempt`(실행 횟수)와 다르다.
-- 각 단계 경계에서 로그 한 줄씩 남긴다(계획서 9절). 조각마다, 라운드마다 남기지 않는다.
+  `revision`은 **silver를 실제로 쓴 경우에만** 올린다 `attempt`(실행 횟수)와 다르다.
+- 각 단계 경계에서 로그 한 줄씩 남긴다. 조각마다, 라운드마다 남기지 않는다.
 
-검증(계획서 12절): manifest `stage`별 분기 5가지(없음 / `bronze_written` / `completed` /
-`--force` / `completed` + 누락 + `--backfill`)를 확인하고, silver 쓰기 직전에 예외를
-주입한 뒤 재실행해서 로그에 `stage=bronze_written`이 **없이** 완료되는지 본다. 조각
-하나를 강제 실패시켜 게이트 통과/초과 양쪽에서 마커가 생기는지도 확인한다.
 
 ## `stage`의 최종 정지점 — 실패 종류별로 다르다
 
@@ -192,40 +176,33 @@ class ForceAndBackfillError(ValueError):
 
 
 def _sorted_chunks(chunks: dict[str, bytes]) -> list[bytes]:
-    """조각을 키의 사전순으로 정렬해 값 목록만 반환한다.
-
-    조각 키는 제로 패딩(`page-00001-...`)돼 있어 사전순 정렬이 곧 호출 순서와
-    같다. 라운드 재시도로 조각이 뒤섞여 `collected` dict에 쌓여도, 여기서 다시
-    정렬해 넘기면 `normalize`가 항상 원래 순서로 이어붙일 수 있다.
-    """
+    """조각을 키의 사전순으로 정렬해 값 목록만 반환한다."""
     return [chunks[key] for key in sorted(chunks)]
 
 
 def _missing_ratio(missing_count: int, expected_total: int | None, fetched_rows: int, collected_count: int) -> float:
     """성공 조각만으로 누락 비율을 계산한다.
 
-    `expected_total`을 아는 소스(서울, 행 기준)는 실제 받은 행 수를 `normalize`로
-    세어 `1 - fetched_rows/expected_total`로 계산한다. 
+    `expected_total`을 아는 소스(서울, 행 기준)는 실제 받은 행 수를 `normalize`로 세어 `1 - fetched_rows/expected_total`로 계산한다. 
     모르는 소스(기상청, 조각 기준)는 `누락 조각 수 / 계획된 조각 수`로 계산한다. 
     행을 세는 방식을 쓰는 이유는 어댑터마다 다른 조각 키 형식을 pipeline이 몰라도 되게하기 위해서다.
 
     args:
         missing_count: 라운드를 다 써도 못 받은 조각 수.
-        expected_total: 소스가 알려준 전체 행 수. 모르면 None(조각 기준으로 전환).
+        expected_total: 소스가 알려준 전체 행 수. 모르면 None.
         fetched_rows: 성공한 조각을 normalize했을 때 나온 행 수.
         collected_count: 성공한 조각 수.
     returns:
         0.0(누락 없음) ~ 1.0(전부 누락) 사이의 비율.
     """
     if expected_total is not None:
-        # expected_total이 0이면 나눗셈 자체가 무의미하므로 누락 없음으로 본다.
         return max(0.0, 1 - (fetched_rows / expected_total)) if expected_total else 0.0
     planned = collected_count + missing_count
     return (missing_count / planned) if planned else 0.0
 
 
 def _build_missing(missing_keys: dict, expected_total: int | None, fetched_rows: int) -> Missing:
-    """manifest에 남길 `Missing` 필드를 만든다. 기준(rows/parts)은 `expected_total` 유무로 정해진다."""
+    """manifest에 남길 Missing 필드를 만든다."""
     parts = tuple(sorted(missing_keys))
     if expected_total is not None:
         return Missing(parts=parts, rows=max(0, expected_total - fetched_rows), basis="rows")
@@ -233,11 +210,7 @@ def _build_missing(missing_keys: dict, expected_total: int | None, fetched_rows:
 
 
 def _now() -> datetime:
-    """KST aware 현재 시각. manifest의 started_at·ended_at에 쓴다.
-
-    `window_start`·`window_end`와 시간대를 통일해 manifest 하나를 볼 때 오프셋
-    계산 없이 바로 비교할 수 있게 한다.
-    """
+    """KST aware 현재 시각. manifest의 started_at·ended_at에 쓴다."""
     return datetime.now(_KST)
 
 
@@ -253,20 +226,17 @@ def execute_window(
     """window 하나를 재개 분기에 따라 처리하고 최종 manifest를 반환한다.
 
     fetch(또는 bronze 재사용) → 완결도 게이트 → normalize → 검증 → 폐기 게이트 →
-    silver·quarantine 저장 → manifest 저장 순으로 진행한다. 실패하더라도 예외를
-    올리지 않고(manifest.save 자체의 실패는 예외) FAILED manifest를 만들어
-    반환한다 — 호출자(CLI)가 `status`만 보고 종료 코드를 정할 수 있게 하기
-    위해서다.
+    silver·quarantine 저장 → manifest 저장 순으로 진행한다. 
+    실패하더라도 예외를 올리지 않고 FAILED manifest를 만들어 반환한다 
+    호출자(CLI)가 `status`만 보고 종료 코드를 정할 수 있게 하기 위해서다.
 
     args:
-        config: 소스 설정. `config.adapter`로 어댑터를, `config.quality`로
-            게이트 임계값을 정한다.
-        window_start: 수집 대상 window의 시작 시각. `window_end`는 여기서
-            `config.schedule.interval`을 더해 계산한다.
+        config: 소스 설정. 
+        window_start: 수집 대상 window의 시작 시각. 
         client: 어댑터에 주입할 httpx 클라이언트.
         force: 재개 분기를 모두 무시하고 처음부터 다시 수집한다.
         backfill: 완결된 window의 누락 조각만 채운다. `force`와 동시에 줄 수 없다.
-        sleep_fn: 라운드 간 대기 함수. 테스트에서 실제로 기다리지 않도록 주입한다.
+        sleep_fn: 라운드 간 대기 함수. 
     returns:
         이번 실행이 도달한 최종 manifest.
     raises:
@@ -281,14 +251,17 @@ def execute_window(
     adapter_cls = get_adapter(config.adapter)
     window = Window(window_start=window_start, window_end=window_end)
 
-    if existing and existing.stage == Stage.COMPLETED and not force:
+    if existing and existing.stage == Stage.COMPLETED and not force and not (backfill and existing.missing.parts):
         # 분기 1: 이미 완결됐고 채울 누락도 없으면(또는 backfill이 아니면) 아무것도
         # 하지 않는다. 재실행해도 안전해야 하므로(Airflow retry) 어댑터를 다시
         # 부르지 않고, 저장된 manifest도 건드리지 않은 채 SKIPPED로만 표시해 돌려준다.
-        if not (backfill and existing.missing.parts):
-            logger.info("stage=completed status=skipped")
-            return existing.model_copy(update={"status": RunStatus.SKIPPED})
+        logger.info("stage=completed status=skipped")
+        return existing.model_copy(update={"status": RunStatus.SKIPPED})
+
+    if existing and backfill and existing.missing.parts and existing.stage.value >= Stage.BRONZE_WRITTEN.value and not force:
         # 분기 4: 백필 — 기존 조각은 그대로 두고(clear_bronze 없이) 누락분만 받는다.
+        # COMPLETED에서 누락이 있든(PARTIAL), FETCH_ERROR로 BRONZE_WRITTEN에서 멈췄든
+        # 둘 다 이 분기를 타서 남은 조각을 마저 채운다.
         have_parts = existing.artifacts.bronze.parts
         prior_chunks = dict(zip(have_parts, storage.read_bronze(config.source_id, window_start, have_parts)))
         round_result = fetch_with_rounds(

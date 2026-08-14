@@ -1,5 +1,4 @@
 """manifest 스키마와 읽기 쓰기, 상태 어휘.
-
 한 번의 실행이 무엇을 했고 어디까지 갔는지를 남긴다. 
 실제 S3 접근은 storage.py에 위임하고, 이 모듈은 dict ↔ 모델 변환과 상태 어휘만 담당한다.
 """
@@ -35,13 +34,13 @@ class Stage(IntEnum):
 
 
 def _stage_from_json(value: object) -> Stage:
-    """저장된 Stage 값을 Stage로 변환한다."""
+    """저장된 Stage 문자열을 Stage 객체로 변환한다."""
+
     if isinstance(value, Stage):
         return value
     return Stage[str(value).upper()]
 
 
-# Stage 타입인데, JSON으로 읽고 쓸 때는 정수 대신 소문자 문자열로 자동 변환해주는 타입
 StageField = Annotated[
     Stage,
     BeforeValidator(_stage_from_json),
@@ -105,7 +104,29 @@ class ColumnIssueCount(BaseModel):
 
 
 class Manifest(BaseModel):
-    """한 번의 실행(source_id, window_start)이 남기는 실행 기록 전체."""
+    """한 번의 실행이 남기는 실행 기록 전체.
+    
+    source_id: 소스 ID
+    window_start: 윈도우 시작 시간
+    window_end: 윈도우 종료 시간
+    status: 실행 상태
+    stage: 실행 단계
+    failure_reason: 실패 이유
+    attempt: 재시도 횟수
+    revision: 수정 횟수
+    started_at: 시작 시간
+    ended_at: 종료 시간
+    duration_ms: 실행 시간
+    artifacts: 실행 결과물
+    counts: 개수 정보
+    missing: 누락 정보
+    drop_ratio: 드롭 비율
+    completeness: 완료 비율
+    backfill_status: 백필 상태
+    column_issues: 컬럼 이슈
+    policy_actions: 정책 실행
+    config_version: 설정 버전
+    """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -133,12 +154,14 @@ class Manifest(BaseModel):
 
 def load(source_id: str, window_start: datetime) -> Manifest | None:
     """해당 윈도우의 manifest를 읽어 모델로 변환한다. 없으면 None을 반환한다."""
+
     data = storage.read_manifest(source_id, window_start)
     return None if data is None else Manifest.model_validate(data)
 
 
 def save(manifest: Manifest) -> None:
     """manifest를 dict로 직렬화해 저장한다."""
+
     storage.write_manifest(
         manifest.source_id, manifest.window_start, manifest.model_dump(mode="json")
     )
@@ -148,7 +171,6 @@ class RetryMarker(BaseModel):
     """부분 실패로 남은 조각을 나중에 재시도하기 위해 큐에 남기는 마커."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
-
     source_id: str
     window_start: datetime
     missing_parts: tuple[str, ...]
@@ -159,6 +181,7 @@ class RetryMarker(BaseModel):
 
 def save_retry_marker(marker: RetryMarker) -> None:
     """retry marker를 dict로 직렬화해 저장한다."""
+
     storage.write_retry_marker(
         marker.source_id, marker.window_start, marker.model_dump(mode="json")
     )
@@ -166,9 +189,11 @@ def save_retry_marker(marker: RetryMarker) -> None:
 
 def load_retry_markers(source_id: str) -> list[RetryMarker]:
     """해당 소스에 쌓인 retry marker를 모두 읽어 모델로 변환한다."""
+
     return [RetryMarker.model_validate(d) for d in storage.list_retry_markers(source_id)]
 
 
 def clear_retry_marker(source_id: str, window_start: datetime) -> None:
     """해당 윈도우의 retry marker를 큐에서 제거한다."""
+    
     storage.delete_retry_marker(source_id, window_start)
