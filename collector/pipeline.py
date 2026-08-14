@@ -163,7 +163,8 @@ quarantine은 하류 소비 대상이 아니다. 반대로 **폐기 행이 0건�
 from __future__ import annotations
 
 import time
-from datetime import UTC, datetime
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import pyarrow as pa
 
@@ -185,6 +186,7 @@ from validation.engine import BatchValidationFailed, validate_batch
 from validation.types import RunContext
 
 _HTTP_TIMEOUT_SECONDS = 10.0
+_KST = ZoneInfo("Asia/Seoul")
 
 
 class ForceAndBackfillError(ValueError):
@@ -192,25 +194,40 @@ class ForceAndBackfillError(ValueError):
 
 
 def _sorted_chunks(chunks: dict[str, bytes]) -> list[bytes]:
-    """조각 키의 사전순 정렬이 호출 순서와 일치한다는 설계를 그대로 이용한다."""
+    """조각을 키의 사전순으로 정렬해 값 목록만 반환한다.
+
+    조각 키는 제로 패딩(`page-00001-...`)돼 있어 사전순 정렬이 곧 호출 순서와
+    같다. 라운드 재시도로 조각이 뒤섞여 `collected` dict에 쌓여도, 여기서 다시
+    정렬해 넘기면 `normalize`가 항상 원래 순서로 이어붙일 수 있다.
+    """
     return [chunks[key] for key in sorted(chunks)]
 
 
 def _missing_ratio(missing_count: int, expected_total: int | None, fetched_rows: int, collected_count: int) -> float:
     """성공 조각만으로 누락 비율을 계산한다.
 
-    `expected_total`을 아는 소스(행 기준)는 실제 받은 행 수를 `normalize`로 세어
-    `1 - fetched_rows/expected_total`로 계산한다. 모르는 소스(조각 기준, 기상청)는
-    `누락 조각 수 / 계획된 조각 수`로 계산한다 — 어댑터마다 다른 조각 키 형식을
-    pipeline이 몰라도 되게 하기 위해서다.
+    `expected_total`을 아는 소스(서울, 행 기준)는 실제 받은 행 수를 `normalize`로
+    세어 `1 - fetched_rows/expected_total`로 계산한다. 
+    모르는 소스(기상청, 조각 기준)는 `누락 조각 수 / 계획된 조각 수`로 계산한다. 
+    행을 세는 방식을 쓰는 이유는 어댑터마다 다른 조각 키 형식을 pipeline이 몰라도 되게하기 위해서다.
+
+    args:
+        missing_count: 라운드를 다 써도 못 받은 조각 수.
+        expected_total: 소스가 알려준 전체 행 수. 모르면 None(조각 기준으로 전환).
+        fetched_rows: 성공한 조각을 normalize했을 때 나온 행 수.
+        collected_count: 성공한 조각 수.
+    returns:
+        0.0(누락 없음) ~ 1.0(전부 누락) 사이의 비율.
     """
     if expected_total is not None:
+        # expected_total이 0이면 나눗셈 자체가 무의미하므로 누락 없음으로 본다.
         return max(0.0, 1 - (fetched_rows / expected_total)) if expected_total else 0.0
     planned = collected_count + missing_count
     return (missing_count / planned) if planned else 0.0
 
 
 def _build_missing(missing_keys: dict, expected_total: int | None, fetched_rows: int) -> Missing:
+    """manifest에 남길 `Missing` 필드를 만든다. 기준(rows/parts)은 `expected_total` 유무로 정해진다."""
     parts = tuple(sorted(missing_keys))
     if expected_total is not None:
         return Missing(parts=parts, rows=max(0, expected_total - fetched_rows), basis="rows")
@@ -218,7 +235,12 @@ def _build_missing(missing_keys: dict, expected_total: int | None, fetched_rows:
 
 
 def _now() -> datetime:
-    return datetime.now(UTC)
+    """KST aware 현재 시각. manifest의 started_at·ended_at에 쓴다.
+
+    `window_start`·`window_end`와 시간대를 통일해 manifest 하나를 볼 때 오프셋
+    계산 없이 바로 비교할 수 있게 한다.
+    """
+    return datetime.now(_KST)
 
 
 def execute_window(
@@ -230,7 +252,28 @@ def execute_window(
     backfill: bool = False,
     sleep_fn=time.sleep,
 ) -> Manifest:
-    """window 하나를 재개 분기에 따라 처리하고 최종 manifest를 반환한다."""
+    """window 하나를 재개 분기에 따라 처리하고 최종 manifest를 반환한다.
+
+    fetch(또는 bronze 재사용) → 완결도 게이트 → normalize → 검증 → 폐기 게이트 →
+    silver·quarantine 저장 → manifest 저장 순으로 진행한다. 실패하더라도 예외를
+    올리지 않고(manifest.save 자체의 실패는 예외) FAILED manifest를 만들어
+    반환한다 — 호출자(CLI)가 `status`만 보고 종료 코드를 정할 수 있게 하기
+    위해서다.
+
+    args:
+        config: 소스 설정. `config.adapter`로 어댑터를, `config.quality`로
+            게이트 임계값을 정한다.
+        window_start: 수집 대상 window의 시작 시각. `window_end`는 여기서
+            `config.schedule.interval`을 더해 계산한다.
+        client: 어댑터에 주입할 httpx 클라이언트.
+        force: 재개 분기를 모두 무시하고 처음부터 다시 수집한다.
+        backfill: 완결된 window의 누락 조각만 채운다. `force`와 동시에 줄 수 없다.
+        sleep_fn: 라운드 간 대기 함수. 테스트에서 실제로 기다리지 않도록 주입한다.
+    returns:
+        이번 실행이 도달한 최종 manifest.
+    raises:
+        ForceAndBackfillError: `force`와 `backfill`을 동시에 줄 때.
+    """
     if force and backfill:
         raise ForceAndBackfillError("--force와 --backfill은 함께 줄 수 없다")
 
@@ -241,9 +284,12 @@ def execute_window(
     window = Window(window_start=window_start, window_end=window_end)
 
     if existing and existing.stage == Stage.COMPLETED and not force:
+        # 분기 1: 이미 완결됐고 채울 누락도 없으면(또는 backfill이 아니면) 아무것도
+        # 하지 않는다. 재실행해도 안전해야 하므로(Airflow retry) 어댑터를 다시
+        # 부르지 않고, 저장된 manifest도 건드리지 않은 채 SKIPPED로만 표시해 돌려준다.
         if not (backfill and existing.missing.parts):
             return existing.model_copy(update={"status": RunStatus.SKIPPED})
-        # 분기 4: 백필 — 기존 조각은 살리고 누락분만 받는다.
+        # 분기 4: 백필 — 기존 조각은 그대로 두고(clear_bronze 없이) 누락분만 받는다.
         have_parts = existing.artifacts.bronze.parts
         prior_chunks = dict(zip(have_parts, storage.read_bronze(config.source_id, window_start, have_parts)))
         round_result = fetch_with_rounds(
@@ -254,19 +300,26 @@ def execute_window(
         )
         chunks = {**prior_chunks, **round_result.chunks}
         missing_keys = round_result.missing
+        # 이번에 새로 알아낸 값이 있으면 그걸 쓰고, 없으면 이전 실행이 남긴 값을 이어받는다.
         expected_total = round_result.expected_total if round_result.expected_total is not None else existing.counts.expected
         attempt = existing.attempt + 1
-        revision_base = existing.revision
+        revision_base = existing.revision  # silver를 실제로 다시 쓸 때만 +1한다(아래에서).
     elif existing and existing.stage.value >= Stage.BRONZE_WRITTEN.value and not force:
-        # 분기 2: bronze 재사용 — fetch는 다시 하지 않는다.
+        # 분기 2: bronze 재사용 — 이전 실행이 fetch까지는 끝냈지만(예: silver 쓰기
+        # 실패로 VALIDATED에서 멈췄음) 그 뒤에서 죽은 경우다. 지금 다시 fetch하면
+        # 실시간 API에서는 그 시점의 다른 데이터를 받게 되므로, 반드시 이전에 저장된
+        # bronze 조각을 그대로 재사용한다.
         parts = existing.artifacts.bronze.parts
         chunks = dict(zip(parts, storage.read_bronze(config.source_id, window_start, parts)))
+        # 조각 자체는 재시도하지 않으므로 실제 실패 종류는 중요하지 않다 — 아래
+        # 게이트 계산이 "재시도 불가능한 누락"으로만 취급하면 되므로 PERMANENT로 채운다.
         missing_keys = {key: FetchErrorKind.PERMANENT for key in existing.missing.parts}
         expected_total = existing.counts.expected
         attempt = existing.attempt + 1
         revision_base = existing.revision
     else:
-        # 분기 3(또는 --force): 처음부터 전체 fetch.
+        # 분기 3(또는 --force): 처음부터 전체 fetch. 조각 수가 실행마다 달라질 수
+        # 있으므로(예: 5조각 → 3조각) 이전 실행의 유령 조각이 남지 않도록 먼저 지운다.
         storage.clear_bronze(config.source_id, window_start)
         round_result = fetch_with_rounds(
             adapter_cls.fetch, config, window, client=client,
@@ -283,6 +336,9 @@ def execute_window(
     artifacts = Artifacts(bronze=BronzeArtifacts(prefix=config.source_id, parts=bronze_parts))
 
     def _base_manifest(**over) -> Manifest:
+        # 실패 케이스가 대부분 같은 필드(source_id·window·attempt 등)를 반복하므로,
+        # 기본값은 "가장 이른 실패 지점"(FAILED, BRONZE_WRITTEN)으로 깔고 각
+        # 호출부가 필요한 값만 덮어쓴다.
         fields = {
             "source_id": config.source_id,
             "window_start": window_start,
@@ -300,25 +356,36 @@ def execute_window(
         return Manifest(**fields)
 
     def _finish(**over) -> Manifest:
+        """manifest를 만들어 저장하고 그대로 반환한다. 아래 모든 종료 지점이 공유한다."""
         result = _base_manifest(**over)
         manifest_module.save(result)
         return result
 
     if FetchErrorKind.FATAL in missing_keys.values():
+        # FATAL(인증 오류 등)은 나머지 조각도 같은 이유로 실패할 게 뻔하므로, 게이트
+        # 계산도 검증도 건너뛰고 즉시 끝낸다. stage는 기본값 BRONZE_WRITTEN 그대로
+        # 둔다 — 다음 실행이 분기 2로 들어가 재계산하게 하기 위해서다.
         return _finish(failure_reason=FailureReason.FETCH_ERROR)
 
+    # normalize는 bronze 재사용 여부와 무관하게 항상 다시 수행한다(네트워크를
+    # 타지 않는 순수 변환이라 비용이 없다). 그 결과로 나온 행 수를 "성공 조각으로
+    # 계산하는 missing_ratio"에도 그대로 재사용한다.
     rows = adapter_cls.normalize(_sorted_chunks(chunks), config)
     fetched_rows = len(rows)
     ratio = _missing_ratio(len(missing_keys), expected_total, fetched_rows, len(chunks))
     missing = _build_missing(missing_keys, expected_total, fetched_rows)
 
     if ratio > config.quality.max_missing_ratio:
+        # 완결도 게이트 초과 — silver를 쓰지 않고 fetch_error로 끝낸다. stage는
+        # BRONZE_WRITTEN 그대로라 재실행(또는 백필)하면 분기 2/4로 들어간다.
         return _finish(
             failure_reason=FailureReason.FETCH_ERROR,
             missing=missing, counts=Counts(expected=expected_total, fetched=fetched_rows),
         )
 
     if fetched_rows == 0:
+        # 행이 0건이면 검증을 돌릴 대상이 없으므로 여기서 바로 갈린다. allow_empty인
+        # 소스(행사 등)만 정상 종료로 인정하고, 그 외에는 quality_gate로 묶는다.
         if config.quality.allow_empty:
             return _finish(
                 status=RunStatus.EMPTY, stage=Stage.COMPLETED, failure_reason=None,
@@ -333,6 +400,9 @@ def execute_window(
     try:
         outcome = validate_batch(rows, config, ctx)
     except BatchValidationFailed:
+        # 컬럼 정책이 FAIL_BATCH를 반환했다 — 그 시점 이후 행은 처리되지 않았으므로
+        # silver·quarantine 어느 쪽도 쓸 수 없다. 같은 bronze + 같은 config면
+        # 재시도해도 결과가 같으므로 config를 고쳐야 하는 quality_gate로 남긴다.
         return _finish(
             stage=Stage.VALIDATED, failure_reason=FailureReason.QUALITY_GATE,
             missing=missing, counts=Counts(expected=expected_total, fetched=fetched_rows),
@@ -340,12 +410,15 @@ def execute_window(
 
     counts = Counts(expected=expected_total, **outcome.counts)
     column_issues = {col: ColumnIssueCount(**v) for col, v in outcome.column_issues.items()}
+    # 아래 세 종료 지점(quarantine 실패·drop_ratio 초과·silver 실패)이 공통으로 남길
+    # 필드. artifacts만 지점마다 달라(quarantine 키가 언제 붙는지) 따로 넘긴다.
     common = {
         "missing": missing, "counts": counts, "column_issues": column_issues,
         "policy_actions": outcome.policy_actions, "drop_ratio": outcome.drop_ratio,
     }
 
     try:
+        # 폐기 행이 없으면 quarantine 객체 자체를 만들지 않는다(빈 객체를 굳이 남기지 않는다).
         quarantine_key = (
             storage.write_quarantine(config.source_id, window_start, outcome.quarantine_records)
             if outcome.quarantine_records else None
@@ -354,6 +427,8 @@ def execute_window(
         return _finish(stage=Stage.VALIDATED, failure_reason=FailureReason.STORAGE_ERROR, **common)
 
     if outcome.drop_ratio > config.quality.max_drop_ratio:
+        # 폐기 게이트 초과 — silver는 쓰지 않지만 quarantine은 남긴다(왜 실패했는지
+        # 분석하려면 폐기된 행이 필요하다).
         return _finish(
             stage=Stage.VALIDATED, failure_reason=FailureReason.QUALITY_GATE, **common,
             artifacts=Artifacts(bronze=artifacts.bronze, quarantine=quarantine_key),
@@ -367,6 +442,9 @@ def execute_window(
             artifacts=Artifacts(bronze=artifacts.bronze, quarantine=quarantine_key),
         )
 
+    # 여기까지 왔다는 것은 silver를 실제로 (다시) 썼다는 뜻이므로 revision을 올린다.
+    # 폐기·누락이 전혀 없을 때만 SUCCEEDED이고, 그 외(둘 중 하나라도 게이트 이내로
+    # 존재)에는 PARTIAL이다.
     status = RunStatus.SUCCEEDED if outcome.counts["dropped"] == 0 and ratio == 0.0 else RunStatus.PARTIAL
     return _finish(
         status=status, stage=Stage.COMPLETED, failure_reason=None,
