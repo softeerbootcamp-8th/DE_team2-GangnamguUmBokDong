@@ -18,6 +18,8 @@ dist/
 # OS
 .DS_Store
 
+# ML
+models/
 
 # Data 
 *.csv
