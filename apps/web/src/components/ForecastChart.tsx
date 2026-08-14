@@ -1,5 +1,6 @@
 import { useState } from "react";
 import type { ForecastPoint } from "../api";
+import { monotonePath } from "../curve";
 import { ACTION_LABEL, formatIsoTime } from "../format";
 
 interface Props {
@@ -12,9 +13,11 @@ const MARGIN = { top: 16, right: 16, bottom: 24, left: 32 };
 const PLOT_WIDTH = WIDTH - MARGIN.left - MARGIN.right;
 const PLOT_HEIGHT = HEIGHT - MARGIN.top - MARGIN.bottom;
 
+// 대여가 늘면 재고가 부족해지고(공급필요, 빨강), 반납이 늘면 재고가 넘친다
+// (회수필요, 파랑) — 지도 마커의 방향별 색과 같은 의미로 맞춘다.
 const SERIES = [
-  { key: "predicted_rent_cnt" as const, label: "대여 예측", color: "var(--series-1)" },
-  { key: "predicted_return_cnt" as const, label: "반납 예측", color: "var(--series-2)" },
+  { key: "predicted_rent_cnt" as const, label: "대여 예측", color: "var(--diverging-red)" },
+  { key: "predicted_return_cnt" as const, label: "반납 예측", color: "var(--diverging-blue)" },
 ];
 
 function formatTime(iso: string): string {
@@ -35,7 +38,10 @@ export function ForecastChart({ points }: Props) {
   const last = points[points.length - 1];
   const criticalIndex = points.findIndex((p) => p.action_type !== "normal");
   const criticalPoint = criticalIndex >= 0 ? points[criticalIndex] : null;
-  const criticalColor = criticalPoint?.action_type === "retrieval_needed" ? "var(--diverging-blue)" : "var(--diverging-red)";
+  // 이 선의 역할은 "언제 문제가 생기는지" 경고이지, 방향(공급/회수) 표시가 아니다
+  // — 방향은 옆에 붙는 라벨 텍스트가 이미 말해준다. 데이터 선(빨강/파랑)과 같은
+  // 색 계열을 쓰면 구분이 안 된다는 의견이 있어서, 경고를 뜻하는 색으로 뺐다.
+  const criticalColor = "var(--status-warning)";
   const criticalAnchor = criticalIndex <= 1 ? "start" : criticalIndex >= points.length - 2 ? "end" : "middle";
 
   function handlePointerMove(event: React.PointerEvent<SVGRectElement>) {
@@ -80,7 +86,9 @@ export function ForecastChart({ points }: Props) {
         ))}
 
         {SERIES.map((series) => {
-          const path = points.map((p, i) => `${i === 0 ? "M" : "L"} ${xAt(i)} ${yAt(p[series.key])}`).join(" ");
+          const xs = points.map((_, i) => xAt(i));
+          const ys = points.map((p) => yAt(p[series.key]));
+          const path = monotonePath(xs, ys);
           return (
             <g key={series.key}>
               <path d={path} fill="none" stroke={series.color} strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" />
