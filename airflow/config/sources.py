@@ -69,3 +69,14 @@ Airflow는 --backfill 실행만 오케스트레이션한다.
 - DAG가 해당 source를 모두 Task로 생성하는지
 - source 추가 시 DAG 본체 수정이 필요 없는지
 """
+
+"""Airflow가 실행할 Collector source 그룹을 정의한다.
+
+이 모듈은 Collector의 실제 source_id만 관리한다.
+API URL, 페이지 크기, 인증 정보, 품질 규칙 같은 Collector 내부 설정은
+Airflow에서 중복 정의하지 않는다.
+"""
+
+REALTIME_SOURCES = (
+    "bike_station_realtime",
+)

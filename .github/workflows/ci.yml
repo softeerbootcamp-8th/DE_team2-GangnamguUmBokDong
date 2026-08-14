@@ -40,5 +40,15 @@ jobs:
       - name: Lint
         run: make lint
 
+      - name: Create CI env file
+        run: cp .env.example .env
+
+      - name: Start test infrastructure
+        run: make up
+
       - name: Test
         run: make test
+
+      - name: Stop test infrastructure
+        if: always()
+        run: make down
