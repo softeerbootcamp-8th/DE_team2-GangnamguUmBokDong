@@ -4,6 +4,8 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import pytest
+from pydantic import BaseModel, ValidationError
+
 from manifest import (
     Artifacts,
     ColumnIssueCount,
@@ -21,7 +23,6 @@ from manifest import (
     save,
     save_retry_marker,
 )
-from pydantic import BaseModel, ValidationError
 
 KST = ZoneInfo("Asia/Seoul")
 WINDOW_START = datetime(2026, 8, 12, 14, 10, tzinfo=KST)

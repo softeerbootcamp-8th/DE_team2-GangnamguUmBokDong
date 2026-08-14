@@ -3,6 +3,8 @@
 from datetime import timedelta
 
 import pytest
+from pydantic import ValidationError
+
 from config.schema import (
     Backfill,
     ColumnSpec,
@@ -15,7 +17,6 @@ from config.schema import (
     Storage,
     _parse_duration,
 )
-from pydantic import ValidationError
 
 
 class TestParseDuration:

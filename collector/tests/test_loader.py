@@ -3,8 +3,9 @@
 from pathlib import Path
 
 import pytest
-from config.loader import ConfigError, load
 from pydantic import ValidationError
+
+from config.loader import ConfigError, load
 
 VALID_YAML = """\
 source_id: test_source
