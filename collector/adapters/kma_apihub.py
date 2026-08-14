@@ -70,20 +70,22 @@
 - 실패 범주 판정은 base의 규칙을 따른다. HTTP 상태 기반이며, 인증 실패는 `FATAL`이라
   격자 20개를 헛되이 돌지 않는다.
 
-## base_date · base_time — window을 그대로 쓴다 (발표 주기 보정 없음)
-`window.window_start`를 가공 없이 `%Y%m%d`·`%H%M`으로 포맷해 요청한다. 기상청 발표
-주기(초단기실황은 매시 40분 발표 등)와 트리거 시각이 어긋날 경우, 응답 본문에
-`resultCode="03"`(데이터 없음/미발표)이 반환된다.
-이 어댑터는 HTTP 상태 코드(200) 뿐만 아니라 이 `resultCode`를 적극적으로 파싱하여
-미발표 응답(`03`)을 `TRANSIENT` 에러로 분류한다. 이를 통해 Airflow DAG의 트리거
-타이밍이 미세하게 어긋나더라도, 파이프라인의 라운드 재시도 메커니즘이 데이터를 
-기다렸다가 스스로 복구할 수 있게 한다.
+## base_date · base_time — time_rule을 통한 자체 보정 지원
+기상청은 엔드포인트마다 유효한 발표 시각(base_time)이 엄격하게 정해져 있습니다.
+Airflow 스케줄의 실행 시각(`window_start`)이 10분 단위 등으로 촘촘하게 잡혀있더라도,
+config의 `time_rule` 파라미터를 통해 기상청이 허용하는 가장 최근 발표 시각으로 
+어댑터가 자체적으로 내림(Floor) 계산을 수행하여 요청합니다.
+
+- `hourly`: 초단기실황 (매시 정각. 예: 14:40 -> 14:00)
+- `half_hourly`: 초단기예보 (매시 30분. 예: 14:40 -> 14:30)
+- `vilage_fcst`: 단기예보 (02, 05, 08...시 정각. 예: 05:05 -> 02:00)
 """
 
 from __future__ import annotations
 
 import json
 import os
+from datetime import datetime, timedelta
 from typing import TYPE_CHECKING
 
 import httpx
@@ -121,6 +123,35 @@ def _classify_result_code(code: str | None) -> FetchErrorKind | None:
     return FetchErrorKind.PERMANENT 
 
 
+def _adjust_base_time(dt: datetime, rule: str | None) -> datetime:
+    """time_rule에 따라 기상청 API가 허용하는 가장 최근의 base_time으로 내림(Floor)한다."""
+    if not rule:
+        return dt
+        
+    if rule == "hourly":
+        # 매시 정각 (초단기실황. 예: 14:40 -> 14:00)
+        return dt.replace(minute=0, second=0, microsecond=0)
+        
+    if rule == "half_hourly":
+        # 매시 30분 (초단기예보. 예: 14:20 -> 13:30, 14:40 -> 14:30)
+        if dt.minute < 30:
+            return (dt - timedelta(hours=1)).replace(minute=30, second=0, microsecond=0)
+        return dt.replace(minute=30, second=0, microsecond=0)
+        
+    if rule == "vilage_fcst":
+        # 단기예보: 02:00, 05:00, 08:00, 11:00, 14:00, 17:00, 20:00, 23:00
+        # API 발표는 기준시간 + 10분부터 이루어지므로, 현재 10분 미만이면 한 턴 앞당겨야 함
+        eval_dt = dt if dt.minute >= 10 else dt - timedelta(hours=1)
+        if eval_dt.hour < 2:
+            return (eval_dt - timedelta(days=1)).replace(hour=23, minute=0, second=0, microsecond=0)
+        
+        k = (eval_dt.hour - 2) // 3
+        base_hour = 2 + 3 * k
+        return eval_dt.replace(hour=base_hour, minute=0, second=0, microsecond=0)
+        
+    raise ValueError(f"알 수 없는 time_rule: {rule}")
+
+
 def _extract(body: dict, root_key: str) -> list[dict]:
     """`root_key`의 점 표기 경로를 따라가 행 배열을 꺼낸다. 경로가 없으면 빈 리스트."""
     node: object = body
@@ -146,9 +177,12 @@ class KmaApiHubAdapter:
     ):
         params = config.adapter_params
         endpoint = params["endpoint"]
-        # 발표 주기 보정 없이 window_start를 그대로 쓴다, 정합은 Airflow 스케줄의 책임.
-        base_date = window.window_start.strftime("%Y%m%d")
-        base_time = window.window_start.strftime("%H%M")
+        time_rule = params.get("time_rule")
+        
+        # time_rule 규칙에 따라 API 유효 시각으로 보정
+        adjusted_time = _adjust_base_time(window.window_start, time_rule)
+        base_date = adjusted_time.strftime("%Y%m%d")
+        base_time = adjusted_time.strftime("%H%M")
 
         for nx, ny in params["grids"]:
             key = f"grid-{nx:03d}x{ny:03d}"
