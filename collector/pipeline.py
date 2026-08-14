@@ -354,9 +354,14 @@ def execute_window(
         누락 없음으로 보고, 그 경우 마커도 건드리지 않는다.
         """
         missing = over.get("missing", Missing())
-        backfill_status = _sync_retry_marker(config, window_start, missing, started_at)
-        result = _base_manifest(backfill_status=backfill_status, **over)
+        
+        # S3 원자적 갱신 불가 문제 해결: manifest 저장을 먼저 수행하고,
+        # 실패하지 않았을 때만 마커를 갱신/삭제해 무한 대기나 고아 마커를 방지한다.
+        status_str = "pending" if (config.backfill and config.backfill.enabled and missing.parts) else None
+        result = _base_manifest(backfill_status=status_str, **over)
         manifest_module.save(result)
+        
+        _sync_retry_marker(config, window_start, missing, started_at)
         return result
 
     if FetchErrorKind.FATAL in missing_keys.values():
