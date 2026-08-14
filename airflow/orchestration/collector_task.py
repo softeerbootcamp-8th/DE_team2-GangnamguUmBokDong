@@ -26,6 +26,8 @@ from datetime import timedelta
 
 from airflow.operators.bash import BashOperator
 
+from callbacks.task_callbacks import log_task_failure, log_task_retry
+
 COLLECTOR_DIR = "/workspace/collector"
 COLLECTOR_WINDOW_START = (
     "{{ logical_date.in_timezone('Asia/Seoul').isoformat() }}"
@@ -33,13 +35,13 @@ COLLECTOR_WINDOW_START = (
 
 
 def build_collector_task(source_id: str) -> BashOperator:
-    """Collector CLI를 실행하는 BashOperator를 생성한다.
+    """Collector 실행 Task를 생성한다.
 
     Args:
-        source_id: Collector YAML에 정의된 source 식별자.
+        source_id: Collector 설정에 정의된 source 식별자.
 
     Returns:
-        source별 Collector CLI를 실행하는 BashOperator.
+        Collector를 실행하는 BashOperator.
     """
     return BashOperator(
         task_id=f"collect_{source_id}",
@@ -52,4 +54,6 @@ def build_collector_task(source_id: str) -> BashOperator:
         retries=2,
         retry_delay=timedelta(seconds=30),
         execution_timeout=timedelta(minutes=4),
+        on_retry_callback=log_task_retry,
+        on_failure_callback=log_task_failure,
     )
