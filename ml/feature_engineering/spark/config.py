@@ -89,10 +89,10 @@ PARAM_COMBO_ID = os.environ.get(
 OUTPUT_ROOT = "/".join(
     [os.environ.get("FEATURE_ENGINEERING_OUTPUT_ROOT", _path("processed_v2", "spark")), PARAM_COMBO_ID]
 )
-ROLLING_RENTAL_FEATURES_PARQUET = "/".join([OUTPUT_ROOT, "rolling_rental_features_2025.parquet"])
-MERGED_TABLE_PARQUET = "/".join([OUTPUT_ROOT, "station_hour_merged_2025.parquet"])
-FEATURES_TABLE_PARQUET = "/".join([OUTPUT_ROOT, "station_hour_features_2025.parquet"])
-WATERMARK_PATH = "/".join([OUTPUT_ROOT, "_watermark.json"])
+ROLLING_RENTAL_FEATURES_PARQUET = f"{OUTPUT_ROOT}/rolling_rental_features_2025.parquet"
+MERGED_TABLE_PARQUET = f"{OUTPUT_ROOT}/station_hour_merged_2025.parquet"
+FEATURES_TABLE_PARQUET = f"{OUTPUT_ROOT}/station_hour_features_2025.parquet"
+WATERMARK_PATH = f"{OUTPUT_ROOT}/_watermark.json"
 
 # --- 증분 재생성 시 얼마나 과거까지 다시 계산해서 겹치는 구간을 보정할지 (common_config.py에서 공유) ---
 # lag_168h(7일)보다 넉넉하게 잡은 안전 마진 — 이보다 짧으면 새로 추가되는 구간의

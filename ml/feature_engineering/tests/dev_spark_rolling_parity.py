@@ -12,17 +12,28 @@ import os
 
 import pandas as pd
 import pytest
-
 from ml_common import common_config as pandas_config
-from ml_common.rolling_window_features import censored_rolling_counts as pandas_censored_rolling_counts
-from ml_common.rolling_window_features import future_rolling_counts as pandas_future_rolling_counts
-from ml_common.rolling_window_features import lookup_count_at_ticks as pandas_lookup_count_at_ticks
+from ml_common.rolling_window_features import (
+    censored_rolling_counts as pandas_censored_rolling_counts,
+)
+from ml_common.rolling_window_features import (
+    future_rolling_counts as pandas_future_rolling_counts,
+)
+from ml_common.rolling_window_features import (
+    lookup_count_at_ticks as pandas_lookup_count_at_ticks,
+)
 
 pyspark = pytest.importorskip("pyspark")
 
-from feature_engineering.spark.rolling_window_features import censored_rolling_counts as spark_censored_rolling_counts
-from feature_engineering.spark.rolling_window_features import future_rolling_counts as spark_future_rolling_counts
-from feature_engineering.spark.rolling_window_features import lookup_count_at_ticks as spark_lookup_count_at_ticks
+from feature_engineering.spark.rolling_window_features import (
+    censored_rolling_counts as spark_censored_rolling_counts,
+)
+from feature_engineering.spark.rolling_window_features import (
+    future_rolling_counts as spark_future_rolling_counts,
+)
+from feature_engineering.spark.rolling_window_features import (
+    lookup_count_at_ticks as spark_lookup_count_at_ticks,
+)
 
 
 @pytest.fixture(scope="module")

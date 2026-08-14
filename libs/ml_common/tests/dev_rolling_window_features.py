@@ -51,21 +51,21 @@ def test_add_censored_visibility_bucket_assignment(sample_trips):
 def test_fast_trip_visible_at_bucket_close(sample_trips):
     out = add_censored_visibility(sample_trips, window_minutes=5)
     fast_trip = out[(out.station_id == "A") & (out.end_dt == pd.Timestamp("2025-06-01 10:04:00"))]
-    assert fast_trip["visible_at_close"].iloc[0] == True  # noqa: E712
+    assert fast_trip["visible_at_close"].iloc[0] == True
 
 
 def test_slow_trip_not_visible_at_own_bucket_close(sample_trips):
     """반납이 버킷 종료 시각(10:05)보다 늦은(10:07) 트립은 그 순간엔 관측되면 안 된다 — 이게 이 파일의 핵심."""
     out = add_censored_visibility(sample_trips, window_minutes=5)
     slow_trip = out[(out.station_id == "A") & (out.end_dt == pd.Timestamp("2025-06-01 10:07:00"))]
-    assert slow_trip["visible_at_close"].iloc[0] == False  # noqa: E712
+    assert slow_trip["visible_at_close"].iloc[0] == False
 
 
 def test_incomplete_trip_never_visible(sample_trips):
     """반납 자체가 안 된(NaT) 트립은 어떤 시점을 봐도 관측되면 안 된다."""
     out = add_censored_visibility(sample_trips, window_minutes=5)
     incomplete = out[(out.station_id == "A") & out.end_dt.isna()]
-    assert incomplete["visible_at_close"].iloc[0] == False  # noqa: E712
+    assert incomplete["visible_at_close"].iloc[0] == False
 
 
 def test_censored_count_undercounts_true_count(sample_trips):
