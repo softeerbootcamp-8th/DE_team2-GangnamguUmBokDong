@@ -26,7 +26,7 @@ TEST_BUCKET = "test-bucket"
 def make_spec():
     """ColumnSpec을 만든다. `range=(0, 200)`처럼 튜플로 주면 Range로 감싼다."""
 
-    def _make(types=("int",), required=False, range=None, enum=None, default=None):
+    def _make(types=("int",), required=False, range=None, enum=None, default=None, on_missing=None, on_outlier=None):
         bounds = Range.model_construct(min=range[0], max=range[1]) if isinstance(range, tuple) else range
         return ColumnSpec.model_construct(
             types=tuple(types),
@@ -34,8 +34,8 @@ def make_spec():
             range=bounds,
             enum=enum,
             default=default,
-            on_missing=None,
-            on_outlier=None,
+            on_missing=on_missing,
+            on_outlier=on_outlier,
         )
 
     return _make
