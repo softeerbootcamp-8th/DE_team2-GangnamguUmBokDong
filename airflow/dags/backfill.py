@@ -1,107 +1,80 @@
-"""누락 데이터 복구를 위한 일일 Backfill DAG.
+"""Collector retry queue를 기반으로 누락 데이터를 복구하는 Backfill DAG."""
 
-## 목적
+from __future__ import annotations
 
-실시간 수집 경로에서 완전히 확보되지 못한 데이터를
-정기적으로 다시 수집하여 데이터 완전성을 보완한다.
-
-## Backfill의 두 가지 목적
-
-### 1. 기술적 실패 복구
-
-API 호출 실패 또는 재시도 소진으로 확보하지 못한 조각을 다시 수집한다.
-
-실패 조각 정보의 저장 및 조회 방법은 Collector 계약을 따른다.
-
-Airflow는 실패 페이지를 직접 계산하지 않는다.
-
-### 2. 지연 도착 데이터 보완
-
-대여이력 API는 대여 시작 시 즉시 최종 기록이 생성되지 않는다.
-
-반납이 완료된 뒤 기록이 생성되며,
-대여 후 약 3시간이 지나야 약 95%가 반납되어 조회 가능한 상태가 된다.
-
-따라서 API 호출이 성공했더라도 최근 대여이력은 완전하지 않을 수 있다.
-
-매일 최근 7일 범위를 다시 조회하여 이후 새롭게 생성된 기록을 보완한다.
-
-## 실행 정책
-
-하루 1회 새벽 시간에 실행한다.
-
-Backfill DAG와 5분 realtime_collection DAG는 독립적이다.
-
-따라서:
-
-    실시간 Collector
-    Backfill Collector
-
-가 동시에 실행될 수 있다.
-
-실시간 작업 하나를 놓치더라도 이후 Backfill에서 복구할 수 있는
-구조를 목표로 한다.
-
-## Collector 계약
-
-Airflow는 Collector의 --backfill 인터페이스를 호출한다.
-
-구체적인 CLI 계약은 Collector 구현 확정 후 반영한다.
-
-## 금지 사항
-
-Airflow에서 다음을 직접 구현하지 않는다.
-
-- 실패 페이지 조회 알고리즘
-- API 페이지 재호출
-- 대여이력 중복 제거
-- Bronze/Silver 보완
-- 데이터 merge
-
-모두 Collector 책임이다.
-
-## 검증
-
-- 하루 한 번 실행되는지
-- realtime_collection과 dependency가 없는지
-- Collector backfill CLI를 올바르게 호출하는지
-- 실패 시 Airflow retry가 동작하는지
-"""
-
-
-"""Collector 누락 조각 복구를 실행하는 Backfill DAG."""
+import json
+import subprocess
 
 import pendulum
-from airflow import DAG
-from airflow.operators.python import PythonOperator
+from airflow.decorators import dag, task
 
-from orchestration.collector_task import build_backfill_task
-
-
-def get_source_id() -> str:
-    """DAG Run conf에서 source_id를 반환한다."""
-    return "{{ dag_run.conf['source_id'] }}"
+COLLECTOR_DIR = "/workspace/collector"
+BACKFILL_SOURCE_ID = "bike_station_realtime"
 
 
-def get_window_start() -> str:
-    """DAG Run conf에서 원래 Collector window_start를 반환한다."""
-    return "{{ dag_run.conf['window_start'] }}"
-
-
-with DAG(
+@dag(
     dag_id="collector_backfill",
     schedule=None,
-    start_date=pendulum.datetime(
-        2026,
-        8,
-        14,
-        tz="Asia/Seoul",
-    ),
+    start_date=pendulum.datetime(2026, 8, 14, tz="Asia/Seoul"),
     catchup=False,
     max_active_runs=1,
     tags=["collection", "backfill"],
-) as dag:
-    build_backfill_task(
-        source_id="{{ dag_run.conf['source_id'] }}",
-        window_start="{{ dag_run.conf['window_start'] }}",
-    )
+)
+def collector_backfill():
+    """Collector가 제공하는 백필 대상 목록을 받아 대상별 복구 작업을 실행한다."""
+
+    @task
+    def list_backfill_targets(source_id: str) -> list[dict[str, str]]:
+        """Collector CLI에서 백필 대상 목록을 조회한다.
+
+        Args:
+            source_id: Collector YAML에 정의된 source 식별자.
+
+        Returns:
+            source_id와 window_start만 포함한 백필 대상 목록.
+        """
+        result = subprocess.run(
+            [
+                "uv",
+                "run",
+                "python",
+                "main.py",
+                "--list-backfill-targets",
+                "--source",
+                source_id,
+            ],
+            cwd=COLLECTOR_DIR,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return json.loads(result.stdout)
+
+    @task
+    def run_backfill(target: dict[str, str]) -> None:
+        """백필 대상 하나에 대해 Collector의 --backfill 실행을 요청한다.
+
+        Args:
+            target: source_id와 window_start를 포함한 백필 대상.
+        """
+        subprocess.run(
+            [
+                "uv",
+                "run",
+                "python",
+                "main.py",
+                "--source",
+                target["source_id"],
+                "--window-start",
+                target["window_start"],
+                "--backfill",
+            ],
+            cwd=COLLECTOR_DIR,
+            check=True,
+        )
+
+    targets = list_backfill_targets(BACKFILL_SOURCE_ID)
+    run_backfill.expand(target=targets)
+
+
+dag = collector_backfill()
