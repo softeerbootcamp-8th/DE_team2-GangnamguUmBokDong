@@ -22,7 +22,6 @@ from airflow.operators.bash import BashOperator
 from config.schedules import TIMEZONE
 from orchestration.collector_task import build_collector_task
 
-
 SOURCE_ID = "bike_station_realtime"
 E2E_WINDOW_START = (
     "{{ logical_date.in_timezone('Asia/Seoul')"
