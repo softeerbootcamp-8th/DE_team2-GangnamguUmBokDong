@@ -495,6 +495,30 @@ def _censored_rental_recent(
         out[f"rental_roll_std_{window}h"] = std_val
 
 
+def _target_timestamp(date: str, hour: int, minute: int = 0) -> pd.Timestamp:
+    """date+hour+minute을 target_ts로 조합한다.
+
+    `minute`은 반드시 `config.GRID_TICK_MINUTES`(5분)의 배수여야 한다 — 그보다
+    더 잘게 쪼갠 시각을 요청해도 학습 데이터(feature_engineering의 5분 tick
+    그리드)에 대응하는 tick이 없어서 lag/rolling 앵커가 의미를 잃는다.
+
+    args:
+        date: "YYYY-MM-DD"
+        hour: 0~23
+        minute: 0~59 중 GRID_TICK_MINUTES의 배수 (기본값 0 — 정시)
+    returns:
+        pd.Timestamp: date+hour+minute을 합친 시각
+    raises:
+        ValueError: hour가 0~23 밖이거나 minute이 0~59 밖이거나 GRID_TICK_MINUTES의
+            배수가 아닐 때
+    """
+    if not (0 <= hour <= 23):
+        raise ValueError(f"hour는 0~23 사이여야 함: {hour}")
+    if not (0 <= minute < 60) or minute % config.GRID_TICK_MINUTES != 0:
+        raise ValueError(f"minute은 0~59 사이의 {config.GRID_TICK_MINUTES}분 배수여야 함: {minute}")
+    return pd.Timestamp(date) + pd.Timedelta(hours=hour, minutes=minute)
+
+
 def _build_feature_record(
     station_id: str,
     date: str,
@@ -509,6 +533,7 @@ def _build_feature_record(
     pop_short_foreign: float,
     stockout: bool,
     skip_rental_recent: bool = False,
+    minute: int = 0,
 ) -> tuple[dict, list[str], bool]:
     """예측 1건에 필요한 feature 값을 dict로 조립한다(DataFrame 생성/dtype 캐스팅은 안 함).
 
@@ -521,17 +546,15 @@ def _build_feature_record(
     args/returns: `_build_feature_row()`와 동일한 의미, 반환은 (record dict,
         fallback_fields, population_fallback) 3개.
     raises:
-        ValueError: station_id가 station_master에 없거나 hour가 0~23 범위를 벗어날 때
+        ValueError: station_id가 station_master에 없거나 hour/minute이 범위를
+            벗어날 때(`_target_timestamp()` 참고)
     """
     master = _get_station_master()
     if station_id not in master.index:
         raise ValueError(f"알 수 없는 station_id: {station_id!r} (station_master.parquet에 없음)")
     station_row = master.loc[station_id]
 
-    if not (0 <= hour <= 23):
-        raise ValueError(f"hour는 0~23 사이여야 함: {hour}")
-
-    target_ts = pd.Timestamp(date) + pd.Timedelta(hours=hour)
+    target_ts = _target_timestamp(date, hour, minute)
 
     population_fallback = population is None
     if population_fallback:
@@ -603,6 +626,7 @@ def _build_feature_row(
     pop_short_foreign: float,
     stockout: bool,
     skip_rental_recent: bool = False,
+    minute: int = 0,
 ) -> pd.DataFrame:
     """예측 1건에 필요한 feature 1행짜리 DataFrame을 조립한다.
 
@@ -623,16 +647,22 @@ def _build_feature_row(
         skip_rental_recent: `_lag_rolling_features()` 참고 — True면 rental의
             "직전 실적" 5개를 비싼 실시간 조회 없이 NaN으로 두고, 호출부가
             바로 덮어쓸 걸 전제한다(predict_demand_multi_hour의 h>=2 전용 최적화)
+        minute: 0~59 중 `config.GRID_TICK_MINUTES`(5분)의 배수 (기본값 0 — 정시).
+            학습 그리드가 5분 tick이라 이 값에 따라 lag/rolling 앵커가 실제로
+            달라진다(`_target_timestamp()` 참고) — 정시로만 고정하면 예를 들어
+            17:05/17:10/17:15 요청을 전부 17:00 기준으로 뭉개서 계산하게 된다.
     returns:
         pd.DataFrame: train_common.FEATURE_COLUMNS를 모두 포함하는 1행 DataFrame.
             attrs["fallback_fields"]/attrs["population_fallback"]에 fallback
             사용 여부가 담김
     raises:
-        ValueError: station_id가 station_master에 없거나 hour가 0~23 범위를 벗어날 때
+        ValueError: station_id가 station_master에 없거나 hour/minute이 범위를
+            벗어날 때(`_target_timestamp()` 참고)
     """
     record, fallback_fields, population_fallback = _build_feature_record(
         station_id, date, hour, temp, precip, wind, humidity,
         population, pop_resd, pop_long_foreign, pop_short_foreign, stockout, skip_rental_recent,
+        minute=minute,
     )
     df = pd.DataFrame([record])
     df.attrs["fallback_fields"] = fallback_fields
@@ -656,7 +686,7 @@ def _predict_at(model_name: str, exposure_col: str | None, **kwargs) -> dict:
         exposure_col: predict()에 전달할 exposure 컬럼명 (반납은 None)
         **kwargs: _build_feature_row()에 그대로 전달할 인자
     returns:
-        dict: station_id, date, hour, pred_mean, pred_p10, pred_p50, pred_p90,
+        dict: station_id, date, hour, minute, pred_mean, pred_p10, pred_p50, pred_p90,
             lag_fallback_used, lag_data_freshness, population_source
     """
     df = _build_feature_row(**kwargs)
@@ -668,6 +698,7 @@ def _predict_at(model_name: str, exposure_col: str | None, **kwargs) -> dict:
         "station_id": row["station_id"],
         "date": row["date"],
         "hour": int(row["hour"]),
+        "minute": int(kwargs.get("minute", 0)),
         "pred_mean": float(row["pred_mean"]),
         "pred_p10": float(row["pred_p10"]),
         "pred_p50": float(row["pred_p50"]),
@@ -985,13 +1016,14 @@ def predict_demand_multi_hour(
     humidity: float,
     population: float | None = None,
     *,
+    minute: int = 0,
     pop_resd: float | None = None,
     pop_long_foreign: float = 0.0,
     pop_short_foreign: float = 0.0,
     stockout: bool = False,
     n_hours: int = 1,
 ) -> list[dict]:
-    """(date, hour)를 "지금(T0)"으로 놓고, 1시간 뒤부터 n_hours시간 뒤까지 1시간 간격으로 예측한다.
+    """(date, hour, minute)를 "지금(T0)"으로 놓고, 1시간 뒤부터 n_hours시간 뒤까지 1시간 간격으로 예측한다.
 
     두 번째 시간대(h=2)부터는 바로 이전 스텝에서 예측한 값을 그 다음 스텝의
     "직전 실적"(lag_1h, roll_mean/std_3h/24h)으로 재귀적으로 사용한다
@@ -1000,7 +1032,8 @@ def predict_demand_multi_hour(
     누적되는 한계가 있다(정확도보다 구현 속도를 우선한 의도적 선택 — 더 정확한
     대안은 `training/experiments/multi_horizon/` 참고). 날씨/인구는 시간마다
     다시 관측/예보되는 게 아니라 호출 시점에 준 값을 n_hours 내내 그대로
-    재사용한다(예보 API 미연동, 알려진 단순화).
+    재사용한다(예보 API 미연동, 알려진 단순화). 재귀 스텝은 1시간 간격으로만
+    전진하므로(`base_ts + h시간`) minute은 모든 스텝에서 T0과 동일하게 유지된다.
 
     args:
         station_id: 정류소 ID
@@ -1008,27 +1041,30 @@ def predict_demand_multi_hour(
         temp, precip, wind, humidity: 날씨 (n_hours 내내 동일 값 재사용)
         population: 생활인구 합계. None이면 매 시간 격자 평소 인구(hour, dow
             기준이라 시간마다 달라짐)로 자동 대체
+        minute: `predict_rental_demand()` 참고 — 0~59 중 5분 배수 (기본값 0),
+            T0의 5분 tick 앵커
         pop_resd, pop_long_foreign, pop_short_foreign: 인구 세부 breakdown
         stockout: 전체 n_hours 동안 재고 없음으로 가정할지 (대여 exposure 보정)
         n_hours: 몇 시간 뒤까지 예측할지 (1이면 사실상 predict_rental/return_demand와 동일)
     returns:
         list[dict]: 길이 n_hours. 각 원소는
-            {station_id, date, hour, rental: {pred_mean/p10/p50/p90,
+            {station_id, date, hour, minute, rental: {pred_mean/p10/p50/p90,
             lag_fallback_used, lag_data_freshness}, return: {pred_mean/p10/p50/p90},
             population_source}
     """
-    base_ts = pd.Timestamp(date) + pd.Timedelta(hours=hour)
+    base_ts = _target_timestamp(date, hour, minute)
     synthetic: dict[pd.Timestamp, dict[str, float]] = {}
     results = []
 
     for h in range(1, n_hours + 1):
         target_ts = base_ts + pd.Timedelta(hours=h)
-        t_date, t_hour = target_ts.strftime("%Y-%m-%d"), int(target_ts.hour)
+        t_date, t_hour, t_minute = target_ts.strftime("%Y-%m-%d"), int(target_ts.hour), int(target_ts.minute)
 
         df = _build_feature_row(
             station_id=station_id,
             date=t_date,
             hour=t_hour,
+            minute=t_minute,
             temp=temp,
             precip=precip,
             wind=wind,
@@ -1061,6 +1097,7 @@ def predict_demand_multi_hour(
             "station_id": station_id,
             "date": t_date,
             "hour": t_hour,
+            "minute": t_minute,
             "rental": {
                 "pred_mean": float(rental_row["pred_mean"]),
                 "pred_p10": float(rental_row["pred_p10"]),
@@ -1094,11 +1131,12 @@ def predict_demand_multi_hour_all_stations(
     wind: float,
     humidity: float,
     *,
+    minute: int = 0,
     station_ids: list[str] | None = None,
     stockout: bool = False,
     n_hours: int = 1,
     on_progress=None,
-) -> list[dict]:
+) -> dict:
     """전체(또는 지정한) 정류소를 시간(h)마다 배치로 묶어서 한 번에 예측한다.
 
     날씨(temp/precip/wind/humidity)는 서울 전체가 관측소 하나를 공유하는
@@ -1121,15 +1159,27 @@ def predict_demand_multi_hour_all_stations(
     args:
         date, hour: "지금(T0)" — 전체 정류소에 공통 적용
         temp, precip, wind, humidity: 날씨 (전체 정류소 공통, n_hours 내내 재사용)
+        minute: `predict_rental_demand()` 참고 — 0~59 중 5분 배수 (기본값 0),
+            T0의 5분 tick 앵커
         station_ids: None이면 학습된 모델이 실제로 아는 정류소 전체(아래 참고)
         stockout: 전체 n_hours·전체 정류소에 공통 적용
         n_hours: 몇 시간 뒤까지 예측할지
         on_progress: (완료된 시간 h, 전체 n_hours)를 받는 콜백 — CLI 진행률
             표시용, None이면 호출 안 함
     returns:
-        list[dict]: predict_demand_multi_hour()과 같은 형태의 원소를 정류소별로
-            이어붙인 것(길이 = len(station_ids) * n_hours) — 각 원소에
-            station_id가 있어 구분 가능
+        dict: {
+            "results": predict_demand_multi_hour()과 같은 형태의 원소를 정류소별로
+                이어붙인 것(각 원소에 station_id가 있어 구분 가능) — 실패한
+                (station, h)는 빠져 있다,
+            "failed": [{station_id, date, hour, minute, error}, ...] — 개별
+                정류소 feature 조립/예측이 예외로 실패해 건너뛴 항목(원인 포함),
+            "expected_count": len(station_ids) * n_hours,
+            "actual_count": len(results),
+        }
+        `actual_count < expected_count`면 일부 정류소가 조용히 누락된 partial
+        결과라는 뜻이다 — Gold 적재 등 downstream은 이 필드로 완결성을 판단해야
+        한다("failed"가 비어 있어도 `actual_count`만으로 partial 여부를 알 수
+        있게 둘 다 반환한다).
     """
     if station_ids is None:
         # station_master.parquet(2,977개)에는 2025년에 트립이 없어 학습 데이터/
@@ -1139,14 +1189,15 @@ def predict_demand_multi_hour_all_stations(
         # 어차피 학습 안 된 station_id는 예측 자체가 의미 없다.
         station_ids = sorted(load_station_dtype("rental").categories)
 
-    base_ts = pd.Timestamp(date) + pd.Timedelta(hours=hour)
+    base_ts = _target_timestamp(date, hour, minute)
     synthetic: dict[str, dict[pd.Timestamp, dict[str, float]]] = {sid: {} for sid in station_ids}
     results_by_station: dict[str, list[dict]] = {sid: [] for sid in station_ids}
     station_index = pd.Index(station_ids, name="station_id")
+    failed: list[dict] = []
 
     for h in range(1, n_hours + 1):
         target_ts = base_ts + pd.Timedelta(hours=h)
-        t_date, t_hour = target_ts.strftime("%Y-%m-%d"), int(target_ts.hour)
+        t_date, t_hour, t_minute = target_ts.strftime("%Y-%m-%d"), int(target_ts.hour), int(target_ts.minute)
 
         # rental "직전 실적" 5개는 정류소별로 반복하지 않고 전체를 한 번에
         # 벡터화해서 미리 계산해둔다(history.md 24번 항목 — anchor 축으로 뒤집는
@@ -1170,7 +1221,7 @@ def predict_demand_multi_hour_all_stations(
         for sid in station_ids:
             try:
                 record, fb, population_fallback = _build_feature_record(
-                    station_id=sid, date=t_date, hour=t_hour,
+                    station_id=sid, date=t_date, hour=t_hour, minute=t_minute,
                     temp=temp, precip=precip, wind=wind, humidity=humidity,
                     population=None, pop_resd=None, pop_long_foreign=0.0, pop_short_foreign=0.0,
                     stockout=stockout, skip_rental_recent=True,
@@ -1198,6 +1249,13 @@ def predict_demand_multi_hour_all_stations(
                     f"({t_date} {t_hour}시) — {type(exc).__name__}: {exc}",
                     file=sys.stderr,
                 )
+                failed.append({
+                    "station_id": sid,
+                    "date": t_date,
+                    "hour": t_hour,
+                    "minute": t_minute,
+                    "error": f"{type(exc).__name__}: {exc}",
+                })
                 continue
             fallback_by_station[sid] = fb
             population_fallback_by_station[sid] = population_fallback
@@ -1224,6 +1282,7 @@ def predict_demand_multi_hour_all_stations(
                 "station_id": sid,
                 "date": t_date,
                 "hour": t_hour,
+                "minute": t_minute,
                 "rental": {
                     "pred_mean": float(rr["pred_mean"]), "pred_p10": float(rr["pred_p10"]),
                     "pred_p50": float(rr["pred_p50"]), "pred_p90": float(rr["pred_p90"]),
@@ -1247,7 +1306,12 @@ def predict_demand_multi_hour_all_stations(
     results = []
     for sid in station_ids:
         results.extend(results_by_station[sid])
-    return results
+    return {
+        "results": results,
+        "failed": failed,
+        "expected_count": len(station_ids) * n_hours,
+        "actual_count": len(results),
+    }
 
 
 def predict_rental_demand(
@@ -1260,6 +1324,7 @@ def predict_rental_demand(
     humidity: float,
     population: float | None = None,
     *,
+    minute: int = 0,
     pop_resd: float | None = None,
     pop_long_foreign: float = 0.0,
     pop_short_foreign: float = 0.0,
@@ -1278,15 +1343,19 @@ def predict_rental_demand(
         population: 그 정류소가 속한 250m 격자의 생활인구 합계. 인구 데이터
             피드가 끊겼으면 생략(None) — 그 격자의 평소 인구(hour, dow 기준)로
             자동 대체된다
+        minute: 0~59 중 5분 배수 (기본값 0) — feature_engineering의 학습 그리드가
+            5분 tick이라, 이 값을 안 주면 예를 들어 17:05/17:10/17:15 요청이 전부
+            17:00 기준으로 계산돼 lag/rolling이 실제 시각과 어긋난다.
         pop_resd: 내국인 인구를 세부적으로 줄 때 (기본값은 population에서 역산)
         pop_long_foreign: 장기체류외국인 인구
         pop_short_foreign: 단기체류외국인 인구
         stockout: 그 시각 정류소에 대여 가능한 자전거가 없었으면 True (품절 보정)
     returns:
-        dict: station_id, date, hour, pred_mean, pred_p10, pred_p50, pred_p90,
+        dict: station_id, date, hour, minute, pred_mean, pred_p10, pred_p50, pred_p90,
             lag_fallback_used, lag_data_freshness, population_source
     raises:
-        ValueError: station_id가 station_master에 없거나 hour가 0~23 범위를 벗어날 때
+        ValueError: station_id가 station_master에 없거나 hour/minute이 범위를
+            벗어날 때(`_target_timestamp()` 참고)
     """
     return _predict_at(
         "rental",
@@ -1294,6 +1363,7 @@ def predict_rental_demand(
         station_id=station_id,
         date=date,
         hour=hour,
+        minute=minute,
         temp=temp,
         precip=precip,
         wind=wind,
@@ -1316,6 +1386,7 @@ def predict_return_demand(
     humidity: float,
     population: float | None = None,
     *,
+    minute: int = 0,
     pop_resd: float | None = None,
     pop_long_foreign: float = 0.0,
     pop_short_foreign: float = 0.0,
@@ -1333,20 +1404,23 @@ def predict_return_demand(
         population: 그 정류소가 속한 250m 격자의 생활인구 합계. 인구 데이터
             피드가 끊겼으면 생략(None) — 그 격자의 평소 인구(hour, dow 기준)로
             자동 대체된다
+        minute: `predict_rental_demand()` 참고 — 0~59 중 5분 배수 (기본값 0)
         pop_resd: 내국인 인구를 세부적으로 줄 때 (기본값은 population에서 역산)
         pop_long_foreign: 장기체류외국인 인구
         pop_short_foreign: 단기체류외국인 인구
     returns:
-        dict: station_id, date, hour, pred_mean, pred_p10, pred_p50, pred_p90,
+        dict: station_id, date, hour, minute, pred_mean, pred_p10, pred_p50, pred_p90,
             lag_fallback_used, lag_data_freshness, population_source
     raises:
-        ValueError: station_id가 station_master에 없거나 hour가 0~23 범위를 벗어날 때
+        ValueError: station_id가 station_master에 없거나 hour/minute이 범위를
+            벗어날 때(`_target_timestamp()` 참고)
     """
     return _predict_at(
         "return",
         None,
         station_id=station_id,
         date=date,
+        minute=minute,
         hour=hour,
         temp=temp,
         precip=precip,
@@ -1373,6 +1447,11 @@ if __name__ == "__main__":
     )
     parser.add_argument("--date", required=True, help="YYYY-MM-DD")
     parser.add_argument("--hour", type=int, required=True)
+    parser.add_argument(
+        "--minute", type=int, default=0,
+        help="0~59 중 5분 배수 (기본값 0 — 정시). 학습 그리드가 5분 tick이라 정시로만 "
+        "고정하면 그 시간 안의 5분 단위 시점(예: 17:05, 17:10)을 요청할 수 없다.",
+    )
     parser.add_argument("--temp", type=float, required=True)
     parser.add_argument("--precip", type=float, required=True)
     parser.add_argument("--wind", type=float, required=True)
@@ -1398,19 +1477,22 @@ if __name__ == "__main__":
         def _progress(done: int, total: int) -> None:
             print(f"  {done}/{total} 시간대 완료 ({time.perf_counter() - start:.1f}s)", flush=True)
 
-        result = predict_demand_multi_hour_all_stations(
-            date=args.date, hour=args.hour, temp=args.temp, precip=args.precip,
+        outcome = predict_demand_multi_hour_all_stations(
+            date=args.date, hour=args.hour, minute=args.minute, temp=args.temp, precip=args.precip,
             wind=args.wind, humidity=args.humidity, stockout=args.stockout,
             n_hours=args.n_hours, on_progress=_progress,
         )
         elapsed = time.perf_counter() - start
-        n_stations = len(result) // args.n_hours
-        print(f"전체 {n_stations:,}개 정류소 x {args.n_hours}시간 = {len(result):,}행, {elapsed:.1f}초 소요")
+        result, failed = outcome["results"], outcome["failed"]
+        print(
+            f"전체 {outcome['expected_count']:,}건 기대 / {outcome['actual_count']:,}건 성공"
+            f"({len(failed):,}건 실패), {elapsed:.1f}초 소요"
+        )
 
         rows = []
         for r in result:
             rows.append({
-                "station_id": r["station_id"], "date": r["date"], "hour": r["hour"],
+                "station_id": r["station_id"], "date": r["date"], "hour": r["hour"], "minute": r["minute"],
                 "rental_pred_mean": r["rental"]["pred_mean"], "rental_pred_p10": r["rental"]["pred_p10"],
                 "rental_pred_p50": r["rental"]["pred_p50"], "rental_pred_p90": r["rental"]["pred_p90"],
                 "return_pred_mean": r["return"]["pred_mean"], "return_pred_p10": r["return"]["pred_p10"],
@@ -1419,15 +1501,27 @@ if __name__ == "__main__":
                 "population_source": r["population_source"],
             })
         out_df = pd.DataFrame(rows)
-        out_path = args.out or f"inference_multi_hour_{args.date.replace('-', '')}_{args.hour:02d}.parquet"
+        out_path = args.out or f"inference_multi_hour_{args.date.replace('-', '')}_{args.hour:02d}{args.minute:02d}.parquet"
         out_df.to_parquet(out_path, index=False)
         print(f"결과 저장: {out_path}")
+
+        if failed:
+            # Gold 적재 등 downstream이 stderr 로그를 안 봐도 partial 여부를 알 수 있게
+            # 실패 목록을 결과 옆에 별도 파일로 남기고, 종료 코드로도 partial임을 알린다
+            # (run_full_pipeline.py/monthly_retrain_check.py처럼 subprocess.run(check=True)로
+            # 호출하는 쪽이 이 실패를 놓치지 않도록).
+            failed_path = out_path.removesuffix(".parquet") + "_failed.json"
+            with open(failed_path, "w", encoding="utf-8") as f:
+                json.dump(failed, f, ensure_ascii=False, indent=2)
+            print(f"실패 {len(failed):,}건 목록 저장: {failed_path}", file=sys.stderr)
+            raise SystemExit(1)
         raise SystemExit(0)
 
     common = {
         "station_id": args.station_id,
         "date": args.date,
         "hour": args.hour,
+        "minute": args.minute,
         "temp": args.temp,
         "precip": args.precip,
         "wind": args.wind,
