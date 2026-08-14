@@ -69,6 +69,7 @@ def evaluate_recent_performance(
     exposure_col: str | None,
     lookback_months: int | None = None,
     as_of: date | None = None,
+    horizon: int = 1,
 ) -> dict:
     """챔피언 모델을 최근 lookback_months개월 실측 데이터로 다시 평가해 baseline과 비교한다.
 
@@ -78,19 +79,24 @@ def evaluate_recent_performance(
         exposure_col: predict()에 전달할 exposure 컬럼명 (반납은 None)
         lookback_months: None이면 config.MONITOR_LOOKBACK_MONTHS
         as_of: 기준 날짜(기본 오늘) — 테스트용 override
+        horizon: 몇 시간 뒤 예측 기준으로 평가할지 (기본 1 — 기존 h=1 전용 챔피언과
+            같은 조건으로 baseline 임계값(10%/15%p)의 연속성을 유지). multi-horizon
+            테이블엔 horizon별 행이 섞여 있어 반드시 하나로 고정해서 걸러야 한다.
     returns:
         dict: model_name, period, n_rows, baseline_*/current_* (deviance, rmse,
             coverage), deviance_relative_change, coverage_drift
     raises:
-        ValueError: 해당 기간에 feature mart 데이터가 전혀 없을 때
+        ValueError: 해당 기간·horizon에 feature mart 데이터가 전혀 없을 때
     """
     lookback_months = lookback_months or config.MONITOR_LOOKBACK_MONTHS
     start, end = _recent_month_range(lookback_months, as_of)
 
-    df = pd.read_parquet(config.FEATURES_TABLE_PARQUET)
-    df = df[(df["date"] >= start) & (df["date"] <= end)].reset_index(drop=True)
+    df = pd.read_parquet(config.MULTI_HORIZON_FEATURES_TABLE_PARQUET)
+    df = df[(df["date"] >= start) & (df["date"] <= end) & (df["horizon"] == horizon)].reset_index(drop=True)
     if df.empty:
-        raise ValueError(f"{start}~{end} 구간에 feature mart 데이터가 없음 — 최신 데이터가 반영됐는지 확인하세요")
+        raise ValueError(
+            f"{start}~{end} 구간·horizon={horizon}에 feature mart 데이터가 없음 — 최신 데이터가 반영됐는지 확인하세요"
+        )
 
     preds = predict(df, model_name, exposure_col=exposure_col)
     y = df[target_col].to_numpy()
@@ -142,17 +148,18 @@ def decide_retrain(evaluation: dict) -> dict:
     return {**evaluation, "needs_retrain": len(reasons) > 0, "reasons": reasons}
 
 
-def check_all_models(as_of: date | None = None) -> list[dict]:
+def check_all_models(as_of: date | None = None, horizon: int = 1) -> list[dict]:
     """대여/반납 챔피언 모델을 모두 확인한다.
 
     args:
         as_of: 기준 날짜 (테스트용 override)
+        horizon: `evaluate_recent_performance()` 참고 — 기본 1
     returns:
         list[dict]: decide_retrain() 결과 (rental, return 순)
     """
     results = []
     for model_name, target_col, exposure_col in MODEL_SPECS:
-        evaluation = evaluate_recent_performance(model_name, target_col, exposure_col, as_of=as_of)
+        evaluation = evaluate_recent_performance(model_name, target_col, exposure_col, as_of=as_of, horizon=horizon)
         results.append(decide_retrain(evaluation))
     return results
 

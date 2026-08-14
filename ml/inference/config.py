@@ -8,9 +8,9 @@
 from ml_common import common_config
 from ml_common.paths import (
     ANALYSIS_SUMMARY_JSON,
-    FEATURES_TABLE_PARQUET,
     MERGED_TABLE_PARQUET,
     MODELS_DIR,
+    MULTI_HORIZON_FEATURES_TABLE_PARQUET,
     POPULATION_HOURLY_PROFILE_PARQUET,
     POPULATION_PARQUET,
     PROCESSED_V2_DIR,
@@ -22,11 +22,12 @@ from ml_common.paths import (
 __all__ = [
     "ANALYSIS_SUMMARY_JSON",
     "EXPOSURE_STOCKOUT_VALUE",
-    "FEATURES_TABLE_PARQUET",
     "GRID_TICK_MINUTES",
+    "HORIZON_COUNT",
     "LAG_HOURS",
     "MERGED_TABLE_PARQUET",
     "MODELS_DIR",
+    "MULTI_HORIZON_FEATURES_TABLE_PARQUET",
     "POPULATION_HOURLY_PROFILE_PARQUET",
     "POPULATION_PARQUET",
     "PROCESSED_V2_DIR",
@@ -50,6 +51,9 @@ GRID_TICK_MINUTES = common_config.GRID_TICK_MINUTES
 # --- lag/rolling 피처 파라미터 (feature_engineering와 동일 — common_config.py에서 공유) ---
 LAG_HOURS = common_config.LAG_HOURS
 ROLLING_WINDOWS = common_config.ROLLING_WINDOWS
+
+# --- 배치예측 horizon 개수 (feature_engineering와 동일 — common_config.py에서 공유) ---
+HORIZON_COUNT = common_config.HORIZON_COUNT
 
 EXPOSURE_STOCKOUT_VALUE = common_config.EXPOSURE_STOCKOUT_VALUE
 

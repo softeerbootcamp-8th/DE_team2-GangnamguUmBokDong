@@ -76,6 +76,9 @@ GRID_TICK_MINUTES = common_config.GRID_TICK_MINUTES
 LAG_HOURS = common_config.LAG_HOURS
 ROLLING_WINDOWS = common_config.ROLLING_WINDOWS
 
+# --- 배치예측 horizon 개수 (common_config.py에서 공유 — build_multi_horizon_features.py 참고) ---
+HORIZON_COUNT = common_config.HORIZON_COUNT
+
 EXPOSURE_STOCKOUT_VALUE = 0.05
 
 # --- 출력: 이 패키지("2차 정제"/피처마트 생성)가 만드는 산출물 ---
@@ -92,6 +95,9 @@ OUTPUT_ROOT = "/".join(
 ROLLING_RENTAL_FEATURES_PARQUET = f"{OUTPUT_ROOT}/rolling_rental_features_2025.parquet"
 MERGED_TABLE_PARQUET = f"{OUTPUT_ROOT}/station_hour_merged_2025.parquet"
 FEATURES_TABLE_PARQUET = f"{OUTPUT_ROOT}/station_hour_features_2025.parquet"
+# FEATURES_TABLE_PARQUET의 각 행(T0)을 horizon=1..HORIZON_COUNT로 self-join한 학습 테이블
+# (build_multi_horizon_features.py) — libs/ml_common/paths.py의 같은 이름 상수와 동일 공식.
+MULTI_HORIZON_FEATURES_TABLE_PARQUET = f"{OUTPUT_ROOT}/station_hour_features_multihorizon_2025.parquet"
 WATERMARK_PATH = f"{OUTPUT_ROOT}/_watermark.json"
 
 # --- 증분 재생성 시 얼마나 과거까지 다시 계산해서 겹치는 구간을 보정할지 (common_config.py에서 공유) ---

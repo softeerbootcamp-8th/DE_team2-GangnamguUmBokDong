@@ -61,6 +61,14 @@ STEPS = {
             _venv_python("feature_engineering"),
             ["-m", "feature_engineering.spark.run_pipeline"],
         ),
+        (
+            (
+                "feature_engineering: multi-horizon 학습 테이블 생성(horizon=1..HORIZON_COUNT self-join, "
+                "training이 이제 이 산출물을 읽으므로 빠지면 다음 단계가 실패한다)"
+            ),
+            _venv_python("feature_engineering"),
+            ["-m", "feature_engineering.spark.build_multi_horizon_features"],
+        ),
     ],
     "training": [
         ("training: 대여 모델 학습", _venv_python("training"), ["-m", "training.train_rental_model"]),

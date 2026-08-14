@@ -87,8 +87,11 @@ def synthetic_environment(spark, tmp_path, monkeypatch):
     pop_path = str(tmp_path / "population.parquet")
     pop_pdf.to_parquet(pop_path, index=False)
 
+    # 2025-01-15(수요일 — 주말이 아님)를 공휴일로 넣어서, is_next_day_off/is_prev_day_off의
+    # "휴일" 분기가 "주말" 분기와 뒤섞이지 않고 독립적으로 검증되게 한다(아래
+    # test_next_and_prev_day_off_match_pandas_reference 참고).
     summary_path = tmp_path / "analysis_summary.json"
-    summary_path.write_text(json.dumps({"holidays_2025": []}), encoding="utf-8")
+    summary_path.write_text(json.dumps({"holidays_2025": ["2025-01-15"]}), encoding="utf-8")
 
     # 트립: 시간마다 1건, 대여 소요시간을 5~40분 사이에서 순환시켜 censoring 신호를 다양하게 만든다.
     # start/end 둘 다 station "00001"에서 일어난다고 두고 rental/return 타겟을 동시에 만든다.
@@ -187,6 +190,38 @@ def test_incremental_append_matches_full_rebuild(spark, synthetic_environment, t
     )
 
     pd.testing.assert_frame_equal(got_new, expected_new, check_dtype=False, check_exact=False, rtol=1e-9)
+
+
+def test_next_and_prev_day_off_match_pandas_reference(spark, synthetic_environment):
+    """build_merged_table()의 is_next_day_off/is_prev_day_off(Spark)가 pandas로 손계산한
+    기대값과 정확히 같은지 확인한다 — inference/predict_single.py의
+    `_build_target_time_fields()`가 쓰는 것과 정확히 같은 공식
+    (`(dow+1)%7>=5`/`(dow+6)%7>=5` OR 휴일 멤버십)을 pandas로 재현해서 대조한다.
+    이 컬럼은 이번에 신규 추가됐는데 기존 회귀 테스트(COMPARE_COLS)엔 lag/rolling만
+    있어서 값 자체를 검증하는 테스트가 따로 없었다 — 이 테스트가 그 공백을 메운다.
+
+    fixture의 공휴일(2025-01-15, 수요일)이 주말이 아니므로, "휴일 분기"가 "주말
+    분기"와 뒤섞이지 않고 독립적으로 검증된다(아래 마지막 assert).
+    """
+    merged = build_merged_table(spark)
+    got = merged.select("hour_ts", "is_next_day_off", "is_prev_day_off").toPandas()
+    got = got.sort_values("hour_ts").reset_index(drop=True)
+
+    holidays = {"2025-01-15"}
+    hour_ts = pd.to_datetime(got["hour_ts"])
+    dow = hour_ts.dt.dayofweek
+    next_date = (hour_ts + pd.Timedelta(days=1)).dt.strftime("%Y-%m-%d")
+    prev_date = (hour_ts - pd.Timedelta(days=1)).dt.strftime("%Y-%m-%d")
+    expected_next = (next_date.isin(holidays) | (((dow + 1) % 7) >= 5)).astype(int)
+    expected_prev = (prev_date.isin(holidays) | (((dow + 6) % 7) >= 5)).astype(int)
+
+    assert (got["is_next_day_off"].to_numpy() == expected_next.to_numpy()).all()
+    assert (got["is_prev_day_off"].to_numpy() == expected_prev.to_numpy()).all()
+
+    # 2025-01-14(화, 평일)의 다음날은 공휴일(01-15, 수)이지만 주말은 아니다 —
+    # is_next_day_off가 "주말이 아닌데도" 1이어야 휴일 분기가 실제로 동작한 것.
+    jan14 = got[hour_ts.dt.strftime("%Y-%m-%d") == "2025-01-14"]
+    assert (jan14["is_next_day_off"] == 1).all() and len(jan14) > 0
 
 
 def test_incremental_is_noop_when_no_new_data(spark, synthetic_environment, tmp_path):

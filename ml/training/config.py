@@ -1,8 +1,8 @@
 """training(LightGBM 학습) 전용 경로·상수.
 
-`feature_engineering`이 만든 feature 테이블을 읽어(`FEATURES_TABLE_PARQUET`, `ml_common/`에서
-공유) `MODELS_DIR`(이 폴더 아래 `models/`)에 학습 결과를 저장한다. `inference`도
-같은 `MODELS_DIR`을 읽어야 하므로 그 경로 자체는 `ml_common/paths.py`가 소유하고
+`feature_engineering`이 만든 multi-horizon feature 테이블을 읽어(`MULTI_HORIZON_FEATURES_TABLE_PARQUET`,
+`ml_common/`에서 공유) `MODELS_DIR`(이 폴더 아래 `models/`)에 학습 결과를 저장한다.
+`inference`도 같은 `MODELS_DIR`을 읽어야 하므로 그 경로 자체는 `ml_common/paths.py`가 소유하고
 (로컬 개발 시 기본값이 `training/models/`), 여기서는 학습에만 쓰는 값(split 기간,
 quantile 목록 등)을 정의한다.
 """
@@ -10,19 +10,39 @@ quantile 목록 등)을 정의한다.
 import os
 
 from ml_common import common_config
-from ml_common.paths import FEATURES_TABLE_PARQUET, MODELS_DIR, PROCESSED_V2_DIR
+from ml_common.paths import (
+    MODELS_DIR,
+    MULTI_HORIZON_FEATURES_TABLE_PARQUET,
+    PROCESSED_V2_DIR,
+)
 
-__all__ = ["FEATURES_TABLE_PARQUET", "MODELS_DIR", "PROCESSED_V2_DIR"]
+__all__ = ["MODELS_DIR", "MULTI_HORIZON_FEATURES_TABLE_PARQUET", "PROCESSED_V2_DIR"]
 
-# --- 학습/검증/평가 기간 (2025년 내에서 시간 순 split, walk-forward) ---
-TRAIN_START = "2025-01-01"
-TRAIN_END = "2025-10-31"
-VALID_START = "2025-11-01"
-VALID_END = "2025-11-30"
-TEST_START = "2025-12-01"
-TEST_END = "2025-12-31"
+# --- 학습/검증/평가 기간 (시간 순 split, walk-forward) ---
+# multi-horizon 테이블은 원본 feature 테이블의 최대 HORIZON_COUNT(기본 12)배 행 수라
+# (T0 앵커를 5분 tick 전체로 유지하는 채로) 기존처럼 10~12개월을 통째로 쓰면 단일 머신
+# LightGBM이 감당 못 한다(history.md 18번 항목이 실제로 겪은 OOM과 같은 종류) — 우선
+# 한 달치(2025년 11월)로 좁혀서 데이터량을 원래 단일 horizon 챔피언과 비슷한 규모로
+# 되돌렸다. TRAIN_SAMPLE_FRAC 등(아래)과 별개로, 실제 학습 머신에서 더 긴 기간이
+# 가능하면 이 값부터 늘릴 것.
+TRAIN_START = "2025-11-01"
+TRAIN_END = "2025-11-20"
+VALID_START = "2025-11-21"
+VALID_END = "2025-11-25"
+TEST_START = "2025-11-26"
+TEST_END = "2025-11-30"
 
 QUANTILE_ALPHAS = [0.1, 0.5, 0.9]
+
+# multi-horizon 테이블은 원본 feature 테이블의 최대 HORIZON_COUNT(기본 12)배 행 수라(T0
+# 앵커를 5분 tick 전체로 유지 — feature_engineering/spark/build_multi_horizon_features.py
+# 참고), 학습 머신 RAM에 안 맞으면 OOM이 난다(history.md 18번 항목이 실제로 겪은 문제와
+# 같은 종류 — 그때는 train/valid/test 각각 다른 비율로 표본을 뽑아 해결했다). 기본값은
+# "표본 없음"(1.0)이라 실행해보고 OOM이 나면 실제 학습 머신 스펙에 맞춰 낮출 것 — 정확한
+# 안전 값은 이 저장소만으로는 알 수 없다.
+TRAIN_SAMPLE_FRAC = float(os.environ.get("TRAIN_SAMPLE_FRAC", "1.0"))
+VALID_SAMPLE_FRAC = float(os.environ.get("VALID_SAMPLE_FRAC", "1.0"))
+TEST_SAMPLE_FRAC = float(os.environ.get("TEST_SAMPLE_FRAC", "1.0"))
 
 CATEGORICAL_FEATURES = ["station_id"]
 
