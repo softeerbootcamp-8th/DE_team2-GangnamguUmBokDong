@@ -55,15 +55,8 @@ def write_bronze_part(
 
 
 def read_bronze(source_id: str, window_start: datetime, parts: Sequence[str]) -> list[bytes]:
-    """지정된 bronze 조각들을 읽어 압축을 해제한 뒤 순서대로 반환한다.
+    """지정된 bronze 조각들을 읽어 압축을 해제한 뒤 순서대로 반환한다."""
 
-    args:
-        source_id: 데이터 소스 식별자
-        window_start: 조각들이 속한 수집 윈도우 시작 시각
-        parts: 읽을 조각들의 chunk_key 목록
-    returns:
-        각 조각의 압축 해제된 원본 bytes 목록 (parts와 같은 순서)
-    """
     client = _client()
     result = []
     for chunk_key in parts:
@@ -74,7 +67,9 @@ def read_bronze(source_id: str, window_start: datetime, parts: Sequence[str]) ->
 
 
 def clear_bronze(source_id: str, window_start: datetime) -> None:
-    """해당 윈도우의 bronze 조각을 모두 삭제한다."""
+    """해당 윈도우의 bronze 조각을 모두 삭제한다.
+        수집 파이프라인이 에러로 뻗었을 때, 쓰레기 데이터가 남지 않도록 임시 조각들을 지워주는 역할."""
+
     client = _client()
     bucket = _bucket()
     prefix = _bronze_prefix(source_id, window_start)
@@ -87,16 +82,14 @@ def clear_bronze(source_id: str, window_start: datetime) -> None:
         for obj in page.get("Contents", [])
     ]
     if keys:
-        # delete_objects는 빈 Objects 리스트를 받으면 에러가 나므로 키가 있을 때만 호출한다.
-        # (참고: delete_objects 한 번에 삭제 가능한 키도 최대 1000개이므로,
-        #  조각 수가 1000개를 넘는 윈도우에서는 배치 분할이 필요하다.)
+        # 참고: delete_objects 한 번에 삭제 가능한 키가 최대 1000개 
         client.delete_objects(
             Bucket=bucket, Delete={"Objects": [{"Key": k} for k in keys]}
         )
 
 
 def _layer_key(layer: str, source_id: str, window_start: datetime, ext: str) -> str:
-    """silver·quarantine처럼 윈도우당 파일 하나로 떨어지는 계층의 키를 만든다."""
+    """silver·quarantine처럼 윈도우당 파일 하나로 떨어지는 계층의 경로를 만든다."""
     return (
         f"{layer}/{source_id}/dt={window_start:%Y-%m-%d}/hh={window_start:%H}/"
         f"{window_start:%H%M}.{ext}"
@@ -113,15 +106,7 @@ def write_silver(source_id: str, window_start: datetime, table: pq.Table) -> str
 
 
 def write_quarantine(source_id: str, window_start: datetime, rows: list[dict]) -> str | None:
-    """검증에 실패한 row들을 jsonl로 저장하고, 저장된 키를 반환한다.
-
-    args:
-        source_id: 데이터 소스 식별자
-        window_start: row들이 속한 수집 윈도우 시작 시각
-        rows: 격리할 row 목록. 비어 있으면 아무것도 쓰지 않는다.
-    returns:
-        저장된 객체의 키. rows가 비어 있으면 None.
-    """
+    """검증에 실패한 row들을 jsonl로 저장하고, 저장된 키를 반환한다."""
     if not rows:
         return None
     key = _layer_key("quarantine", source_id, window_start, "jsonl")
@@ -144,43 +129,40 @@ def _retry_marker_key(source_id: str, window_start: datetime) -> str:
 
 
 def _get_json(key: str) -> dict | None:
-    """주어진 키의 JSON 객체를 읽는다. 키가 없으면 None을 반환한다.
-
-    args:
-        key: 읽을 객체의 전체 키
-    returns:
-        파싱된 JSON dict, 객체가 없으면 None
-    raises:
-        ClientError: NoSuchKey가 아닌 다른 S3 오류가 발생했을 때
-    """
+    """.json 확장자로 끝나는 설정이나 이력 파일을 읽어와서 파이썬 딕셔너리로 반환해주는 내부 헬퍼 함수."""
+    
     try:
         body = _client().get_object(Bucket=_bucket(), Key=key)["Body"].read()
     except ClientError as exc:
         if exc.response["Error"]["Code"] == "NoSuchKey":
-            return None
+            return None       # 진짜로 파일이 없는 경우에는 조용히 None 반환
         raise
-    return json.loads(body)
+    return json.loads(body)   # 권한 오류나 통신 에러면 에러
 
 
 def write_manifest(source_id: str, window_start: datetime, data: dict) -> None:
-    """해당 윈도우의 manifest를 JSON으로 저장한다."""
+    """해당 윈도우의 manifest를 json으로 저장한다."""
+
     key = _manifest_key(source_id, window_start)
     _client().put_object(Bucket=_bucket(), Key=key, Body=json.dumps(data).encode("utf-8"))
 
 
 def read_manifest(source_id: str, window_start: datetime) -> dict | None:
     """해당 윈도우의 manifest를 읽는다. 없으면 None을 반환한다."""
+
     return _get_json(_manifest_key(source_id, window_start))
 
 
 def write_retry_marker(source_id: str, window_start: datetime, data: dict) -> None:
     """해당 윈도우의 retry marker를 JSON으로 저장한다."""
+
     key = _retry_marker_key(source_id, window_start)
     _client().put_object(Bucket=_bucket(), Key=key, Body=json.dumps(data).encode("utf-8"))
 
 
 def list_retry_markers(source_id: str) -> list[dict]:
     """해당 소스에 쌓인 retry marker를 모두 읽어 반환한다."""
+
     client = _client()
     bucket = _bucket()
     prefix = f"_retry_queue/{source_id}/"
@@ -196,5 +178,6 @@ def list_retry_markers(source_id: str) -> list[dict]:
 
 def delete_retry_marker(source_id: str, window_start: datetime) -> None:
     """해당 윈도우의 retry marker를 삭제한다."""
+    
     key = _retry_marker_key(source_id, window_start)
     _client().delete_object(Bucket=_bucket(), Key=key)
