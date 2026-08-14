@@ -11,7 +11,7 @@ import os
 import pandas as pd
 import pytest
 
-from common.rolling_window_features import censored_rolling_counts
+from ml_common.rolling_window_features import censored_rolling_counts
 
 pyspark = pytest.importorskip("pyspark")
 

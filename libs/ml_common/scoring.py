@@ -7,7 +7,7 @@
 train-serve skew와 같은 종류의 사고(두 경로가 조용히 다른 값을 냄)가 날 수 있다.
 
 입력 DataFrame은 반드시 `make_dataset`의 `features.build_features()`를 거친
-스키마여야 한다(`common.model_contract.FEATURE_COLUMNS` 포함).
+스키마여야 한다(`ml_common.model_contract.FEATURE_COLUMNS` 포함).
 """
 
 import json
@@ -69,7 +69,7 @@ def predict(df: pd.DataFrame, model_name: str, exposure_col: str | None = None) 
 
     args:
         df: make_dataset의 features.build_features()와 동일한 스키마의 DataFrame
-            (station_id, date, hour, common.model_contract.FEATURE_COLUMNS 포함)
+            (station_id, date, hour, ml_common.model_contract.FEATURE_COLUMNS 포함)
         model_name: "rental" 또는 "return"
         exposure_col: Poisson exposure 컬럼명. None이면 exposure=1로 간주 (반납 모델)
     returns:

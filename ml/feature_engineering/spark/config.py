@@ -20,7 +20,7 @@ station_status/weather/population parquet과 대여이력 원본(트립 단위) 
 
 import os
 
-from common import common_config
+from ml_common import common_config
 
 # --- 데이터 루트: 로컬 개발 시 ml/data(이 파일 기준 ../../data), EMR/S3에선 DATA_ROOT
 # 환경변수로 override. 이 파일은 ml/make_dataset/spark/config.py에 있으므로 dirname을

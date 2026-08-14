@@ -13,10 +13,10 @@ import os
 import pandas as pd
 import pytest
 
-from common import common_config as pandas_config
-from common.rolling_window_features import censored_rolling_counts as pandas_censored_rolling_counts
-from common.rolling_window_features import future_rolling_counts as pandas_future_rolling_counts
-from common.rolling_window_features import lookup_count_at_ticks as pandas_lookup_count_at_ticks
+from ml_common import common_config as pandas_config
+from ml_common.rolling_window_features import censored_rolling_counts as pandas_censored_rolling_counts
+from ml_common.rolling_window_features import future_rolling_counts as pandas_future_rolling_counts
+from ml_common.rolling_window_features import lookup_count_at_ticks as pandas_lookup_count_at_ticks
 
 pyspark = pytest.importorskip("pyspark")
 
