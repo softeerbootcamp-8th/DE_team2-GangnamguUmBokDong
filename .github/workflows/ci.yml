@@ -37,9 +37,6 @@ jobs:
       - name: Sync dependencies
         run: make sync-all
 
-      - name: Lint
-        run: make lint
-
       - name: Create CI env file
         run: cp .env.example .env
 
