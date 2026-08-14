@@ -364,7 +364,8 @@ def execute_window(
         # 계산도 검증도 건너뛰고 즉시 끝낸다. stage는 기본값 BRONZE_WRITTEN 그대로
         # 둔다 — 다음 실행이 분기 2로 들어가 재계산하게 하기 위해서다.
         logger.error("stage=bronze_written status=failed failure_reason=fetch_error reason=fatal")
-        return _finish(failure_reason=FailureReason.FETCH_ERROR)
+        missing = _build_missing(missing_keys, expected_total, fetched_rows=0)
+        return _finish(failure_reason=FailureReason.FETCH_ERROR, missing=missing)
 
     # normalize는 bronze 재사용 여부와 무관하게 항상 다시 수행한다(네트워크를
     # 타지 않는 순수 변환이라 비용이 없다). 그 결과로 나온 행 수를 "성공 조각으로
