@@ -3,7 +3,8 @@
 from airflow.models.mappedoperator import MappedOperator
 from airflow.timetables.simple import NullTimetable
 
-from dags.backfill import BACKFILL_SOURCE_ID, dag
+from callbacks.task_callbacks import log_task_failure, log_task_retry
+from dags.backfill import BACKFILL_SOURCE_IDS, dag
 
 
 def test_backfill_dag_configuration() -> None:
@@ -28,8 +29,19 @@ def test_backfill_task_mapping_contract() -> None:
 
     assert isinstance(task, MappedOperator)
     assert task.upstream_task_ids == {"list_backfill_targets"}
+    assert task.retries == 2
+    assert task.on_retry_callback == log_task_retry
+    assert task.on_failure_callback == log_task_failure
 
 
 def test_backfill_source_contract() -> None:
-    """현재 Backfill 대상 source가 Collector 계약과 일치하는지 검증한다."""
-    assert BACKFILL_SOURCE_ID == "bike_station_realtime"
+    """Backfill 대상 source가 Collector 설정과 일치하는지 검증한다."""
+    assert BACKFILL_SOURCE_IDS == (
+        "bike_rental_history",
+        "cultural_event",
+        "living_population_grid",
+        "weather_ultra_short_term",
+        "weather_short_term_forecast",
+    )
+    assert "bike_station_realtime" not in BACKFILL_SOURCE_IDS
+    assert "population_realtime" not in BACKFILL_SOURCE_IDS
