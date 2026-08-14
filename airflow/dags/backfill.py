@@ -67,3 +67,41 @@ Airflow에서 다음을 직접 구현하지 않는다.
 - Collector backfill CLI를 올바르게 호출하는지
 - 실패 시 Airflow retry가 동작하는지
 """
+
+
+"""Collector 누락 조각 복구를 실행하는 Backfill DAG."""
+
+import pendulum
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+
+from orchestration.collector_task import build_backfill_task
+
+
+def get_source_id() -> str:
+    """DAG Run conf에서 source_id를 반환한다."""
+    return "{{ dag_run.conf['source_id'] }}"
+
+
+def get_window_start() -> str:
+    """DAG Run conf에서 원래 Collector window_start를 반환한다."""
+    return "{{ dag_run.conf['window_start'] }}"
+
+
+with DAG(
+    dag_id="collector_backfill",
+    schedule=None,
+    start_date=pendulum.datetime(
+        2026,
+        8,
+        14,
+        tz="Asia/Seoul",
+    ),
+    catchup=False,
+    max_active_runs=1,
+    tags=["collection", "backfill"],
+) as dag:
+    build_backfill_task(
+        source_id="{{ dag_run.conf['source_id'] }}",
+        window_start="{{ dag_run.conf['window_start'] }}",
+    )
