@@ -2,9 +2,9 @@
 
 이 문서는 5분마다 갱신되는 실시간 서빙 롤링 피처에서 발생하는 **우측 절단
 (right-censoring) train-serving skew**를 다룬다. 핵심 로직(`ml_common/rolling_window_features.py`,
-`make_dataset/build_rolling_rental_features.py`)은 이미 기존 배치 파이프라인
-([make_dataset/DESIGN.md](make_dataset/DESIGN.md), [inference/DESIGN.md](inference/DESIGN.md))에 실제로 연결돼 있다 —
-학습 쪽은 `make_dataset/features.py`의 `_add_rental_lag_rolling`(4-2절), 추론 쪽은
+`feature_engineering/spark/build_rolling_rental_features.py`)은 이미 기존 배치 파이프라인
+([feature_engineering/DESIGN.md](feature_engineering/DESIGN.md), [inference/DESIGN.md](inference/DESIGN.md))에 실제로 연결돼 있다 —
+학습 쪽은 `feature_engineering/spark/build_features.py`의 `_add_rental_lag_rolling`(4-2절), 추론 쪽은
 `inference/predict_single.py`의 `_censored_rental_recent`(4-3절)가 각각 이 파일의 함수를
 가져다 쓴다. 반납(return)은 지연 관측 문제가 없어 대상이 아니다.
 
@@ -76,7 +76,7 @@ offset으로 다루고 있다 ([training/DESIGN.md](training/DESIGN.md) 2절). �
 
 ## 3. 핵심 규칙 (학습·서빙이 반드시 동일하게 지켜야 하는 계약)
 
-구현은 [`ml_common/rolling_window_features.py`](../lib/ml_common/rolling_window_features.py) 하나에 몰아뒀다(`ml/`과 별도로 관리되는 `lib/ml_common/` 라이브러리):
+구현은 [`ml_common/rolling_window_features.py`](../libs/ml_common/rolling_window_features.py) 하나에 몰아뒀다(`ml/`과 별도로 관리되는 `libs/ml_common/` 라이브러리):
 
 | 함수 | 용도 |
 |---|---|
@@ -127,7 +127,7 @@ offset으로 다루고 있다 ([training/DESIGN.md](training/DESIGN.md) 2절). �
 
 ---
 
-## 4. 학습 데이터 생성 — `make_dataset/build_rolling_rental_features.py`
+## 4. 학습 데이터 생성 — `feature_engineering/spark/build_rolling_rental_features.py`
 
 **`load_rental_trip_events()`** (공개 함수 — `predict_single.py`도 재사용, 5절 참고):
 2025년 12개월 대여이력 parquet에서 `station_master` 크로스워크로 매칭된 트립만
@@ -154,7 +154,7 @@ grid를 만들면 된다 — 7절 참고).
 
 ---
 
-## 4-2. 학습 파이프라인 반영 — `make_dataset/features.py`
+## 4-2. 학습 파이프라인 반영 — `feature_engineering/spark/build_features.py`
 
 `_add_rental_lag_rolling(df)`가 대여의 "직전 1시간" 피처만 point-in-time
 censored 값으로 대체한다:
@@ -216,7 +216,7 @@ censoring을 반영하지 않은 "완전한" 값이었다. 이제 대여의 "직
 
 ---
 
-## 5. 실측 검증 — `make_dataset/scripts/validate_completion_curve.py`
+## 5. 실측 검증 — `feature_engineering/scripts/validate_completion_curve.py`
 
 "시간이 지날수록 관측 완료율이 올라간다"는 주장 자체를, 가장 단순한 특수
 케이스(`embargo=0, width=5`, 즉 `add_censored_visibility`)로 실제 2025-06

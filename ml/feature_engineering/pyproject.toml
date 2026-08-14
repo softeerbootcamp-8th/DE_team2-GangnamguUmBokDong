@@ -1,5 +1,5 @@
 [project]
-name = "make_dataset"
+name = "feature_engineering"
 version = "0.1.0"
 description = "station x 5분tick feature 테이블 생성(2차정제, Spark) — 본 서비스 코드는 spark/뿐"
 requires-python = "==3.11.*"
@@ -16,4 +16,4 @@ dev = ["pytest"]
 package = false
 
 [tool.uv.sources]
-ml_common = { path = "../../lib/ml_common", editable = true }
+ml_common = { path = "../../libs/ml_common", editable = true }

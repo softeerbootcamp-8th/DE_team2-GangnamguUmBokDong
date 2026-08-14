@@ -2,7 +2,7 @@
 
 EMR에서 `spark-submit`으로 실행할 때는 이미 클러스터 매니저(YARN)가 세션을
 관리하므로 `SparkSession.builder.getOrCreate()`만으로 충분하다 — 이 함수는 로컬
-개발 시(예: `./.venv/bin/python -m make_dataset.spark.run_pipeline`) master를
+개발 시(예: `./.venv/bin/python -m feature_engineering.spark.run_pipeline`) master를
 명시적으로 지정해주는 것 하나만 다르고, 나머지 설정은 EMR/로컬 어디서 돌아가든
 동일한 코드 경로를 타게 한다.
 """

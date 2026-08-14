@@ -9,14 +9,14 @@
 모듈을 import하게 한다.
 
 `LAG_ROLLING_FEATURE_COLUMNS`는 `common_config.LAG_HOURS`/`ROLLING_WINDOWS`에서
-결정적으로 유도되는 이름 목록이다 — 실제 값을 계산하는 로직(`make_dataset/features.py`)은
-여기 없다(그건 make_dataset의 책임). `make_dataset/features.py`는 이 상수를 그대로
+결정적으로 유도되는 이름 목록이다 — 실제 값을 계산하는 로직(`feature_engineering/spark/build_features.py`)은
+여기 없다(그건 feature_engineering의 책임). `feature_engineering/spark/build_features.py`는 이 상수를 그대로
 import해서 자기가 만드는 컬럼 이름이 이 계약과 어긋나지 않게 맞춘다 — 즉 "스키마
-정의"는 `ml_common/`이 소유하고, "그 스키마를 실제로 채우는 계산"은 make_dataset이
+정의"는 `ml_common/`이 소유하고, "그 스키마를 실제로 채우는 계산"은 feature_engineering이
 소유하는 구조다.
 
 **dtype도 같은 이유로 계약에 포함**: `NATIVE_COLUMN_DTYPES`/`FEATURE_COLUMN_DTYPES`는
-원래 `make_dataset/build_merged_table.py`에만 있던 다운캐스트(int8/int16/float32)
+원래 `feature_engineering/spark/build_merged_table.py`에만 있던 다운캐스트(int8/int16/float32)
 매핑이었는데, `inference/predict_single.py`가 Python 스칼라로 feature 행을 새로
 조립할 때는 이걸 안 써서 학습 데이터(float32 등)와 서빙 입력(float64 기본값)의
 dtype이 어긋나 있었다 — 예측값 자체는 달라지지 않지만(LightGBM이 내부적으로
@@ -45,8 +45,8 @@ LAG_ROLLING_FEATURE_COLUMNS = [
 FEATURE_COLUMNS = common_config.BASE_FEATURE_COLUMNS + LAG_ROLLING_FEATURE_COLUMNS
 
 # 값 범위 대비 과한 자료형(float64/int64)을 실측 최소~최대 범위에 맞게 줄인 매핑
-# (make_dataset/build_merged_table.py에서 이관 — 근거/실측 범위는 그 파일 참고).
-# bike_count/stockout_flag/minute처럼 FEATURE_COLUMNS엔 없지만 make_dataset 내부
+# (feature_engineering/spark/build_merged_table.py에서 이관 — 근거/실측 범위는 그 파일 참고).
+# bike_count/stockout_flag/minute처럼 FEATURE_COLUMNS엔 없지만 feature_engineering 내부
 # 중간 산출물에 쓰이는 컬럼도 포함한다(build_merged_table.py가 그대로 재사용).
 NATIVE_COLUMN_DTYPES = {
     "bike_count": "int16",

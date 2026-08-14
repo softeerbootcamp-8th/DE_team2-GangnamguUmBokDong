@@ -20,7 +20,7 @@ LightGBM 하이퍼파라미터처럼 **두 쪽이 반드시 같은 값을 써야
 `scripts/run_embargo_sweep.py`류 스크립트가 실험 중 값을 임시로 바꿀 때 사용)는
 프로필 값 위에 한 번 더 덮어쓸 수 있게 유지한다 — 우선순위는
 "개별 환경변수 > 프로필 파일 > (프로필 파일도 없을 때만 쓰는 하드코드 기본값 없음,
-프로필 파일이 최종 소스)". `src/config.py`/`feature_engineering/config.py`는 지금처럼
+프로필 파일이 최종 소스)". `src/config.py`/`feature_engineering/spark/config.py`는 지금처럼
 `common_config.XXX`를 그대로 참조하면 되고 인터페이스는 바뀌지 않는다.
 """
 
@@ -69,7 +69,7 @@ GRID_TICK_MINUTES = _int_env("GRID_TICK_MINUTES", _PROFILE["GRID_TICK_MINUTES"])
 LAG_HOURS = _PROFILE["LAG_HOURS"]  # t-1h, 전일 동시간, 전주 동요일 동시간
 ROLLING_WINDOWS = _PROFILE["ROLLING_WINDOWS"]  # rolling mean/std
 
-# --- 모델 입력 feature 스키마(lag/rolling 제외) — make_dataset이 만들고, training이
+# --- 모델 입력 feature 스키마(lag/rolling 제외) — feature_engineering이 만들고, training이
 # 학습에 쓰고, inference가 동일 순서로 맞춰야 하는 "모델 계약"의 일부라 공유한다.
 BASE_FEATURE_COLUMNS = [
     "station_id",
@@ -115,11 +115,11 @@ CONFORMAL_TARGET_COVERAGE = _float_env("CONFORMAL_TARGET_COVERAGE", _PROFILE["CO
 
 # 재고 스냅샷 결측(~1.1%)은 "알 수 없음"이므로 exposure=1(정상 운영)로 간주.
 # 품절(stockout) 시간대는 대여가 사실상 불가능하지만 완전히 0은 아니므로 작은 값으로
-# 근사한다. make_dataset(학습 데이터의 exposure 계산)와 inference(서빙 시점
+# 근사한다. feature_engineering(학습 데이터의 exposure 계산)와 inference(서빙 시점
 # rental_exposure 계산)가 정확히 같은 값을 써야 하므로 공유한다.
 EXPOSURE_STOCKOUT_VALUE = 0.05
 
-# --- 증분 피처마트 생성 (feature_engineering/run_pipeline.py) ---
+# --- 증분 피처마트 생성 (feature_engineering/spark/run_pipeline.py) ---
 # lag_168h(7일)보다 넉넉한 안전 마진 — 짧으면 신규 구간 초반 며칠의 lag/rolling이
 # 과거를 못 보고 결측/오류가 날 수 있다.
 INCREMENTAL_LOOKBACK_HOURS = _int_env("INCREMENTAL_LOOKBACK_HOURS", _PROFILE["INCREMENTAL_LOOKBACK_HOURS"])

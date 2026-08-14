@@ -6,7 +6,7 @@ Accepted
 
 ## Context
 
-`training/`은 지금까지 항상 단일 머신 로컬 LightGBM으로 학습해왔다. `make_dataset`은
+`training/`은 지금까지 항상 단일 머신 로컬 LightGBM으로 학습해왔다. `feature_engineering`은
 EMR/Spark로 분산 처리하지만, 학습은 "최근 N개월만 잘라서" 쓰기 때문에 학습
 데이터량이 히스토리 길이와 무관하게 고정되고, 그래서 분산 학습 없이도 확장성
 문제가 없었다.
