@@ -96,6 +96,11 @@ class SeoulOpenApiAdapter:
 
         # . 기준으로 문자열을 쪼개서 앞부분만 떼어낸다.
         wrapper_key = params["root_key"].split(".", 1)[0]
+        
+        path_suffix_template = params.get("path_suffix", "")
+        suffix = ""
+        if path_suffix_template:
+            suffix = path_suffix_template.format(window_start=window.window_start)
 
         # total을 모르면 몇 페이지를 더 돌아야 하는지 알 수 없다.
         # expected_total로 이미 받았으면(라운드 재시도·백필) 그 값을 그대로 쓴다.
@@ -117,7 +122,7 @@ class SeoulOpenApiAdapter:
                 page_start = page_end + 1
                 continue
 
-            url = f"{_BASE_URL}/{_api_key()}/json/{service}/{page_start}/{page_end}/"
+            url = f"{_BASE_URL}/{_api_key()}/json/{service}/{page_start}/{page_end}{suffix}/"
             try:
                 response = client.get(url)
                 response.raise_for_status()

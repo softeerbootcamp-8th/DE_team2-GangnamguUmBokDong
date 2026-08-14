@@ -3,9 +3,10 @@ description: 따릉이 대여이력 정보
 
 adapter: seoul_openapi
 adapter_params:
-  service: tbCycleRentUseInfo
+  service: tbCycleRentUseDayInfo
   page_size: 1000
-  root_key: tbCycleRentUseInfo.row
+  root_key: cycleRentUseDayInfo.row
+  path_suffix: "/{window_start:%Y-%m-%d}"
 
 schedule:
   interval: 5m
