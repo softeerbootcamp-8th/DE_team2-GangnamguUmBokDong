@@ -1,5 +1,3 @@
-
-
 # Airflow 구현 작업 단위
 
 > 전체 설계와 역할 분리는 [Airflow 구현 계획](./implementation-plan.md)을 참고한다. 이 문서는 해당 계획을 실제 이슈·브랜치 단위로 나누고, 어떤 순서로 구현할지 정의한다.
@@ -68,6 +66,13 @@ Collector는 **데이터를 어떻게 수집하고 처리할지** 책임진다.
 | 10 | `test/airflow-bronze-compaction` | 일 단위 Data Interval 및 재처리 대상 기간 검증 | `airflow/tests/test_bronze_compaction.py` | 9 |
 | 11 | `feature/airflow-integration` | 로컬 Docker에서 Airflow → BashOperator → Collector CLI end-to-end 검증 | DAG 및 로컬 통합 테스트 | 4·5, Collector CLI 완료 |
 | 12 | `feature/airflow-remote-collector` | 4 EC2 전환 시 SSH 또는 SSM 기반 Collector 원격 실행 계층 구현 | `airflow/orchestration/collector_task.py` 확장 또는 별도 executor 모듈 | 11, Collector EC2 준비 |
+| 13 | `feature/airflow-inference` | 추론용 DAG 및 Task 구현 | `airflow/dags/inference.py` | 4·5 |
+| 14 | `test/airflow-inference` | 추론 DAG 및 Task 검증 | `airflow/tests/test_inference.py` | 13 |
+| 15 | `feature/airflow-gold-load` | Gold 데이터 적재용 DAG 및 Task 구현 | `airflow/dags/gold_load.py` | 13 |
+| 16 | `test/airflow-gold-load` | Gold 적재 DAG 및 Task 검증 | `airflow/tests/test_gold_load.py` | 15 |
+| 17 | `feature/airflow-emr-job` | EMR Job 실행 DAG 및 Task 구현 | `airflow/dags/emr_job.py` | 13 |
+| 18 | `test/airflow-emr-job` | EMR Job DAG 및 Task 검증 | `airflow/tests/test_emr_job.py` | 17 |
+| 19 | `feature/airflow-integration-extended` | 추론·Gold Load·EMR Job 통합 테스트 | 통합 테스트 스크립트 | 14·16·18 |
 
 현재 진행 상태:
 
@@ -83,6 +88,13 @@ Collector는 **데이터를 어떻게 수집하고 처리할지** 책임진다.
 - [ ] 10. Bronze Compaction 테스트
 - [ ] 11. 로컬 통합 테스트
 - [ ] 12. 원격 Collector 실행
+- [ ] 13. 추론 DAG 및 Task
+- [ ] 14. 추론 DAG 테스트
+- [ ] 15. Gold Load DAG 및 Task
+- [ ] 16. Gold Load DAG 테스트
+- [ ] 17. EMR Job DAG 및 Task
+- [ ] 18. EMR Job DAG 테스트
+- [ ] 19. 추론·Gold Load·EMR 통합 테스트
 
 ---
 
@@ -659,6 +671,152 @@ Collector EC2
 
 ---
 
+## #13 `feature/airflow-inference`
+
+### 목적
+
+추론용 DAG 및 Task를 구현한다.
+
+### 구현 위치
+
+```text
+airflow/dags/inference.py
+```
+
+### 주요 내용
+
+- 실시간 수집 결과를 기반으로 ML 추론 실행
+- 추론 Task는 병렬로 실행 가능
+- 실패 시 retry 정책 적용
+
+### 완료 기준
+
+- 추론 DAG가 Airflow UI에 등록된다.
+- source별 Task가 생성되고 병렬 실행된다.
+- run_id가 일관되게 전달된다.
+- 실패 시 retry가 동작한다.
+
+---
+
+## #14 `test/airflow-inference`
+
+### 목적
+
+추론 DAG 및 Task의 구조와 동작을 검증한다.
+
+### 검증 항목
+
+- DAG import 성공
+- Task 병렬 생성 확인
+- retry 및 timeout 정책 확인
+- run_id 일관성 검증
+
+---
+
+## #15 `feature/airflow-gold-load`
+
+### 목적
+
+Gold 데이터 적재용 DAG 및 Task를 구현한다.
+
+### 구현 위치
+
+```text
+airflow/dags/gold_load.py
+```
+
+### 주요 내용
+
+- Gold 데이터 적재 작업 스케줄링
+- 데이터 적재 Task 병렬 실행 가능
+- 실패 시 retry 정책 적용
+
+### 완료 기준
+
+- Gold Load DAG가 Airflow UI에 등록된다.
+- Task가 병렬 생성되고 실행된다.
+- run_id 일관성 유지
+- 실패 시 retry가 동작한다.
+
+---
+
+## #16 `test/airflow-gold-load`
+
+### 목적
+
+Gold 적재 DAG 및 Task의 구조와 동작을 검증한다.
+
+### 검증 항목
+
+- DAG import 성공
+- Task 병렬 생성 확인
+- retry 및 timeout 정책 확인
+- run_id 일관성 검증
+
+---
+
+## #17 `feature/airflow-emr-job`
+
+### 목적
+
+EMR Job 실행 DAG 및 Task를 구현한다.
+
+### 구현 위치
+
+```text
+airflow/dags/emr_job.py
+```
+
+### 주요 내용
+
+- EMR 클러스터 작업 실행 스케줄링
+- Task 병렬 실행 및 관리
+- 실패 시 retry 정책 적용
+
+### 완료 기준
+
+- EMR Job DAG가 Airflow UI에 등록된다.
+- Task가 병렬 실행된다.
+- run_id 일관성 유지
+- 실패 시 retry가 동작한다.
+
+---
+
+## #18 `test/airflow-emr-job`
+
+### 목적
+
+EMR Job DAG 및 Task의 구조와 동작을 검증한다.
+
+### 검증 항목
+
+- DAG import 성공
+- Task 병렬 생성 확인
+- retry 및 timeout 정책 확인
+- run_id 일관성 검증
+
+---
+
+## #19 `feature/airflow-integration-extended`
+
+### 목적
+
+추론·Gold Load·EMR Job 통합 테스트를 수행한다.
+
+### 주요 내용
+
+- 각 DAG 간 통합 동작 검증
+- 병렬 실행 및 retry 정책 확인
+- run_id 일관성 및 로그 확인
+
+### 완료 기준
+
+- 통합 테스트 스크립트 정상 동작
+- Airflow UI에서 통합 DAG 정상 실행 확인
+- 실패 시 재시도 및 상태 관리 확인
+
+---
+
 ## 진행 순서
 
 선행 관계를 기준으로 다음 순서로 진행한다.
@@ -671,6 +829,9 @@ Collector EC2
 | 4 | #5 · #7 · #9 |
 | 5 | #8 · #10 · #11 |
 | 6 | #12 |
+| 7 | #13 |
+| 8 | #14 · #15 · #17 |
+| 9 | #16 · #18 · #19 |
 
 ```text
 #1 skeleton
@@ -680,15 +841,15 @@ Collector EC2
                       │                                  ├─ #11 integration ─ #12 remote
 Collector backfill ────┴────────────── #7 backfill ─ #8 ─┤
 Compaction 계약 ────────────────────── #9 compaction ─ #10┘
+                                               │
+                                               ├─ #13 inference ─ #14 ─┐
+                                               │                      │
+                                               ├─ #15 gold load ─ #16 ─┤
+                                               │                      │
+                                               └─ #17 emr job ─ #18 ─ #19
 ```
 
-#2와 #3은 서로 독립적으로 구현할 수 있다.
-
-Backfill과 Compaction은 Airflow만으로 완성할 수 없으며 Collector 또는 실행 프로그램의 CLI 계약이 확정되어야 한다.
-
----
-
-## 최종 완료 기준
+# 최종 완료 기준
 
 Airflow 구현 전체는 다음 조건을 만족하면 완료로 본다.
 
@@ -721,6 +882,39 @@ FAILED → Airflow retry
 해당 날짜의 Bronze Compaction Job 실행
 ```
 
+### 추론·서빙
+
+```text
+실시간 수집 결과 기반으로
+추론 DAG 병렬 실행
+↓
+성공 시 Gold Load DAG 실행
+↓
+실패 시 Airflow retry
+```
+
+### Gold Load
+
+```text
+추론 결과 기반으로
+Gold 데이터 적재 실행
+↓
+성공 시 EMR Job DAG 실행
+↓
+실패 시 Airflow retry
+```
+
+### EMR Job
+
+```text
+Gold 적재 완료 후
+EMR 작업 실행
+↓
+성공 시 완료
+↓
+실패 시 Airflow retry
+```
+
 ### 인프라
 
 3 EC2에서는 BashOperator로 로컬 Collector를 실행하고,
@@ -730,4 +924,4 @@ Collector EC2가 추가되면 동일 DAG 구조를 유지하면서 SSH/SSM 실�
 
 최종적으로 다음 원칙이 코드 구조에서도 유지되어야 한다.
 
-> **Airflow는 실행을 오케스트레이션하고, Collector는 데이터를 수집·처리한다.**
+> **Airflow는 실행과 dependency를 오케스트레이션하고, Collector·Inference·Gold Load·EMR Job은 각자의 데이터 처리 책임을 수행한다.**
