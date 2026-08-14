@@ -34,7 +34,7 @@ E2E_WINDOW_START = (
 
 with DAG(
     dag_id="e2e_realtime",
-    schedule=None,
+    schedule="*/5 * * * *",
     start_date=pendulum.datetime(
         2026,
         8,
