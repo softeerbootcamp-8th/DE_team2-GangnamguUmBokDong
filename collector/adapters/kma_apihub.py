@@ -72,12 +72,12 @@
 
 ## base_date · base_time — window을 그대로 쓴다 (발표 주기 보정 없음)
 `window.window_start`를 가공 없이 `%Y%m%d`·`%H%M`으로 포맷해 요청한다. 기상청 발표
-주기(초단기실황은 매시 40분 발표 등)와 트리거 시각이 어긋나면 `resultCode`가 "아직
-미발표"를 뜻하는 값으로 와도 **이 어댑터는 그 값을 보지 않는다** — 실패 범주는
-`classify_http_status`가 다루는 HTTP 상태로만 정해지고(HTTP 200이면 무조건 성공), 본문
-내용은 검사하지 않는다. 발표 시각과 트리거 시각을 맞추는 책임은 전부 Airflow DAG
-스케줄에 있다. 어댑터가 기상청 발표 스케줄이라는 도메인 지식을 갖지 않기 위한
-선택이다.
+주기(초단기실황은 매시 40분 발표 등)와 트리거 시각이 어긋날 경우, 응답 본문에
+`resultCode="03"`(데이터 없음/미발표)이 반환된다.
+이 어댑터는 HTTP 상태 코드(200) 뿐만 아니라 이 `resultCode`를 적극적으로 파싱하여
+미발표 응답(`03`)을 `TRANSIENT` 에러로 분류한다. 이를 통해 Airflow DAG의 트리거
+타이밍이 미세하게 어긋나더라도, 파이프라인의 라운드 재시도 메커니즘이 데이터를 
+기다렸다가 스스로 복구할 수 있게 한다.
 """
 
 from __future__ import annotations
@@ -86,11 +86,11 @@ import json
 import os
 from typing import TYPE_CHECKING
 
-from adapters.base import FetchResult, adapter, classify_http_status
+import httpx
+
+from adapters.base import FetchErrorKind, FetchResult, adapter, classify_http_status
 
 if TYPE_CHECKING:
-    import httpx
-
     from adapters.base import Window
     from config.schema import SourceConfig
 
@@ -101,6 +101,24 @@ _NUM_OF_ROWS = 1000  # 격자 하나당 한 시각의 관측·예보 항목 수�
 def _api_key() -> str:
     # 조각 키(grid-{nx}x{ny})에는 이 값이 섞이지 않는다
     return os.environ["KMA_APIHUB_KEY"]
+
+
+def _classify_result_code(code: str | None) -> FetchErrorKind | None:
+    """본문의 resultCode를 실패 범주로 매핑한다."""
+    if not isinstance(code, str):
+        return FetchErrorKind.PERMANENT
+
+    if code == "00":
+        return None  # NORMAL_SERVICE (성공)
+    if code in {"03", "04", "05", "22"}:
+        # 03: 데이터 없음(미발표), 04: HTTP 에러, 05: 연결 실패, 22: 제한 초과 -> 재시도
+        return FetchErrorKind.TRANSIENT 
+    if code in {"20", "21", "30", "31", "32", "33"}:
+        # 인증/권한 에러 -> 즉시 중단
+        return FetchErrorKind.FATAL 
+    
+    # 01, 02, 10, 11, 12 등 파라미터/DB 에러 -> 영구 실패
+    return FetchErrorKind.PERMANENT 
 
 
 def _extract(body: dict, root_key: str) -> list[dict]:
@@ -142,17 +160,40 @@ class KmaApiHubAdapter:
                 f"&numOfRows={_NUM_OF_ROWS}&pageNo=1"
                 f"&base_date={base_date}&base_time={base_time}&nx={nx}&ny={ny}"
             )
-            response = client.get(url)
+            try:
+                response = client.get(url)
+            except httpx.RequestError:
+                yield FetchResult(key=key, payload=None, error=FetchErrorKind.TRANSIENT, expected_total=None)
+                continue
 
             category = classify_http_status(response.status_code)
-            if category is None:
-                yield FetchResult(key=key, payload=response.content, error=None, expected_total=None)
-            elif category.value == "fatal":
-                # 인증키 오류 등 확정적 원인인 경우, 나머지 격자를 헛되이 부르지 않고 즉시 중단.
+            if category is FetchErrorKind.FATAL:
+                # HTTP 레벨의 인증키 오류 등 확정적 원인인 경우, 즉시 중단.
                 yield FetchResult(key=key, payload=None, error=category, expected_total=None)
                 return
-            else:  # TRANSIENT 또는 PERMANENT, 이 격자만 실패로 보고하고 나머지는 계속
+            elif category is not None:
+                # HTTP 상태 5xx (TRANSIENT) 또는 4xx (PERMANENT)
                 yield FetchResult(key=key, payload=None, error=category, expected_total=None)
+                continue
+
+            # HTTP 200 OK일 경우 본문의 resultCode 확인
+            try:
+                body = json.loads(response.content)
+                if not isinstance(body, dict):
+                    raise TypeError("응답이 JSON 객체가 아님")
+                result_code = body.get("response", {}).get("header", {}).get("resultCode")
+            except (json.JSONDecodeError, TypeError):
+                yield FetchResult(key=key, payload=None, error=FetchErrorKind.TRANSIENT, expected_total=None)
+                continue
+
+            api_category = _classify_result_code(result_code)
+            if api_category is None:
+                yield FetchResult(key=key, payload=response.content, error=None, expected_total=None)
+            elif api_category is FetchErrorKind.FATAL:
+                yield FetchResult(key=key, payload=None, error=api_category, expected_total=None)
+                return
+            else:  # TRANSIENT 또는 PERMANENT
+                yield FetchResult(key=key, payload=None, error=api_category, expected_total=None)
 
     @staticmethod
     def normalize(chunks: list[bytes], config: SourceConfig) -> list[dict]:
