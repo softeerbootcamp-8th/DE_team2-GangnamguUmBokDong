@@ -1,10 +1,5 @@
 """fetch→bronze→validate→silver 오케스트레이션과 재개 분기.
 
-구현 예정: docs/collector/implementation-issues.md #7
-설계 근거: docs/collector/implementation-plan.md 7절 (재개 로직)
-          docs/collector/implementation-plan.md 8절 (부분 실패와 백필)
-          docs/adr/0003-bronze-streaming-and-scaling-boundaries.md
-          docs/adr/0004-partial-fetch-and-backfill.md
 
 ## 실행 순서
 
@@ -15,7 +10,7 @@ manifest 마감 → (불완전하면) 백필 마커.
 단계를 넘어갈 때마다 manifest의 `stage`를 갱신한다. 중간에 죽어도 어디까지 진행됐는지
 남아 있어야 다음 실행이 재개할 수 있다.
 
-## 재개 분기 (계획서 7절 그대로)
+## 재개 분기 
 
     manifest = manifest.load(source_id, window_start)      # 없으면 None
 
@@ -162,6 +157,7 @@ quarantine은 하류 소비 대상이 아니다. 반대로 **폐기 행이 0건�
 
 from __future__ import annotations
 
+import logging
 import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -187,6 +183,8 @@ from validation.types import RunContext
 
 _HTTP_TIMEOUT_SECONDS = 10.0
 _KST = ZoneInfo("Asia/Seoul")
+
+logger = logging.getLogger(__name__)
 
 
 class ForceAndBackfillError(ValueError):
@@ -288,6 +286,7 @@ def execute_window(
         # 하지 않는다. 재실행해도 안전해야 하므로(Airflow retry) 어댑터를 다시
         # 부르지 않고, 저장된 manifest도 건드리지 않은 채 SKIPPED로만 표시해 돌려준다.
         if not (backfill and existing.missing.parts):
+            logger.info("stage=completed status=skipped")
             return existing.model_copy(update={"status": RunStatus.SKIPPED})
         # 분기 4: 백필 — 기존 조각은 그대로 두고(clear_bronze 없이) 누락분만 받는다.
         have_parts = existing.artifacts.bronze.parts
@@ -365,6 +364,7 @@ def execute_window(
         # FATAL(인증 오류 등)은 나머지 조각도 같은 이유로 실패할 게 뻔하므로, 게이트
         # 계산도 검증도 건너뛰고 즉시 끝낸다. stage는 기본값 BRONZE_WRITTEN 그대로
         # 둔다 — 다음 실행이 분기 2로 들어가 재계산하게 하기 위해서다.
+        logger.error("stage=bronze_written status=failed failure_reason=fetch_error reason=fatal")
         return _finish(failure_reason=FailureReason.FETCH_ERROR)
 
     # normalize는 bronze 재사용 여부와 무관하게 항상 다시 수행한다(네트워크를
@@ -375,22 +375,41 @@ def execute_window(
     ratio = _missing_ratio(len(missing_keys), expected_total, fetched_rows, len(chunks))
     missing = _build_missing(missing_keys, expected_total, fetched_rows)
 
+    parts_summary = f"{len(chunks)}/{len(chunks) + len(missing_keys)}"
+
     if ratio > config.quality.max_missing_ratio:
         # 완결도 게이트 초과 — silver를 쓰지 않고 fetch_error로 끝낸다. stage는
         # BRONZE_WRITTEN 그대로라 재실행(또는 백필)하면 분기 2/4로 들어간다.
+        logger.error(
+            "stage=bronze_written status=failed failure_reason=fetch_error "
+            f"parts={parts_summary} missing_ratio={ratio:.3f}"
+        )
         return _finish(
             failure_reason=FailureReason.FETCH_ERROR,
             missing=missing, counts=Counts(expected=expected_total, fetched=fetched_rows),
         )
 
+    # 여기 도달했다는 것은 완결도 게이트를 통과했다는 뜻이다 — fetch 단계 경계의
+    # 로그 한 줄을 여기서 남긴다. 누락이 남아 있으면 WARNING, 없으면 INFO.
+    bronze_bytes = sum(len(v) for v in chunks.values())
+    if missing_keys:
+        logger.warning(
+            f"stage=bronze_written parts={parts_summary} rows={fetched_rows} bytes={bronze_bytes} "
+            f"missing={','.join(sorted(missing_keys))} completeness={1.0 - ratio:.3f}"
+        )
+    else:
+        logger.info(f"stage=bronze_written parts={parts_summary} rows={fetched_rows} bytes={bronze_bytes}")
+
     if fetched_rows == 0:
         # 행이 0건이면 검증을 돌릴 대상이 없으므로 여기서 바로 갈린다. allow_empty인
         # 소스(행사 등)만 정상 종료로 인정하고, 그 외에는 quality_gate로 묶는다.
         if config.quality.allow_empty:
+            logger.info("stage=completed status=empty")
             return _finish(
                 status=RunStatus.EMPTY, stage=Stage.COMPLETED, failure_reason=None,
                 missing=missing, counts=Counts(expected=expected_total),
             )
+        logger.error("stage=validated status=failed failure_reason=quality_gate rows=0")
         return _finish(
             stage=Stage.VALIDATED, failure_reason=FailureReason.QUALITY_GATE,
             missing=missing, counts=Counts(expected=expected_total),
@@ -403,6 +422,7 @@ def execute_window(
         # 컬럼 정책이 FAIL_BATCH를 반환했다 — 그 시점 이후 행은 처리되지 않았으므로
         # silver·quarantine 어느 쪽도 쓸 수 없다. 같은 bronze + 같은 config면
         # 재시도해도 결과가 같으므로 config를 고쳐야 하는 quality_gate로 남긴다.
+        logger.error("stage=validated status=failed failure_reason=quality_gate reason=fail_batch")
         return _finish(
             stage=Stage.VALIDATED, failure_reason=FailureReason.QUALITY_GATE,
             missing=missing, counts=Counts(expected=expected_total, fetched=fetched_rows),
@@ -417,6 +437,20 @@ def execute_window(
         "policy_actions": outcome.policy_actions, "drop_ratio": outcome.drop_ratio,
     }
 
+    # 데이터 품질 관점의 validated 단계 경계 로그. 폐기 게이트 초과 여부는 이 시점에
+    # 이미 알 수 있으므로 여기서 ERROR로 확정해 남긴다 — 뒤에 storage_error가 나면
+    # 그건 별개 사건이라 각자 자기 ERROR 줄을 남긴다(둘이 겹쳐도 서로 다른 사유다).
+    validated_summary = (
+        f"stage=validated kept={outcome.counts['kept']} repaired={outcome.counts['repaired']} "
+        f"dropped={outcome.counts['dropped']} drop_ratio={outcome.drop_ratio:.3f} completeness={1.0 - ratio:.3f}"
+    )
+    if outcome.drop_ratio > config.quality.max_drop_ratio:
+        logger.error(f"{validated_summary} status=failed failure_reason=quality_gate")
+    elif outcome.counts["dropped"] or missing.parts:
+        logger.warning(f"{validated_summary} status=partial")
+    else:
+        logger.info(f"{validated_summary} status=succeeded")
+
     try:
         # 폐기 행이 없으면 quarantine 객체 자체를 만들지 않는다(빈 객체를 굳이 남기지 않는다).
         quarantine_key = (
@@ -424,6 +458,7 @@ def execute_window(
             if outcome.quarantine_records else None
         )
     except Exception:  # noqa: BLE001 — 저장소 예외 종류를 가리지 않고 storage_error로 묶는다
+        logger.error("stage=validated status=failed failure_reason=storage_error reason=quarantine_write")
         return _finish(stage=Stage.VALIDATED, failure_reason=FailureReason.STORAGE_ERROR, **common)
 
     if outcome.drop_ratio > config.quality.max_drop_ratio:
@@ -437,6 +472,7 @@ def execute_window(
     try:
         silver_key = storage.write_silver(config.source_id, window_start, pa.Table.from_pylist(outcome.silver_rows))
     except Exception:  # noqa: BLE001 — 저장소 예외 종류를 가리지 않고 storage_error로 묶는다
+        logger.error("stage=validated status=failed failure_reason=storage_error reason=silver_write")
         return _finish(
             stage=Stage.VALIDATED, failure_reason=FailureReason.STORAGE_ERROR, **common,
             artifacts=Artifacts(bronze=artifacts.bronze, quarantine=quarantine_key),
@@ -446,8 +482,10 @@ def execute_window(
     # 폐기·누락이 전혀 없을 때만 SUCCEEDED이고, 그 외(둘 중 하나라도 게이트 이내로
     # 존재)에는 PARTIAL이다.
     status = RunStatus.SUCCEEDED if outcome.counts["dropped"] == 0 and ratio == 0.0 else RunStatus.PARTIAL
+    new_revision = revision_base + 1
+    logger.info(f"stage=completed status={status.value} revision={new_revision} key={silver_key}")
     return _finish(
         status=status, stage=Stage.COMPLETED, failure_reason=None,
-        revision=revision_base + 1, completeness=1.0 - ratio, **common,
+        revision=new_revision, completeness=1.0 - ratio, **common,
         artifacts=Artifacts(bronze=artifacts.bronze, silver=silver_key, quarantine=quarantine_key),
     )

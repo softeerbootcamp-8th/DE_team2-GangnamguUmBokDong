@@ -1,7 +1,5 @@
 """구조화 로그 설정 — 고정 필드(source_id·window·attempt) 주입.
 
-구현 예정: docs/collector/implementation-issues.md #8
-설계 근거: docs/collector/implementation-plan.md 9절 (로깅)
 
 ## 구현할 것
 
@@ -48,10 +46,113 @@
     INFO  source_id=… mode=backfill parts=1 filled=page-02001-02765
           revision=1→2 completeness=0.717→1.0
 
+## 구현 방향
+
+- `configure_logging(source_id, window_start, attempt)`은 **root 로거**에 핸들러를
+  붙인다. `pipeline.py`는 그냥 `logging.getLogger(__name__)`으로 자기 이름의 로거를
+  얻어 쓰면 되고, 전파(`propagate`)를 타고 올라와 root의 핸들러에서 고정 필드가
+  주입된다 — 모듈마다 로거를 따로 설정할 필요가 없다.
+- 고정 필드 주입은 `logging.Filter`가 담당하고, 나머지 필드는 호출부가 `extra=`로
+  넘긴 값을 포매터가 `key=value`로 이어붙인다.
+- 인증키 마스킹도 여기 한 곳에서 한다 — 최종 로그 줄 문자열에서 `key=`류 쿼리
+  파라미터 값을 정규식으로 가려, 예외 메시지에 URL이 실려도 키가 새지 않게 막는다.
+  (어댑터마다 마스킹을 반복하지 않기 위해 이 모듈에 모았다.)
+
 ## 주의
 
-- 인증키가 로그에 남지 않게 한다. 서울 API는 키를 URL 경로에 담으므로 예외 메시지에
-  URL이 실려 나가는 경로를 특히 조심한다. 마스킹을 여기서 할지 어댑터에서 할지는
-  #8에서 한 곳으로 정한다.
 - boto3 · httpx의 기본 로거가 시끄러우면 레벨을 따로 낮춘다.
 """
+
+from __future__ import annotations
+
+import logging
+import re
+import sys
+from datetime import datetime
+
+_FIXED_FIELDS = ("source_id", "window", "attempt")
+_STANDARD_ATTRS = frozenset(vars(logging.LogRecord("", 0, "", 0, "", (), None)).keys()) | {"message", "asctime"}
+
+# 서울/기상청 API 모두 인증키를 쿼리 파라미터로 받는다. 값만 가리고 키 이름은 남긴다.
+_SECRET_PARAM_RE = re.compile(r"(?i)([?&](?:service|auth)?key=)[^&\s'\"]+")
+
+
+def _redact(text: str) -> str:
+    """URL 쿼리 파라미터에 실린 인증키 값을 가린다."""
+    return _SECRET_PARAM_RE.sub(r"\1***", text)
+
+
+class _ContextFilter(logging.Filter):
+    """모든 레코드에 source_id·window·attempt를 주입한다."""
+
+    def __init__(self, source_id: str, window_start: datetime, attempt: int):
+        super().__init__()
+        self._source_id = source_id
+        self._window = window_start.isoformat()
+        self._attempt = attempt
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        """레코드에 고정 필드 3개를 얹고 항상 통과시킨다(걸러내는 필터가 아니다)."""
+        record.source_id = self._source_id
+        record.window = self._window
+        record.attempt = self._attempt
+        return True
+
+
+class _KeyValueFormatter(logging.Formatter):
+    """`LEVEL message key=value ...` 형식으로 렌더링한다.
+
+    고정 필드(source_id·window·attempt)를 먼저 쓰고, 호출부가 `extra=`로 넘긴
+    필드를 그 뒤에 넘긴 순서대로 이어붙인다.
+    """
+
+    def format(self, record: logging.LogRecord) -> str:
+        """레코드 하나를 한 줄로 렌더링한다."""
+        parts = [record.levelname]
+        message = record.getMessage()
+        if message:
+            parts.append(message)
+        for field in _FIXED_FIELDS:
+            if hasattr(record, field):
+                parts.append(f"{field}={getattr(record, field)}")
+        # 표준 LogRecord 속성(pathname·lineno 등)을 뺀 나머지가 `extra=`로 넘어온
+        # 호출부 필드다. dict 순서가 삽입 순서를 보존하므로 넘긴 순서 그대로 붙는다.
+        for key, value in vars(record).items():
+            if key in _FIXED_FIELDS or key in _STANDARD_ATTRS:
+                continue
+            parts.append(f"{key}={value}")
+        return _redact(" ".join(parts))
+
+
+def configure_logging(
+    source_id: str,
+    window_start: datetime,
+    attempt: int = 1,
+    *,
+    level: int = logging.INFO,
+    stream=None,
+) -> logging.Logger:
+    """source_id·window·attempt를 모든 로그에 자동으로 붙이는 root 로거를 설정한다.
+
+    `main.py`가 pipeline을 부르기 **전에** 호출해야 pipeline이 남기는 로그에도
+    고정 필드가 붙는다.
+
+    args:
+        source_id: 이번 실행의 소스 id.
+        window_start: 이번 실행이 처리하는 window의 시작 시각.
+        attempt: 이번 실행이 몇 번째 시도인지. manifest의 attempt와 같은 값을 쓴다.
+        level: root 로거의 최소 레벨.
+        stream: 로그를 보낼 스트림. 생략하면 컨테이너 stdout(`sys.stdout`).
+    returns:
+        설정이 끝난 root 로거.
+    """
+    root = logging.getLogger()
+    root.handlers.clear()
+    root.setLevel(level)
+
+    handler = logging.StreamHandler(stream if stream is not None else sys.stdout)
+    handler.setFormatter(_KeyValueFormatter())
+    handler.addFilter(_ContextFilter(source_id, window_start, attempt))
+    root.addHandler(handler)
+
+    return root
