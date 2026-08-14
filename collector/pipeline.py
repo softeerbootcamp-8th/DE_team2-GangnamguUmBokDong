@@ -234,6 +234,33 @@ def _now() -> datetime:
     return datetime.now(_KST)
 
 
+def get_backfill_targets(config: SourceConfig) -> list[dict[str, str]]:
+    """Airflow 백필 DAG에 반환할 백필 대상 목록을 조회한다.
+
+    만료된 마커나 백필이 비활성화된 소스는 거르고, Airflow가 실행에 필요한 최소한의
+    정보(source_id, window_start)만 JSON 반환용 dict로 추려 반환한다.
+    """
+    if config.backfill is None or not config.backfill.enabled:
+        return []
+
+    now = _now()
+    targets = []
+
+    for marker in manifest_module.load_retry_markers(config.source_id):
+        # 만료된 마커는 걸러낸다 (저장소 보존 주기에 의해 나중에 정리됨)
+        if now > marker.expires_at:
+            continue
+
+        targets.append({
+            "source_id": marker.source_id,
+            "window_start": marker.window_start.isoformat(),
+        })
+
+    # 과거 시간부터 채우도록 정렬
+    targets.sort(key=lambda x: x["window_start"])
+    return targets
+
+
 def execute_window(
     config,
     window_start: datetime,

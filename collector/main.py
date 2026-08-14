@@ -65,16 +65,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     args:
         argv: 파싱할 인자 목록. 생략하면 `sys.argv`를 그대로 쓴다.
     returns:
-        `source` · `window_start` · `force` · `backfill` 네 필드를 담은 네임스페이스.
+        `source` · `window_start` · `force` · `backfill` · `list_backfill_targets` 필드를 담은 네임스페이스.
     raises:
         SystemExit: 필수 인자가 없거나 `--force`와 `--backfill`을 함께 줬을 때.
     """
     parser = argparse.ArgumentParser(prog="main.py")
     parser.add_argument("--source", required=True, help="소스 id (sources/{source_id}.yaml)")
-    parser.add_argument("--window-start", required=True, help="ISO8601, KST 오프셋(+09:00) 포함")
+    parser.add_argument("--window-start", help="ISO8601, KST 오프셋(+09:00) 포함")
     parser.add_argument("--force", action="store_true", help="재개 분기를 무시하고 clear_bronze 후 전체 재수집")
     parser.add_argument("--backfill", action="store_true", help="완결된 window의 누락 조각만 채운다")
+    parser.add_argument("--list-backfill-targets", action="store_true", help="백필 대상을 JSON으로 출력하고 종료")
     args = parser.parse_args(argv)
+
+    if not args.list_backfill_targets and not args.window_start:
+        parser.error("the following arguments are required: --window-start (unless --list-backfill-targets is used)")
 
     if args.force and args.backfill:
         parser.error("--force와 --backfill은 함께 줄 수 없다")
@@ -110,6 +114,14 @@ def main(argv: list[str] | None = None) -> int:
         Airflow가 태스크 성공/실패를 판단할 프로세스 종료 코드.
     """
     args = parse_args(argv)
+    
+    if args.list_backfill_targets:
+        import json
+        config = config_loader.load(args.source)
+        targets = pipeline.get_backfill_targets(config)
+        print(json.dumps(targets))
+        return 0
+
     window_start = datetime.fromisoformat(args.window_start)
 
     configure_logging(args.source, window_start, attempt=1)
