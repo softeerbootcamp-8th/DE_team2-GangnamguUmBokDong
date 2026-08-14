@@ -32,24 +32,34 @@ policies:
   optional_outlier: set_null
 
 columns:
-  RENT_ID:
-    types: [str]
-    required: true
   RENT_DT:
     types: [str]
     required: true
-  RENT_STATION_ID:
+  RENT_ID:
     types: [str]
     required: true
-  RTN_DT:
+  RENT_NM:
     types: [str]
     required: true
-  RTN_STATION_ID:
+  RENT_TYPE:
     types: [str]
-    required: true
-  USE_TIME:
+  GENDER_CD:
+    types: [str]
+  AGE_TYPE:
+    types: [str]
+  USE_CNT:
     types: [int]
-    range: { min: 0, max: 1440 }
-  USE_DIST:
+  EXER_AMT:
     types: [float]
-    range: { min: 0, max: 200000 }
+  CARBON_AMT:
+    types: [float]
+  MOVE_METER:
+    types: [float]
+  MOVE_TIME:
+    types: [int]
+  START_INDEX:
+    types: [int]
+  END_INDEX:
+    types: [int]
+  RNUM:
+    types: [str]
