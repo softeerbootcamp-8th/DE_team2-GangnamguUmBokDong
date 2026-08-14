@@ -145,7 +145,7 @@ class SeoulOpenApiAdapter:
                 if total is None:
                     # list_total_count는 첫 응답에만 실려 오기 때문에 
                     # 여기서 이 값을 한 번 잡아야 남은 페이지 수를 계산할 수 있다.
-                    total = wrapper.get("list_total_count")
+                    total = int(wrapper.get("list_total_count", 0))
                 yield FetchResult(
                     key=key, payload=response.content, error=None,
                     # expected_total은 pipeline이 기억해뒀다가 다음 라운드·백필에 되돌려주는 값이므로, 
