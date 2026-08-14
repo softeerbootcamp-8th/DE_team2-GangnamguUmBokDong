@@ -1,38 +1,10 @@
-"""fetch→bronze→validate→silver 오케스트레이션과 재개 분기.
 
+"""데이터 수집 파이프라인.
 
 ## 실행 순서
-
-config 로드 → manifest 로드 → **재개 분기** → (라운드를 돌며 조각마다 fetch → bronze
-즉시 저장) → **완결도 게이트** → normalize → 검증 · 정책 적용 → silver + quarantine →
-manifest 마감 → (불완전하면) 백필 마커.
-
-단계를 넘어갈 때마다 manifest의 `stage`를 갱신한다. 중간에 죽어도 어디까지 진행됐는지
-남아 있어야 다음 실행이 재개할 수 있다.
-
-## 재개 분기 
-
-    manifest = manifest.load(source_id, window_start)      # 없으면 None
-
-    if manifest and manifest.stage == Stage.COMPLETED and not force:
-        if backfill and manifest.missing.parts:            # ← 분기 4
-            have   = set(manifest.artifacts.bronze.parts)  # clear_bronze 하지 않는다
-            chunks = storage.read_bronze(manifest.artifacts.bronze)
-            new, missing = fetch_with_rounds(
-                adapter, config, window,
-                skip=have, expected_total=manifest.counts.expected)
-            chunks += new
-        else:
-            return SKIPPED                                 # 멱등 — 재실행해도 안전
-
-    elif manifest and manifest.stage >= Stage.BRONZE_WRITTEN and not force:
-        chunks = storage.read_bronze(manifest.artifacts.bronze)
-
-    else:
-        storage.clear_bronze(source_id, window_start)      # 이전 실행의 조각을 비운다
-        chunks, missing = fetch_with_rounds(adapter, config, window)
-
-    rows = adapter.normalize(chunks)                       # 항상 다시 수행
+config 로드 → manifest 로드 → 재개 분기 → (라운드를 돌며 조각마다 fetch → bronze 즉시 저장) 
+→ 완결도 게이트 → normalize → 검증 · 정책 적용 → silver · quarantine → manifest 마감 → (불완전하면) 백필 마커.
+단계를 넘어갈 때마다 manifest의 `stage`를 갱신한다. 중간에 죽어도 어디까지 진행됐는지 남아 있어야 다음 실행이 재개할 수 있다.
 
 | # | 조건 | 동작 |
 | --- | --- | --- |
