@@ -13,3 +13,8 @@ package = false
 
 [tool.uv.sources]
 core = { path = "../libs/core", editable = true }
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]

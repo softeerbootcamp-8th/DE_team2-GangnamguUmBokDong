@@ -66,3 +66,11 @@ schedule을 기준으로 Collector 내부 API 조회 범위를 계산하지 않�
 - Backfill이 일 단위인지 확인
 - Compaction이 Data Interval 기반인지 확인
 """
+
+
+
+"""Airflow DAG에서 공통으로 사용하는 스케줄 설정."""
+
+TIMEZONE = "Asia/Seoul"
+
+REALTIME_CRON = "*/5 * * * *"

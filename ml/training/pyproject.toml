@@ -1,11 +1,22 @@
 [project]
 name = "training"
 version = "0.1.0"
-requires-python = "==3.11.*"
-dependencies = ["core"]
+description = "feature 테이블로 LightGBM 대여/반납 모델 학습, 성능 모니터링"
+requires-python = ">=3.11"
+dependencies = [
+    "lightgbm",
+    "numpy",
+    "pandas",
+    "pyarrow",
+    "scikit-learn",
+    "ml_common",
+]
+
+[dependency-groups]
+dev = ["pytest"]
 
 [tool.uv]
 package = false
 
 [tool.uv.sources]
-core = { path = "../../libs/core", editable = true }
+ml_common = { path = "../../libs/ml_common", editable = true }
