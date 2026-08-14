@@ -312,26 +312,26 @@ int8 등)를 만들어 `df.astype(...)`으로 다운캐스트. `src/features.py`
 3곳이 dtype(float32 vs float64) 불일치로 실패 — 값은 맞고 dtype만 의도적으로
 다른 것이라 `check_dtype=False` 추가.
 
-## 16. 폴더 구조 재편 — `src`/`feature_engineering`/`scripts` → `common`/`make_dataset`/`training`/`inference`
+## 16. 폴더 구조 재편 — `src`/`feature_engineering`/`scripts` → `common`/`feature_engineering`/`training`/`inference`
 
-**배경**: make_dataset(피처마트 생성)/training(학습)/inference(서빙)를 서로 다른
+**배경**: feature_engineering(피처마트 생성)/training(학습)/inference(서빙)를 서로 다른
 인스턴스에 각각 배포하기로 함(5번 항목에서 이미 예고된 방향). 기존 `src/`
 패키지 하나에 세 역할이 다 섞여 있어서(build_*.py, train_*.py, predict_*.py가
 전부 같은 패키지) 인스턴스별로 나눠 배포하기 어려웠다.
 
-**최종 구조**: `ml/` 아래 정확히 5개 폴더 — `common/`, `make_dataset/`,
+**최종 구조**: `ml/` 아래 정확히 5개 폴더 — `common/`, `feature_engineering/`,
 `training/`, `inference/`, `data/`(그대로 유지, 실제 배포 시 S3로 대체).
 
 - **`common/`**: 세 인스턴스가 반드시 같은 값/로직을 써야 하는 것만 모음 —
   `common_config.py`+`profiles/`(프로필 시스템), `paths.py`(신규 — `data/processed_v2/*`
   경로와 `MODELS_DIR`), `rolling_window_features.py`(censoring 핵심 로직,
-  make_dataset+inference 공유), `trip_events.py`(신규 — 트립 로딩, 마찬가지로
-  make_dataset+inference 공유), `model_contract.py`(신규 — `FEATURE_COLUMNS`,
+  feature_engineering+inference 공유), `trip_events.py`(신규 — 트립 로딩, 마찬가지로
+  feature_engineering+inference 공유), `model_contract.py`(신규 — `FEATURE_COLUMNS`,
   station_id 카테고리 저장/로드, training+inference 공유), `metrics.py`(신규 —
   poisson deviance/pinball loss), `scoring.py`(신규, `predict_common.py`에서
   채점 로직만 추출 — inference+training/monitor_performance.py+
   training/scripts/compare_baselines.py가 공유).
-- **`make_dataset/`**: pandas 로컬 파이프라인(옛 `src/build_*.py`, `features.py`,
+- **`feature_engineering/`**: pandas 로컬 파이프라인(옛 `src/build_*.py`, `features.py`,
   `grid.py`)과 `spark/` 서브패키지(옛 `feature_engineering/` 그대로 이동)를
   같이 둠 — 둘 다 "피처마트 생성"이라는 같은 역할의 서로 다른 실행 환경이라
   한 폴더에 묶는 게 자연스러움.
@@ -346,18 +346,18 @@ int8 등)를 만들어 `df.astype(...)`으로 다운캐스트. `src/features.py`
   남고 실제 채점은 `common/scoring.py`로 이관.
 
 **설계 포인트**: `common/model_contract.py`의 `LAG_ROLLING_FEATURE_COLUMNS`는
-`make_dataset/features.py`(실제 계산 로직)가 아니라 `common_config.LAG_HOURS`/
-`ROLLING_WINDOWS`에서 직접 재계산한다 — `make_dataset/features.py`가 오히려 이
+`feature_engineering/features.py`(실제 계산 로직)가 아니라 `common_config.LAG_HOURS`/
+`ROLLING_WINDOWS`에서 직접 재계산한다 — `feature_engineering/features.py`가 오히려 이
 값을 `common/`에서 import해서 자기가 만드는 컬럼이 스키마와 어긋나지 않게
-맞춘다(의존 방향: `common` → `make_dataset`/`training`/`inference`, 반대가
+맞춘다(의존 방향: `common` → `feature_engineering`/`training`/`inference`, 반대가
 아님 — 그래야 `common/`만 봐도 전체 모델 계약을 알 수 있고 순환 참조가 없음).
 `EXPOSURE_STOCKOUT_VALUE`, `BASE_FEATURE_COLUMNS`도 같은 이유로 `common_config.py`로
-옮김(make_dataset와 inference 양쪽이 정확히 같은 값을 써야 함 — 전자는 학습
+옮김(feature_engineering와 inference 양쪽이 정확히 같은 값을 써야 함 — 전자는 학습
 데이터의 exposure, 후자는 서빙 시점 exposure 계산에 씀).
 
 **모듈-속성 접근 주의사항(실제로 겪은 버그)**: `common/trip_events.py`를 처음
 `from .paths import TRAIN_MONTHS`(bound-name import) 형태로 짰더니,
-`make_dataset/scripts/validate_completion_curve.py`가 진단용으로
+`feature_engineering/scripts/validate_completion_curve.py`가 진단용으로
 `_config.TRAIN_MONTHS`를 임시로 override하는 기존 패턴이 조용히 안 먹히는
 문제가 생겼다(각기 다른 모듈에 바인딩된 별개의 이름이라 한쪽을 바꿔도 다른
 쪽엔 안 보임). `from . import paths` 형태로 바꿔 항상 `paths.TRAIN_MONTHS`
@@ -539,7 +539,7 @@ IP/포트)가 서면 `LGB_MACHINES`에 실제 값을 넣고 여러 머신에서 
 N시간 뒤를 묻는다"는 정보를 horizon feature로 직접 알려주고, 몇 시간 뒤일
 때 그 실적이 얼마나 신뢰할 만한지는 모델이 학습으로 알아서 배우게 한다.
 
-**핵심 설계 — 데이터를 새로 만들 필요가 없었다**: `make_dataset`이 이미 만든
+**핵심 설계 — 데이터를 새로 만들 필요가 없었다**: `feature_engineering`이 이미 만든
 `station_hour_features_2025.parquet`(5분 tick, lag/rolling·날씨·인구·캘린더·
 기존 1시간 타겟 전부 계산돼 있음)를 그대로 재사용했다. "T0 기준 h시간 뒤"
 학습 행 하나는 이 테이블의 **두 시점을 조합**한 것뿐이다 — 소스 행(T0)에서
@@ -623,14 +623,14 @@ history.md 11번 항목의 "8% 표본 학습" 실험도 비슷한 성격의 표�
   §2(초기 데이터 감사·사용자 스코프 결정·250m 격자 통합·파이프라인 스키마
   함정·최종 병합 테이블 검증)는 이 프로젝트의 가장 첫 결정들이라 다른 어디에도
   없었다 — `DATA_CATALOG.md`가 이 절들을 번호로 직접 인용하고 있었을 정도.
-  **`make_dataset/DESIGN.md` 0번 항목으로 이관**하고 원본은 삭제.
+  **`feature_engineering/DESIGN.md` 0번 항목으로 이관**하고 원본은 삭제.
 - `SPARK_SCALING.md`: §1~3(feature engineering/학습을 Spark로 옮길지 판단)은
-  이미 실행 완료된 질문(`make_dataset/spark/` 존재, 학습 쪽은 17번 항목+
+  이미 실행 완료된 질문(`feature_engineering/spark/` 존재, 학습 쪽은 17번 항목+
   [ADR-0001](adr/0001-lightgbm-distributed-training.md)로 결론) — 버려도 됨.
   **§4.3(Kafka+Spark Streaming 대신 Redis로 충분하다는 재검토)만 유일하게
   다른 곳에 없는 미래 아키텍처 결정**이라 `inference/DESIGN.md` 6번 항목으로
   이관하고 원본은 삭제.
-- `REALTIME_FEATURES.md`/`DATA_CATALOG.md`는 삭제하지 않음 — `make_dataset/DESIGN.md`가
+- `REALTIME_FEATURES.md`/`DATA_CATALOG.md`는 삭제하지 않음 — `feature_engineering/DESIGN.md`가
   전자를 "자세한 설계"로 명시적으로 링크하는 살아있는 원본이고, 후자는 원본
   데이터 자체를 설명하는 유일한 문서라 다른 DESIGN.md와 안 겹침. 옛 경로
   참조(`src/`, 삭제된 문서 링크)만 갱신.
@@ -690,7 +690,7 @@ profile fallback으로 넘어가는지 확인. 기존 45개 회귀 테스트 전
 ## 21. `inference/predict_single.py`의 dtype을 학습 데이터(float32/int8/int16)와 통일
 
 **배경**: 사용자가 "학습용 데이터는 다 float32/int8/int16으로 다운캐스트했는데
-추론 코드도 그런가?"라고 물어서 확인해보니, `make_dataset`(pandas+Spark)와
+추론 코드도 그런가?"라고 물어서 확인해보니, `feature_engineering`(pandas+Spark)와
 `training`은 전부 다운캐스트된 스키마를 그대로 쓰는데 **`inference/predict_single.py`만
 아니었다** — Python 스칼라로 feature 행을 새로 조립하다 보니 기본값인
 float64/int64로 들어가고 있었다(배치 조회 CLI `predict_common.py`는 parquet를
@@ -700,7 +700,7 @@ float64/int64로 들어가고 있었다(배치 조회 CLI `predict_common.py`는
 카테고리 인코딩 등)에서 지켜온 "학습/서빙 스키마는 정확히 같아야 한다" 원칙에
 비춰보면 맞는 지적이라 반영.
 
-**구현**: `make_dataset/build_merged_table.py`에 있던 `NATIVE_COLUMN_DTYPES`를
+**구현**: `feature_engineering/build_merged_table.py`에 있던 `NATIVE_COLUMN_DTYPES`를
 `common/model_contract.py`로 이관(두 곳 이상이 정확히 같은 값을 써야 하는 계약
 → `common/`이라는 기존 원칙 그대로 적용). 여기에 `FEATURE_COLUMN_DTYPES`(FEATURE_COLUMNS
 전체의 dtype, station_id 제외)를 새로 추가 — lag/rolling 33개 컬럼은
@@ -829,7 +829,7 @@ station_id를 섞어 스모크 테스트로 확인.
 예측을 채택할 때 "예측값을 다음 스텝 lag 자리에 그냥 넣는다"고만 했는데,
 사용자가 "그 자리는 원래 embargo 적용된 값이 들어가야 하는 거 아니냐"고
 정확히 짚었다. 실제로 `rental_count`(학습 타겟)는
-`make_dataset/build_targets.py`의 `future_rolling_counts()`가 만드는
+`feature_engineering/build_targets.py`의 `future_rolling_counts()`가 만드는
 "`[T,T+60분)`의 완결된 건수"이고, `rental_lag_1h`는 window=60/embargo=30분
 기준 `[T-90분,T-30분)`을 **T 시점까지 반납 완료된 것만** 세는 값이다 — 재귀
 스텝은 전자(모델이 예측한 완결 건수)를 후자(부분관측+embargo 적용) 자리에
@@ -922,21 +922,21 @@ empty slice" 경고(프로필 표본이 아예 없는 극소수 station×hour×d
 
 **배경**: 이 저장소는 연습용이고, 실제 배포할 저장소에는 "진짜 서비스에
 필요한 것만" 올리기로 함(사용자 지침). 두 가지를 확정: (1) 피처엔지니어링은
-앞으로 Spark 코드만 유지 — 로컬 테스트도 `make_dataset/spark/`를 `local[*]`
+앞으로 Spark 코드만 유지 — 로컬 테스트도 `feature_engineering/spark/`를 `local[*]`
 단일 노드로 그대로 쓴다. (2) 학습(training)은 원래부터 Spark 기반이 아니었으므로
 (LightGBM은 항상 로컬/소켓분산, 5번 항목) 이 원칙에서 제외 — training은
 "실제 서비스 자동화 경로가 아닌 일회성 분석/튜닝 도구"만 legacy로 옮긴다.
 
-**한 것**: `make_dataset/build_merged_table.py`/`build_rolling_rental_features.py`/
+**한 것**: `feature_engineering/build_merged_table.py`/`build_rolling_rental_features.py`/
 `features.py`(pandas 2차정제, `spark/`가 parity 테스트로 이미 검증된 동일 로직으로
 대체)와 `scripts/validate_completion_curve.py`(일회성 진단 스크립트) + 그 전용
-테스트 2개를 `make_dataset/legacy/`로, `training/experiment_log.py` +
+테스트 2개를 `feature_engineering/legacy/`로, `training/experiment_log.py` +
 `scripts/{build_embargo_candidate,compare_baselines,run_embargo_sweep}.py`(파라미터
 튜닝/베이스라인 비교 도구) + `experiments/{tick_model_ooc,tick_model_sampled}/`를
 `training/legacy/`로 `git mv`(히스토리 보존). 이동한 파일들의 상대 임포트를
-새 깊이에 맞게 수정하고, `make_dataset/scripts/run_build_pipeline.py`(6~7단계
+새 깊이에 맞게 수정하고, `feature_engineering/scripts/run_build_pipeline.py`(6~7단계
 pandas 2차정제 호출 제거, 1~5단계만)와 `run_full_pipeline.py`(dataset 스테이지의
-2차정제를 `.venv-spark`의 `make_dataset.spark.run_pipeline`으로 교체)를 새 구조에
+2차정제를 `.venv-spark`의 `feature_engineering.spark.run_pipeline`으로 교체)를 새 구조에
 맞게 고쳤다. 각 폴더 README/DESIGN.md와 루트 README.md도 갱신.
 
 **검증**: 기존 Spark parity 테스트(`dev_spark_rolling_parity`/`dev_spark_build_features`/
@@ -948,35 +948,35 @@ legacy 11개) 전부 통과 — 파일 이동/임포트 수정이 기존 동작�
 
 ## 26. Spark 피처마트 산출물 경로를 `training`/`inference`가 읽는 경로와 통일 + `DATA_ROOT` 회귀 버그 발견·수정
 
-**배경**: 25번 항목 정리 중 발견한 미해결 문제 — `make_dataset/spark/run_pipeline.py`의
+**배경**: 25번 항목 정리 중 발견한 미해결 문제 — `feature_engineering/spark/run_pipeline.py`의
 기본 산출물 경로(`data/processed_v2/spark/{PARAM_COMBO_ID}/station_hour_features_2025.parquet`)와
 `training/config.py`(→`common/paths.py`)가 읽는 pandas 시절 챔피언 경로
 (`data/processed_v2/station_hour_features_2025.parquet`)가 서로 달라서, 이제
 2차정제를 Spark로만 하면 `training`이 그 산출물을 못 찾는 상태였다.
 
 **발견한 회귀 버그**: 경로를 맞추려고 두 config를 대조하다가
-`make_dataset/spark/config.py`의 `DATA_ROOT` 기본값 계산 자체가 깨져 있었다는
+`feature_engineering/spark/config.py`의 `DATA_ROOT` 기본값 계산 자체가 깨져 있었다는
 걸 발견 — `os.path.dirname(os.path.dirname(__file__))`을 두 번만 적용해서
-`ml/make_dataset/data`(존재하지 않는 경로)를 가리키고 있었다. 이 파일이 원래
+`ml/feature_engineering/data`(존재하지 않는 경로)를 가리키고 있었다. 이 파일이 원래
 `ml/feature_engineering/config.py`(ml 바로 아래, 16번 항목 재편 전)였을 때는
-dirname 두 번으로 정확히 `ml/`에 닿았지만, 재편으로 `ml/make_dataset/spark/config.py`
+dirname 두 번으로 정확히 `ml/`에 닿았지만, 재편으로 `ml/feature_engineering/spark/config.py`
 (두 단계 더 깊음)로 옮기면서 dirname 호출 수를 안 늘려서 생긴 버그로 보인다.
 단위 테스트가 전부 synthetic tmp 경로로 fixture를 만들어 쓰다 보니 기본 경로
 계산 자체는 아무 테스트도 실제로 거치지 않아서 지금까지 안 걸리고 남아있었다.
 
 **수정**:
-1. `make_dataset/spark/config.py` — dirname 3번으로 고쳐 `ml/data`를 정확히 가리키게 함.
+1. `feature_engineering/spark/config.py` — dirname 3번으로 고쳐 `ml/data`를 정확히 가리키게 함.
 2. `common/paths.py` — `MERGED_TABLE_PARQUET`/`ROLLING_RENTAL_FEATURES_PARQUET`/
-   `FEATURES_TABLE_PARQUET`을 `make_dataset/spark/config.py`와 **정확히 같은 공식**
+   `FEATURES_TABLE_PARQUET`을 `feature_engineering/spark/config.py`와 **정확히 같은 공식**
    (`FEATURE_ENGINEERING_OUTPUT_ROOT`/`FEATURE_PARAM_COMBO_ID` 환경변수, 기본값
-   수식도 동일)으로 계산하도록 변경. `training`/`inference`/`make_dataset/config.py`가
+   수식도 동일)으로 계산하도록 변경. `training`/`inference`/`feature_engineering/config.py`가
    전부 `common/paths.py`를 통해 이 값을 읽으므로(8/16번 항목에서 확립된 기존
    설계 — "세 인스턴스가 정확히 같은 경로를 봐야 한다") 한 곳만 고치면 셋이
    다시 같은 경로를 보게 된다. 1차정제 산출물(`STATION_MASTER_PARQUET` 등)과
    inference fallback 프로필(`STATION_HOURLY_PROFILE_PARQUET` 등)은 파라미터
    조합과 무관하므로 그대로 `PROCESSED_V2_DIR` 루트에 둠.
 
-**검증**: `.venv-spark`의 `make_dataset.spark.config.FEATURES_TABLE_PARQUET`과
+**검증**: `.venv-spark`의 `feature_engineering.spark.config.FEATURES_TABLE_PARQUET`과
 `.venv`의 `common.paths`/`training.config`/`inference.config`의 같은 이름
 경로가 완전히 동일한 절대경로로 resolve되는지 직접 확인. 기존 회귀
 테스트 45개(pandas) + 12개(Spark parity) 재실행 전부 통과 — 경로 변경이
@@ -1008,39 +1008,39 @@ dirname 두 번으로 정확히 `ml/`에 닿았지만, 재편으로 `ml/make_dat
 
 상세는 [LEGACY_AUDIT.md](LEGACY_AUDIT.md) 참고.
 
-## 28. `make_dataset`의 pandas는 1차정제까지 전부 legacy — 25번 항목 분류 정정
+## 28. `feature_engineering`의 pandas는 1차정제까지 전부 legacy — 25번 항목 분류 정정
 
 **배경**: 25번 항목에서 "2차정제(피처엔지니어링)만 Spark로 통일, 1차정제(원본→
 station_master/targets/status/weather/population)는 Spark 대응 구현이 없으니
-그대로 유지"로 분류했었는데, 사용자가 이걸 정정 — `make_dataset`은 1차정제든
+그대로 유지"로 분류했었는데, 사용자가 이걸 정정 — `feature_engineering`은 1차정제든
 2차정제든 pandas 코드 자체를 안 쓴다. 실제 배포에서는 1차정제를 이 저장소 밖의
-다른 시스템이 처리하므로(5번 항목), 본 서비스 저장소의 `make_dataset`에는
+다른 시스템이 처리하므로(5번 항목), 본 서비스 저장소의 `feature_engineering`에는
 `spark/`(2차정제)만 있으면 된다 — 1차정제 pandas는 이 연습 저장소에서 로컬
 테스트 입력을 준비하는 용도로만 legacy에 남는다.
 
-**한 것**: `make_dataset/{config,build_station_master,build_targets,
+**한 것**: `feature_engineering/{config,build_station_master,build_targets,
 build_station_status,build_weather,build_population,grid}.py`와
-`scripts/run_build_pipeline.py`를 `git mv`로 `make_dataset/legacy/`로 이동(남는
-게 없어진 `make_dataset/scripts/` 디렉터리는 삭제). 이동한 파일들의 상대
-임포트를 재조정하고, `make_dataset.config`를 참조하던 세 곳(`run_build_pipeline.py`,
-legacy 테스트 2개, `make_dataset/tests/dev_spark_rolling_parity.py`,
+`scripts/run_build_pipeline.py`를 `git mv`로 `feature_engineering/legacy/`로 이동(남는
+게 없어진 `feature_engineering/scripts/` 디렉터리는 삭제). 이동한 파일들의 상대
+임포트를 재조정하고, `feature_engineering.config`를 참조하던 세 곳(`run_build_pipeline.py`,
+legacy 테스트 2개, `feature_engineering/tests/dev_spark_rolling_parity.py`,
 `inference/tests/dev_rental_censoring_cross_parity.py`)을 각각 맞는 대상으로
 갱신 — 순수 상수만 쓰는 곳은 `common.common_config`로 legacy 의존을 없애고,
 `ROLLING_RENTAL_FEATURES_PARQUET` 경로를 monkeypatch해야 하는
 `dev_rental_censoring_cross_parity.py`는 `features.py`가 실제로 읽는 모듈과
-같아야 해서 `make_dataset.legacy.config`를 그대로 써야 했다(처음에
+같아야 해서 `feature_engineering.legacy.config`를 그대로 써야 했다(처음에
 `common_config`로 바꿨다가 테스트가 깨져서 원인 파악 후 되돌림). `run_full_pipeline.py`/
-루트 `README.md`/`make_dataset/README.md`/`DESIGN.md`/`common/README.md`도
+루트 `README.md`/`feature_engineering/README.md`/`DESIGN.md`/`common/README.md`도
 새 구조에 맞게 갱신.
 
-**결과적으로 `make_dataset/` 최상위(legacy 제외)에는 `spark/`, `tests/dev_spark_*.py`,
+**결과적으로 `feature_engineering/` 최상위(legacy 제외)에는 `spark/`, `tests/dev_spark_*.py`,
 `__init__.py`, `README.md`, `DESIGN.md`만 남는다.**
 
 **남은 한계**: `inference/tests/dev_rental_censoring_cross_parity.py`는 여전히
-`make_dataset.legacy.{config,features}`에 의존한다 — 배치 계산 기준으로
+`feature_engineering.legacy.{config,features}`에 의존한다 — 배치 계산 기준으로
 Spark 대신 pandas `features.py`를 쓰기 때문(가볍게 `.venv`만으로 돌 수 있어서,
 pandas==Spark parity가 이미 검증돼 있다는 사실에 기대는 간접 검증). 본 서비스
-저장소가 `make_dataset/legacy/`를 전혀 안 가져가기로 하면 이 테스트를 어떻게
+저장소가 `feature_engineering/legacy/`를 전혀 안 가져가기로 하면 이 테스트를 어떻게
 할지(legacy로 같이 옮기기/Spark 기반으로 재작성/포기) 결정이 필요 — 코드로
 판단할 문제가 아니라서 임의로 안 골랐다.
 
@@ -1050,7 +1050,7 @@ pandas==Spark parity가 이미 검증돼 있다는 사실에 기대는 간접 �
 
 ## 29. common/training/inference도 실제 참조 관계로 재검증 — `profiles/embargo45.json` legacy로 추가 이동
 
-**배경**: 28번 항목에서 make_dataset 분류를 정정한 뒤, 사용자가 "다른 폴더(training/
+**배경**: 28번 항목에서 feature_engineering 분류를 정정한 뒤, 사용자가 "다른 폴더(training/
 inference)는 legacy 없어? common도 봐줘"라고 재차 확인 요청 — 이전에 "전부
 유지"라고 답했던 걸 다시 근거 있게 검증하라는 뜻으로 받아들여, "git 추적 여부"가
 아니라 각 파일을 실제로 누가 import/참조하는지 grep으로 다시 추적했다.
@@ -1078,12 +1078,12 @@ README/`run_full_pipeline.py`의 엔트리포인트로 쓰이고 있음을 재�
 
 상세는 [LEGACY_AUDIT.md](LEGACY_AUDIT.md) 참고.
 
-## 30. 환경 관리를 uv로 전환 + `common`을 `lib/ml_common/`으로 분리(독립 라이브러리화)
+## 30. 환경 관리를 uv로 전환 + `common`을 `libs/ml_common/`으로 분리(독립 라이브러리화)
 
 **배경 1(uv)**: 사용자가 환경 관리를 pip+venv(공용 `.venv`/`.venv-spark`,
-`requirements.txt`)에서 `uv`로 바꾸기로 함 — `make_dataset`/`training`/`inference`
+`requirements.txt`)에서 `uv`로 바꾸기로 함 — `feature_engineering`/`training`/`inference`
 각자 독립 배포되는 설계(16번 항목)와 맞춰, 폴더별로 독립된 `pyproject.toml`/
-`uv.lock`/`.venv`를 쓰도록 전환. `make_dataset`은 `==3.11.*`(pyspark 제약,
+`uv.lock`/`.venv`를 쓰도록 전환. `feature_engineering`은 `==3.11.*`(pyspark 제약,
 EMR 8.0.0 기본값), 나머지 둘은 `>=3.11`. 세 폴더가 실제로 무엇을 import하는지
 grep으로 정확히 추적해 의존성을 채웠다(예: inference는 lightgbm을 직접 import
 안 하지만 `common.scoring`을 통해 씀 — 직접 import하는 것만 명시).
@@ -1092,11 +1092,11 @@ grep으로 정확히 추적해 의존성을 채웠다(예: inference는 lightgbm
 계층의 `lib/` 폴더 아래 `ml_common`으로 따로 만들어 넣을 것"이라고 확정 —
 `lib/`가 이 저장소의 다른 서비스(`client`/`etl`/`infra`/`weather-etl`)와도
 공유될 수 있는 자리라 `common`이란 일반적인 이름은 충돌 위험이 있어서
-`ml_common`으로 이름 붙임. `ml/common/` → `<repo-root>/lib/ml_common/`로
+`ml_common`으로 이름 붙임. `ml/common/` → `<repo-root>/libs/ml_common/`로
 `git mv`, 패키지 import명도 `common` → `ml_common`으로 전부 변경(처음엔
 디렉터리를 `ml-common`으로 만들었다가 오타였다고 정정받아 `ml_common`으로
 다시 바꿈 — 디렉터리명/프로젝트명/import명이 전부 `ml_common`으로 통일).
-make_dataset/training/inference/legacy/experiments 전체에서 `from common import`/
+feature_engineering/training/inference/legacy/experiments 전체에서 `from common import`/
 `common.X`/`common/X` 패턴 60여 곳을 일괄 치환(대부분 perl — macOS 기본
 `sed -E`는 `\b`(단어 경계)를 지원하지 않아 처음에 조용히 실패했었음, GNU
 sed 없어서 perl로 교체).
@@ -1111,14 +1111,14 @@ sed 없어서 perl로 교체).
 가장 단순한 방법이었다. `training/scripts/monthly_retrain_check.py`가
 `ML_ROOT`를 쓰고 있어서 심볼 자체는 유지하고 계산 방식만 바꿈 — 이 파일이
 쓰던 `SPARK_PYTHON = ML_ROOT / ".venv-spark" / ...`도 uv 전환 이후 안 맞게 된
-옛 경로라 `make_dataset/.venv`로 같이 갱신.
+옛 경로라 `feature_engineering/.venv`로 같이 갱신.
 
-**검증**: `lib/ml_common/`은 `ml/pytest.ini`의 `dev_*.py` 규칙을 더 이상
+**검증**: `libs/ml_common/`은 `ml/pytest.ini`의 `dev_*.py` 규칙을 더 이상
 상속받지 못해서(다른 rootdir) 자체 `pyproject.toml`에 같은 규칙을 추가.
 세 폴더 모두 `uv sync`로 실제 `.venv` 재생성 + `uv lock`으로 `ml_common`
-editable 의존성이 새 경로(`../../lib/ml_common`)로 정확히 잡히는지 확인,
+editable 의존성이 새 경로(`../../libs/ml_common`)로 정확히 잡히는지 확인,
 전체 회귀 테스트 57개(`ml_common` 17 + `training` 9 + `inference` 8 +
-`make_dataset` legacy 11 + Spark parity 12) 재실행 전부 통과 — 대량 치환이
+`feature_engineering` legacy 11 + Spark parity 12) 재실행 전부 통과 — 대량 치환이
 아무 것도 깨뜨리지 않았음을 확인.
 
 **남은 것**: 이번 작업으로 문서(README/DESIGN.md 등)의 `common/` 참조는
@@ -1126,4 +1126,4 @@ editable 의존성이 새 경로(`../../lib/ml_common`)로 정확히 잡히는�
 `common`으로 불렸던 시점의 기록이라 그대로 둔다(이 저장소의 결정 로그
 컨벤션 — 과거 기록은 그때 사실을 남기고, 최신 상태는 README/LEGACY_AUDIT.md가
 반영). 자세한 파일별 변경 목록은 [LEGACY_AUDIT.md](LEGACY_AUDIT.md)의
-"환경 관리 — uv + `lib/ml_common/`" 절 참고.
+"환경 관리 — uv + `libs/ml_common/`" 절 참고.

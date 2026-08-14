@@ -6,7 +6,7 @@
 공유한다 — 서빙 경로와 모니터링/평가 경로가 각자 채점 로직을 따로 구현하면
 train-serve skew와 같은 종류의 사고(두 경로가 조용히 다른 값을 냄)가 날 수 있다.
 
-입력 DataFrame은 반드시 `make_dataset`의 `features.build_features()`를 거친
+입력 DataFrame은 반드시 `feature_engineering`의 `build_features.build_features()`를 거친
 스키마여야 한다(`ml_common.model_contract.FEATURE_COLUMNS` 포함).
 """
 
@@ -68,7 +68,7 @@ def predict(df: pd.DataFrame, model_name: str, exposure_col: str | None = None) 
     """station×tick feature 행마다 point(poisson) + quantile(P10/50/90, conformal 보정 적용) 예측.
 
     args:
-        df: make_dataset의 features.build_features()와 동일한 스키마의 DataFrame
+        df: feature_engineering의 build_features.build_features()와 동일한 스키마의 DataFrame
             (station_id, date, hour, ml_common.model_contract.FEATURE_COLUMNS 포함)
         model_name: "rental" 또는 "return"
         exposure_col: Poisson exposure 컬럼명. None이면 exposure=1로 간주 (반납 모델)

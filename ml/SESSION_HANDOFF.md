@@ -7,7 +7,7 @@
 ## 프로젝트 배경
 
 `ml/` 디렉터리(따릉이 대여/반납 수요 예측). **폴더 구조가 이번 세션에 재편됨** —
-`ml/` 아래 정확히 5개 폴더: `common/`, `make_dataset/`, `training/`, `inference/`,
+`ml/` 아래 정확히 5개 폴더: `common/`, `feature_engineering/`, `training/`, `inference/`,
 `data/`(그대로 유지, 실배포는 S3). 각 폴더의 `README.md`(실행 방법)/`DESIGN.md`
 (설계 배경)를 먼저 읽을 것. 전체 개요는 [README.md](README.md).
 
@@ -18,26 +18,26 @@
 
 1. **하이퍼파라미터 프로필 시스템** — `common/common_config.py`가 `ML_PROFILE`
    환경변수로 `common/profiles/{이름}.json`을 읽는 로더로 재작성.
-2. **Spark(`make_dataset/spark/`) 5분 tick 그리드 포팅** — pandas와 대칭 맞춤,
+2. **Spark(`feature_engineering/spark/`) 5분 tick 그리드 포팅** — pandas와 대칭 맞춤,
    sparse target 조회, dtype 다운캐스트.
 3. **타임존 KST(Asia/Seoul) 확정 + 근본 버그 수정** — `F.unix_timestamp()`/
    `F.timestamp_seconds()`의 timestamp_ntz/tz-aware 비대칭 문제를
    `_unix_seconds_ntz()`/`_seconds_to_ntz()`(session-tz 무관 헬퍼)로 해결.
 4. **폴더 구조 재편** — `src`/`feature_engineering`/`scripts` 단일 패키지를
-   `common`/`make_dataset`/`training`/`inference` 5개 폴더로 분리(인스턴스별
+   `common`/`feature_engineering`/`training`/`inference` 5개 폴더로 분리(인스턴스별
    독립 배포 가능하게). 상세는 history.md 16번 항목.
 
-**검증**: `.venv/bin/python -m pytest common/tests make_dataset/tests/dev_features_rental_censoring.py make_dataset/tests/dev_completion_curve_integration.py training/tests inference/tests -q`
-(45개), `.venv-spark/bin/python -m pytest make_dataset/tests/test_spark_*.py -q`(12개)
+**검증**: `.venv/bin/python -m pytest common/tests feature_engineering/tests/dev_features_rental_censoring.py feature_engineering/tests/dev_completion_curve_integration.py training/tests inference/tests -q`
+(45개), `.venv-spark/bin/python -m pytest feature_engineering/tests/test_spark_*.py -q`(12개)
 전부 통과.
 
 ## 다음 세션에서 할 수 있는 것 (우선순위 없음 — 필요할 때 참고)
 
 1. **실데이터로 Spark 파이프라인 전체 재검증**: `data/processed_v2/targets_2025.parquet`/
    `return_targets_2025.parquet`(pandas가 이미 sparse tick 포맷으로 만들어둔 실제
-   2025년 데이터)이 `make_dataset/spark/config.py`의 기본 경로와 같은 곳을
-   가리키므로, `make_dataset.spark.build_targets`로 다시 만들 필요 없이 바로
-   `make_dataset.spark.run_pipeline`을 실데이터로 돌려볼 수 있다. 이전(시간 단위
+   2025년 데이터)이 `feature_engineering/spark/config.py`의 기본 경로와 같은 곳을
+   가리키므로, `feature_engineering.spark.build_targets`로 다시 만들 필요 없이 바로
+   `feature_engineering.spark.run_pipeline`을 실데이터로 돌려볼 수 있다. 이전(시간 단위
    그리드 시절) E2E 실행 기록은 tick 그리드로 재실행하면 행 수가 12배 늘어나므로
    리소스/시간이 달라질 것 — 로컬 머신 RAM(18GB) 한계를 먼저 고려(history.md
    11번의 청크 처리 교훈 참고).
@@ -63,7 +63,7 @@
 - **타임존은 KST(Asia/Seoul)로 통일** — Spark 세션을 새로 만드는 코드/테스트는
   `TZ=Asia/Seoul` env(SparkSession 생성 **전**)와
   `spark.sql.session.timeZone=Asia/Seoul`을 반드시 같이 설정할 것. 초 단위
-  정수 ↔ 타임스탬프 왕복은 `make_dataset/spark/rolling_window_features.py`의
+  정수 ↔ 타임스탬프 왕복은 `feature_engineering/spark/rolling_window_features.py`의
   `_unix_seconds_ntz()`/`_seconds_to_ntz()`를 쓸 것(직접 `F.unix_timestamp()`/
   `F.timestamp_seconds()` 쓰면 세션 타임존에 따라 조용히 틀어짐).
 - **공유 모듈을 쪼갤 때 monkeypatch 대상 확인**: `from x import NAME`(bound-name)
@@ -71,5 +71,5 @@
   `x.NAME = ...`으로 override했을 때 실제로 반영된다 — `common/trip_events.py`가
   이 함정에 걸렸었다(history.md 16번 항목 참고).
 - **폴더 구조 재편 후 새 코드를 추가할 때**: 어느 폴더에 넣을지 애매하면
-  "이 로직을 make_dataset/training/inference 중 2개 이상이 정확히 같은 값으로
+  "이 로직을 feature_engineering/training/inference 중 2개 이상이 정확히 같은 값으로
   써야 하는가?"를 먼저 물어볼 것 — 그렇다면 `common/`, 아니면 해당 폴더에만.

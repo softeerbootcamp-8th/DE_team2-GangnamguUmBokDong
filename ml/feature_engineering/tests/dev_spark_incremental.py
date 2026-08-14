@@ -18,13 +18,13 @@ pyspark = pytest.importorskip("pyspark")
 
 from pyspark.sql import functions as F
 
-from make_dataset.spark import config as fe_config
-from make_dataset.spark.build_features import build_features
-from make_dataset.spark.build_merged_table import build_merged_table
-from make_dataset.spark.build_rolling_rental_features import build_rolling_rental_features
-from make_dataset.spark.build_targets import build_targets
-from make_dataset.spark.run_pipeline import _run_incremental
-from make_dataset.spark.watermark import write_watermark
+from feature_engineering.spark import config as fe_config
+from feature_engineering.spark.build_features import build_features
+from feature_engineering.spark.build_merged_table import build_merged_table
+from feature_engineering.spark.build_rolling_rental_features import build_rolling_rental_features
+from feature_engineering.spark.build_targets import build_targets
+from feature_engineering.spark.run_pipeline import _run_incremental
+from feature_engineering.spark.watermark import write_watermark
 
 N_HOURS = 600  # 25일
 WATERMARK_OFFSET_HOURS = 432  # 18일차 -> 신규 구간 168시간(7일)

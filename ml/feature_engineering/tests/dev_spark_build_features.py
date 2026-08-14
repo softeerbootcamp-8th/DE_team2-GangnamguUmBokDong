@@ -15,8 +15,8 @@ from ml_common.rolling_window_features import censored_rolling_counts
 
 pyspark = pytest.importorskip("pyspark")
 
-from make_dataset.spark import config as fe_config
-from make_dataset.spark.build_features import build_features
+from feature_engineering.spark import config as fe_config
+from feature_engineering.spark.build_features import build_features
 
 
 @pytest.fixture(scope="module")

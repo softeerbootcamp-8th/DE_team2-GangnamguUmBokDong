@@ -11,10 +11,10 @@
 
 다른 파라미터 조합(다른 모델)은 `config.OUTPUT_ROOT`가 조합 ID로 이미 분리돼 있어서
 서로 겹치지 않는다 — 조합별로 이 스크립트를 각자 실행하면 된다(예:
-`ROLLING_EMBARGO_MINUTES=45 python -m make_dataset.spark.run_pipeline`).
+`ROLLING_EMBARGO_MINUTES=45 python -m feature_engineering.spark.run_pipeline`).
 
 실행 예:
-    로컬: ./.venv-spark/bin/python -m make_dataset.spark.run_pipeline
+    로컬: ./.venv-spark/bin/python -m feature_engineering.spark.run_pipeline
     EMR:  spark-submit --deploy-mode cluster feature_engineering/run_pipeline.py
 """
 

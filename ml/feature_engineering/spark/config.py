@@ -23,10 +23,10 @@ import os
 from ml_common import common_config
 
 # --- 데이터 루트: 로컬 개발 시 ml/data(이 파일 기준 ../../data), EMR/S3에선 DATA_ROOT
-# 환경변수로 override. 이 파일은 ml/make_dataset/spark/config.py에 있으므로 dirname을
+# 환경변수로 override. 이 파일은 ml/feature_engineering/spark/config.py에 있으므로 dirname을
 # 세 번 타야 ml/에 닿는다(예전 feature_engineering/config.py 시절엔 두 번이면 됐던
 # 게 폴더 재편으로 한 단계 더 깊어짐 — LEGACY_AUDIT.md 참고, dirname 두 번짜리는
-# 실제로는 ml/make_dataset/data라는 존재하지 않는 경로를 가리키는 버그였다) ---
+# 실제로는 ml/feature_engineering/data라는 존재하지 않는 경로를 가리키는 버그였다) ---
 _DEFAULT_LOCAL_DATA_ROOT = os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "data"
 )

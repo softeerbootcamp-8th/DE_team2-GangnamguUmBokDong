@@ -2,7 +2,7 @@
 
 `ml/data/`에 있는 모든 원본·중간·참고 데이터를 소스별로 상세히 정리한 문서.
 "이 데이터가 뭐고, 얼마나 있고, 어떤 주기·속성을 가지는지"에 집중한다. 이
-데이터들을 어떻게 가공해서 모델에 넣었는지는 [make_dataset/DESIGN.md](make_dataset/DESIGN.md)/
+데이터들을 어떻게 가공해서 모델에 넣었는지는 [feature_engineering/DESIGN.md](feature_engineering/DESIGN.md)/
 [training/DESIGN.md](training/DESIGN.md), 왜 그렇게 했는지는
 [history.md](history.md)를 참고.
 
@@ -42,7 +42,7 @@
 | **Parquet (파이프라인이 실제로 쓰는 버전)** | `data/parquet/*.parquet` | — | 9컬럼, **`대여소ID` 없이 `start_st`/`end_st`(5자리 대여소번호)만** — utf8_trips와 컬럼 구성이 다름 |
 
 **기간**: 2024-01-01 ~ 2026-06-30 (30개월). **학습에는 이 중 2025년 12개월만
-사용**했다 (다른 소스가 2025년만 커버하기 때문, [make_dataset/DESIGN.md](make_dataset/DESIGN.md) 0.2절).
+사용**했다 (다른 소스가 2025년만 커버하기 때문, [feature_engineering/DESIGN.md](feature_engineering/DESIGN.md) 0.2절).
 
 **규모**: 전체 30개월 **99,736,535건**. 2025년 한 해만 37,372,654건
 (기존 EDA `analysis_summary.json`의 `trips_2025`와 정확히 일치, 교차 검증됨).
@@ -78,7 +78,7 @@ end_st, end_st_nm, duration_min, distance_m` (9컬럼)
 
 **파이프라인에서 쓰는 부분**: `start_dt/start_st`(대여), `end_dt/end_st`(반납)
 4개 컬럼만 사용해 station×hour 대여/반납 건수로 집계한다
-(`make_dataset/build_targets.py`). 나머지(이용시간·거리·인적속성)는 이번 모델에는 쓰지 않음 — 필요하면
+(`feature_engineering/spark/build_targets.py`). 나머지(이용시간·거리·인적속성)는 이번 모델에는 쓰지 않음 — 필요하면
 추가 feature 후보.
 
 **품질 이슈**:
@@ -137,7 +137,7 @@ end_st, end_st_nm, duration_min, distance_m` (9컬럼)
 **`거치대수량` 통계** (2025-06 샘플, n=2,000,111): 평균 11.76, 중앙값 8,
 최댓값 **212**(!) — `station_master.capacity`의 중앙값(10)을 훨씬 초과하는
 overflow가 실제로 관측됨. 반납이 거치대 상태와 무관하게 항상 성공하기 때문
-(버그 아님, [make_dataset/DESIGN.md](make_dataset/DESIGN.md) 0.4절).
+(버그 아님, [feature_engineering/DESIGN.md](feature_engineering/DESIGN.md) 0.4절).
 
 **품질 이슈**: 컬럼명이 `거치대수량`이라 capacity처럼 보이지만, 실제로는
 **그 시각 실제 주차된 자전거 수**(시간별 변동값)다.
@@ -169,7 +169,7 @@ overflow가 실제로 관측됨. 반납이 거치대 상태와 무관하게 항�
 **같이 있지만 미사용**: `data/raw_forecast/OBS_ASOS_TIM_*.csv` — 폴더명은
 "forecast"지만 내용은 위 관측 파일과 **행 수(8,762)·값이 완전히 동일한
 중복본**이다. 실제 예보 데이터가 아니므로 사용하지 않음
-([make_dataset/DESIGN.md](make_dataset/DESIGN.md) 0.1절).
+([feature_engineering/DESIGN.md](feature_engineering/DESIGN.md) 0.1절).
 
 ### 1.5 생활인구 250m 격자 (KT + 서울시)
 
@@ -206,8 +206,8 @@ overflow가 실제로 관측됨. 반납이 거치대 상태와 무관하게 항�
   몽골 등 18개국 + 기타) 컬럼
 
 **격자 ID 규칙**: `다사52255325` 형태, 행정안전부 국가지점번호 체계와 동일 —
-좌표 역산 공식은 [make_dataset/DESIGN.md](make_dataset/DESIGN.md) 0.3절,
-[grid.py](make_dataset/grid.py) 참고.
+좌표 역산 공식은 [feature_engineering/DESIGN.md](feature_engineering/DESIGN.md) 0.3절,
+[grid.py](feature_engineering/grid.py) 참고.
 
 **마스킹 규칙**: 집계값이 **3 이하면 K-익명성 처리로 `"*"`** — KT 자체 EDA
 기준 전체의 약 5%. 파이프라인은 이를 2로 대체 (KT 예시 코드와 동일).
@@ -241,7 +241,7 @@ EDA**의 요약 결과. 파이프라인은 이 중 **`holidays_2025`(공휴일 1
 (`stratified_resid`), 강수 dose-response, 온도 구간별 반응, 자치구 단위 상관
 등 훨씬 많은 분석 결과가 담겨 있으며 (`trips_2025: 37,372,654`가 우리 파이프라인
 집계와 정확히 일치해 같은 원본 데이터임을 교차 검증하는 데도 썼다,
-[make_dataset/DESIGN.md](make_dataset/DESIGN.md) 0.5절) 이번 모델링에는 공휴일 목록 외엔 직접
+[feature_engineering/DESIGN.md](feature_engineering/DESIGN.md) 0.5절) 이번 모델링에는 공휴일 목록 외엔 직접
 활용하지 않았다.
 
 ---
@@ -252,7 +252,7 @@ EDA**의 요약 결과. 파이프라인은 이 중 **`holidays_2025`(공휴일 1
 
 원래 이 값을 쓰려고 했으나(정류소↔행정동 매핑 테이블이 없어서 어려움을 겪음),
 사용자가 250m 격자 원본을 제공하면서 대체됨
-([make_dataset/DESIGN.md](make_dataset/DESIGN.md) 0.2절).
+([feature_engineering/DESIGN.md](feature_engineering/DESIGN.md) 0.2절).
 
 - **기간**: 2025-01~2026-06 (18개월, 250m보다 범위가 넓음 — 나중에 학습 기간을
   확장하게 되면 이 데이터가 다시 후보가 될 수 있음)

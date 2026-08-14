@@ -26,6 +26,31 @@ wheels = [
 ]
 
 [[package]]
+name = "feature-engineering"
+version = "0.1.0"
+source = { virtual = "." }
+dependencies = [
+    { name = "ml-common" },
+    { name = "pyproj" },
+    { name = "pyspark" },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "pytest" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "ml-common", editable = "../../libs/ml_common" },
+    { name = "pyproj" },
+    { name = "pyspark", specifier = "==3.5.3" },
+]
+
+[package.metadata.requires-dev]
+dev = [{ name = "pytest" }]
+
+[[package]]
 name = "iniconfig"
 version = "2.3.0"
 source = { registry = "https://pypi.org/simple" }
@@ -53,34 +78,9 @@ wheels = [
 ]
 
 [[package]]
-name = "make-dataset"
-version = "0.1.0"
-source = { virtual = "." }
-dependencies = [
-    { name = "ml-common" },
-    { name = "pyproj" },
-    { name = "pyspark" },
-]
-
-[package.dev-dependencies]
-dev = [
-    { name = "pytest" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "ml-common", editable = "../../lib/ml_common" },
-    { name = "pyproj" },
-    { name = "pyspark", specifier = "==3.5.3" },
-]
-
-[package.metadata.requires-dev]
-dev = [{ name = "pytest" }]
-
-[[package]]
 name = "ml-common"
 version = "0.1.0"
-source = { editable = "../../lib/ml_common" }
+source = { editable = "../../libs/ml_common" }
 dependencies = [
     { name = "lightgbm" },
     { name = "numpy" },

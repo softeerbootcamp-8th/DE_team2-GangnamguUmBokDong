@@ -1,4 +1,4 @@
-# make_dataset — 설계 문서
+# feature_engineering — 설계 문서
 
 실행 방법은 [README.md](README.md), 원본 데이터 상세는 [DATA_CATALOG.md](../DATA_CATALOG.md),
 결정의 배경/시행착오는 [history.md](../history.md)를 참고. 이 문서는 "지금 코드가
@@ -7,11 +7,11 @@
 **파일 위치 안내**: 아래 설계 설명이 언급하는 파일명(`build_station_master.py`/
 `build_merged_table.py`/`build_rolling_rental_features.py`/`features.py`/
 `config.py`/`grid.py` 등)은 전부 pandas 구현 기준이지만, 이 코드는 1차정제든
-옛 2차정제든 전부 `make_dataset/legacy/`로 옮겨졌다 — **본 서비스 코드는
-`make_dataset/spark/`뿐**이다. 설계 의도/로직 자체는 pandas와 Spark 구현이
+옛 2차정제든 전부 `feature_engineering/legacy/`로 옮겨졌다 — **본 서비스 코드는
+`feature_engineering/spark/`뿐**이다. 설계 의도/로직 자체는 pandas와 Spark 구현이
 동일(2차정제는 parity 테스트로 검증됨, 1차정제는 Spark 쪽에 대응 구현이 원래
-없음)하므로 아래 설명은 그대로 유효하고, 파일 경로만 `make_dataset/legacy/`
-(1차정제) 또는 `make_dataset/spark/`(2차정제) 쪽으로 옮겨 읽으면 된다. 자세한
+없음)하므로 아래 설명은 그대로 유효하고, 파일 경로만 `feature_engineering/legacy/`
+(1차정제) 또는 `feature_engineering/spark/`(2차정제) 쪽으로 옮겨 읽으면 된다. 자세한
 분류는 [../LEGACY_AUDIT.md](../LEGACY_AUDIT.md) 참고.
 
 ## 0. 초기 데이터 감사 및 스코프 결정
@@ -40,7 +40,7 @@ self-test 검증). 그 외 주의점: 집계는 "그 시간대에 가장 오래 
 (`"*"` → 2로 대체, KT 예시 코드와 동일), 정류소가 실제로 속한 격자(2,273개)로
 먼저 필터링 후 concat(전체 격자 10,021개×365일×3종을 다 로드하면 감당 불가).
 
-**0.4 파이프라인 모듈 및 스키마 함정** (`make_dataset/scripts/run_build_pipeline.py`가
+**0.4 파이프라인 모듈 및 스키마 함정** (`feature_engineering/scripts/run_build_pipeline.py`가
 아래 순서로 `build_*.py`를 실행):
 
 | 단계 | 발견한 문제 | 해결 |
@@ -92,7 +92,7 @@ sparse 타겟/rolling 카운트를 그리드의 특정 tick에서 조회하려�
   5분 tick을 평균한다(N개 시간별 지점만이 아니라) — 인접 tick끼리 창이 겹쳐
   사실상 스무딩에 가깝다.
 
-`make_dataset/spark/build_features.py`는 애초에 self-join/rangeBetween 기반으로
+`feature_engineering/spark/build_features.py`는 애초에 self-join/rangeBetween 기반으로
 짜여 있어서 tick 밀도 변화의 영향을 받지 않는다 — station 휴업으로 인한 그리드
 구멍(과거 문제)과 tick 밀도(새 문제)가 같은 해법(행 개수 대신 실제 시간 기준)으로
 동시에 해결된다.
@@ -123,7 +123,7 @@ tick)만 이 값으로 대체한다. 반납은 반납 이벤트 자체가 로그
 
 ## 5. Spark 포팅 — pandas와 반드시 일치해야 하는 부분
 
-`make_dataset/spark/`는 EMR 배포용 별도 구현이다(pandas와 서로 import 안 함).
+`feature_engineering/spark/`는 EMR 배포용 별도 구현이다(pandas와 서로 import 안 함).
 핵심 규칙이 조용히 갈라지지 않도록 대조 테스트(`tests/dev_spark_rolling_parity.py`)가
 합성 데이터로 pandas/Spark 결과를 비교한다. 포팅 중 겪은 문제:
 
@@ -132,7 +132,7 @@ tick)만 이 값으로 대체한다. 반납은 반납 이벤트 자체가 로그
   `timestamp_ntz` 입력을 세션 타임존과 무관하게 항상 UTC로 해석하지만,
   `F.timestamp_seconds()`로 되돌릴 땐 세션 타임존을 쓴다 — 이 비대칭 때문에
   세션 타임존이 UTC가 아니면(이 프로젝트는 KST) 초 단위 왕복 변환이 조용히
-  어긋난다. `make_dataset/spark/rolling_window_features.py`의
+  어긋난다. `feature_engineering/spark/rolling_window_features.py`의
   `_unix_seconds_ntz()`/`_seconds_to_ntz()`가 `timestampadd()`(순수 wall-clock
   연산, 타임존 변환 자체가 없음)로 이 문제를 근본적으로 없앴다 — 세션
   타임존이 무엇이든(KST든 UTC든) 정확하다. 초 단위 정수 ↔ 타임스탬프 왕복이
@@ -146,4 +146,4 @@ tick)만 이 값으로 대체한다. 반납은 반납 이벤트 자체가 로그
 censoring 윈도우/LightGBM 파라미터 등은 `ml_common/common_config.py`가
 `ML_PROFILE` 환경변수(기본 `default`)로 `ml_common/profiles/{이름}.json`을 읽어
 제공한다. 개별 환경변수(`ROLLING_EMBARGO_MINUTES=45` 등)는 프로필 값 위에
-추가로 덮어쓸 수 있다 — 상세는 [ml_common README](../../lib/ml_common/README.md).
+추가로 덮어쓸 수 있다 — 상세는 [ml_common README](../../libs/ml_common/README.md).
