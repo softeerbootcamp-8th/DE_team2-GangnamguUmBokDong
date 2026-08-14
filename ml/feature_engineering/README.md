@@ -17,28 +17,22 @@ Spark로** 담당한다.
 
 | | 위치 | 실행 환경 | 역할 |
 |---|---|---|---|
-| **2차 정제(Spark) — 본 서비스** | `make_dataset/spark/*.py` | `.venv-spark`(로컬 `local[*]` 단일 노드) 또는 EMR `spark-submit` | 1차 정제 산출물을 병합·feature화해 최종 feature 테이블 생성 |
-| **1차 정제 + 옛 2차정제(pandas) — legacy, 로컬 테스트 전용** | `make_dataset/legacy/*.py` | `.venv` | 1차 정제 산출물을 로컬에서 재현해 위 Spark 경로를 테스트해볼 입력을 만들 뿐, 본 서비스 경로가 아님 |
+| **2차 정제(Spark) — 본 서비스** | `make_dataset/spark/*.py` | `make_dataset/.venv`(uv, Python 3.11, 로컬은 `local[*]` 단일 노드) 또는 EMR `spark-submit` | 1차 정제 산출물을 병합·feature화해 최종 feature 테이블 생성 |
+| **1차 정제 + 옛 2차정제(pandas) — legacy, 로컬 테스트 전용** | `make_dataset/legacy/*.py` | `make_dataset/.venv` | 1차 정제 산출물을 로컬에서 재현해 위 Spark 경로를 테스트해볼 입력을 만들 뿐, 본 서비스 경로가 아님 |
 
 Spark 구현이 이미 pandas와 정확히 같은 값을 낸다는 것을 parity 테스트
 (`dev_spark_rolling_parity.py`/`dev_spark_build_features.py`/`dev_spark_incremental.py`)로
 확인했으므로, 피처엔지니어링(2차정제)은 Spark 코드만 유지한다. `make_dataset/legacy/`가
-`common/`(파라미터·경로 계약)만 참조하고 `spark/`를 import하지 않으므로, Spark 쪽을
-EMR에 올릴 때는 `make_dataset/spark/` + `common/` 디렉터리만 있으면 된다. 분류
-근거는 [../LEGACY_AUDIT.md](../LEGACY_AUDIT.md) 참고.
+`ml_common`(파라미터·경로 계약, `<repo-root>/lib/ml_common/` — `ml/`과 별도로
+관리되는 공유 라이브러리)만 참조하고 `spark/`를 import하지 않으므로, Spark
+쪽을 EMR에 올릴 때는 `make_dataset/spark/` + `lib/ml_common/` 디렉터리만 있으면
+된다. 분류 근거는 [../LEGACY_AUDIT.md](../LEGACY_AUDIT.md) 참고.
 
 ## 세팅
 
 ```bash
-cd ml
-
-# Spark 실행에 필요한 venv (Python 3.11 — EMR 8.0.0 기본값과 동일)
-python3.11 -m venv .venv-spark
-./.venv-spark/bin/pip install -r spark/requirements.txt
-
-# 로컬에서 1차 정제(legacy)까지 처음부터 테스트해보려면 추가로 메인 venv도 필요
-python3 -m venv .venv
-./.venv/bin/pip install -r ../requirements.txt
+cd ml/make_dataset
+uv sync   # pyproject.toml/uv.lock 기준 .venv 생성 — pyspark(Python 3.11) + ml_common(editable) 포함
 ```
 
 필요한 원본 데이터(이미 `ml/data/`에 있어야 함)는 [DATA_CATALOG.md](../DATA_CATALOG.md) 참고.
@@ -46,8 +40,9 @@ python3 -m venv .venv
 ## 실행 — 2차 정제(Spark, 본 서비스)
 
 ```bash
-# 로컬 테스트 (.venv-spark, local[*] 단일 노드 — 1차 정제 산출물이 data/processed_v2/에 있어야 함)
-./.venv-spark/bin/python -m make_dataset.spark.run_pipeline
+cd ml
+# 로컬 테스트 (local[*] 단일 노드 — 1차 정제 산출물이 data/processed_v2/에 있어야 함)
+./make_dataset/.venv/bin/python -m make_dataset.spark.run_pipeline
 
 # EMR
 spark-submit --deploy-mode cluster make_dataset/spark/run_pipeline.py
@@ -57,11 +52,14 @@ spark-submit --deploy-mode cluster make_dataset/spark/run_pipeline.py
 히스토리로 처음부터 만들고, 있으면 `common_config.INCREMENTAL_LOOKBACK_HOURS`만큼만
 다시 계산해서 새 행만 append한다. 파라미터 조합(window/embargo/tick)마다
 `make_dataset/spark/config.py`의 `OUTPUT_ROOT`가 자동으로 분리되므로, 다른 조합을
-실험할 때 챔피언 산출물을 덮어쓸 걱정 없이 `ROLLING_EMBARGO_MINUTES=45 ./.venv-spark/bin/python -m make_dataset.spark.run_pipeline`처럼
-환경변수만 바꿔 실행하면 된다(또는 `ML_PROFILE=embargo45`로 프로필째 교체 — [공통 프로필 시스템](../common/README.md) 참고).
+실험할 때 챔피언 산출물을 덮어쓸 걱정 없이
+`ROLLING_EMBARGO_MINUTES=45 ./make_dataset/.venv/bin/python -m make_dataset.spark.run_pipeline`처럼
+환경변수만 바꿔 실행하면 된다(또는 `ML_PROFILE=embargo45`로 프로필째 교체 —
+[ml_common README](../../lib/ml_common/README.md) 참고).
 
-**주의**: Spark 스크립트/테스트는 반드시 `.venv-spark`(Python 3.11)로 실행할 것.
-메인 `.venv`는 pyspark가 지원하지 않는 버전이라 직렬화가 깨진다.
+**주의**: Spark 스크립트/테스트는 반드시 `make_dataset/.venv`(uv, Python 3.11)로
+실행할 것. `training`/`inference`의 venv는 pyspark가 지원하지 않는 Python
+버전을 쓴다.
 
 ## 실행 — 1차 정제(legacy pandas, 로컬 테스트 입력 준비용)
 
@@ -70,7 +68,7 @@ spark-submit --deploy-mode cluster make_dataset/spark/run_pipeline.py
 
 ```bash
 cd ml
-./.venv/bin/python -m make_dataset.legacy.scripts.run_build_pipeline
+./make_dataset/.venv/bin/python -m make_dataset.legacy.scripts.run_build_pipeline
 ```
 
 순서대로 실행하는 단계: `build_station_master`(정류소 마스터 + grid_id) →
@@ -83,15 +81,15 @@ cd ml
 
 ```bash
 cd ml
-.venv-spark/bin/python -m pytest make_dataset/tests/dev_spark_rolling_parity.py make_dataset/tests/dev_spark_build_features.py make_dataset/tests/dev_spark_incremental.py -q
+./make_dataset/.venv/bin/python -m pytest make_dataset/tests/dev_spark_rolling_parity.py make_dataset/tests/dev_spark_build_features.py make_dataset/tests/dev_spark_incremental.py -q
 ```
 
-`dev_spark_rolling_parity.py`/`dev_spark_incremental.py`는 pandas(`common/rolling_window_features.py`,
+`dev_spark_rolling_parity.py`/`dev_spark_incremental.py`는 pandas(`ml_common.rolling_window_features`,
 이미 검증된 기준 구현)와 Spark 버전이 정확히 같은 결과를 내는지 대조하는 핵심
 회귀 테스트다 — `spark/` 쪽을 고치면 반드시 다시 통과하는지 확인해야 한다.
 
 legacy 전용 테스트(1차 정제 진단, 옛 pandas 2차정제 단위 테스트)는 기본 검증에서
-뺐다 — 필요하면 `./.venv/bin/python -m pytest make_dataset/legacy/tests -q`로
+뺐다 — 필요하면 `./make_dataset/.venv/bin/python -m pytest make_dataset/legacy/tests -q`로
 개별 실행.
 
 ## 산출물
@@ -107,8 +105,8 @@ legacy 전용 테스트(1차 정제 진단, 옛 pandas 2차정제 단위 테스�
 | `data/processed_v2/spark/{PARAM_COMBO_ID}/rolling_rental_features_2025.parquet` | 2차정제(Spark) | point-in-time censored 대여 카운트(sparse) |
 | `data/processed_v2/spark/{PARAM_COMBO_ID}/station_hour_features_2025.parquet` | 2차정제(Spark) | **최종 feature 테이블** — `training/`이 읽는 입력 |
 
-`training`/`inference`는 `common/paths.py`를 통해 이 경로를 그대로 읽는다 —
-`common/paths.py`가 `make_dataset/spark/config.py`와 정확히 같은 공식
+`training`/`inference`는 `ml_common.paths`를 통해 이 경로를 그대로 읽는다 —
+`lib/ml_common/paths.py`가 `make_dataset/spark/config.py`와 정확히 같은 공식
 (`FEATURE_ENGINEERING_OUTPUT_ROOT`/`FEATURE_PARAM_COMBO_ID` 환경변수 포함)으로
 `{PARAM_COMBO_ID}` 경로를 계산하므로 별도 복사/심링크가 필요 없다. 다른 파라미터
 조합으로 실험할 때는 두 환경변수를 Spark 실행/training·inference 실행 양쪽에

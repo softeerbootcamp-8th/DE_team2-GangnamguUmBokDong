@@ -11,6 +11,14 @@
 쓴다. **실제 배포**: `data/`는 S3에 저장되므로(요구사항), 인스턴스별로 `DATA_ROOT`/
 `MODELS_ROOT` 환경변수를 `s3://...`로 override하면 코드 변경 없이 그대로 동작한다
 (`feature_engineering/config.py`가 이미 쓰던 것과 같은 패턴).
+
+**주의**: 이 패키지(`ml_common`)는 `lib/ml_common/`에 있고 `ml/`의 형제(sibling)라
+`ml/` 위치를 자기 파일 경로 기준으로는 알아낼 수 없다(`ml/`이 조상 디렉터리가
+아니라 아예 다른 가지에 있음) — 그래서 기본값은 `__file__` 대신 **현재
+작업 디렉터리(cwd)** 기준이다. 이 저장소의 모든 명령이 `cd ml` 다음에
+실행되는 걸 전제로 하므로(각 폴더 README 참고) 그 컨벤션을 따르는 한 그대로
+동작하고, `cd ml`을 안 지키거나 실제 배포 환경이면 `DATA_ROOT`/`MODELS_ROOT`를
+명시적으로 설정해야 한다.
 """
 
 import json
@@ -19,7 +27,9 @@ from pathlib import Path
 
 from . import common_config
 
-ML_ROOT = Path(__file__).resolve().parents[1]
+# ml_common은 lib/ml_common/에 있고 ml/의 형제 디렉터리라 __file__ 기준으로 ml/을
+# 찾을 수 없다 — cwd가 ml/이라는 이 저장소의 실행 컨벤션에 기대는 기본값이다.
+ML_ROOT = Path.cwd()
 
 DATA_DIR = Path(os.environ.get("DATA_ROOT", str(ML_ROOT / "data")))
 PROCESSED_V2_DIR = DATA_DIR / "processed_v2"
@@ -45,7 +55,8 @@ TRAIN_MONTHS = [f"{TRAIN_YEAR % 100:02d}{m:02d}" for m in range(1, 13)]
 RENTAL_PARQUET_DIR = DATA_DIR / "parquet"
 
 # training이 만들고(학습), inference가 읽는(서빙) 모델 아티팩트 — 로컬 개발 중엔
-# training/models/ 그대로, 실제 배포에서는 MODELS_ROOT 환경변수로 override.
+# training/models/ 그대로(cwd=ml/ 전제, 위 DATA_DIR과 같은 이유), 실제 배포에서는
+# MODELS_ROOT 환경변수로 override.
 MODELS_DIR = Path(os.environ.get("MODELS_ROOT", str(ML_ROOT / "training" / "models")))
 
 # --- make_dataset 1차 정제 산출물(pandas) ---

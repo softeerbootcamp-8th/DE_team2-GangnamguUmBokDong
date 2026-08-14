@@ -9,7 +9,7 @@
 import pandas as pd
 import pytest
 
-from common.rolling_window_features import (
+from ml_common.rolling_window_features import (
     add_censored_visibility,
     censored_rolling_counts,
     count_visible_in_window,
