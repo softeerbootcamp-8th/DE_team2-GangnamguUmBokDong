@@ -175,6 +175,7 @@ from manifest import (
     FailureReason,
     Manifest,
     Missing,
+    RetryMarker,
     RunStatus,
     Stage,
 )
@@ -230,6 +231,53 @@ def _build_missing(missing_keys: dict, expected_total: int | None, fetched_rows:
     if expected_total is not None:
         return Missing(parts=parts, rows=max(0, expected_total - fetched_rows), basis="rows")
     return Missing(parts=parts, rows=None, basis="parts")
+
+
+def _sync_retry_marker(config, window_start: datetime, missing: Missing, first_failed_at: datetime) -> str | None:
+    """이번 실행이 남긴 누락에 맞춰 `_retry_queue` 마커를 쓰거나·갱신하거나·지운다.
+
+    누락 조각이 남아 있으면 마커를 쓴다. 이미 마커가 있으면 `first_failed_at`은
+    그대로 두고(나이는 처음 실패한 시점부터 잰다) `missing_parts`만 최신값으로
+    바꾸고 `attempts`를 늘린다. 누락이 없어졌으면(이번에 다 채웠거나 애초에
+    없었으면) 기존 마커를 지운다. `backfill.enabled`가 아닌 소스는 채울 방법이
+    없는 마커를 쌓지 않도록 아예 건드리지 않는다 — 마커 만료 판정은 Airflow
+    백필 DAG의 책임이라 여기서는 `expires_at`만 계산해 남긴다.
+
+    args:
+        config: `backfill` 설정을 담은 소스 설정.
+        window_start: 이번 실행이 처리한 window의 시작 시각.
+        missing: 이번 실행이 최종적으로 도달한 누락 정보.
+        first_failed_at: 이번 실행을 첫 실패로 볼 때 쓸 시각. 기존 마커가 있으면
+            무시되고 그 마커의 값이 유지된다.
+    returns:
+        마커가 존재하게 됐으면 `"pending"`, 지워졌거나 애초에 필요 없었으면 `None`.
+        manifest의 `backfill_status` 필드에 그대로 쓰인다.
+    """
+    if config.backfill is None or not config.backfill.enabled:
+        return None
+
+    existing = next(
+        (m for m in manifest_module.load_retry_markers(config.source_id) if m.window_start == window_start),
+        None,
+    )
+
+    if not missing.parts:
+        if existing is not None:
+            manifest_module.clear_retry_marker(config.source_id, window_start)
+        return None
+
+    first_failed = existing.first_failed_at if existing is not None else first_failed_at
+    manifest_module.save_retry_marker(
+        RetryMarker(
+            source_id=config.source_id,
+            window_start=window_start,
+            missing_parts=missing.parts,
+            first_failed_at=first_failed,
+            expires_at=first_failed + config.backfill.max_age,
+            attempts=(existing.attempts + 1) if existing is not None else 1,
+        )
+    )
+    return "pending"
 
 
 def _now() -> datetime:
@@ -355,8 +403,14 @@ def execute_window(
         return Manifest(**fields)
 
     def _finish(**over) -> Manifest:
-        """manifest를 만들어 저장하고 그대로 반환한다. 아래 모든 종료 지점이 공유한다."""
-        result = _base_manifest(**over)
+        """manifest를 만들고 마커를 동기화해 저장한 뒤 그대로 반환한다.
+
+        아래 모든 종료 지점이 공유한다. `missing`을 넘기지 않은 호출(FATAL 등)은
+        누락 없음으로 보고, 그 경우 마커도 건드리지 않는다.
+        """
+        missing = over.get("missing", Missing())
+        backfill_status = _sync_retry_marker(config, window_start, missing, started_at)
+        result = _base_manifest(backfill_status=backfill_status, **over)
         manifest_module.save(result)
         return result
 

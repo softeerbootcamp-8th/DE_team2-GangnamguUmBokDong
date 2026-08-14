@@ -13,7 +13,7 @@ import manifest as manifest_module
 import pipeline
 import storage
 from adapters.base import FetchErrorKind, FetchResult, adapter
-from config.schema import Policies, Quality, Schedule, SourceConfig
+from config.schema import Backfill, Policies, Quality, Schedule, SourceConfig
 from config.schema import Storage as StorageConfig
 from manifest import FailureReason, RunStatus, Stage
 
@@ -402,3 +402,110 @@ class TestEmptyResult:
 
         assert result.status == RunStatus.FAILED
         assert result.failure_reason == FailureReason.QUALITY_GATE
+
+
+class TestRetryMarkerSync:
+    """#11 백필 DAG가 읽을 `_retry_queue` 마커를 pipeline이 실제로 쓰는지 확인한다."""
+
+    def _backfill_config(self, **overrides):
+        return _config(backfill=Backfill(enabled=True, max_age="1d"), **overrides)
+
+    def test_marker_written_on_missing_ratio_gate_failure(self, scripted_adapter, client):
+        scripted_adapter.results = [
+            [
+                FetchResult(key="a", payload=_chunk("a"), error=None, expected_total=2),
+                FetchResult(key="b", payload=None, error=FetchErrorKind.PERMANENT, expected_total=None),
+            ]
+        ]
+        config = self._backfill_config(quality=Quality(max_drop_ratio=1.0, max_missing_ratio=0.1, allow_empty=True))
+
+        result = pipeline.execute_window(config, WINDOW_START, client=client, sleep_fn=lambda s: None)
+
+        assert result.status == RunStatus.FAILED
+        assert result.backfill_status == "pending"
+        markers = manifest_module.load_retry_markers(config.source_id)
+        assert len(markers) == 1
+        assert markers[0].missing_parts == ("b",)
+        assert markers[0].attempts == 1
+
+    def test_marker_written_on_partial_success_with_missing(self, scripted_adapter, client):
+        scripted_adapter.results = [
+            [
+                FetchResult(key="a", payload=_chunk("a"), error=None, expected_total=10),
+                FetchResult(key="b", payload=None, error=FetchErrorKind.PERMANENT, expected_total=None),
+            ]
+        ]
+        config = self._backfill_config(quality=Quality(max_drop_ratio=1.0, max_missing_ratio=0.95, allow_empty=True))
+
+        result = pipeline.execute_window(config, WINDOW_START, client=client, sleep_fn=lambda s: None)
+
+        assert result.status == RunStatus.PARTIAL
+        assert result.backfill_status == "pending"
+        assert manifest_module.load_retry_markers(config.source_id)[0].missing_parts == ("b",)
+
+    def test_no_marker_when_run_fully_succeeds(self, scripted_adapter, client):
+        scripted_adapter.results = [[FetchResult(key="a", payload=_chunk("a"), error=None, expected_total=None)]]
+        config = self._backfill_config()
+
+        result = pipeline.execute_window(config, WINDOW_START, client=client)
+
+        assert result.status == RunStatus.SUCCEEDED
+        assert result.backfill_status is None
+        assert manifest_module.load_retry_markers(config.source_id) == []
+
+    def test_no_marker_when_backfill_disabled(self, scripted_adapter, client):
+        scripted_adapter.results = [
+            [
+                FetchResult(key="a", payload=_chunk("a"), error=None, expected_total=2),
+                FetchResult(key="b", payload=None, error=FetchErrorKind.PERMANENT, expected_total=None),
+            ]
+        ]
+        config = _config(quality=Quality(max_drop_ratio=1.0, max_missing_ratio=0.1, allow_empty=True))
+
+        result = pipeline.execute_window(config, WINDOW_START, client=client, sleep_fn=lambda s: None)
+
+        assert result.status == RunStatus.FAILED
+        assert result.backfill_status is None
+        assert manifest_module.load_retry_markers(config.source_id) == []
+
+    def test_marker_update_keeps_first_failed_at_and_bumps_attempts(self, scripted_adapter, client):
+        scripted_adapter.results = [
+            [
+                FetchResult(key="a", payload=_chunk("a"), error=None, expected_total=10),
+                FetchResult(key="b", payload=None, error=FetchErrorKind.PERMANENT, expected_total=None),
+            ]
+        ]
+        config = self._backfill_config(quality=Quality(max_drop_ratio=1.0, max_missing_ratio=0.95, allow_empty=True))
+        pipeline.execute_window(config, WINDOW_START, client=client, sleep_fn=lambda s: None)
+        first_marker = manifest_module.load_retry_markers(config.source_id)[0]
+
+        # 다시 --force로 돌려도 같은 조각(b)이 또 실패해 마커가 갱신된다.
+        scripted_adapter.results = [
+            [
+                FetchResult(key="a", payload=_chunk("a"), error=None, expected_total=10),
+                FetchResult(key="b", payload=None, error=FetchErrorKind.PERMANENT, expected_total=None),
+            ]
+        ]
+        pipeline.execute_window(config, WINDOW_START, client=client, force=True, sleep_fn=lambda s: None)
+        second_marker = manifest_module.load_retry_markers(config.source_id)[0]
+
+        assert second_marker.first_failed_at == first_marker.first_failed_at
+        assert second_marker.attempts == first_marker.attempts + 1
+
+    def test_marker_cleared_once_backfill_fills_all_missing(self, scripted_adapter, client):
+        scripted_adapter.results = [
+            [
+                FetchResult(key="a", payload=_chunk("a"), error=None, expected_total=2),
+                FetchResult(key="b", payload=None, error=FetchErrorKind.PERMANENT, expected_total=None),
+            ]
+        ]
+        config = self._backfill_config(quality=Quality(max_drop_ratio=1.0, max_missing_ratio=0.6, allow_empty=True))
+        pipeline.execute_window(config, WINDOW_START, client=client, sleep_fn=lambda s: None)
+        assert len(manifest_module.load_retry_markers(config.source_id)) == 1
+
+        scripted_adapter.results = [[FetchResult(key="b", payload=_chunk("b"), error=None, expected_total=None)]]
+        result = pipeline.execute_window(config, WINDOW_START, client=client, backfill=True)
+
+        assert result.status == RunStatus.SUCCEEDED
+        assert result.backfill_status is None
+        assert manifest_module.load_retry_markers(config.source_id) == []
