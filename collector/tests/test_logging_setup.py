@@ -109,6 +109,16 @@ class TestSecretRedaction:
         assert "SUPERSECRET" not in line
         assert "serviceKey=***" in line
 
+    def test_masks_seoul_api_path_segment(self):
+        stream = io.StringIO()
+        root = _configure(stream)
+
+        root.error("fetch failed: http://openapi.seoul.go.kr:8088/SEOULSECRETKEY123/json/bikeList/1/1000/")
+
+        line = stream.getvalue()
+        assert "SEOULSECRETKEY123" not in line
+        assert "openapi.seoul.go.kr:8088/***" in line
+
 
 class TestIsolation:
     def test_second_configure_call_replaces_handlers_not_stacks(self):

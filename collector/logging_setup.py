@@ -73,13 +73,18 @@ from datetime import datetime
 _FIXED_FIELDS = ("source_id", "window", "attempt")
 _STANDARD_ATTRS = frozenset(vars(logging.LogRecord("", 0, "", 0, "", (), None)).keys()) | {"message", "asctime"}
 
-# 서울/기상청 API 모두 인증키를 쿼리 파라미터로 받는다. 값만 가리고 키 이름은 남긴다.
-_SECRET_PARAM_RE = re.compile(r"(?i)([?&](?:service|auth)?key=)[^&\s'\"]+")
+# 기상청 API는 인증키를 쿼리 파라미터로 받고, 서울 API는 경로 세그먼트로 받는다.
+# 1. 쿼리 파라미터 형태 (?key=..., &ServiceKey=...)
+_SECRET_QUERY_RE = re.compile(r"(?i)([?&](?:service|auth)?key=)[^&\s'\"]+")
+# 2. 서울 API 경로 파라미터 형태 (openapi.seoul.go.kr:8088/{key}/...)
+_SECRET_PATH_RE = re.compile(r"(?i)(openapi\.seoul\.go\.kr:8088/)[^/\s'\"]+")
 
 
 def _redact(text: str) -> str:
-    """URL 쿼리 파라미터에 실린 인증키 값을 가린다."""
-    return _SECRET_PARAM_RE.sub(r"\1***", text)
+    """URL 쿼리 파라미터와 경로에 실린 인증키 값을 가린다."""
+    text = _SECRET_QUERY_RE.sub(r"\1***", text)
+    text = _SECRET_PATH_RE.sub(r"\1***", text)
+    return text
 
 
 class _ContextFilter(logging.Filter):
