@@ -49,9 +49,12 @@ services:
       context: ../..
       dockerfile: ops/compose/Dockerfile.airflow
     command: ["init"]
-    env_file: ../../.env
+    env_file:
+      - path: ../../.env
+        required: false
     environment:
       AIRFLOW_HOME: /workspace/airflow
+      PYTHONPATH: /workspace/airflow
       AIRFLOW__CORE__EXECUTOR: LocalExecutor
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_AIRFLOW_DB:-airflow}
     volumes:
@@ -65,9 +68,12 @@ services:
       context: ../..
       dockerfile: ops/compose/Dockerfile.airflow
     command: ["webserver"]
-    env_file: ../../.env
+    env_file:
+      - path: ../../.env
+        required: false
     environment:
       AIRFLOW_HOME: /workspace/airflow
+      PYTHONPATH: /workspace/airflow
       AIRFLOW__CORE__EXECUTOR: LocalExecutor
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_AIRFLOW_DB:-airflow}
     ports:
@@ -85,9 +91,12 @@ services:
       context: ../..
       dockerfile: ops/compose/Dockerfile.airflow
     command: ["scheduler"]
-    env_file: ../../.env
+    env_file:
+      - path: ../../.env
+        required: false
     environment:
       AIRFLOW_HOME: /workspace/airflow
+      PYTHONPATH: /workspace/airflow
       AIRFLOW__CORE__EXECUTOR: LocalExecutor
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_AIRFLOW_DB:-airflow}
     volumes:

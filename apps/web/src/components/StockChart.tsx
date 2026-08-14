@@ -1,5 +1,6 @@
 import { useState } from "react";
 import type { ForecastPoint, StationSummary } from "../api";
+import { monotonePath } from "../curve";
 import { formatIsoTime } from "../format";
 
 interface Props {
@@ -47,14 +48,14 @@ export function StockChart({ station, baseDttm, points }: Props) {
   const hoverFraction = hoverIndex !== null ? hoverIndex / (series.length - 1) : 0;
   const tooltipTransform = hoverFraction < 0.15 ? "translateX(0)" : hoverFraction > 0.85 ? "translateX(-100%)" : "translateX(-50%)";
 
-  const path = series.map((p, i) => `${i === 0 ? "M" : "L"} ${xAt(i)} ${yAt(p.bikes)}`).join(" ");
+  const path = monotonePath(series.map((_, i) => xAt(i)), series.map((p) => yAt(p.bikes)));
 
   return (
     <div className="chart-panel">
       <div className="chart-legend">
         <span className="chart-legend-item">
           <svg width="16" height="8" aria-hidden="true">
-            <line x1="0" y1="4" x2="16" y2="4" stroke="var(--series-1)" strokeWidth={2} strokeLinecap="round" />
+            <line x1="0" y1="4" x2="16" y2="4" stroke="var(--series-stock)" strokeWidth={2} strokeLinecap="round" />
           </svg>
           예측 재고
         </span>
@@ -93,8 +94,8 @@ export function StockChart({ station, baseDttm, points }: Props) {
             strokeDasharray="4 3"
           />
 
-          <path d={path} fill="none" stroke="var(--series-1)" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" />
-          <circle cx={xAt(series.length - 1)} cy={yAt(last.bikes)} r={4} fill="var(--series-1)" stroke="var(--surface-1)" strokeWidth={2} />
+          <path d={path} fill="none" stroke="var(--series-stock)" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" />
+          <circle cx={xAt(series.length - 1)} cy={yAt(last.bikes)} r={4} fill="var(--series-stock)" stroke="var(--surface-1)" strokeWidth={2} />
           <text
             x={xAt(series.length - 1) - 6}
             y={yAt(last.bikes) - 10}
@@ -116,7 +117,7 @@ export function StockChart({ station, baseDttm, points }: Props) {
                 stroke="var(--baseline)"
                 strokeWidth={1}
               />
-              <circle cx={xAt(hoverIndex)} cy={yAt(hovered.bikes)} r={4} fill="var(--series-1)" stroke="var(--surface-1)" strokeWidth={2} />
+              <circle cx={xAt(hoverIndex)} cy={yAt(hovered.bikes)} r={4} fill="var(--series-stock)" stroke="var(--surface-1)" strokeWidth={2} />
             </>
           )}
 
@@ -141,7 +142,7 @@ export function StockChart({ station, baseDttm, points }: Props) {
             <div className="time">{formatTime(hovered.time)}</div>
             <div className="chart-tooltip-row">
               <svg width="10" height="8" aria-hidden="true">
-                <line x1="0" y1="4" x2="10" y2="4" stroke="var(--series-1)" strokeWidth={2} strokeLinecap="round" />
+                <line x1="0" y1="4" x2="10" y2="4" stroke="var(--series-stock)" strokeWidth={2} strokeLinecap="round" />
               </svg>
               <span className="value">{hovered.bikes}대</span>
               <span className="label">예측 재고</span>
