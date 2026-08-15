@@ -309,6 +309,104 @@ def pipeline_make_required_str_spec():
     return ColumnSpec(types=("str",), required=True)
 
 
+class TestLogging:
+    """계획서 9절: 단계 경계마다 로그 한 줄, 행·조각 단위 로그는 없다."""
+
+    def test_success_run_logs_bronze_written_validated_and_completed(self, scripted_adapter, client, caplog):
+        scripted_adapter.results = [
+            [
+                FetchResult(key="a", payload=_chunk("a"), error=None, expected_total=None),
+                FetchResult(key="b", payload=_chunk("b"), error=None, expected_total=None),
+            ]
+        ]
+        config = _config()
+
+        with caplog.at_level("INFO", logger="pipeline"):
+            pipeline.execute_window(config, WINDOW_START, client=client)
+
+        messages = [r.message for r in caplog.records]
+        assert any("stage=bronze_written" in m for m in messages)
+        assert any("stage=validated" in m for m in messages)
+        assert any("stage=completed" in m for m in messages)
+        assert all(r.levelname == "INFO" for r in caplog.records)
+
+    def test_missing_chunks_logs_bronze_written_at_warning(self, scripted_adapter, client, caplog):
+        scripted_adapter.results = [
+            [
+                FetchResult(key="a", payload=_chunk("a"), error=None, expected_total=10),
+                FetchResult(key="b", payload=None, error=FetchErrorKind.PERMANENT, expected_total=None),
+            ]
+        ]
+        config = _config(quality=Quality(max_drop_ratio=1.0, max_missing_ratio=0.95, allow_empty=True))
+
+        with caplog.at_level("INFO", logger="pipeline"):
+            pipeline.execute_window(config, WINDOW_START, client=client, sleep_fn=lambda s: None)
+
+        bronze_record = next(r for r in caplog.records if "stage=bronze_written" in r.message)
+        assert bronze_record.levelname == "WARNING"
+        assert "missing=b" in bronze_record.message
+
+    def test_missing_ratio_gate_failure_logs_error(self, scripted_adapter, client, caplog):
+        scripted_adapter.results = [
+            [
+                FetchResult(key="a", payload=_chunk("a"), error=None, expected_total=2),
+                FetchResult(key="b", payload=None, error=FetchErrorKind.PERMANENT, expected_total=None),
+            ]
+        ]
+        config = _config(quality=Quality(max_drop_ratio=1.0, max_missing_ratio=0.1, allow_empty=True))
+
+        with caplog.at_level("INFO", logger="pipeline"):
+            pipeline.execute_window(config, WINDOW_START, client=client, sleep_fn=lambda s: None)
+
+        error_records = [r for r in caplog.records if r.levelname == "ERROR"]
+        assert len(error_records) == 1
+        assert "failure_reason=fetch_error" in error_records[0].message
+
+    def test_fatal_logs_error_without_bronze_written_line(self, scripted_adapter, client, caplog):
+        scripted_adapter.results = [
+            [
+                FetchResult(key="a", payload=_chunk("a"), error=None, expected_total=None),
+                FetchResult(key="b", payload=None, error=FetchErrorKind.FATAL, expected_total=None),
+            ]
+        ]
+        config = _config()
+
+        with caplog.at_level("INFO", logger="pipeline"):
+            pipeline.execute_window(config, WINDOW_START, client=client)
+
+        assert len(caplog.records) == 1
+        assert caplog.records[0].levelname == "ERROR"
+        assert "failure_reason=fetch_error" in caplog.records[0].message
+
+    def test_skip_branch_logs_single_info_line(self, scripted_adapter, client, caplog):
+        scripted_adapter.results = [[FetchResult(key="a", payload=_chunk("a"), error=None, expected_total=None)]]
+        config = _config()
+        pipeline.execute_window(config, WINDOW_START, client=client)
+        caplog.clear()
+
+        with caplog.at_level("INFO", logger="pipeline"):
+            pipeline.execute_window(config, WINDOW_START, client=client)
+
+        assert len(caplog.records) == 1
+        assert caplog.records[0].levelname == "INFO"
+        assert "status=skipped" in caplog.records[0].message
+
+    def test_drop_ratio_gate_failure_logs_error_with_quality_gate(self, scripted_adapter, client, caplog):
+        scripted_adapter.results = [[FetchResult(key="a", payload=_chunk("a"), error=None, expected_total=None)]]
+        scripted_adapter.rows_by_key = {"a": {"col": None}}
+        config = _config(
+            quality=Quality(max_drop_ratio=0.1, max_missing_ratio=1.0, allow_empty=True),
+            columns={"col": pipeline_make_required_str_spec()},
+        )
+
+        with caplog.at_level("INFO", logger="pipeline"):
+            pipeline.execute_window(config, WINDOW_START, client=client)
+
+        error_records = [r for r in caplog.records if r.levelname == "ERROR"]
+        assert len(error_records) == 1
+        assert "failure_reason=quality_gate" in error_records[0].message
+
+
 class TestEmptyResult:
     def test_zero_rows_with_allow_empty_is_empty_status(self, scripted_adapter, client):
         scripted_adapter.results = [[]]
