@@ -8,8 +8,6 @@
 """
 
 import json
-import os
-import sys
 
 import pandas as pd
 import pytest
@@ -32,27 +30,6 @@ N_HOURS = 600  # 25일
 WATERMARK_OFFSET_HOURS = 432  # 18일차 -> 신규 구간 168시간(7일)
 LOOKBACK_HOURS = 240  # 10일 (lag_168h의 7일보다 넉넉한 마진)
 TICKS_PER_HOUR = 60 // fe_config.GRID_TICK_MINUTES  # 그리드가 이제 시간이 아니라 5분 tick 단위
-
-
-@pytest.fixture(scope="module")
-def spark():
-    from pyspark.sql import SparkSession
-
-    os.environ.setdefault("PYSPARK_PYTHON", sys.executable)
-    os.environ.setdefault("PYSPARK_DRIVER_PYTHON", sys.executable)
-    # timestamp_ntz/timestamp(tz-aware) 왕복 어긋남 방지 — feature_engineering/spark_session.py 참고.
-    os.environ.setdefault("TZ", "Asia/Seoul")
-
-    session = (
-        SparkSession.builder.master("local[2]")
-        .appName("test-feature-engineering-incremental")
-        .config("spark.sql.shuffle.partitions", "2")
-        .config("spark.ui.enabled", "false")
-        .config("spark.sql.session.timeZone", "Asia/Seoul")
-        .getOrCreate()
-    )
-    yield session
-    session.stop()
 
 
 @pytest.fixture
