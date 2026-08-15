@@ -65,8 +65,9 @@ def _adjust_base_time(dt: datetime, rule: str | None) -> datetime:
         return dt
         
     if rule == "hourly":
-        # 매시 정각 (초단기실황. 예: 14:40 -> 14:00)
-        return dt.replace(minute=0, second=0, microsecond=0)
+        # 매시 정각 (초단기실황. 매시 40분 발표. 예: 14:40 -> 14:00, 14:39 -> 13:00)
+        eval_dt = dt if dt.minute >= 40 else dt - timedelta(hours=1)
+        return eval_dt.replace(minute=0, second=0, microsecond=0)
         
     if rule == "half_hourly":
         # 매시 30분 (초단기예보. 예: 14:20 -> 13:30, 14:40 -> 14:30)
