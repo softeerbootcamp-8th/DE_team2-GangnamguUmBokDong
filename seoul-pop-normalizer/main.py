@@ -62,7 +62,7 @@ def _filter_grid_rows_for_hour(grid_table: pa.Table, hour: int) -> dict[str, mer
     """TT가 window_start.hour와 같은 행만 남기고, CELL_ID 중복은 마지막 값으로 정리한다.
 
     실측 버그(plan.md): living_population_grid는 CELL_ID당 하루 24행(TT별)을 가지므로
-    이 필터링을 빠뜨리면 결과가 24배 가까이 부풀려진다. null 연령대(마스킹 `*`가
+    이 필터링을 빠뜨리면 결과가 24배 가까이 부풀려진다. null SPOP·연령대(마스킹 `*`가
     collector에서 이미 null로 정규화된 것)는 0.0으로 취급한다(spec 3.5).
     """
     hour_str = f"{hour:02d}"
@@ -74,7 +74,7 @@ def _filter_grid_rows_for_hour(grid_table: pa.Table, hour: int) -> dict[str, mer
         cells[row["CELL_ID"]] = merge.GridCell(
             cell_id=row["CELL_ID"],
             h_dng_cd=row["H_DNG_CD"],
-            spop=float(row["SPOP"]),
+            spop=float(row["SPOP"] or 0.0),
             ages=ages,
             geometry=grid.cell_id_to_polygon(row["CELL_ID"]),
         )
