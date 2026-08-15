@@ -1,0 +1,32 @@
+{
+  "_comment": "챔피언 파라미터 프로필. common_config.py가 ML_PROFILE 환경변수(기본값 'default')로 이 파일을 읽는다. 개별 ROLLING_EMBARGO_MINUTES 같은 환경변수는 이 프로필 값 위에 추가로 override할 수 있다(scripts/run_embargo_sweep.py 등 하위 호환).",
+
+  "ROLLING_TICK_MINUTES": 5,
+  "ROLLING_WINDOW_MINUTES": 60,
+  "ROLLING_EMBARGO_MINUTES": 30,
+
+  "TARGET_HORIZON_MINUTES": 60,
+  "GRID_TICK_MINUTES": 5,
+
+  "LAG_HOURS": [1, 24, 168],
+  "ROLLING_WINDOWS": [3, 24],
+
+  "LGB_PARAMS_COMMON": {
+    "num_leaves": 63,
+    "learning_rate": 0.05,
+    "feature_fraction": 0.8,
+    "bagging_fraction": 0.8,
+    "bagging_freq": 5,
+    "min_data_in_leaf": 100
+  },
+  "LGB_NUM_BOOST_ROUND": 800,
+  "LGB_EARLY_STOPPING_ROUNDS": 50,
+
+  "CONFORMAL_TARGET_COVERAGE": 0.80,
+
+  "INCREMENTAL_LOOKBACK_HOURS": 840,
+
+  "PERFORMANCE_DEGRADATION_THRESHOLD": 0.10,
+  "COVERAGE_DRIFT_THRESHOLD": 0.15,
+  "MONITOR_LOOKBACK_MONTHS": 1
+}

@@ -10,14 +10,15 @@ import된다.
 
     cd collector
     uv run python main.py --source bike_station_realtime \
-        --window-start 2026-08-12T14:10:00Z [--force] [--backfill]
+        --window-start 2026-08-12T23:10:00+09:00 [--force] [--backfill]
 
-Airflow는 소스별 태스크에서 `data_interval_start`를 `--window-start`로 넘긴다.
-백필 DAG는 `_retry_queue/`에서 얻은 대상에 `--backfill`을 붙여 호출한다.
+Airflow는 소스별 태스크에서 `data_interval_start`를 KST로 변환해 `--window-start`로
+넘긴다. 백필 DAG는 `_retry_queue/`에서 얻은 대상에 `--backfill`을 붙여 호출한다.
 
 ## 구현할 것
 
-- 인자 — `--source`(필수) · `--window-start`(필수, ISO8601 Z) · `--force` · `--backfill`
+- 인자 — `--source`(필수) · `--window-start`(필수, ISO8601, KST 오프셋(`+09:00`) 포함)
+  · `--force` · `--backfill`
 - `window_end`는 config의 `schedule.interval`로 계산한다. **collector 자체는 스케줄을
   모른다.**
 - 처리 순서 — 인자 파싱 → 로깅 초기화 → config 로드 → pipeline 실행 → 종료 코드 반환.

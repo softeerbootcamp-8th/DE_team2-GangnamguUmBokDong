@@ -1,0 +1,30 @@
+[project]
+name = "ml_common"
+version = "0.1.0"
+description = "feature_engineering/training/inference가 공유하는 파라미터·경로·핵심 알고리즘"
+requires-python = ">=3.11"
+dependencies = [
+    "pandas",
+    "numpy",
+    "pyarrow",
+    "lightgbm",
+]
+
+[dependency-groups]
+dev = ["pytest"]
+
+[tool.pytest.ini_options]
+# ml/pytest.ini와 동일한 규칙(dev_*.py) — ml_common은 이제 ml/ 밖(lib/)에 있어서
+# 그 설정을 상속받지 못한다. 이유는 ml/pytest.ini 주석 참고(ML의 train/valid/test
+# split과 "test_"가 겹쳐서 헷갈리는 걸 피함).
+python_files = ["dev_*.py"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["ml_common"]
+
+[tool.setuptools.package-dir]
+ml_common = "."

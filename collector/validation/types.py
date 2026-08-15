@@ -1,7 +1,4 @@
-"""
-collector에서 이 파일은 검증 계층의 어휘(공용 타입)를 정의하는 모듈.
-코드를 직접 실행하지 않고, 다른 모듈들이 서로 대화할 때 쓰는 공통 언어만 제공.
-"""
+"""데이터 검증 과정에서 여러 모듈들의 공통 언어를 정의해 둔 곳"""
 
 from __future__ import annotations
 
@@ -39,19 +36,19 @@ class RowVerdict(Enum):
 
 @dataclass(frozen=True, slots=True)
 class Issue:
-    """컬럼 하나의 판정 결과가 무엇으로 문제인지, 
-    원시값·필수여부·스펙을 담아 정책 함수에 전달하는 불변 데이터 객체
+    """컬럼 하나에 문제가 있을 때, 그 상황에 대한 페이로드를 만들어
+    정책 함수로 전달하기 위한 객체
 
-    엔진이 정책에 넘기는 `value`와 이 객체의 `raw_value`는 다르다.
+    column: 문제가 생긴 컬럼명
+    kind: 문제 종류
+    required: 필수 여부
+    raw_value: 캐스팅 전 원시값
+    spec: 컬럼 스펙
 
-    | kind | 정책이 받는 value |
-    | --- | --- |
-    | MISSING | 정규화된 `None` |
-    | TYPE_ERROR | 캐스팅에 실패한 원시값 |
-    | OUTLIER | 캐스팅에 성공한 값 |
-
-    `MISSING`에서 원시값을 넘기지 않는 이유는 `optional_missing`의 기본값이
-    `keep_null`이기 때문이다.
+    엔진이 정책에 넘기는 value 
+    MISSING: 정규화된 None
+    TYPE_ERROR: 캐스팅에 실패한 원시값
+    OUTLIER: 캐스팅에 성공한 값
     """
 
     column: str
@@ -63,7 +60,13 @@ class Issue:
 
 @dataclass(frozen=True, slots=True)
 class RunContext:
-    """정책이 참조할 수 있는 실행 맥락."""
+    """정책이 참조할 수 있는 실행 맥락.
+    
+    source_id: 데이터 소스 식별자
+    window_start: 배치 시작 시각
+    window_end: 배치 종료 시각
+    attempt: 재시도 횟수
+    """
 
     source_id: str
     window_start: datetime
