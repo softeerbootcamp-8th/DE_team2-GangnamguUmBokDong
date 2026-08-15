@@ -48,6 +48,7 @@ import sys
 from datetime import datetime
 
 import httpx
+import adapters  # noqa: F401 (어댑터 레지스트리 로드용)
 
 import config.loader as config_loader
 import pipeline

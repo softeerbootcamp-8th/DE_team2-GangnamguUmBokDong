@@ -96,6 +96,11 @@ class SeoulOpenApiAdapter:
 
         # . 기준으로 문자열을 쪼개서 앞부분만 떼어낸다.
         wrapper_key = params["root_key"].split(".", 1)[0]
+        
+        path_suffix_template = params.get("path_suffix", "")
+        suffix = ""
+        if path_suffix_template:
+            suffix = path_suffix_template.format(window_start=window.window_start)
 
         # total을 모르면 몇 페이지를 더 돌아야 하는지 알 수 없다.
         # expected_total로 이미 받았으면(라운드 재시도·백필) 그 값을 그대로 쓴다.
@@ -117,7 +122,7 @@ class SeoulOpenApiAdapter:
                 page_start = page_end + 1
                 continue
 
-            url = f"{_BASE_URL}/{_api_key()}/json/{service}/{page_start}/{page_end}/"
+            url = f"{_BASE_URL}/{_api_key()}/json/{service}/{page_start}/{page_end}{suffix}/"
             try:
                 response = client.get(url)
                 response.raise_for_status()
@@ -140,7 +145,7 @@ class SeoulOpenApiAdapter:
                 if total is None:
                     # list_total_count는 첫 응답에만 실려 오기 때문에 
                     # 여기서 이 값을 한 번 잡아야 남은 페이지 수를 계산할 수 있다.
-                    total = wrapper.get("list_total_count")
+                    total = int(wrapper.get("list_total_count", 0))
                 yield FetchResult(
                     key=key, payload=response.content, error=None,
                     # expected_total은 pipeline이 기억해뒀다가 다음 라운드·백필에 되돌려주는 값이므로, 

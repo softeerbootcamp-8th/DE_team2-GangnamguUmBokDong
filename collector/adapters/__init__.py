@@ -3,3 +3,7 @@
 어댑터는 소스 수만큼 필요하지 않다. 소스 7종을 어댑터 2개(seoul_openapi ·
 kma_apihub)로 수용하고, 소스별 차이는 config의 `adapter_params`로 흡수한다.
 """
+
+# 어댑터 모듈들을 임포트하여 데코레이터(@adapter)가 실행되고 레지스트리에 등록되도록 한다.
+import adapters.seoul_openapi  # noqa: F401
+import adapters.kma_apihub     # noqa: F401
