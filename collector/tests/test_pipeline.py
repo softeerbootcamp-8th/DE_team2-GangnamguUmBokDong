@@ -425,7 +425,6 @@ class TestEmptyResult:
 
         assert result.status == RunStatus.FAILED
         assert result.failure_reason == FailureReason.QUALITY_GATE
-<<<<<<< HEAD
 
 
 class TestRetryMarkerSync:
