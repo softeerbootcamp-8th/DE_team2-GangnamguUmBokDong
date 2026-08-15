@@ -9,17 +9,20 @@
 storage.py·manifest.py 테스트가 공유하는 moto S3 환경 픽스처도 함께 둔다.
 """
 
-from datetime import UTC, datetime
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import boto3
 import pytest
 from moto import mock_aws
 
+from adapters import base as adapter_base
 from config.schema import ColumnSpec, Range
 from validation import registry
 from validation.types import Issue, RunContext
 
 TEST_BUCKET = "test-bucket"
+KST = ZoneInfo("Asia/Seoul")
 
 
 @pytest.fixture
@@ -62,8 +65,8 @@ def make_issue(make_spec):
 def ctx():
     return RunContext(
         source_id="bike_station_realtime",
-        window_start=datetime(2026, 8, 12, 14, 10, tzinfo=UTC),
-        window_end=datetime(2026, 8, 12, 14, 15, tzinfo=UTC),
+        window_start=datetime(2026, 8, 12, 14, 10, tzinfo=KST),
+        window_end=datetime(2026, 8, 12, 14, 15, tzinfo=KST),
         attempt=1,
     )
 
@@ -78,6 +81,15 @@ def clean_registry():
     registry._POLICIES.update(saved_policies)
     registry._ROW_POLICIES.clear()
     registry._ROW_POLICIES.update(saved_row_policies)
+
+
+@pytest.fixture
+def clean_adapter_registry():
+    """어댑터 레지스트리도 전역 상태다. 테스트가 등록한 이름이 다른 테스트로 새지 않게 복원한다."""
+    saved = dict(adapter_base._ADAPTERS)
+    yield adapter_base
+    adapter_base._ADAPTERS.clear()
+    adapter_base._ADAPTERS.update(saved)
 
 
 @pytest.fixture(autouse=True)

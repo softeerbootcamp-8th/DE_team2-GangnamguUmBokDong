@@ -40,7 +40,7 @@
     ERROR source_id=… stage=validated status=FAILED failure_reason=quality_gate
           dropped=412 drop_ratio=0.149
     ERROR source_id=… stage=bronze_written status=FAILED failure_reason=fetch_error
-          missing_ratio=0.638 reason=circuit_breaker
+          missing_ratio=0.638 reason=budget_exceeded
 
 백필 실행은 `revision` 변화를 남긴다. 이 한 줄이 "silver 내용이 언제 바뀌었는지"의
 유일한 기록이므로 하류 재처리를 추적할 때 쓰인다.
