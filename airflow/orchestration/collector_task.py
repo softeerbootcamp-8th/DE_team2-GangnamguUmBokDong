@@ -22,9 +22,13 @@ Airflow는 Collector의 API retry, 페이지네이션, 품질 게이트, manifes
 Bronze/Silver 저장, Backfill 대상 계산을 구현하지 않는다.
 """
 
+import shlex
 from datetime import timedelta
 
+from airflow.models.mappedoperator import MappedOperator
 from airflow.operators.bash import BashOperator
+
+from callbacks.task_callbacks import log_task_failure, log_task_retry
 
 COLLECTOR_DIR = "/workspace/collector"
 COLLECTOR_WINDOW_START = (
@@ -33,13 +37,13 @@ COLLECTOR_WINDOW_START = (
 
 
 def build_collector_task(source_id: str) -> BashOperator:
-    """Collector CLI를 실행하는 BashOperator를 생성한다.
+    """Collector 실행 Task를 생성한다.
 
     Args:
-        source_id: Collector YAML에 정의된 source 식별자.
+        source_id: Collector 설정에 정의된 source 식별자.
 
     Returns:
-        source별 Collector CLI를 실행하는 BashOperator.
+        Collector를 실행하는 BashOperator.
     """
     return BashOperator(
         task_id=f"collect_{source_id}",
@@ -52,4 +56,50 @@ def build_collector_task(source_id: str) -> BashOperator:
         retries=2,
         retry_delay=timedelta(seconds=30),
         execution_timeout=timedelta(minutes=4),
+        on_retry_callback=log_task_retry,
+        on_failure_callback=log_task_failure,
+    )
+
+
+def build_backfill_command(target: dict[str, str]) -> str:
+    """백필 대상 하나에 대한 Collector CLI 명령을 생성한다.
+
+    Args:
+        target: source_id와 window_start를 포함한 백필 대상.
+
+    Returns:
+        Collector backfill CLI 실행 명령.
+    """
+    source_id = shlex.quote(target["source_id"])
+    window_start = shlex.quote(target["window_start"])
+
+    return (
+        f"cd {COLLECTOR_DIR} && "
+        "env -u VIRTUAL_ENV uv run python main.py "
+        f"--source {source_id} "
+        f"--window-start {window_start} "
+        "--backfill"
+    )
+
+
+def build_backfill_task(targets) -> MappedOperator:
+    """백필 대상 목록을 기반으로 Collector Task를 동적으로 생성한다.
+
+    Args:
+        targets: Collector 조회 Task가 반환한 백필 대상 XComArg.
+
+    Returns:
+        대상별 Collector backfill CLI를 실행하는 동적 BashOperator.
+    """
+    commands = targets.map(build_backfill_command)
+
+    return BashOperator.partial(
+        task_id="run_backfill",
+        retries=2,
+        retry_delay=timedelta(seconds=30),
+        execution_timeout=timedelta(minutes=4),
+        on_retry_callback=log_task_retry,
+        on_failure_callback=log_task_failure,
+    ).expand(
+        bash_command=commands,
     )
