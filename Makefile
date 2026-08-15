@@ -1,7 +1,7 @@
 PROJECTS := collector apps/api airflow ml/inference ml/training ml/feature_engineering libs/core libs/ml_common
 LOCAL_TEST_PROJECTS := collector apps/api ml/inference ml/training ml/feature_engineering libs/core libs/ml_common
 
-COMPOSE = docker compose --env-file .env -f ops/compose/docker-compose.yml
+COMPOSE = docker compose $(if $(wildcard .env),--env-file .env,) -f ops/compose/docker-compose.yml
 
 .PHONY: sync-all lint test bootstrap up down logs ps seed
 

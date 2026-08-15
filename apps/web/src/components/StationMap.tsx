@@ -13,7 +13,16 @@ const MAX_RADIUS = 20;
 const CLICK_PADDING = 10; // 시각적 마커보다 이만큼 더 넓게 클릭을 받는다
 const SELECTED_BORDER = "#0b0b0b";
 const IDLE_BORDER = "#fcfcfb";
-const MAX_VISIBLE_MARKERS = 300; // 현재 화면 범위 안에 이보다 많으면 덜 급한 것부터 숨긴다
+const MAX_VISIBLE_MARKERS = 100; // 현재 화면 범위 안에 이보다 많으면 덜 급한 것부터 숨긴다
+
+// 서비스 대상이 서울 전역이라, 그 밖으로 패닝/줌아웃해서 벗어날 이유가 없다.
+// 실제 대여소 좌표 범위(위도 37.43~37.69, 경도 126.80~127.18)보다 여유를 두고
+// 잡아서, 서울 경계 안쪽 대여소가 없는 지역(외곽 일부)도 화면에 들어오게 한다.
+const SEOUL_BOUNDS: L.LatLngBoundsExpression = [
+  [37.39, 126.72],
+  [37.73, 127.21],
+];
+const SEOUL_MIN_ZOOM = 10; // 이보다 축소하면 서울 전체가 한 화면보다 작아져서 의미가 없다
 
 // 지도를 확대하면 도로·건물이 커지는데 마커만 화면 픽셀 크기 그대로 고정돼
 // 있으면 상대적으로 쪼그라들어 보여서 부자연스럽다. BASE_ZOOM보다 4레벨
@@ -304,6 +313,9 @@ export function StationMap({ stations, alerts, selectedStationId, onSelect }: Pr
     <MapContainer
       center={GANGNAM_CENTER}
       zoom={DEFAULT_ZOOM}
+      minZoom={SEOUL_MIN_ZOOM}
+      maxBounds={SEOUL_BOUNDS}
+      maxBoundsViscosity={1.0}
       style={{ height: "100%", width: "100%" }}
       wheelDebounceTime={100}
     >

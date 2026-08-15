@@ -1,0 +1,76 @@
+source_id: bike_rental_history
+description: 따릉이 대여이력 정보
+
+adapter: seoul_openapi
+adapter_params:
+  service: tbCycleRentData
+  page_size: 1000
+  root_key: rentData.row
+  path_suffix: "/{window_start:%Y-%m-%d}/{window_start:%Y-%m-%d}"
+
+schedule:
+  interval: 5m
+
+storage:
+  bronze_format: json
+  silver_format: parquet
+  partition: [dt, hh]
+
+quality:
+  max_drop_ratio: 0.05
+  max_missing_ratio: 0.05
+  allow_empty: false
+
+backfill:
+  enabled: true
+  max_age: 7d
+
+policies:
+  required_missing: drop_row
+  required_outlier: drop_row
+  optional_missing: keep_null
+  optional_outlier: set_null
+
+columns:
+  BIKE_ID:
+    types: [str]
+    required: true
+  RENT_DT:
+    types: [str]
+    required: true
+  RENT_ID:
+    types: [str]
+  RENT_NM:
+    types: [str]
+  RENT_HOLD:
+    types: [str]
+  RTN_DT:
+    types: [str]
+  RTN_ID:
+    types: [str]
+  RTN_NM:
+    types: [str]
+  RTN_HOLD:
+    types: [str]
+  USE_MIN:
+    types: [str, int]
+  USE_DST:
+    types: [str, float]
+  USR_CLS_CD:
+    types: [str]
+  SEX_CD:
+    types: [str]
+  BIRTH_YEAR:
+    types: [str, int]
+  RENT_STATION_ID:
+    types: [str]
+  RETURN_STATION_ID:
+    types: [str]
+  BIKE_SE_CD:
+    types: [str]
+  START_INDEX:
+    types: [int]
+  END_INDEX:
+    types: [int]
+  RNUM:
+    types: [str, int]
