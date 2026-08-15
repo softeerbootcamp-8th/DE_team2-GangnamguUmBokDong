@@ -95,6 +95,7 @@ from airflow.timetables.trigger import CronTriggerTimetable
 from config.schedules import REALTIME_CRON, TIMEZONE
 from config.sources import REALTIME_SOURCES
 from orchestration.collector_task import build_collector_task
+from orchestration.normalizer_task import build_normalizer_task
 
 with DAG(
     dag_id="realtime_collection",
@@ -112,5 +113,15 @@ with DAG(
     max_active_runs=1,
     tags=["collection", "realtime"],
 ) as dag:
-    for source_id in REALTIME_SOURCES:
-        build_collector_task(source_id)
+    collector_tasks = {
+        source_id: build_collector_task(source_id) for source_id in REALTIME_SOURCES
+    }
+
+    normalize_task = build_normalizer_task("normalize_pop_grid")
+    normalize_fallback_task = build_normalizer_task(
+        "normalize_pop_grid_fallback",
+        baseline_date_mode="latest",
+        trigger_rule="all_failed",
+    )
+
+    collector_tasks["population_realtime"] >> normalize_task >> normalize_fallback_task
