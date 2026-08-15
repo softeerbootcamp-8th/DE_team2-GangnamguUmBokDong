@@ -1,11 +1,20 @@
 [project]
-name = "predict"
+name = "inference"
 version = "0.1.0"
-requires-python = "==3.11.*"
-dependencies = ["core"]
+description = "학습된 모델로 배치 조회 + 단일 시점 예측"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy",
+    "pandas",
+    "pyarrow",
+    "ml_common",
+]
+
+[dependency-groups]
+dev = ["pytest"]
 
 [tool.uv]
 package = false
 
 [tool.uv.sources]
-core = { path = "../../libs/core", editable = true }
+ml_common = { path = "../../libs/ml_common", editable = true }
