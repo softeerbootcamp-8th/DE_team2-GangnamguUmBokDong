@@ -28,12 +28,14 @@ def test_issue_is_frozen():
 
 
 def test_run_context_is_frozen():
-    from datetime import UTC, datetime
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
 
+    kst = ZoneInfo("Asia/Seoul")
     ctx = RunContext(
         source_id="bike_station_realtime",
-        window_start=datetime(2026, 8, 12, 14, 10, tzinfo=UTC),
-        window_end=datetime(2026, 8, 12, 14, 15, tzinfo=UTC),
+        window_start=datetime(2026, 8, 12, 14, 10, tzinfo=kst),
+        window_end=datetime(2026, 8, 12, 14, 15, tzinfo=kst),
         attempt=1,
     )
     with pytest.raises(FrozenInstanceError):
