@@ -178,7 +178,7 @@ class TestKmaSourceEndToEnd:
                 {"category": "RN1", "obsrValue": "0"},
                 {"category": "PTY", "obsrValue": "0"},
             ]
-            body = {"response": {"body": {"items": {"item": items}}}}
+            body = {"response": {"header": {"resultCode": "00"}, "body": {"items": {"item": items}}}}
             return httpx.Response(200, content=json.dumps(body).encode())
 
         client = httpx.Client(transport=httpx.MockTransport(handler))

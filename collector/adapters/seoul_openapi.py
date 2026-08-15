@@ -106,6 +106,38 @@ class SeoulOpenApiAdapter:
         if path_suffix_template:
             suffix = path_suffix_template.format(window_start=window.window_start)
 
+        # citydata_ppltn은 페이지네이션 대신 POI001~POI116 순회
+        if service == "citydata_ppltn":
+            expected = 116
+            for i in range(1, expected + 1):
+                poi_id = f"POI{i:03d}"
+                key = f"poi-{poi_id}"
+                
+                if key in skip:
+                    continue
+                
+                url = f"{_BASE_URL}/{_api_key()}/json/{service}/1/5/{poi_id}/"
+                try:
+                    response = client.get(url)
+                    response.raise_for_status()
+                    body = json.loads(response.content)
+                    wrapper = _extract(body, wrapper_key)
+                except (httpx.RequestError, httpx.HTTPStatusError, json.JSONDecodeError):
+                    yield FetchResult(key=key, payload=None, error=FetchErrorKind.TRANSIENT, expected_total=expected if i == 1 else None)
+                    continue
+
+                code = body.get("RESULT.CODE") or body.get("RESULT", {}).get("RESULT.CODE")
+                category = _classify(code)
+
+                if category is None:
+                    yield FetchResult(key=key, payload=response.content, error=None, expected_total=expected if i == 1 else None)
+                elif category is FetchErrorKind.FATAL:
+                    yield FetchResult(key=key, payload=None, error=category, expected_total=expected if i == 1 else None)
+                    return
+                else:
+                    yield FetchResult(key=key, payload=None, error=category, expected_total=expected if i == 1 else None)
+            return
+
         # total을 모르면 몇 페이지를 더 돌아야 하는지 알 수 없다.
         # expected_total로 이미 받았으면(라운드 재시도·백필) 그 값을 그대로 쓴다.
         total = expected_total
