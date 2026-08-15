@@ -2,7 +2,7 @@
 
 import gzip
 import json
-from datetime import UTC, datetime
+from datetime import datetime
 
 import boto3
 import pyarrow as pa
@@ -20,9 +20,9 @@ from storage import (
     write_retry_marker,
     write_silver,
 )
-from tests.conftest import TEST_BUCKET
+from tests.conftest import KST, TEST_BUCKET
 
-WINDOW_START = datetime(2026, 8, 12, 14, 10, tzinfo=UTC)
+WINDOW_START = datetime(2026, 8, 12, 14, 10, tzinfo=KST)
 
 
 def _s3():
