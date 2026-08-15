@@ -58,6 +58,9 @@ HORIZON_COUNT = common_config.HORIZON_COUNT
 EXPOSURE_STOCKOUT_VALUE = common_config.EXPOSURE_STOCKOUT_VALUE
 
 # 배치 조회 CLI의 기본 조회 기간 (테스트 기간, training/config.py와 같은 값을 유지해야
-# "학습 시 나온 지표"와 "배치 조회 CLI로 재현한 지표"가 어긋나지 않는다).
-TEST_START = "2025-12-01"
-TEST_END = "2025-12-31"
+# "학습 시 나온 지표"와 "배치 조회 CLI로 재현한 지표"가 어긋나지 않는다). training이
+# RAM 제약으로 학습 기간을 2025년 11월 한 달로 좁히면서(training/config.py 참고) 이
+# 값도 그 TEST_START/TEST_END와 같이 좁혀야 한다 — 실제 학습 머신에서 기간을 늘리면
+# 이 값도 같이 늘릴 것.
+TEST_START = "2025-11-26"
+TEST_END = "2025-11-30"

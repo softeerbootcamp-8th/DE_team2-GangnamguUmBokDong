@@ -154,14 +154,23 @@ if __name__ == "__main__":
     # anchor를 정시(매시 0분)로만 좁혀 12배 줄인다 — target_ts/타겟 라벨은 그대로 원본
     # 5분 tick 값이라 서빙 정밀도와는 무관(서빙은 predict_single.py가 라이브로 계산).
     anchor_hourly_only = os.environ.get("MULTI_HORIZON_ANCHOR_HOURLY_ONLY") == "1"
+    # 정각(60분)보다 촘촘하되 5분 tick 전체보다는 성긴 임의 간격(예: 20분)으로 anchor를
+    # 뽑고 싶을 때 — MULTI_HORIZON_ANCHOR_HOURLY_ONLY=1은 사실 이 값의 60분짜리 특수
+    # 케이스와 같다(둘 다 켜져 있으면 이 값이 우선).
+    anchor_tick_minutes = os.environ.get("MULTI_HORIZON_ANCHOR_TICK_MINUTES")
     anchor_input = None
-    if anchor_since or anchor_until or anchor_hourly_only:
+    if anchor_since or anchor_until or anchor_hourly_only or anchor_tick_minutes:
         anchor_input = features
         if anchor_since:
             anchor_input = anchor_input.filter(F.col("hour_ts") >= F.lit(anchor_since))
         if anchor_until:
             anchor_input = anchor_input.filter(F.col("hour_ts") < F.lit(anchor_until))
-        if anchor_hourly_only:
+        if anchor_tick_minutes:
+            tick = int(anchor_tick_minutes)
+            anchor_input = anchor_input.filter(
+                (F.hour(F.col("hour_ts")) * 60 + F.minute(F.col("hour_ts"))) % tick == 0
+            )
+        elif anchor_hourly_only:
             anchor_input = anchor_input.filter(F.minute(F.col("hour_ts")) == 0)
 
     result = build_multi_horizon_features(spark, features, anchor_df=anchor_input)

@@ -21,16 +21,16 @@ __all__ = ["MODELS_DIR", "MULTI_HORIZON_FEATURES_TABLE_PARQUET", "PROCESSED_V2_D
 # --- 학습/검증/평가 기간 (시간 순 split, walk-forward) ---
 # multi-horizon 테이블은 원본 feature 테이블의 최대 HORIZON_COUNT(기본 12)배 행 수라
 # (T0 앵커를 5분 tick 전체로 유지하는 채로) 기존처럼 10~12개월을 통째로 쓰면 단일 머신
-# LightGBM이 감당 못 한다(history.md 18번 항목이 실제로 겪은 OOM과 같은 종류) — 우선
+# LightGBM이 감당 못 한다(history.md 18번 항목이 실제로 겪은 OOM과 같은 종류) — 기본값은
 # 한 달치(2025년 11월)로 좁혀서 데이터량을 원래 단일 horizon 챔피언과 비슷한 규모로
-# 되돌렸다. TRAIN_SAMPLE_FRAC 등(아래)과 별개로, 실제 학습 머신에서 더 긴 기간이
-# 가능하면 이 값부터 늘릴 것.
-TRAIN_START = "2025-11-01"
-TRAIN_END = "2025-11-20"
-VALID_START = "2025-11-21"
-VALID_END = "2025-11-25"
-TEST_START = "2025-11-26"
-TEST_END = "2025-11-30"
+# 되돌린 것이다. 실제 학습 머신(더 큰 RAM/EMR 등)에서 더 긴 기간이 가능하면 이 6개
+# 환경변수로 코드를 안 고치고 늘릴 수 있다 — TRAIN_SAMPLE_FRAC 등(아래)과 조합해서 씀.
+TRAIN_START = os.environ.get("TRAIN_START", "2025-11-01")
+TRAIN_END = os.environ.get("TRAIN_END", "2025-11-20")
+VALID_START = os.environ.get("VALID_START", "2025-11-21")
+VALID_END = os.environ.get("VALID_END", "2025-11-25")
+TEST_START = os.environ.get("TEST_START", "2025-11-26")
+TEST_END = os.environ.get("TEST_END", "2025-11-30")
 
 QUANTILE_ALPHAS = [0.1, 0.5, 0.9]
 
