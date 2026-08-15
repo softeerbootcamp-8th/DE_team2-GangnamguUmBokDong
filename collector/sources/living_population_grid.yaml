@@ -1,0 +1,48 @@
+source_id: living_population_grid
+description: 서울 생활인구(250m)
+
+adapter: seoul_openapi
+adapter_params:
+  service: SPOP_LOCAL_RESD_DONG
+  page_size: 1000
+  root_key: SPOP_LOCAL_RESD_DONG.row
+
+schedule:
+  interval: 1d
+
+storage:
+  bronze_format: json
+  silver_format: parquet
+  partition: [dt, hh]
+
+quality:
+  max_drop_ratio: 0.05
+  max_missing_ratio: 0.05
+  allow_empty: false
+
+backfill:
+  enabled: true
+  max_age: 7d
+
+policies:
+  required_missing: drop_row
+  required_outlier: drop_row
+  optional_missing: keep_null
+  optional_outlier: set_null
+
+columns:
+  STD_YMD:
+    types: [str]
+    required: true
+  ADSTRD_CODE_SE:
+    types: [str]
+    required: true
+  TOT_LVPOP_CO:
+    types: [float]
+    range: { min: 0, max: 10000000 }
+  MAN_LVPOP_CO:
+    types: [float]
+    range: { min: 0, max: 10000000 }
+  WMAN_LVPOP_CO:
+    types: [float]
+    range: { min: 0, max: 10000000 }
