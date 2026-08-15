@@ -74,6 +74,19 @@ class TestFilterGridRowsForHour:
         assert set(result.keys()) == {"다사53815262"}
         assert result["다사53815262"].spop == 30.0  # 마지막(TT=14) 중복 행이 남음
 
+    def test_null_spop_becomes_zero(self):
+        table = pa.table({
+            "CELL_ID": ["다사53815262"],
+            "TT": ["14"],
+            "H_DNG_CD": ["1100053"],
+            "SPOP": pa.array([None], type=pa.float64()),
+            **{c: [None] for c in main.merge.AGE_COLUMNS},
+        })
+
+        result = main._filter_grid_rows_for_hour(table, hour=14)
+
+        assert result["다사53815262"].spop == 0.0
+
     def test_null_ages_become_zero(self):
         table = pa.table({
             "CELL_ID": ["다사53815262"],
