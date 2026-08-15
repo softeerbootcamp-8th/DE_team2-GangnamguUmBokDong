@@ -12,12 +12,10 @@
 import pytest
 from shapely.geometry import box
 
-from grid import GRID_AREA_M2
 from merge import (
     FEMALE_AGE_COLUMNS,
     MALE_AGE_COLUMNS,
     GridCell,
-    MergedCell,
     PoiSnapshot,
     find_overlaps,
     merge_cell,

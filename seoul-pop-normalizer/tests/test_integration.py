@@ -18,6 +18,7 @@ import grid
 import main
 import merge
 import poi
+import storage
 from tests.conftest import KST, TEST_BUCKET
 
 # POI001("강남 MICE 관광특구")와 실제로 크게 겹치는 격자(약 97.9% 겹침, 이번 조사에서 확인).
@@ -140,5 +141,5 @@ class TestEndToEndRun:
     def test_run_raises_when_grid_partition_missing_in_strict_mode(self):
         _seed_realtime_silver()  # grid silver는 심지 않음
 
-        with pytest.raises(Exception):  # storage.PartitionNotFoundError
+        with pytest.raises(storage.PartitionNotFoundError):
             main.run(WINDOW_START, "strict")
