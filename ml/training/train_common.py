@@ -51,7 +51,10 @@ def load_training_table() -> pd.DataFrame:
             rental_exposure(대여 exposure offset) + date(`_split()` 경계 기준)
     """
     needed = sorted(set(FEATURE_COLUMNS) | {"rental_count", "return_count", "rental_exposure", "date"})
-    return s3_io.read_parquet(config.MULTI_HORIZON_FEATURES_TABLE_PARQUET, columns=needed)
+    df = s3_io.read_parquet(config.MULTI_HORIZON_FEATURES_TABLE_PARQUET, columns=needed)
+    if df is None:
+        raise FileNotFoundError(f"S3에 없음: {config.MULTI_HORIZON_FEATURES_TABLE_PARQUET}")
+    return df
 
 
 def _split(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:

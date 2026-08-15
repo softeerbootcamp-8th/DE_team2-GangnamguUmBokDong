@@ -58,6 +58,8 @@ def run_predict_cli(model_name: str, target_col: str, exposure_col: str | None, 
         raise SystemExit(f"--horizon은 1~{config.HORIZON_COUNT} 사이여야 합니다: {args.horizon}")
 
     df = s3_io.read_parquet(config.MULTI_HORIZON_FEATURES_TABLE_PARQUET)
+    if df is None:
+        raise FileNotFoundError(f"S3에 없음: {config.MULTI_HORIZON_FEATURES_TABLE_PARQUET}")
     df = df[(df["date"] >= args.start_date) & (df["date"] <= args.end_date) & (df["horizon"] == args.horizon)]
     if args.station_id:
         df = df[df["station_id"] == args.station_id]

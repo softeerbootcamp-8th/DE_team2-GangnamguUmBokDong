@@ -29,6 +29,8 @@ def build_station_profile() -> pd.DataFrame:
     df = s3_io.read_parquet(
         config.MERGED_TABLE_PARQUET, columns=["station_id", "date", "hour", "rental_count", "return_count"]
     )
+    if df is None:
+        raise FileNotFoundError(f"S3에 없음: {config.MERGED_TABLE_PARQUET}")
     dt = pd.to_datetime(df["date"])
     # .dt.dayofweek/.dt.month는 기본 int32를 낸다 — ml_common/model_contract.NATIVE_COLUMN_DTYPES와
     # 맞춰 int8로(둘 다 0~11 범위라 여유 있음).

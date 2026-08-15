@@ -95,7 +95,9 @@ def evaluate_recent_performance(
     lookback_months = lookback_months or config.MONITOR_LOOKBACK_MONTHS
     start, end = _recent_month_range(lookback_months, as_of)
 
-    df = pd.read_parquet(config.MULTI_HORIZON_FEATURES_TABLE_PARQUET)
+    df = s3_io.read_parquet(config.MULTI_HORIZON_FEATURES_TABLE_PARQUET)
+    if df is None:
+        raise FileNotFoundError(f"S3에 없음: {config.MULTI_HORIZON_FEATURES_TABLE_PARQUET}")
     df = df[(df["date"] >= start) & (df["date"] <= end) & (df["horizon"] == horizon)].reset_index(drop=True)
     if df.empty:
         raise ValueError(

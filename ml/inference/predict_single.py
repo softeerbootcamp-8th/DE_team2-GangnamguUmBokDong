@@ -443,7 +443,9 @@ def _get_station_profile() -> dict[tuple[str, int, int, int], dict[str, float]]:
     """
     global _station_profile
     if _station_profile is None:
-        df = pd.read_parquet(config.STATION_HOURLY_PROFILE_PARQUET)
+        df = s3_io.read_parquet(config.STATION_HOURLY_PROFILE_PARQUET)
+        if df is None:
+            raise FileNotFoundError(f"S3에 없음: {config.STATION_HOURLY_PROFILE_PARQUET}")
         _station_profile = {
             (r.station_id, r.hour, r.dow, r.month): {
                 "rental_mean": r.rental_mean,
@@ -483,7 +485,9 @@ def _get_population_profile() -> dict[tuple[str, int, int], dict[str, float]]:
     """
     global _population_profile
     if _population_profile is None:
-        df = pd.read_parquet(config.POPULATION_HOURLY_PROFILE_PARQUET)
+        df = s3_io.read_parquet(config.POPULATION_HOURLY_PROFILE_PARQUET)
+        if df is None:
+            raise FileNotFoundError(f"S3에 없음: {config.POPULATION_HOURLY_PROFILE_PARQUET}")
         _population_profile = {
             (r.grid_id, r.hour, r.dow): {
                 "pop_resd_mean": r.pop_resd_mean,
