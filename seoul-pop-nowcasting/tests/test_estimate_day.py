@@ -20,7 +20,7 @@ class TestBuildNowcastTable:
         result = estimate_day.build_nowcast_table([week1, week2, week3, week4])
 
         row = result.iloc[0]
-        assert row["SPOP"] == 100.0 * 0.4 + 200.0 * 0.3 + 300.0 * 0.2 + 400.0 * 0.1
+        assert row["SPOP"] == pytest.approx(100.0 * 0.4 + 200.0 * 0.3 + 300.0 * 0.2 + 400.0 * 0.1)
         assert row["is_estimated"] == True
         assert row["estimation_method"] == "weighted_avg"
 
@@ -57,7 +57,7 @@ class TestBuildNowcastTable:
         result = estimate_day.build_nowcast_table([week1, week2, week3, week4])
 
         row = result.iloc[0]
-        assert row["M00"] == 10.0 * 0.4 + 20.0 * 0.3 + 30.0 * 0.2 + 40.0 * 0.1
+        assert row["M00"] == pytest.approx(10.0 * 0.4 + 20.0 * 0.3 + 30.0 * 0.2 + 40.0 * 0.1)
 
 class TestHistoricalAverage:
     def test_averages_value_columns_grouped_by_key_across_all_frames(self):
@@ -126,5 +126,5 @@ class TestMultipleKeysEstimatedIndependently:
         result = estimate_day.build_nowcast_table([week1, week2, week3, week4])
 
         by_cell = result.set_index("CELL_ID")
-        assert by_cell.loc["C1", "SPOP"] == 100.0 * 0.4 + 200.0 * 0.3 + 300.0 * 0.2 + 400.0 * 0.1
-        assert by_cell.loc["C2", "SPOP"] == 500.0 * 0.4 + 600.0 * 0.3 + 700.0 * 0.2 + 800.0 * 0.1
+        assert by_cell.loc["C1", "SPOP"] == pytest.approx(100.0 * 0.4 + 200.0 * 0.3 + 300.0 * 0.2 + 400.0 * 0.1)
+        assert by_cell.loc["C2", "SPOP"] == pytest.approx(500.0 * 0.4 + 600.0 * 0.3 + 700.0 * 0.2 + 800.0 * 0.1)

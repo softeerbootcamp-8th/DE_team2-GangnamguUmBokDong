@@ -25,11 +25,14 @@ def _read_archive_as_frame(target_date: date):
 
 
 def run_estimate(today: date) -> int:
-    d4 = today - timedelta(days=4)
-    real = storage.read_real_grid_silver(d4)
+    # collector의 dt= 파티션은 "수집 실행일"이지 데이터가 가리키는 실제 날짜가
+    # 아니다(예: dt=2026-08-15 안의 YMD가 20260811). 오늘자 파티션을 읽고,
+    # 그 안의 YMD로 실제 대상(biz) 날짜를 알아내 그 날짜로 archive에 적재한다.
+    real = storage.read_real_grid_silver(today)
     if real is not None:
-        storage.write_archive(d4, backfill.add_estimation_columns(real))
-        storage.delete_nowcast(d4)
+        for biz_date, day_table in backfill.group_rows_by_date(real).items():
+            storage.write_archive(biz_date, backfill.add_estimation_columns(day_table))
+            storage.delete_nowcast(biz_date)
 
     for offset in range(-3, 4):
         target = today + timedelta(days=offset)

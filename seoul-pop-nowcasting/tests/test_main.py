@@ -33,23 +33,33 @@ def _key_exists(key: str) -> bool:
 
 
 class TestRunEstimateArchivesD4Data:
-    def test_archives_real_d4_data_and_cleans_up_old_nowcast(self):
+    def test_archives_real_data_from_todays_partition_using_actual_ymd(self):
         today = date(2026, 8, 20)
-        d4 = today - timedelta(days=4)  # 2026-08-16
+        # collector의 dt= 파티션은 "수집 실행일"이다. 실제 대상(biz) 날짜는
+        # 그 안의 YMD 컬럼 값으로만 알 수 있다(예: 오늘 실행분의 YMD가 D-4).
+        biz_date = today - timedelta(days=4)  # 2026-08-16
 
         _put_parquet(
-            f"silver/living_population_grid/dt={d4:%Y-%m-%d}/hh=00/0000.parquet",
-            pa.table({"H_DNG_CD": ["H1"], "CELL_ID": ["C1"], "TT": ["10"], "SPOP": [123.0]}),
+            f"silver/living_population_grid/dt={today:%Y-%m-%d}/hh=00/0000.parquet",
+            pa.table(
+                {
+                    "YMD": [f"{biz_date:%Y%m%d}"],
+                    "H_DNG_CD": ["H1"],
+                    "CELL_ID": ["C1"],
+                    "TT": ["10"],
+                    "SPOP": [123.0],
+                }
+            ),
         )
         # 예전에 이 날짜를 추정치로 채워뒀던 잔재
-        storage.write_nowcast(d4, pa.table({"CELL_ID": ["C1"], "SPOP": [999.0]}))
+        storage.write_nowcast(biz_date, pa.table({"CELL_ID": ["C1"], "SPOP": [999.0]}))
 
         main.run_estimate(today)
 
-        archived = storage.read_archive(d4)
+        archived = storage.read_archive(biz_date)
         assert archived is not None
         assert archived.column("is_estimated").to_pylist() == [False]
-        assert storage.nowcast_exists(d4) is False
+        assert storage.nowcast_exists(biz_date) is False
 
 
 class TestRunEstimateWritesNowcast:
