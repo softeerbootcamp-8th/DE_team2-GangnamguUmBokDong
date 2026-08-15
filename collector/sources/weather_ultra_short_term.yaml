@@ -1,0 +1,49 @@
+source_id: weather_ultra_short_term
+description: 기상청 초단기 실황·예보
+
+adapter: kma_apihub
+adapter_params:
+  endpoint: getUltraSrtNcst
+  root_key: response.body.items.item
+  pivot: { key: category, value: obsrValue }
+  grids: [[60, 127], [61, 127], [61, 126]]
+
+schedule:
+  interval: 10m
+
+storage:
+  bronze_format: json
+  silver_format: parquet
+  partition: [dt, hh]
+
+quality:
+  max_drop_ratio: 0.05
+  max_missing_ratio: 0.1
+  allow_empty: false
+
+backfill:
+  enabled: true
+  max_age: 6h
+
+policies:
+  required_missing: drop_row
+  required_outlier: drop_row
+  optional_missing: keep_null
+  optional_outlier: set_null
+
+columns:
+  T1H:
+    types: [float]
+    range: { min: -50, max: 50 }
+  REH:
+    types: [float]
+    range: { min: 0, max: 100 }
+  WSD:
+    types: [float]
+    range: { min: 0, max: 50 }
+  RN1:
+    types: [float]
+    range: { min: 0, max: 500 }
+  PTY:
+    types: [int]
+    enum: [0, 1, 2, 3, 5, 6, 7]
