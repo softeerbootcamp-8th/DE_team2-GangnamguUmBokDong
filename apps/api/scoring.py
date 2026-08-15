@@ -1,21 +1,12 @@
 import math
 from datetime import datetime
 
-# 우선순위 점수 계산용 임계값. 실측치가 나오면 팀 확인 후 확정해야 한다.
-RESPONSE_LAG_MIN = 30  # 트럭 출동~도착 소요시간
-HALF_LIFE_MIN = 60  # 대응 여유시간이 이만큼 늘어날 때마다 시급성 점수가 절반이 됨
-FIRST_FORECAST_MIN = 60  # 예측 데이터는 1시간 뒤부터만 존재(그 이전은 추세로 메꿈)
-
-# 심각도(정원 대비 초과/부족량 비율 -> 0~1) 변환 곡선의 스케일. 비율이 이 값만큼
-# 쌓일 때마다 남은 여유가 지수적으로 줄어든다(1 - e^(-ratio/SEVERITY_SCALE)).
-# 실측 데이터(서울 전역 2,746곳)로 몇 가지 값을 대입해보고, 비율 1(정원만큼
-# 초과/부족)이 40점대, 비율 4 이상(정원의 4배 이상)이 90점대로 나오는 이 값을
-# 골랐다. 고정 배수에서 상한을 자르는 클램프 대신 점근 곡선을 쓴 이유는, 클램프를
-# 쓰면 특정 배수를 넘는 순간부터 아무리 더 심해져도 점수가 그대로라 실측에서
-# 회수필요 대여소의 35%가 똑같이 100점에 뭉쳐 있었기 때문이다(정원 2배 초과 =
-# 클램프 상한). 점근 곡선은 상한이 없어서 극단치(실측 최대 22배)끼리도 계속
-# 구분된다.
-SEVERITY_SCALE = 1.5
+from scoring_config import (
+    FIRST_FORECAST_MIN,
+    HALF_LIFE_MIN,
+    RESPONSE_LAG_MIN,
+    SEVERITY_SCALE,
+)
 
 
 def enrich_forecast_points(current_stock: int, hold_cnt: int, raw_points: list[dict]) -> list[dict]:
