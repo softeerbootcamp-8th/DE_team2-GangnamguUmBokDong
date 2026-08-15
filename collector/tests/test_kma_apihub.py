@@ -239,6 +239,7 @@ def test_normalize_tolerates_grid_missing_from_chunk_list():
     assert rows == [{"baseDate": "20260812", "baseTime": "1400", "nx": 60, "ny": 127, "T1H": "31.6"}]
 
 
+
 def test_classify_result_code():
     assert _classify_result_code("00") is None
     assert _classify_result_code("03") is FetchErrorKind.TRANSIENT
