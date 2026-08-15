@@ -95,7 +95,47 @@ class SeoulOpenApiAdapter:
         page_size = params["page_size"]
 
         # . 기준으로 문자열을 쪼개서 앞부분만 떼어낸다.
-        wrapper_key = params["root_key"].split(".", 1)[0]
+        # "SeoulRtd.citydata_ppltn" 처럼 마침표가 포함된 단일 키가 응답의 최상단에 존재할 수 있다.
+        if params["root_key"] in {"SeoulRtd.citydata_ppltn"}:
+            wrapper_key = params["root_key"]
+        else:
+            wrapper_key = params["root_key"].split(".", 1)[0]
+        
+        path_suffix_template = params.get("path_suffix", "")
+        suffix = ""
+        if path_suffix_template:
+            suffix = path_suffix_template.format(window_start=window.window_start)
+        # citydata_ppltn은 페이지네이션 대신 POI001~POI116 순회
+        if service == "citydata_ppltn":
+            expected = 116
+            for i in range(1, expected + 1):
+                poi_id = f"POI{i:03d}"
+                key = f"poi-{poi_id}"
+                
+                if key in skip:
+                    continue
+                
+                url = f"{_BASE_URL}/{_api_key()}/json/{service}/1/5/{poi_id}/"
+                try:
+                    response = client.get(url)
+                    response.raise_for_status()
+                    body = json.loads(response.content)
+                    wrapper = _extract(body, wrapper_key)
+                except (httpx.RequestError, httpx.HTTPStatusError, json.JSONDecodeError):
+                    yield FetchResult(key=key, payload=None, error=FetchErrorKind.TRANSIENT, expected_total=expected if i == 1 else None)
+                    continue
+
+                code = body.get("RESULT.CODE") or body.get("RESULT", {}).get("RESULT.CODE")
+                category = _classify(code)
+
+                if category is None:
+                    yield FetchResult(key=key, payload=response.content, error=None, expected_total=expected if i == 1 else None)
+                elif category is FetchErrorKind.FATAL:
+                    yield FetchResult(key=key, payload=None, error=category, expected_total=expected if i == 1 else None)
+                    return
+                else:
+                    yield FetchResult(key=key, payload=None, error=category, expected_total=expected if i == 1 else None)
+            return
 
         # total을 모르면 몇 페이지를 더 돌아야 하는지 알 수 없다.
         # expected_total로 이미 받았으면(라운드 재시도·백필) 그 값을 그대로 쓴다.
@@ -117,7 +157,7 @@ class SeoulOpenApiAdapter:
                 page_start = page_end + 1
                 continue
 
-            url = f"{_BASE_URL}/{_api_key()}/json/{service}/{page_start}/{page_end}/"
+            url = f"{_BASE_URL}/{_api_key()}/json/{service}/{page_start}/{page_end}{suffix}/"
             try:
                 response = client.get(url)
                 response.raise_for_status()
@@ -140,7 +180,7 @@ class SeoulOpenApiAdapter:
                 if total is None:
                     # list_total_count는 첫 응답에만 실려 오기 때문에 
                     # 여기서 이 값을 한 번 잡아야 남은 페이지 수를 계산할 수 있다.
-                    total = wrapper.get("list_total_count")
+                    total = int(wrapper.get("list_total_count", 0))
                 yield FetchResult(
                     key=key, payload=response.content, error=None,
                     # expected_total은 pipeline이 기억해뒀다가 다음 라운드·백필에 되돌려주는 값이므로, 
@@ -169,7 +209,11 @@ class SeoulOpenApiAdapter:
         네트워크를 타지 않는 순수 함수이다. bronze에서 다시 읽어 언제든 재호출된다.
         """
         root_key = config.adapter_params["root_key"]
-        wrapper_key, _, row_path = root_key.partition(".")
+        if root_key in {"SeoulRtd.citydata_ppltn"}:
+            wrapper_key = root_key
+            row_path = ""
+        else:
+            wrapper_key, _, row_path = root_key.partition(".")
 
         rows: list[dict] = []
         for chunk in chunks:

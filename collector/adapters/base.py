@@ -169,6 +169,19 @@ def adapter_names() -> tuple[str, ...]:
     return tuple(sorted(_ADAPTERS))
 
 
+def classify_http_status(status_code: int) -> FetchErrorKind | None:
+    """HTTP 상태 코드를 실패 범주로 매핑한다. `None`은 성공(2xx)이다.
+    HTTP 상태만으로 성공/실패를 가르는 제공처가 공유하는 규칙이다.
+    """
+    if 200 <= status_code < 300:
+        return None
+    if status_code in (401, 403):
+        return FetchErrorKind.FATAL
+    if status_code == 429 or status_code >= 500:
+        return FetchErrorKind.TRANSIENT
+    return FetchErrorKind.PERMANENT
+
+
 @dataclass(frozen=True, slots=True)
 class FetchRoundResult:
     """라운드 오케스트레이션의 최종 결과."""

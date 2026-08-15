@@ -1,0 +1,51 @@
+source_id: bike_station_realtime
+description: 따릉이 실시간 대여정보
+
+adapter: seoul_openapi
+adapter_params:
+  service: bikeList
+  page_size: 1000
+  root_key: rentBikeStatus.row
+
+schedule:
+  interval: 5m
+
+storage:
+  bronze_format: json
+  silver_format: parquet
+  partition: [dt, hh]
+
+quality:
+  max_drop_ratio: 0.05
+  max_missing_ratio: 0.0
+  allow_empty: false
+
+policies:
+  required_missing: drop_row
+  required_outlier: drop_row
+  optional_missing: keep_null
+  optional_outlier: set_null
+
+columns:
+  stationId:
+    types: [str]
+    required: true
+  stationName:
+    types: [str]
+    required: true
+  rackTotCnt:
+    types: [int]
+    range: { min: 0, max: 200 }
+  parkingBikeTotCnt:
+    types: [int]
+    range: { min: 0, max: 200 }
+    on_outlier: clip_to_range
+  shared:
+    types: [int]
+    range: { min: 0, max: 1000 }
+  stationLatitude:
+    types: [float]
+    range: { min: 37.4, max: 37.7 }
+  stationLongitude:
+    types: [float]
+    range: { min: 126.7, max: 127.2 }
