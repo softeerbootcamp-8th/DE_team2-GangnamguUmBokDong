@@ -9,7 +9,6 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pyarrow as pa
-import pyarrow.csv as pa_csv
 
 _KST = ZoneInfo("Asia/Seoul")
 
@@ -62,13 +61,9 @@ def run_estimate(today: date) -> int:
     return 0
 
 
-_ID_COLUMNS = ("YMD", "TT", "H_DNG_CD", "CELL_ID")
-
-
 def run_backfill_archive(csv_dir: str) -> int:
-    convert_options = pa_csv.ConvertOptions(column_types={col: pa.string() for col in _ID_COLUMNS})
     for csv_path in sorted(Path(csv_dir).glob("*.csv")):
-        table = backfill.add_estimation_columns(pa_csv.read_csv(csv_path, convert_options=convert_options))
+        table = backfill.add_estimation_columns(backfill.read_source_csv(csv_path))
         for target_date, day_table in backfill.group_rows_by_date(table).items():
             storage.write_archive(target_date, day_table)
     return 0

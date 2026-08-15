@@ -97,14 +97,32 @@ class TestRunEstimateWritesNowcast:
         assert _key_exists(key) is False
 
 
+_PORTAL_HEADER = (
+    '"일자","시간","행정동코드","250M격자","생활인구합계","남자 0~9세","남자 10~14세",'
+    '"남자 15~19세","남자 20~24세","남자 25~29세","남자 30~34세","남자 35~39세",'
+    '"남자 40~44세","남자 45~49세","남자 50~54세","남자 55~59세","남자 60~64세",'
+    '"남자 65~69세","남자 70세 이상","여자 0~9세","여자 10~14세","여자 15~19세",'
+    '"여자 20~24세","여자 25~29세","여자 30~34세","여자 35~39세","여자 40~44세",'
+    '"여자 45~49세","여자 50~54세","여자 55~59세","여자 60~64세","여자 65~69세",'
+    '"여자 70세 이상"'
+)
+
+
+def _portal_row(ymd: str, cell_id: str, spop: str) -> str:
+    return f'"{ymd}","10","1100053","{cell_id}","{spop}"' + ',"*"' * 28
+
+
 class TestRunBackfillArchive:
-    def test_reads_csv_and_writes_one_archive_file_per_date(self, tmp_path):
-        csv_path = tmp_path / "sample.csv"
-        csv_path.write_text(
-            "YMD,TT,H_DNG_CD,CELL_ID,SPOP\n"
-            "20260810,10,H1,C1,111.0\n"
-            "20260811,10,H1,C1,222.0\n"
+    def test_reads_real_portal_csv_and_writes_one_archive_file_per_date(self, tmp_path):
+        csv_path = tmp_path / "250_LOCAL_RESD_sample.csv"
+        content = "\n".join(
+            [
+                _PORTAL_HEADER,
+                _portal_row("20260810", "C1", "111.0"),
+                _portal_row("20260811", "C1", "222.0"),
+            ]
         )
+        csv_path.write_bytes((content + "\n").encode("euc-kr"))
 
         main.run_backfill_archive(str(tmp_path))
 

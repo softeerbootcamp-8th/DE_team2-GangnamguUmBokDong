@@ -41,3 +41,6 @@ airflow/standalone_admin_password.txt
 docs/superpowers/
 .claude/
 .superpowers/
+
+# Data
+seoul-pop-nowcasting/data/
