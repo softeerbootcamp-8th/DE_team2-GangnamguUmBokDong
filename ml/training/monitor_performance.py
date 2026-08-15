@@ -165,7 +165,21 @@ def check_all_models(as_of: date | None = None, horizon: int = 1) -> list[dict]:
 
 
 if __name__ == "__main__":
-    results = check_all_models()
+    import argparse
+
+    parser = argparse.ArgumentParser(description="월별 챔피언 모델 성능 점검 (baseline 대비 상대 악화율)")
+    parser.add_argument(
+        "--as-of", default=None,
+        help="YYYY-MM-DD, 기준 날짜(기본값: 오늘) — 미지정 시 실제 배포 환경에서는 항상 실행 시점의 "
+             "'지난달'을 본다. 로컬 검증처럼 시스템 시계와 보유 데이터 기간이 다른 경우(예: 이 저장소의 "
+             "샘플 데이터는 2025년뿐인데 시스템 날짜는 그 이후) 반드시 지정할 것 — 안 그러면 데이터가 "
+             "없는 기간을 조회해 ValueError가 난다.",
+    )
+    parser.add_argument("--horizon", type=int, default=1, help="점검할 horizon(1~HORIZON_COUNT), 기본값 1")
+    args = parser.parse_args()
+    as_of = date.fromisoformat(args.as_of) if args.as_of else None
+
+    results = check_all_models(as_of=as_of, horizon=args.horizon)
     for r in results:
         status = "재학습 필요" if r["needs_retrain"] else "정상"
         print(f"[{r['model_name']}] {status} — {r['period']['start']}~{r['period']['end']} ({r['n_rows']:,}행)")
