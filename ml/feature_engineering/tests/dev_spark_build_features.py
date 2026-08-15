@@ -6,8 +6,6 @@
 구멍 근처에서 "24시간 전"이 실제로는 27시간 전 값을 가져오는 조용한 버그가 된다.
 """
 
-import os
-
 import pandas as pd
 import pytest
 from ml_common.rolling_window_features import censored_rolling_counts
@@ -16,29 +14,6 @@ pyspark = pytest.importorskip("pyspark")
 
 from feature_engineering.spark import config as fe_config
 from feature_engineering.spark.build_features import build_features
-
-
-@pytest.fixture(scope="module")
-def spark():
-    import sys
-
-    from pyspark.sql import SparkSession
-
-    os.environ.setdefault("PYSPARK_PYTHON", sys.executable)
-    os.environ.setdefault("PYSPARK_DRIVER_PYTHON", sys.executable)
-    # timestamp_ntz/timestamp(tz-aware) 왕복 어긋남 방지 — feature_engineering/spark_session.py 참고.
-    os.environ.setdefault("TZ", "Asia/Seoul")
-
-    session = (
-        SparkSession.builder.master("local[2]")
-        .appName("test-feature-engineering-build-features")
-        .config("spark.sql.shuffle.partitions", "2")
-        .config("spark.ui.enabled", "false")
-        .config("spark.sql.session.timeZone", "Asia/Seoul")
-        .getOrCreate()
-    )
-    yield session
-    session.stop()
 
 
 def _write_rolling_parquet(tmp_path, trips: list[dict]) -> str:
