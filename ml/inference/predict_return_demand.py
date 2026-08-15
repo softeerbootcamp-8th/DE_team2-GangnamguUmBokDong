@@ -3,7 +3,7 @@
 from . import config
 from .predict_common import run_predict_cli
 
-OUTPUT_PARQUET = config.PROCESSED_V2_DIR / "predictions_return_test.parquet"
+OUTPUT_PARQUET = f"{config.PROCESSED_V2_PREFIX}/predictions_return_test.parquet"
 
 
 def main():

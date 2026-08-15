@@ -14,6 +14,7 @@ station x hour x dow x month로 묶으면 표본이 그 달에 그 요일이 나
 """
 
 import pandas as pd
+from ml_common import s3_io
 
 from . import config
 
@@ -25,7 +26,7 @@ def build_station_profile() -> pd.DataFrame:
         pd.DataFrame: station_id, hour, dow, month, rental_mean, rental_std,
             return_mean, return_std, n_samples
     """
-    df = pd.read_parquet(
+    df = s3_io.read_parquet(
         config.MERGED_TABLE_PARQUET, columns=["station_id", "date", "hour", "rental_count", "return_count"]
     )
     dt = pd.to_datetime(df["date"])
@@ -53,8 +54,7 @@ def build_station_profile() -> pd.DataFrame:
     profile[mean_std_cols] = profile[mean_std_cols].astype("float32")
     profile["n_samples"] = profile["n_samples"].astype("int32")
 
-    config.PROCESSED_V2_DIR.mkdir(parents=True, exist_ok=True)
-    profile.to_parquet(config.STATION_HOURLY_PROFILE_PARQUET, index=False)
+    s3_io.write_parquet(profile, config.STATION_HOURLY_PROFILE_PARQUET)
     print(
         f"station_hourly_profile: {profile.shape[0]:,}행 "
         f"({df['station_id'].nunique()}개 정류소 x 24시간 x 7요일 x 12개월), "

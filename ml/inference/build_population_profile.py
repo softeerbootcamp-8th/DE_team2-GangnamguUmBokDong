@@ -14,6 +14,7 @@ grid_id x hour x dow만으로도 격자당 표본이 연간 약 52개(그 요일
 """
 
 import pandas as pd
+from ml_common import s3_io
 
 from . import config
 
@@ -25,7 +26,7 @@ def build_population_profile() -> pd.DataFrame:
         pd.DataFrame: grid_id, hour, dow, pop_resd_mean, pop_long_foreign_mean,
             pop_short_foreign_mean, pop_total_mean, n_samples
     """
-    df = pd.read_parquet(config.POPULATION_PARQUET)
+    df = s3_io.read_parquet(config.POPULATION_PARQUET)
     # .dt.dayofweek/.dt.hour는 기본 int32를 낸다 — ml_common/model_contract.NATIVE_COLUMN_DTYPES와
     # 맞춰 int8로.
     df["dow"] = df["hour_ts"].dt.dayofweek.astype("int8")
@@ -45,8 +46,7 @@ def build_population_profile() -> pd.DataFrame:
     profile[mean_cols] = profile[mean_cols].astype("float32")
     profile["n_samples"] = profile["n_samples"].astype("int32")
 
-    config.PROCESSED_V2_DIR.mkdir(parents=True, exist_ok=True)
-    profile.to_parquet(config.POPULATION_HOURLY_PROFILE_PARQUET, index=False)
+    s3_io.write_parquet(profile, config.POPULATION_HOURLY_PROFILE_PARQUET)
     print(
         f"population_hourly_profile: {profile.shape[0]:,}행 "
         f"({df['grid_id'].nunique()}개 격자 x 24시간 x 7요일), "

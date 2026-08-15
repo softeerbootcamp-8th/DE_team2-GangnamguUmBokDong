@@ -1,22 +1,22 @@
 """training(LightGBM 학습) 전용 경로·상수.
 
-`feature_engineering`이 만든 multi-horizon feature 테이블을 읽어(`MULTI_HORIZON_FEATURES_TABLE_PARQUET`,
-`ml_common/`에서 공유) `MODELS_DIR`(이 폴더 아래 `models/`)에 학습 결과를 저장한다.
-`inference`도 같은 `MODELS_DIR`을 읽어야 하므로 그 경로 자체는 `ml_common/paths.py`가 소유하고
-(로컬 개발 시 기본값이 `training/models/`), 여기서는 학습에만 쓰는 값(split 기간,
-quantile 목록 등)을 정의한다.
+`feature_engineering`이 만든 multi-horizon feature 테이블을 S3에서 읽어
+(`MULTI_HORIZON_FEATURES_TABLE_PARQUET`, `ml_common/`에서 공유) `MODELS_PREFIX`
+(S3 키 prefix, `models/`)에 학습 결과를 저장한다. `inference`도 같은
+`MODELS_PREFIX`를 읽어야 하므로 그 값 자체는 `ml_common/paths.py`가 소유하고,
+여기서는 학습에만 쓰는 값(split 기간, quantile 목록 등)을 정의한다.
 """
 
 import os
 
 from ml_common import common_config
 from ml_common.paths import (
-    MODELS_DIR,
+    MODELS_PREFIX,
     MULTI_HORIZON_FEATURES_TABLE_PARQUET,
-    PROCESSED_V2_DIR,
+    PROCESSED_V2_PREFIX,
 )
 
-__all__ = ["MODELS_DIR", "MULTI_HORIZON_FEATURES_TABLE_PARQUET", "PROCESSED_V2_DIR"]
+__all__ = ["MODELS_PREFIX", "MULTI_HORIZON_FEATURES_TABLE_PARQUET", "PROCESSED_V2_PREFIX"]
 
 # --- 학습/검증/평가 기간 (시간 순 split, walk-forward) ---
 # multi-horizon 테이블은 원본 feature 테이블의 최대 HORIZON_COUNT(기본 12)배 행 수라

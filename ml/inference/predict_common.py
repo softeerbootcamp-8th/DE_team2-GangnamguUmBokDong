@@ -14,22 +14,22 @@
 """
 
 import argparse
-from pathlib import Path
 
 import pandas as pd
+from ml_common import s3_io
 from ml_common.scoring import predict, print_metrics
 
 from . import config
 
 
-def run_predict_cli(model_name: str, target_col: str, exposure_col: str | None, default_output: Path) -> pd.DataFrame:
+def run_predict_cli(model_name: str, target_col: str, exposure_col: str | None, default_output: str) -> pd.DataFrame:
     """station_id/기간/horizon을 골라 예측하는 CLI 진입점. 두 predict_*.py가 공유한다.
 
     args:
         model_name: "rental" 또는 "return"
         target_col: "rental_count" 또는 "return_count" (actual 비교용)
         exposure_col: predict()에 그대로 전달할 exposure 컬럼명
-        default_output: --out 미지정시 저장할 parquet 경로
+        default_output: --out 미지정시 저장할 parquet S3 키
     returns:
         pd.DataFrame: predict() 결과에 "actual" 컬럼을 추가한 DataFrame
     """
@@ -49,7 +49,7 @@ def run_predict_cli(model_name: str, target_col: str, exposure_col: str | None, 
         "챔피언과 동일한 조회 범위). multi-horizon 테이블엔 horizon별 행이 섞여 있어 "
         "반드시 하나로 골라야 한다.",
     )
-    parser.add_argument("--out", default=None, help="결과 저장 경로(parquet). 미지정시 기본 경로")
+    parser.add_argument("--out", default=None, help="결과 저장 S3 키(parquet). 미지정시 기본 경로")
     args = parser.parse_args()
 
     if args.station_id and args.station_ids:
@@ -57,7 +57,7 @@ def run_predict_cli(model_name: str, target_col: str, exposure_col: str | None, 
     if not (1 <= args.horizon <= config.HORIZON_COUNT):
         raise SystemExit(f"--horizon은 1~{config.HORIZON_COUNT} 사이여야 합니다: {args.horizon}")
 
-    df = pd.read_parquet(config.MULTI_HORIZON_FEATURES_TABLE_PARQUET)
+    df = s3_io.read_parquet(config.MULTI_HORIZON_FEATURES_TABLE_PARQUET)
     df = df[(df["date"] >= args.start_date) & (df["date"] <= args.end_date) & (df["horizon"] == args.horizon)]
     if args.station_id:
         df = df[df["station_id"] == args.station_id]
@@ -83,8 +83,8 @@ def run_predict_cli(model_name: str, target_col: str, exposure_col: str | None, 
     preds = predict(df, model_name, exposure_col=exposure_col)
     preds["actual"] = df[target_col].to_numpy()
 
-    out_path = Path(args.out) if args.out else default_output
-    preds.to_parquet(out_path, index=False)
+    out_path = args.out if args.out else default_output
+    s3_io.write_parquet(preds, out_path)
     print(f"예측 {len(preds):,}행 -> {out_path}")
 
     if len(preds) <= 48:
