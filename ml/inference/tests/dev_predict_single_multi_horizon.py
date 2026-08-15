@@ -263,3 +263,26 @@ def test_predict_demand_multi_hour_all_stations_weather_array_and_shared_lag(mon
     assert by_horizon[2]["rental"]["pred_mean"] == pytest.approx(22.0)
     # station당 lag/rolling을 한 번만 계산하므로 두 horizon의 fallback 상태가 같아야 한다.
     assert by_horizon[1]["rental"]["lag_fallback_used"] == by_horizon[2]["rental"]["lag_fallback_used"]
+
+
+def test_predict_demand_multi_hour_all_stations_partial_failure_reports_failed_and_counts(monkeypatch):
+    """station "B"는 station_master에 없어 lag/rolling 계산 단계에서 예외가 나야 한다 —
+    그래도 station "A"의 예측은 정상 반환되고, "B"는 전체 horizon이 통째로 "failed"에
+    쌓이며 actual_count가 expected_count보다 작아져야 한다(부분실패 계약)."""
+    _setup_common("A")
+    monkeypatch.setattr(ps, "predict", _fake_predict_echo_temp)
+
+    outcome = ps.predict_demand_multi_hour_all_stations(
+        date="2025-06-10", hour=8, temp=[11.0, 22.0], precip=0.0, wind=1.0, humidity=50.0,
+        station_ids=["A", "B"], n_hours=2,
+    )
+
+    assert outcome["expected_count"] == 4  # 2 station * 2 horizon
+    assert outcome["actual_count"] == 2  # "B"의 horizon 2개가 통째로 빠짐
+    assert [r["station_id"] for r in outcome["results"]] == ["A", "A"]
+
+    assert len(outcome["failed"]) == 1
+    failure = outcome["failed"][0]
+    assert failure["station_id"] == "B"
+    assert failure["n_hours_skipped"] == 2
+    assert "ValueError" in failure["error"]

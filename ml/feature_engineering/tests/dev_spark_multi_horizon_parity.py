@@ -6,8 +6,6 @@ lag/rolling(anchor 쪽)은 그대로, 날씨/캘린더/타겟(target 쪽)만 (k-
 한다. target_ts가 그리드 밖(예: 마지막 몇 시간)이면 그 (anchor, horizon) 조합은 빠져야 한다.
 """
 
-import os
-
 import pandas as pd
 import pytest
 from ml_common.model_contract import LAG_ROLLING_FEATURE_COLUMNS
@@ -18,28 +16,6 @@ from feature_engineering.spark import config as fe_config
 from feature_engineering.spark.build_multi_horizon_features import (
     build_multi_horizon_features,
 )
-
-
-@pytest.fixture(scope="module")
-def spark():
-    import sys
-
-    from pyspark.sql import SparkSession
-
-    os.environ.setdefault("PYSPARK_PYTHON", sys.executable)
-    os.environ.setdefault("PYSPARK_DRIVER_PYTHON", sys.executable)
-    os.environ.setdefault("TZ", "Asia/Seoul")
-
-    session = (
-        SparkSession.builder.master("local[2]")
-        .appName("test-feature-engineering-multi-horizon")
-        .config("spark.sql.shuffle.partitions", "2")
-        .config("spark.ui.enabled", "false")
-        .config("spark.sql.session.timeZone", "Asia/Seoul")
-        .getOrCreate()
-    )
-    yield session
-    session.stop()
 
 
 def _synthetic_features_table(n_hours: int = 20) -> pd.DataFrame:
