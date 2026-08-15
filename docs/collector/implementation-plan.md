@@ -72,7 +72,7 @@ fetch ─┼─ 호출 2 → 응답 도착 ─→ bronze/…/1410/part=001.json.
 | bronze 완결 판정 | `stage`는 **실행 진행도**만 뜻한다. 조각이 다 모였는지는 `completeness` · `missing`이 표현한다 |
 | 조각 실패 재시도 | 즉시 중단하지 않고 실패분을 모아 **최대 3라운드** 재시도 (라운드 간 15s → 30s 대기) |
 | 실패 분류 | `TRANSIENT`(재투입) · `PERMANENT`(그 조각만 포기) · `FATAL`(fetch 즉시 중단) |
-| fetch 안전장치 | `fetch_budget`(window 단위 시간 예산) · 서킷브레이커(연속 5회 실패) |
+| fetch 안전장치 | `fetch_budget`(window 단위 시간 예산) |
 | fetch 부분 실패 | 라운드 후에도 남은 누락은 **기록하고 진행한다.** `max_missing_ratio` 게이트가 판정 |
 | silver 저장 시점 | **window 전체를 모아 배치로 1회.** Parquet 파일 1개 |
 | 게이트 2종 | 수집(`max_missing_ratio`)과 폐기(`max_drop_ratio`)는 **독립.** `drop_ratio` 분모는 `fetched` |
@@ -309,7 +309,7 @@ columns:
 
 `backfill.enabled`가 소스마다 다른 이유는 [8절](#8-부분-실패와-백필)에 있다. 시간 파라미터가 없는 API는 나중에 호출하면 그때 시점 데이터가 오므로 채워 넣을 수 없다.
 
-라운드 수 · 라운드 간 대기 · 서킷브레이커 임계는 **config에 노출하지 않는다.** 소스별로 다를 이유가 없고, 설정 키를 늘리면 소스 YAML 7개에 그대로 곱해진다. `adapters/base.py` 상수로 두고 필요해지면 그때 연다.
+라운드 수 · 라운드 간 대기는 **config에 노출하지 않는다.** 소스별로 다를 이유가 없고, 설정 키를 늘리면 소스 YAML 7개에 그대로 곱해진다. `adapters/base.py` 상수로 두고 필요해지면 그때 연다.
 
 `loader.py`는 로드 시점에 다음을 수행한다.
 
@@ -444,7 +444,7 @@ def drop_if_issue_count_exceeds(
 
 **`fetched` 단계는 두지 않는다.** 조각을 도착 즉시 저장하므로 실행이 `fetch₁ → save₁ → fetch₂ → save₂ → …`로 흐르고, 마지막 조각을 저장한 순간 두 상태가 동시에 달성된다. 도달할 수 없는 중간 단계를 어휘에 남기지 않는다.
 
-**`stage`는 실행이 어디까지 갔는지만 뜻한다.** 조각이 다 모였는지는 `completeness` · `missing`이 따로 표현하므로, `stage=completed`이면서 불완전한 window가 존재한다. `bronze_written`은 이제 "계획한 조각을 전부 받았다"가 아니라 "이번 실행이 fetch 단계를 마쳤다"는 뜻이고, 마쳤다는 판정에는 라운드 소진 · 예산 초과 · 서킷브레이커가 모두 포함된다.
+**`stage`는 실행이 어디까지 갔는지만 뜻한다.** 조각이 다 모였는지는 `completeness` · `missing`이 따로 표현하므로, `stage=completed`이면서 불완전한 window가 존재한다. `bronze_written`은 이제 "계획한 조각을 전부 받았다"가 아니라 "이번 실행이 fetch 단계를 마쳤다"는 뜻이고, 마쳤다는 판정에는 라운드 소진 · 예산 초과가 모두 포함된다.
 
 `FailureReason`(선택, `FAILED`일 때만): 재시도가 의미 있는 실패인지 구분한다.
 
@@ -462,8 +462,8 @@ def drop_if_issue_count_exceeds(
 ```json
 {
   "source_id": "bike_station_realtime",
-  "window_start": "2026-08-12T14:10:00Z",
-  "window_end":   "2026-08-12T14:15:00Z",
+  "window_start": "2026-08-12T14:10:00+09:00",
+  "window_end":   "2026-08-12T14:15:00+09:00",
   "status": "PARTIAL",
   "stage":  "completed",
   "failure_reason": null,
@@ -584,7 +584,7 @@ rows = adapter.normalize(chunks)                              # 항상 다시 �
 | 4 | `stage=completed` & 누락 존재 & `--backfill` | **`clear_bronze` 없이 누락 조각만 fetch → 기존 조각과 합쳐 전체 재처리 → silver 덮어쓰기, `revision` +1** |
 
 `stage`를 `bronze_written`으로 올리는 것은 **fetch 단계를 마친 뒤**다. 라운드를 소진했든
-예산이 끝났든 서킷브레이커가 걸렸든, 더 이상 호출하지 않기로 결정한 시점이다. 그 전에 죽으면
+예산이 끝났든, 더 이상 호출하지 않기로 결정한 시점이다. 그 전에 죽으면
 조각이 S3에 남아 있어도 미완결로 취급되고 재실행은 fetch부터 다시 한다. **조각 단위 재개는
 백필 모드에서만 한다.**
 
@@ -637,18 +637,17 @@ rows = adapter.normalize(chunks)                              # 항상 다시 �
 | `PERMANENT` | 400, 404 | X | 그 조각만 누락 확정 |
 | `FATAL` | 401·403, 서울 `INFO-100`(인증키 오류) | X | **fetch 전체 즉시 중단** |
 
-`FATAL`을 분리하는 이유는 **모든 조각이 같은 인증키를 쓰기 때문**이다. page 0이 401이면 나머지도 401이므로, 20개 조각 × 6회 = 120번을 부르고 아무것도 성공하지 못한다. 서킷브레이커가 결국 잡지만 원인이 확정적인데 기다릴 이유가 없다. `FATAL`은 게이트도 백필도 타지 않고 `failure_reason=fetch_error`로 즉시 끝난다 — 재시도도 백필도 무의미하고 키를 고쳐 `--force`로 재실행할 문제다.
+`FATAL`을 분리하는 이유는 **모든 조각이 같은 인증키를 쓰기 때문**이다. page 0이 401이면 나머지도 401이므로, 20개 조각 × 6회 = 120번을 부르고 아무것도 성공하지 못한다. 원인이 확정적인데 나머지를 다 불러볼 이유가 없다. `FATAL`은 게이트도 백필도 타지 않고 `failure_reason=fetch_error`로 즉시 끝난다 — 재시도도 백필도 무의미하고 키를 고쳐 `--force`로 재실행할 문제다.
 
 `PERMANENT`를 분리하는 이유는 확정된 실패를 세 라운드 반복하지 않기 위해서다.
 
 서울 API의 **`INFO-200`(해당 데이터 없음)은 빈 결과로 성공 처리한다.** 실패로 보면 정상 상황이 누락으로 집계되어 완결도가 왜곡된다.
 
-### 8.3 안전장치 셋
+### 8.3 안전장치 둘
 
 | 장치 | 값 | 초과 시 |
 | --- | --- | --- |
 | `fetch_budget` | `min(interval × 0.5, 30m)` 기본, 소스별 오버라이드 | 새 호출 중단(진행 중인 호출은 마무리) → 게이트 |
-| 서킷브레이커 | 연속 실패 5회 | 라운드를 더 돌지 않고 fetch 종료 → 게이트 |
 | 라운드 간 대기 | 15s → 30s | — |
 
 **`fetch_budget`은 window 하나의 fetch 단계 전체 예산이다.** 호출 하나의 응답 대기 상한(httpx timeout)과는 층이 다르다.
@@ -666,10 +665,6 @@ window (interval 5m)
 
 호출 단위 제한만으로는 전체 시간을 통제할 수 없다. 480페이지가 전부 타임아웃이면 호출당 10초씩 지켜도 480 × 10s × 2회 = 160분이 된다. 측정은 fetch 진입 시각부터이고 `normalize` 이후는 예산 밖이다(네트워크를 타지 않아 결정적이고, 프로세스 전체 상한은 Airflow 태스크 타임아웃이 담당한다). 판정은 **새 호출을 시작하기 직전에만** 하므로 진행 중인 호출은 끝까지 두고 거의 다 받은 응답을 버리지 않는다.
 
-**서킷브레이커를 비율이 아닌 연속 실패로 판정하는 이유**는 비율이 조각 수에 따라 의미가 달라지기 때문이다. 조각 3개짜리에서 1개 실패는 33%라 정상 상황에 발동하고, 480개짜리에서는 100개가 실패해도 미발동한다. 연속 5회는 조각 수가 적은 소스에서 사실상 발동하지 않지만 그런 소스는 헛수고 규모 자체가 작다.
-
-발동 시 **다음 라운드로 넘어가지 않는다.** 연속 5개 실패는 개별 조각 문제가 아니라 서비스 상태 문제이고, 15초 뒤 라운드가 성공할 가능성이 낮다.
-
 **라운드 간 대기**가 필요한 이유는 조각 3개짜리 소스에서 라운드 0이 1~2초 만에 끝나기 때문이다. 대기가 없으면 "다른 일을 하며 시간을 번다"는 이점이 사라진다.
 
 ### 8.4 게이트와 완결도
@@ -677,7 +672,7 @@ window (interval 5m)
 부분 성공은 **모든 소스에서 허용**하되 `max_missing_ratio`가 판정한다. 기본값 `0.0`이므로 명시적으로 열지 않은 소스는 조각 하나만 빠져도 FAILED다.
 
 ```
-fetch 종료 (라운드 소진 · 예산 초과 · 서킷브레이커)
+fetch 종료 (라운드 소진 · 예산 초과)
    ↓
 성공 조각으로 missing_ratio 계산
    ↓
@@ -789,7 +784,7 @@ WARN  source_id=… stage=bronze_written parts=2/3 rounds=3 missing=page-02001-0
 
 ```
 ERROR source_id=… stage=validated status=FAILED failure_reason=quality_gate dropped=412 drop_ratio=0.149
-ERROR source_id=… stage=bronze_written status=FAILED failure_reason=fetch_error missing_ratio=0.638 reason=circuit_breaker
+ERROR source_id=… stage=bronze_written status=FAILED failure_reason=fetch_error missing_ratio=0.638 reason=budget_exceeded
 ```
 
 백필 실행은 `revision` 변화를 남긴다.
@@ -845,7 +840,7 @@ Airflow는 소스별 태스크에서 `data_interval_start`를 `--window-start`�
 | 2 | 계약 타입 + 정책 레지스트리 + 공통 정책 함수 | `types.py`, 데코레이터 등록(params 모델 포함), 함수 10종 |
 | 3 | 검증 엔진 | 판정 3단계, 4분면 × 정책 디스패치, 행 정책, 집계 |
 | 4 | storage + manifest | 경로 규칙(조각 키), bronze 조각 쓰기·읽기·정리, `_retry_queue` 마커 I/O, 상태 어휘, 완결도 필드 |
-| 5 | 어댑터 base + `seoul_openapi` | `FetchResult` 계약, 실패 3범주, 라운드·예산·서킷브레이커, `RESULT.CODE` 검사, 페이지네이션 |
+| 5 | 어댑터 base + `seoul_openapi` | `FetchResult` 계약, 실패 3범주, 라운드·예산, `RESULT.CODE` 검사, 페이지네이션 |
 | 6 | pipeline | 4단계 오케스트레이션 + 재개 분기 4가지 + 게이트 2종 |
 | 7 | main.py + 로깅 | CLI(`--force` · `--backfill`), 구조화 로그 |
 | 8 | 소스 YAML 확장 | 1개로 end-to-end 검증 → 나머지 6개 추가 (+ `kma_apihub` 어댑터의 격자 반복·pivot) |
@@ -883,7 +878,6 @@ cd collector && uv run pytest
   끝나는지. 3라운드를 모두 실패하면 누락으로 확정되는지
 - 실패 3범주: `TRANSIENT`는 재투입되고, `PERMANENT`는 라운드에서 제외되며, `FATAL`은
   게이트·마커 없이 즉시 종료되는지
-- 서킷브레이커: 연속 5회 실패 후 남은 조각을 호출하지 않는지
 - `fetch_budget`: 초과 시 새 호출을 시작하지 않고 진행 중 호출만 마무리하는지
 - 게이트 조합: `max_missing_ratio` × `max_drop_ratio` 통과/초과 4조합. 기본값 `0.0`에서
   기존과 동일하게 조각 하나만 빠져도 FAILED인지
