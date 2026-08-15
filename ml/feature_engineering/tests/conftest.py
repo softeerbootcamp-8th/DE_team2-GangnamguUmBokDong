@@ -27,6 +27,7 @@ def spark():
     session = (
         SparkSession.builder.master("local[2]")
         .appName("test-feature-engineering")
+        .config("spark.driver.memory", "3g")
         .config("spark.sql.shuffle.partitions", "2")
         .config("spark.ui.enabled", "false")
         .config("spark.sql.session.timeZone", "Asia/Seoul")
