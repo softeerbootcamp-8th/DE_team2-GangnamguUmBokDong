@@ -1,4 +1,3 @@
-
 """데이터 수집 파이프라인.
 
 ## 실행 순서
@@ -145,7 +144,6 @@ _HTTP_TIMEOUT_SECONDS = 10.0
 _KST = ZoneInfo("Asia/Seoul")
 
 logger = logging.getLogger(__name__)
-
 
 class ForceAndBackfillError(ValueError):
     """`--force`와 `--backfill`은 목적이 반대라 동시에 줄 수 없다."""
