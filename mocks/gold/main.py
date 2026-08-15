@@ -1,34 +1,90 @@
 from __future__ import annotations
 
 import argparse
-import shutil
-from pathlib import Path
+import json
+import os
+
+import boto3
+import psycopg2
 
 
-ROOT = Path("/tmp/e2e_components")
+def get_s3_client():
+    return boto3.client(
+        "s3",
+        endpoint_url=os.environ.get("S3_ENDPOINT_URL", "http://minio:9000"),
+        aws_access_key_id=os.environ.get(
+            "AWS_ACCESS_KEY_ID",
+            "minioadmin",
+        ),
+        aws_secret_access_key=os.environ.get(
+            "AWS_SECRET_ACCESS_KEY",
+            "minioadmin",
+        ),
+        region_name="ap-northeast-2",
+    )
+
+
+def get_db_connection():
+    return psycopg2.connect(
+        host=os.environ.get("POSTGRES_HOST", "postgres"),
+        port=int(os.environ.get("POSTGRES_INTERNAL_PORT", "5432")),
+        dbname=os.environ.get("POSTGRES_APP_DB", "app"),
+        user=os.environ.get("POSTGRES_USER", "postgres"),
+        password=os.environ.get("POSTGRES_PASSWORD", "postgres"),
+    )
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--run-key", required=True)
-
     args = parser.parse_args()
 
-    run_dir = ROOT / args.run_key
-    gold_path = run_dir / "gold.json"
+    bucket = os.environ.get("S3_BUCKET", "local-dev")
+    gold_key = f"mock/gold/{args.run_key}.json"
 
-    if not gold_path.exists():
-        raise FileNotFoundError(gold_path)
+    s3 = get_s3_client()
+    response = s3.get_object(
+        Bucket=bucket,
+        Key=gold_key,
+    )
 
-    rds_dir = ROOT / "mock_rds" / "forecast_points"
-    rds_dir.mkdir(parents=True, exist_ok=True)
+    gold = json.loads(
+        response["Body"].read().decode("utf-8")
+    )
 
-    destination = rds_dir / f"{args.run_key}.json"
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO forecast_points (
+                    sta_id,
+                    predicted_dttm,
+                    predicted_rent_cnt,
+                    predicted_return_cnt,
+                    batch_run_at
+                )
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (sta_id, predicted_dttm)
+                DO UPDATE SET
+                    predicted_rent_cnt = EXCLUDED.predicted_rent_cnt,
+                    predicted_return_cnt = EXCLUDED.predicted_return_cnt,
+                    batch_run_at = EXCLUDED.batch_run_at
+                """,
+                (
+                    gold["sta_id"],
+                    gold["predicted_dttm"],
+                    gold["predicted_rent_cnt"],
+                    gold["predicted_return_cnt"],
+                    gold["batch_run_at"],
+                ),
+            )
 
-    # 같은 window 재실행 시 덮어쓰기 → UPSERT 모사
-    shutil.copyfile(gold_path, destination)
-
-    print(f"[gold] upserted {destination}")
+    print(f"[gold] read s3://{bucket}/{gold_key}")
+    print(
+        "[gold] upserted forecast_points "
+        f"sta_id={gold['sta_id']} "
+        f"predicted_dttm={gold['predicted_dttm']}"
+    )
 
 
 if __name__ == "__main__":
