@@ -148,10 +148,13 @@ def urgency_score(
     slack = max(0.0, time_to_critical - RESPONSE_LAG_MIN)
     time_factor = 2 ** (-slack / HALF_LIFE_MIN)
 
+    # hold_cnt=0(신규/이상 등록 등)인 대여소가 들어오면 division by zero로 API
+    # 전체가 500 에러를 내므로, 최소 1로 방어한다.
+    safe_hold_cnt = max(hold_cnt, 1)
     if action_type == "retrieval_needed":
-        ratio = _max_overshoot(current, hold_cnt, points) / hold_cnt
+        ratio = _max_overshoot(current, hold_cnt, points) / safe_hold_cnt
     else:
-        ratio = _max_deficit(current, points) / hold_cnt
+        ratio = _max_deficit(current, points) / safe_hold_cnt
     impact_factor = _severity(ratio)
 
     score = round(100 * time_factor * impact_factor, 1)
