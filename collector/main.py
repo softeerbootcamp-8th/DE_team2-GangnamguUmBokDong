@@ -80,6 +80,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if not args.list_backfill_targets and not args.window_start:
         parser.error("the following arguments are required: --window-start (unless --list-backfill-targets is used)")
 
+
     if args.force and args.backfill:
         parser.error("--force와 --backfill은 함께 줄 수 없다")
 
@@ -121,6 +122,7 @@ def main(argv: list[str] | None = None) -> int:
         targets = pipeline.get_backfill_targets(config)
         print(json.dumps(targets))
         return 0
+
 
     window_start = datetime.fromisoformat(args.window_start)
 

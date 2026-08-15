@@ -95,7 +95,7 @@ class SeoulOpenApiAdapter:
         page_size = params["page_size"]
 
         # . 기준으로 문자열을 쪼개서 앞부분만 떼어낸다.
-                # "SeoulRtd.citydata_ppltn" 처럼 마침표가 포함된 단일 키가 응답의 최상단에 존재할 수 있다.
+        # "SeoulRtd.citydata_ppltn" 처럼 마침표가 포함된 단일 키가 응답의 최상단에 존재할 수 있다.
         if params["root_key"] in {"SeoulRtd.citydata_ppltn"}:
             wrapper_key = params["root_key"]
         else:
@@ -105,7 +105,6 @@ class SeoulOpenApiAdapter:
         suffix = ""
         if path_suffix_template:
             suffix = path_suffix_template.format(window_start=window.window_start)
-
         # citydata_ppltn은 페이지네이션 대신 POI001~POI116 순회
         if service == "citydata_ppltn":
             expected = 116

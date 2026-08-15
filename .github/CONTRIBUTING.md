@@ -34,9 +34,10 @@
 refactor/cart-logic
 feature/login
 fix/signup-error
+modify/button-color
 ```
 
-타입: `feature`, `fix`, `refactor`, `docs`, `test`, `chore`
+타입: `feature`, `modify`, `fix`, `refactor`, `docs`, `test`, `chore`
 
 ## 작업 절차
 
