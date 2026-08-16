@@ -171,12 +171,19 @@ class TestKmaSourceEndToEnd:
         config = config_loader.load("weather_ultra_short_term", base_dir=SOURCES_DIR)
 
         def handler(request):
+            params = dict(request.url.params)
+            common = {
+                "nx": int(params["nx"]),
+                "ny": int(params["ny"]),
+                "baseDate": params["base_date"],
+                "baseTime": params["base_time"],
+            }
             items = [
-                {"category": "T1H", "obsrValue": "28.5"},
-                {"category": "REH", "obsrValue": "55"},
-                {"category": "WSD", "obsrValue": "2.1"},
-                {"category": "RN1", "obsrValue": "0"},
-                {"category": "PTY", "obsrValue": "0"},
+                {**common, "category": "T1H", "obsrValue": "28.5"},
+                {**common, "category": "REH", "obsrValue": "55"},
+                {**common, "category": "WSD", "obsrValue": "2.1"},
+                {**common, "category": "RN1", "obsrValue": "0"},
+                {**common, "category": "PTY", "obsrValue": "0"},
             ]
             body = {"response": {"header": {"resultCode": "00"}, "body": {"items": {"item": items}}}}
             return httpx.Response(200, content=json.dumps(body).encode())
@@ -188,3 +195,17 @@ class TestKmaSourceEndToEnd:
 
         assert result.status == RunStatus.SUCCEEDED
         assert result.artifacts.silver is not None
+
+    @pytest.mark.parametrize(
+        "source_id", ["weather_ultra_short_term", "weather_short_term_forecast"]
+    )
+    def test_weather_grids_cover_25_seoul_gu_one_to_one(self, source_id):
+        """db-loader/gu_mapping.py의 `_GRID_TO_GU_TABLE`은 여기 grids 목록과 1:1로
+        맞춰 25개 구 전부를 대표하도록 만들어졌다. 격자를 늘리거나 줄일 때 db-loader
+        쪽 테이블과 어긋나면 일부 구의 weather_current/weather_forecast가 조용히
+        비게 되므로, 최소한 "정확히 25개, 중복 없음"은 여기서 회귀로 잡는다."""
+        config = config_loader.load(source_id, base_dir=SOURCES_DIR)
+        grids = config.adapter_params["grids"]
+
+        assert len(grids) == 25
+        assert len({tuple(g) for g in grids}) == 25

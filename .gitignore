@@ -48,3 +48,6 @@ dev/
 
 # Data
 seoul-pop-nowcasting/data/
+
+# ops scripts 런타임 산출물
+ops/scripts/logs/

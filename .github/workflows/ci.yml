@@ -44,7 +44,7 @@ jobs:
         run: make up
 
       - name: Test
-        run: make test
+        run: make test-ci
 
       - name: Stop test infrastructure
         if: always()

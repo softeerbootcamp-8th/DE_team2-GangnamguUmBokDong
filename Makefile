@@ -1,5 +1,6 @@
-PROJECTS := collector apps/api airflow ml/inference ml/training ml/feature_engineering libs/core libs/ml_common seoul-pop-normalizer seoul-pop-nowcasting
-LOCAL_TEST_PROJECTS := collector apps/api ml/inference ml/training ml/feature_engineering libs/core libs/ml_common seoul-pop-normalizer seoul-pop-nowcasting
+PROJECTS := collector apps/api airflow ml/inference ml/training ml/feature_engineering libs/core libs/ml_common seoul-pop-normalizer seoul-pop-nowcasting db-loader
+LOCAL_TEST_PROJECTS := collector apps/api ml/inference ml/training ml/feature_engineering libs/core libs/ml_common seoul-pop-normalizer seoul-pop-nowcasting db-loader
+CI_TEST_PROJECTS := collector apps/api libs/core libs/ml_common seoul-pop-normalizer seoul-pop-nowcasting db-loader
 
 COMPOSE = docker compose $(if $(wildcard .env),--env-file .env,) -f ops/compose/docker-compose.yml
 
@@ -19,6 +20,17 @@ lint:
 
 test:
 	@for p in $(LOCAL_TEST_PROJECTS); do \
+		echo "==> $$p"; \
+		(cd $$p && uv run --with pytest pytest -q); \
+		code=$$?; \
+		if [ $$code -ne 0 ] && [ $$code -ne 5 ]; then exit $$code; fi; \
+	done
+	@echo "==> airflow"
+	@$(COMPOSE) exec -T airflow-scheduler \
+		sh -lc 'cd /workspace/airflow && uv run pytest -q'
+
+test-ci:
+	@for p in $(CI_TEST_PROJECTS); do \
 		echo "==> $$p"; \
 		(cd $$p && uv run --with pytest pytest -q); \
 		code=$$?; \
