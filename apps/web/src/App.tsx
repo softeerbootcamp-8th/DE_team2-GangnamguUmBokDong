@@ -6,11 +6,16 @@ import { DetailPanel } from "./components/DetailPanel";
 import { ForecastPanel } from "./components/ForecastPanel";
 import { Header } from "./components/Header";
 import { StationMap } from "./components/StationMap";
+import type { MapFilterMode } from "./components/StationMap";
 import { StockPanel } from "./components/StockPanel";
 import { formatClock } from "./format";
 
 const POLL_INTERVAL_MS = 15_000;
 const FORECAST_POLL_INTERVAL_MS = 60_000;
+const MAP_FILTER_TABS: { key: MapFilterMode; label: string }[] = [
+  { key: "supply_only", label: "부족한것만" },
+  { key: "all", label: "모두 보기" },
+];
 
 export default function App() {
   const [stations, setStations] = useState<StationSummary[]>([]);
@@ -18,6 +23,10 @@ export default function App() {
   const [alerts, setAlerts] = useState<Alert[]>([]);
   const [selectedStationId, setSelectedStationId] = useState<number | null>(null);
   const [forecast, setForecast] = useState<ForecastResponse | null>(null);
+  // 기본값은 공급필요만(이슈 #63) — 트럭 기사의 실제 작업 순서(어디가 비었나
+  // -> 그 주변에서 뭘 가져올까)에 맞춘다. "모두 보기"는 그 전 동작으로 돌아가는
+  // 탈출구다.
+  const [mapFilterMode, setMapFilterMode] = useState<MapFilterMode>("supply_only");
 
   useEffect(() => {
     let cancelled = false;
@@ -67,7 +76,23 @@ export default function App() {
       <div className="dashboard-grid">
         <section className="panel map-panel">
           <div className="panel-header">
-            <h2>대여소 지도</h2>
+            <span className="panel-title-group">
+              <h2>대여소 지도</h2>
+              <div className="alert-tabs" role="tablist" aria-label="지도 표시 범위">
+                {MAP_FILTER_TABS.map((t) => (
+                  <button
+                    key={t.key}
+                    type="button"
+                    role="tab"
+                    aria-selected={mapFilterMode === t.key}
+                    className={`alert-tab${mapFilterMode === t.key ? " active" : ""}`}
+                    onClick={() => setMapFilterMode(t.key)}
+                  >
+                    {t.label}
+                  </button>
+                ))}
+              </div>
+            </span>
             <span className="panel-meta">현황 기준 시각 {stationsUpdatedAt ? formatClock(stationsUpdatedAt) : "-"}</span>
           </div>
           <div className="panel-body">
@@ -76,6 +101,7 @@ export default function App() {
               alerts={alerts}
               selectedStationId={selectedStationId}
               onSelect={setSelectedStationId}
+              mapFilterMode={mapFilterMode}
             />
           </div>
         </section>
