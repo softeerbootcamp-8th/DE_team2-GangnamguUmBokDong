@@ -16,7 +16,7 @@ NORMALIZER_DIR = str(REPO_ROOT / "normalizer")
 
 def build_normalizer_task(dag, task_id: str, baseline_date_mode: str, *, trigger_rule="all_success"):
     cmd = (
-        f"uv run python main.py --window-start {KST_WINDOW_START} "
+        f"uv run --frozen python main.py --window-start {KST_WINDOW_START} "
         f"--baseline-date-mode {baseline_date_mode}"
     )
     return build_module_task(dag, task_id, NORMALIZER_DIR, cmd, trigger_rule=trigger_rule)

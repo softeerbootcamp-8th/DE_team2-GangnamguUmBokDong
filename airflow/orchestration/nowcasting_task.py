@@ -14,7 +14,7 @@ NOWCASTING_DIR = str(REPO_ROOT / "nowcaster")
 
 
 def build_nowcasting_task(dag):
-    cmd = f"uv run python main.py estimate --target-date {KST_DATE}"
+    cmd = f"uv run --frozen python main.py estimate --target-date {KST_DATE}"
     return build_module_task(
         dag,
         "run_nowcasting_estimate",

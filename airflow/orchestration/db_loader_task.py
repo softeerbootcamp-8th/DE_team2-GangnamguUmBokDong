@@ -10,7 +10,7 @@ DB_LOADER_DIR = str(REPO_ROOT / "loader")
 
 
 def build_db_loader_task(dag, table: str, *, trigger_rule="all_success"):
-    cmd = f"uv run python main.py --table {table} --window-start {KST_WINDOW_START}"
+    cmd = f"uv run --frozen python main.py --table {table} --window-start {KST_WINDOW_START}"
     return build_module_task(
         dag,
         f"load_{table}",

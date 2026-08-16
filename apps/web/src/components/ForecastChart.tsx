@@ -66,6 +66,12 @@ export function ForecastChart({ points }: Props) {
             {series.label}
           </span>
         ))}
+        <span className="chart-legend-item">
+          <svg width="16" height="8" aria-hidden="true">
+            <line x1="0" y1="4" x2="16" y2="4" stroke={criticalColor} strokeWidth={1.5} strokeDasharray="4 4" />
+          </svg>
+          회수·공급 필요
+        </span>
       </div>
       <div className="chart-plot">
       <svg className="chart-svg" viewBox={`0 0 ${WIDTH} ${HEIGHT}`} role="img" aria-label="12시간 대여·반납 예측 그래프">
@@ -116,6 +122,7 @@ export function ForecastChart({ points }: Props) {
               y2={HEIGHT - MARGIN.bottom}
               stroke={criticalColor}
               strokeWidth={1.5}
+              strokeDasharray="4 4"
             />
             <text x={xAt(criticalIndex)} y={MARGIN.top - 4} textAnchor={criticalAnchor} fontSize={10} fontWeight={700} fill={criticalColor}>
               {formatTime(criticalPoint.predicted_dttm)} {ACTION_LABEL[criticalPoint.action_type]}

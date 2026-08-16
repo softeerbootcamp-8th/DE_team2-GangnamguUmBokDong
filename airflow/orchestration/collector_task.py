@@ -16,7 +16,7 @@ COLLECTOR_DIR = str(REPO_ROOT / "collector")
 
 def build_collector_task(dag, source_id: str):
     timeout = EXECUTION_TIMEOUT_OVERRIDES.get(source_id, DEFAULT_EXECUTION_TIMEOUT)
-    cmd = f"uv run python main.py --source {source_id} --window-start {KST_WINDOW_START}"
+    cmd = f"uv run --frozen python main.py --source {source_id} --window-start {KST_WINDOW_START}"
     return build_module_task(
         dag,
         f"collect_{source_id}",
