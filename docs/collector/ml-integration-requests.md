@@ -12,7 +12,7 @@
 더 나와 6~9번으로 추가했다 — 특히 8번(생활인구 스키마)은 코드 수정만으로는
 완전히 해소되지 않는, 모델 feature 설계 자체에 관련된 사항이라 확인이 필요하다.
 
-**2026-08-16 갱신**: `KMA_APIHUB_KEY`를 실제로 넣고 `weather_ultra_short_term`/
+**2026-08-16 갱신**: `KMA_APIHUB_KEY`를 실제로 넣고 `weather_ultra_short_live`/
 `weather_short_term_forecast` 두 소스를 직접(수동으로 `collector/main.py` 실행)
 돌려서 raw 응답과 Silver 결과를 대조했다. 그 결과 6번(강수량 없음)이 실은 잘못된
 결론이었음을 확인해 정정했고(11번), 코드 버그 하나(12번)와 두 소스 다 애초에
@@ -71,12 +71,12 @@
 기준(`weather_forecast`, `living_population_per_population_grid`)으로 추측했었다.
 
 - **실제 예시 데이터로 확인한 결과, 둘 다 예상과 달랐고 구조도 더 복잡했다**:
-  - 날씨는 소스가 **2개**였다: `weather_ultra_short_term`(초단기실황, 10분 간격,
+  - 날씨는 소스가 **2개**였다: `weather_ultra_short_live`(초단기실황, 10분 간격,
     컬럼 `T1H`/`REH`/`WSD`/`RN1`/`PTY`)와 `weather_short_term_forecast`(단기예보,
     3시간 간격, 컬럼 `TMP`/`REH`/`WSD`/`POP`/`SKY`/`PTY`). ~~예보 쪽은 강수량(mm)이
     아니라 강수확률(%, `POP`)만 있어 `precip`과 단위가 안 맞는다~~ — **(2026-08-16
     정정) 이 결론은 틀렸다, raw엔 강수량(`PCP`)이 실제로 있고 YAML에만 안
-    선언돼 있었다, 6번 참고.** 지금은 `weather_ultra_short_term`(관측치)만 쓰고
+    선언돼 있었다, 6번 참고.** 지금은 `weather_ultra_short_live`(관측치)만 쓰고
     예보 쪽은 안 쓴다.
   - 인구도 소스가 **2개**였고 둘 다 우리가 가정한 이름·구조와 달랐다:
     `population_realtime`(실시간 인구, `AREA_NM`/`AREA_CD`/`AREA_CONGEST_LVL` 등
@@ -128,7 +128,7 @@
 ## 6. (2026-08-16 정정) `weather_short_term_forecast`에 강수량(mm)이 없다고 했던 결론이 틀렸다
 
 ~~지금 `_get_recent_weather()`는 사실 "예보"가 아니라 "가장 최근 관측값"을 쓴다
-(`weather_ultra_short_term`, 10분 간격 관측치). horizon이 커져(예: 6시간 뒤)
+(`weather_ultra_short_live`, 10분 간격 관측치). horizon이 커져(예: 6시간 뒤)
 target_ts가 미래로 멀어지면 원래는 진짜 예보(`weather_short_term_forecast`,
 3시간 간격)를 써야 더 정확할 텐데, 그 소스엔 강수량이 없고 강수확률(`POP`, %)만
 있다.~~ (아래에서 정정)
@@ -149,7 +149,7 @@ normalize 정책 필요"라는 문구까지 있다 — 이게 정확히 `PCP`의
 빠진 것으로 보인다.
 
 - **지금 ML이 하는 일**: (정정 전과 동일) horizon과 무관하게 항상
-  `weather_ultra_short_term`의 "가장 최근 값"만 쓴다 — 이건 그대로 유지.
+  `weather_ultra_short_live`의 "가장 최근 값"만 쓴다 — 이건 그대로 유지.
 - **요청**:
   1. `weather_short_term_forecast.yaml`에 `PCP`(강수량)를 `columns:`로 추가해달라
      — 다만 raw 값이 순수 숫자가 아니라 `"강수없음"`/`"1mm 미만"`/`"10.0mm"`처럼
@@ -227,7 +227,7 @@ YAML 예시(210행 근처)에 `adapter_params.page_size: 1000`이 있어, 혹시
 
 ## 11. (2026-08-16 신규) 날씨 두 소스 다 자동 수집 스케줄이 없다
 
-`airflow/dags/`를 전부 확인해봤는데 `weather_ultra_short_term`(10분 주기)/
+`airflow/dags/`를 전부 확인해봤는데 `weather_ultra_short_live`(10분 주기)/
 `weather_short_term_forecast`(3시간 주기)를 실제로 자동으로 도는 스케줄에
 올려주는 DAG가 하나도 없다.
 
@@ -261,7 +261,7 @@ YAML 예시(210행 근처)에 `adapter_params.page_size: 1000`이 있어, 혹시
   `optional_missing: keep_null`로 조용히 null 처리되고, manifest는
   `kept=2075 dropped=0 completeness=1.000`으로 찍힌다 — raw와 직접 대조하지
   않는 한 이 유실을 알 방법이 없다.
-- `weather_ultra_short_term`(`getUltraSrtNcst`)은 지금은 격자당 8건뿐이라
+- `weather_ultra_short_live`(`getUltraSrtNcst`)은 지금은 격자당 8건뿐이라
   1000 밑이라 안 잘리는데, 코드가 맞아서가 아니라 이 엔드포인트 페이로드가
   작아서 우연히 안전한 것뿐이다 — 같은 코드를 쓰는 한 이 소스도 똑같이
   취약하다.
@@ -273,13 +273,13 @@ YAML 예시(210행 근처)에 `adapter_params.page_size: 1000`이 있어, 혹시
 
 raw 응답과 YAML `columns:` 선언을 대조한 결과:
 
-- `weather_ultra_short_term.yaml`의 `description`은 "초단기 실황·**예보**"라고
+- `weather_ultra_short_live.yaml`의 `description`은 "초단기 실황·**예보**"라고
   돼 있지만 실제로 부르는 건 `getUltraSrtNcst`(실황)뿐이다. `getUltraSrtFcst`
   (진짜 초단기예보)는 코드 전체에서 `collector/tests/test_kma_apihub.py`의
   예시 테스트에만 등장하고, 실제 소스로 설정된 적이 없다 — description이
   실제 동작과 안 맞는다.
 - 두 소스 다 raw엔 있는데 YAML `columns:`엔 없어서 조용히 버려지는 필드가
-  있다: `weather_ultra_short_term`은 `UUU`/`VEC`/`VVV`(바람 성분·풍향),
+  있다: `weather_ultra_short_live`은 `UUU`/`VEC`/`VVV`(바람 성분·풍향),
   `weather_short_term_forecast`는 `PCP`(강수량, 6번 참고)/`SNO`(적설).
 - `PCP`의 실제 raw 값 종류(참고용): `"강수없음"`, `"1mm 미만"`, `"1.0mm"`~
   `"17.0mm"`(숫자+"mm" 텍스트), 그리고 `"0"`(단위 없는 숫자 문자열)까지 섞여

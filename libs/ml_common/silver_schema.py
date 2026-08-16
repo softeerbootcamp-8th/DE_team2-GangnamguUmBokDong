@@ -61,7 +61,7 @@ RENTAL_COLUMN_MAP = {
     "BIKE_ID": "bike_id",
 }
 
-# ml/data/silver/weather_ultra_short_term/ 예시 데이터 기준(기상청 초단기실황,
+# ml/data/silver/weather_ultra_short_live/ 예시 데이터 기준(기상청 초단기실황,
 # 10분 간격) — 우리가 가정했던 "weather_forecast" 하나가 아니라 실제로는 소스가
 # 2개로 나뉘어 있다: 이 소스(관측치, 강수량 mm 있음)와
 # weather_short_term_forecast(예보, 3시간 간격, 강수량 대신 강수확률%만 있어
@@ -130,7 +130,7 @@ def rental_tick_keys(anchor_ts: pd.Timestamp, lookback_hours: float) -> list[str
 
 
 def weather_tick_keys(anchor_ts: pd.Timestamp, lookback_hours: float = 3.0) -> list[str]:
-    """`weather_ultra_short_term`의 10분 tick 키 목록(오래된 것부터 최신 순)."""
+    """`weather_ultra_short_live`의 10분 tick 키 목록(오래된 것부터 최신 순)."""
     return _tick_keys(WEATHER_SOURCE_ID, anchor_ts, lookback_hours, WEATHER_TICK_MINUTES)
 
 

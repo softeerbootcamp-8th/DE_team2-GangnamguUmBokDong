@@ -536,7 +536,7 @@ def _population_fallback(grid_id: str, ts: pd.Timestamp) -> dict[str, float]:
 def _get_recent_weather(target_ts: pd.Timestamp, lookback_hours: float = 3) -> dict[str, float]:
     """target_ts 시각(또는 그 근처)의 Silver 기상 관측값을 읽는다(서울 전체 공유).
 
-    `weather_ultra_short_term`(기상청 초단기실황, 10분 간격)을 쓴다 — 실제로는
+    `weather_ultra_short_live`(기상청 초단기실황, 10분 간격)을 쓴다 — 실제로는
     `weather_short_term_forecast`(예보, 3시간 간격)도 있지만 그쪽은 강수량(mm)이
     아니라 강수확률(%)만 제공해 `precip`과 단위가 안 맞고, 이 함수가 원래
     "그 시점 근처 가장 최근 관측값"을 찾는 용도라 관측 소스가 의미상으로도 더

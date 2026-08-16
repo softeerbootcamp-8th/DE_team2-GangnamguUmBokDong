@@ -34,7 +34,7 @@
 
 ### 3. 10분 단위 주기 (10 Minute Interval)
 *   **단일 수집:**
-    *   `weather_ultra_short_term` 수집
+    *   `weather_ultra_short_live` 수집
 
 ### 4. 3시간 단위 주기 (3 Hour Interval)
 *   **단일 수집:**

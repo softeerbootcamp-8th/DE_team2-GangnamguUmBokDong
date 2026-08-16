@@ -50,7 +50,7 @@ CREATE TABLE IF NOT EXISTS station_stock (
 ## 2. 신규 데이터 적재 스펙 (UI 상세정보용)
 
 ### 2-1. `weather_current` (초단기 실황 날씨)
-- **S3 Silver Parquet 추출 출처**: `weather_ultra_short_term`
+- **S3 Silver Parquet 추출 출처**: `weather_ultra_short_live`
 - **컬럼 매핑 (Silver -> Gold)**:
   - 수집 격자 좌표 / 위치 정보 -> `gu` (자치구 이름으로 변환 매핑)
   - 파티션 시간(`dt`, `hh`) 또는 데이터 내부 시간 -> `observed_at` (TIMESTAMPTZ)

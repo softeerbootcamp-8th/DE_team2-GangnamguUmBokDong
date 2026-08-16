@@ -9,7 +9,7 @@
   10번)
 - living_population_grid: 같은 (grid_id, hour_ts)가 서로 다른 수집일(dt=)
   파티션에 걸쳐 나오면 더 최근에 수집된 값이 이기는지(공표 지연, 8번)
-- bike_station_realtime/weather_ultra_short_term: 파일 경로(dt=/hh=/HHMM)에서
+- bike_station_realtime/weather_ultra_short_live: 파일 경로(dt=/hh=/HHMM)에서
   시각을 정확히 역추출하는지
 """
 
@@ -133,7 +133,7 @@ def test_read_station_status_and_weather_extract_tick_from_path(spark, _silver_r
         }]),
     )
     _write_parquet(
-        _silver_root / "weather_ultra_short_term" / "dt=2025-06-01" / "hh=08" / "0800.parquet",
+        _silver_root / "weather_ultra_short_live" / "dt=2025-06-01" / "hh=08" / "0800.parquet",
         pd.DataFrame([{"T1H": 25.5, "REH": 61.0, "WSD": 1.5, "RN1": 0.0, "PTY": 0}]),
     )
 

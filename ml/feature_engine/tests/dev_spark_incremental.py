@@ -9,7 +9,7 @@
 Silver만 읽도록 바뀐 뒤로(collector Silver 예시 데이터 기준, `docs/collector/
 ml-integration-requests.md` 참고) 이 fixture는 "1차 정제 산출물"을 직접 만드는 대신
 Silver 조각 파일(`bike_station_realtime`/`bike_rental_history`/
-`weather_ultra_short_term`/`living_population_grid`) 자체를 로컬 tmp_path에
+`weather_ultra_short_live`/`living_population_grid`) 자체를 로컬 tmp_path에
 만들어서 `fe_config.SILVER_ROOT`를 그리로 돌린다 — `silver_source.py`의 실제 파싱
 로직(경로에서 시각 역추출, station_id 직접 매칭 등)까지 이 테스트가 같이 검증한다.
 """
@@ -75,7 +75,7 @@ def synthetic_environment(spark, tmp_path, monkeypatch):
         )
         weather_pdf = pd.DataFrame([{"T1H": 20.0, "REH": 50.0, "WSD": 2.0, "RN1": 0.0, "PTY": 0}])
         _write_parquet(
-            silver_root / "weather_ultra_short_term" / f"dt={h:%Y-%m-%d}" / f"hh={h:%H}" / f"{h:%H}00.parquet",
+            silver_root / "weather_ultra_short_live" / f"dt={h:%Y-%m-%d}" / f"hh={h:%H}" / f"{h:%H}00.parquet",
             weather_pdf,
         )
 

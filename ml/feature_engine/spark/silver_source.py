@@ -12,7 +12,7 @@ Spark는 boto3로 파일 하나씩 긁는 `inference`와 달리 **glob 하나로
 조각 파일 수천~수만 개를 한 번에** 읽는다(`spark.read.parquet("s3a://.../dt=2025-*/hh=*/*.parquet")`)
 — 이게 이 패키지가 Spark를 쓰는 이유 그 자체다.
 
-`bike_station_realtime`/`weather_ultra_short_term`은 파일 **내용에 시각 컬럼이
+`bike_station_realtime`/`weather_ultra_short_live`은 파일 **내용에 시각 컬럼이
 없다**(예시 데이터로 확인 — 시각은 S3 키 경로의 `dt=/hh=/HHMM`에만 있음). Spark의
 `input_file_name()`으로 각 행이 어느 파일에서 왔는지 알아내 거기서 시각을
 역추출한다(`_tick_from_path()`).
@@ -51,7 +51,7 @@ def _tick_from_path() -> Column:
     """`input_file_name()`에서 `dt=YYYY-MM-DD/hh=HH/HHMM.parquet` 부분을 파싱해
     그 파일이 대표하는 시각(timestamp_ntz)을 만든다.
 
-    `bike_station_realtime`/`weather_ultra_short_term`처럼 시각이 파일 내용이
+    `bike_station_realtime`/`weather_ultra_short_live`처럼 시각이 파일 내용이
     아니라 S3 키 경로에만 있는 소스에 쓴다.
     """
     path = F.input_file_name()
@@ -125,7 +125,7 @@ def read_rental_trips(spark: SparkSession, since: str | None = None) -> DataFram
 def _pick_first_per_hour(df: DataFrame, tick_col: str, partition_cols: list[str]) -> DataFrame:
     """(partition_cols, hour) 그룹마다 tick_col이 가장 이른 행 하나만 남긴다.
 
-    `bike_station_realtime`/`weather_ultra_short_term`은 5~10분 tick이지만, 지금
+    `bike_station_realtime`/`weather_ultra_short_live`은 5~10분 tick이지만, 지금
     다운스트림(`build_merged_table.py`)이 기대하는 station_status/weather 입력은
     시간(hour) 단위 스냅샷 하나다 — 그 시간의 첫 tick을 대표값으로 쓴다(그 시간
     동안 값이 유지된다고 forward-fill하는 것과 동치, `build_merged_table.py`의
@@ -161,7 +161,7 @@ def read_station_status(spark: SparkSession, since: str | None = None) -> DataFr
 
 
 def read_weather(spark: SparkSession, since: str | None = None) -> DataFrame:
-    """Silver `weather_ultra_short_term`(10분 tick, 서울 전체 공통)에서 시간당 관측값을 만든다.
+    """Silver `weather_ultra_short_live`(10분 tick, 서울 전체 공통)에서 시간당 관측값을 만든다.
 
     `weather_short_term_forecast`(예보, 3시간)는 강수량이 아니라 강수확률만 있어
     아직 안 쓴다(`ml-integration-requests.md` 6번) — `inference/predict_single.py`의
