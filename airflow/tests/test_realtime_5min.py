@@ -84,7 +84,7 @@ def test_collector_task_execution_contract():
     assert task.execution_timeout == timedelta(seconds=240)
     assert "--source bike_station_realtime" in task.bash_command
     assert "--window-start" in task.bash_command
-    assert "in_timezone" in task.bash_command
+    assert "astimezone" in task.bash_command
     assert "env -u VIRTUAL_ENV" in task.bash_command
 
 

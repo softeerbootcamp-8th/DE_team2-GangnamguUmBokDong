@@ -1,7 +1,7 @@
 """대여이력 원본(트립 단위) parquet -> station_id 매칭된 (start_dt, end_dt) 로딩.
 
-**왜 공유하는가**: `feature_engineering/spark/build_targets.py`(타겟 생성)와
-`feature_engineering/spark/build_rolling_rental_features.py`(배치 point-in-time 카운트)가 배치로
+**왜 공유하는가**: `feature_engine/spark/build_targets.py`(타겟 생성)와
+`feature_engine/spark/build_rolling_rental_features.py`(배치 point-in-time 카운트)가 배치로
 쓰는 것과, `inference/predict_single.py`가 실시간 서빙을 흉내내는 point-in-time
 censoring 계산을 위해 최근 트립을 조회하는 것이 **같은 크로스워크 로직**(대여소번호
 정규화 + station_master 매칭)을 써야 한다 — 트립 파일 재로딩/매칭 로직을 두 곳에서

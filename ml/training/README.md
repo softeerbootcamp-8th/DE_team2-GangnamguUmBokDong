@@ -1,6 +1,6 @@
 # training — 실행 방법
 
-`feature_engineering`이 만든 feature 테이블(`station_hour_features_2025.parquet`)을 읽어
+`feature_engine`이 만든 feature 테이블(`station_hour_features_2025.parquet`)을 읽어
 대여/반납 LightGBM 모델(Poisson+exposure, quantile P10/50/90)을 학습하고,
 `training/models/`에 아티팩트를 저장한다.
 
@@ -14,8 +14,8 @@ uv sync   # pyproject.toml/uv.lock 기준 .venv 생성 — lightgbm/pandas/numpy
 brew install libomp   # macOS에서 LightGBM 실행에 필요
 ```
 
-`feature_engineering`이 먼저 `station_hour_features_2025.parquet`을 만들어둬야 한다
-([feature_engineering/README.md](../feature_engineering/README.md)).
+`feature_engine`이 먼저 `station_hour_features_2025.parquet`을 만들어둬야 한다
+([feature_engine/README.md](../feature_engine/README.md)).
 
 ## 학습 실행
 
@@ -48,7 +48,7 @@ override할 수 있다(`inference`도 같은 값을 봐야 하므로 `ml_common.
 **실제 서비스 운영에 필요한 코드가 아니라 파라미터 튜닝 때 한시적으로 쓰는
 분석 도구라 `training/legacy/`로 옮겼다** — 분류 근거는
 [../LEGACY_AUDIT.md](../LEGACY_AUDIT.md) 참고. 여전히 그대로 실행 가능하다
-(pandas 2차정제 `feature_engineering/legacy/`에 의존하므로 그쪽도 같이 있어야 함):
+(pandas 2차정제 `feature_engine/legacy/`에 의존하므로 그쪽도 같이 있어야 함):
 
 ```bash
 ./training/.venv/bin/python -m training.legacy.scripts.run_embargo_sweep         # embargo 후보 4개 스윕 (~2시간)
@@ -68,8 +68,8 @@ override할 수 있다(`inference`도 같은 값을 봐야 하므로 `ml_common.
 ./training/.venv/bin/python -m training.scripts.monthly_retrain_check --execute    # 기준 미달 시 실제 피처마트 재생성 + 재학습
 ```
 
-기본은 리포트만 찍는 dry-run이다. `--execute`는 `feature_engineering/spark`의 증분
-파이프라인(`feature_engineering/.venv` subprocess)을 실행한 뒤 재학습까지 트리거하고,
+기본은 리포트만 찍는 dry-run이다. `--execute`는 `feature_engine/spark`의 증분
+파이프라인(`feature_engine/.venv` subprocess)을 실행한 뒤 재학습까지 트리거하고,
 챔피언 모델 파일을 그 자리에서 덮어쓴다 — 승격 전 비교가 필요하면 실행 전에
 `training/models/`를 백업해둘 것.
 

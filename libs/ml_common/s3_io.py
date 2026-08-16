@@ -5,7 +5,7 @@
 안 씀)을 따른다. `ml_common`은 `collector`를 import하지 않는다(두 모듈은
 서로 다른 인스턴스에 독립 배포되므로 의존 관계를 만들면 안 됨) — 그래서
 같은 스타일의 코드를 여기 독립적으로 둔다. `collector/storage.py`가 bytes
-단위로만 주고받는 것과 달리, 여기는 `feature_engineering`/`training`/
+단위로만 주고받는 것과 달리, 여기는 `feature_engine`/`training`/
 `inference`가 바로 쓸 수 있게 pandas DataFrame/dict/LightGBM Booster 단위로
 한 겹 더 감싼다.
 """
@@ -104,7 +104,7 @@ def read_parquet(key: str, columns: list[str] | None = None) -> pd.DataFrame | N
     `part-00000-....parquet` 여러 개 + `_SUCCESS`가 있는 형태) 둘 다 지원한다.
 
     Spark의 `df.write.parquet(path)`는 파일 하나가 아니라 이런 다중 파트로 쓰는 게
-    기본 동작이라(`feature_engineering`이 만드는 모든 산출물이 이 형태), `key`
+    기본 동작이라(`feature_engine`이 만드는 모든 산출물이 이 형태), `key`
     그대로의 GET이 실패하면(정확히 그 이름의 객체가 없으면) `key`를 prefix로 보고
     그 아래 parquet 파일들을 찾아 병렬로 읽어 이어붙인다.
 

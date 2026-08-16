@@ -5,6 +5,7 @@ requires-python = "==3.11.*"
 dependencies = [
     "apache-airflow[postgres]>=3.0,<4",
     "apache-airflow-providers-standard",
+    "apache-airflow-providers-fab>=3.8.0",
 ]
 
 [tool.uv]

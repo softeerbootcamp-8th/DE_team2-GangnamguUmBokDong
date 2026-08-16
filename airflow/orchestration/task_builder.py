@@ -1,4 +1,4 @@
-"""5개 모듈(collector/normalizer/nowcasting/ml-inference/db-loader) 전체가 쓰는
+"""5개 모듈(collector/normalizer/nowcasting/ml-inference/loader) 전체가 쓰는
 공용 subprocess-CLI BashOperator 팩토리.
 
 Airflow는 각 모듈을 독립된 CLI로만 호출한다 — 모듈 내부 코드를 import하지 않는다.

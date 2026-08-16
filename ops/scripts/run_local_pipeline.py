@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""collector -> normalizer/nowcasting -> db-loader 로컬 통합 실행 오케스트레이터.
+"""collector -> normalizer/nowcasting -> loader 로컬 통합 실행 오케스트레이터.
 
 Airflow 없이, 소스별 실제 수집 주기(5분/10분/3시간/1일)에 맞춰 각 CLI를
 직접 실행한다. 실 API(SEOUL_OPENAPI_KEY, KMA_APIHUB_KEY)와 로컬 docker-compose
@@ -139,7 +139,7 @@ def run_nowcasting(target_date: datetime) -> bool:
 def run_db_loader(table: str, window_start: datetime) -> bool:
     return _run(
         f"db_loader:{table}",
-        REPO_ROOT / "db-loader",
+        REPO_ROOT / "loader",
         f"uv run python main.py --table {shlex.quote(table)} --window-start {shlex.quote(_iso(window_start))}",
         timeout=120,
         args={"table": table, "window_start": _iso(window_start)},

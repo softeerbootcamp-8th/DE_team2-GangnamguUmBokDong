@@ -1,6 +1,6 @@
 """training(LightGBM 학습) 전용 경로·상수.
 
-`feature_engineering`이 만든 multi-horizon feature 테이블을 S3에서 읽어
+`feature_engine`이 만든 multi-horizon feature 테이블을 S3에서 읽어
 (`MULTI_HORIZON_FEATURES_TABLE_PARQUET`, `ml_common/`에서 공유) `MODELS_PREFIX`
 (S3 키 prefix, `models/`)에 학습 결과를 저장한다. `inference`도 같은
 `MODELS_PREFIX`를 읽어야 하므로 그 값 자체는 `ml_common/paths.py`가 소유하고,
@@ -35,7 +35,7 @@ TEST_END = os.environ.get("TEST_END", "2025-11-30")
 QUANTILE_ALPHAS = [0.1, 0.5, 0.9]
 
 # multi-horizon 테이블은 원본 feature 테이블의 최대 HORIZON_COUNT(기본 12)배 행 수라(T0
-# 앵커를 5분 tick 전체로 유지 — feature_engineering/spark/build_multi_horizon_features.py
+# 앵커를 5분 tick 전체로 유지 — feature_engine/spark/build_multi_horizon_features.py
 # 참고), 학습 머신 RAM에 안 맞으면 OOM이 난다(history.md 18번 항목이 실제로 겪은 문제와
 # 같은 종류 — 그때는 train/valid/test 각각 다른 비율로 표본을 뽑아 해결했다). 기본값은
 # "표본 없음"(1.0)이라 실행해보고 OOM이 나면 실제 학습 머신 스펙에 맞춰 낮출 것 — 정확한
@@ -46,7 +46,7 @@ TEST_SAMPLE_FRAC = float(os.environ.get("TEST_SAMPLE_FRAC", "1.0"))
 
 CATEGORICAL_FEATURES = ["station_id"]
 
-# LightGBM 하이퍼파라미터 (common_config.py에서 공유 — feature_engineering/spark의 SynapseML
+# LightGBM 하이퍼파라미터 (common_config.py에서 공유 — feature_engine/spark의 SynapseML
 # 학습도 참고할 수 있게)
 LGB_PARAMS_COMMON = common_config.LGB_PARAMS_COMMON
 LGB_NUM_BOOST_ROUND = common_config.LGB_NUM_BOOST_ROUND

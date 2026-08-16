@@ -11,7 +11,7 @@ from __future__ import annotations
 from orchestration.task_builder import REPO_ROOT, build_module_task
 from orchestration.templates import KST_WINDOW_START
 
-NORMALIZER_DIR = str(REPO_ROOT / "seoul-pop-normalizer")
+NORMALIZER_DIR = str(REPO_ROOT / "normalizer")
 
 
 def build_normalizer_task(dag, task_id: str, baseline_date_mode: str, *, trigger_rule="all_success"):

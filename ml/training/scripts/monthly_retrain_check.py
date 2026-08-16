@@ -28,7 +28,7 @@ from .. import config
 from ..monitor_performance import MODEL_SPECS, check_all_models
 from ..train_common import load_training_table, train_target
 
-SPARK_PYTHON = ML_ROOT / "feature_engineering" / ".venv" / "bin" / "python"
+SPARK_PYTHON = ML_ROOT / "feature_engine" / ".venv" / "bin" / "python"
 
 
 def _print_report(results: list[dict]) -> None:
@@ -49,24 +49,24 @@ def _print_report(results: list[dict]) -> None:
 
 
 def _trigger_feature_pipeline() -> None:
-    """feature_engineering/spark의 증분 파이프라인 + multi-horizon 테이블 생성을 Spark
+    """feature_engine/spark의 증분 파이프라인 + multi-horizon 테이블 생성을 Spark
     전용 venv(Python 3.11)에서 실행한다.
 
     rental/return 두 모델이 같은 multi-horizon feature mart(파라미터 조합 하나)를 같이
     쓰므로, 어느 모델이 기준 미달이든 이 파이프라인은 한 번만 실행하면 된다.
 
     **주의(1단계 한계)**: `build_multi_horizon_features`는 아직 증분(watermark)을 지원하지
-    않아 매번 전체를 다시 만든다(feature_engineering/spark/build_multi_horizon_features.py
+    않아 매번 전체를 다시 만든다(feature_engine/spark/build_multi_horizon_features.py
     docstring 참고) — multi-horizon 테이블이 원본의 최대 HORIZON_COUNT배라 이 단계가
     월별 점검 중 가장 오래 걸리는 부분이 될 수 있다.
     """
     if not SPARK_PYTHON.exists():
-        raise RuntimeError(f"{SPARK_PYTHON}가 없습니다 — feature_engineering/에서 'uv sync'를 먼저 실행해야 합니다")
-    print(f"[trigger] feature_engineering.spark.run_pipeline 실행 중 ({SPARK_PYTHON})...")
-    subprocess.run([str(SPARK_PYTHON), "-m", "feature_engineering.spark.run_pipeline"], cwd=ML_ROOT, check=True)
-    print(f"[trigger] feature_engineering.spark.build_multi_horizon_features 실행 중 ({SPARK_PYTHON})...")
+        raise RuntimeError(f"{SPARK_PYTHON}가 없습니다 — feature_engine/에서 'uv sync'를 먼저 실행해야 합니다")
+    print(f"[trigger] feature_engine.spark.run_pipeline 실행 중 ({SPARK_PYTHON})...")
+    subprocess.run([str(SPARK_PYTHON), "-m", "feature_engine.spark.run_pipeline"], cwd=ML_ROOT, check=True)
+    print(f"[trigger] feature_engine.spark.build_multi_horizon_features 실행 중 ({SPARK_PYTHON})...")
     subprocess.run(
-        [str(SPARK_PYTHON), "-m", "feature_engineering.spark.build_multi_horizon_features"], cwd=ML_ROOT, check=True
+        [str(SPARK_PYTHON), "-m", "feature_engine.spark.build_multi_horizon_features"], cwd=ML_ROOT, check=True
     )
 
 

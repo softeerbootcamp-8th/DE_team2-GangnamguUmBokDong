@@ -1,6 +1,6 @@
-"""DAG가 실행할 collector source_id 목록과 db-loader 테이블 이름을 모은다.
+"""DAG가 실행할 collector source_id 목록과 loader 테이블 이름을 모은다.
 
-실제 값은 collector/sources/*.yaml의 source_id, db-loader/config.py의 TABLE_SPECS
+실제 값은 collector/sources/*.yaml의 source_id, loader/config.py의 TABLE_SPECS
 키와 정확히 일치해야 한다. API 세부 설정(URL, 인증키 등)은 여기 넣지 않는다 —
 그건 각 모듈의 책임이다.
 """

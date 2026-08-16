@@ -1,6 +1,6 @@
 # ML → collector 확인/요청 사항
 
-이번 S3/MinIO 데이터 파이프라인 전환(`feature_engineering`/`training`/`inference`가
+이번 S3/MinIO 데이터 파이프라인 전환(`feature_engine`/`training`/`inference`가
 로컬 `ml/data/processed_v2/*.parquet` 대신 collector가 Silver로 쌓는 S3 데이터를
 직접 읽도록 바꾸는 작업)을 진행하며 `collector` 쪽 확정이 필요한 사항을 정리한다.
 `collector` 모듈(어댑터/파이프라인/CLI)은 이번 작업에서 손대지 않았다 — 전부 이
@@ -38,7 +38,7 @@
   ID가 서로 겹치는 것도 직접 확인했다(`ST-83`, `ST-280` 등 다수 공통).
 - **ML 쪽 반영**: `inference/predict_single.py`의 `_resolve_rental_stations()`를
   station_no 크로스워크(`normalize_station_no()`) 없이 station_id로 직접 매칭하도록
-  단순화했다. (배치 학습 쪽 `feature_engineering/spark/build_targets.py`가 읽는
+  단순화했다. (배치 학습 쪽 `feature_engine/spark/build_targets.py`가 읽는
   과거 이력 CSV는 여전히 raw 숫자라 그쪽 `_normalize_station_no()`는 그대로 둔다 —
   다른 원본 포맷이라 서로 영향 없음.)
 - **남은 확인 요청**: 이 형식이 앞으로도 계속 유지되는지(예를 들어 신규
@@ -109,7 +109,7 @@
 
 - **지금 괜찮은 이유(추정)**: 추론은 "방금 지난 시각"을 짧은 수명의 프로세스가
   한 번 읽고 끝나는 구조라, 그 시점에 이미 `stage=completed`로 확정된 최신
-  silver를 읽을 가능성이 높다 — 학습(`feature_engineering`, 1년치 배치)과 달리
+  silver를 읽을 가능성이 높다 — 학습(`feature_engine`, 1년치 배치)과 달리
   "이미 백필로 여러 번 바뀐 과거 데이터를 다시 집계"하는 경로가 아니다.
 - **확인하고 싶은 것**: 그래도 실시간 추론이 매우 최근(예: 방금 지난 5분) 시각을
   읽을 때, 그 window가 아직 `PARTIAL`이거나 재시도 중이어서 완결되지 않은

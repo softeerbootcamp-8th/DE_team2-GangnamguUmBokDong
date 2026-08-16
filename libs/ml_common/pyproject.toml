@@ -1,7 +1,7 @@
 [project]
 name = "ml_common"
 version = "0.1.0"
-description = "feature_engineering/training/inference가 공유하는 파라미터·경로·핵심 알고리즘"
+description = "feature_engine/training/inference가 공유하는 파라미터·경로·핵심 알고리즘"
 requires-python = ">=3.11"
 dependencies = [
     "pandas",

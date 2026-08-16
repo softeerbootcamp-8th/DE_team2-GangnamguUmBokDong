@@ -65,8 +65,11 @@ services:
       AIRFLOW__CORE__EXECUTOR: LocalExecutor
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_AIRFLOW_DB:-airflow}
       AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-webserver:8080/execution/
+      AIRFLOW__CORE__AUTH_MANAGER: airflow.api_fastapi.auth.managers.simple.simple_auth_manager.SimpleAuthManager
       AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_USERS: ${AIRFLOW_ADMIN_USER:-admin}:admin
-      # BashOperator subprocess(collector/normalizer/nowcasting/ml/db-loader)가 컨테이너
+      AIRFLOW__API_AUTH__JWT_SECRET: "c29tZV9yYW5kb21fdmVyeV9sb25nX3NlY3JldF9rZXlfdGhhdF9tdXN0X2JlX2F0X2xlYXN0XzMyX2NoYXJz"
+      AIRFLOW__API__BASE_URL: http://localhost:${AIRFLOW_WEBSERVER_PORT:-8080}
+      # BashOperator subprocess(collector/normalizer/nowcasting/ml/loader)가 컨테이너
       # 내부에서 실제로 Postgres/MinIO에 붙도록, 호스트 관점 .env 값을 컨테이너 관점으로 덮어쓴다.
       DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_APP_DB:-app}
       S3_ENDPOINT_URL: http://minio:9000
@@ -90,7 +93,10 @@ services:
       AIRFLOW__CORE__EXECUTOR: LocalExecutor
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_AIRFLOW_DB:-airflow}
       AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-webserver:8080/execution/
+      AIRFLOW__CORE__AUTH_MANAGER: airflow.api_fastapi.auth.managers.simple.simple_auth_manager.SimpleAuthManager
       AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_USERS: ${AIRFLOW_ADMIN_USER:-admin}:admin
+      AIRFLOW__API_AUTH__JWT_SECRET: "c29tZV9yYW5kb21fdmVyeV9sb25nX3NlY3JldF9rZXlfdGhhdF9tdXN0X2JlX2F0X2xlYXN0XzMyX2NoYXJz"
+      AIRFLOW__API__BASE_URL: http://localhost:${AIRFLOW_WEBSERVER_PORT:-8080}
       DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_APP_DB:-app}
       S3_ENDPOINT_URL: http://minio:9000
     ports:
@@ -117,7 +123,10 @@ services:
       AIRFLOW__CORE__EXECUTOR: LocalExecutor
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_AIRFLOW_DB:-airflow}
       AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-webserver:8080/execution/
+      AIRFLOW__CORE__AUTH_MANAGER: airflow.api_fastapi.auth.managers.simple.simple_auth_manager.SimpleAuthManager
       AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_USERS: ${AIRFLOW_ADMIN_USER:-admin}:admin
+      AIRFLOW__API_AUTH__JWT_SECRET: "c29tZV9yYW5kb21fdmVyeV9sb25nX3NlY3JldF9rZXlfdGhhdF9tdXN0X2JlX2F0X2xlYXN0XzMyX2NoYXJz"
+      AIRFLOW__API__BASE_URL: http://localhost:${AIRFLOW_WEBSERVER_PORT:-8080}
       DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_APP_DB:-app}
       S3_ENDPOINT_URL: http://minio:9000
     volumes:
@@ -142,6 +151,9 @@ services:
       AIRFLOW__CORE__EXECUTOR: LocalExecutor
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_AIRFLOW_DB:-airflow}
       AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-webserver:8080/execution/
+      AIRFLOW__CORE__AUTH_MANAGER: airflow.api_fastapi.auth.managers.simple.simple_auth_manager.SimpleAuthManager
+      AIRFLOW__API_AUTH__JWT_SECRET: "c29tZV9yYW5kb21fdmVyeV9sb25nX3NlY3JldF9rZXlfdGhhdF9tdXN0X2JlX2F0X2xlYXN0XzMyX2NoYXJz"
+      AIRFLOW__API__BASE_URL: http://localhost:${AIRFLOW_WEBSERVER_PORT:-8080}
     volumes:
       - ../..:/workspace
     depends_on:

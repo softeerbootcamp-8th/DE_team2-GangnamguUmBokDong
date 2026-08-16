@@ -1,7 +1,7 @@
 """predict_single.py의 두 가지 API 계약을 검증한다 (PR 리뷰에서 지적된 문제 재발 방지).
 
 1. **5분 tick 단위 시각 지정** — 공개 API가 `date`+`hour`만 받으면 17:05/17:10/17:15
-   같은 요청을 전부 17:00 기준으로 뭉개 계산하게 된다(feature_engineering의 학습
+   같은 요청을 전부 17:00 기준으로 뭉개 계산하게 된다(feature_engine의 학습
    그리드는 5분 tick인데 서빙 인터페이스가 그 정밀도를 못 받는 문제). `minute`
    인자가 실제로 target_ts/lag·rolling 앵커에 반영되는지 확인한다.
 2. **배치 실패의 완결성 계약** — `predict_demand_multi_hour_all_stations()`가 일부

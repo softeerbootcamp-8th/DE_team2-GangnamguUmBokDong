@@ -145,7 +145,7 @@ def _resolve_rental_stations(trips: pd.DataFrame) -> pd.DataFrame:
     station_master에 실제로 존재하는 station_id인지만 확인한다. 대여소가 이상값이거나
     station_master에 없는 트립(폐쇄 대여소 등)은 대여 쪽(`station_id`)이면 행 자체를
     제외하고, 반납 쪽(`end_station_id`)이면 NaN으로 남겨 반납 집계에서만 빠지게 한다
-    (`feature_engineering/spark/build_targets.py`의 배치 경로와 같은 원칙 — raw 숫자
+    (`feature_engine/spark/build_targets.py`의 배치 경로와 같은 원칙 — raw 숫자
     대여이력 CSV를 읽는 그쪽은 `_normalize_station_no()`를 그대로 쓴다, 서로 다른 원본
     포맷이라 별개로 둔다).
 
@@ -184,7 +184,7 @@ def _get_history_by_station(anchor_ts: pd.Timestamp) -> dict[str, pd.DataFrame]:
     """station_id -> (rental_count, return_count)를 hour_ts로 인덱싱한 DataFrame.
 
     원본 트립(`_get_raw_rental_trips()`)에서 직접 집계한다 —
-    `feature_engineering.build_targets.future_rolling_counts()`와 같은 정의
+    `feature_engine.build_targets.future_rolling_counts()`와 같은 정의
     ("[t, t+TARGET_HORIZON_MINUTES분) 동안 시작/종료된 트립 수")를, 대여는
     station_id(대여 정류소)·start_dt 기준으로, 반납은 end_station_id(반납 정류소)·
     end_dt 기준으로 계산한다. `_lag_rolling_features()`가 실제로 조회하는 시각은
@@ -408,7 +408,7 @@ def _rental_visible_batch_all_stations(
 def _get_station_master() -> pd.DataFrame:
     """Silver `station` 정류소 마스터를 station_id 인덱스로 캐시해 반환한다.
 
-    (feature_engineering이 쓰는 1차정제 산출물 `config.STATION_MASTER_PARQUET`와는
+    (feature_engine이 쓰는 1차정제 산출물 `config.STATION_MASTER_PARQUET`와는
     별개 — 이건 collector Silver의 station_master를 실시간 조회용으로 직접 읽는다.
     두 소스가 정류소 신설/폐쇄 시점에 따라 잠깐 어긋날 수 있으나, 서빙은 항상
     "지금 실제로 존재하는 정류소" 기준이어야 하므로 Silver를 우선한다.)
@@ -782,7 +782,7 @@ def _target_timestamp(date: str, hour: int, minute: int = 0) -> pd.Timestamp:
     """date+hour+minute을 target_ts로 조합한다.
 
     `minute`은 반드시 `config.GRID_TICK_MINUTES`(5분)의 배수여야 한다 — 그보다
-    더 잘게 쪼갠 시각을 요청해도 학습 데이터(feature_engineering의 5분 tick
+    더 잘게 쪼갠 시각을 요청해도 학습 데이터(feature_engine의 5분 tick
     그리드)에 대응하는 tick이 없어서 lag/rolling 앵커가 의미를 잃는다.
 
     args:
@@ -1025,7 +1025,7 @@ def _build_feature_row(
     df.attrs["population_fallback"] = population_fallback
 
     # Python 스칼라로 조립한 행이라 기본 float64/int64로 들어와 있다 — 학습 데이터
-    # (feature_engineering이 다운캐스트한 float32/int8/int16, ml_common.model_contract.FEATURE_COLUMN_DTYPES)와
+    # (feature_engine이 다운캐스트한 float32/int8/int16, ml_common.model_contract.FEATURE_COLUMN_DTYPES)와
     # dtype을 맞춘다. 값 자체는 바뀌지 않지만(LightGBM은 어차피 내부적으로 캐스팅해서
     # 예측 결과에 영향 없음) 학습/서빙 스키마가 정확히 일치해야 한다는 이 프로젝트의
     # 원칙(model_contract.py 모듈 docstring)을 dtype까지 지키기 위함.
@@ -1290,7 +1290,7 @@ def predict_demand_multi_hour_all_stations(
     """전체(또는 지정한) 정류소를 station×horizon 전체 배치로 묶어서 한 번에 예측한다.
 
     날씨(temp/precip/wind/humidity)는 서울 전체가 관측소 하나를 공유하는
-    실제 데이터 구조(`feature_engineering/DATA_CATALOG.md` 1.4절)와 같은 이유로 모든
+    실제 데이터 구조(`feature_engine/DATA_CATALOG.md` 1.4절)와 같은 이유로 모든
     정류소에 동일하게 적용한다(horizon별 값은 허용 — `_resolve_weather_for_horizon()`
     참고). 인구는 정류소마다 속한 250m 격자가 달라 하나의 값을 공유할 수 없으므로
     항상 `population=None`(정류소별 격자 평소 인구로 자동 대체)으로 둔다.
@@ -1518,7 +1518,7 @@ def predict_rental_demand(
         population: 그 정류소가 속한 250m 격자의 생활인구 합계. None이면 Silver
             `living_population_per_population_grid`에서 실시간 조회를 먼저 시도하고,
             그마저 없으면 그 격자의 평소 인구(hour, dow 기준)로 자동 대체된다
-        minute: 0~59 중 5분 배수 (기본값 0) — feature_engineering의 학습 그리드가
+        minute: 0~59 중 5분 배수 (기본값 0) — feature_engine의 학습 그리드가
             5분 tick이라, 이 값을 안 주면 예를 들어 17:05/17:10/17:15 요청이 전부
             17:00 기준으로 계산돼 lag/rolling이 실제 시각과 어긋난다.
         horizon: 몇 시간 뒤를 예측할지(1~HORIZON_COUNT, 기본값 1). 여러 horizon을

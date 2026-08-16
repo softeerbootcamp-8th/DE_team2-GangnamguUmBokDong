@@ -1,4 +1,4 @@
-"""db-loader CLI를 실행하는 태스크 빌더."""
+"""loader CLI를 실행하는 태스크 빌더."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ from config.schedules import DB_LOADER_EXECUTION_TIMEOUT
 from orchestration.task_builder import REPO_ROOT, build_module_task
 from orchestration.templates import KST_WINDOW_START
 
-DB_LOADER_DIR = str(REPO_ROOT / "db-loader")
+DB_LOADER_DIR = str(REPO_ROOT / "loader")
 
 
 def build_db_loader_task(dag, table: str, *, trigger_rule="all_success"):

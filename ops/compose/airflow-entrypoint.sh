@@ -16,7 +16,7 @@ case "${1:-api-server}" in
         uv run airflow db migrate
         # 5개 모듈은 Airflow와 별개의 uv 프로젝트다 — BashOperator가 처음 스케줄될 때
         # 콜드 네트워크 sync로 타임아웃을 먹지 않도록 컨테이너 기동 시 한 번 예열해둔다.
-        for proj in collector seoul-pop-normalizer seoul-pop-nowcasting ml/inference db-loader; do
+        for proj in collector normalizer nowcaster ml/inference loader; do
             (cd "/workspace/$proj" && uv sync --frozen)
         done
         ;;

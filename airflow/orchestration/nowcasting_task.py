@@ -10,7 +10,7 @@ from config.schedules import NOWCASTING_EXECUTION_TIMEOUT
 from orchestration.task_builder import REPO_ROOT, build_module_task
 from orchestration.templates import KST_DATE
 
-NOWCASTING_DIR = str(REPO_ROOT / "seoul-pop-nowcasting")
+NOWCASTING_DIR = str(REPO_ROOT / "nowcaster")
 
 
 def build_nowcasting_task(dag):

@@ -1,7 +1,7 @@
-"""`src/`(로컬 pandas 학습·추론)와 `feature_engineering/`(EMR Spark 배포용)이 공유하는
+"""`src/`(로컬 pandas 학습·추론)와 `feature_engine/`(EMR Spark 배포용)이 공유하는
 파라미터·기준값 — 이 파일 하나만 두 패키지가 같이 참조한다.
 
-**왜 따로 뺐는가**: 두 패키지는 서로를 import하면 안 된다 — `feature_engineering/`은
+**왜 따로 뺐는가**: 두 패키지는 서로를 import하면 안 된다 — `feature_engine/`은
 EMR에 단독으로 올라가는 걸 전제로 하고, `src/`는 로컬 pandas/LightGBM 스택이라
 pyspark가 없어도 돌아가야 한다. 그런데 point-in-time censoring 윈도우(embargo 등)나
 LightGBM 하이퍼파라미터처럼 **두 쪽이 반드시 같은 값을 써야 하는** 상수들이 있다 —
@@ -20,7 +20,7 @@ LightGBM 하이퍼파라미터처럼 **두 쪽이 반드시 같은 값을 써야
 `scripts/run_embargo_sweep.py`류 스크립트가 실험 중 값을 임시로 바꿀 때 사용)는
 프로필 값 위에 한 번 더 덮어쓸 수 있게 유지한다 — 우선순위는
 "개별 환경변수 > 프로필 파일 > (프로필 파일도 없을 때만 쓰는 하드코드 기본값 없음,
-프로필 파일이 최종 소스)". `src/config.py`/`feature_engineering/spark/config.py`는 지금처럼
+프로필 파일이 최종 소스)". `src/config.py`/`feature_engine/spark/config.py`는 지금처럼
 `common_config.XXX`를 그대로 참조하면 되고 인터페이스는 바뀌지 않는다.
 """
 
@@ -68,7 +68,7 @@ GRID_TICK_MINUTES = _int_env("GRID_TICK_MINUTES", _PROFILE["GRID_TICK_MINUTES"])
 # --- 배치예측 horizon(몇 시간 뒤까지 한 번에 예측하는지) ---
 # lag/rolling(직전 실적)은 항상 "지금(T0)" 기준으로 고정하고, horizon(1..HORIZON_COUNT)을
 # feature로 모델에 직접 알려준다 — horizon마다 별도 모델을 두거나 재귀 예측(오차 누적)을
-# 쓰지 않는 이유는 history.md 18번 항목 참고. feature_engineering의 multi-horizon self-join
+# 쓰지 않는 이유는 history.md 18번 항목 참고. feature_engine의 multi-horizon self-join
 # 범위와 inference의 기본 예측 구간 수가 이 값 하나를 같이 참조한다.
 HORIZON_COUNT = _int_env("HORIZON_COUNT", _PROFILE["HORIZON_COUNT"])
 
@@ -76,7 +76,7 @@ HORIZON_COUNT = _int_env("HORIZON_COUNT", _PROFILE["HORIZON_COUNT"])
 LAG_HOURS = _PROFILE["LAG_HOURS"]  # t-1h, 전일 동시간, 전주 동요일 동시간
 ROLLING_WINDOWS = _PROFILE["ROLLING_WINDOWS"]  # rolling mean/std
 
-# --- 모델 입력 feature 스키마(lag/rolling 제외) — feature_engineering이 만들고, training이
+# --- 모델 입력 feature 스키마(lag/rolling 제외) — feature_engine이 만들고, training이
 # 학습에 쓰고, inference가 동일 순서로 맞춰야 하는 "모델 계약"의 일부라 공유한다.
 BASE_FEATURE_COLUMNS = [
     "station_id",
@@ -125,11 +125,11 @@ CONFORMAL_TARGET_COVERAGE = _float_env("CONFORMAL_TARGET_COVERAGE", _PROFILE["CO
 
 # 재고 스냅샷 결측(~1.1%)은 "알 수 없음"이므로 exposure=1(정상 운영)로 간주.
 # 품절(stockout) 시간대는 대여가 사실상 불가능하지만 완전히 0은 아니므로 작은 값으로
-# 근사한다. feature_engineering(학습 데이터의 exposure 계산)와 inference(서빙 시점
+# 근사한다. feature_engine(학습 데이터의 exposure 계산)와 inference(서빙 시점
 # rental_exposure 계산)가 정확히 같은 값을 써야 하므로 공유한다.
 EXPOSURE_STOCKOUT_VALUE = 0.05
 
-# --- 증분 피처마트 생성 (feature_engineering/spark/run_pipeline.py) ---
+# --- 증분 피처마트 생성 (feature_engine/spark/run_pipeline.py) ---
 # lag_168h(7일)보다 넉넉한 안전 마진 — 짧으면 신규 구간 초반 며칠의 lag/rolling이
 # 과거를 못 보고 결측/오류가 날 수 있다.
 INCREMENTAL_LOOKBACK_HOURS = _int_env("INCREMENTAL_LOOKBACK_HOURS", _PROFILE["INCREMENTAL_LOOKBACK_HOURS"])

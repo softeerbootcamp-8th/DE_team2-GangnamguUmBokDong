@@ -1,4 +1,4 @@
-"""학습(feature_engineering/spark/build_features.py, 배치)과 추론(predict_single.py,
+"""학습(feature_engine/spark/build_features.py, 배치)과 추론(predict_single.py,
 단일 시점)이 같은 트립 데이터에 대해 rental_lag_1h/roll_mean_std_3h·24h를 정확히
 같은 값으로 계산하는지 확인한다.
 
@@ -9,12 +9,12 @@ count_visible_in_window()을 anchor마다 반복 호출하는 방식으로 구�
 이 대조가 없으면 두 경로가 조용히 어긋나도 알아챌 방법이 없다.
 
 **실제 서비스가 쓰는 Spark 구현(`_add_rental_lag_rolling`)을 그대로 불러다 비교한다**
-— 예전엔 저장소 밖으로 빠진 `feature_engineering/legacy/features.py`(옛 pandas
+— 예전엔 저장소 밖으로 빠진 `feature_engine/legacy/features.py`(옛 pandas
 2차정제)와 비교했는데, 그 코드가 이 저장소에 없어서 테스트가 깨져 있었다. Spark
-로직을 직접 검증 대상으로 삼으므로, **pyspark가 있는 venv(`feature_engineering/.venv`)
+로직을 직접 검증 대상으로 삼으므로, **pyspark가 있는 venv(`feature_engine/.venv`)
 로 실행해야 한다** — `inference/.venv`에는 pyspark가 없어 `pytest.importorskip`으로
 자동 skip된다:
-    cd ml && ./feature_engineering/.venv/bin/python -m pytest inference/tests/dev_rental_censoring_cross_parity.py -q
+    cd ml && ./feature_engine/.venv/bin/python -m pytest inference/tests/dev_rental_censoring_cross_parity.py -q
 """
 
 import os
@@ -25,8 +25,8 @@ from ml_common.rolling_window_features import censored_rolling_counts
 
 pyspark = pytest.importorskip("pyspark")
 
-from feature_engineering.spark import config as fe_config
-from feature_engineering.spark.build_features import _add_rental_lag_rolling
+from feature_engine.spark import config as fe_config
+from feature_engine.spark.build_features import _add_rental_lag_rolling
 
 from inference import predict_single as ps
 
@@ -39,7 +39,7 @@ def spark():
 
     os.environ.setdefault("PYSPARK_PYTHON", sys.executable)
     os.environ.setdefault("PYSPARK_DRIVER_PYTHON", sys.executable)
-    # timestamp_ntz/timestamp(tz-aware) 왕복 어긋남 방지 — feature_engineering/spark_session.py 참고.
+    # timestamp_ntz/timestamp(tz-aware) 왕복 어긋남 방지 — feature_engine/spark_session.py 참고.
     os.environ.setdefault("TZ", "Asia/Seoul")
 
     session = (
