@@ -24,13 +24,32 @@ def test_realtime_collection_schedule() -> None:
 
 
 def test_realtime_collection_tasks() -> None:
-    """실시간 source마다 Collector Task가 생성되는지 검증한다."""
-    expected_task_ids = {
-        f"collect_{source_id}"
-        for source_id in REALTIME_SOURCES
+    """실시간 source Task + 정규화 Task 2개가 모두 생성되는지 검증한다."""
+    expected_task_ids = {f"collect_{source_id}" for source_id in REALTIME_SOURCES} | {
+        "normalize_pop_grid",
+        "normalize_pop_grid_fallback",
     }
 
     assert set(dag.task_ids) == expected_task_ids
+
+
+def test_normalize_pop_grid_depends_on_population_realtime() -> None:
+    """normalize_pop_grid는 collect_population_realtime의 다운스트림이어야 한다."""
+    collect_population = dag.get_task("collect_population_realtime")
+    normalize = dag.get_task("normalize_pop_grid")
+
+    assert normalize.task_id in {t.task_id for t in collect_population.downstream_list}
+
+
+def test_normalize_pop_grid_fallback_only_runs_after_all_failed() -> None:
+    """fallback은 normalize_pop_grid 재시도가 모두 실패했을 때만 실행돼야 한다(strict 실패 시 latest로 재시도)."""
+    normalize = dag.get_task("normalize_pop_grid")
+    fallback = dag.get_task("normalize_pop_grid_fallback")
+
+    assert fallback.trigger_rule == "all_failed"
+    assert fallback.task_id in {t.task_id for t in normalize.downstream_list}
+    assert "--baseline-date-mode latest" in fallback.bash_command
+    assert "--baseline-date-mode" not in normalize.bash_command
 
 
 def test_collector_task_execution_contract() -> None:
