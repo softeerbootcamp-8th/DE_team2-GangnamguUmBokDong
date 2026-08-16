@@ -43,6 +43,9 @@ jobs:
       - name: Start test infrastructure
         run: make up
 
+      - name: Fix permissions from Docker root
+        run: sudo chown -R $USER:$USER .
+
       - name: Test
         run: make test-ci
 
