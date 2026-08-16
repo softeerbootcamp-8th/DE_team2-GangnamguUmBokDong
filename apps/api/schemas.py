@@ -7,7 +7,7 @@ ActionType = Literal["supply_needed", "retrieval_needed", "normal"]
 
 
 class StationSummary(BaseModel):
-    sta_id: int
+    sta_id: str
     sta_nm: str
     gu: str
     lat: float
@@ -32,14 +32,14 @@ class ForecastPoint(BaseModel):
 
 
 class ForecastResponse(BaseModel):
-    sta_id: int
+    sta_id: str
     base_dttm: datetime
     points: list[ForecastPoint]
     reasons: list[str]
 
 
 class Alert(BaseModel):
-    sta_id: int
+    sta_id: str
     sta_nm: str
     action_type: ActionType
     urgency_score: float
