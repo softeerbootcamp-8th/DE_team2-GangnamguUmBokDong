@@ -30,11 +30,37 @@ import math
 
 from pyspark.sql import DataFrame, SparkSession, Window
 from pyspark.sql import functions as F
+from pyspark.sql.types import FloatType, ShortType
 
 from . import config
-from .rolling_window_features import lookup_count_at_ticks
+from .rolling_window_features import _unix_seconds_ntz, lookup_count_at_ticks
 
 HOUR_SECONDS = 3600
+
+# build_merged_table.py의 NATIVE_COLUMN_DTYPES는 그 파일이 직접 만드는 컬럼만 다운캐스트한다 —
+# 이 파일이 나중에 계산해서 붙이는 컬럼(rolling mean/std, 순환 인코딩, exposure)은 캐스트가
+# 없어서 Spark 집계 함수(F.avg/F.stddev)의 기본 반환 타입인 double로 그대로 남아 있었다
+# (263M행 규모에서 이 13개 컬럼만으로 행당 58바이트, 전체로는 수 GB~십수 GB 차이 — 실측
+# 기반 값 범위: rolling mean/std는 최대 수십 단위, sin/cos는 [-1,1], exposure는 [0.05,1.0]
+# 이라 float32로 정밀도 손실 없음). rental_lag_1h만 `rolling_rental_features`의 카운트
+# 조회 결과라 다른 lag_24h/168h(둘 다 ShortType 유지)와 다르게 long으로 남는다 — 실측
+# max=96이라 int16(ShortType)에 안전하게 들어간다.
+_COMPUTED_FLOAT_COLUMNS = [
+    "rental_roll_mean_3h", "rental_roll_std_3h", "rental_roll_mean_24h", "rental_roll_std_24h",
+    "return_roll_mean_3h", "return_roll_std_3h", "return_roll_mean_24h", "return_roll_std_24h",
+    "hour_sin", "hour_cos", "dow_sin", "dow_cos",
+    "rental_exposure",
+]
+_COMPUTED_SHORT_COLUMNS = ["rental_lag_1h"]
+
+
+def _downcast_computed_columns(df: DataFrame) -> DataFrame:
+    """이 파일이 계산해서 붙인 컬럼들을 값 범위에 맞는 최소 타입으로 다운캐스트한다."""
+    for col in _COMPUTED_FLOAT_COLUMNS:
+        df = df.withColumn(col, F.col(col).cast(FloatType()))
+    for col in _COMPUTED_SHORT_COLUMNS:
+        df = df.withColumn(col, F.col(col).cast(ShortType()))
+    return df
 
 
 def _add_cyclical(df: DataFrame) -> DataFrame:
@@ -76,7 +102,7 @@ def _add_return_lag_rolling(df: DataFrame) -> DataFrame:
     for lag in config.LAG_HOURS:
         df = _exact_hour_lag(df, "return_count", lag, f"return_lag_{lag}h")
 
-    df = df.withColumn("_hour_ts_unix", F.unix_timestamp("hour_ts"))
+    df = df.withColumn("_hour_ts_unix", _unix_seconds_ntz(F.col("hour_ts")))
     w_order = Window.partitionBy("station_id").orderBy("_hour_ts_unix")
     for window in config.ROLLING_WINDOWS:
         w_roll = w_order.rangeBetween(-window * HOUR_SECONDS, -1)  # 직전 window시간, 현재 시점 제외
@@ -114,7 +140,7 @@ def _add_rental_lag_rolling(spark: SparkSession, df: DataFrame, rolling_parquet_
             continue
         df = _exact_hour_lag(df, "rental_count", lag, f"rental_lag_{lag}h")
 
-    df = df.withColumn("_hour_ts_unix", F.unix_timestamp("hour_ts"))
+    df = df.withColumn("_hour_ts_unix", _unix_seconds_ntz(F.col("hour_ts")))
     w_order = Window.partitionBy("station_id").orderBy("_hour_ts_unix")
     tick_seconds = config.GRID_TICK_MINUTES * 60
     for window in config.ROLLING_WINDOWS:
@@ -154,6 +180,7 @@ def build_features(spark: SparkSession, df: DataFrame, rolling_parquet_path: str
     df = _add_return_lag_rolling(df)
     df = _add_rental_lag_rolling(spark, df, rolling_path)
     df = _add_exposure(df)
+    df = _downcast_computed_columns(df)
     return df
 
 

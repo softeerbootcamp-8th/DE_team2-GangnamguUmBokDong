@@ -14,15 +14,15 @@ from . import paths
 
 
 def normalize_station_no(series: pd.Series) -> pd.Series:
-    """대여소번호 컬럼을 5자리 zero-padding 문자열로 정규화한다 ('\\N'은 결측 처리).
+    """대여소번호 컬럼을 5자리 zero-padding 문자열로 정규화한다 ('\\N'과 숫자로 못 바꾸는 값은 결측 처리).
 
     args:
         series: start_st 또는 end_st 컬럼 (문자열, 0-padding 불일치 + '\\N' 포함 가능)
     returns:
-        pd.Series: 5자리로 zfill된 문자열, '\\N'이었던 자리는 NaN
+        pd.Series: 5자리로 zfill된 문자열, '\\N'이거나 숫자가 아니었던 자리는 NaN
     """
-    numeric = series.where(series != "\\N")
-    return numeric.astype("Int64").astype(str).str.zfill(5).where(numeric.notna())
+    numeric = pd.to_numeric(series.where(series != "\\N"), errors="coerce").astype("Int64")
+    return numeric.astype(str).str.zfill(5).where(numeric.notna())
 
 
 def load_rental_trip_events(verbose: bool = True) -> pd.DataFrame:
