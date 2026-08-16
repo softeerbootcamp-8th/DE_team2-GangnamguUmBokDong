@@ -22,7 +22,7 @@ export default function App() {
   const [stations, setStations] = useState<StationSummary[]>([]);
   const [stationsUpdatedAt, setStationsUpdatedAt] = useState<Date | null>(null);
   const [alerts, setAlerts] = useState<Alert[]>([]);
-  const [selectedStationId, setSelectedStationId] = useState<number | null>(null);
+  const [selectedStationId, setSelectedStationId] = useState<string | null>(null);
   const [forecast, setForecast] = useState<ForecastResponse | null>(null);
   // 기본값은 공급필요만(이슈 #63) — 트럭 기사의 실제 작업 순서(어디가 비었나
   // -> 그 주변에서 뭘 가져올까)에 맞춘다. "모두 보기"는 그 전 동작으로 돌아가는
@@ -67,7 +67,7 @@ export default function App() {
     }
     let cancelled = false;
     function refresh() {
-      api.forecast(selectedStationId as number).then((data) => {
+      api.forecast(selectedStationId as string).then((data) => {
         if (!cancelled) setForecast(data);
       });
     }

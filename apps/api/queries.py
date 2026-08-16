@@ -17,9 +17,9 @@ def _rows_as_dicts(cur) -> list[dict]:
     return [dict(zip(columns, row)) for row in cur.fetchall()]
 
 
-def _group_by_sta_id(rows: list[dict]) -> dict[int, list[dict]]:
+def _group_by_sta_id(rows: list[dict]) -> dict[str, list[dict]]:
     """sta_id 컬럼 기준으로 행을 묶는다(그 컬럼은 결과 dict에서 빠진다)."""
-    grouped: dict[int, list[dict]] = defaultdict(list)
+    grouped: dict[str, list[dict]] = defaultdict(list)
     for row in rows:
         sta_id = row.pop("sta_id")
         grouped[sta_id].append(row)
@@ -46,7 +46,7 @@ def fetch_stations() -> list[dict]:
         return _rows_as_dicts(cur)
 
 
-def fetch_station(sta_id: int) -> dict | None:
+def fetch_station(sta_id: str) -> dict | None:
     """대여소 하나의 마스터 + 최신 재고를 반환한다. 없으면 None."""
     query = """
         SELECT s.sta_id, s.sta_nm, s.gu, s.sta_addr, s.lat, s.lon, s.hold_cnt,
@@ -67,7 +67,7 @@ def fetch_station(sta_id: int) -> dict | None:
         return rows[0] if rows else None
 
 
-def fetch_forecast_points(sta_id: int, now: datetime) -> list[dict]:
+def fetch_forecast_points(sta_id: str, now: datetime) -> list[dict]:
     """now 이후 시점의 예측 원본치(대여·반납량)를 시간순으로 반환한다."""
     query = """
         SELECT predicted_dttm, predicted_rent_cnt, predicted_return_cnt
@@ -80,7 +80,7 @@ def fetch_forecast_points(sta_id: int, now: datetime) -> list[dict]:
         return _rows_as_dicts(cur)
 
 
-def fetch_all_stock_history(sta_ids: list[int], now: datetime) -> dict[int, list[dict]]:
+def fetch_all_stock_history(sta_ids: list[str], now: datetime) -> dict[str, list[dict]]:
     """여러 대여소의 최근 재고 이력을 대여소당 1번이 아니라 쿼리 1번으로 가져와
     sta_id별로 묶어서 반환한다(/alerts처럼 전체 대여소를 훑는 경우 N+1을 피하려고)."""
     query = """
@@ -97,7 +97,7 @@ def fetch_all_stock_history(sta_ids: list[int], now: datetime) -> dict[int, list
     return {sta_id: grouped.get(sta_id, []) for sta_id in sta_ids}
 
 
-def fetch_all_forecast_points(sta_ids: list[int], now: datetime) -> dict[int, list[dict]]:
+def fetch_all_forecast_points(sta_ids: list[str], now: datetime) -> dict[str, list[dict]]:
     """여러 대여소의 예측 원본치를 쿼리 1번으로 가져와 sta_id별로 묶어서 반환한다."""
     query = """
         SELECT sta_id, predicted_dttm, predicted_rent_cnt, predicted_return_cnt

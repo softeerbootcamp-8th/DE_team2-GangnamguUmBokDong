@@ -35,17 +35,18 @@ def seed() -> None:
     """STATIONS를 골드 테이블에 채운다. 몇 번을 다시 실행해도 결과가 같도록,
     대상 대여소의 기존 재고 이력·예측치를 먼저 지우고 새로 넣는다."""
     now = now_utc()
-    sta_ids = [station["sta_id"] for station in STATIONS]
+    sta_ids = [str(station["sta_id"]) for station in STATIONS]
 
     stock_rows = []
     forecast_rows = []
     for station in STATIONS:
+        sta_id = str(station["sta_id"])
         for minutes_ago, parking_bike_tot_cnt in station["stock_history"]:
-            stock_rows.append((station["sta_id"], now - timedelta(minutes=minutes_ago), parking_bike_tot_cnt))
+            stock_rows.append((sta_id, now - timedelta(minutes=minutes_ago), parking_bike_tot_cnt))
 
         for hour, (predicted_rent_cnt, predicted_return_cnt) in enumerate(station["demand_profile"], start=1):
             forecast_rows.append(
-                (station["sta_id"], now + timedelta(hours=hour), predicted_rent_cnt, predicted_return_cnt, now)
+                (sta_id, now + timedelta(hours=hour), predicted_rent_cnt, predicted_return_cnt, now)
             )
 
     with get_connection() as conn, conn.cursor() as cur:
@@ -72,7 +73,7 @@ def seed() -> None:
                 hold_cnt = EXCLUDED.hold_cnt
             """,
             [
-                (s["sta_id"], s["sta_nm"], s["gu"], s["sta_addr"], s["lat"], s["lon"], s["hold_cnt"])
+                (str(s["sta_id"]), s["sta_nm"], s["gu"], s["sta_addr"], s["lat"], s["lon"], s["hold_cnt"])
                 for s in STATIONS
             ],
         )
