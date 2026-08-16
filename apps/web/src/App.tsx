@@ -6,11 +6,16 @@ import { DetailPanel } from "./components/DetailPanel";
 import { ForecastPanel } from "./components/ForecastPanel";
 import { Header } from "./components/Header";
 import { StationMap } from "./components/StationMap";
+import type { MapFilterMode } from "./components/StationMap";
 import { StockPanel } from "./components/StockPanel";
 import { formatClock } from "./format";
 
 const POLL_INTERVAL_MS = 15_000;
 const FORECAST_POLL_INTERVAL_MS = 60_000;
+const MAP_FILTER_TABS: { key: MapFilterMode; label: string }[] = [
+  { key: "supply_only", label: "부족한것만" },
+  { key: "all", label: "모두 보기" },
+];
 const ALL_REGIONS = "all";
 
 export default function App() {
@@ -19,6 +24,10 @@ export default function App() {
   const [alerts, setAlerts] = useState<Alert[]>([]);
   const [selectedStationId, setSelectedStationId] = useState<string | null>(null);
   const [forecast, setForecast] = useState<ForecastResponse | null>(null);
+  // 기본값은 공급필요만(이슈 #63) — 트럭 기사의 실제 작업 순서(어디가 비었나
+  // -> 그 주변에서 뭘 가져올까)에 맞춘다. "모두 보기"는 그 전 동작으로 돌아가는
+  // 탈출구다.
+  const [mapFilterMode, setMapFilterMode] = useState<MapFilterMode>("supply_only");
   // 지도와 우선순위 리스트가 항상 같은 지역만 보여줘야 해서, 필터 상태를 두 패널의
   // 공통 부모인 여기서 들고 각각에 걸러진 배열을 내려보낸다. 지역센터 관할 경계는
   // 공개 자료가 없어 최근접 근사로 배정한 값이다(apps/api/regions.py 참고).
@@ -100,6 +109,20 @@ export default function App() {
                   </option>
                 ))}
               </select>
+              <div className="alert-tabs" role="tablist" aria-label="지도 표시 범위">
+                {MAP_FILTER_TABS.map((t) => (
+                  <button
+                    key={t.key}
+                    type="button"
+                    role="tab"
+                    aria-selected={mapFilterMode === t.key}
+                    className={`alert-tab${mapFilterMode === t.key ? " active" : ""}`}
+                    onClick={() => setMapFilterMode(t.key)}
+                  >
+                    {t.label}
+                  </button>
+                ))}
+              </div>
             </span>
             <span className="panel-meta">현황 기준 시각 {stationsUpdatedAt ? formatClock(stationsUpdatedAt) : "-"}</span>
           </div>
@@ -109,6 +132,7 @@ export default function App() {
               alerts={filteredAlerts}
               selectedStationId={selectedStationId}
               onSelect={setSelectedStationId}
+              mapFilterMode={mapFilterMode}
               regionCenters={regionCenters}
               selectedRegion={selectedRegion}
             />

@@ -76,6 +76,59 @@ function computeRegionCell(centers: DispatchCenter[], selectedRegion: string): [
   return outerRingsToLatLng(clipped.geometry);
 }
 
+export type MapFilterMode = "all" | "supply_only";
+
+// 트럭 기사는 "어디가 비었나 -> 그 주변에서 뭘 가져올까" 순서로 판단하므로,
+// 선택된 공급필요 대여소로부터 이 반경(직선거리) 안에 있는 회수필요 대여소만
+// 후보로 드러낸다. 너무 멀리서 끌어오면 실제 동선과 안 맞고, 너무 많이
+// 드러내면 오히려 "주변"이라는 의미가 흐려진다(이슈 #63).
+const NEARBY_RADIUS_KM = 1;
+const MAX_NEARBY_RETRIEVAL = 5;
+const EARTH_RADIUS_KM = 6371;
+
+function haversineKm(a: { lat: number; lon: number }, b: { lat: number; lon: number }): number {
+  const toRad = (deg: number) => (deg * Math.PI) / 180;
+  const dLat = toRad(b.lat - a.lat);
+  const dLon = toRad(b.lon - a.lon);
+  const sinLat = Math.sin(dLat / 2);
+  const sinLon = Math.sin(dLon / 2);
+  const h = sinLat * sinLat + Math.cos(toRad(a.lat)) * Math.cos(toRad(b.lat)) * sinLon * sinLon;
+  return 2 * EARTH_RADIUS_KM * Math.asin(Math.sqrt(h));
+}
+
+// "부족한것만" 모드에서는 공급필요 대여소만 기본으로 보여주고, 그중 하나를
+// 선택했을 때만 그 주변 회수필요 후보를 몇 개 더 드러낸다. "전체" 모드는
+// 필터링 없이 기존 동작(모든 대여소 표시) 그대로 둔다.
+function applyMapFilter(
+  stations: StationSummary[],
+  alertsByStation: Map<number, Alert>,
+  mode: MapFilterMode,
+  selectedStationId: number | null,
+): StationSummary[] {
+  if (mode === "all") return stations;
+
+  const supplyStations = stations.filter((s) => alertsByStation.get(s.sta_id)?.action_type === "supply_needed");
+  const visible = new Map(supplyStations.map((s) => [s.sta_id, s]));
+
+  const selectedStation = stations.find((s) => s.sta_id === selectedStationId);
+  const selectedIsSupply = selectedStation && alertsByStation.get(selectedStation.sta_id)?.action_type === "supply_needed";
+  if (selectedStation && selectedIsSupply) {
+    const retrievalStations = stations.filter((s) => alertsByStation.get(s.sta_id)?.action_type === "retrieval_needed");
+    const nearby = retrievalStations
+      .map((station) => ({ station, distanceKm: haversineKm(selectedStation, station) }))
+      .filter((x) => x.distanceKm <= NEARBY_RADIUS_KM)
+      .sort((a, b) => a.distanceKm - b.distanceKm)
+      .slice(0, MAX_NEARBY_RETRIEVAL);
+    for (const { station } of nearby) visible.set(station.sta_id, station);
+  }
+
+  // 선택된 대여소가 공급필요가 아니어도(예: 방금 드러난 회수필요 후보를 눌러
+  // 상세를 보는 중) 지도에서 갑자기 사라지면 혼란스러우니 항상 보이게 둔다.
+  if (selectedStation) visible.set(selectedStation.sta_id, selectedStation);
+
+  return [...visible.values()];
+}
+
 // 지도를 확대하면 도로·건물이 커지는데 마커만 화면 픽셀 크기 그대로 고정돼
 // 있으면 상대적으로 쪼그라들어 보여서 부자연스럽다. BASE_ZOOM보다 4레벨
 // 올라갈 때마다 2배, 내려갈 때마다 절반이 되도록 줌에 비례해 키우고 줄인다.
@@ -206,7 +259,15 @@ interface Props {
   selectedRegion: string;
 }
 
-function StationMarkers({ stations, alerts, selectedStationId, onSelect, regionCenters, selectedRegion }: Props) {
+function StationMarkers({
+  stations,
+  alerts,
+  selectedStationId,
+  onSelect,
+  mapFilterMode,
+  regionCenters,
+  selectedRegion,
+}: Props) {
   const [zoom, setZoom] = useState(DEFAULT_ZOOM);
   const [bounds, setBounds] = useState<L.LatLngBounds | null>(null);
   // zoomend가 아니라 zoom을 듣는다. zoom은 줌 애니메이션이 진행되는 동안
@@ -228,9 +289,17 @@ function StationMarkers({ stations, alerts, selectedStationId, onSelect, regionC
   const priorityOf = (station: StationSummary) =>
     zPriority(alertsByStation.get(station.sta_id), station.sta_id === selectedStationId);
 
-  // urgency_score 정렬은 stations/alerts가 바뀔 때만 다시 계산한다. 화면 범위가
-  // 바뀔 때는(팬/줌) 이미 정렬된 배열을 거르기만 한다.
-  const ranked = useMemo(() => rankByUrgency(stations, alertsByStation), [stations, alertsByStation]);
+  // "부족한것만" 모드에서는 랭킹/화면범위 필터링 전에 먼저 대여소 후보군 자체를
+  // 좁힌다(공급필요 + 선택된 대여소 주변 회수필요 후보). 이후 파이프라인은
+  // "전체" 모드와 동일하게 이 후보군 안에서 랭킹/화면범위로 자른다.
+  const filteredStations = useMemo(
+    () => applyMapFilter(stations, alertsByStation, mapFilterMode, selectedStationId),
+    [stations, alertsByStation, mapFilterMode, selectedStationId],
+  );
+
+  // urgency_score 정렬은 filteredStations/alerts가 바뀔 때만 다시 계산한다.
+  // 화면 범위가 바뀔 때는(팬/줌) 이미 정렬된 배열을 거르기만 한다.
+  const ranked = useMemo(() => rankByUrgency(filteredStations, alertsByStation), [filteredStations, alertsByStation]);
   const visible = useMemo(
     () => visibleStations(ranked, bounds, selectedStationId),
     [ranked, bounds, selectedStationId],
@@ -384,7 +453,15 @@ function StationMarkers({ stations, alerts, selectedStationId, onSelect, regionC
   );
 }
 
-export function StationMap({ stations, alerts, selectedStationId, onSelect, regionCenters, selectedRegion }: Props) {
+export function StationMap({
+  stations,
+  alerts,
+  selectedStationId,
+  onSelect,
+  mapFilterMode,
+  regionCenters,
+  selectedRegion,
+}: Props) {
   return (
     <MapContainer
       center={GANGNAM_CENTER}
@@ -404,6 +481,7 @@ export function StationMap({ stations, alerts, selectedStationId, onSelect, regi
         alerts={alerts}
         selectedStationId={selectedStationId}
         onSelect={onSelect}
+        mapFilterMode={mapFilterMode}
         regionCenters={regionCenters}
         selectedRegion={selectedRegion}
       />
