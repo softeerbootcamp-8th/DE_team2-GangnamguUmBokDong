@@ -62,7 +62,7 @@ def list_partition_dates(source_id: str) -> list[date]:
         for common_prefix in page.get("CommonPrefixes", []):
             dt_segment = common_prefix["Prefix"][len(prefix):].rstrip("/")
             if dt_segment.startswith("dt="):
-                dates.append(datetime.strptime(dt_segment[len("dt="):], "%Y-%m-%d").date())
+                dates.append(datetime.strptime(dt_segment[len("dt="):], "%Y-%m-%d").date())  # noqa: DTZ007
     return sorted(dates)
 
 

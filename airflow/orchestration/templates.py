@@ -11,7 +11,7 @@ collector/storage.py와 loader/s3_reader.py는 window_start 객체가 들고 있
 채워진다.
 """
 
-KST_WINDOW_START = '{{ dag_run.logical_date.astimezone(macros.dateutil.tz.gettz("Asia/Seoul")).isoformat() }}'
-KST_DATE = '{{ dag_run.logical_date.astimezone(macros.dateutil.tz.gettz("Asia/Seoul")).strftime("%Y-%m-%d") }}'
-KST_HOUR = '{{ dag_run.logical_date.astimezone(macros.dateutil.tz.gettz("Asia/Seoul")).hour }}'
-KST_MINUTE = '{{ dag_run.logical_date.astimezone(macros.dateutil.tz.gettz("Asia/Seoul")).minute }}'
+KST_WINDOW_START = '{{ (dag_run.logical_date or dag_run.start_date).astimezone(macros.dateutil.tz.gettz("Asia/Seoul")).isoformat() }}'
+KST_DATE = '{{ (dag_run.logical_date or dag_run.start_date).astimezone(macros.dateutil.tz.gettz("Asia/Seoul")).strftime("%Y-%m-%d") }}'
+KST_HOUR = '{{ (dag_run.logical_date or dag_run.start_date).astimezone(macros.dateutil.tz.gettz("Asia/Seoul")).hour }}'
+KST_MINUTE = '{{ (dag_run.logical_date or dag_run.start_date).astimezone(macros.dateutil.tz.gettz("Asia/Seoul")).minute }}'

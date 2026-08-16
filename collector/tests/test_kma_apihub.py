@@ -10,7 +10,11 @@ import httpx
 import pytest
 
 from adapters.base import FetchErrorKind, Window
-from adapters.kma_apihub import KmaApiHubAdapter, _adjust_base_time, _classify_result_code
+from adapters.kma_apihub import (
+    KmaApiHubAdapter,
+    _adjust_base_time,
+    _classify_result_code,
+)
 
 KST = ZoneInfo("Asia/Seoul")
 

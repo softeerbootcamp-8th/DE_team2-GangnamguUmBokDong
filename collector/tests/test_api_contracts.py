@@ -1,13 +1,14 @@
 import os
-import pytest
-import httpx
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from config import loader
-from adapters.base import get_adapter, Window
+import httpx
+import pytest
+
+import adapters.kma_apihub
 import adapters.seoul_openapi  # noqa: F401
-import adapters.kma_apihub     # noqa: F401
+from adapters.base import Window, get_adapter
+from config import loader
 
 KST = ZoneInfo("Asia/Seoul")
 

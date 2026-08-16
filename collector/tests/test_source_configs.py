@@ -36,8 +36,8 @@ def _api_keys(monkeypatch):
 
 
 class TestAllSourcesLoad:
-    def test_seven_sources_exist(self):
-        assert len(SOURCE_IDS) == 7
+    def test_nine_sources_exist(self):
+        assert len(SOURCE_IDS) == 9
 
     @pytest.mark.parametrize("source_id", SOURCE_IDS)
     def test_loads_without_error(self, source_id):

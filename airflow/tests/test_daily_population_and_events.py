@@ -25,6 +25,8 @@ def test_expected_tasks():
         "run_nowcasting_estimate",
         "collect_cultural_event",
         "load_cultural_events",
+        "collect_performance_event",
+        "load_cultural_events_performance",
     }
 
 

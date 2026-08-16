@@ -7,7 +7,11 @@ from airflow import DAG
 from airflow.timetables.trigger import CronTriggerTimetable
 
 from config.schedules import CATCHUP, DAILY_CRON, MAX_ACTIVE_RUNS, TIMEZONE
-from config.sources import DAILY_EVENT_SOURCE, DAILY_POPULATION_SOURCE, PERFORMANCE_EVENT_SOURCE
+from config.sources import (
+    DAILY_EVENT_SOURCE,
+    DAILY_POPULATION_SOURCE,
+    PERFORMANCE_EVENT_SOURCE,
+)
 from orchestration.collector_task import build_collector_task
 from orchestration.db_loader_task import build_db_loader_task
 from orchestration.nowcasting_task import build_nowcasting_task

@@ -121,15 +121,17 @@ export default function App() {
                       </span>
                       <span className="text-sm text-muted-foreground">현황 기준 시각 {stationsUpdatedAt ? formatClock(stationsUpdatedAt) : "-"}</span>
                     </div>
-                    <div className="flex-1 min-h-0 rounded-md border overflow-hidden">
-                      <StationMap
-                        stations={filteredStations}
-                        alerts={filteredAlerts}
-                        selectedStationId={selectedStationId}
-                        onSelect={setSelectedStationId}
-                        regionCenters={regionCenters}
-                        selectedRegion={selectedRegion}
-                      />
+                    <div className="flex-1 min-h-0 rounded-md border overflow-hidden relative">
+                      <div className="absolute inset-0 z-0">
+                        <StationMap
+                          stations={filteredStations}
+                          alerts={filteredAlerts}
+                          selectedStationId={selectedStationId}
+                          onSelect={setSelectedStationId}
+                          regionCenters={regionCenters}
+                          selectedRegion={selectedRegion}
+                        />
+                      </div>
                     </div>
                   </section>
                 </div>
