@@ -6,6 +6,7 @@ from scoring_config import (
     HALF_LIFE_MIN,
     RESPONSE_LAG_MIN,
     SEVERITY_SCALE,
+    SUPPLY_LOW_STOCK_RATIO,
 )
 
 
@@ -17,10 +18,11 @@ def enrich_forecast_points(current_stock: int, hold_cnt: int, raw_points: list[d
     실제로 정원을 넘는 대여소가 있기 때문이다.
     """
     predicted = current_stock
+    supply_threshold = SUPPLY_LOW_STOCK_RATIO * hold_cnt
     points = []
     for raw in raw_points:
         predicted = max(0, predicted + raw["predicted_return_cnt"] - raw["predicted_rent_cnt"])
-        if predicted == 0:
+        if predicted <= supply_threshold:
             action_type = "supply_needed"
         elif predicted >= hold_cnt:
             action_type = "retrieval_needed"
@@ -93,20 +95,22 @@ def _max_deficit(current: int, points: list[dict]) -> int:
     return max(0, -worst)
 
 
-def _max_unmet_demand(current: int, points: list[dict]) -> int:
-    """각 시간대가 시작할 때(직전 시간대가 끝난 시점) 재고가 이미 0이었는데, 그 시간대에
-    들어온 대여 수요(predicted_rent_cnt)의 최댓값을 찾는다. _max_deficit은 그 시간대가
-    끝날 때의 순누적 결과만 보므로, 그 안에서 반납이 대여보다 많이 들어와 순증가로
-    마감된 시간대(예: 재고 0에서 대여 1건·반납 2건 -> 재고 1로 회복)는 놓친다. 하지만
-    그 시간대 어느 순간 재고가 0이었는데 대여 수요가 있었다는 사실 자체는 남아 있으므로,
+def _max_unmet_demand(current: int, hold_cnt: int, points: list[dict]) -> int:
+    """각 시간대가 시작할 때(직전 시간대가 끝난 시점) 재고가 이미 정원의
+    SUPPLY_LOW_STOCK_RATIO 이하였는데, 그 시간대에 들어온 대여 수요(predicted_rent_cnt)의
+    최댓값을 찾는다. _max_deficit은 그 시간대가 끝날 때의 순누적 결과만 보므로, 그
+    안에서 반납이 대여만큼 들어와 재고가 그대로거나 오히려 회복된 시간대(예: 재고
+    1에서 대여 10건·반납 10건 -> 재고 1 유지)는 놓친다. 하지만 그 시간대 어느
+    순간 재고가 거의 바닥이었는데 대여 수요가 있었다는 사실 자체는 남아 있으므로,
     순누적과 별개로 이 신호를 따로 계산해 둘 중 더 심각한 쪽을 최종 심각도에 쓴다."""
+    threshold = SUPPLY_LOW_STOCK_RATIO * hold_cnt
     prev = current
-    vals = []
+    worst = 0
     for point in points:
-        if prev <= 0:
-            vals.append(point["predicted_rent_cnt"])
+        if prev <= threshold:
+            worst = max(worst, point["predicted_rent_cnt"])
         prev = point["predicted_bikes"]
-    return max(vals) if vals else 0
+    return worst
 
 
 def _severity(ratio: float) -> float:
@@ -123,20 +127,21 @@ def urgency_score(
 ) -> tuple[float, int, str]:
     """우선순위 점수 = 시급성(언제 위험해지나) × 심각도(그때 얼마나 아프나).
 
-    시급성: 즉시위험(지금 이미 0석/만재)/추세감지(최근 재고 추세로 1시간 안에
-    위험)/예측감지(예측 그래프상 처음 이상해지는 시점) 셋 중 가장 이른 시점을
-    쓴다. 트럭이 도착하는 데 RESPONSE_LAG_MIN이 걸리므로, 그보다 짧게 남은
-    시간은 "대응 여유가 없음"으로 취급해 전부 최대 긴급도로 묶는다.
+    시급성: 즉시위험(지금 이미 정원의 SUPPLY_LOW_STOCK_RATIO 이하/만재)/추세감지
+    (최근 재고 추세로 1시간 안에 위험)/예측감지(예측 그래프상 처음 이상해지는
+    시점) 셋 중 가장 이른 시점을 쓴다. 트럭이 도착하는 데 RESPONSE_LAG_MIN이
+    걸리므로, 그보다 짧게 남은 시간은 "대응 여유가 없음"으로 취급해 전부 최대
+    긴급도로 묶는다.
 
     심각도: 지금부터 예측 구간 전체에서 가장 심해지는 지점(회수필요는 정원을
     가장 크게 넘는 지점, 공급필요는 클램프 없이 뒀을 때 가장 깊이 마이너스로
-    내려가는 지점과, 재고 0인 채로 대여 수요가 들어온 시간대 중 더 심각한 쪽)을
-    찾아 정원 대비 비율로 바꾸고, 그 비율을 `_severity`로 0~1 사이 값으로
-    변환한다. 어느 시급성 경로(즉시위험/추세감지/예측감지)로 감지됐는지와
-    무관하게 항상 같은 방식으로 계산해서, 두 action_type의 점수가 같은 기준으로
-    비교 가능하다.
+    내려가는 지점과, 재고가 거의 바닥인 채로 대여 수요가 들어온 시간대 중 더
+    심각한 쪽)을 찾아 정원 대비 비율로 바꾸고, 그 비율을 `_severity`로 0~1
+    사이 값으로 변환한다. 어느 시급성 경로(즉시위험/추세감지/예측감지)로
+    감지됐는지와 무관하게 항상 같은 방식으로 계산해서, 두 action_type의 점수가
+    같은 기준으로 비교 가능하다.
     """
-    if current <= 0:
+    if current <= SUPPLY_LOW_STOCK_RATIO * hold_cnt:
         time_to_critical, action_type = 0.0, "supply_needed"
     elif current >= hold_cnt:
         time_to_critical, action_type = 0.0, "retrieval_needed"
@@ -162,7 +167,7 @@ def urgency_score(
     if action_type == "retrieval_needed":
         ratio = _max_overshoot(current, hold_cnt, points) / safe_hold_cnt
     else:
-        ratio = max(_max_deficit(current, points), _max_unmet_demand(current, points)) / safe_hold_cnt
+        ratio = max(_max_deficit(current, points), _max_unmet_demand(current, hold_cnt, points)) / safe_hold_cnt
     impact_factor = _severity(ratio)
 
     score = round(100 * time_factor * impact_factor, 1)
