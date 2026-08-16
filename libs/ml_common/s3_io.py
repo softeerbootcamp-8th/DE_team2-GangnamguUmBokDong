@@ -17,6 +17,7 @@ import json
 import os
 import re
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import boto3
@@ -98,18 +99,52 @@ def put_object_bytes(key: str, body: bytes) -> None:
 
 
 def read_parquet(key: str, columns: list[str] | None = None) -> pd.DataFrame | None:
-    """S3의 parquet 객체를 pandas DataFrame으로 읽는다.
+    """S3의 parquet을 pandas DataFrame으로 읽는다 — 파일 1개짜리 객체와 Spark가
+    쓰는 다중 파트 "디렉터리"(`key`가 실제 객체가 아니라 prefix이고 그 아래
+    `part-00000-....parquet` 여러 개 + `_SUCCESS`가 있는 형태) 둘 다 지원한다.
+
+    Spark의 `df.write.parquet(path)`는 파일 하나가 아니라 이런 다중 파트로 쓰는 게
+    기본 동작이라(`feature_engineering`이 만드는 모든 산출물이 이 형태), `key`
+    그대로의 GET이 실패하면(정확히 그 이름의 객체가 없으면) `key`를 prefix로 보고
+    그 아래 parquet 파일들을 찾아 병렬로 읽어 이어붙인다.
 
     args:
-        key: 읽을 parquet 객체의 전체 키
+        key: 읽을 parquet 객체의 전체 키, 또는 Spark 다중 파트 출력의 prefix
         columns: 읽을 컬럼만 지정(None이면 전체)
     returns:
-        pd.DataFrame, 키가 없으면 None
+        pd.DataFrame, 키(이자 prefix)가 아무것도 없으면 None
     """
     body = get_object_bytes(key)
-    if body is None:
+    if body is not None:
+        return pq.read_table(io.BytesIO(body), columns=columns).to_pandas()
+
+    prefix = key if key.endswith("/") else f"{key}/"
+    part_keys = sorted(k for k in list_keys(prefix) if k.endswith(".parquet"))
+    if not part_keys:
         return None
-    return pq.read_table(io.BytesIO(body), columns=columns).to_pandas()
+    frames = [df for df in read_parquet_many(part_keys, columns=columns) if df is not None]
+    return pd.concat(frames, ignore_index=True) if frames else None
+
+
+def read_parquet_many(keys: list[str], columns: list[str] | None = None, max_workers: int = 16) -> list[pd.DataFrame | None]:
+    """여러 parquet 키를 스레드로 병렬 조회한다.
+
+    실시간 Silver 소스가 5분 tick처럼 작은 파일로 잘게 쪼개져 있으면(예: 168시간
+    lookback을 5분 간격으로 읽으면 키가 2천 개 가까이 된다), 키마다 순차로
+    `read_parquet()`를 부르면 네트워크 왕복 지연이 그대로 누적된다. boto3 호출은
+    I/O 대기 동안 GIL을 놓아주므로 스레드 병렬화로 왕복 지연을 겹쳐 처리한다.
+
+    args:
+        keys: 읽을 키 목록
+        columns: 각 파일에서 읽을 컬럼(None이면 전체)
+        max_workers: 동시 요청 수
+    returns:
+        keys와 같은 순서의 DataFrame 목록 (해당 키가 없으면 그 자리에 None)
+    """
+    if not keys:
+        return []
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        return list(pool.map(lambda key: read_parquet(key, columns=columns), keys))
 
 
 def write_parquet(df: pd.DataFrame, key: str) -> None:

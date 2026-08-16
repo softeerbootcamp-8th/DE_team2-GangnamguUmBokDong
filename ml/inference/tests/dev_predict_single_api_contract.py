@@ -221,3 +221,85 @@ def test_predict_demand_multi_hour_all_stations_no_failures_when_all_known(monke
 
     assert outcome["failed"] == []
     assert outcome["expected_count"] == outcome["actual_count"] == 1
+
+
+def test_single_station_cli_saves_to_s3(monkeypatch):
+    """단일 정류소 CLI 실행 시 single_prediction_key 경로로 parquet이 저장되는지 검증한다."""
+    from ml_common import s3_io
+
+    trips = pd.DataFrame([_trip("ST-100", "2025-06-01 09:00:00", "2025-06-01 09:05:00")])
+    _set_rental_events(trips)
+    _set_history("ST-100", pd.date_range("2025-06-01 00:00", periods=200, freq="h"), [0] * 200, [0] * 200)
+    ps._station_profile = {}
+    ps._population_profile = {}
+    _set_station_master(["ST-100"])
+    ps._holidays = set()
+    monkeypatch.setattr(ps, "predict", _fake_predict)
+
+    saved_calls = []
+    monkeypatch.setattr(s3_io, "write_parquet", lambda df, key: saved_calls.append((df, key)))
+
+    argv = [
+        "--station-id", "ST-100",
+        "--date", "2025-06-01",
+        "--hour", "10",
+        "--minute", "0",
+        "--temp", "20.0",
+        "--precip", "0.0",
+        "--wind", "1.0",
+        "--humidity", "50.0",
+        "--stockout",
+    ]
+
+    ps.main(argv)
+
+    assert len(saved_calls) == 1
+    df, key = saved_calls[0]
+    assert key == "predictions/single/dt=2025-06-01/hh=10/ST-100_1000.parquet"
+    assert len(df) == 1
+    assert df["station_id"].iloc[0] == "ST-100"
+    assert "rental_pred_mean" in df.columns
+    assert "return_pred_mean" in df.columns
+
+
+def test_single_station_multi_hour_cli_saves_to_s3(monkeypatch):
+    """단일 정류소 다중 시간대(n_hours>1) CLI 실행 시 S3 저장 검증."""
+    from ml_common import s3_io
+
+    trips = pd.DataFrame([_trip("ST-100", "2025-06-01 09:00:00", "2025-06-01 09:05:00")])
+    _set_rental_events(trips)
+    _set_history("ST-100", pd.date_range("2025-06-01 00:00", periods=200, freq="h"), [0] * 200, [0] * 200)
+    ps._station_profile = {}
+    ps._population_profile = {}
+    _set_station_master(["ST-100"])
+    ps._holidays = set()
+    monkeypatch.setattr(ps, "predict", _fake_predict)
+
+    saved_calls = []
+    monkeypatch.setattr(s3_io, "write_parquet", lambda df, key: saved_calls.append((df, key)))
+
+    argv = [
+        "--station-id", "ST-100",
+        "--date", "2025-06-01",
+        "--hour", "10",
+        "--minute", "0",
+        "--temp", "20.0",
+        "--precip", "0.0",
+        "--wind", "1.0",
+        "--humidity", "50.0",
+        "--stockout",
+        "--n-hours", "3",
+    ]
+
+    try:
+        ps.main(argv)
+    except SystemExit:
+        pass
+
+    assert len(saved_calls) == 1
+    df, key = saved_calls[0]
+    assert key == "predictions/single/dt=2025-06-01/hh=10/ST-100_1000.parquet"
+    assert len(df) == 3
+    assert list(df["horizon"]) == [1, 2, 3]
+
+
