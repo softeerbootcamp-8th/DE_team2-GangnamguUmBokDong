@@ -20,8 +20,8 @@ const TABS: { key: Tab; label: string }[] = [
 
 interface Props {
   alerts: Alert[];
-  selectedStationId: number | null;
-  onSelect: (stationId: number) => void;
+  selectedStationId: string | null;
+  onSelect: (stationId: string) => void;
 }
 
 export function AlertList({ alerts, selectedStationId, onSelect }: Props) {
