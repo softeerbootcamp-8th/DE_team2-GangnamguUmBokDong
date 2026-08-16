@@ -1,23 +1,20 @@
-"""2025년 대여이력 -> station별 point-in-time 대여 카운트 (PySpark 포팅).
+"""Silver `bike_rental_history` -> station별 point-in-time 대여 카운트 (PySpark).
 
-`src/build_rolling_rental_features.py`(pandas, 로컬 검증용)와 동일한 규칙으로
-station_master 크로스워크 매칭 후 `rolling_window_features.censored_rolling_counts()`를
-호출한다 — 자세한 설계 배경은 REALTIME_FEATURES.md 참고.
+트립 로딩·station_id 매칭은 `silver_source.read_rental_trips()`가 담당한다 — 자세한
+설계 배경은 REALTIME_FEATURES.md 참고.
 """
 
 from __future__ import annotations
 
 from pyspark.sql import DataFrame, SparkSession
-from pyspark.sql import functions as F
 
 from . import config
-from .build_targets import _normalize_station_no
 from .rolling_window_features import censored_rolling_counts
+from .silver_source import read_rental_trips
 
 
 def load_rental_trip_events(spark: SparkSession, since: str | None = None) -> DataFrame:
-    """1차 정제 산출물(원본 대여이력 parquet, config.TRAIN_MONTHS 기준)에서
-    station_id 매칭된 트립만 추린다.
+    """Silver 대여이력에서 station_id 매칭된 트립만 추린다(대여 쪽 station_id 기준).
 
     args:
         spark: SparkSession
@@ -26,21 +23,9 @@ def load_rental_trip_events(spark: SparkSession, since: str | None = None) -> Da
             맞물린다). None이면(기본값) 전체 히스토리.
     returns:
         DataFrame: station_id, start_dt, end_dt (station_master와 매칭 안 되는
-            트립은 제외 — 폐쇄/결번 정류소 등, 약 5~7%)
+            트립은 제외)
     """
-    master = spark.read.parquet(config.STATION_MASTER_PARQUET).select("station_no", "station_id")
-
-    paths = [
-        f"{config.RENTAL_PARQUET_DIR}/서울특별시 공공자전거 대여이력 정보_{ym}.parquet"
-        for ym in config.TRAIN_MONTHS
-    ]
-    trips = spark.read.parquet(*paths).select("start_dt", "start_st", "end_dt")
-    if since is not None:
-        trips = trips.filter(F.col("start_dt") >= F.lit(since))
-    trips = trips.withColumn("station_no", _normalize_station_no(F.col("start_st")))
-
-    matched = trips.join(master, on="station_no", how="inner").select("station_id", "start_dt", "end_dt")
-    return matched
+    return read_rental_trips(spark, since=since).select("station_id", "start_dt", "end_dt")
 
 
 def build_rolling_rental_features(

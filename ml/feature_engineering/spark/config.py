@@ -7,11 +7,12 @@ S3(MinIO)를 거친다 — 로컬 파일시스템 폴백은 없다. 경로는 �
 `pathlib.Path`나 `"/".join(...)`을 쓰지 않고 f-string으로 그때그때 만든다
 (`collector/storage.py`와 통일된 컨벤션).
 
-**입력**: "1차 정제"(원본 CSV -> parquet) 결과물 — station_master/targets/
-station_status/weather/population parquet과 대여이력 원본(트립 단위) parquet.
-이 패키지는 그 산출물이 이미 S3에 존재한다고 가정하고(이번 phase는 raw Silver
-로부터 직접 만드는 로직을 아직 안 짬 — 다음 단계 과제), "피처마트 생성"(2차
-정제)만 담당한다.
+**입력**: collector Silver(`SILVER_ROOT` 아래, `silver_source.py` 참고)뿐이다.
+`ml/data/processed_v2/*` 같은 로컬 파생 데이터는 전혀 안 본다 —
+station_master/targets/station_status/weather/population(예전엔 "이미 S3에
+존재한다고 가정"했던 1차 정제 산출물)을 이제 이 패키지가 Silver로부터 직접
+만들어(`run_pipeline._refresh_primary_tables()`) 아래 경로들에 저장한 뒤, 그걸
+"피처마트 생성"(2차 정제) 단계가 읽는다 — 두 단계 다 이 패키지 안에 있다.
 
 `src/`와 반드시 같은 값을 써야 하는 파라미터(censoring 윈도우, lag/rolling 등)는
 `common_config.py`(ml/ 루트, 순수 상수 모듈 — pandas/pyspark 등 무거운 의존성 없음)에서
@@ -19,7 +20,10 @@ station_status/weather/population parquet과 대여이력 원본(트립 단위) 
 하나만 두 패키지가 같이 참조하는 구조라 EMR에 이 패키지만 올려도 그 작은 파일 하나만
 같이 올리면 된다. 같은 이유로 `libs/ml_common/paths.py`도 import하지 않고 같은 이름의
 상수를 독립적으로 다시 정의한다 — **두 파일이 가리키는 실제 키는 반드시 같아야
-하므로, 한쪽을 고치면 다른 쪽도 같이 고칠 것.**
+하므로, 한쪽을 고치면 다른 쪽도 같이 고칠 것.** 컬럼명 매핑·source_id는 대신
+`libs/ml_common/silver_schema.py`를 그대로 import해서 쓴다(그건 순수 상수/문자열
+모듈이라 가볍고, `inference`의 실시간 조회와 같은 스키마를 보장해야 해서 중복을
+피했다).
 """
 
 import os
@@ -38,8 +42,12 @@ def _s3a(key: str) -> str:
     return f"s3a://{S3_BUCKET}/{key}"
 
 
-# --- 입력: "1차 정제" 산출물 (이미 S3에 존재한다고 가정) ---
-RENTAL_PARQUET_DIR = os.environ.get("RENTAL_PARQUET_DIR", _s3a("parquet"))  # 대여이력 원본(트립 단위) parquet 디렉터리
+# collector Silver 계층의 루트 — `silver_source.py`가 이 아래에서 소스별 glob을
+# 만든다. 테스트에서 로컬 tmp_path 디렉터리로 monkeypatch하기 쉽도록 이 하나의
+# 상수로 분리해뒀다(`dev_spark_incremental.py` 참고).
+SILVER_ROOT = os.environ.get("SILVER_ROOT", _s3a("silver"))
+
+# --- 1차 정제 산출물 (이제 이 패키지가 Silver로부터 직접 만들어 저장 — silver_source.py) ---
 STATION_MASTER_PARQUET = os.environ.get("STATION_MASTER_PARQUET", _s3a("processed_v2/station_master.parquet"))
 TARGETS_PARQUET = os.environ.get("TARGETS_PARQUET", _s3a("processed_v2/targets_2025.parquet"))
 RETURN_TARGETS_PARQUET = os.environ.get("RETURN_TARGETS_PARQUET", _s3a("processed_v2/return_targets_2025.parquet"))
@@ -48,9 +56,8 @@ WEATHER_PARQUET = os.environ.get("WEATHER_PARQUET", _s3a("processed_v2/weather_2
 POPULATION_PARQUET = os.environ.get("POPULATION_PARQUET", _s3a("processed_v2/population_2025.parquet"))
 ANALYSIS_SUMMARY_JSON = os.environ.get("ANALYSIS_SUMMARY_JSON", _s3a("processed_v2/output/analysis_summary.json"))
 
-# --- 학습 대상 연도/월 (지금은 2025년 단일 연도 — 다년 확장은 후속 과제) ---
+# --- 학습 대상 연도 (Silver glob을 이 연도로 좁히는 데 씀 — silver_source.py) ---
 TRAIN_YEAR = int(os.environ.get("TRAIN_YEAR", "2025"))
-TRAIN_MONTHS = [f"{TRAIN_YEAR % 100:02d}{m:02d}" for m in range(1, 13)]
 
 # --- point-in-time censoring 파라미터 (src/config.py와 반드시 같은 값을 유지 — common_config.py에서 공유) ---
 ROLLING_TICK_MINUTES = common_config.ROLLING_TICK_MINUTES

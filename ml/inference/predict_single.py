@@ -69,7 +69,6 @@ from ml_common.model_contract import (
     load_station_dtype,
 )
 from ml_common.scoring import predict
-from ml_common.trip_events import normalize_station_no
 
 from . import config
 
@@ -99,41 +98,56 @@ N_LAG_ROLLING_FEATURES = 2 * (len(config.LAG_HOURS) + 2 * len(config.ROLLING_WIN
 
 
 def _fetch_recent_rental_trips(anchor_ts: pd.Timestamp, lookback_hours: int) -> pd.DataFrame:
-    """anchor_ts 기준 최근 lookback_hours시간 동안의 Silver `rental` 트립 원본을 읽어온다.
+    """anchor_ts 기준 최근 lookback_hours시간 동안의 Silver `bike_rental_history` 트립 원본을 읽어온다.
 
-    `silver_schema.hourly_keys()`로 필요한 시간별 키를 결정적으로 만들고(LIST 없이),
-    존재하는 파일만 이어붙인다 — 아직 안 쌓였거나 결측인 시간대는 자연히 빠진다.
+    `silver_schema.rental_tick_keys()`로 필요한 5분 tick 키를 결정적으로 만들고
+    (LIST 없이), `s3_io.read_parquet_many()`로 병렬 조회한 뒤 존재하는 파일만
+    이어붙인다 — 아직 안 쌓였거나 결측인 tick은 자연히 빠진다. 실제 수집 주기가
+    5분이라(예시 데이터로 확인, `docs/collector/ml-integration-requests.md`) lag_168h
+    기준 lookback 하나에 키가 2천 개 가까이 되므로 순차 조회는 병목이 된다.
     컬럼명만 `RENTAL_COLUMN_MAP`으로 바꾸고, station_id 매칭(`start_st`/`end_st` ->
     station_id)은 아직 안 한다(`_resolve_rental_stations()`가 담당).
+
+    실제로 collector의 각 5분 tick 파일이 "그 5분 동안 새로 생긴 트립"만 담는
+    델타(incremental)인지, 아니면 그날 지금까지의 트립을 매번 통째로 다시 담는
+    누적(cumulative) 스냅샷인지는 실제 예시 데이터만으로는 확정할 수 없었다
+    (`docs/collector/ml-integration-requests.md` 10번 참고) — 누적이면 여러 tick을
+    이어붙일 때 같은 트립이 몇 번이고 중복된다. 어느 쪽이든 안전하도록
+    `(bike_id, start_dt)`로 중복을 제거한다(같은 자전거가 같은 순간에 두 트립을
+    동시에 시작할 수 없으므로 실제 트립 하나를 안정적으로 식별하는 키).
 
     args:
         anchor_ts: 조회 기준 시각("지금")
         lookback_hours: 몇 시간 전까지 읽을지
     returns:
-        pd.DataFrame: start_dt, end_dt, start_st, end_st (station_no 문자열, 5자리
-            zero-pad은 아직 안 됨 — normalize_station_no()가 처리)
+        pd.DataFrame: start_dt, end_dt, start_st, end_st (이미 station_id와 같은
+            "ST-"형식 — station_no 크로스워크 불필요, `_resolve_rental_stations()` 참고)
     """
-    keys = silver_schema.hourly_keys(silver_schema.RENTAL_SOURCE_ID, anchor_ts, lookback_hours)
-    frames = []
-    for key in keys:
-        raw = s3_io.read_parquet(key)
-        if raw is not None and not raw.empty:
-            frames.append(raw.rename(columns=silver_schema.RENTAL_COLUMN_MAP))
+    keys = silver_schema.rental_tick_keys(anchor_ts, lookback_hours)
+    raws = s3_io.read_parquet_many(keys)
+    frames = [raw.rename(columns=silver_schema.RENTAL_COLUMN_MAP) for raw in raws if raw is not None and not raw.empty]
     if not frames:
         return pd.DataFrame(columns=["start_dt", "end_dt", "start_st", "end_st"])
     trips = pd.concat(frames, ignore_index=True)
     trips["start_dt"] = pd.to_datetime(trips["start_dt"])
     trips["end_dt"] = pd.to_datetime(trips["end_dt"])
+    if "bike_id" in trips.columns:
+        trips = trips.drop_duplicates(subset=["bike_id", "start_dt"], ignore_index=True)
     return trips
 
 
 def _resolve_rental_stations(trips: pd.DataFrame) -> pd.DataFrame:
-    """트립의 start_st/end_st(대여소번호)를 station_master 크로스워크로 station_id로 매칭한다.
+    """트립의 start_st/end_st(대여소 ID)를 station_master 기준으로 걸러 station_id로 확정한다.
 
-    `feature_engineering/spark/build_targets.py`가 배치로 하는 것과 같은 크로스워크
-    원칙 — 대여소번호가 이상값이거나 station_master에 없는 트립(폐쇄 대여소 등)은
-    `normalize_station_no()`가 NaN으로 만들고 이 함수의 inner join에서 자연히
-    빠진다(반납쪽 `end_station_id`는 없으면 NaN으로 남겨 반납 집계에서만 빠짐).
+    실제 예시 데이터(`ml/data/silver/bike_rental_history/`) 확인 결과 `RENT_STATION_ID`/
+    `RETURN_STATION_ID`가 이미 `"ST-2565"`처럼 station_id와 동일한 형식이라(raw 숫자
+    대여소번호가 아님), `normalize_station_no()` + station_no 크로스워크가 필요 없다 —
+    station_master에 실제로 존재하는 station_id인지만 확인한다. 대여소가 이상값이거나
+    station_master에 없는 트립(폐쇄 대여소 등)은 대여 쪽(`station_id`)이면 행 자체를
+    제외하고, 반납 쪽(`end_station_id`)이면 NaN으로 남겨 반납 집계에서만 빠지게 한다
+    (`feature_engineering/spark/build_targets.py`의 배치 경로와 같은 원칙 — raw 숫자
+    대여이력 CSV를 읽는 그쪽은 `_normalize_station_no()`를 그대로 쓴다, 서로 다른 원본
+    포맷이라 별개로 둔다).
 
     args:
         trips: _fetch_recent_rental_trips()의 결과
@@ -143,18 +157,11 @@ def _resolve_rental_stations(trips: pd.DataFrame) -> pd.DataFrame:
     if trips.empty:
         return trips.assign(station_id=pd.Series(dtype=str), end_station_id=pd.Series(dtype=str))
 
-    master = _get_station_master().reset_index()[["station_id", "station_no"]]
-    trips = trips.copy()
-    trips["_start_no"] = normalize_station_no(trips["start_st"].astype(str))
-    trips["_end_no"] = normalize_station_no(trips["end_st"].astype(str))
-
-    trips = trips.merge(
-        master.rename(columns={"station_no": "_start_no", "station_id": "station_id"}), on="_start_no", how="inner"
-    )
-    trips = trips.merge(
-        master.rename(columns={"station_no": "_end_no", "station_id": "end_station_id"}), on="_end_no", how="left"
-    )
-    return trips.drop(columns=["_start_no", "_end_no"])
+    known_ids = _get_station_master().index
+    trips = trips[trips["start_st"].isin(known_ids)].copy()
+    trips["station_id"] = trips["start_st"]
+    trips["end_station_id"] = trips["end_st"].where(trips["end_st"].isin(known_ids))
+    return trips
 
 
 def _get_raw_rental_trips(anchor_ts: pd.Timestamp) -> pd.DataFrame:
@@ -526,15 +533,16 @@ def _population_fallback(grid_id: str, ts: pd.Timestamp) -> dict[str, float]:
 # "그 시점 근처의 최근 값 하나"만 있으면 되므로 조회 범위가 훨씬 좁다. ---
 
 
-def _get_recent_weather(target_ts: pd.Timestamp, lookback_hours: int = 3) -> dict[str, float]:
-    """target_ts 시각(또는 그 근처)의 Silver 기상 관측/예보값을 읽는다(서울 전체 공유).
+def _get_recent_weather(target_ts: pd.Timestamp, lookback_hours: float = 3) -> dict[str, float]:
+    """target_ts 시각(또는 그 근처)의 Silver 기상 관측값을 읽는다(서울 전체 공유).
 
-    `silver/weather_forecast/dt=.../hh=.../HH00.parquet`은 collector가 아직
-    실제 예보(미래 forecast_dttm)를 쌓기 시작하지 않아(어댑터 미구현) target_ts 키가
-    정확히 있으면 그걸, 없으면(수집 지연 또는 아직 도착 안 한 미래 시각) 바로 이전
-    시간대까지 거슬러 올라가 가장 최근 값을 대신 쓴다 — collector가 실제 예보를
-    쌓기 시작하면 이 fallback 없이 target_ts 키가 바로 맞아떨어질 것이다(자세한
-    내용은 docs/collector/ml-integration-requests.md).
+    `weather_ultra_short_term`(기상청 초단기실황, 10분 간격)을 쓴다 — 실제로는
+    `weather_short_term_forecast`(예보, 3시간 간격)도 있지만 그쪽은 강수량(mm)이
+    아니라 강수확률(%)만 제공해 `precip`과 단위가 안 맞고, 이 함수가 원래
+    "그 시점 근처 가장 최근 관측값"을 찾는 용도라 관측 소스가 의미상으로도 더
+    맞는다(자세한 내용은 `docs/collector/ml-integration-requests.md`). target_ts
+    키가 정확히 있으면 그걸, 없으면(수집 지연 또는 아직 도착 안 한 미래 시각)
+    거슬러 올라가 가장 최근 값을 대신 쓴다.
 
     args:
         target_ts: 조회하려는 시각(horizon에 따라 미래일 수 있음)
@@ -544,9 +552,8 @@ def _get_recent_weather(target_ts: pd.Timestamp, lookback_hours: int = 3) -> dic
     raises:
         ValueError: target_ts부터 lookback_hours시간 전까지 전부 데이터가 없을 때
     """
-    keys = silver_schema.hourly_keys(silver_schema.WEATHER_SOURCE_ID, target_ts, lookback_hours)
-    for key in reversed(keys):  # target_ts에 가장 가까운 것부터
-        df = s3_io.read_parquet(key)
+    keys = silver_schema.weather_tick_keys(target_ts, lookback_hours)
+    for df in reversed(s3_io.read_parquet_many(keys)):  # target_ts에 가장 가까운 것부터
         if df is not None and not df.empty:
             row = df.rename(columns=silver_schema.WEATHER_COLUMN_MAP).iloc[-1]
             return {
@@ -579,12 +586,34 @@ def _get_recent_bike_status(anchor_ts: pd.Timestamp, lookback_hours: float = 1.0
     return pd.DataFrame(columns=["bike_count", "capacity", "stockout_flag"])
 
 
-def _get_recent_population(target_ts: pd.Timestamp, lookback_hours: int = 3) -> pd.DataFrame:
-    """target_ts 시각(또는 그 근처)의 Silver 생활인구를 읽는다(격자별).
+def _get_recent_population(target_ts: pd.Timestamp, lookback_days: int = 7) -> pd.DataFrame:
+    """target_ts와 같은 시각대(hour-of-day)의 가장 최근 Silver 생활인구 스냅샷을 읽는다(격자별).
+
+    `living_population_grid`는 다른 실시간 소스와 달리 **하루에 파일 1개**만
+    쌓인다 — 그 파일 안에 `YMD`(날짜)+`TT`(시각, "00"~"23")로 24시간 데이터가 전부
+    들어있고, collector job이 실제로 몇 시·몇 분에 그 파일을 쓰는지(파일명의
+    hh=/HHMM)는 알 수 없다. 그래서 시간별 키를 추측하는 대신 그 날짜의 dt=.../
+    prefix를 LIST해서 존재하는 파일을 찾는다.
+
+    실제 예시 데이터로 확인한 중요한 특성: 파일의 **수집일(경로의 dt=)과 내용의
+    YMD가 다르다** — 2026-08-15에 수집된 파일인데 내용은 `YMD=20260811`(4일 전)
+    데이터였다. 생활인구 원천 자체가 공표 지연이 있어 "가장 최근 수집분"이 며칠
+    전 데이터를 담고 있는 게 정상이라는 뜻이다. 그래서 target_ts의 날짜와 파일
+    내용의 YMD를 맞추려 하지 않고, **가장 최근 dt= 파티션 하나를 찾아 그 안에서
+    TT(시각)만 맞춰** 쓴다 — "정확히 그 날짜"가 아니라 "구할 수 있는 가장 최근
+    스냅샷의 같은 시간대 패턴"이라는 뜻이다(자세한 내용은
+    `docs/collector/ml-integration-requests.md`).
+
+    실제 예시 데이터에는 나이대x성별 인구(`M00`~`M70`/`F00`~`F70`)만 있고 우리가
+    쓰는 `pop_resd`/`pop_long_foreign`/`pop_short_foreign` 구분 자체가 없다 —
+    세부 breakdown은 만들 수 없어 `SPOP`(총 생활인구)을 `pop_total`로 쓰고,
+    `pop_resd`는 `pop_total`과 같다고 근사(전부 내국인으로 간주)한 뒤
+    `pop_long_foreign`/`pop_short_foreign`은 0으로 둔다 — 모델이 쓰는 4개 컬럼
+    자리는 채우되, 실제 국적별 구성은 반영하지 못하는 한계가 있다.
 
     args:
-        target_ts: 조회하려는 시각
-        lookback_hours: target_ts 키가 없을 때 몇 시간 전까지 대신 찾아볼지
+        target_ts: 조회하려는 시각(시각대만 사용, 날짜는 "가장 최근 수집분" 탐색에만 씀)
+        lookback_days: 오늘치 파티션이 없으면 며칠 전까지 대신 찾아볼지
     returns:
         pd.DataFrame: grid_id로 인덱싱된 pop_resd/pop_long_foreign/pop_short_foreign/pop_total
             (lookback 안에 데이터가 전혀 없으면 빈 DataFrame — 호출부가
@@ -597,15 +626,28 @@ def _get_recent_population(target_ts: pd.Timestamp, lookback_hours: int = 3) -> 
     """
     if target_ts in _recent_population_by_ts:
         return _recent_population_by_ts[target_ts]
-    keys = silver_schema.hourly_keys(silver_schema.POPULATION_SOURCE_ID, target_ts, lookback_hours)
-    for key in reversed(keys):
-        df = s3_io.read_parquet(key)
-        if df is not None and not df.empty:
-            df = df.rename(columns=silver_schema.POPULATION_COLUMN_MAP)
-            result = df.set_index("grid_id")[["pop_resd", "pop_long_foreign", "pop_short_foreign", "pop_total"]]
-            _recent_population_by_ts[target_ts] = result
-            return result
+
+    target_hour = f"{target_ts.hour:02d}"
     result = pd.DataFrame(columns=["pop_resd", "pop_long_foreign", "pop_short_foreign", "pop_total"])
+    for day_offset in range(lookback_days + 1):
+        day = target_ts - pd.Timedelta(days=day_offset)
+        keys = s3_io.list_keys(silver_schema.population_daily_prefix(day))
+        if not keys:
+            continue
+        df = s3_io.read_parquet(max(keys))
+        if df is None or df.empty:
+            continue
+        df = df.rename(columns=silver_schema.POPULATION_COLUMN_MAP)
+        rows = df[df["TT"] == target_hour]
+        if rows.empty:
+            continue
+        rows = rows.copy()
+        rows["pop_resd"] = rows["pop_total"]
+        rows["pop_long_foreign"] = 0.0
+        rows["pop_short_foreign"] = 0.0
+        result = rows.set_index("grid_id")[["pop_resd", "pop_long_foreign", "pop_short_foreign", "pop_total"]]
+        break
+
     _recent_population_by_ts[target_ts] = result
     return result
 
@@ -1592,7 +1634,8 @@ def _parse_weather_arg(raw: str) -> float | list[float]:
     return float(raw)
 
 
-if __name__ == "__main__":
+def main(argv: list[str] | None = None) -> None:
+    """단일 시점 대여/반납 수요 예측 CLI 엔트리포인트."""
     import argparse
     import json
 
@@ -1637,8 +1680,11 @@ if __name__ == "__main__":
         help="1보다 크면 horizon=1..n_hours를 한 번에 예측한다(predict_demand_multi_hour — "
         "lag/rolling은 T0 기준 한 번만 계산, 재귀 없음)",
     )
-    parser.add_argument("--out", default=None, help="--all-stations 결과 저장 S3 키(parquet). 미지정시 predictions_key() 기본 경로")
-    args = parser.parse_args()
+    parser.add_argument(
+        "--out", default=None,
+        help="결과 저장 S3 키(parquet). 미지정시 기본 S3 경로(단일: single_prediction_key, 전체: predictions_key)",
+    )
+    args = parser.parse_args(argv)
 
     if bool(args.station_id) == bool(args.all_stations):
         raise SystemExit("--station-id와 --all-stations 중 정확히 하나만 지정해야 합니다.")
@@ -1707,13 +1753,59 @@ if __name__ == "__main__":
         "humidity": args.humidity,
         "population": args.population,
     }
+    window_start = _target_timestamp(args.date, args.hour, args.minute)
+    out_path = args.out or silver_schema.single_prediction_key(args.station_id, window_start)
+
     if args.n_hours > 1:
         result = predict_demand_multi_hour(**common, stockout=args.stockout, n_hours=args.n_hours)
+        rows = []
+        for r in result:
+            rows.append({
+                "station_id": r["station_id"], "date": r["date"], "hour": r["hour"], "minute": r["minute"],
+                "horizon": r["horizon"],
+                "rental_pred_mean": r["rental"]["pred_mean"], "rental_pred_p10": r["rental"]["pred_p10"],
+                "rental_pred_p50": r["rental"]["pred_p50"], "rental_pred_p90": r["rental"]["pred_p90"],
+                "return_pred_mean": r["return"]["pred_mean"], "return_pred_p10": r["return"]["pred_p10"],
+                "return_pred_p50": r["return"]["pred_p50"], "return_pred_p90": r["return"]["pred_p90"],
+                "lag_data_freshness": r["rental"]["lag_data_freshness"],
+                "population_source": r["population_source"],
+            })
+        out_df = pd.DataFrame(rows)
+        s3_io.write_parquet(out_df, out_path)
+        print(f"결과 저장: {out_path}", file=sys.stderr)
         print(json.dumps(result, indent=2, ensure_ascii=False))
         raise SystemExit(0)
 
+    rental_res = predict_rental_demand(**common, stockout=args.stockout)
+    return_res = predict_return_demand(**common)
     result = {
-        "rental": predict_rental_demand(**common, stockout=args.stockout),
-        "return": predict_return_demand(**common),
+        "rental": rental_res,
+        "return": return_res,
     }
+    rows = [{
+        "station_id": rental_res["station_id"],
+        "date": rental_res["date"],
+        "hour": rental_res["hour"],
+        "minute": rental_res["minute"],
+        "horizon": rental_res["horizon"],
+        "rental_pred_mean": rental_res["pred_mean"],
+        "rental_pred_p10": rental_res["pred_p10"],
+        "rental_pred_p50": rental_res["pred_p50"],
+        "rental_pred_p90": rental_res["pred_p90"],
+        "return_pred_mean": return_res["pred_mean"],
+        "return_pred_p10": return_res["pred_p10"],
+        "return_pred_p50": return_res["pred_p50"],
+        "return_pred_p90": return_res["pred_p90"],
+        "lag_data_freshness": rental_res["lag_data_freshness"],
+        "population_source": rental_res["population_source"],
+    }]
+    out_df = pd.DataFrame(rows)
+    s3_io.write_parquet(out_df, out_path)
+    print(f"결과 저장: {out_path}", file=sys.stderr)
     print(json.dumps(result, indent=2, ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main()
+
+
