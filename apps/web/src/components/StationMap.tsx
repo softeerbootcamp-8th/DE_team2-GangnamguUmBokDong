@@ -1,8 +1,19 @@
+import { featureCollection, polygon } from "@turf/helpers";
+import { intersect } from "@turf/intersect";
 import "leaflet/dist/leaflet.css";
+import { Delaunay } from "d3-delaunay";
 import L from "leaflet";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { CircleMarker, MapContainer, Marker, TileLayer, Tooltip, useMapEvents } from "react-leaflet";
-import type { ActionType, Alert, StationSummary } from "../api";
+import { CircleMarker, MapContainer, Marker, Polygon, TileLayer, Tooltip, useMapEvents } from "react-leaflet";
+import type { ActionType, Alert, DispatchCenter, StationSummary } from "../api";
+import seoulBoundary from "../seoul_boundary.json";
+
+const ALL_REGIONS = "all"; // App.tsx의 선택 안 함 상태와 동일한 값이어야 한다.
+const SEOUL_POLYGON = polygon(seoulBoundary.geometry.coordinates);
+// 서울시 따릉이 서비스라 서울 윤곽선을 항상 기본으로 띄워둔다(권역 선택과 무관).
+const SEOUL_OUTLINE: [number, number][] = seoulBoundary.geometry.coordinates[0].map(
+  ([lon, lat]) => [lat, lon] as [number, number],
+);
 
 const GANGNAM_CENTER: [number, number] = [37.5172, 127.0473];
 const DEFAULT_ZOOM = 13;
@@ -18,11 +29,52 @@ const MAX_VISIBLE_MARKERS = 100; // 현재 화면 범위 안에 이보다 많으
 // 서비스 대상이 서울 전역이라, 그 밖으로 패닝/줌아웃해서 벗어날 이유가 없다.
 // 실제 대여소 좌표 범위(위도 37.43~37.69, 경도 126.80~127.18)보다 여유를 두고
 // 잡아서, 서울 경계 안쪽 대여소가 없는 지역(외곽 일부)도 화면에 들어오게 한다.
-const SEOUL_BOUNDS: L.LatLngBoundsExpression = [
-  [37.39, 126.72],
-  [37.73, 127.21],
-];
+const SEOUL_SW: [number, number] = [37.39, 126.72];
+const SEOUL_NE: [number, number] = [37.73, 127.21];
+const SEOUL_BOUNDS: L.LatLngBoundsExpression = [SEOUL_SW, SEOUL_NE];
 const SEOUL_MIN_ZOOM = 10; // 이보다 축소하면 서울 전체가 한 화면보다 작아져서 의미가 없다
+const REGION_FILL = "#2a78d6";
+
+// 지역센터 관할의 실제 경계 데이터는 없다(apps/api/regions.py 참고). 그래서
+// "권역 면적"은 우리 배정 로직(최근접 지역센터)이 암묵적으로 정의하는 경계,
+// 즉 보로노이 다이어그램으로 그린다 — 대여소 배정에 실제로 쓰인 것과 정확히
+// 같은 기준이라 최소한 우리 시스템 안에서는 정직한 시각화다. 서울 밖으로
+// 무한히 뻗어나가는 바깥쪽 셀들은 SEOUL_BOUNDS로 잘라낸다.
+// turf 교집합 결과(Polygon 또는 MultiPolygon)의 바깥 링들을 Leaflet
+// [위도, 경도] 좌표 배열로 바꾼다. 구멍(hole)은 우리 케이스에서 나올 일이
+// 없어 각 폴리곤의 첫 링(바깥 링)만 쓴다.
+function outerRingsToLatLng(geometry: { type: string; coordinates: number[][][] | number[][][][] }): [
+  number,
+  number,
+][][] {
+  const polygons = geometry.type === "Polygon" ? [geometry.coordinates as number[][][]] : (geometry.coordinates as number[][][][]);
+  return polygons.map((rings) => rings[0].map(([lon, lat]) => [lat, lon] as [number, number]));
+}
+
+function computeRegionCell(centers: DispatchCenter[], selectedRegion: string): [number, number][][] | null {
+  if (selectedRegion === ALL_REGIONS || centers.length === 0) return null;
+  const index = centers.findIndex((c) => c.region === selectedRegion);
+  if (index === -1) return null;
+
+  // d3-delaunay는 평면 좌표를 쓰므로 (경도, 위도)를 (x, y)로 그대로 쓴다.
+  // 서울 정도의 좁은 범위에서는 구면 보정 없이도 배정 결과와 시각적으로
+  // 어긋나지 않는다(11장소 사이 실제 최근접 배정도 이 정밀도로 충분했다).
+  const points: [number, number][] = centers.map((c) => [c.lon, c.lat]);
+  const delaunay = Delaunay.from(points);
+  const bounds = L.latLngBounds(SEOUL_SW, SEOUL_NE);
+  const voronoi = delaunay.voronoi([bounds.getWest(), bounds.getSouth(), bounds.getEast(), bounds.getNorth()]);
+  const rectClippedCell = voronoi.cellPolygon(index);
+  if (!rectClippedCell) return null;
+
+  // 사각형(SEOUL_BOUNDS)으로만 자른 셀은 서울시 바깥 땅도 포함한다. 서울시 실제
+  // 경계(seoul_boundary.json, kostat 2013 단순화 데이터)와 교집합해서, 최소한
+  // 바깥쪽 테두리는 실제 서울시 모양과 일치하게 만든다 — 지역센터 사이 안쪽
+  // 경계선 자체는 여전히 최근접 근사다.
+  const cellPolygon = polygon([rectClippedCell as unknown as number[][]]);
+  const clipped = intersect(featureCollection([cellPolygon, SEOUL_POLYGON]));
+  if (!clipped) return null;
+  return outerRingsToLatLng(clipped.geometry);
+}
 
 // 지도를 확대하면 도로·건물이 커지는데 마커만 화면 픽셀 크기 그대로 고정돼
 // 있으면 상대적으로 쪼그라들어 보여서 부자연스럽다. BASE_ZOOM보다 4레벨
@@ -150,9 +202,11 @@ interface Props {
   alerts: Alert[];
   selectedStationId: number | null;
   onSelect: (stationId: number) => void;
+  regionCenters: DispatchCenter[];
+  selectedRegion: string;
 }
 
-function StationMarkers({ stations, alerts, selectedStationId, onSelect }: Props) {
+function StationMarkers({ stations, alerts, selectedStationId, onSelect, regionCenters, selectedRegion }: Props) {
   const [zoom, setZoom] = useState(DEFAULT_ZOOM);
   const [bounds, setBounds] = useState<L.LatLngBounds | null>(null);
   // zoomend가 아니라 zoom을 듣는다. zoom은 줌 애니메이션이 진행되는 동안
@@ -243,8 +297,30 @@ function StationMarkers({ stations, alerts, selectedStationId, onSelect }: Props
     map.setView([station.lat, station.lon], Math.max(map.getZoom(), COUNT_LABEL_MIN_ZOOM));
   }, [selectedStationId, map]);
 
+  const regionCell = useMemo(
+    () => computeRegionCell(regionCenters, selectedRegion),
+    [regionCenters, selectedRegion],
+  );
+
+  useEffect(() => {
+    if (selectedRegion === ALL_REGIONS) return;
+    if (!regionCell || regionCell.length === 0) return;
+    // 선택된 권역의 경계(보로노이 셀) 전체가 화면에 들어오게 이동한다. 대여소
+    // 이동(setView, 위 effect)과 달리 여기는 넓은 영역을 한 번에 보여줘야 하므로
+    // fitBounds를 쓴다.
+    map.fitBounds(L.latLngBounds(regionCell.flat()), { padding: [24, 24] });
+  }, [selectedRegion, regionCell, map]);
+
   return (
     <>
+      <Polygon positions={SEOUL_OUTLINE} pathOptions={{ color: "#9a9a9a", weight: 1.5, fill: false }} interactive={false} />
+      {regionCell && (
+        <Polygon
+          positions={regionCell}
+          pathOptions={{ color: REGION_FILL, weight: 2, fillColor: REGION_FILL, fillOpacity: 0.08 }}
+          interactive={false}
+        />
+      )}
       {/* 마커 자체보다 넓게 깔아 두는 투명 클릭 영역. 시각적 마커 밑에 먼저 그려야
           마커 위에서의 호버가 그대로 툴팁을 띄우고, 마커 밖 여백(CLICK_PADDING)만
           이 레이어가 받아서 대충 눌러도 선택되게 한다. */}
@@ -308,7 +384,7 @@ function StationMarkers({ stations, alerts, selectedStationId, onSelect }: Props
   );
 }
 
-export function StationMap({ stations, alerts, selectedStationId, onSelect }: Props) {
+export function StationMap({ stations, alerts, selectedStationId, onSelect, regionCenters, selectedRegion }: Props) {
   return (
     <MapContainer
       center={GANGNAM_CENTER}
@@ -323,7 +399,14 @@ export function StationMap({ stations, alerts, selectedStationId, onSelect }: Pr
         attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions">CARTO</a>'
         url="https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png"
       />
-      <StationMarkers stations={stations} alerts={alerts} selectedStationId={selectedStationId} onSelect={onSelect} />
+      <StationMarkers
+        stations={stations}
+        alerts={alerts}
+        selectedStationId={selectedStationId}
+        onSelect={onSelect}
+        regionCenters={regionCenters}
+        selectedRegion={selectedRegion}
+      />
     </MapContainer>
   );
 }

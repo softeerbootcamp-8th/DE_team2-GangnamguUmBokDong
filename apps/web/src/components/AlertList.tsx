@@ -26,6 +26,10 @@ interface Props {
 
 export function AlertList({ alerts, selectedStationId, onSelect }: Props) {
   const [tab, setTab] = useState<Tab>("all");
+
+  // 지역센터 필터는 지도와 공유해야 해서(같은 지역만 지도+리스트 동시에 보여야 함)
+  // 이 컴포넌트 자체가 아니라 App.tsx가 들고 있다 — 여기 들어오는 alerts는 이미
+  // 그 필터가 적용된 상태다.
   const filtered = tab === "all" ? alerts : alerts.filter((alert) => alert.action_type === tab);
 
   return (
