@@ -22,11 +22,11 @@ import argparse
 import json
 import subprocess
 
-import pandas as pd
 from ml_common.paths import ML_ROOT
 
+from .. import config
 from ..monitor_performance import MODEL_SPECS, check_all_models
-from ..train_common import train_target
+from ..train_common import load_training_table, train_target
 
 SPARK_PYTHON = ML_ROOT / "feature_engineering" / ".venv" / "bin" / "python"
 
@@ -49,19 +49,29 @@ def _print_report(results: list[dict]) -> None:
 
 
 def _trigger_feature_pipeline() -> None:
-    """feature_engineering/spark의 증분 파이프라인을 Spark 전용 venv(Python 3.11)에서 실행한다.
+    """feature_engineering/spark의 증분 파이프라인 + multi-horizon 테이블 생성을 Spark
+    전용 venv(Python 3.11)에서 실행한다.
 
-    rental/return 두 모델이 같은 feature mart(파라미터 조합 하나)를 같이 쓰므로,
-    어느 모델이 기준 미달이든 이 파이프라인은 한 번만 실행하면 된다.
+    rental/return 두 모델이 같은 multi-horizon feature mart(파라미터 조합 하나)를 같이
+    쓰므로, 어느 모델이 기준 미달이든 이 파이프라인은 한 번만 실행하면 된다.
+
+    **주의(1단계 한계)**: `build_multi_horizon_features`는 아직 증분(watermark)을 지원하지
+    않아 매번 전체를 다시 만든다(feature_engineering/spark/build_multi_horizon_features.py
+    docstring 참고) — multi-horizon 테이블이 원본의 최대 HORIZON_COUNT배라 이 단계가
+    월별 점검 중 가장 오래 걸리는 부분이 될 수 있다.
     """
     if not SPARK_PYTHON.exists():
         raise RuntimeError(f"{SPARK_PYTHON}가 없습니다 — feature_engineering/에서 'uv sync'를 먼저 실행해야 합니다")
     print(f"[trigger] feature_engineering.spark.run_pipeline 실행 중 ({SPARK_PYTHON})...")
     subprocess.run([str(SPARK_PYTHON), "-m", "feature_engineering.spark.run_pipeline"], cwd=ML_ROOT, check=True)
+    print(f"[trigger] feature_engineering.spark.build_multi_horizon_features 실행 중 ({SPARK_PYTHON})...")
+    subprocess.run(
+        [str(SPARK_PYTHON), "-m", "feature_engineering.spark.build_multi_horizon_features"], cwd=ML_ROOT, check=True
+    )
 
 
 def _trigger_retrain(model_name: str, target_col: str, exposure_col: str | None) -> dict:
-    """feature_engineering/spark가 방금 만든 최신 feature mart로 해당 모델을 재학습한다 (챔피언 경로에 덮어씀).
+    """방금 만든 최신 multi-horizon feature mart로 해당 모델을 재학습한다 (챔피언 경로에 덮어씀).
 
     args:
         model_name: "rental" 또는 "return"
@@ -71,11 +81,8 @@ def _trigger_retrain(model_name: str, target_col: str, exposure_col: str | None)
         dict: train_target()이 반환한 평가 지표 (재학습 후 새 baseline이 됨 —
             train_target()이 models/{model_name}_metrics.json에 자동 저장)
     """
-    import feature_engineering.spark.config as fe_config  # pyspark 자체는 필요 없음(경로 상수만 사용)
-
-    features_path = fe_config.FEATURES_TABLE_PARQUET
-    print(f"[trigger] {model_name} 재학습 중 (입력: {features_path})...")
-    df = pd.read_parquet(features_path)
+    print(f"[trigger] {model_name} 재학습 중 (입력: {config.MULTI_HORIZON_FEATURES_TABLE_PARQUET})...")
+    df = load_training_table()
     metrics = train_target(df, target_col, model_name, exposure_col=exposure_col)
     print(f"[trigger] {model_name} 재학습 완료")
     return metrics

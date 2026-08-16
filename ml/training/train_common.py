@@ -27,11 +27,40 @@ from ml_common.model_contract import (
 
 from . import config
 
-__all__ = ["FEATURE_COLUMNS", "load_station_dtype", "station_categories_path", "train_target"]
+__all__ = [
+    "FEATURE_COLUMNS",
+    "load_station_dtype",
+    "load_training_table",
+    "station_categories_path",
+    "train_target",
+]
+
+
+def load_training_table() -> pd.DataFrame:
+    """multi-horizon feature 테이블에서 학습에 필요한 컬럼만 읽는다.
+
+    `pd.read_parquet(..., columns=[...])`로 필요한 컬럼만 골라 읽는다 — 전체 컬럼을 읽은
+    뒤 `df[FEATURE_COLUMNS]`로 다시 골라내면 안 쓸 컬럼까지 한 번 더 메모리에 올렸다가
+    버리는 이중 보유가 생긴다(history.md 18번 항목, multi-horizon 실험에서 실측된 병목).
+    multi-horizon 테이블은 원본 feature 테이블의 최대 HORIZON_COUNT배 행 수라 이 절약이
+    특히 중요하다.
+
+    returns:
+        pd.DataFrame: FEATURE_COLUMNS + rental_count/return_count(라벨) +
+            rental_exposure(대여 exposure offset) + date(`_split()` 경계 기준)
+    """
+    needed = sorted(set(FEATURE_COLUMNS) | {"rental_count", "return_count", "rental_exposure", "date"})
+    return pd.read_parquet(config.MULTI_HORIZON_FEATURES_TABLE_PARQUET, columns=needed)
 
 
 def _split(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """config의 TRAIN/VALID/TEST 기간으로 시간 순 split한다 (랜덤 split 금지 — lag feature 누출 방지).
+
+    구간을 먼저 시간 순으로 확정한 뒤에만 `config.{TRAIN,VALID,TEST}_SAMPLE_FRAC`으로
+    행을 표본 추출한다(기본 1.0=표본 없음) — multi-horizon 테이블은 원본의 최대
+    HORIZON_COUNT배라 학습 머신 RAM에 안 맞을 수 있다(history.md 18번 항목이 실제로
+    겪은 OOM과 같은 종류). 시간 경계를 먼저 자르고 그 안에서만 무작위 표본을 뽑으므로
+    표본 추출 자체가 누출을 만들지는 않는다.
 
     args:
         df: date 컬럼(YYYY-MM-DD)을 포함한 feature 테이블
@@ -41,6 +70,13 @@ def _split(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     train = df[(df["date"] >= config.TRAIN_START) & (df["date"] <= config.TRAIN_END)]
     valid = df[(df["date"] >= config.VALID_START) & (df["date"] <= config.VALID_END)]
     test = df[(df["date"] >= config.TEST_START) & (df["date"] <= config.TEST_END)]
+
+    if config.TRAIN_SAMPLE_FRAC < 1.0:
+        train = train.sample(frac=config.TRAIN_SAMPLE_FRAC, random_state=42)
+    if config.VALID_SAMPLE_FRAC < 1.0:
+        valid = valid.sample(frac=config.VALID_SAMPLE_FRAC, random_state=42)
+    if config.TEST_SAMPLE_FRAC < 1.0:
+        test = test.sample(frac=config.TEST_SAMPLE_FRAC, random_state=42)
     return train, valid, test
 
 
@@ -285,7 +321,7 @@ def train_target(
 
 
 if __name__ == "__main__":
-    df = pd.read_parquet(config.FEATURES_TABLE_PARQUET)
+    df = load_training_table()
 
     rental_metrics = train_target(df, "rental_count", "rental", exposure_col="rental_exposure")
     return_metrics = train_target(df, "return_count", "return", exposure_col=None)

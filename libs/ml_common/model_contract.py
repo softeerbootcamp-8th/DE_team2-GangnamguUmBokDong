@@ -70,6 +70,9 @@ NATIVE_COLUMN_DTYPES = {
     "month": "int8",
     "is_holiday": "int8",
     "is_weekend": "int8",
+    "is_next_day_off": "int8",
+    "is_prev_day_off": "int8",
+    "horizon": "int8",  # 1~HORIZON_COUNT(기본 12) — common_config.HORIZON_COUNT 참고
 }
 
 # hour_sin/cos, dow_sin/cos는 build_merged_table.py가 아니라 features.py가 나중에

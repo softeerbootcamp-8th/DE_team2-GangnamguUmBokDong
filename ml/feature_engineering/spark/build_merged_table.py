@@ -77,6 +77,8 @@ NATIVE_COLUMN_DTYPES = {
     "month": ByteType(),
     "is_holiday": ByteType(),
     "is_weekend": ByteType(),
+    "is_next_day_off": ByteType(),
+    "is_prev_day_off": ByteType(),
 }
 
 
@@ -137,7 +139,8 @@ def build_merged_table(spark: SparkSession, since: str | None = None) -> DataFra
         DataFrame: 최종 병합 테이블 (station_id, rental_count, return_count, bike_count,
             stockout_flag, capacity, lat, lon, temp, precip, wind, humidity,
             pop_resd, pop_long_foreign, pop_short_foreign, pop_total, hour_ts,
-            date, hour, minute, dow, month, is_holiday, is_weekend)
+            date, hour, minute, dow, month, is_holiday, is_weekend, is_next_day_off,
+            is_prev_day_off)
     """
     master = spark.read.parquet(config.STATION_MASTER_PARQUET)
     rental_targets = spark.read.parquet(config.TARGETS_PARQUET)  # sparse step function
@@ -199,6 +202,19 @@ def build_merged_table(spark: SparkSession, since: str | None = None) -> DataFra
     df = df.withColumn("month", F.month("hour_ts"))
     df = df.withColumn("is_holiday", F.col("date").isin(list(holidays)).cast("int"))
     df = df.withColumn("is_weekend", (F.col("dow") >= 5).cast("int"))
+    # 다음날/전날이 휴일(공휴일 또는 주말)인지 — "내일 쉬는 날이라 오늘 저녁 대여가
+    # 늘어난다"/"연휴 다음날은 패턴이 다르다" 같은 신호를 모델에 직접 알려준다.
+    # dow는 Monday=0..Sunday=6이라 (dow+1)%7/(dow+6)%7이 각각 다음날/전날의 dow.
+    next_date = F.date_format(F.date_add(F.col("hour_ts"), 1), "yyyy-MM-dd")
+    prev_date = F.date_format(F.date_sub(F.col("hour_ts"), 1), "yyyy-MM-dd")
+    df = df.withColumn(
+        "is_next_day_off",
+        (next_date.isin(list(holidays)) | (((F.col("dow") + 1) % 7) >= 5)).cast("int"),
+    )
+    df = df.withColumn(
+        "is_prev_day_off",
+        (prev_date.isin(list(holidays)) | (((F.col("dow") + 6) % 7) >= 5)).cast("int"),
+    )
 
     df = df.drop("grid_id")
 
