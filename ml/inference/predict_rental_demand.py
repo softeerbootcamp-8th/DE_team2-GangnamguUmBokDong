@@ -20,7 +20,7 @@ station_id/기간이 42행 이하로 좁혀지면 표로 바로 출력하고, �
 from . import config
 from .predict_common import run_predict_cli
 
-OUTPUT_PARQUET = config.PROCESSED_V2_DIR / "predictions_rental_test.parquet"
+OUTPUT_PARQUET = f"{config.PROCESSED_V2_PREFIX}/predictions_rental_test.parquet"
 
 
 def main():

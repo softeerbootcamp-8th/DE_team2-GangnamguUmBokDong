@@ -8,10 +8,11 @@ dependencies = [
     "numpy",
     "pyarrow",
     "lightgbm",
+    "boto3>=1.43.69",
 ]
 
 [dependency-groups]
-dev = ["pytest"]
+dev = ["pytest", "moto[s3]>=5.2.2"]
 
 [tool.pytest.ini_options]
 # ml/pytest.ini와 동일한 규칙(dev_*.py) — ml_common은 이제 ml/ 밖(lib/)에 있어서

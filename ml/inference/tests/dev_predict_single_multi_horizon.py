@@ -23,8 +23,12 @@ def _trip(station, start, end=None):
     }
 
 
+_EMPTY_POPULATION = pd.DataFrame(columns=["pop_resd", "pop_long_foreign", "pop_short_foreign", "pop_total"])
+_EMPTY_BIKE_STATUS = pd.DataFrame(columns=["bike_count", "capacity", "stockout_flag"])
+
+
 @pytest.fixture(autouse=True)
-def _reset_module_caches():
+def _reset_module_caches(monkeypatch):
     names = [
         "_history_by_station",
         "_rental_events_by_station",
@@ -37,6 +41,10 @@ def _reset_module_caches():
     ]
     saved = {n: getattr(ps, n) for n in names}
     ps._rental_events_sorted_by_station = {}
+    # 이 테스트들은 horizon-as-feature 조립 로직만 검증한다 — population/stockout을 안
+    # 준 호출도 S3(MinIO)를 실제로 두드리지 않도록 실시간 조회 함수를 "데이터 없음"으로 고정한다.
+    monkeypatch.setattr(ps, "_get_recent_population", lambda target_ts, lookback_hours=3: _EMPTY_POPULATION)
+    monkeypatch.setattr(ps, "_get_recent_bike_status", lambda anchor_ts, lookback_hours=1.0: _EMPTY_BIKE_STATUS)
     yield
     for n, v in saved.items():
         setattr(ps, n, v)

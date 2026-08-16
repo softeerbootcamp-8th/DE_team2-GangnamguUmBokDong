@@ -24,13 +24,10 @@ dtype이 어긋나 있었다 — 예측값 자체는 달라지지 않지만(Ligh
 옮겼다.
 """
 
-import json
-from pathlib import Path
-
 import pandas as pd
 
-from . import common_config
-from .paths import MODELS_DIR
+from . import common_config, s3_io
+from .paths import MODELS_PREFIX
 
 LAG_ROLLING_FEATURE_COLUMNS = [
     f"{prefix}_{suffix}"
@@ -94,29 +91,30 @@ FEATURE_COLUMN_DTYPES = {
 RENTAL_EXPOSURE_DTYPE = "float32"  # features.py의 rental_exposure와 동일 (FEATURE_COLUMNS엔 없음 — init_score offset 전용)
 
 
-def station_categories_path(model_name: str, models_dir: Path | None = None) -> Path:
-    """model_name에 대응하는 station_id 카테고리 목록 json 경로를 반환한다.
+def station_categories_path(model_name: str, models_prefix: str | None = None) -> str:
+    """model_name에 대응하는 station_id 카테고리 목록 json의 S3 키를 반환한다.
 
     args:
         model_name: "rental" 또는 "return"
-        models_dir: None이면 챔피언 저장 경로(paths.MODELS_DIR) — 실험/스윕 실행은
-            자신만의 models_dir(예: models/experiments/{run_id}/)을 넘겨서 챔피언
-            아티팩트를 덮어쓰지 않는다.
+        models_prefix: None이면 챔피언 저장 prefix(paths.MODELS_PREFIX) — 실험/스윕
+            실행은 자신만의 prefix(예: "models/experiments/{run_id}")를 넘겨서
+            챔피언 아티팩트를 덮어쓰지 않는다.
     returns:
-        Path: {models_dir}/{model_name}_station_categories.json
+        str: "{models_prefix}/{model_name}_station_categories.json"
     """
-    return (models_dir or MODELS_DIR) / f"{model_name}_station_categories.json"
+    return f"{models_prefix or MODELS_PREFIX}/{model_name}_station_categories.json"
 
 
-def load_station_dtype(model_name: str, models_dir: Path | None = None) -> pd.CategoricalDtype:
+def load_station_dtype(model_name: str, models_prefix: str | None = None) -> pd.CategoricalDtype:
     """학습 때 고정한 station_id 카테고리 목록을 그대로 불러온다 (predict에서 코드 어긋남 방지용).
 
     args:
         model_name: "rental" 또는 "return"
-        models_dir: station_categories_path() 참고
+        models_prefix: station_categories_path() 참고
     returns:
         pd.CategoricalDtype: 학습 시점과 동일한 순서의 station_id 카테고리
     """
-    with open(station_categories_path(model_name, models_dir), encoding="utf-8") as f:
-        categories = json.load(f)
+    categories = s3_io.read_json(station_categories_path(model_name, models_prefix))
+    if categories is None:
+        raise FileNotFoundError(f"station_categories 없음: {station_categories_path(model_name, models_prefix)}")
     return pd.CategoricalDtype(categories=categories)

@@ -10,7 +10,7 @@ censoring 계산을 위해 최근 트립을 조회하는 것이 **같은 크로�
 
 import pandas as pd
 
-from . import paths
+from . import paths, s3_io
 
 
 def normalize_station_no(series: pd.Series) -> pd.Series:
@@ -36,13 +36,17 @@ def load_rental_trip_events(verbose: bool = True) -> pd.DataFrame:
         pd.DataFrame: station_id, start_dt, end_dt (station_master와 매칭 안 되는
             약 5~7%의 트립은 제외됨)
     """
-    master = pd.read_parquet(paths.STATION_MASTER_PARQUET)
+    master = s3_io.read_parquet(paths.STATION_MASTER_PARQUET)
+    if master is None:
+        raise FileNotFoundError(f"S3에 없음: {paths.STATION_MASTER_PARQUET}")
     no_to_id = dict(zip(master["station_no"], master["station_id"]))
 
     frames = []
     for ym in paths.TRAIN_MONTHS:
-        path = paths.RENTAL_PARQUET_DIR / f"서울특별시 공공자전거 대여이력 정보_{ym}.parquet"
-        df = pd.read_parquet(path, columns=["start_dt", "start_st", "end_dt"])
+        key = f"{paths.RENTAL_PARQUET_DIR}/서울특별시 공공자전거 대여이력 정보_{ym}.parquet"
+        df = s3_io.read_parquet(key, columns=["start_dt", "start_st", "end_dt"])
+        if df is None:
+            continue
         station_id = normalize_station_no(df["start_st"]).map(no_to_id)
         matched = pd.DataFrame({"station_id": station_id, "start_dt": df["start_dt"], "end_dt": df["end_dt"]})
         matched = matched.dropna(subset=["station_id"])
@@ -50,4 +54,6 @@ def load_rental_trip_events(verbose: bool = True) -> pd.DataFrame:
         if verbose:
             print(f"  {ym}: {len(df):,}건 중 {len(matched):,}건 매칭")
 
+    if not frames:
+        return pd.DataFrame(columns=["station_id", "start_dt", "end_dt"])
     return pd.concat(frames, ignore_index=True)
