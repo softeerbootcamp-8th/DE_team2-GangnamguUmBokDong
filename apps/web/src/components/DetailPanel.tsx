@@ -26,7 +26,7 @@ export function DetailPanel({ stationId, reasons }: Props) {
   }, [stationId]);
 
   if (stationId === null) {
-    return <p className="empty-state">대여소를 선택하면 상세 정보가 표시됩니다.</p>;
+    return <p className="empty-state">지도나 우측 리스트에서 대여소를 선택하세요.</p>;
   }
 
   if (!detail) {

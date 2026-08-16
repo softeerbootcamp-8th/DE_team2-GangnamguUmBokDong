@@ -8,6 +8,8 @@ import { Header } from "./components/Header";
 import { StationMap } from "./components/StationMap";
 import { StockPanel } from "./components/StockPanel";
 import { formatClock } from "./format";
+import { ResizableHandle, ResizablePanel, ResizablePanelGroup } from "@/components/ui/resizable";
+
 
 const POLL_INTERVAL_MS = 15_000;
 const FORECAST_POLL_INTERVAL_MS = 60_000;
@@ -79,65 +81,97 @@ export default function App() {
   const filteredAlerts = selectedRegion === ALL_REGIONS ? alerts : alerts.filter((a) => a.region === selectedRegion);
 
   return (
-    <div className="dashboard">
+    <div className="flex h-screen flex-col bg-background text-foreground p-3 gap-3">
       <Header />
-      <div className="dashboard-grid">
-        <section className="panel map-panel">
-          <div className="panel-header">
-            <span className="panel-title-group">
-              <h2>대여소 지도</h2>
-              <select
-                className="region-select"
-                value={selectedRegion}
-                onChange={(e) => setSelectedRegion(e.target.value)}
-                aria-label="지역센터 필터"
-                title="지역센터 관할 경계는 근사치입니다(공개 자료 없음, 최근접 배정)"
-              >
-                <option value={ALL_REGIONS}>전체 지역센터</option>
-                {regionCenters.map((c) => (
-                  <option key={c.region} value={c.region}>
-                    {c.region}
-                  </option>
-                ))}
-              </select>
-            </span>
-            <span className="panel-meta">현황 기준 시각 {stationsUpdatedAt ? formatClock(stationsUpdatedAt) : "-"}</span>
-          </div>
-          <div className="panel-body">
-            <StationMap
-              stations={filteredStations}
-              alerts={filteredAlerts}
-              selectedStationId={selectedStationId}
-              onSelect={setSelectedStationId}
-              regionCenters={regionCenters}
-              selectedRegion={selectedRegion}
-            />
-          </div>
-        </section>
-        <section className="panel alert-panel">
-          <h2>작업 우선순위 리스트</h2>
-          <div className="panel-body">
-            <AlertList alerts={filteredAlerts} selectedStationId={selectedStationId} onSelect={setSelectedStationId} />
-          </div>
-        </section>
-        <section className="panel forecast-panel">
-          <h2>반납/대여 수요 예측 그래프</h2>
-          <div className="panel-body">
-            <ForecastPanel station={selectedStation} forecast={forecast} />
-          </div>
-        </section>
-        <section className="panel stock-panel">
-          <h2>예측 재고 그래프</h2>
-          <div className="panel-body">
-            <StockPanel station={selectedStation} forecast={forecast} />
-          </div>
-        </section>
-        <section className="panel detail-panel">
-          <h2>대여소 상세 데이터</h2>
-          <div className="panel-body">
-            <DetailPanel stationId={selectedStationId} reasons={forecast?.reasons ?? []} />
-          </div>
-        </section>
+      <div className="flex-1 overflow-hidden">
+        <ResizablePanelGroup orientation="vertical" className="rounded-lg border">
+          {/* Top Row: Map and Alert List */}
+          <ResizablePanel defaultSize={67} minSize={30}>
+            <ResizablePanelGroup orientation="horizontal">
+              {/* Map */}
+              <ResizablePanel defaultSize={66.666} minSize={30}>
+                <div className="flex h-full flex-col p-4 bg-background">
+                  <section className="flex flex-col h-full gap-4 min-w-0 min-h-0">
+                    <div className="flex items-center justify-between">
+                      <span className="flex items-center gap-2">
+                        <h2 className="text-lg font-semibold tracking-tight">대여소 지도</h2>
+                        <select
+                          className="region-select rounded border px-2 py-1 text-sm bg-background"
+                          value={selectedRegion}
+                          onChange={(e) => setSelectedRegion(e.target.value)}
+                          aria-label="지역센터 필터"
+                          title="지역센터 관할 경계는 근사치입니다(공개 자료 없음, 최근접 배정)"
+                        >
+                          <option value={ALL_REGIONS}>전체 지역센터</option>
+                          {regionCenters.map((c) => (
+                            <option key={c.region} value={c.region}>
+                              {c.region}
+                            </option>
+                          ))}
+                        </select>
+                      </span>
+                      <span className="text-sm text-muted-foreground">현황 기준 시각 {stationsUpdatedAt ? formatClock(stationsUpdatedAt) : "-"}</span>
+                    </div>
+                    <div className="flex-1 min-h-0 rounded-md border overflow-hidden">
+                      <StationMap
+                        stations={filteredStations}
+                        alerts={filteredAlerts}
+                        selectedStationId={selectedStationId}
+                        onSelect={setSelectedStationId}
+                        regionCenters={regionCenters}
+                        selectedRegion={selectedRegion}
+                      />
+                    </div>
+                  </section>
+                </div>
+              </ResizablePanel>
+              <ResizableHandle withHandle />
+              {/* Alert List */}
+              <ResizablePanel defaultSize={33.334} minSize={20}>
+                <div className="flex h-full flex-col overflow-auto bg-card p-4 min-w-0 min-h-0">
+                  <section className="flex flex-col h-full gap-4 min-w-0 min-h-0">
+                    <h2 className="text-lg font-semibold tracking-tight">작업 우선순위</h2>
+                    <div className="flex-1 overflow-y-auto">
+                      <AlertList alerts={filteredAlerts} selectedStationId={selectedStationId} onSelect={setSelectedStationId} />
+                    </div>
+                  </section>
+                </div>
+              </ResizablePanel>
+            </ResizablePanelGroup>
+          </ResizablePanel>
+
+          <ResizableHandle withHandle />
+
+          {/* Bottom Row: Forecast, Stock, Details */}
+          <ResizablePanel defaultSize={33} minSize={20}>
+            <div className="grid h-full grid-cols-3 divide-x">
+              <div className="flex h-full flex-col overflow-auto bg-card p-4 min-w-0 min-h-0">
+                <section className="flex flex-col h-full gap-4 min-w-0 min-h-0">
+                  <h2 className="text-lg font-semibold tracking-tight">반납 · 수요 예측 그래프</h2>
+                  <div className="flex-1 min-w-0 min-h-0">
+                    <ForecastPanel station={selectedStation} forecast={forecast} />
+                  </div>
+                </section>
+              </div>
+              <div className="flex h-full flex-col overflow-auto bg-card p-4 min-w-0 min-h-0">
+                <section className="flex flex-col h-full gap-4 min-w-0 min-h-0">
+                  <h2 className="text-lg font-semibold tracking-tight">재고 예측 그래프</h2>
+                  <div className="flex-1 min-w-0 min-h-0">
+                    <StockPanel station={selectedStation} forecast={forecast} />
+                  </div>
+                </section>
+              </div>
+              <div className="flex h-full flex-col overflow-auto bg-card p-4 min-w-0 min-h-0">
+                <section className="flex flex-col h-full gap-4 min-w-0 min-h-0">
+                  <h2 className="text-lg font-semibold tracking-tight">대여소 상세</h2>
+                  <div className="flex-1 min-w-0 min-h-0">
+                    <DetailPanel stationId={selectedStationId} reasons={forecast?.reasons ?? []} />
+                  </div>
+                </section>
+              </div>
+            </div>
+          </ResizablePanel>
+        </ResizablePanelGroup>
       </div>
     </div>
   );
