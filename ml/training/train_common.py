@@ -12,11 +12,11 @@ tree(x)의 objective 역변환(Poisson이면 exp(tree(x)))일 뿐 init_score를 
 
 import json
 import zlib
-from pathlib import Path
 
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
+from ml_common import s3_io
 from ml_common.metrics import pinball_loss as _pinball_loss
 from ml_common.metrics import poisson_deviance as _poisson_deviance
 from ml_common.model_contract import (
@@ -24,6 +24,7 @@ from ml_common.model_contract import (
     load_station_dtype,
     station_categories_path,
 )
+from ml_common.paths import model_json_key, model_key
 
 from . import config
 
@@ -50,7 +51,10 @@ def load_training_table() -> pd.DataFrame:
             rental_exposure(대여 exposure offset) + date(`_split()` 경계 기준)
     """
     needed = sorted(set(FEATURE_COLUMNS) | {"rental_count", "return_count", "rental_exposure", "date"})
-    return pd.read_parquet(config.MULTI_HORIZON_FEATURES_TABLE_PARQUET, columns=needed)
+    df = s3_io.read_parquet(config.MULTI_HORIZON_FEATURES_TABLE_PARQUET, columns=needed)
+    if df is None:
+        raise FileNotFoundError(f"S3에 없음: {config.MULTI_HORIZON_FEATURES_TABLE_PARQUET}")
+    return df
 
 
 def _split(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
@@ -161,12 +165,12 @@ def train_target(
     target_col: str,
     model_name: str,
     exposure_col: str | None = None,
-    models_dir: Path | None = None,
+    models_prefix: str | None = None,
 ) -> dict:
     """대여 또는 반납 하나를 학습한다 — Poisson(+exposure offset) 1개 + quantile(P10/50/90) 3개.
 
-    학습된 booster 4개, station_id 카테고리 목록, conformal correction을 models_dir에
-    저장하고, 2025-12 테스트셋 기준 평가 지표를 반환한다.
+    학습된 booster 4개, station_id 카테고리 목록, conformal correction을 S3의
+    models_prefix 아래 저장하고, 2025-12 테스트셋 기준 평가 지표를 반환한다.
 
     args:
         df: features.build_features()를 거친 전체 feature 테이블
@@ -174,13 +178,14 @@ def train_target(
         model_name: 저장 파일명 접두사 ("rental" 또는 "return")
         exposure_col: Poisson exposure offset으로 쓸 컬럼명. None이면 offset 없이
             (exposure=1) 학습 — 반납 모델은 항상 None
-        models_dir: 저장 경로. None이면 챔피언 경로(config.MODELS_DIR) — 하이퍼파라미터
-            스윕 등 실험 실행은 자신만의 디렉터리를 넘겨서 챔피언 아티팩트를 보존한다.
+        models_prefix: 저장할 S3 키 prefix. None이면 챔피언 prefix(config.MODELS_PREFIX)
+            — 하이퍼파라미터 스윕 등 실험 실행은 자신만의 prefix를 넘겨서 챔피언
+            아티팩트를 덮어쓰지 않는다.
     returns:
         dict: poisson_deviance_test, rmse_test, best_iteration, pinball_test_q{10,50,90},
             p10_p90_coverage_raw_test, conformal_correction, p10_p90_coverage_calibrated_test
     """
-    models_dir = models_dir or config.MODELS_DIR
+    models_prefix = models_prefix or config.MODELS_PREFIX
     is_primary = config.LGB_MACHINE_RANK == 0  # 분산 학습 시 최종 평가/아티팩트 저장은 이 머신만 담당
     train_df, valid_df, test_df = _split(df)
 
@@ -201,9 +206,7 @@ def train_target(
     X_test, y_test = _prepare_xy(test_df, target_col, station_dtype)
 
     if is_primary:
-        models_dir.mkdir(parents=True, exist_ok=True)
-        with open(station_categories_path(model_name, models_dir), "w", encoding="utf-8") as f:
-            json.dump(station_categories, f, ensure_ascii=False)
+        s3_io.write_json(station_categories_path(model_name, models_prefix), station_categories)
 
     metrics: dict = {"model_name": model_name}
 
@@ -242,7 +245,7 @@ def train_target(
     # (매 라운드 gradient를 네트워크로 동기화) 파일 저장은 대표 머신(rank 0)만 하면 되고,
     # 나머지 머신이 같은 경로에 동시에 쓰면 경합이 생길 수 있어 그 부분만 막는다.
     if is_primary:
-        booster.save_model(str(models_dir / f"{model_name}_poisson.txt"))
+        s3_io.stage_and_upload_booster(booster, model_key(model_name, "poisson", models_prefix))
 
     mu_test = exposure_test * booster.predict(X_test, num_iteration=booster.best_iteration)
     metrics["poisson_deviance_test"] = _poisson_deviance(y_test.to_numpy(), mu_test)
@@ -274,7 +277,7 @@ def train_target(
             ],
         )
         if is_primary:
-            q_booster.save_model(str(models_dir / f"{model_name}_q{int(alpha * 100)}.txt"))
+            s3_io.stage_and_upload_booster(q_booster, model_key(model_name, f"q{int(alpha * 100)}", models_prefix))
         pred_test = q_booster.predict(X_test, num_iteration=q_booster.best_iteration)
         pred_valid = q_booster.predict(X_valid, num_iteration=q_booster.best_iteration)
         quantile_preds_test[alpha] = pred_test
@@ -297,8 +300,10 @@ def train_target(
         y_valid.to_numpy(), quantile_preds_valid[0.1], quantile_preds_valid[0.9], config.CONFORMAL_TARGET_COVERAGE
     )
     if is_primary:
-        with open(models_dir / f"{model_name}_conformal_correction.json", "w", encoding="utf-8") as f:
-            json.dump({"correction": correction, "target_coverage": config.CONFORMAL_TARGET_COVERAGE}, f)
+        s3_io.write_json(
+            model_json_key(model_name, "conformal_correction", models_prefix),
+            {"correction": correction, "target_coverage": config.CONFORMAL_TARGET_COVERAGE},
+        )
 
     p10_calibrated = np.clip(p10_test - correction, 0, None)  # count는 음수가 될 수 없음
     p90_calibrated = p90_test + correction
@@ -314,8 +319,7 @@ def train_target(
     # monitor_performance.py가 "이 모델이 학습/검수 시점에 어느 정도였는지"를 알아야
     # 매달 실측 성능과 비교할 baseline을 잡을 수 있다 — 그 baseline을 여기서 남긴다.
     if is_primary:
-        with open(models_dir / f"{model_name}_metrics.json", "w", encoding="utf-8") as f:
-            json.dump(metrics, f, ensure_ascii=False, indent=2)
+        s3_io.write_json(model_json_key(model_name, "metrics", models_prefix), metrics)
 
     return metrics
 
