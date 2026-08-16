@@ -3,7 +3,7 @@ const API_BASE = import.meta.env.VITE_API_BASE ?? "http://localhost:8000";
 export type ActionType = "supply_needed" | "retrieval_needed" | "normal";
 
 export interface StationSummary {
-  sta_id: number;
+  sta_id: string;
   sta_nm: string;
   gu: string;
   lat: number;
@@ -28,14 +28,14 @@ export interface ForecastPoint {
 }
 
 export interface ForecastResponse {
-  sta_id: number;
+  sta_id: string;
   base_dttm: string;
   points: ForecastPoint[];
   reasons: string[];
 }
 
 export interface Alert {
-  sta_id: number;
+  sta_id: string;
   sta_nm: string;
   action_type: ActionType;
   urgency_score: number;
@@ -63,8 +63,8 @@ async function getJson<T>(path: string): Promise<T> {
 
 export const api = {
   stations: () => getJson<StationSummary[]>("/stations"),
-  station: (id: number) => getJson<StationDetail>(`/stations/${id}`),
-  forecast: (id: number) => getJson<ForecastResponse>(`/stations/${id}/forecast`),
+  station: (id: string) => getJson<StationDetail>(`/stations/${id}`),
+  forecast: (id: string) => getJson<ForecastResponse>(`/stations/${id}/forecast`),
   alerts: () => getJson<Alert[]>("/alerts"),
   status: () => getJson<StatusResponse>("/status"),
   regions: () => getJson<DispatchCenter[]>("/regions"),

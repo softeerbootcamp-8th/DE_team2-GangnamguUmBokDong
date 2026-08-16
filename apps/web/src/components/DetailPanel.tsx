@@ -4,7 +4,7 @@ import type { StationDetail } from "../api";
 import { formatIsoTime } from "../format";
 
 interface Props {
-  stationId: number | null;
+  stationId: string | null;
   reasons: string[];
 }
 
