@@ -1,5 +1,5 @@
 [project]
-name = "seoul-pop-nowcasting"
+name = "nowcaster"
 version = "0.1.0"
 requires-python = "==3.11.*"
 dependencies = [

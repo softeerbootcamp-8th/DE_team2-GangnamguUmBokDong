@@ -5,9 +5,10 @@ requires-python = "==3.11.*"
 dependencies = [
     "core",
     "boto3>=1.43.69",
-    "pandas>=2.3.4",
+    "pandas>=2.2.0,<3.0.0",
     "pyarrow>=25.0.1",
     "shapely>=2.1.2",
+    "psycopg[binary]>=3.1.0",
 ]
 
 [tool.uv]
