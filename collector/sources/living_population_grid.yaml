@@ -1,48 +1,85 @@
 source_id: living_population_grid
-description: 서울 생활인구(250m)
-
+description: "\uC11C\uC6B8 \uC0DD\uD65C\uC778\uAD6C(250m)"
 adapter: seoul_openapi
-adapter_params:
-  service: SPOP_LOCAL_RESD_DONG
-  page_size: 1000
-  root_key: SPOP_LOCAL_RESD_DONG.row
-
-schedule:
-  interval: 1d
-
+adapter_params: {service: Se250MSpopLocalResd, page_size: 1000, root_key: Se250MSpopLocalResd.row}
+schedule: {interval: 1d}
 storage:
   bronze_format: json
   silver_format: parquet
   partition: [dt, hh]
-
-quality:
-  max_drop_ratio: 0.05
-  max_missing_ratio: 0.05
-  allow_empty: false
-
-backfill:
-  enabled: true
-  max_age: 7d
-
-policies:
-  required_missing: drop_row
-  required_outlier: drop_row
-  optional_missing: keep_null
-  optional_outlier: set_null
-
+quality: {max_drop_ratio: 0.05, max_missing_ratio: 0.1, allow_empty: false}
+backfill: {enabled: true, max_age: 7d}
+policies: {required_missing: drop_row, required_outlier: drop_row, optional_missing: keep_null,
+  optional_outlier: set_null}
 columns:
-  STD_YMD:
+  YMD:
     types: [str]
     required: true
-  ADSTRD_CODE_SE:
+  TT:
     types: [str]
     required: true
-  TOT_LVPOP_CO:
+  H_DNG_CD:
+    types: [str]
+    required: true
+  CELL_ID:
+    types: [str]
+    required: true
+  SPOP:
     types: [float]
-    range: { min: 0, max: 10000000 }
-  MAN_LVPOP_CO:
+    range: {min: 0, max: 10000000}
+  M00:
     types: [float]
-    range: { min: 0, max: 10000000 }
-  WMAN_LVPOP_CO:
+  M10:
     types: [float]
-    range: { min: 0, max: 10000000 }
+  M15:
+    types: [float]
+  M20:
+    types: [float]
+  M25:
+    types: [float]
+  M30:
+    types: [float]
+  M35:
+    types: [float]
+  M40:
+    types: [float]
+  M45:
+    types: [float]
+  M50:
+    types: [float]
+  M55:
+    types: [float]
+  M60:
+    types: [float]
+  M65:
+    types: [float]
+  M70:
+    types: [float]
+  F00:
+    types: [float]
+  F10:
+    types: [float]
+  F15:
+    types: [float]
+  F20:
+    types: [float]
+  F25:
+    types: [float]
+  F30:
+    types: [float]
+  F35:
+    types: [float]
+  F40:
+    types: [float]
+  F45:
+    types: [float]
+  F50:
+    types: [float]
+  F55:
+    types: [float]
+  F60:
+    types: [float]
+  F65:
+    types: [float]
+  F70:
+    types: [float]

@@ -3,10 +3,10 @@ description: 따릉이 대여이력 정보
 
 adapter: seoul_openapi
 adapter_params:
-  service: tbCycleRentUseDayInfo
+  service: tbCycleRentData
   page_size: 1000
-  root_key: cycleRentUseDayInfo.row
-  path_suffix: "/{window_start:%Y-%m-%d}"
+  root_key: rentData.row
+  path_suffix: "/{window_start:%Y-%m-%d}/{window_start:%Y-%m-%d}"
 
 schedule:
   interval: 5m
@@ -32,34 +32,45 @@ policies:
   optional_outlier: set_null
 
 columns:
+  BIKE_ID:
+    types: [str]
+    required: true
   RENT_DT:
     types: [str]
     required: true
   RENT_ID:
     types: [str]
-    required: true
   RENT_NM:
     types: [str]
-    required: true
-  RENT_TYPE:
+  RENT_HOLD:
     types: [str]
-  GENDER_CD:
+  RTN_DT:
     types: [str]
-  AGE_TYPE:
+  RTN_ID:
     types: [str]
-  USE_CNT:
-    types: [int]
-  EXER_AMT:
-    types: [float]
-  CARBON_AMT:
-    types: [float]
-  MOVE_METER:
-    types: [float]
-  MOVE_TIME:
-    types: [int]
+  RTN_NM:
+    types: [str]
+  RTN_HOLD:
+    types: [str]
+  USE_MIN:
+    types: [str, int]
+  USE_DST:
+    types: [str, float]
+  USR_CLS_CD:
+    types: [str]
+  SEX_CD:
+    types: [str]
+  BIRTH_YEAR:
+    types: [str, int]
+  RENT_STATION_ID:
+    types: [str]
+  RETURN_STATION_ID:
+    types: [str]
+  BIKE_SE_CD:
+    types: [str]
   START_INDEX:
     types: [int]
   END_INDEX:
     types: [int]
   RNUM:
-    types: [str]
+    types: [str, int]
