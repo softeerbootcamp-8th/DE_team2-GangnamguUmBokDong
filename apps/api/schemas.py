@@ -15,6 +15,7 @@ class StationSummary(BaseModel):
     hold_cnt: int
     parking_bike_tot_cnt: int
     shared_rate: float
+    region: str
     base_dttm: datetime
 
 
@@ -43,7 +44,14 @@ class Alert(BaseModel):
     action_type: ActionType
     urgency_score: float
     minutes_until_critical: int
+    region: str
 
 
 class StatusResponse(BaseModel):
     base_dttm: datetime
+
+
+class DispatchCenter(BaseModel):
+    region: str
+    lat: float
+    lon: float
