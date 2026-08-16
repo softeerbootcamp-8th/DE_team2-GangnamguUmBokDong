@@ -24,11 +24,19 @@ def _trip(station, start, end=None):
     }
 
 
+_EMPTY_POPULATION = pd.DataFrame(columns=["pop_resd", "pop_long_foreign", "pop_short_foreign", "pop_total"])
+_EMPTY_BIKE_STATUS = pd.DataFrame(columns=["bike_count", "capacity", "stockout_flag"])
+
+
 @pytest.fixture(autouse=True)
-def _reset_module_caches():
+def _reset_module_caches(monkeypatch):
     """predict_single.py의 모듈 전역 캐시를 각 테스트 전후로 리셋한다 (station_master/
     holidays/population_profile까지 — dev_predict_single_rental_censoring.py의 목록에
-    이 세 개를 추가로 리셋해야 이 파일의 테스트가 다른 테스트를 오염시키지 않는다)."""
+    이 세 개를 추가로 리셋해야 이 파일의 테스트가 다른 테스트를 오염시키지 않는다).
+
+    population/stockout을 생략한 호출(`predict_demand_multi_hour_all_stations`는
+    population을 아예 받지 않아 항상 생략된 것과 같다)도 S3(MinIO)를 실제로 두드리지
+    않도록 실시간 조회 함수를 "데이터 없음"으로 고정해 이 파일의 테스트를 hermetic하게 둔다."""
     names = [
         "_history_by_station",
         "_rental_events_by_station",
@@ -41,6 +49,8 @@ def _reset_module_caches():
     ]
     saved = {n: getattr(ps, n) for n in names}
     ps._rental_events_sorted_by_station = {}
+    monkeypatch.setattr(ps, "_get_recent_population", lambda target_ts, lookback_hours=3: _EMPTY_POPULATION)
+    monkeypatch.setattr(ps, "_get_recent_bike_status", lambda anchor_ts, lookback_hours=1.0: _EMPTY_BIKE_STATUS)
     yield
     for n, v in saved.items():
         setattr(ps, n, v)
