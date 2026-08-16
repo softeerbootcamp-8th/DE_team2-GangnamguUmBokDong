@@ -1,21 +1,23 @@
 [project]
-name = "airflow-dags"
+name = "airflow"
 version = "0.1.0"
 requires-python = "==3.11.*"
 dependencies = [
-    "apache-airflow==2.10.4",
-    "boto3>=1.43.71",
-    "core",
-    "psycopg2-binary>=2.9.12",
+    "apache-airflow[postgres]>=3.0,<4",
+    "apache-airflow-providers-standard",
 ]
 
 [tool.uv]
 package = false
 
 [tool.uv.sources]
-core = { path = "../libs/core", editable = true }
+ml_common = { path = "../libs/ml_common", editable = true }
 
 [dependency-groups]
 dev = [
     "pytest>=9.1.1",
 ]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

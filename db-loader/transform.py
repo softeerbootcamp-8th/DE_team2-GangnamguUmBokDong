@@ -23,6 +23,16 @@ def _kst_to_utc(date_str: str, time_str: str) -> datetime:
     return naive_kst - _KST
 
 
+def _kst_date_hm_to_utc(date_str: str, hour: int, minute: int) -> datetime:
+    """predict_single.py 출력의 date("YYYY-MM-DD", KST) + hour/minute(정수)을 UTC로 변환한다.
+
+    기상청 baseDate/fcstDate(YYYYMMDD, 대시 없음)와 형식이 달라 `_kst_to_utc`를
+    재사용하지 않고 별도 헬퍼로 둔다.
+    """
+    naive_kst = datetime.strptime(f"{date_str} {hour:02d}{minute:02d}", "%Y-%m-%d %H%M").replace(tzinfo=UTC)
+    return naive_kst - _KST
+
+
 def stations_from_silver(df: pd.DataFrame) -> list[dict]:
     """`bike_station_realtime` silver -> stations 레코드."""
     records = []
@@ -147,6 +157,35 @@ def cultural_events_from_silver(df: pd.DataFrame, today: date | None = None) -> 
                 "is_free": row.get("IS_FREE"),
                 "lat": _to_float(row.get("LAT")),
                 "lon": _to_float(row.get("LOT")),
+            }
+        )
+    return records
+
+
+def forecast_points_from_predictions(df: pd.DataFrame, batch_run_at: datetime) -> list[dict]:
+    """ml/inference의 predict_single.py --all-stations 출력 -> forecast_points 레코드.
+
+    각 행의 date/hour/minute는 이미 그 horizon의 목표 시각이다
+    (predict_demand_multi_hour_all_stations()가 target_ts = anchor_ts + (horizon-1)h로
+    계산해서 채워 넣는다) — horizon을 여기서 다시 더하지 않는다.
+
+    station_id("ST-101" 등)와 stations.sta_id("101" 등, bike_station_realtime의
+    raw stationId를 그대로 씀)가 같은 값 공간인지는 실제 데이터로 아직 확정되지
+    않았다 — libs/ml_common/silver_schema.py의 컬럼 매핑이 둘 다 raw stationId를
+    그대로 통과시키는 것처럼 보이지만, 실제 Seoul OpenAPI 응답으로 검증 전까지는
+    가정으로만 남겨둔다.
+    """
+    records = []
+    for row in df.to_dict("records"):
+        sta_id = str(row["station_id"])
+        predicted_dttm = _kst_date_hm_to_utc(row["date"], int(row["hour"]), int(row["minute"]))
+        records.append(
+            {
+                "sta_id": sta_id,
+                "predicted_dttm": predicted_dttm,
+                "predicted_rent_cnt": round(row["rental_pred_mean"]),
+                "predicted_return_cnt": round(row["return_pred_mean"]),
+                "batch_run_at": batch_run_at,
             }
         )
     return records

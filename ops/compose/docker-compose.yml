@@ -35,12 +35,19 @@ services:
     image: minio/mc
     depends_on:
       - minio
+    volumes:
+      # 운영환경에서는 학습 파이프라인이 S3에 직접 모델을 올린다 — 이 볼륨/미러링은
+      # 로컬 개발 전용 1회성 부트스트랩이다 (models/*.txt,*.json은 참고용으로 레포
+      # 루트에 있을 뿐, ml/inference는 S3에서만 모델을 로드하므로 로컬 MinIO에도
+      # 똑같이 올려둬야 추론이 실제로 동작한다).
+      - ../../models:/seed-models:ro
     entrypoint: >
       /bin/sh -c "
       until mc alias set local http://minio:9000 ${MINIO_ROOT_USER:-minioadmin} ${MINIO_ROOT_PASSWORD:-minioadmin}; do
         echo 'waiting for minio...'; sleep 2;
       done;
       mc mb --ignore-existing local/${S3_BUCKET:-local-dev};
+      mc mirror --overwrite /seed-models local/${S3_BUCKET:-local-dev}/${MODELS_PREFIX:-models};
       exit 0;
       "
 
@@ -57,6 +64,12 @@ services:
       PYTHONPATH: /workspace/airflow
       AIRFLOW__CORE__EXECUTOR: LocalExecutor
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_AIRFLOW_DB:-airflow}
+      AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-webserver:8080/execution/
+      AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_USERS: ${AIRFLOW_ADMIN_USER:-admin}:admin
+      # BashOperator subprocess(collector/normalizer/nowcasting/ml/db-loader)가 컨테이너
+      # 내부에서 실제로 Postgres/MinIO에 붙도록, 호스트 관점 .env 값을 컨테이너 관점으로 덮어쓴다.
+      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_APP_DB:-app}
+      S3_ENDPOINT_URL: http://minio:9000
     volumes:
       - ../..:/workspace
     depends_on:
@@ -67,7 +80,7 @@ services:
     build:
       context: ../..
       dockerfile: ops/compose/Dockerfile.airflow
-    command: ["webserver"]
+    command: ["api-server"]
     env_file:
       - path: ../../.env
         required: false
@@ -76,6 +89,10 @@ services:
       PYTHONPATH: /workspace/airflow
       AIRFLOW__CORE__EXECUTOR: LocalExecutor
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_AIRFLOW_DB:-airflow}
+      AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-webserver:8080/execution/
+      AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_USERS: ${AIRFLOW_ADMIN_USER:-admin}:admin
+      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_APP_DB:-app}
+      S3_ENDPOINT_URL: http://minio:9000
     ports:
       - "${AIRFLOW_WEBSERVER_PORT:-8080}:8080"
     volumes:
@@ -99,6 +116,32 @@ services:
       PYTHONPATH: /workspace/airflow
       AIRFLOW__CORE__EXECUTOR: LocalExecutor
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_AIRFLOW_DB:-airflow}
+      AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-webserver:8080/execution/
+      AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_USERS: ${AIRFLOW_ADMIN_USER:-admin}:admin
+      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_APP_DB:-app}
+      S3_ENDPOINT_URL: http://minio:9000
+    volumes:
+      - ../..:/workspace
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-dag-processor:
+    build:
+      context: ../..
+      dockerfile: ops/compose/Dockerfile.airflow
+    command: ["dag-processor"]
+    env_file:
+      - path: ../../.env
+        required: false
+    environment:
+      AIRFLOW_HOME: /workspace/airflow
+      PYTHONPATH: /workspace/airflow
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_AIRFLOW_DB:-airflow}
+      AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-webserver:8080/execution/
     volumes:
       - ../..:/workspace
     depends_on:

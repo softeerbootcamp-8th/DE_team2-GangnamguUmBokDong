@@ -4,6 +4,7 @@ import pandas as pd
 
 from transform import (
     cultural_events_from_silver,
+    forecast_points_from_predictions,
     station_stock_from_silver,
     stations_from_silver,
     weather_current_from_silver,
@@ -123,3 +124,49 @@ def test_cultural_events_from_silver_filters_ended_events():
     assert len(records) == 1
     assert records[0]["title"] == "여름 재즈 페스티벌"
     assert records[0]["end_date"] == date(2026, 8, 20)
+
+
+def test_forecast_points_from_predictions_maps_columns_and_converts_kst_to_utc():
+    df = pd.DataFrame(
+        [
+            {
+                "station_id": "101",
+                "date": "2026-08-16",
+                "hour": 14,
+                "minute": 5,
+                "horizon": 1,
+                "rental_pred_mean": 3.6,
+                "return_pred_mean": 2.4,
+            }
+        ]
+    )
+    batch_run_at = datetime(2026, 8, 16, 5, 5, tzinfo=UTC)
+
+    [record] = forecast_points_from_predictions(df, batch_run_at=batch_run_at)
+
+    assert record["sta_id"] == "101"
+    assert record["predicted_dttm"] == datetime(2026, 8, 16, 5, 5, tzinfo=UTC)
+    assert record["predicted_rent_cnt"] == 4
+    assert record["predicted_return_cnt"] == 2
+    assert record["batch_run_at"] == batch_run_at
+
+
+def test_forecast_points_from_predictions_rounds_half_to_even():
+    df = pd.DataFrame(
+        [
+            {
+                "station_id": "101",
+                "date": "2026-08-16",
+                "hour": 15,
+                "minute": 0,
+                "horizon": 2,
+                "rental_pred_mean": 2.5,
+                "return_pred_mean": 1.5,
+            }
+        ]
+    )
+
+    [record] = forecast_points_from_predictions(df, batch_run_at=datetime(2026, 8, 16, 6, 0, tzinfo=UTC))
+
+    assert record["predicted_rent_cnt"] == round(2.5)
+    assert record["predicted_return_cnt"] == round(1.5)

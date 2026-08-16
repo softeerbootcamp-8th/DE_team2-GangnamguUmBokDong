@@ -7,13 +7,25 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime
 
+import pandas as pd
+
+import s3_reader
 import transform
 
 SOURCE_BIKE_STATION_REALTIME = "bike_station_realtime"
 SOURCE_WEATHER_ULTRA_SHORT_TERM = "weather_ultra_short_term"
 SOURCE_WEATHER_SHORT_TERM_FORECAST = "weather_short_term_forecast"
 SOURCE_CULTURAL_EVENT = "cultural_event"
+# ml/inference가 predictions/dt=.../hh=.../inference_{HHMM}.parquet에 쓰는 결과물 —
+# collector가 정의한 source_id가 아니라 의도를 나타내는 sentinel일 뿐이며,
+# read_predictions()가 실제 읽기 경로를 담당한다(TABLE_SPECS["forecast_points"] 참고).
+SOURCE_ML_PREDICTIONS = "ml_predictions"
+
+
+def _read_silver_as_pandas(source_id: str, window_start: datetime) -> pd.DataFrame:
+    return s3_reader.read_silver(source_id, window_start).to_pandas()
 
 
 @dataclass(frozen=True)
@@ -22,6 +34,12 @@ class TableSpec:
     transform: Callable
     conflict_cols: list[str]
     update_cols: list[str]
+    reader: Callable[[datetime], pd.DataFrame] | None = None
+
+    def read(self, window_start: datetime) -> pd.DataFrame:
+        if self.reader is not None:
+            return self.reader(window_start)
+        return _read_silver_as_pandas(self.source_id, window_start)
 
 
 TABLE_SPECS: dict[str, TableSpec] = {
@@ -54,5 +72,12 @@ TABLE_SPECS: dict[str, TableSpec] = {
         transform=transform.cultural_events_from_silver,
         conflict_cols=["event_id"],
         update_cols=["title", "category", "gu", "place", "start_date", "end_date", "is_free", "lat", "lon"],
+    ),
+    "forecast_points": TableSpec(
+        source_id=SOURCE_ML_PREDICTIONS,
+        transform=transform.forecast_points_from_predictions,
+        conflict_cols=["sta_id", "predicted_dttm"],
+        update_cols=["predicted_rent_cnt", "predicted_return_cnt", "batch_run_at"],
+        reader=lambda window_start: s3_reader.read_predictions(window_start).to_pandas(),
     ),
 }
