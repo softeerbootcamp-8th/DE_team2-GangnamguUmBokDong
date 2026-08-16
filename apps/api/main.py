@@ -39,7 +39,7 @@ def list_stations() -> list[dict]:
 
 
 @app.get("/stations/{sta_id}", response_model=StationDetail)
-def get_station(sta_id: int) -> dict:
+def get_station(sta_id: str) -> dict:
     """대여소 하나의 상세 정보를 반환한다. 없으면 404."""
     row = queries.fetch_station(sta_id)
     if row is None:
@@ -48,7 +48,7 @@ def get_station(sta_id: int) -> dict:
 
 
 @app.get("/stations/{sta_id}/forecast", response_model=ForecastResponse)
-def get_forecast(sta_id: int) -> dict:
+def get_forecast(sta_id: str) -> dict:
     """대여소의 대여·반납 예측과 예측 재고를 시간순으로 반환한다. 없으면 404."""
     station = queries.fetch_station(sta_id)
     if station is None:

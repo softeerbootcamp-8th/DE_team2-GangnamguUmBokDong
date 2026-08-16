@@ -17,7 +17,7 @@ export default function App() {
   const [stations, setStations] = useState<StationSummary[]>([]);
   const [stationsUpdatedAt, setStationsUpdatedAt] = useState<Date | null>(null);
   const [alerts, setAlerts] = useState<Alert[]>([]);
-  const [selectedStationId, setSelectedStationId] = useState<number | null>(null);
+  const [selectedStationId, setSelectedStationId] = useState<string | null>(null);
   const [forecast, setForecast] = useState<ForecastResponse | null>(null);
   // 지도와 우선순위 리스트가 항상 같은 지역만 보여줘야 해서, 필터 상태를 두 패널의
   // 공통 부모인 여기서 들고 각각에 걸러진 배열을 내려보낸다. 지역센터 관할 경계는
@@ -58,7 +58,7 @@ export default function App() {
     }
     let cancelled = false;
     function refresh() {
-      api.forecast(selectedStationId as number).then((data) => {
+      api.forecast(selectedStationId as string).then((data) => {
         if (!cancelled) setForecast(data);
       });
     }

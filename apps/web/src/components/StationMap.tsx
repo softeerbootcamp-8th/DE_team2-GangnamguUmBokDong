@@ -153,12 +153,12 @@ function countIcon(count: number, markerRadiusPx: number) {
 // (우선순위가 급한) 대여소일수록 먼저 살아남게 순위를 매겨둔다. 정렬은
 // stations/alerts가 바뀔 때만 다시 하고, 화면이 바뀔 때는 이미 정렬된 배열을
 // 거르기만 한다.
-function rankByUrgency(stations: StationSummary[], alertsByStation: Map<number, Alert>): StationSummary[] {
+function rankByUrgency(stations: StationSummary[], alertsByStation: Map<string, Alert>): StationSummary[] {
   return [...stations].sort((a, b) => {
     const scoreA = alertsByStation.get(a.sta_id)?.urgency_score ?? -1;
     const scoreB = alertsByStation.get(b.sta_id)?.urgency_score ?? -1;
     if (scoreB !== scoreA) return scoreB - scoreA;
-    return a.sta_id - b.sta_id;
+    return a.sta_id.localeCompare(b.sta_id);
   });
 }
 
@@ -170,7 +170,7 @@ function rankByUrgency(stations: StationSummary[], alertsByStation: Map<number, 
 function visibleStations(
   ranked: StationSummary[],
   bounds: L.LatLngBounds | null,
-  keepStationId: number | null,
+  keepStationId: string | null,
 ): StationSummary[] {
   const inView = bounds ? ranked.filter((s) => bounds.contains([s.lat, s.lon])) : ranked;
   if (inView.length <= MAX_VISIBLE_MARKERS) return inView;
@@ -200,8 +200,8 @@ function zPriority(alert: Alert | undefined, isSelected: boolean): number {
 interface Props {
   stations: StationSummary[];
   alerts: Alert[];
-  selectedStationId: number | null;
-  onSelect: (stationId: number) => void;
+  selectedStationId: string | null;
+  onSelect: (stationId: string) => void;
   regionCenters: DispatchCenter[];
   selectedRegion: string;
 }
@@ -254,7 +254,7 @@ function StationMarkers({ stations, alerts, selectedStationId, onSelect, regionC
   // 동점 순서가 반대로 나온다). 그러면 실제로는 위에 그려진 원인데 겹침
   // 판정에서는 아래로 취급돼서, 위에 있는 쪽의 라벨이 반대로 사라진다.
   const occludedStationIds = useMemo(() => {
-    if (!showCounts) return new Set<number>();
+    if (!showCounts) return new Set<string>();
     const withPixel = stackOrder.map((station) => {
       const alert = alertsByStation.get(station.sta_id);
       return {
@@ -264,7 +264,7 @@ function StationMarkers({ stations, alerts, selectedStationId, onSelect, regionC
       };
     });
     const topToBottom = [...withPixel].reverse();
-    const occluded = new Set<number>();
+    const occluded = new Set<string>();
     for (let i = 1; i < topToBottom.length; i++) {
       const station = topToBottom[i];
       for (let j = 0; j < i; j++) {
