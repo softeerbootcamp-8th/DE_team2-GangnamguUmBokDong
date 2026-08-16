@@ -2,8 +2,10 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 import queries
+from regions import DISPATCH_CENTERS, nearest_region
 from schemas import (
     Alert,
+    DispatchCenter,
     ForecastResponse,
     StationDetail,
     StationSummary,
@@ -30,7 +32,10 @@ def _shared_rate(row: dict) -> float:
 @app.get("/stations", response_model=list[StationSummary])
 def list_stations() -> list[dict]:
     """전체 대여소의 마스터 정보 + 현재 재고를 반환한다."""
-    return [{**row, "shared_rate": _shared_rate(row)} for row in queries.fetch_stations()]
+    return [
+        {**row, "shared_rate": _shared_rate(row), "region": nearest_region(row["lat"], row["lon"])}
+        for row in queries.fetch_stations()
+    ]
 
 
 @app.get("/stations/{sta_id}", response_model=StationDetail)
@@ -39,7 +44,7 @@ def get_station(sta_id: int) -> dict:
     row = queries.fetch_station(sta_id)
     if row is None:
         raise HTTPException(status_code=404, detail=f"station {sta_id} not found")
-    return {**row, "shared_rate": _shared_rate(row)}
+    return {**row, "shared_rate": _shared_rate(row), "region": nearest_region(row["lat"], row["lon"])}
 
 
 @app.get("/stations/{sta_id}/forecast", response_model=ForecastResponse)
@@ -60,6 +65,14 @@ def get_forecast(sta_id: int) -> dict:
         # 아직 없다. 생기면 여기서 채운다.
         "reasons": [],
     }
+
+
+@app.get("/regions", response_model=list[DispatchCenter])
+def list_regions() -> list[dict]:
+    """지역센터(권역) 목록과 좌표를 반환한다. 프론트가 권역 경계(보로노이)를
+    그리려면 대여소 배정에 쓰인 것과 같은 좌표를 알아야 하므로, 여기 하나(regions.py)만
+    출처로 둔다."""
+    return [{"region": name, "lat": lat, "lon": lon} for name, lat, lon in DISPATCH_CENTERS]
 
 
 @app.get("/status", response_model=StatusResponse)
@@ -97,6 +110,7 @@ def list_alerts() -> list[dict]:
                 "action_type": action_type,
                 "urgency_score": score,
                 "minutes_until_critical": minutes,
+                "region": nearest_region(station["lat"], station["lon"]),
             }
         )
     return sorted(alerts, key=lambda a: a["urgency_score"], reverse=True)

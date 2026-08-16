@@ -11,6 +11,7 @@ export interface StationSummary {
   hold_cnt: number;
   parking_bike_tot_cnt: number;
   shared_rate: number;
+  region: string;
   base_dttm: string;
 }
 
@@ -39,10 +40,17 @@ export interface Alert {
   action_type: ActionType;
   urgency_score: number;
   minutes_until_critical: number;
+  region: string;
 }
 
 export interface StatusResponse {
   base_dttm: string;
+}
+
+export interface DispatchCenter {
+  region: string;
+  lat: number;
+  lon: number;
 }
 
 async function getJson<T>(path: string): Promise<T> {
@@ -59,4 +67,5 @@ export const api = {
   forecast: (id: number) => getJson<ForecastResponse>(`/stations/${id}/forecast`),
   alerts: () => getJson<Alert[]>("/alerts"),
   status: () => getJson<StatusResponse>("/status"),
+  regions: () => getJson<DispatchCenter[]>("/regions"),
 };
