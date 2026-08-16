@@ -34,7 +34,7 @@ _BOUNDARY_PATH = Path(__file__).parent / "assets" / "seoul_gu_boundary.geojson"
 # 서울 시가지 반경(~15km)의 두 배 이상 여유를 둔 값이다.
 _MAX_NEAREST_GU_DEGREES = 0.3
 
-# collector/sources/weather_ultra_short_term.yaml, weather_short_term_forecast.yaml의
+# collector/sources/weather_ultra_short_live.yaml, weather_short_term_forecast.yaml의
 # grids 목록과 반드시 같은 25개 좌표를 유지해야 한다(각 구 중심점에 가장 가까운
 # 정수 격자를 그리디 배정한 결과 — loader/implementation-plan.md 참고).
 _GRID_TO_GU_TABLE: dict[tuple[int, int], str] = {

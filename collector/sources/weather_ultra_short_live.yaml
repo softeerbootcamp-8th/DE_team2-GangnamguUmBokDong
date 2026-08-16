@@ -1,4 +1,4 @@
-source_id: weather_ultra_short_term
+source_id: weather_ultra_short_live
 description: "\uAE30\uC0C1\uCCAD \uCD08\uB2E8\uAE30 \uC2E4\uD669\xB7\uC608\uBCF4"
 adapter: kma_apihub
 adapter_params:

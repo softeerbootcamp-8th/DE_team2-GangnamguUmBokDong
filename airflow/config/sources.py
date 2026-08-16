@@ -6,10 +6,12 @@
 """
 
 REALTIME_5MIN_SOURCES = ("bike_rental_history", "bike_station_realtime", "population_realtime")
-WEATHER_10MIN_SOURCE = "weather_ultra_short_term"
+WEATHER_10MIN_SOURCE = "weather_ultra_short_live"
+WEATHER_ULTRA_SHORT_FORECAST_SOURCE = "weather_ultra_short_forecast"
 WEATHER_3H_SOURCE = "weather_short_term_forecast"
 DAILY_POPULATION_SOURCE = "living_population_grid"
 DAILY_EVENT_SOURCE = "cultural_event"
+PERFORMANCE_EVENT_SOURCE = "performance_event"
 
 NORMALIZER_BASELINE_MODE_PRIMARY = "strict"
 NORMALIZER_BASELINE_MODE_FALLBACK = "latest"

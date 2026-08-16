@@ -167,8 +167,8 @@ class TestSeoulSourcesEndToEnd:
 
 
 class TestKmaSourceEndToEnd:
-    def test_weather_ultra_short_term_end_to_end(self):
-        config = config_loader.load("weather_ultra_short_term", base_dir=SOURCES_DIR)
+    def test_weather_ultra_short_live_end_to_end(self):
+        config = config_loader.load("weather_ultra_short_live", base_dir=SOURCES_DIR)
 
         def handler(request):
             params = dict(request.url.params)
@@ -197,7 +197,7 @@ class TestKmaSourceEndToEnd:
         assert result.artifacts.silver is not None
 
     @pytest.mark.parametrize(
-        "source_id", ["weather_ultra_short_term", "weather_short_term_forecast"]
+        "source_id", ["weather_ultra_short_live", "weather_short_term_forecast"]
     )
     def test_weather_grids_cover_25_seoul_gu_one_to_one(self, source_id):
         """loader/gu_mapping.py의 `_GRID_TO_GU_TABLE`은 여기 grids 목록과 1:1로

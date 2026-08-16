@@ -15,9 +15,11 @@ import s3_reader
 import transform
 
 SOURCE_BIKE_STATION_REALTIME = "bike_station_realtime"
-SOURCE_WEATHER_ULTRA_SHORT_TERM = "weather_ultra_short_term"
+SOURCE_WEATHER_ULTRA_SHORT_LIVE = "weather_ultra_short_live"
 SOURCE_WEATHER_SHORT_TERM_FORECAST = "weather_short_term_forecast"
 SOURCE_CULTURAL_EVENT = "cultural_event"
+SOURCE_PERFORMANCE_EVENT = "performance_event"
+SOURCE_WEATHER_ULTRA_SHORT_FORECAST = "weather_ultra_short_forecast"
 # ml/inference가 predictions/dt=.../hh=.../inference_{HHMM}.parquet에 쓰는 결과물 —
 # collector가 정의한 source_id가 아니라 의도를 나타내는 sentinel일 뿐이며,
 # read_predictions()가 실제 읽기 경로를 담당한다(TABLE_SPECS["forecast_points"] 참고).
@@ -56,7 +58,7 @@ TABLE_SPECS: dict[str, TableSpec] = {
         update_cols=["parking_bike_tot_cnt"],
     ),
     "weather_current": TableSpec(
-        source_id=SOURCE_WEATHER_ULTRA_SHORT_TERM,
+        source_id=SOURCE_WEATHER_ULTRA_SHORT_LIVE,
         transform=transform.weather_current_from_silver,
         conflict_cols=["gu"],
         update_cols=["observed_at", "temperature", "humidity", "wind_speed", "rainfall", "pty_type"],
@@ -65,11 +67,23 @@ TABLE_SPECS: dict[str, TableSpec] = {
         source_id=SOURCE_WEATHER_SHORT_TERM_FORECAST,
         transform=transform.weather_forecast_from_silver,
         conflict_cols=["gu", "forecast_dttm"],
-        update_cols=["temperature", "precip_prob", "sky_cond", "pty_type"],
+        update_cols=["sky_cond", "pty_type", "temperature", "precip_prob", "precip_amount", "humidity", "wind_speed", "base_dttm"],
+    ),
+    "weather_forecast_ultra": TableSpec(
+        source_id=SOURCE_WEATHER_ULTRA_SHORT_FORECAST,
+        transform=transform.weather_forecast_ultra_from_silver,
+        conflict_cols=["gu", "forecast_dttm"],
+        update_cols=["sky_cond", "pty_type", "temperature", "precip_prob", "precip_amount", "humidity", "wind_speed", "base_dttm"],
     ),
     "cultural_events": TableSpec(
         source_id=SOURCE_CULTURAL_EVENT,
         transform=transform.cultural_events_from_silver,
+        conflict_cols=["event_id"],
+        update_cols=["title", "category", "gu", "place", "start_date", "end_date", "is_free", "lat", "lon"],
+    ),
+    "cultural_events_performance": TableSpec(
+        source_id=SOURCE_PERFORMANCE_EVENT,
+        transform=transform.performance_events_from_silver,
         conflict_cols=["event_id"],
         update_cols=["title", "category", "gu", "place", "start_date", "end_date", "is_free", "lat", "lon"],
     ),

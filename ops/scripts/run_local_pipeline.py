@@ -192,7 +192,7 @@ JOBS: list[Job] = [
     Job("bike_station_realtime", 5, [_downstream_db_loader("stations"), _downstream_db_loader("station_stock")]),
     Job("population_realtime", 5, [_downstream_normalizer]),
     Job("bike_rental_history", 5, []),
-    Job("weather_ultra_short_term", 10, [_downstream_db_loader("weather_current")]),
+    Job("weather_ultra_short_live", 10, [_downstream_db_loader("weather_current")]),
     Job("weather_short_term_forecast", 180, [_downstream_db_loader("weather_forecast")]),
     Job("cultural_event", 1440, [_downstream_db_loader("cultural_events")]),
     Job("living_population_grid", 1440, [_downstream_nowcasting]),

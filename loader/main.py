@@ -34,11 +34,19 @@ def run(table: str, window_start: datetime) -> None:
     else:
         rows = spec.transform(silver)
 
+    # 논리 spec 이름 → 물리 테이블 이름 매핑
+    # 여러 소스가 같은 골드 테이블로 병합되는 경우를 처리한다.
+    _TABLE_ALIASES = {
+        "cultural_events_performance": "cultural_events",
+        "weather_forecast_ultra": "weather_forecast",
+    }
+    target_table = _TABLE_ALIASES.get(table, table)
+
     with get_connection() as conn:
-        upsert(conn, table, rows, spec.conflict_cols, spec.update_cols)
+        upsert(conn, target_table, rows, spec.conflict_cols, spec.update_cols)
         conn.commit()
 
-    print(f"upserted {len(rows)} rows into {table}")
+    print(f"upserted {len(rows)} rows into {target_table}")
 
 
 def main() -> int:

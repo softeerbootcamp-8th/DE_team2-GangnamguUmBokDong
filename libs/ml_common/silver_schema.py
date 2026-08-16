@@ -88,7 +88,7 @@ POPULATION_COLUMN_MAP = {
 
 BIKE_REALTIME_SOURCE_ID = "bike_station_realtime"
 RENTAL_SOURCE_ID = "bike_rental_history"
-WEATHER_SOURCE_ID = "weather_ultra_short_term"
+WEATHER_SOURCE_ID = "weather_ultra_short_live"
 POPULATION_SOURCE_ID = "living_population_grid"
 
 BIKE_REALTIME_TICK_MINUTES = 5

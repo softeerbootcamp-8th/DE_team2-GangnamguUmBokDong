@@ -78,7 +78,7 @@ def station_stock_from_silver(df: pd.DataFrame, observed_at: datetime) -> list[d
 
 
 def weather_current_from_silver(df: pd.DataFrame) -> list[dict]:
-    """`weather_ultra_short_term` silver -> weather_current 레코드.
+    """`weather_ultra_short_live` silver -> weather_current 레코드.
 
     격자(nx, ny)를 gu로 변환한 뒤, 같은 gu에 여러 격자가 매핑되면 가장 최근 관측
     (baseDate·baseTime 기준) 1건만 남긴다.
@@ -108,6 +108,7 @@ def weather_forecast_from_silver(df: pd.DataFrame) -> list[dict]:
     """`weather_short_term_forecast` silver -> weather_forecast 레코드.
 
     동일 (gu, forecast_dttm)에 대해 가장 최근에 발표된(base_dttm이 가장 늦은) 예보만 남긴다.
+    base_dttm은 대시보드에서 '(기상청 XX:XX 발표 기준)' 표시를 위해 보존한다.
     """
     by_key: dict[tuple[str, datetime], dict] = {}
     for row in df.to_dict("records"):
@@ -118,19 +119,75 @@ def weather_forecast_from_silver(df: pd.DataFrame) -> list[dict]:
         base_dttm = _kst_to_utc(str(row["baseDate"]), str(row["baseTime"]))
         key = (gu, forecast_dttm)
         existing = by_key.get(key)
-        if existing is not None and existing["_base_dttm"] >= base_dttm:
+        if existing is not None and existing["base_dttm"] >= base_dttm:
             continue
         by_key[key] = {
             "gu": gu,
             "forecast_dttm": forecast_dttm,
-            "temperature": _to_float(row.get("TMP")),
-            "precip_prob": _to_float(row.get("POP")),
             "sky_cond": _to_int(row.get("SKY")),
             "pty_type": _to_int(row.get("PTY")),
-            "_base_dttm": base_dttm,
+            "temperature": _to_float(row.get("TMP")),
+            "precip_prob": _to_float(row.get("POP")),
+            "precip_amount": _parse_precip_str(row.get("PCP")),
+            "humidity": _to_float(row.get("REH")),
+            "wind_speed": _to_float(row.get("WSD")),
+            "base_dttm": base_dttm,
         }
-    for record in by_key.values():
-        del record["_base_dttm"]
+    return list(by_key.values())
+
+
+def _parse_precip_str(value) -> float | None:
+    """기상청 강수량 문자열('강수없음', '1.0mm 미만', '30.0~50.0mm' 등)을 float으로 변환한다.
+
+    단기예보(PCP)와 초단기예보(RN1)는 숫자가 아닌 범위 문자열을 반환하는 경우가 있다.
+    범위인 경우 하한값을 사용하고, '강수없음'은 0.0으로 변환한다.
+    """
+    if value is None or value == "":
+        return None
+    text = str(value).strip()
+    if text in ("강수없음", "적설없음"):
+        return 0.0
+    if "미만" in text:
+        return 0.5  # "1.0mm 미만" → 0에 가까운 값
+    # "30.0~50.0mm" → 30.0
+    text = text.replace("mm", "").strip()
+    if "~" in text:
+        text = text.split("~")[0]
+    try:
+        return float(text)
+    except (TypeError, ValueError):
+        return None
+
+
+def weather_forecast_ultra_from_silver(df: pd.DataFrame) -> list[dict]:
+    """`weather_ultra_short_forecast` silver -> weather_forecast 레코드.
+
+    초단기예보는 단기예보와 컬럼명이 다르다(T1H/RN1 vs TMP/PCP, POP 없음).
+    동일 (gu, forecast_dttm)에 대해 가장 최근에 발표된 예보만 남긴다.
+    """
+    by_key: dict[tuple[str, datetime], dict] = {}
+    for row in df.to_dict("records"):
+        gu = grid_to_gu(row["nx"], row["ny"])
+        if gu is None:
+            continue
+        forecast_dttm = _kst_to_utc(str(row["fcstDate"]), str(row["fcstTime"]))
+        base_dttm = _kst_to_utc(str(row["baseDate"]), str(row["baseTime"]))
+        key = (gu, forecast_dttm)
+        existing = by_key.get(key)
+        if existing is not None and existing["base_dttm"] >= base_dttm:
+            continue
+        by_key[key] = {
+            "gu": gu,
+            "forecast_dttm": forecast_dttm,
+            "sky_cond": _to_int(row.get("SKY")),
+            "pty_type": _to_int(row.get("PTY")),
+            "temperature": _to_float(row.get("T1H")),
+            "precip_prob": None,  # 초단기예보에는 강수확률(POP)이 없다
+            "precip_amount": _parse_precip_str(row.get("RN1")),
+            "humidity": _to_float(row.get("REH")),
+            "wind_speed": _to_float(row.get("WSD")),
+            "base_dttm": base_dttm,
+        }
     return list(by_key.values())
 
 
@@ -157,6 +214,40 @@ def cultural_events_from_silver(df: pd.DataFrame, today: date | None = None) -> 
                 "is_free": row.get("IS_FREE"),
                 "lat": _to_float(row.get("LAT")),
                 "lon": _to_float(row.get("LOT")),
+            }
+        )
+    return records
+
+
+def performance_events_from_silver(df: pd.DataFrame, today: date | None = None) -> list[dict]:
+    """`performance_event` silver -> cultural_events 레코드. 종료일이 지난 행사는 제외한다."""
+    today = today or datetime.now(UTC).date()
+    records = []
+    for row in df.to_dict("records"):
+        end_date = _parse_date(row.get("SVCOPNENDDT"))
+        if end_date is not None and end_date < today:
+            continue
+        title = row.get("SVCNM", "")
+        place = row.get("PLACENM", "")
+        svcid = row.get("SVCID")
+        
+        event_id = str(svcid) if svcid else hashlib.sha256(f"{title}{place}{row.get('SVCOPNBGNDT', '')}".encode()).hexdigest()
+        
+        is_free_val = row.get("PAYATNM")
+        is_free = "무료" if is_free_val == "무료" else "유료"
+        
+        records.append(
+            {
+                "event_id": event_id,
+                "title": title,
+                "category": row.get("MINCLASSNM"),
+                "gu": row.get("AREANM"),
+                "place": place,
+                "start_date": _parse_date(row.get("SVCOPNBGNDT")),
+                "end_date": end_date,
+                "is_free": is_free,
+                "lat": _to_float(row.get("Y")),
+                "lon": _to_float(row.get("X")),
             }
         )
     return records

@@ -14,8 +14,12 @@ def test_schedule():
 
 
 def test_tasks_and_dependency():
-    assert set(dag.task_ids) == {"collect_weather_ultra_short_term", "load_weather_current"}
-    collect = dag.get_task("collect_weather_ultra_short_term")
+    expected_tasks = {
+        "collect_weather_ultra_short_live", "load_weather_current",
+        "collect_weather_ultra_short_forecast", "load_weather_forecast_ultra",
+    }
+    assert set(dag.task_ids) == expected_tasks
+    collect = dag.get_task("collect_weather_ultra_short_live")
     load = dag.get_task("load_weather_current")
     assert load.task_id in {t.task_id for t in collect.downstream_list}
     assert "--table weather_current" in load.bash_command

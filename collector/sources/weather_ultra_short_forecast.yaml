@@ -1,11 +1,11 @@
-source_id: weather_short_term_forecast
-description: "\uAE30\uC0C1\uCCAD \uB2E8\uAE30\uC608\uBCF4"
+source_id: weather_ultra_short_forecast
+description: "기상청 초단기예보"
 adapter: kma_apihub
 adapter_params:
-  endpoint: getVilageFcst
+  endpoint: getUltraSrtFcst
   root_key: response.body.items.item
   pivot: {key: category, value: fcstValue}
-  time_rule: vilage_fcst
+  time_rule: half_hourly
   grids:
   - [57, 127]
   - [58, 124]
@@ -32,13 +32,13 @@ adapter_params:
   - [62, 127]
   - [62, 129]
   - [63, 126]
-schedule: {interval: 3h}
+schedule: {interval: 30m}
 storage:
   bronze_format: json
   silver_format: parquet
   partition: [dt, hh]
 quality: {max_drop_ratio: 0.05, max_missing_ratio: 0.15, allow_empty: false}
-backfill: {enabled: true, max_age: 24h}
+backfill: {enabled: true, max_age: 6h}
 policies: {required_missing: drop_row, required_outlier: drop_row, optional_missing: keep_null,
   optional_outlier: set_null}
 columns:
@@ -60,23 +60,23 @@ columns:
   fcstTime:
     types: [str]
     required: true
-  TMP:
+  T1H:
     types: [float]
     range: {min: -50, max: 50}
-  REH:
-    types: [float]
-    range: {min: 0, max: 100}
-  WSD:
-    types: [float]
-    range: {min: 0, max: 50}
-  POP:
-    types: [float]
-    range: {min: 0, max: 100}
-  PCP:
+  RN1:
     types: [str]
   SKY:
     types: [int]
     enum: [1, 3, 4]
   PTY:
     types: [int]
-    enum: [0, 1, 2, 3, 4]
+    enum: [0, 1, 2, 3, 5, 6, 7]
+  REH:
+    types: [float]
+    range: {min: 0, max: 100}
+  WSD:
+    types: [float]
+    range: {min: 0, max: 50}
+  LGT:
+    types: [float]
+    range: {min: 0, max: 100}

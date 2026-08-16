@@ -54,13 +54,19 @@ CREATE TABLE IF NOT EXISTS weather_current (
 );
 
 -- 기상청 단기예보(미래 날씨). 동일 (gu, forecast_dttm)에 대해 가장 최근 발표만 upsert로 남긴다.
+-- 대시보드에서 상세 기상 수치(습도, 풍속, 강수량)와 발표시각까지 표시 가능하다.
 CREATE TABLE IF NOT EXISTS weather_forecast (
-    gu              TEXT NOT NULL,
-    forecast_dttm   TIMESTAMPTZ NOT NULL,
-    temperature     DOUBLE PRECISION,
-    precip_prob     DOUBLE PRECISION,
-    sky_cond        INTEGER,
-    pty_type        INTEGER,
+    gu                   TEXT NOT NULL,
+    forecast_dttm        TIMESTAMPTZ NOT NULL,
+    sky_cond             INTEGER,
+    pty_type             INTEGER,
+    temperature          DOUBLE PRECISION,
+    precip_prob          DOUBLE PRECISION,
+    precip_amount        DOUBLE PRECISION,
+    humidity             DOUBLE PRECISION,
+    wind_speed           DOUBLE PRECISION,
+    base_dttm            TIMESTAMPTZ NOT NULL,
+    updated_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (gu, forecast_dttm)
 );
 
