@@ -134,7 +134,7 @@ def cultural_events_from_silver(df: pd.DataFrame, today: date | None = None) -> 
             continue
         title = row["TITLE"]
         place = row["PLACE"]
-        event_id = hashlib.sha256(f"{title}{place}".encode()).hexdigest()
+        event_id = hashlib.sha256(f"{title}{place}{row.get('STRTDATE', '')}".encode()).hexdigest()
         records.append(
             {
                 "event_id": event_id,
