@@ -73,6 +73,12 @@ POPULATION_PARQUET = PROCESSED_V2_DIR / "population_2025.parquet"
 # feature_engineering.spark.run_pipeline이 실제로 쓴 경로와 항상 일치한다 ---
 MERGED_TABLE_PARQUET = FEATURE_ENGINEERING_OUTPUT_DIR / "station_hour_merged_2025.parquet"
 FEATURES_TABLE_PARQUET = FEATURE_ENGINEERING_OUTPUT_DIR / "station_hour_features_2025.parquet"
+# FEATURES_TABLE_PARQUET의 각 행(T0, 5분 tick)을 horizon=1..HORIZON_COUNT만큼 self-join해
+# "T0의 lag/rolling + T0+(horizon-1)시간의 날씨/캘린더/타겟"으로 조합한 학습 테이블
+# (build_multi_horizon_features.py) — training이 이제 이 테이블만 읽는다.
+MULTI_HORIZON_FEATURES_TABLE_PARQUET = (
+    FEATURE_ENGINEERING_OUTPUT_DIR / "station_hour_features_multihorizon_2025.parquet"
+)
 ROLLING_RENTAL_FEATURES_PARQUET = FEATURE_ENGINEERING_OUTPUT_DIR / "rolling_rental_features_2025.parquet"
 
 # --- inference가 만드는 fallback 프로필(위 MERGED_TABLE_PARQUET/POPULATION_PARQUET

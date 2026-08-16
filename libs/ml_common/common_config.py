@@ -65,6 +65,13 @@ ROLLING_EMBARGO_MINUTES = _int_env("ROLLING_EMBARGO_MINUTES", _PROFILE["ROLLING_
 TARGET_HORIZON_MINUTES = _int_env("TARGET_HORIZON_MINUTES", _PROFILE["TARGET_HORIZON_MINUTES"])
 GRID_TICK_MINUTES = _int_env("GRID_TICK_MINUTES", _PROFILE["GRID_TICK_MINUTES"])
 
+# --- 배치예측 horizon(몇 시간 뒤까지 한 번에 예측하는지) ---
+# lag/rolling(직전 실적)은 항상 "지금(T0)" 기준으로 고정하고, horizon(1..HORIZON_COUNT)을
+# feature로 모델에 직접 알려준다 — horizon마다 별도 모델을 두거나 재귀 예측(오차 누적)을
+# 쓰지 않는 이유는 history.md 18번 항목 참고. feature_engineering의 multi-horizon self-join
+# 범위와 inference의 기본 예측 구간 수가 이 값 하나를 같이 참조한다.
+HORIZON_COUNT = _int_env("HORIZON_COUNT", _PROFILE["HORIZON_COUNT"])
+
 # --- lag/rolling 피처 파라미터 ---
 LAG_HOURS = _PROFILE["LAG_HOURS"]  # t-1h, 전일 동시간, 전주 동요일 동시간
 ROLLING_WINDOWS = _PROFILE["ROLLING_WINDOWS"]  # rolling mean/std
@@ -89,10 +96,13 @@ BASE_FEATURE_COLUMNS = [
     "month",
     "is_holiday",
     "is_weekend",
+    "is_next_day_off",  # 다음날이 휴일(공휴일 또는 주말)인지 — "내일 쉬는 날이라 오늘 저녁 대여가 늘 것" 같은 패턴
+    "is_prev_day_off",  # 전날이 휴일(공휴일 또는 주말)이었는지 — 연휴 다음날 패턴 반영
     "hour_sin",
     "hour_cos",
     "dow_sin",
     "dow_cos",
+    "horizon",
 ]
 
 # --- LightGBM 공통 하이퍼파라미터 (train_common.py, 향후 SynapseML 쪽도 이 값을 참고) ---

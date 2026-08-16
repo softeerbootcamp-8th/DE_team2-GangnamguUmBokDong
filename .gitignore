@@ -20,6 +20,7 @@ dist/
 
 # ML
 models/
+data/
 
 # Data 
 *.csv
@@ -39,3 +40,8 @@ airflow/standalone_admin_password.txt
 
 # Claude
 docs/superpowers/
+
+# development
+dev/
+.claude/
+.superpowers/

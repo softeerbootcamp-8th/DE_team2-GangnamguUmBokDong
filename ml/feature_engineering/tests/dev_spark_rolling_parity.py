@@ -8,8 +8,6 @@ src/rolling_window_features.py(pandas, 이미 검증된 기준 구현)와 정확
 같은 입력에 같은 출력이 나오는지 확인한다.
 """
 
-import os
-
 import pandas as pd
 import pytest
 from ml_common import common_config as pandas_config
@@ -34,35 +32,6 @@ from feature_engineering.spark.rolling_window_features import (
 from feature_engineering.spark.rolling_window_features import (
     lookup_count_at_ticks as spark_lookup_count_at_ticks,
 )
-
-
-@pytest.fixture(scope="module")
-def spark():
-    import sys
-
-    from pyspark.sql import SparkSession
-
-    # 드라이버/워커(로컬 서브프로세스) Python을 이 프로세스와 고정 — 방치하면 PATH의
-    # 다른 python(pyspark가 지원 안 하는 버전일 수 있음)을 워커가 집어서 죽는다.
-    os.environ.setdefault("PYSPARK_PYTHON", sys.executable)
-    os.environ.setdefault("PYSPARK_DRIVER_PYTHON", sys.executable)
-    # JVM 기본 타임존을 세션 타임존(아래 UTC)과 맞춘다 — 안 맞추면 timestamp_ntz
-    # (parquet에서 읽은 값)와 timestamp(tz-aware, spark.createDataFrame(pandas_df)로
-    # 만든 값)가 unix_timestamp()/timestamp_seconds() 왕복에서 로컬 타임존만큼(이
-    # 개발 머신은 KST라 9시간) 조용히 어긋난다 — feature_engineering/spark_session.py
-    # 참고, 실제로 이 버그에 걸려서 발견함.
-    os.environ.setdefault("TZ", "Asia/Seoul")
-
-    session = (
-        SparkSession.builder.master("local[2]")
-        .appName("test-feature-engineering-rolling-parity")
-        .config("spark.sql.shuffle.partitions", "2")
-        .config("spark.ui.enabled", "false")
-        .config("spark.sql.session.timeZone", "Asia/Seoul")
-        .getOrCreate()
-    )
-    yield session
-    session.stop()
 
 
 def _trip(station, start, end=None):

@@ -5,10 +5,11 @@
 "station_id/기간을 골라 조회 -> 저장 -> 요약 출력"하는 배치 CLI 경험만 얹는다.
 
 이 프로젝트엔 실시간 서빙 API가 없으므로, CLI(`run_predict_cli`)는 이미 구축된
-`station_hour_features_2025.parquet`(feature_engineering이 만든 실제 관측 기반 테이블)에서
-station_id/기간을 골라 예측을 뽑아보는 용도다. 그 범위를 벗어난 날짜나 날씨·인구
-데이터가 없는 미래 시점은 예측할 수 없다 — 그러려면 해당 시점의 날씨·인구·최근
-실적 데이터를 먼저 `feature_engineering`의 피처마트 생성 파이프라인(`feature_engineering/spark/`)으로
+`station_hour_features_multihorizon_2025.parquet`(feature_engineering이 만든 multi-horizon
+학습 테이블 — horizon=1..HORIZON_COUNT가 섞여 있음)에서 station_id/기간/horizon을 골라
+예측을 뽑아보는 용도다. 그 범위를 벗어난 날짜나 날씨·인구 데이터가 없는 미래 시점은
+예측할 수 없다 — 그러려면 해당 시점의 날씨·인구·최근 실적 데이터를 먼저
+`feature_engineering`의 피처마트 생성 파이프라인(`feature_engineering/spark/`)으로
 넣어줘야 한다(그런 임의 시점 예측은 `predict_single.py`가 담당).
 """
 
@@ -22,7 +23,7 @@ from . import config
 
 
 def run_predict_cli(model_name: str, target_col: str, exposure_col: str | None, default_output: Path) -> pd.DataFrame:
-    """station_id/기간을 골라 예측하는 CLI 진입점. 두 predict_*.py가 공유한다.
+    """station_id/기간/horizon을 골라 예측하는 CLI 진입점. 두 predict_*.py가 공유한다.
 
     args:
         model_name: "rental" 또는 "return"
@@ -32,7 +33,7 @@ def run_predict_cli(model_name: str, target_col: str, exposure_col: str | None, 
     returns:
         pd.DataFrame: predict() 결과에 "actual" 컬럼을 추가한 DataFrame
     """
-    parser = argparse.ArgumentParser(description=f"{model_name} 수요 예측 (2025년 범위 내에서 조회)")
+    parser = argparse.ArgumentParser(description=f"{model_name} 수요 예측 (feature mart 범위 내에서 조회)")
     parser.add_argument("--station-id", default=None, help="정류소 ID 1개 (예: ST-1234). --station-ids와 동시 사용 불가")
     parser.add_argument(
         "--station-ids", default=None,
@@ -42,14 +43,22 @@ def run_predict_cli(model_name: str, target_col: str, exposure_col: str | None, 
     parser.add_argument("--start-date", default=config.TEST_START, help="YYYY-MM-DD, 기본값: 테스트 기간 시작")
     parser.add_argument("--end-date", default=config.TEST_END, help="YYYY-MM-DD, 기본값: 테스트 기간 끝")
     parser.add_argument("--hour", type=int, default=None, help="특정 시(0~23)만 조회하고 싶을 때")
+    parser.add_argument(
+        "--horizon", type=int, default=1,
+        help="몇 시간 뒤 예측을 조회할지 (1~HORIZON_COUNT, 기본값 1 — 기존 단일 horizon "
+        "챔피언과 동일한 조회 범위). multi-horizon 테이블엔 horizon별 행이 섞여 있어 "
+        "반드시 하나로 골라야 한다.",
+    )
     parser.add_argument("--out", default=None, help="결과 저장 경로(parquet). 미지정시 기본 경로")
     args = parser.parse_args()
 
     if args.station_id and args.station_ids:
         raise SystemExit("--station-id와 --station-ids는 동시에 지정할 수 없습니다.")
+    if not (1 <= args.horizon <= config.HORIZON_COUNT):
+        raise SystemExit(f"--horizon은 1~{config.HORIZON_COUNT} 사이여야 합니다: {args.horizon}")
 
-    df = pd.read_parquet(config.FEATURES_TABLE_PARQUET)
-    df = df[(df["date"] >= args.start_date) & (df["date"] <= args.end_date)]
+    df = pd.read_parquet(config.MULTI_HORIZON_FEATURES_TABLE_PARQUET)
+    df = df[(df["date"] >= args.start_date) & (df["date"] <= args.end_date) & (df["horizon"] == args.horizon)]
     if args.station_id:
         df = df[df["station_id"] == args.station_id]
         if df.empty:

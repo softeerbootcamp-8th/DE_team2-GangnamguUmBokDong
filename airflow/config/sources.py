@@ -79,4 +79,5 @@ Airflow에서 중복 정의하지 않는다.
 
 REALTIME_SOURCES = (
     "bike_station_realtime",
+    "population_realtime",
 )
