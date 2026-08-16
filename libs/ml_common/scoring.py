@@ -10,28 +10,27 @@ train-serve skew와 같은 종류의 사고(두 경로가 조용히 다른 값�
 스키마여야 한다(`ml_common.model_contract.FEATURE_COLUMNS` 포함).
 """
 
-import json
 from functools import cache
 
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
 
-from . import metrics
+from . import metrics, s3_io
 from .model_contract import FEATURE_COLUMNS, load_station_dtype
-from .paths import MODELS_DIR
+from .paths import model_json_key, model_key
 
 BOOSTER_SUFFIXES = ["poisson", "q10", "q50", "q90"]
 
 
 @cache
 def load_boosters(model_name: str) -> dict[str, lgb.Booster]:
-    """model_name의 booster 4개(poisson, q10, q50, q90)를 로드한다.
+    """model_name의 booster 4개(poisson, q10, q50, q90)를 S3에서 로드한다.
 
-    `lru_cache`로 프로세스당 model_name 하나에 한 번만 디스크에서 읽는다 —
+    `lru_cache`로 프로세스당 model_name 하나에 한 번만 S3에서 읽는다 —
     `predict()`가 배치/단일 조회 어느 경로든 호출마다 이걸 다시 읽고 있어서,
     같은 프로세스에서 반복 호출(예: 여러 정류소×여러 시간대 예측)이 많을 때
-    불필요한 파일 I/O가 병목이 됐다. **가정**: 이 프로세스가 살아있는 동안
+    불필요한 S3 GET이 병목이 됐다. **가정**: 이 프로세스가 살아있는 동안
     챔피언 모델 파일이 안 바뀐다 — 지금 이 함수를 부르는 곳(배치/단일 시점
     예측, 모니터링, 베이스라인 비교) 중 "같은 프로세스 안에서 재학습 후
     바로 다시 채점"하는 코드는 없어서 안전하다. 그런 코드를 나중에 추가한다면
@@ -42,15 +41,12 @@ def load_boosters(model_name: str) -> dict[str, lgb.Booster]:
     returns:
         dict[str, lgb.Booster]: {"poisson": ..., "q10": ..., "q50": ..., "q90": ...}
     """
-    return {
-        suffix: lgb.Booster(model_file=str(MODELS_DIR / f"{model_name}_{suffix}.txt"))
-        for suffix in BOOSTER_SUFFIXES
-    }
+    return {suffix: s3_io.download_and_load_booster(model_key(model_name, suffix)) for suffix in BOOSTER_SUFFIXES}
 
 
 @cache
 def load_conformal_correction(model_name: str) -> float:
-    """학습 시 저장해둔 split-conformal 보정값을 불러온다.
+    """학습 시 저장해둔 split-conformal 보정값을 S3에서 불러온다.
 
     `load_boosters()`와 같은 이유로 캐시한다(위 docstring 참고).
 
@@ -59,9 +55,11 @@ def load_conformal_correction(model_name: str) -> float:
     returns:
         float: P10/P90 구간에 적용할 보정값 (training/train_common._conformal_correction 참고)
     """
-    path = MODELS_DIR / f"{model_name}_conformal_correction.json"
-    with open(path, encoding="utf-8") as f:
-        return json.load(f)["correction"]
+    key = model_json_key(model_name, "conformal_correction")
+    data = s3_io.read_json(key)
+    if data is None:
+        raise FileNotFoundError(f"conformal_correction 없음: {key}")
+    return data["correction"]
 
 
 def predict(df: pd.DataFrame, model_name: str, exposure_col: str | None = None) -> pd.DataFrame:

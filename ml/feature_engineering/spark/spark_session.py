@@ -70,5 +70,26 @@ def get_spark(app_name: str = "ttareungyi-feature-engineering") -> SparkSession:
         # shuffle partition 기본값(200)은 로컬 코어 수 대비 과도하게 쪼개서 작은 파티션이
         # 너무 많아지는 오버헤드가 있다 — 로컬 코어 수 정도로 줄인다.
         builder = builder.config("spark.sql.shuffle.partitions", os.environ.get("SPARK_SHUFFLE_PARTITIONS", "8"))
+        # 로컬 개발도 항상 S3(MinIO)를 거치므로 Hadoop-S3A 커넥터가 필요하다 — EMR은
+        # EMRFS가 이미 내장돼 있어서 이 설정 자체가 필요 없다(그래서 is_local_run에서만
+        # 붙임). 버전은 pyspark 3.5.3이 내장한 Hadoop 3.3.4와 맞춘 것 — 다른 버전을
+        # 섞으면 클래스 충돌(NoSuchMethodError 등)이 난다. 최초 실행 시 Maven에서
+        # 내려받으므로 인터넷 연결이 필요하다(이후엔 로컬 ivy 캐시 재사용).
+        builder = builder.config(
+            "spark.jars.packages",
+            "org.apache.hadoop:hadoop-aws:3.3.4,com.amazonaws:aws-java-sdk-bundle:1.12.262",
+        )
+        builder = builder.config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
+        # MinIO는 버킷을 서브도메인이 아니라 경로로 구분한다(virtual-hosted-style 미지원).
+        builder = builder.config("spark.hadoop.fs.s3a.path.style.access", "true")
+        endpoint = os.environ.get("S3_ENDPOINT_URL")
+        if endpoint:
+            builder = builder.config("spark.hadoop.fs.s3a.endpoint", endpoint)
+        builder = builder.config(
+            "spark.hadoop.fs.s3a.access.key", os.environ.get("AWS_ACCESS_KEY_ID", "minioadmin")
+        )
+        builder = builder.config(
+            "spark.hadoop.fs.s3a.secret.key", os.environ.get("AWS_SECRET_ACCESS_KEY", "minioadmin")
+        )
 
     return builder.getOrCreate()

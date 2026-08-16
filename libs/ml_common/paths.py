@@ -1,98 +1,111 @@
-"""`feature_engineering`/`training`/`inference` 세 인스턴스가 공통으로 참조하는 산출물 경로.
+"""`feature_engineering`/`training`/`inference` 세 인스턴스가 공통으로 참조하는 S3 키.
 
-세 기능이 서로 다른 인스턴스에서 따로 배포되지만(각 폴더의 README 참고),
-`data/processed_v2/*.parquet` 산출물 경로만큼은 세 쪽 모두 **정확히 같은 값**을
-써야 한다 — feature_engineering가 만들고, training이 읽어서 학습하고, inference가 읽어서
-서빙하기 때문이다. 따로 하드코딩하면 한쪽만 고치고 잊어버려 조용히 갈라지는
-사고가 나므로(파라미터를 공유하는 `common_config.py`와 같은 이유), 경로도 이
-파일 하나로 모았다.
+로컬 개발도 항상 S3(MinIO, `dev/start_minio.sh`)를 거친다 — 더 이상 로컬
+파일시스템 폴백이 없다. 여기 정의된 값은 전부 **S3 버킷 안의 상대 키**(문자열)
+이지 로컬 경로가 아니다 — 실제 버킷 이름은 `S3_BUCKET` 환경변수(`ml_common.
+s3_io._bucket()`가 읽음)로 정해지고, 이 파일은 그 버킷 "안"에서 어떤 키를
+쓸지만 정의한다.
 
-**로컬 개발**: 이 파일 그대로 로컬 파일시스템 경로(`ml/data/`, `ml/training/models/`)를
-쓴다. **실제 배포**: `data/`는 S3에 저장되므로(요구사항), 인스턴스별로 `DATA_ROOT`/
-`MODELS_ROOT` 환경변수를 `s3://...`로 override하면 코드 변경 없이 그대로 동작한다
-(`feature_engineering/spark/config.py`가 이미 쓰던 것과 같은 패턴).
+키를 조합할 때 `pathlib.Path`나 `"/".join(...)`을 쓰지 않는다 — f-string으로
+그때그때 직접 만든다(`collector/storage.py`와 같은 컨벤션).
 
-**주의**: 이 패키지(`ml_common`)는 `libs/ml_common/`에 있고 `ml/`의 형제(sibling)라
-`ml/` 위치를 자기 파일 경로 기준으로는 알아낼 수 없다(`ml/`이 조상 디렉터리가
-아니라 아예 다른 가지에 있음) — 그래서 기본값은 `__file__` 대신 **현재
-작업 디렉터리(cwd)** 기준이다. 이 저장소의 모든 명령이 `cd ml` 다음에
-실행되는 걸 전제로 하므로(각 폴더 README 참고) 그 컨벤션을 따르는 한 그대로
-동작하고, `cd ml`을 안 지키거나 실제 배포 환경이면 `DATA_ROOT`/`MODELS_ROOT`를
-명시적으로 설정해야 한다.
+**주의**: `feature_engineering/spark/config.py`는 이 파일을 import하지 않고
+같은 이름의 상수를 독립적으로 다시 정의한다(EMR에 그 패키지만 올릴 때
+`ml_common`의 무거운 의존성 없이도 동작하게 하려는 기존 설계) — 두 파일이
+가리키는 실제 키는 **반드시 같아야 하므로**, 한쪽을 고치면 다른 쪽도 같이
+고칠 것.
 """
 
-import json
 import os
 from pathlib import Path
 
 from . import common_config
 
-# ml_common은 libs/ml_common/에 있고 ml/의 형제 디렉터리라 __file__ 기준으로 ml/을
-# 찾을 수 없다 — cwd가 ml/이라는 이 저장소의 실행 컨벤션에 기대는 기본값이다.
+# 로컬 subprocess로 형제 패키지의 venv 실행파일을 찾을 때만 쓰는 로컬 경로
+# 개념(예: training/scripts/monthly_retrain_check.py가 feature_engineering의
+# .venv/bin/python을 실행) — 데이터 저장 위치와는 무관, 코드 자체는 여전히
+# 로컬(또는 EMR/EC2) 프로세스로 실행되므로 이 개념만 남겨둔다.
 ML_ROOT = Path.cwd()
 
-DATA_DIR = Path(os.environ.get("DATA_ROOT", str(ML_ROOT / "data")))
-PROCESSED_V2_DIR = DATA_DIR / "processed_v2"
-
-# feature_engineering/spark/config.py의 OUTPUT_ROOT/PARAM_COMBO_ID와 정확히 같은 공식 —
-# 같은 환경변수(FEATURE_ENGINEERING_OUTPUT_ROOT/FEATURE_PARAM_COMBO_ID)를 쓰면
-# Spark가 실제로 쓰는 산출물 디렉터리와 항상 같은 경로를 가리킨다(LEGACY_AUDIT.md 참고).
-FEATURE_ENGINEERING_OUTPUT_ROOT = Path(
-    os.environ.get("FEATURE_ENGINEERING_OUTPUT_ROOT", str(PROCESSED_V2_DIR / "spark"))
-)
 FEATURE_PARAM_COMBO_ID = os.environ.get(
     "FEATURE_PARAM_COMBO_ID",
     f"w{common_config.ROLLING_WINDOW_MINUTES}_e{common_config.ROLLING_EMBARGO_MINUTES}_t{common_config.ROLLING_TICK_MINUTES}",
 )
-FEATURE_ENGINEERING_OUTPUT_DIR = FEATURE_ENGINEERING_OUTPUT_ROOT / FEATURE_PARAM_COMBO_ID
+# feature_engineering의 2차 정제 산출물 위치 — dev/S3_DATA_CATALOG.md의
+# `processed/features/` prefix를 따른다. 파라미터 조합마다 결과가 달라지므로
+# 조합 ID를 키에 넣어 서로 안 덮어쓰게 한다.
+_FEATURE_ENGINEERING_OUTPUT_PREFIX = os.environ.get("FEATURE_ENGINEERING_OUTPUT_PREFIX", "processed/features")
+FEATURE_ENGINEERING_OUTPUT_DIR = f"{_FEATURE_ENGINEERING_OUTPUT_PREFIX}/{FEATURE_PARAM_COMBO_ID}"
 
 TRAIN_YEAR = 2025
 TRAIN_MONTHS = [f"{TRAIN_YEAR % 100:02d}{m:02d}" for m in range(1, 13)]
 
-# 대여이력 원본(트립 단위) parquet — feature_engineering(타겟/rolling 계산)과 inference
-# (predict_single.py가 실시간 point-in-time censoring 시뮬레이션에 최근 트립을
-# 조회)가 같이 읽으므로 공유 경로로 둔다.
-RENTAL_PARQUET_DIR = DATA_DIR / "parquet"
+# 대여이력 원본(트립 단위) parquet 디렉터리 — feature_engineering(타겟/rolling
+# 계산)이 여전히 이걸 읽는다고 가정(이번 phase는 1차정제 이전 상태 유지, 2단계
+# 에서 raw Silver `rental` 조회로 대체 예정). `inference`는 이번 phase부터
+# `silver_schema`를 통해 Silver `rental`을 직접 읽으므로 이 상수를 안 쓴다.
+RENTAL_PARQUET_DIR = os.environ.get("RENTAL_PARQUET_DIR", "parquet")
 
-# training이 만들고(학습), inference가 읽는(서빙) 모델 아티팩트 — 로컬 개발 중엔
-# training/models/ 그대로(cwd=ml/ 전제, 위 DATA_DIR과 같은 이유), 실제 배포에서는
-# MODELS_ROOT 환경변수로 override.
-MODELS_DIR = Path(os.environ.get("MODELS_ROOT", str(ML_ROOT / "training" / "models")))
+# training이 만들고(학습), inference가 읽는(서빙) 모델 아티팩트 — dev/
+# S3_DATA_CATALOG.md에 정의된 `models/` prefix를 그대로 쓴다.
+MODELS_PREFIX = os.environ.get("MODELS_PREFIX", "models")
 
-# --- feature_engineering 1차 정제 산출물(pandas) ---
-STATION_MASTER_PARQUET = PROCESSED_V2_DIR / "station_master.parquet"
-TARGETS_PARQUET = PROCESSED_V2_DIR / "targets_2025.parquet"
-RETURN_TARGETS_PARQUET = PROCESSED_V2_DIR / "return_targets_2025.parquet"
-STATION_STATUS_PARQUET = PROCESSED_V2_DIR / "station_status_2025.parquet"
-WEATHER_PARQUET = PROCESSED_V2_DIR / "weather_2025.parquet"
-POPULATION_PARQUET = PROCESSED_V2_DIR / "population_2025.parquet"
 
-# --- feature_engineering 2차 정제 산출물(Spark, feature_engineering/spark/config.py가 실제로 쓰는
-# 파라미터 조합별 디렉터리) — training/inference가 그대로 읽는다. 위
-# FEATURE_ENGINEERING_OUTPUT_ROOT/FEATURE_PARAM_COMBO_ID와 같은 환경변수를 쓰면
-# feature_engineering.spark.run_pipeline이 실제로 쓴 경로와 항상 일치한다 ---
-MERGED_TABLE_PARQUET = FEATURE_ENGINEERING_OUTPUT_DIR / "station_hour_merged_2025.parquet"
-FEATURES_TABLE_PARQUET = FEATURE_ENGINEERING_OUTPUT_DIR / "station_hour_features_2025.parquet"
+def model_key(model_name: str, suffix: str, models_prefix: str | None = None) -> str:
+    """모델 아티팩트 하나의 S3 키를 만든다 (예: model_key("rental", "poisson") -> "models/rental_poisson.txt").
+
+    args:
+        model_name: "rental" 또는 "return"
+        suffix: "poisson"/"q10"/"q50"/"q90"
+        models_prefix: None이면 챔피언 prefix(MODELS_PREFIX) — 하이퍼파라미터 스윕 등
+            실험 실행은 자신만의 prefix(예: "models/experiments/{run_id}")를 넘겨서
+            챔피언 아티팩트를 덮어쓰지 않는다.
+    """
+    return f"{models_prefix or MODELS_PREFIX}/{model_name}_{suffix}.txt"
+
+
+def model_json_key(model_name: str, kind: str, models_prefix: str | None = None) -> str:
+    """모델 부속 JSON(conformal_correction/station_categories/metrics)의 S3 키를 만든다."""
+    return f"{models_prefix or MODELS_PREFIX}/{model_name}_{kind}.json"
+
+
+# --- feature_engineering 1차 정제 산출물 (이번 phase는 "이미 어딘가 있다"고
+# 가정 — 2단계에서 raw Silver로부터 직접 만드는 로직으로 대체될 예정. prefix
+# 이름은 로컬 개발 때 쓰던 것을 그대로 유지해 마이그레이션 부담을 줄인다) ---
+PROCESSED_V2_PREFIX = os.environ.get("PROCESSED_V2_PREFIX", "processed_v2")
+STATION_MASTER_PARQUET = f"{PROCESSED_V2_PREFIX}/station_master.parquet"
+TARGETS_PARQUET = f"{PROCESSED_V2_PREFIX}/targets_2025.parquet"
+RETURN_TARGETS_PARQUET = f"{PROCESSED_V2_PREFIX}/return_targets_2025.parquet"
+STATION_STATUS_PARQUET = f"{PROCESSED_V2_PREFIX}/station_status_2025.parquet"
+WEATHER_PARQUET = f"{PROCESSED_V2_PREFIX}/weather_2025.parquet"
+POPULATION_PARQUET = f"{PROCESSED_V2_PREFIX}/population_2025.parquet"
+
+# --- feature_engineering 2차 정제 산출물(Spark) — training/inference가 그대로
+# 읽는다. `feature_engineering/spark/config.py`의 같은 이름 상수와 반드시
+# 같은 값이어야 한다(위 모듈 docstring 참고) ---
+MERGED_TABLE_PARQUET = f"{FEATURE_ENGINEERING_OUTPUT_DIR}/station_hour_merged_2025.parquet"
+FEATURES_TABLE_PARQUET = f"{FEATURE_ENGINEERING_OUTPUT_DIR}/station_hour_features_2025.parquet"
 # FEATURES_TABLE_PARQUET의 각 행(T0, 5분 tick)을 horizon=1..HORIZON_COUNT만큼 self-join해
 # "T0의 lag/rolling + T0+(horizon-1)시간의 날씨/캘린더/타겟"으로 조합한 학습 테이블
 # (build_multi_horizon_features.py) — training이 이제 이 테이블만 읽는다.
-MULTI_HORIZON_FEATURES_TABLE_PARQUET = (
-    FEATURE_ENGINEERING_OUTPUT_DIR / "station_hour_features_multihorizon_2025.parquet"
-)
-ROLLING_RENTAL_FEATURES_PARQUET = FEATURE_ENGINEERING_OUTPUT_DIR / "rolling_rental_features_2025.parquet"
+MULTI_HORIZON_FEATURES_TABLE_PARQUET = f"{FEATURE_ENGINEERING_OUTPUT_DIR}/station_hour_features_multihorizon_2025.parquet"
+ROLLING_RENTAL_FEATURES_PARQUET = f"{FEATURE_ENGINEERING_OUTPUT_DIR}/rolling_rental_features_2025.parquet"
 
 # --- inference가 만드는 fallback 프로필(위 MERGED_TABLE_PARQUET/POPULATION_PARQUET
 # 기반) — 파라미터 조합과 무관하게 챔피언 경로 하나만 씀 ---
-STATION_HOURLY_PROFILE_PARQUET = PROCESSED_V2_DIR / "station_hourly_profile.parquet"
-POPULATION_HOURLY_PROFILE_PARQUET = PROCESSED_V2_DIR / "population_hourly_profile.parquet"
+STATION_HOURLY_PROFILE_PARQUET = f"{PROCESSED_V2_PREFIX}/station_hourly_profile.parquet"
+POPULATION_HOURLY_PROFILE_PARQUET = f"{PROCESSED_V2_PREFIX}/population_hourly_profile.parquet"
 
 # 1차 정제 산출물(원본 CSV -> parquet) — analysis_summary.json은 feature_engineering(공휴일
 # 목록 재사용)과 inference(predict_single.py가 서빙 시점의 is_holiday 계산)가 같이 읽는다.
-ANALYSIS_SUMMARY_JSON = DATA_DIR / "output" / "analysis_summary.json"
+ANALYSIS_SUMMARY_JSON = f"{PROCESSED_V2_PREFIX}/output/analysis_summary.json"
 
 
 def load_holidays_2025() -> set[str]:
     """analysis_summary.json의 holidays_2025 목록을 'YYYY-MM-DD' 문자열 set으로 반환한다."""
-    with open(ANALYSIS_SUMMARY_JSON, encoding="utf-8") as f:
-        summary = json.load(f)
+    from . import s3_io
+
+    summary = s3_io.read_json(ANALYSIS_SUMMARY_JSON)
+    if summary is None:
+        raise FileNotFoundError(f"S3에 없음: {ANALYSIS_SUMMARY_JSON}")
     return set(summary["holidays_2025"])

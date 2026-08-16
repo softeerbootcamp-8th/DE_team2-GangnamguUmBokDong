@@ -19,7 +19,9 @@ from datetime import date
 
 import numpy as np
 import pandas as pd
+from ml_common import s3_io
 from ml_common.metrics import poisson_deviance as _poisson_deviance
+from ml_common.paths import model_json_key
 from ml_common.scoring import predict
 
 from . import config
@@ -31,7 +33,7 @@ MODEL_SPECS = [
 
 
 def _load_baseline_metrics(model_name: str) -> dict:
-    """train_target()이 학습 시점에 저장해둔 baseline 지표를 읽는다.
+    """train_target()이 학습 시점에 저장해둔 baseline 지표를 S3에서 읽는다.
 
     args:
         model_name: "rental" 또는 "return"
@@ -40,9 +42,11 @@ def _load_baseline_metrics(model_name: str) -> dict:
     raises:
         FileNotFoundError: 아직 한 번도 학습 안 해서 baseline이 없는 모델
     """
-    path = config.MODELS_DIR / f"{model_name}_metrics.json"
-    with open(path, encoding="utf-8") as f:
-        return json.load(f)
+    key = model_json_key(model_name, "metrics")
+    data = s3_io.read_json(key)
+    if data is None:
+        raise FileNotFoundError(f"baseline metrics 없음: {key}")
+    return data
 
 
 def _recent_month_range(lookback_months: int, as_of: date | None = None) -> tuple[str, str]:
@@ -91,7 +95,9 @@ def evaluate_recent_performance(
     lookback_months = lookback_months or config.MONITOR_LOOKBACK_MONTHS
     start, end = _recent_month_range(lookback_months, as_of)
 
-    df = pd.read_parquet(config.MULTI_HORIZON_FEATURES_TABLE_PARQUET)
+    df = s3_io.read_parquet(config.MULTI_HORIZON_FEATURES_TABLE_PARQUET)
+    if df is None:
+        raise FileNotFoundError(f"S3에 없음: {config.MULTI_HORIZON_FEATURES_TABLE_PARQUET}")
     df = df[(df["date"] >= start) & (df["date"] <= end) & (df["horizon"] == horizon)].reset_index(drop=True)
     if df.empty:
         raise ValueError(
