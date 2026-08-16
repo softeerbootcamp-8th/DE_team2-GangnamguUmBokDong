@@ -93,6 +93,22 @@ def _max_deficit(current: int, points: list[dict]) -> int:
     return max(0, -worst)
 
 
+def _max_unmet_demand(current: int, points: list[dict]) -> int:
+    """각 시간대가 시작할 때(직전 시간대가 끝난 시점) 재고가 이미 0이었는데, 그 시간대에
+    들어온 대여 수요(predicted_rent_cnt)의 최댓값을 찾는다. _max_deficit은 그 시간대가
+    끝날 때의 순누적 결과만 보므로, 그 안에서 반납이 대여보다 많이 들어와 순증가로
+    마감된 시간대(예: 재고 0에서 대여 1건·반납 2건 -> 재고 1로 회복)는 놓친다. 하지만
+    그 시간대 어느 순간 재고가 0이었는데 대여 수요가 있었다는 사실 자체는 남아 있으므로,
+    순누적과 별개로 이 신호를 따로 계산해 둘 중 더 심각한 쪽을 최종 심각도에 쓴다."""
+    prev = current
+    vals = []
+    for point in points:
+        if prev <= 0:
+            vals.append(point["predicted_rent_cnt"])
+        prev = point["predicted_bikes"]
+    return max(vals) if vals else 0
+
+
 def _severity(ratio: float) -> float:
     """정원 대비 초과/부족 비율(ratio)을 0~1 심각도로 바꾼다. SEVERITY_SCALE 참고."""
     return 1 - math.exp(-ratio / SEVERITY_SCALE)
@@ -114,10 +130,11 @@ def urgency_score(
 
     심각도: 지금부터 예측 구간 전체에서 가장 심해지는 지점(회수필요는 정원을
     가장 크게 넘는 지점, 공급필요는 클램프 없이 뒀을 때 가장 깊이 마이너스로
-    내려가는 지점)을 찾아 정원 대비 비율로 바꾸고, 그 비율을 `_severity`로
-    0~1 사이 값으로 변환한다. 어느 시급성 경로(즉시위험/추세감지/예측감지)로
-    감지됐는지와 무관하게 항상 같은 방식으로 계산해서, 두 action_type의 점수가
-    같은 기준으로 비교 가능하다.
+    내려가는 지점과, 재고 0인 채로 대여 수요가 들어온 시간대 중 더 심각한 쪽)을
+    찾아 정원 대비 비율로 바꾸고, 그 비율을 `_severity`로 0~1 사이 값으로
+    변환한다. 어느 시급성 경로(즉시위험/추세감지/예측감지)로 감지됐는지와
+    무관하게 항상 같은 방식으로 계산해서, 두 action_type의 점수가 같은 기준으로
+    비교 가능하다.
     """
     if current <= 0:
         time_to_critical, action_type = 0.0, "supply_needed"
@@ -145,7 +162,7 @@ def urgency_score(
     if action_type == "retrieval_needed":
         ratio = _max_overshoot(current, hold_cnt, points) / safe_hold_cnt
     else:
-        ratio = _max_deficit(current, points) / safe_hold_cnt
+        ratio = max(_max_deficit(current, points), _max_unmet_demand(current, points)) / safe_hold_cnt
     impact_factor = _severity(ratio)
 
     score = round(100 * time_factor * impact_factor, 1)

@@ -233,6 +233,17 @@ body {
   color: #fff;
 }
 
+.region-select {
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--surface-1);
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
 .alert-list {
   list-style: none;
   margin: 0;

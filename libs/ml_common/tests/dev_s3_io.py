@@ -39,6 +39,22 @@ def test_read_parquet_with_columns_filter():
     assert list(result.columns) == ["a", "c"]
 
 
+def test_read_parquet_reads_spark_style_multi_part_directory():
+    """Spark의 df.write.parquet(key)는 key 자체가 아니라 key를 prefix로 삼아
+    part-00000-....parquet 여러 개 + _SUCCESS 마커를 쓴다(feature_engineering의
+    모든 산출물이 이 형태) — read_parquet()가 정확히 그 key의 단일 GET이 실패하면
+    prefix로 보고 파트 파일들을 찾아 이어붙이는지 확인한다."""
+    part1 = pd.DataFrame({"a": [1, 2]})
+    part2 = pd.DataFrame({"a": [3, 4]})
+    s3_io.put_object_bytes("out/table.parquet/_SUCCESS", b"")
+    s3_io.write_parquet(part1, "out/table.parquet/part-00000.parquet")
+    s3_io.write_parquet(part2, "out/table.parquet/part-00001.parquet")
+
+    result = s3_io.read_parquet("out/table.parquet")
+
+    assert sorted(result["a"].tolist()) == [1, 2, 3, 4]
+
+
 def test_read_json_missing_key_returns_none():
     assert s3_io.read_json("no/such/file.json") is None
 
@@ -86,3 +102,12 @@ def test_stage_and_upload_then_download_and_load_booster_round_trip(tiny_booster
 def test_download_and_load_booster_missing_key_raises_file_not_found():
     with pytest.raises(FileNotFoundError):
         s3_io.download_and_load_booster("models/does_not_exist.txt")
+
+
+def test_single_prediction_key():
+    from ml_common import silver_schema
+
+    ts = pd.Timestamp("2026-08-15 17:05:00")
+    key = silver_schema.single_prediction_key("ST-2000", ts)
+    assert key == "predictions/single/dt=2026-08-15/hh=17/ST-2000_1705.parquet"
+
