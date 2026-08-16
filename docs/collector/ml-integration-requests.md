@@ -12,6 +12,12 @@
 더 나와 6~9번으로 추가했다 — 특히 8번(생활인구 스키마)은 코드 수정만으로는
 완전히 해소되지 않는, 모델 feature 설계 자체에 관련된 사항이라 확인이 필요하다.
 
+**2026-08-16 갱신**: `KMA_APIHUB_KEY`를 실제로 넣고 `weather_ultra_short_term`/
+`weather_short_term_forecast` 두 소스를 직접(수동으로 `collector/main.py` 실행)
+돌려서 raw 응답과 Silver 결과를 대조했다. 그 결과 6번(강수량 없음)이 실은 잘못된
+결론이었음을 확인해 정정했고(11번), 코드 버그 하나(12번)와 두 소스 다 애초에
+자동 수집 스케줄 자체가 없다는 것(13번, 영향이 가장 큼)을 새로 발견했다.
+
 ## 배경 — 왜 `dev/seed_s3_from_local.py`를 기준으로 개발했는가 (지금은 실제 예시로 대체됨)
 
 `collector`의 실제 수집 어댑터(`collector/adapters/`, `collector/pipeline.py` 등)는
@@ -67,9 +73,11 @@
 - **실제 예시 데이터로 확인한 결과, 둘 다 예상과 달랐고 구조도 더 복잡했다**:
   - 날씨는 소스가 **2개**였다: `weather_ultra_short_term`(초단기실황, 10분 간격,
     컬럼 `T1H`/`REH`/`WSD`/`RN1`/`PTY`)와 `weather_short_term_forecast`(단기예보,
-    3시간 간격, 컬럼 `TMP`/`REH`/`WSD`/`POP`/`SKY`/`PTY`). 예보 쪽은 강수량(mm)이
-    아니라 **강수확률(%, `POP`)만 있어 `precip`과 단위가 안 맞는다** — 지금은
-    `weather_ultra_short_term`(관측치, 강수량 있음)만 쓰고 예보 쪽은 안 쓴다(6번 참고).
+    3시간 간격, 컬럼 `TMP`/`REH`/`WSD`/`POP`/`SKY`/`PTY`). ~~예보 쪽은 강수량(mm)이
+    아니라 강수확률(%, `POP`)만 있어 `precip`과 단위가 안 맞는다~~ — **(2026-08-16
+    정정) 이 결론은 틀렸다, raw엔 강수량(`PCP`)이 실제로 있고 YAML에만 안
+    선언돼 있었다, 6번 참고.** 지금은 `weather_ultra_short_term`(관측치)만 쓰고
+    예보 쪽은 안 쓴다.
   - 인구도 소스가 **2개**였고 둘 다 우리가 가정한 이름·구조와 달랐다:
     `population_realtime`(실시간 인구, `AREA_NM`/`AREA_CD`/`AREA_CONGEST_LVL` 등
     관광특구·주요장소 단위 혼잡도 데이터, `DataSchema.md`의 `main_spot_living_population`에
@@ -117,20 +125,38 @@
   확인하고 넘어가야 하는지 확인 요청 — 만약 필요하다면 `_get_recent_*` 함수들에
   manifest 확인 스텝을 추가해야 한다(현재는 안 함).
 
-## 6. `weather_short_term_forecast`에 강수량(mm)이 없음 — 진짜 "미래 예보"가 필요해지면 어떻게 하나
+## 6. (2026-08-16 정정) `weather_short_term_forecast`에 강수량(mm)이 없다고 했던 결론이 틀렸다
 
-지금 `_get_recent_weather()`는 사실 "예보"가 아니라 "가장 최근 관측값"을 쓴다
+~~지금 `_get_recent_weather()`는 사실 "예보"가 아니라 "가장 최근 관측값"을 쓴다
 (`weather_ultra_short_term`, 10분 간격 관측치). horizon이 커져(예: 6시간 뒤)
 target_ts가 미래로 멀어지면 원래는 진짜 예보(`weather_short_term_forecast`,
 3시간 간격)를 써야 더 정확할 텐데, 그 소스엔 강수량이 없고 강수확률(`POP`, %)만
-있다.
+있다.~~ (아래에서 정정)
 
-- **지금 ML이 하는 일**: horizon과 무관하게 항상 `weather_ultra_short_term`의
-  "가장 최근 값"만 쓴다(즉 6시간 뒤를 예측할 때도 지금 날씨를 그대로 씀) — 기존
-  방식(예보 API 미연동 시의 단순화)의 연장선이라 새로 생긴 문제는 아니다.
-- **요청**: 강수량(mm) 예보 값이 별도로 존재하는지(예: 다른 필드명으로), 아니면
-  강수확률(%)을 강수량으로 환산하는 규칙이 있는지 확인해달라 — 있으면 진짜
-  미래 예보를 쓰도록 개선할 수 있다.
+**뭐가 틀렸었나**: `KMA_APIHUB_KEY`를 실제로 넣고 `getVilageFcst`(단기예보)를
+직접 호출해보니, raw 응답에 `PCP`(1시간 강수량, mm)와 `SNO`(적설)가 실제로
+있었다 — `weather_short_term_forecast.yaml`의 `columns:`에 선언이 안 돼 있어서
+Silver로 넘어올 때 조용히 버려지고 있었을 뿐이다.
+
+**왜 잘못 판단했었나**: 위 결론은 collector 팀이 준 예시 Silver 데이터
+(컬럼이 `TMP/REH/WSD/POP/SKY/PTY`뿐)와 실제 구현된 YAML만 보고 낸 것이었다 —
+"지금 실제로 뭐가 나오나"만 확인하고 "원래 뭘 만들기로 계획했었나"까지 거슬러
+올라가지 않았다. `DataSchema.md`의 `weather_forecast` 절(53~64행)에는 애초에
+`precipitation_amount`가 "일반" 컬럼으로 계획돼 있었고 "원천 특수 표현은
+normalize 정책 필요"라는 문구까지 있다 — 이게 정확히 `PCP`의 실제 형식
+(`"강수없음"`, `"1mm 미만"`, `"10.0mm"`, `"0"`이 섞여 나옴)과 들어맞는다. 즉
+계획 문서는 이 필드를 정확히 예견하고 있었는데, 실제 YAML 구현 단계에서
+빠진 것으로 보인다.
+
+- **지금 ML이 하는 일**: (정정 전과 동일) horizon과 무관하게 항상
+  `weather_ultra_short_term`의 "가장 최근 값"만 쓴다 — 이건 그대로 유지.
+- **요청**:
+  1. `weather_short_term_forecast.yaml`에 `PCP`(강수량)를 `columns:`로 추가해달라
+     — 다만 raw 값이 순수 숫자가 아니라 `"강수없음"`/`"1mm 미만"`/`"10.0mm"`처럼
+     텍스트가 섞여 있어(13번 참고) 그냥 `types: [float]`로는 캐스팅이 깨진다,
+     전용 normalize 정책이 필요해 보인다(`DataSchema.md`가 이미 예견한 부분).
+  2. 추가되면 ML도 `_get_recent_weather()`가 horizon에 따라 진짜 예보
+     (`weather_short_term_forecast`)를 쓰도록 개선할 예정.
 
 ## 7. `bike_station_realtime` 예시 파일이 항상 1,000행 — 페이지네이션으로 잘린 건 아닌지
 
@@ -198,3 +224,67 @@ YAML 예시(210행 근처)에 `adapter_params.page_size: 1000`이 있어, 혹시
   읽어도 그날 전체 트립을 다 얻는다"는 뜻이라 여러 tick을 안 읽고 최신 파일
   하나만 읽는 쪽으로 최적화할 수 있다(지금처럼 5분 tick 수백~수천 개를 병렬로
   긁을 필요가 없어짐).
+
+## 11. (2026-08-16 신규) 날씨 두 소스 다 자동 수집 스케줄이 없다
+
+`airflow/dags/`를 전부 확인해봤는데 `weather_ultra_short_term`(10분 주기)/
+`weather_short_term_forecast`(3시간 주기)를 실제로 자동으로 도는 스케줄에
+올려주는 DAG가 하나도 없다.
+
+- `realtime_collection.py`(5분 주기)의 `airflow/config/sources.py`
+  `REALTIME_SOURCES`엔 `bike_station_realtime`/`population_realtime`만 있고
+  날씨는 없다.
+- `collector_backfill`(`airflow/dags/backfill.py`)에 두 날씨 source_id가
+  들어있긴 한데 `schedule=None`(수동 트리거 전용)이고, "이미 도는 1차 수집의
+  누락 조각만 채우는" 백필 용도라 1차 수집 자체가 없으면 채울 게 없다.
+- 실제로 지금은 사람이 직접 `collector/main.py --source weather_... --window-start ...`를
+  실행해야만 데이터가 들어간다(이번 검증도 그렇게 했다).
+
+- **요청**: 두 소스를 각자 YAML의 `schedule.interval`(10분/3시간)에 맞는
+  스케줄로 자동 수집하는 DAG(들)를 만들어달라. 기존 5분 DAG에 억지로
+  끼워넣지 말고 별도 스케줄 그룹으로(`sources.py` 모듈 docstring이 이미
+  이 방식을 권장하고 있다).
+
+## 12. (2026-08-16 신규) `kma_apihub` 어댑터에 페이지네이션이 없어 단기예보가 매번 잘림
+
+`collector/adapters/kma_apihub.py`의 `fetch()`가 `numOfRows=1000&pageNo=1`을
+하드코딩하고, 응답의 `totalCount`를 아예 안 읽는다 — 2페이지 이상을 가져오는
+로직이 없다.
+
+- 실제로 돌려본 결과 `weather_short_term_forecast`(`getVilageFcst`)는
+  **격자 25개 전부** `totalCount=1052`인데 1000개만 받아왔다 — 격자당 52건씩
+  유실, 이 엔드포인트 특성상(3일치×14개 카테고리) 거의 항상 재현되는 문제로
+  보인다.
+- 잘리는 건 항상 그 격자의 가장 먼 미래 예보 시각 — 그 시각의 `REH`(습도) 등
+  일부 카테고리가 통째로 빠진다.
+- **아무 경고도 안 뜬다**: `REH`가 `required: true`가 아니라
+  `optional_missing: keep_null`로 조용히 null 처리되고, manifest는
+  `kept=2075 dropped=0 completeness=1.000`으로 찍힌다 — raw와 직접 대조하지
+  않는 한 이 유실을 알 방법이 없다.
+- `weather_ultra_short_term`(`getUltraSrtNcst`)은 지금은 격자당 8건뿐이라
+  1000 밑이라 안 잘리는데, 코드가 맞아서가 아니라 이 엔드포인트 페이로드가
+  작아서 우연히 안전한 것뿐이다 — 같은 코드를 쓰는 한 이 소스도 똑같이
+  취약하다.
+
+- **요청**: `totalCount`를 읽어서 필요하면 `pageNo`를 늘려가며 전체를 받아오는
+  루프를 추가해달라.
+
+## 13. (2026-08-16 신규) YAML `columns:`에 없어서 조용히 버려지는 raw 필드들 + description 오류
+
+raw 응답과 YAML `columns:` 선언을 대조한 결과:
+
+- `weather_ultra_short_term.yaml`의 `description`은 "초단기 실황·**예보**"라고
+  돼 있지만 실제로 부르는 건 `getUltraSrtNcst`(실황)뿐이다. `getUltraSrtFcst`
+  (진짜 초단기예보)는 코드 전체에서 `collector/tests/test_kma_apihub.py`의
+  예시 테스트에만 등장하고, 실제 소스로 설정된 적이 없다 — description이
+  실제 동작과 안 맞는다.
+- 두 소스 다 raw엔 있는데 YAML `columns:`엔 없어서 조용히 버려지는 필드가
+  있다: `weather_ultra_short_term`은 `UUU`/`VEC`/`VVV`(바람 성분·풍향),
+  `weather_short_term_forecast`는 `PCP`(강수량, 6번 참고)/`SNO`(적설).
+- `PCP`의 실제 raw 값 종류(참고용): `"강수없음"`, `"1mm 미만"`, `"1.0mm"`~
+  `"17.0mm"`(숫자+"mm" 텍스트), 그리고 `"0"`(단위 없는 숫자 문자열)까지 섞여
+  나온다 — 하나의 정책으로 캐스팅하기 까다로운 형태다.
+
+- **요청**: `description`을 실제 동작에 맞게 수정. `PCP`/`UUU`/`VEC`/`VVV`/
+  `SNO`를 feature로 쓸 계획이 있는지 확인하고, 쓴다면(특히 `PCP`) YAML에
+  추가 + 전용 normalize 정책을 정의해달라.
