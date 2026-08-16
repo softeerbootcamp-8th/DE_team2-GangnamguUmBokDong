@@ -45,3 +45,6 @@ docs/superpowers/
 dev/
 .claude/
 .superpowers/
+
+# Data
+seoul-pop-nowcasting/data/
