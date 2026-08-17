@@ -47,6 +47,8 @@ jobs:
         run: sudo chown -R $USER:$USER .
 
       - name: Test
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5433/app
         run: make test-ci
 
       - name: Stop test infrastructure

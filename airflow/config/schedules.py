@@ -18,7 +18,7 @@ DEFAULT_RETRY_DELAY = timedelta(seconds=30)
 DEFAULT_EXECUTION_TIMEOUT = timedelta(seconds=240)
 
 # living_population_grid는 서울 전체 250m 격자 x 24시간을 페이지네이션으로 받아오므로
-# 다른 실시간 소스보다 훨씬 오래 걸린다(ops/scripts/run_local_pipeline.py 실측 기준).
+# 다른 실시간 소스보다 훨씬 오래 걸린다(로컬 테스트 실측 기준).
 EXECUTION_TIMEOUT_OVERRIDES = {
     "living_population_grid": timedelta(seconds=1200),
 }
