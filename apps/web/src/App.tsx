@@ -118,6 +118,20 @@ export default function App() {
                             </option>
                           ))}
                         </select>
+                        <div className="alert-tabs" role="tablist" aria-label="지도 표시 범위">
+                          {MAP_FILTER_TABS.map((t) => (
+                            <button
+                              key={t.key}
+                              type="button"
+                              role="tab"
+                              aria-selected={mapFilterMode === t.key}
+                              className={`alert-tab${mapFilterMode === t.key ? " active" : ""}`}
+                              onClick={() => setMapFilterMode(t.key)}
+                            >
+                              {t.label}
+                            </button>
+                          ))}
+                        </div>
                       </span>
                       <span className="text-xs text-muted-foreground">기준 시각 {stationsUpdatedAt ? formatClock(stationsUpdatedAt) : "-"}</span>
                     </div>
@@ -128,6 +142,7 @@ export default function App() {
                           alerts={filteredAlerts}
                           selectedStationId={selectedStationId}
                           onSelect={setSelectedStationId}
+                          mapFilterMode={mapFilterMode}
                           regionCenters={regionCenters}
                           selectedRegion={selectedRegion}
                         />
