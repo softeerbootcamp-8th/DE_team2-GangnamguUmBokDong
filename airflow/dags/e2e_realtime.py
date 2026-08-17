@@ -1,0 +1,56 @@
+"""실제 컴포넌트 CLI 연결을 수동 검증하는 실시간 E2E DAG.
+
+운영 DAG인 ``realtime_5min``과 동일한 핵심 컴포넌트 계약을 사용하지만
+schedule=None으로 두어 개발/통합 검증 시에만 수동 실행한다.
+
+목적은 개별 모듈 구현을 DAG에 복제하는 것이 아니라 다음 경계를 한 번에 검증하는 것이다.
+
+    Collector -> Silver -> Inference -> Gold Loader
+                    \
+                     -> Operational DB Loader
+
+normalizer는 현재 inference의 직접 입력이 아니므로 별도 보조 브랜치로 유지한다.
+"""
+
+import pendulum
+from airflow import DAG
+
+from config.schedules import TIMEZONE
+from config.sources import (
+    NORMALIZER_BASELINE_MODE_FALLBACK,
+    NORMALIZER_BASELINE_MODE_PRIMARY,
+    REALTIME_5MIN_SOURCES,
+)
+from orchestration.collector_task import build_collector_task
+from orchestration.db_loader_task import build_db_loader_task
+from orchestration.inference_task import build_inference_task
+from orchestration.normalizer_task import build_normalizer_task
+
+with DAG(
+    dag_id="e2e_realtime",
+    schedule=None,
+    start_date=pendulum.datetime(2026, 8, 17, tz=TIMEZONE),
+    catchup=False,
+    max_active_runs=1,
+    tags=["e2e", "realtime", "manual"],
+) as dag:
+    collector_tasks = {source_id: build_collector_task(dag, source_id) for source_id in REALTIME_5MIN_SOURCES}
+
+    load_stations = build_db_loader_task(dag, "stations")
+    load_station_stock = build_db_loader_task(dag, "station_stock")
+    collector_tasks["bike_station_realtime"] >> load_stations >> load_station_stock
+
+    run_normalizer_strict = build_normalizer_task(dag, "run_normalizer_strict", NORMALIZER_BASELINE_MODE_PRIMARY)
+    run_normalizer_fallback = build_normalizer_task(
+        dag,
+        "run_normalizer_fallback",
+        NORMALIZER_BASELINE_MODE_FALLBACK,
+        trigger_rule="all_failed",
+    )
+    collector_tasks["population_realtime"] >> run_normalizer_strict >> run_normalizer_fallback
+
+    run_inference = build_inference_task(dag)
+    list(collector_tasks.values()) >> run_inference
+
+    load_forecast_points = build_db_loader_task(dag, "forecast_points")
+    [run_inference, load_station_stock] >> load_forecast_points
