@@ -1,6 +1,6 @@
-"""로컬 개발/데모용 — feature_engineering -> training -> inference 전체를 한 번에 실행한다.
+"""로컬 개발/데모용 — feature_engine -> training -> inference 전체를 한 번에 실행한다.
 
-**주의**: 실제 배포에서는 `feature_engineering`/`training`/`inference`가 각자 다른
+**주의**: 실제 배포에서는 `feature_engine`/`training`/`inference`가 각자 다른
 인스턴스에서 따로 실행된다(각 폴더의 README.md 참고) — 세 폴더를 나눈 이유
 자체가 그 독립 배포였다. 이 스크립트는 그 원칙을 바꾸는 게 아니라, 로컬
 한 대에서 전체 파이프라인이 처음부터 끝까지 정상 동작하는지 빠르게 검증하고
@@ -14,18 +14,18 @@
 
 **환경은 폴더별 `uv`가 관리한다** — 공용 `.venv`/`.venv-spark`는 안 쓰고, 각
 폴더 자기 `.venv`(`<폴더>/.venv/bin/python`, `uv sync`로 미리 준비돼 있어야 함)를
-쓴다. `feature_engineering`은 Spark로만 한다(`feature_engineering/.venv`, 로컬은 `local[*]`
-단일 노드 모드) — `feature_engineering/.venv`가 없으면 이 단계에서 바로 실패하니 먼저
-[feature_engineering/README.md](feature_engineering/README.md)의 세팅을 따를 것. **1차
-정제(pandas)도 포함해서 feature_engineering의 pandas 코드 전체가 `feature_engineering/legacy/`로
+쓴다. `feature_engine`은 Spark로만 한다(`feature_engine/.venv`, 로컬은 `local[*]`
+단일 노드 모드) — `feature_engine/.venv`가 없으면 이 단계에서 바로 실패하니 먼저
+[feature_engine/README.md](feature_engine/README.md)의 세팅을 따를 것. **1차
+정제(pandas)도 포함해서 feature_engine의 pandas 코드 전체가 `feature_engine/legacy/`로
 이동했다** — 실제 배포에서는 1차 정제 자체를 이 저장소 밖에서 처리하므로, 아래
-첫 스텝(`feature_engineering.legacy.scripts.run_build_pipeline`)은 로컬에서
+첫 스텝(`feature_engine.legacy.scripts.run_build_pipeline`)은 로컬에서
 2차정제(Spark)를 테스트해볼 입력을 만드는 용도일 뿐 본 서비스 경로가 아니다 —
 배경은 [LEGACY_AUDIT.md](LEGACY_AUDIT.md) 참고.
 
-`libs/ml_common/paths.py`(각 폴더가 editable 의존성으로 참조하는 공유 라이브러리)가
+`libs/ml_core/paths.py`(각 폴더가 editable 의존성으로 참조하는 공유 라이브러리)가
 Spark 산출물 경로(`data/processed_v2/spark/{FEATURE_PARAM_COMBO_ID}/...`)를
-`feature_engineering/spark/config.py`와 정확히 같은 공식으로 계산하므로, dataset 단계가
+`feature_engine/spark/config.py`와 정확히 같은 공식으로 계산하므로, dataset 단계가
 쓴 파일을 training/inference가 그대로 읽는다(파라미터 조합을 바꾸려면
 `FEATURE_ENGINEERING_OUTPUT_ROOT`/`FEATURE_PARAM_COMBO_ID` 환경변수를 두 쪽 다 같이
 설정할 것 — LEGACY_AUDIT.md 참고).
@@ -33,7 +33,7 @@ Spark 산출물 경로(`data/processed_v2/spark/{FEATURE_PARAM_COMBO_ID}/...`)�
 실행(이 스크립트 자체는 stdlib만 써서 임의의 python3로 실행 가능 — 각 단계는
 내부적으로 해당 폴더의 `.venv`를 골라서 씀):
     python3 run_full_pipeline.py               # 전체
-    python3 run_full_pipeline.py --only dataset # feature_engineering만
+    python3 run_full_pipeline.py --only dataset # feature_engine만
     python3 run_full_pipeline.py --only training
     python3 run_full_pipeline.py --only inference
 """
@@ -52,22 +52,22 @@ def _venv_python(folder: str) -> str:
 STEPS = {
     "dataset": [
         (
-            "feature_engineering: 1차 정제(legacy pandas, 1~5단계 — 로컬 테스트 입력 준비용)",
-            _venv_python("feature_engineering"),
-            ["-m", "feature_engineering.legacy.scripts.run_build_pipeline"],
+            "feature_engine: 1차 정제(legacy pandas, 1~5단계 — 로컬 테스트 입력 준비용)",
+            _venv_python("feature_engine"),
+            ["-m", "feature_engine.legacy.scripts.run_build_pipeline"],
         ),
         (
-            "feature_engineering: 피처마트 생성(Spark, 2차정제 6~8단계, local[*] 단일 노드)",
-            _venv_python("feature_engineering"),
-            ["-m", "feature_engineering.spark.run_pipeline"],
+            "feature_engine: 피처마트 생성(Spark, 2차정제 6~8단계, local[*] 단일 노드)",
+            _venv_python("feature_engine"),
+            ["-m", "feature_engine.spark.run_pipeline"],
         ),
         (
             (
-                "feature_engineering: multi-horizon 학습 테이블 생성(horizon=1..HORIZON_COUNT self-join, "
+                "feature_engine: multi-horizon 학습 테이블 생성(horizon=1..HORIZON_COUNT self-join, "
                 "training이 이제 이 산출물을 읽으므로 빠지면 다음 단계가 실패한다)"
             ),
-            _venv_python("feature_engineering"),
-            ["-m", "feature_engineering.spark.build_multi_horizon_features"],
+            _venv_python("feature_engine"),
+            ["-m", "feature_engine.spark.build_multi_horizon_features"],
         ),
     ],
     "training": [
@@ -97,7 +97,7 @@ def run_stage(stage: str) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="feature_engineering -> training -> inference 전체 실행 (로컬 개발용)")
+    parser = argparse.ArgumentParser(description="feature_engine -> training -> inference 전체 실행 (로컬 개발용)")
     parser.add_argument(
         "--only", choices=STAGE_ORDER, default=None, help="이 단계만 실행 (미지정 시 전체 순서대로 실행)"
     )

@@ -72,6 +72,8 @@ columns:
   POP:
     types: [float]
     range: {min: 0, max: 100}
+  PCP:
+    types: [str]
   SKY:
     types: [int]
     enum: [1, 3, 4]

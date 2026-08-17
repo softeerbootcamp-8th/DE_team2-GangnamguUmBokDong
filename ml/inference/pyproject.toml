@@ -7,7 +7,7 @@ dependencies = [
     "numpy",
     "pandas",
     "pyarrow",
-    "ml_common",
+    "ml_core",
 ]
 
 [dependency-groups]
@@ -17,4 +17,4 @@ dev = ["pytest"]
 package = false
 
 [tool.uv.sources]
-ml_common = { path = "../../libs/ml_common", editable = true }
+ml_core = { path = "../../libs/ml_core", editable = true }

@@ -1,13 +1,14 @@
 import os
-import pytest
-import httpx
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from config import loader
-from adapters.base import get_adapter, Window
+import httpx
+import pytest
+
+import adapters.kma_apihub
 import adapters.seoul_openapi  # noqa: F401
-import adapters.kma_apihub     # noqa: F401
+from adapters.base import Window, get_adapter
+from config import loader
 
 KST = ZoneInfo("Asia/Seoul")
 
@@ -23,7 +24,7 @@ pytestmark = pytest.mark.skipif(
 def get_recent_window(source_id: str) -> Window:
     """각 소스별로 데이터를 확실히 받을 수 있는 최근 시각을 반환한다."""
     now = datetime.now(KST)
-    if source_id == "weather_ultra_short_term":
+    if source_id == "weather_ultra_short_live":
         # 초단기 실황은 1시간 전
         start = now - timedelta(hours=1)
     elif source_id == "weather_short_term_forecast":
@@ -44,7 +45,7 @@ def get_recent_window(source_id: str) -> Window:
     "bike_rental_history",
     "living_population_grid",
     "population_realtime",
-    "weather_ultra_short_term",
+    "weather_ultra_short_live",
     "weather_short_term_forecast",
 ])
 def test_api_contract(source_id):

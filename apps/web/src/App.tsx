@@ -99,11 +99,11 @@ export default function App() {
             <ResizablePanelGroup orientation="horizontal">
               {/* Map */}
               <ResizablePanel defaultSize={66.666} minSize={30}>
-                <div className="flex h-full flex-col p-4 bg-background">
-                  <section className="flex flex-col h-full gap-4 min-w-0 min-h-0">
+                <div className="flex h-full flex-col px-4 py-2 bg-background">
+                  <section className="flex flex-col h-full gap-2 min-w-0 min-h-0">
                     <div className="flex items-center justify-between">
                       <span className="flex items-center gap-2">
-                        <h2 className="text-lg font-semibold tracking-tight">대여소 지도</h2>
+                        <h2 className="text-base font-semibold tracking-tight">대여소 지도</h2>
                         <select
                           className="region-select rounded border px-2 py-1 text-sm bg-background"
                           value={selectedRegion}
@@ -119,17 +119,19 @@ export default function App() {
                           ))}
                         </select>
                       </span>
-                      <span className="text-sm text-muted-foreground">현황 기준 시각 {stationsUpdatedAt ? formatClock(stationsUpdatedAt) : "-"}</span>
+                      <span className="text-xs text-muted-foreground">기준 시각 {stationsUpdatedAt ? formatClock(stationsUpdatedAt) : "-"}</span>
                     </div>
-                    <div className="flex-1 min-h-0 rounded-md border overflow-hidden">
-                      <StationMap
-                        stations={filteredStations}
-                        alerts={filteredAlerts}
-                        selectedStationId={selectedStationId}
-                        onSelect={setSelectedStationId}
-                        regionCenters={regionCenters}
-                        selectedRegion={selectedRegion}
-                      />
+                    <div className="flex-1 min-h-0 rounded-md border overflow-hidden relative">
+                      <div className="absolute inset-0 z-0">
+                        <StationMap
+                          stations={filteredStations}
+                          alerts={filteredAlerts}
+                          selectedStationId={selectedStationId}
+                          onSelect={setSelectedStationId}
+                          regionCenters={regionCenters}
+                          selectedRegion={selectedRegion}
+                        />
+                      </div>
                     </div>
                   </section>
                 </div>
@@ -137,9 +139,9 @@ export default function App() {
               <ResizableHandle withHandle />
               {/* Alert List */}
               <ResizablePanel defaultSize={33.334} minSize={20}>
-                <div className="flex h-full flex-col overflow-auto bg-card p-4 min-w-0 min-h-0">
-                  <section className="flex flex-col h-full gap-4 min-w-0 min-h-0">
-                    <h2 className="text-lg font-semibold tracking-tight">작업 우선순위</h2>
+                <div className="flex h-full flex-col overflow-auto bg-card px-4 py-2 min-w-0 min-h-0">
+                  <section className="flex flex-col h-full gap-2 min-w-0 min-h-0">
+                    <h2 className="text-base font-semibold tracking-tight">작업 우선순위</h2>
                     <div className="flex-1 overflow-y-auto">
                       <AlertList alerts={filteredAlerts} selectedStationId={selectedStationId} onSelect={setSelectedStationId} />
                     </div>
@@ -154,25 +156,25 @@ export default function App() {
           {/* Bottom Row: Forecast, Stock, Details */}
           <ResizablePanel defaultSize={33} minSize={20}>
             <div className="grid h-full grid-cols-3 divide-x">
-              <div className="flex h-full flex-col overflow-auto bg-card p-4 min-w-0 min-h-0">
-                <section className="flex flex-col h-full gap-4 min-w-0 min-h-0">
-                  <h2 className="text-lg font-semibold tracking-tight">반납 · 수요 예측 그래프</h2>
+              <div className="flex h-full flex-col overflow-auto bg-card px-4 py-2 min-w-0 min-h-0">
+                <section className="flex flex-col h-full gap-2 min-w-0 min-h-0">
+                  <h2 className="text-base font-semibold tracking-tight">대여·반납 예측</h2>
                   <div className="flex-1 min-w-0 min-h-0">
                     <ForecastPanel station={selectedStation} forecast={forecast} />
                   </div>
                 </section>
               </div>
-              <div className="flex h-full flex-col overflow-auto bg-card p-4 min-w-0 min-h-0">
-                <section className="flex flex-col h-full gap-4 min-w-0 min-h-0">
-                  <h2 className="text-lg font-semibold tracking-tight">재고 예측 그래프</h2>
+              <div className="flex h-full flex-col overflow-auto bg-card px-4 py-2 min-w-0 min-h-0">
+                <section className="flex flex-col h-full gap-2 min-w-0 min-h-0">
+                  <h2 className="text-base font-semibold tracking-tight">재고 예측</h2>
                   <div className="flex-1 min-w-0 min-h-0">
                     <StockPanel station={selectedStation} forecast={forecast} />
                   </div>
                 </section>
               </div>
-              <div className="flex h-full flex-col overflow-auto bg-card p-4 min-w-0 min-h-0">
-                <section className="flex flex-col h-full gap-4 min-w-0 min-h-0">
-                  <h2 className="text-lg font-semibold tracking-tight">대여소 상세</h2>
+              <div className="flex h-full flex-col overflow-auto bg-card px-4 py-2 min-w-0 min-h-0">
+                <section className="flex flex-col h-full gap-2 min-w-0 min-h-0">
+                  <h2 className="text-base font-semibold tracking-tight">대여소 상세</h2>
                   <div className="flex-1 min-w-0 min-h-0">
                     <DetailPanel stationId={selectedStationId} reasons={forecast?.reasons ?? []} />
                   </div>

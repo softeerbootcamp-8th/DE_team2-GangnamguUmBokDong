@@ -453,6 +453,19 @@ function StationMarkers({
   );
 }
 
+function MapResizer() {
+  const map = useMapEvents({});
+  useEffect(() => {
+    const container = map.getContainer();
+    const observer = new ResizeObserver(() => {
+      map.invalidateSize();
+    });
+    observer.observe(container);
+    return () => observer.disconnect();
+  }, [map]);
+  return null;
+}
+
 export function StationMap({
   stations,
   alerts,
@@ -472,6 +485,7 @@ export function StationMap({
       style={{ height: "100%", width: "100%" }}
       wheelDebounceTime={100}
     >
+      <MapResizer />
       <TileLayer
         attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions">CARTO</a>'
         url="https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png"
