@@ -82,6 +82,16 @@ def run_predict_cli(model_name: str, target_col: str, exposure_col: str | None, 
         df = df[df["hour"] == args.hour]
     df = df.reset_index(drop=True)
 
+    if df.empty:
+        # station_id(s)를 지정 안 한 경로(전체 정류소)는 위 station_id/station_ids
+        # 분기의 개별 빈-결과 체크를 안 거치므로, 여기서 한 번 더 걸러야 --hour나
+        # 날짜 범위만으로 조용히 0행짜리 predict()/parquet 저장이 되는 걸 막는다.
+        raise SystemExit(
+            f"조회 조건에 맞는 데이터가 없습니다 (기간 {args.start_date}~{args.end_date}, "
+            f"horizon={args.horizon}{f', hour={args.hour}' if args.hour is not None else ''}) — "
+            "feature mart 범위/조건을 확인하세요."
+        )
+
     preds = predict(df, model_name, exposure_col=exposure_col)
     preds["actual"] = df[target_col].to_numpy()
 

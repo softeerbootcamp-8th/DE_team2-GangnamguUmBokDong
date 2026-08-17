@@ -47,6 +47,8 @@ def load_rental_trip_events(verbose: bool = True) -> pd.DataFrame:
         key = f"{paths.RENTAL_PARQUET_DIR}/서울특별시 공공자전거 대여이력 정보_{ym}.parquet"
         df = s3_io.read_parquet(key, columns=["start_dt", "start_st", "end_dt"])
         if df is None:
+            if verbose:
+                print(f"  {ym}: 파일 없음 — 건너뜀 ({key})")
             continue
         station_id = normalize_station_no(df["start_st"]).map(no_to_id)
         matched = pd.DataFrame({"station_id": station_id, "start_dt": df["start_dt"], "end_dt": df["end_dt"]})

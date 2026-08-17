@@ -17,7 +17,7 @@ from ml_core import common_config
 from ml_core.paths import archive_models_prefix
 
 from .config import today_kst
-from .train_common import load_training_table, train_target
+from .train_common import load_training_table, run_and_notify_on_failure, train_target
 
 
 def main() -> dict:
@@ -36,4 +36,4 @@ def main() -> dict:
 
 
 if __name__ == "__main__":
-    main()
+    run_and_notify_on_failure("train_return_model", main)

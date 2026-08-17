@@ -134,7 +134,7 @@ def build_multi_horizon_features(
     return combined
 
 
-if __name__ == "__main__":
+def _run_cli() -> None:
     import os
 
     from .spark_session import get_spark
@@ -174,8 +174,19 @@ if __name__ == "__main__":
             anchor_input = anchor_input.filter(F.minute(F.col("hour_ts")) == 0)
 
     result = build_multi_horizon_features(spark, features, anchor_df=anchor_input)
-    # date 파티션으로 써야 training/monitor_performance가 ml_common.s3_io.read_parquet()의
-    # date_range로 필요한 기간만 읽을 수 있다(전체 히스토리를 매번 훑지 않음) — s3_io.py
+    # date 파티션으로 써야 training/monitor_performance가 core.s3.read_parquet()의
+    # date_range로 필요한 기간만 읽을 수 있다(전체 히스토리를 매번 훑지 않음) — s3.py
     # 모듈 docstring 참고.
     result.write.mode("overwrite").partitionBy("date").parquet(config.MULTI_HORIZON_FEATURES_TABLE_PARQUET)
     print(f"multi-horizon features -> {config.MULTI_HORIZON_FEATURES_TABLE_PARQUET}")
+
+
+if __name__ == "__main__":
+    try:
+        _run_cli()
+    except Exception as exc:
+        # training/scripts/monthly_retrain_check.py가 이 스크립트를 subprocess로
+        # 띄운다 — 표준출력이 그대로 스트리밍되므로, 실패 사유를 알아보기 쉬운
+        # 한 줄로 여기 남겨야 오케스트레이터 로그만 보고도 원인을 알 수 있다.
+        print(f"[build_multi_horizon_features] 실패: {exc}", flush=True)
+        raise

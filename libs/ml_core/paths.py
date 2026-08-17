@@ -22,10 +22,17 @@ from pathlib import Path
 from . import common_config
 
 # 로컬 subprocess로 형제 패키지의 venv 실행파일을 찾을 때만 쓰는 로컬 경로
-# 개념(예: training/scripts/monthly_retrain_check.py가 feature_engine의
+# 개념(예: training/scripts/monthly_retrain_check.py가 feature_engine/training의
 # .venv/bin/python을 실행) — 데이터 저장 위치와는 무관, 코드 자체는 여전히
 # 로컬(또는 EMR/EC2) 프로세스로 실행되므로 이 개념만 남겨둔다.
-ML_ROOT = Path.cwd()
+#
+# `Path.cwd()`가 아니라 이 파일 위치 기준으로 고정한다 — cwd 기준이면 스케줄러
+# (cron/systemd 등)가 "ml/"로 cd하지 않고 절대경로로 이 스크립트를 실행할 때
+# ML_ROOT가 엉뚱한 디렉터리가 되고, 그 아래 "feature_engine/.venv/bin/python"을
+# 못 찾아 RuntimeError가 난다 — 실행 위치와 무관하게 항상 이 저장소의 "ml/"을
+# 가리켜야 한다. 이 파일은 "libs/ml_core/paths.py"에 있으므로 parents[2]가
+# 저장소 루트다.
+ML_ROOT = Path(__file__).resolve().parents[2] / "ml"
 
 FEATURE_PARAM_COMBO_ID = os.environ.get(
     "FEATURE_PARAM_COMBO_ID",

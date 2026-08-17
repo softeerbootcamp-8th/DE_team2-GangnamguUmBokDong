@@ -33,9 +33,32 @@ __all__ = [
     "FEATURE_COLUMNS",
     "load_station_dtype",
     "load_training_table",
+    "run_and_notify_on_failure",
     "station_categories_path",
     "train_target",
 ]
+
+
+def run_and_notify_on_failure(label: str, main_fn):
+    """`main_fn()`을 실행하고, 실패하면 알아보기 쉬운 한 줄을 표준출력에 남긴 뒤 다시 던진다.
+
+    `train_rental_model.py`/`train_return_model.py`는 `monthly_retrain_check.py`가
+    subprocess로 띄운다 — 그 표준출력이 그대로 오케스트레이터 로그에 스트리밍되므로,
+    오케스트레이터 쪽은 "다음 프로필로 넘어감" 정도로만 요약해도 실제 실패 사유(예:
+    feature mart에 학습 구간 데이터가 아직 없음)가 이 한 줄로 로그에 분명히 남는다 —
+    파이썬 기본 traceback만 믿으면 로그를 끝까지 스크롤해야 원인을 알 수 있다.
+
+    args:
+        label: 로그에 남길 스크립트 이름(예: "train_rental_model")
+        main_fn: 실행할 함수(인자 없음)
+    returns:
+        main_fn()의 반환값
+    """
+    try:
+        return main_fn()
+    except Exception as exc:
+        print(f"[{label}] 실패: {exc}", flush=True)
+        raise
 
 
 def load_training_table() -> pd.DataFrame:
@@ -81,10 +104,25 @@ def _split(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         df: date 컬럼(YYYY-MM-DD)을 포함한 feature 테이블
     returns:
         tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]: (train, valid, test)
+    raises:
+        ValueError: 세 구간 중 하나라도 행이 0개일 때 — `config.py`의 TRAIN/VALID/TEST
+            구간이 이제 "오늘 - 안전마진" 기준으로 매번 동적으로 계산되므로(고정
+            캘린더 달이 아님), feature mart가 그 구간까지 아직 안 쌓였으면 조용히
+            빈 데이터로 학습을 시도하다 lgb.train() 안에서 알아보기 힘든 에러로
+            죽을 수 있다 — 여기서 먼저 걸러서 원인을 바로 알 수 있게 한다
+            (monitor_performance.evaluate_recent_performance()의 같은 패턴 참고).
     """
     train = df[(df["date"] >= config.TRAIN_START) & (df["date"] <= config.TRAIN_END)]
     valid = df[(df["date"] >= config.VALID_START) & (df["date"] <= config.VALID_END)]
     test = df[(df["date"] >= config.TEST_START) & (df["date"] <= config.TEST_END)]
+
+    if train.empty or valid.empty or test.empty:
+        raise ValueError(
+            f"학습 구간에 데이터가 없음 — train {len(train)}행({config.TRAIN_START}~{config.TRAIN_END}), "
+            f"valid {len(valid)}행({config.VALID_START}~{config.VALID_END}), "
+            f"test {len(test)}행({config.TEST_START}~{config.TEST_END}) — feature mart가 이 구간까지 "
+            "쌓였는지 확인하세요"
+        )
 
     if config.TRAIN_SAMPLE_FRAC < 1.0:
         train = train.sample(frac=config.TRAIN_SAMPLE_FRAC, random_state=42)
