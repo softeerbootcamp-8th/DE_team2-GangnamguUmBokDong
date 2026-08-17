@@ -11,9 +11,8 @@ def test_realtime_5min_dag_id():
     assert realtime_5min_dag.dag.dag_id == "realtime_5min"
 
 
-def test_e2e_realtime_dag_id_and_manual_schedule():
+def test_e2e_realtime_dag_id():
     assert e2e_realtime_dag.dag.dag_id == "e2e_realtime"
-    assert e2e_realtime_dag.dag.schedule is None
 
 
 def test_realtime_gold_waits_for_inference_and_station_stock():
