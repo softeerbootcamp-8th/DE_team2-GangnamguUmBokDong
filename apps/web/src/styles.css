@@ -273,7 +273,7 @@ body {
 }
 
 .region-select {
-  padding: 2px 8px;
+  padding: 4px 10px;
   border-radius: 999px;
   border: 1px solid var(--border);
   background: var(--surface-1);
