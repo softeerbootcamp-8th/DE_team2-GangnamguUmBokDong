@@ -142,7 +142,8 @@ def _read_parquet_by_date_range(
         result = result[columns]
     if as_pandas:
         return result
-    return pq.Table.from_pandas(result, preserve_index=False)
+    import pyarrow as pa
+    return pa.Table.from_pandas(result, preserve_index=False)
 
 
 def read_parquet_many(keys: list[str], columns: list[str] | None = None, max_workers: int = 16, as_pandas: bool = True) -> list[pd.DataFrame | pq.Table | None]:
