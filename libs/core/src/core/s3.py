@@ -12,6 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import boto3
 import pandas as pd
+import pyarrow as pa
 import pyarrow.parquet as pq
 from botocore.exceptions import ClientError
 
@@ -84,15 +85,19 @@ def read_parquet(
     if not part_keys:
         return None
 
-    tables = [t for t in read_parquet_many(part_keys, columns=columns, as_pandas=as_pandas) if t is not None]
+    # 조각마다 pandas DataFrame으로 각각 변환해 리스트에 쌓아뒀다가 pd.concat()하면,
+    # 그 순간 "조각 전부 + 새로 만든 합본"이 동시에 메모리에 떠 있는다(최종 크기의
+    # 최대 2배). 항상 Arrow Table로만 모아서(as_pandas=False) Arrow 레벨에서 먼저
+    # 합치고(zero-copy — ChunkedArray가 기존 버퍼를 복사 없이 이어붙임), pandas
+    # 변환은 최종 결과 하나에 대해 딱 한 번만 한다. 조각 목록은 합치자마자 바로
+    # 참조를 끊어서(del) 가비지 컬렉션이 즉시 회수할 수 있게 한다.
+    tables = [t for t in read_parquet_many(part_keys, columns=columns, as_pandas=False) if t is not None]
     if not tables:
         return None
+    combined = pa.concat_tables(tables)
+    del tables
 
-    if as_pandas:
-        return pd.concat(tables, ignore_index=True)
-    else:
-        import pyarrow as pa
-        return pa.concat_tables(tables)
+    return combined.to_pandas() if as_pandas else combined
 
 
 def _read_parquet_by_date_range(
@@ -122,28 +127,30 @@ def _read_parquet_by_date_range(
     prefix = key if key.endswith("/") else f"{key}/"
     file_columns = [c for c in columns if c != "date"] if columns is not None else None
 
-    frames = []
+    # read_parquet()와 같은 이유로 Arrow Table 상태로만 모은다 — "date" 컬럼도
+    # pandas .copy()+할당 대신 Arrow 레벨에서 상수 컬럼으로 붙여서, 조각마다 pandas
+    # DataFrame을 따로 만들지 않는다(다중 파티션 읽기라 이 함수가 가장 큰 데이터를
+    # 다룰 가능성이 높음 — training의 multi-horizon 테이블 읽기).
+    tables = []
     for day in pd.date_range(start, end, freq="D"):
         date_str = day.strftime("%Y-%m-%d")
         part_keys = sorted(k for k in list_keys(f"{prefix}date={date_str}/") if k.endswith(".parquet"))
         if not part_keys:
             continue
-        for df in read_parquet_many(part_keys, columns=file_columns, as_pandas=True):
-            if df is None:
+        for table in read_parquet_many(part_keys, columns=file_columns, as_pandas=False):
+            if table is None:
                 continue
-            df = df.copy()
-            df["date"] = date_str
-            frames.append(df)
+            date_column = pa.array([date_str] * table.num_rows)
+            tables.append(table.append_column("date", date_column))
 
-    if not frames:
+    if not tables:
         return None
-    result = pd.concat(frames, ignore_index=True)
+    combined = pa.concat_tables(tables)
+    del tables
+
     if columns is not None:
-        result = result[columns]
-    if as_pandas:
-        return result
-    import pyarrow as pa
-    return pa.Table.from_pandas(result, preserve_index=False)
+        combined = combined.select(columns)
+    return combined.to_pandas() if as_pandas else combined
 
 
 def read_parquet_many(keys: list[str], columns: list[str] | None = None, max_workers: int = 16, as_pandas: bool = True) -> list[pd.DataFrame | pq.Table | None]:

@@ -254,12 +254,9 @@ def train_target(
     X_valid, y_valid = _prepare_xy(valid_df, target_col, station_dtype)
     X_test, y_test = _prepare_xy(test_df, target_col, station_dtype)
 
-    if is_primary:
-        s3_io.write_json(station_categories_path(model_name, models_prefix), station_categories)
-
-    metrics: dict = {"model_name": model_name}
-
-    # 1) Poisson (+ exposure offset)
+    # exposure 컬럼은 원본 DataFrame에서 뽑아쓰는 마지막 용도다 — 뽑자마자 바로
+    # del해서 X_*/y_*로 이미 변환된 train_df/valid_df/test_df를 이중으로 메모리에
+    # 붙들고 있지 않게 한다(아래로는 어디서도 이 세 DataFrame을 참조하지 않음).
     if exposure_col is not None:
         exposure_train = train_df[exposure_col].to_numpy()
         exposure_valid = valid_df[exposure_col].to_numpy()
@@ -270,7 +267,14 @@ def train_target(
         exposure_valid = np.ones(len(valid_df))
         exposure_test = np.ones(len(test_df))
         init_train = init_valid = None
+    del train_df, valid_df, test_df
 
+    if is_primary:
+        s3_io.write_json(station_categories_path(model_name, models_prefix), station_categories)
+
+    metrics: dict = {"model_name": model_name}
+
+    # 1) Poisson (+ exposure offset)
     train_set = lgb.Dataset(
         X_train, label=y_train, init_score=init_train, categorical_feature=config.CATEGORICAL_FEATURES
     )
@@ -310,6 +314,14 @@ def train_target(
     valid_set_q = lgb.Dataset(
         X_valid, label=y_valid, reference=train_set_q, categorical_feature=config.CATEGORICAL_FEATURES
     )
+
+    # train_set/train_set_q는 X_train/y_train을 쓰는 마지막 Dataset이다 — 지금
+    # construct()로 bin 압축을 강제로 끝내두면(각 Dataset이 압축된 자체 사본을
+    # 가짐) 그 뒤로는 원본 X_train/y_train이 필요 없으므로 del로 참조를 끊는다.
+    # X_valid/X_test는 뒤에서 predict()에 그대로 쓰이므로 지우지 않는다.
+    train_set.construct()
+    train_set_q.construct()
+    del X_train, y_train
 
     quantile_preds_test = {}
     quantile_preds_valid = {}
