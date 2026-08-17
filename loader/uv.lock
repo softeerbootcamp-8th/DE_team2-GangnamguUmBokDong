@@ -240,7 +240,7 @@ dependencies = [
 
 [package.dev-dependencies]
 dev = [
-    { name = "ml-common" },
+    { name = "ml-core" },
     { name = "moto", extra = ["s3"] },
     { name = "pytest" },
 ]
@@ -257,7 +257,7 @@ requires-dist = [
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "ml-common", editable = "../libs/ml_common" },
+    { name = "ml-core", editable = "../libs/ml_core" },
     { name = "moto", extras = ["s3"], specifier = ">=5.2.2" },
     { name = "pytest", specifier = ">=9.1.1" },
 ]
@@ -282,9 +282,9 @@ wheels = [
 ]
 
 [[package]]
-name = "ml-common"
+name = "ml-core"
 version = "0.1.0"
-source = { editable = "../libs/ml_common" }
+source = { editable = "../libs/ml_core" }
 dependencies = [
     { name = "boto3" },
     { name = "core" },
