@@ -20,6 +20,7 @@ from datetime import date
 import numpy as np
 import pandas as pd
 from core import s3 as s3_io
+from ml_core import common_config
 from ml_core.metrics import poisson_deviance as _poisson_deviance
 from ml_core.model_contract import FEATURE_COLUMNS
 from ml_core.paths import model_json_key
@@ -51,10 +52,16 @@ def _load_baseline_metrics(model_name: str) -> dict:
 
 
 def _recent_month_range(lookback_months: int, as_of: date | None = None) -> tuple[str, str]:
-    """최근 완결된 lookback_months개월의 (시작일, 종료일) "YYYY-MM-DD" 문자열을 만든다.
+    """최근 "완전히 확정된" lookback_months개월의 (시작일, 종료일) "YYYY-MM-DD" 문자열을 만든다.
 
-    "완결된" 개월만 본다 — 이번 달은 아직 안 끝났으니 제외(부분 데이터로 성능을
-    오판하지 않기 위함).
+    "이번 달 제외 = 완결"이 아니다 — 대여이력은 반납 완료 시에만 Silver에
+    나타나므로(`feature_engine/spark/run_pipeline.py` 참고), `rental_count`는
+    `common_config.INCREMENTAL_LOOKBACK_HOURS`(기본 840시간=35일) 동안 다음 증분
+    실행 때마다 계속 사후 보정될 수 있다. 그래서 "지난달 말일"이 아니라 "그 달의
+    마지막 날이 `as_of - INCREMENTAL_LOOKBACK_HOURS`보다 확실히 이전인 가장 최근
+    달"을 끝으로 잡는다 — 안 그러면(예: 8/1에 실행) 7/31까지를 확정된 걸로 보고
+    baseline과 비교하는데, 그 구간은 며칠 뒤 증분 실행에서 rental_count가 또
+    바뀔 수 있어 "재학습 필요" 판정이 아직 안정화되지 않은 값으로 오염된다.
 
     args:
         lookback_months: 몇 개월치를 볼지
@@ -63,7 +70,12 @@ def _recent_month_range(lookback_months: int, as_of: date | None = None) -> tupl
         tuple[str, str]: (start_date, end_date)
     """
     as_of_ts = pd.Timestamp(as_of) if as_of is not None else pd.Timestamp.now().normalize()
-    end = as_of_ts.replace(day=1) - pd.Timedelta(days=1)  # 지난달 마지막 날
+    safe_cutoff = as_of_ts - pd.Timedelta(hours=common_config.INCREMENTAL_LOOKBACK_HOURS)
+
+    end = as_of_ts.replace(day=1) - pd.Timedelta(days=1)  # 지난달 마지막 날(후보)
+    while end > safe_cutoff:  # 아직 사후 보정 대상이면 그 이전 달로 계속 밀어낸다
+        end = end.replace(day=1) - pd.Timedelta(days=1)
+
     start = (end - pd.DateOffset(months=lookback_months - 1)).replace(day=1)
     return start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")
 
