@@ -16,7 +16,8 @@ import zlib
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
-from ml_common import s3_io
+from core import s3 as s3_io
+from ml_common import model_io
 from ml_common.metrics import pinball_loss as _pinball_loss
 from ml_common.metrics import poisson_deviance as _poisson_deviance
 from ml_common.model_contract import (
@@ -245,7 +246,7 @@ def train_target(
     # (매 라운드 gradient를 네트워크로 동기화) 파일 저장은 대표 머신(rank 0)만 하면 되고,
     # 나머지 머신이 같은 경로에 동시에 쓰면 경합이 생길 수 있어 그 부분만 막는다.
     if is_primary:
-        s3_io.stage_and_upload_booster(booster, model_key(model_name, "poisson", models_prefix))
+        model_io.stage_and_upload_booster(booster, model_key(model_name, "poisson", models_prefix))
 
     mu_test = exposure_test * booster.predict(X_test, num_iteration=booster.best_iteration)
     metrics["poisson_deviance_test"] = _poisson_deviance(y_test.to_numpy(), mu_test)
@@ -277,7 +278,7 @@ def train_target(
             ],
         )
         if is_primary:
-            s3_io.stage_and_upload_booster(q_booster, model_key(model_name, f"q{int(alpha * 100)}", models_prefix))
+            model_io.stage_and_upload_booster(q_booster, model_key(model_name, f"q{int(alpha * 100)}", models_prefix))
         pred_test = q_booster.predict(X_test, num_iteration=q_booster.best_iteration)
         pred_valid = q_booster.predict(X_valid, num_iteration=q_booster.best_iteration)
         quantile_preds_test[alpha] = pred_test

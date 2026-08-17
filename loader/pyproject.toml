@@ -4,7 +4,7 @@ version = "0.1.0"
 requires-python = "==3.11.*"
 dependencies = [
     "core",
-    "boto3>=1.43.69",
+    "boto3==1.43.69",
     "pandas>=2.2.0,<3.0.0",
     "pyarrow>=25.0.1",
     "shapely>=2.1.2",

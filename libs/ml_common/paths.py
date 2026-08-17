@@ -103,7 +103,7 @@ ANALYSIS_SUMMARY_JSON = f"{PROCESSED_V2_PREFIX}/output/analysis_summary.json"
 
 def load_holidays_2025() -> set[str]:
     """analysis_summary.json의 holidays_2025 목록을 'YYYY-MM-DD' 문자열 set으로 반환한다."""
-    from . import s3_io
+    from core import s3 as s3_io
 
     summary = s3_io.read_json(ANALYSIS_SUMMARY_JSON)
     if summary is None:

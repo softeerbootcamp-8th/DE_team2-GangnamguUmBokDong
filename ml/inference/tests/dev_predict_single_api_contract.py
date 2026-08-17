@@ -225,7 +225,7 @@ def test_predict_demand_multi_hour_all_stations_no_failures_when_all_known(monke
 
 def test_single_station_cli_saves_to_s3(monkeypatch):
     """단일 정류소 CLI 실행 시 single_prediction_key 경로로 parquet이 저장되는지 검증한다."""
-    from ml_common import s3_io
+    from core import s3 as s3_io
 
     trips = pd.DataFrame([_trip("ST-100", "2025-06-01 09:00:00", "2025-06-01 09:05:00")])
     _set_rental_events(trips)
@@ -264,7 +264,7 @@ def test_single_station_cli_saves_to_s3(monkeypatch):
 
 def test_single_station_multi_hour_cli_saves_to_s3(monkeypatch):
     """단일 정류소 다중 시간대(n_hours>1) CLI 실행 시 S3 저장 검증."""
-    from ml_common import s3_io
+    from core import s3 as s3_io
 
     trips = pd.DataFrame([_trip("ST-100", "2025-06-01 09:00:00", "2025-06-01 09:05:00")])
     _set_rental_events(trips)

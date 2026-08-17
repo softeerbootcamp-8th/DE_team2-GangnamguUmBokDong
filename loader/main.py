@@ -20,7 +20,7 @@ from datetime import datetime
 from core.db import get_connection
 
 from config import TABLE_SPECS
-from upsert import upsert
+from core.upsert import upsert
 
 
 def run(table: str, window_start: datetime) -> None:

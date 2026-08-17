@@ -8,7 +8,7 @@ import os
 import psycopg
 import pytest
 
-from upsert import upsert
+from core.upsert import upsert
 
 pytestmark = pytest.mark.skipif(
     not os.environ.get("DATABASE_URL"), reason="DATABASE_URL 미설정: 로컬 Postgres 필요"

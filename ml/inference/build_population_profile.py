@@ -14,7 +14,7 @@ grid_id x hour x dow만으로도 격자당 표본이 연간 약 52개(그 요일
 """
 
 import pandas as pd
-from ml_common import s3_io
+from core import s3 as s3_io
 
 from . import config
 

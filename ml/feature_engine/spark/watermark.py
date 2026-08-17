@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from ml_common import s3_io
+from core import s3 as s3_io
 
 
 def read_watermark(path: str) -> dict | None:

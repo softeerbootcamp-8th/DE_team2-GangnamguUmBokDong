@@ -14,7 +14,7 @@ station x hour x dow x month로 묶으면 표본이 그 달에 그 요일이 나
 """
 
 import pandas as pd
-from ml_common import s3_io
+from core import s3 as s3_io
 
 from . import config
 

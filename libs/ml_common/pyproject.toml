@@ -4,15 +4,22 @@ version = "0.1.0"
 description = "feature_engine/training/inference가 공유하는 파라미터·경로·핵심 알고리즘"
 requires-python = ">=3.11"
 dependencies = [
+    "core",
     "pandas",
     "numpy",
     "pyarrow",
     "lightgbm",
-    "boto3>=1.43.69",
+    "boto3==1.43.69",
 ]
 
 [dependency-groups]
 dev = ["pytest", "moto[s3]>=5.2.2"]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+core = { path = "../core", editable = true }
 
 [tool.pytest.ini_options]
 # ml/pytest.ini와 동일한 규칙(dev_*.py) — ml_common은 이제 ml/ 밖(lib/)에 있어서

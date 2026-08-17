@@ -3,7 +3,8 @@ name = "nowcaster"
 version = "0.1.0"
 requires-python = "==3.11.*"
 dependencies = [
-    "boto3>=1.43.69",
+    "core",
+    "boto3==1.43.69",
     "pyarrow>=25.0.1",
     "holidays>=0.65",
     "pandas>=2.2",
@@ -11,6 +12,9 @@ dependencies = [
 
 [tool.uv]
 package = false
+
+[tool.uv.sources]
+core = { path = "../libs/core", editable = true }
 
 [dependency-groups]
 dev = [

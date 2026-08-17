@@ -16,7 +16,7 @@
 import argparse
 
 import pandas as pd
-from ml_common import s3_io
+from core import s3 as s3_io
 from ml_common.scoring import predict, print_metrics
 
 from . import config

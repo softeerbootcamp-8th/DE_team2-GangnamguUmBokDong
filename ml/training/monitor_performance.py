@@ -19,7 +19,7 @@ from datetime import date
 
 import numpy as np
 import pandas as pd
-from ml_common import s3_io
+from core import s3 as s3_io
 from ml_common.metrics import poisson_deviance as _poisson_deviance
 from ml_common.paths import model_json_key
 from ml_common.scoring import predict

@@ -1,7 +1,8 @@
 from collections import defaultdict
 from datetime import UTC, datetime, timedelta
 
-from core.db import get_connection
+from core.db import fetch_all, fetch_one
+
 
 STOCK_HISTORY_WINDOW_MIN = 25
 
@@ -9,12 +10,6 @@ STOCK_HISTORY_WINDOW_MIN = 25
 def _floor_to_5min(dt: datetime) -> datetime:
     """주어진 시각을 5분 단위로 내림한다."""
     return dt - timedelta(minutes=dt.minute % 5, seconds=dt.second, microseconds=dt.microsecond)
-
-
-def _rows_as_dicts(cur) -> list[dict]:
-    """psycopg 커서의 조회 결과를 컬럼명 기준 dict 리스트로 변환한다."""
-    columns = [col.name for col in cur.description]
-    return [dict(zip(columns, row)) for row in cur.fetchall()]
 
 
 def _group_by_sta_id(rows: list[dict]) -> dict[str, list[dict]]:
@@ -41,9 +36,7 @@ def fetch_stations() -> list[dict]:
         ) stock ON true
         ORDER BY s.sta_id
     """
-    with get_connection() as conn, conn.cursor() as cur:
-        cur.execute(query)
-        return _rows_as_dicts(cur)
+    return fetch_all(query)
 
 
 def fetch_station(sta_id: str) -> dict | None:
@@ -61,10 +54,7 @@ def fetch_station(sta_id: str) -> dict | None:
         ) stock ON true
         WHERE s.sta_id = %(sta_id)s
     """
-    with get_connection() as conn, conn.cursor() as cur:
-        cur.execute(query, {"sta_id": sta_id})
-        rows = _rows_as_dicts(cur)
-        return rows[0] if rows else None
+    return fetch_one(query, {"sta_id": sta_id})
 
 
 def fetch_forecast_points(sta_id: str, now: datetime) -> list[dict]:
@@ -75,9 +65,7 @@ def fetch_forecast_points(sta_id: str, now: datetime) -> list[dict]:
         WHERE sta_id = %(sta_id)s AND predicted_dttm > %(now)s
         ORDER BY predicted_dttm
     """
-    with get_connection() as conn, conn.cursor() as cur:
-        cur.execute(query, {"sta_id": sta_id, "now": now})
-        return _rows_as_dicts(cur)
+    return fetch_all(query, {"sta_id": sta_id, "now": now})
 
 
 def fetch_all_stock_history(sta_ids: list[str], now: datetime) -> dict[str, list[dict]]:
@@ -90,9 +78,7 @@ def fetch_all_stock_history(sta_ids: list[str], now: datetime) -> dict[str, list
         ORDER BY sta_id, observed_at
     """
     since = now - timedelta(minutes=STOCK_HISTORY_WINDOW_MIN)
-    with get_connection() as conn, conn.cursor() as cur:
-        cur.execute(query, {"sta_ids": sta_ids, "since": since})
-        rows = _rows_as_dicts(cur)
+    rows = fetch_all(query, {"sta_ids": sta_ids, "since": since})
     grouped = _group_by_sta_id(rows)
     return {sta_id: grouped.get(sta_id, []) for sta_id in sta_ids}
 
@@ -105,18 +91,15 @@ def fetch_all_forecast_points(sta_ids: list[str], now: datetime) -> dict[str, li
         WHERE sta_id = ANY(%(sta_ids)s) AND predicted_dttm > %(now)s
         ORDER BY sta_id, predicted_dttm
     """
-    with get_connection() as conn, conn.cursor() as cur:
-        cur.execute(query, {"sta_ids": sta_ids, "now": now})
-        rows = _rows_as_dicts(cur)
+    rows = fetch_all(query, {"sta_ids": sta_ids, "now": now})
     grouped = _group_by_sta_id(rows)
     return {sta_id: grouped.get(sta_id, []) for sta_id in sta_ids}
 
 
 def fetch_batch_run_at(now: datetime) -> datetime:
-    """가장 최근 예측 배치 실행 시각. 배치 결과가 아직 없으면 지금을 5분 단위로 내림해 대신한다."""
-    with get_connection() as conn, conn.cursor() as cur:
-        cur.execute("SELECT max(batch_run_at) FROM forecast_points")
-        (latest,) = cur.fetchone()
+    """가장 최근 예측 배치 실행 시각. 배치 결과가 아직 없으면 지금을 5분 단위로 내림해 대신한다.    """
+    row = fetch_one("SELECT max(batch_run_at) as latest FROM forecast_points")
+    latest = row["latest"] if row else None
     return latest if latest is not None else _floor_to_5min(now)
 
 

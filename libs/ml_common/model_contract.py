@@ -26,7 +26,8 @@ dtype이 어긋나 있었다 — 예측값 자체는 달라지지 않지만(Ligh
 
 import pandas as pd
 
-from . import common_config, s3_io
+from . import common_config
+from core import s3 as s3_io
 from .paths import MODELS_PREFIX
 
 LAG_ROLLING_FEATURE_COLUMNS = [
