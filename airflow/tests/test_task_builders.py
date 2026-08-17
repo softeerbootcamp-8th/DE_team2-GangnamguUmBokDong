@@ -41,7 +41,7 @@ def test_inference_task_cwd_is_ml_not_ml_inference(dag):
     task = build_inference_task(dag)
     assert task.cwd == ML_DIR
     assert task.cwd.endswith("/ml")
-    assert "./inference/.venv/bin/python -m inference.predict_single" in task.bash_command
+    assert "uv --project inference run python -m inference.predict_single" in task.bash_command
     assert "--all-stations" in task.bash_command
 
 
