@@ -8,13 +8,10 @@ collector/storage.py의 경로 컨벤션(`{layer}/{source_id}/dt=.../hh=.../HHMM
 from __future__ import annotations
 
 import io
-import os
 from datetime import date, datetime
 
 import pyarrow as pa
 import pyarrow.parquet as pq
-from botocore.exceptions import ClientError
-
 from core.s3 import (
     get_object_bytes,
     list_common_prefixes,

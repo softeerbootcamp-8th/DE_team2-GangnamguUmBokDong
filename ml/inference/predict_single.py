@@ -446,10 +446,17 @@ def _get_station_master() -> pd.DataFrame:
             realtime = s3_io.read_parquet(max(realtime_keys))
             if realtime is not None:
                 realtime = realtime.rename(columns=silver_schema.BIKE_REALTIME_COLUMN_MAP)
-                supplement = realtime[["station_id", "station_name", "capacity"]]
-                master = master.drop(columns=["station_name"], errors="ignore").merge(
-                    supplement, on="station_id", how="left"
+                supplement = realtime[["station_id", "station_name", "capacity"]].rename(
+                    columns={"station_name": "station_name_live", "capacity": "capacity_live"}
                 )
+                master = master.merge(supplement, on="station_id", how="left")
+                for column in ("station_name", "capacity"):
+                    live_column = f"{column}_live"
+                    if column in master:
+                        master[column] = master[live_column].combine_first(master[column])
+                    else:
+                        master[column] = master[live_column]
+                master = master.drop(columns=["station_name_live", "capacity_live"])
         if "station_name" not in master:
             master["station_name"] = master.get("ADDR1")
         if "capacity" not in master:

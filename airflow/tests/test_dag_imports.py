@@ -31,6 +31,7 @@ def test_e2e_population_is_normalized_before_inference():
     assert "population_normalized" in e2e_realtime_dag.dag.get_task("run_inference").upstream_task_ids
     assert "collect_population_realtime" not in e2e_realtime_dag.dag.get_task("run_inference").upstream_task_ids
     assert "collect_weather_ultra_short_live" in e2e_realtime_dag.dag.get_task("run_inference").upstream_task_ids
+    assert "enrich_station_master" in e2e_realtime_dag.dag.get_task("run_inference").upstream_task_ids
 
 
 def test_realtime_gold_waits_for_inference_and_station_stock():
@@ -59,3 +60,6 @@ def test_station_master_daily_collector_contract():
     assert station_master_dag.dag.dag_id == "station_master"
     task = station_master_dag.dag.get_task("collect_bike_station_master")
     assert "--source bike_station_master" in task.bash_command
+    enrich = station_master_dag.dag.get_task("enrich_station_master")
+    assert enrich.upstream_task_ids == {"collect_bike_station_master"}
+    assert "station_master.py" in enrich.bash_command

@@ -44,16 +44,19 @@ def test_recent_population_never_falls_back_to_raw_population(monkeypatch):
 
 
 def test_station_master_uses_latest_daily_master_and_realtime_capacity(monkeypatch):
-    """일 단위 master에 최신 실시간 이름과 capacity를 보강한다."""
+    """CELL_ID 보강 master에 최신 실시간 이름과 capacity를 보강한다."""
     master = pd.DataFrame(
-        [{"RNTLS_ID": "ST-10", "ADDR1": "서울시 마포구", "ADDR2": "427", "LAT": 37.55, "LOT": 126.91}]
+        [{
+            "station_id": "ST-10", "station_no": "427", "station_name": "서울시 마포구",
+            "capacity": 10, "lat": 37.55, "lon": 126.91, "grid_id": "다사53815262",
+        }]
     )
     realtime = pd.DataFrame(
         [{"stationId": "ST-10", "stationName": "서교동 사거리", "rackTotCnt": 15}]
     )
 
     def list_keys(prefix):
-        if prefix == ps.silver_schema.STATION_MASTER_PREFIX:
+        if prefix == ps.silver_schema.STATION_MASTER_ENRICHED_PREFIX:
             return [f"{prefix}dt=2026-08-17/hh=03/0300.parquet"]
         return [f"{prefix}dt=2026-08-17/hh=15/1505.parquet"]
 
@@ -61,7 +64,7 @@ def test_station_master_uses_latest_daily_master_and_realtime_capacity(monkeypat
     monkeypatch.setattr(
         ps.s3_io,
         "read_parquet",
-        lambda key: master if "bike_station_master" in key else realtime,
+        lambda key: master if "station_master_enriched" in key else realtime,
     )
     ps._station_master = None
 
@@ -69,7 +72,7 @@ def test_station_master_uses_latest_daily_master_and_realtime_capacity(monkeypat
 
     assert result.loc["ST-10", "station_name"] == "서교동 사거리"
     assert result.loc["ST-10", "capacity"] == 15
-    assert pd.isna(result.loc["ST-10", "grid_id"])
+    assert result.loc["ST-10", "grid_id"] == "다사53815262"
 
 
 def test_missing_population_profile_uses_nan_fallback(monkeypatch):

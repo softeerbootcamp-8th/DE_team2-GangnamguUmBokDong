@@ -7,13 +7,12 @@ import math
 import sys
 from datetime import datetime
 
+import grid
 import pyarrow as pa
+import storage
 from pyproj import Transformer
 from shapely import STRtree
 from shapely.geometry import Point
-
-import grid
-import storage
 
 MIN_GRID_COVERAGE = 0.95
 
