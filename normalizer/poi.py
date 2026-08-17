@@ -1,21 +1,15 @@
-"""POI(121장소) shapefile 로딩, 위상 오류(POI070) 복구, 결과 캐싱.
-
-shapefile은 이미 EPSG:4326(WGS84)이다. AREA_CD/AREA_NM/geometry가 shapefile
-자체에 있어 별도 목록.xlsx와의 조인이 필요 없다(spec 확인 완료).
-
-실측으로 발견된 버그: POI070("쌍문역")이 shapely가 TopologyException을 던질
-정도로 자기교차한다. is_valid 체크 후 shapely.make_valid로 복구하고, 복구
-결과가 단일 Polygon이 아니면(MultiPolygon/GeometryCollection) 면적이 가장
-큰 Polygon 조각을 취한다. Polygon 조각이 하나도 없으면 명확히 실패시킨다.
-"""
+"""서울 주요 핫스팟(POI) Shapefile을 로드하고 위상 오류를 복구하여 EPSG:5179로 변환한다."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import lru_cache
 
+
+# pyrefly: ignore [missing-import]
 import shapefile
 import shapely
+# pyrefly: ignore [missing-import]
 from pyproj import Transformer
 from shapely.geometry import shape
 from shapely.geometry.base import BaseGeometry
@@ -28,7 +22,7 @@ _TO_EPSG5179 = Transformer.from_crs("EPSG:4326", "EPSG:5179", always_xy=True)
 
 @dataclass(frozen=True)
 class PoiArea:
-    """shapefile에서 로딩한 POI 하나(EPSG:5179로 변환·위상 오류 복구 완료)."""
+    """EPSG:5179로 변환 및 위상 복구가 완료된 POI 영역 지오메트리 정보."""
 
     area_cd: str
     area_nm: str
@@ -37,14 +31,18 @@ class PoiArea:
 
 
 def _select_largest_polygon(geom: BaseGeometry, area_cd: str) -> BaseGeometry:
-    """make_valid 등의 결과에서 면적이 가장 큰 Polygon 조각을 고른다.
+    """복구 결과 지오메트리 중 면적이 가장 큰 Polygon을 선택한다.
 
-    Args:
-        geom: Polygon, MultiPolygon, 또는 GeometryCollection.
-        area_cd: 에러 메시지에 쓸 POI 식별자.
+    make_valid()로 자기교차된 폴리곤을 복구하면 주 영역 외에 미세한 파편들이 생성되므로
+    실제 구역 본체에 해당하는 가장 큰 폴리곤만 선택한다.
 
-    Raises:
-        ValueError: Polygon 조각이 하나도 없거나 처리할 수 없는 타입일 때.
+    args:
+        geom: BaseGeometry 객체
+        area_cd: POI 영역 코드 
+    returns:
+        가장 큰 단일 Polygon 지오메트리
+    raises:
+        ValueError: Polygon 조각이 없거나 지원되지 않는 타입일 때
     """
     if geom.geom_type == "Polygon":
         return geom
@@ -54,12 +52,20 @@ def _select_largest_polygon(geom: BaseGeometry, area_cd: str) -> BaseGeometry:
             raise ValueError(
                 f"{area_cd}: make_valid 이후 Polygon 조각이 없음(geom_type={geom.geom_type})"
             )
+        # 꼬임 복구 시 분리된 미세 파편 조각들을 제외하고 본체 구역만 선택
         return max(polygons, key=lambda p: p.area)
     raise ValueError(f"{area_cd}: 처리할 수 없는 geometry 타입 {geom.geom_type}")
 
 
 def _fix_topology(geom: BaseGeometry, area_cd: str) -> BaseGeometry:
-    """자기교차 등 위상 오류가 있으면 make_valid로 복구한다."""
+    """자기교차 등의 위상 오류가 있는 지오메트리를 유효한 폴리곤으로 복구한다.
+
+    args:
+        geom: 검사할 지오메트리
+        area_cd: POI 영역 코드
+    returns:
+        위상이 복구된 유효한 지오메트리
+    """
     if geom.is_valid:
         return geom
     fixed = shapely.make_valid(geom)
@@ -67,22 +73,23 @@ def _fix_topology(geom: BaseGeometry, area_cd: str) -> BaseGeometry:
 
 
 def _to_epsg5179(geom: BaseGeometry) -> BaseGeometry:
+    """WGS84(EPSG:4326) 좌표계의 지오메트리를 UTM-K(EPSG:5179) 좌표계로 변환한다."""
     return shapely_transform(_TO_EPSG5179.transform, geom)
 
 
 @lru_cache(maxsize=4)
 def load_poi_areas(shp_path: str) -> tuple[PoiArea, ...]:
-    """POI shapefile을 읽어 위상 오류를 복구하고 EPSG:5179로 변환한 뒤 캐싱한다.
+    """POI Shapefile을 읽어 위상 오류를 복구하고 EPSG:5179로 변환한 목록을 반환한다.
 
-    Args:
-        shp_path: `.shp` 파일 경로(`.dbf`/`.shx`/`.prj`/`.cpg`가 같은 디렉터리에 있어야 함).
+    파일 I/O 및 지오메트리 변환 연산 비용을 줄이기 위해 결과를 메모리에 캐싱(@lru_cache)하며,
+    캐시 데이터의 외부 오염을 방지하기 위해 불변(tuple) 객체로 반환합니다.
 
-    Returns:
-        PoiArea 튜플(같은 shp_path로 다시 호출하면 동일 객체를 반환).
-
-    Raises:
-        ValueError: 위상 오류 복구 후에도 Polygon이 없거나, shapefile에
-            레코드가 하나도 없을 때.
+    args:
+        shp_path: Shapefile(.shp) 경로
+    returns:
+        PoiArea 객체 튜플 (결과는 캐싱됨)
+    raises:
+        ValueError: 레코드가 없거나 유효한 폴리곤이 없을 때
     """
     reader = shapefile.Reader(shp_path)
     areas: list[PoiArea] = []
@@ -102,4 +109,5 @@ def load_poi_areas(shp_path: str) -> tuple[PoiArea, ...]:
     if not areas:
         raise ValueError(f"POI shapefile에 레코드가 없음: {shp_path}")
 
+    # 캐시 오염 방지를 위해 불변 튜플로 반환
     return tuple(areas)
