@@ -1,31 +1,31 @@
-"""5분 주기 핵심 파이프라인: 실시간 수집 -> 운영 DB 적재/보조 처리 -> 추론 -> Gold 적재.
+"""5분 주기 핵심 파이프라인: 실시간 수집 -> 정규화/운영 DB 적재 -> 추론 -> Gold 적재.
 
 ## Task 구조
 
-    collect_bike_rental_history                              (leaf)
+    collect_bike_rental_history -----------------------------┐
+                                                             |
+    collect_bike_station_realtime ---------------------------+-> run_inference
+        |                                                    |       |
+        -> load_stations -> load_station_stock --------------|-------+-> load_forecast_points
+                                                             |
+    collect_population_realtime -> run_normalizer_strict ----|
+                                      |                      |
+                                      -(실패)-> run_normalizer_fallback
+                                                   |         |
+                         [strict 또는 fallback 성공]          |
+                                                   v         |
+                                      population_normalized -┘
 
-    collect_bike_station_realtime -> load_stations -> load_station_stock
-        (station_stock.sta_id가 stations.sta_id를 FK 참조하므로 순차 실행)
-
-    collect_population_realtime -> run_normalizer_strict -(all_failed)-> run_normalizer_fallback
-        (normalizer 자신의 docstring이 "latest는 Airflow fallback용"이라고 명시)
-
-    [collect_bike_rental_history, collect_bike_station_realtime, collect_population_realtime]
-        -> run_inference
-
-    [run_inference, load_station_stock]
-        -> load_forecast_points
+population_realtime Silver는 inference 전에 반드시 normalizer를 거쳐 보정된 상태여야 한다.
+strict가 성공하면 fallback은 skipped되고, strict가 실패하면 fallback(latest)이 실행된다.
+``population_normalized``는 둘 중 하나가 성공한 경우에만 통과하는 합류 지점이다.
 
 ## 의존성 원칙
 
 Airflow dependency는 실제 데이터 계약을 기준으로 둔다.
-현재 ml/inference/predict_single.py는 population_realtime Silver를 직접 읽기 때문에
-normalizer 출력에 의존하지 않는다. 따라서 normalizer 브랜치는 inference의 선행 조건으로
-강제하지 않는다.
-
-반면 forecast_points는 서비스용 Gold 결과이므로, 같은 run의 예측 결과뿐 아니라
-stations/station_stock 적재까지 완료된 뒤 적재하도록 한다. 이 구조는 E2E 경계에서
-Gold가 참조하는 운영 데이터와 예측 결과가 함께 준비됐음을 보장한다.
+- population_realtime -> normalizer -> inference
+- bike_station_realtime -> stations -> station_stock
+- inference + station_stock -> forecast_points
 
 ## 금지 사항
 
@@ -35,7 +35,9 @@ DAG 안에서 API 호출, 페이지네이션, S3 저장, 데이터 검증, 모�
 
 import pendulum
 from airflow import DAG
+from airflow.task.trigger_rule import TriggerRule
 from airflow.timetables.trigger import CronTriggerTimetable
+from airflow.providers.standard.operators.empty import EmptyOperator
 
 from config.schedules import CATCHUP, MAX_ACTIVE_RUNS, REALTIME_5MIN_CRON, TIMEZONE
 from config.sources import (
@@ -69,10 +71,21 @@ with DAG(
         NORMALIZER_BASELINE_MODE_FALLBACK,
         trigger_rule="all_failed",
     )
+    population_normalized = EmptyOperator(
+        task_id="population_normalized",
+        trigger_rule=TriggerRule.ONE_SUCCESS,
+    )
+
     collector_tasks["population_realtime"] >> run_normalizer_strict >> run_normalizer_fallback
+    [run_normalizer_strict, run_normalizer_fallback] >> population_normalized
 
     run_inference = build_inference_task(dag)
-    list(collector_tasks.values()) >> run_inference
+    inference_inputs = [
+        task
+        for source_id, task in collector_tasks.items()
+        if source_id != "population_realtime"
+    ]
+    [*inference_inputs, population_normalized] >> run_inference
 
     load_forecast_points = build_db_loader_task(dag, "forecast_points")
     [run_inference, load_station_stock] >> load_forecast_points
