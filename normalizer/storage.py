@@ -26,6 +26,9 @@ from core.s3 import (
 GRID_SOURCE_ID = "living_population_grid"
 REALTIME_SOURCE_ID = "population_realtime"
 NORMALIZED_SOURCE_ID = "living_population_normalized"
+STATION_MASTER_SOURCE_ID = "bike_station_master"
+BIKE_REALTIME_SOURCE_ID = "bike_station_realtime"
+ENRICHED_STATION_MASTER_SOURCE_ID = "station_master_enriched"
 
 
 class PartitionNotFoundError(RuntimeError):
@@ -68,6 +71,16 @@ def find_latest_partition_date(source_id: str) -> date:
     return dates[-1]
 
 
+def find_latest_partition_date_on_or_before(source_id: str, reference_date: date) -> date:
+    """기준일보다 미래가 아닌 가장 최신 파티션 날짜를 반환한다."""
+    dates = [item for item in list_partition_dates(source_id) if item <= reference_date]
+    if not dates:
+        raise PartitionNotFoundError(
+            f"{source_id}에 dt<={reference_date:%Y-%m-%d} 파티션이 없음"
+        )
+    return dates[-1]
+
+
 def read_grid_silver(baseline_date: date) -> pa.Table:
     """해당 baseline 날짜의 living_population_grid silver 조각을 전부 읽어 이어붙인다."""
     prefix = _silver_date_prefix(GRID_SOURCE_ID, baseline_date)
@@ -95,6 +108,29 @@ def read_realtime_silver(window_start: datetime) -> pa.Table:
     return pq.read_table(io.BytesIO(body))
 
 
+def read_station_master_silver(window_start: datetime) -> pa.Table:
+    """Collector가 같은 window에 쓴 대여소 master Silver를 읽는다."""
+    key = _silver_key(STATION_MASTER_SOURCE_ID, window_start)
+    body = get_object_bytes(key)
+    if body is None:
+        raise PartitionNotFoundError(f"{STATION_MASTER_SOURCE_ID} silver 파일 없음: {key}")
+    return pq.read_table(io.BytesIO(body))
+
+
+def read_latest_bike_realtime_silver(window_start: datetime) -> pa.Table | None:
+    """window 시각 이전의 최신 실시간 대여소 Silver를 읽는다."""
+    cutoff = _silver_key(BIKE_REALTIME_SOURCE_ID, window_start)
+    keys = [
+        key
+        for key in list_keys(f"silver/{BIKE_REALTIME_SOURCE_ID}/")
+        if key.endswith(".parquet") and key <= cutoff
+    ]
+    if not keys:
+        return None
+    body = get_object_bytes(max(keys))
+    return pq.read_table(io.BytesIO(body)) if body else None
+
+
 def write_normalized_silver(window_start: datetime, table: pa.Table) -> str:
     """living_population_normalized silver를 parquet으로 저장하고 저장된 key를 반환한다."""
     key = _silver_key(NORMALIZED_SOURCE_ID, window_start)
@@ -102,15 +138,26 @@ def write_normalized_silver(window_start: datetime, table: pa.Table) -> str:
     return key
 
 
-def _manifest_key(window_start: datetime) -> str:
+def write_enriched_station_master(window_start: datetime, table: pa.Table) -> str:
+    """CELL_ID가 보강된 대여소 master를 파티션 Silver로 저장한다."""
+    key = _silver_key(ENRICHED_STATION_MASTER_SOURCE_ID, window_start)
+    write_parquet(table, key)
+    return key
+
+
+def _manifest_key(window_start: datetime, source_id: str = NORMALIZED_SOURCE_ID) -> str:
     return (
-        f"_manifest/{NORMALIZED_SOURCE_ID}/dt={window_start:%Y-%m-%d}/hh={window_start:%H}/"
+        f"_manifest/{source_id}/dt={window_start:%Y-%m-%d}/hh={window_start:%H}/"
         f"{window_start:%H%M}.json"
     )
 
 
-def write_manifest(window_start: datetime, data: dict) -> str:
+def write_manifest(
+    window_start: datetime,
+    data: dict,
+    source_id: str = NORMALIZED_SOURCE_ID,
+) -> str:
     """해당 window의 manifest(baseline_date, baseline_date_mode 등)를 json으로 저장한다."""
-    key = _manifest_key(window_start)
+    key = _manifest_key(window_start, source_id)
     write_json(key, data)
     return key

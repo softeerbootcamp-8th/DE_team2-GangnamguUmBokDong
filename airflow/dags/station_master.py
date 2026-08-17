@@ -4,6 +4,7 @@ import pendulum
 from config.schedules import CATCHUP, DAILY_CRON, MAX_ACTIVE_RUNS, TIMEZONE
 from config.sources import STATION_MASTER_SOURCE
 from orchestration.collector_task import build_collector_task
+from orchestration.normalizer_task import build_station_master_enrichment_task
 
 from airflow import DAG
 
@@ -15,4 +16,7 @@ with DAG(
     max_active_runs=MAX_ACTIVE_RUNS,
     tags=["collector", "daily", "station"],
 ) as dag:
-    build_collector_task(dag, STATION_MASTER_SOURCE)
+    collect_station_master = build_collector_task(dag, STATION_MASTER_SOURCE)
+    enrich_station_master = build_station_master_enrichment_task(dag)
+
+    collect_station_master >> enrich_station_master

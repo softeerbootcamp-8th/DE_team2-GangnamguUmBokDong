@@ -412,11 +412,11 @@ def _rental_visible_batch_all_stations(
 
 
 def _get_station_master() -> pd.DataFrame:
-    """최신 Collector 정류소 마스터를 station_id 인덱스로 캐시해 반환한다.
+    """최신 CELL_ID 보강 정류소 마스터를 station_id 인덱스로 캐시해 반환한다.
 
-    `bikeStationMaster` API에는 capacity가 없으므로 최신 bike realtime Silver로
-    보강한다. API에 없는 grid_id는 결측으로 두며, 생활인구는 기존
-    profile fallback을 사용한다.
+    normalizer의 station master 후처리가 API LAT/LOT를 실제 생활인구 격자와
+    공간 조인해 grid_id를 만든다. capacity와 이름은 일일 master 생성 이후 바뀔
+    수 있으므로 최신 bike realtime Silver로 한 번 더 보강한다.
 
     returns:
         pd.DataFrame: station_id로 인덱싱된 정류소 마스터 (station_no, capacity, lat, lon, grid_id)
@@ -425,12 +425,12 @@ def _get_station_master() -> pd.DataFrame:
     if _station_master is None:
         keys = [
             key
-            for key in s3_io.list_keys(silver_schema.STATION_MASTER_PREFIX)
+            for key in s3_io.list_keys(silver_schema.STATION_MASTER_ENRICHED_PREFIX)
             if key.endswith(".parquet")
         ]
         if not keys:
             raise FileNotFoundError(
-                f"S3에 없음: {silver_schema.STATION_MASTER_PREFIX} 아래 parquet"
+                f"S3에 없음: {silver_schema.STATION_MASTER_ENRICHED_PREFIX} 아래 parquet"
             )
         raw = s3_io.read_parquet(max(keys))
         if raw is None:
@@ -454,7 +454,11 @@ def _get_station_master() -> pd.DataFrame:
             master["station_name"] = master.get("ADDR1")
         if "capacity" not in master:
             master["capacity"] = np.nan
-        master["grid_id"] = np.nan
+        if "grid_id" not in master:
+            raise ValueError("보강 station master에 grid_id 컬럼이 없음")
+        grid_coverage = float(master["grid_id"].notna().mean())
+        if grid_coverage < 0.95:
+            raise ValueError(f"보강 station master의 grid_id 매핑률이 기준 미달: {grid_coverage:.3%}")
         _station_master = master.set_index("station_id")
     return _station_master
 

@@ -20,8 +20,10 @@ import pandas as pd
 
 STATION_MASTER_SOURCE_ID = "bike_station_master"
 STATION_MASTER_PREFIX = f"silver/{STATION_MASTER_SOURCE_ID}/"
+STATION_MASTER_ENRICHED_SOURCE_ID = "station_master_enriched"
+STATION_MASTER_ENRICHED_PREFIX = f"silver/{STATION_MASTER_ENRICHED_SOURCE_ID}/"
 # Spark feature pipeline이 사용하는 기존 정적 마스터 계약. 실시간 inference는
-# Collector가 쓴 STATION_MASTER_PREFIX의 최신 파티션을 사용한다.
+# LAT/LOT에 grid_id를 공간 조인한 STATION_MASTER_ENRICHED_PREFIX를 사용한다.
 STATION_MASTER_KEY = "silver/station/station_master.parquet"
 
 # 실제 예시 데이터에 station 마스터 샘플이 없어 아직 검증 못 했다 — 지금은

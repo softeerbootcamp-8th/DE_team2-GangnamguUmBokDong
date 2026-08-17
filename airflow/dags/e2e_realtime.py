@@ -23,12 +23,16 @@ from config.sources import (
     NORMALIZER_BASELINE_MODE_FALLBACK,
     NORMALIZER_BASELINE_MODE_PRIMARY,
     REALTIME_5MIN_SOURCES,
+    STATION_MASTER_SOURCE,
     WEATHER_10MIN_SOURCE,
 )
 from orchestration.collector_task import build_collector_task
 from orchestration.db_loader_task import build_db_loader_task
 from orchestration.inference_task import build_inference_task
-from orchestration.normalizer_task import build_normalizer_task
+from orchestration.normalizer_task import (
+    build_normalizer_task,
+    build_station_master_enrichment_task,
+)
 
 from airflow import DAG
 
@@ -42,6 +46,9 @@ with DAG(
 ) as dag:
     collector_tasks = {source_id: build_collector_task(dag, source_id) for source_id in REALTIME_5MIN_SOURCES}
     collect_weather = build_collector_task(dag, WEATHER_10MIN_SOURCE)
+    collect_station_master = build_collector_task(dag, STATION_MASTER_SOURCE)
+    enrich_station_master = build_station_master_enrichment_task(dag)
+    [collect_station_master, collector_tasks["bike_station_realtime"]] >> enrich_station_master
 
     load_stations = build_db_loader_task(dag, "stations")
     load_station_stock = build_db_loader_task(dag, "station_stock")
@@ -68,7 +75,7 @@ with DAG(
         for source_id, task in collector_tasks.items()
         if source_id != "population_realtime"
     ]
-    [*inference_inputs, collect_weather, population_normalized] >> run_inference
+    [*inference_inputs, collect_weather, population_normalized, enrich_station_master] >> run_inference
 
     load_forecast_points = build_db_loader_task(dag, "forecast_points")
     [run_inference, load_station_stock] >> load_forecast_points
