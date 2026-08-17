@@ -118,7 +118,7 @@ export default function App() {
                             </option>
                           ))}
                         </select>
-                        <div className="alert-tabs" role="tablist" aria-label="지도 표시 범위">
+                        <div className="alert-tabs alert-tabs--inline" role="tablist" aria-label="지도 표시 범위">
                           {MAP_FILTER_TABS.map((t) => (
                             <button
                               key={t.key}
