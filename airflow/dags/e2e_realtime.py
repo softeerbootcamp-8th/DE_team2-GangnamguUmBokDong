@@ -3,17 +3,20 @@
 운영 DAG인 ``realtime_5min``과 동일한 핵심 컴포넌트 계약을 사용하지만
 schedule=None으로 두어 개발/통합 검증 시에만 수동 실행한다.
 
-목적은 개별 모듈 구현을 DAG에 복제하는 것이 아니라 다음 경계를 한 번에 검증하는 것이다.
+핵심 경로:
 
-    Collector -> Silver -> Inference -> Gold Loader
-                    \
-                     -> Operational DB Loader
+    Collector -> population normalizer -> Inference -> Gold Loader
+              -> Operational DB Loader -----------^
 
-normalizer는 현재 inference의 직접 입력이 아니므로 별도 보조 브랜치로 유지한다.
+population_realtime Silver는 inference 전에 normalizer를 반드시 통과한다.
+strict가 성공하면 fallback은 skipped되고, strict가 실패하면 fallback(latest)이 실행된다.
+둘 중 하나가 성공한 경우 ``population_normalized`` 합류 task가 성공해 inference로 진행한다.
 """
 
 import pendulum
 from airflow import DAG
+from airflow.task.trigger_rule import TriggerRule
+from airflow.providers.standard.operators.empty import EmptyOperator
 
 from config.schedules import TIMEZONE
 from config.sources import (
@@ -47,10 +50,21 @@ with DAG(
         NORMALIZER_BASELINE_MODE_FALLBACK,
         trigger_rule="all_failed",
     )
+    population_normalized = EmptyOperator(
+        task_id="population_normalized",
+        trigger_rule=TriggerRule.ONE_SUCCESS,
+    )
+
     collector_tasks["population_realtime"] >> run_normalizer_strict >> run_normalizer_fallback
+    [run_normalizer_strict, run_normalizer_fallback] >> population_normalized
 
     run_inference = build_inference_task(dag)
-    list(collector_tasks.values()) >> run_inference
+    inference_inputs = [
+        task
+        for source_id, task in collector_tasks.items()
+        if source_id != "population_realtime"
+    ]
+    [*inference_inputs, population_normalized] >> run_inference
 
     load_forecast_points = build_db_loader_task(dag, "forecast_points")
     [run_inference, load_station_stock] >> load_forecast_points
