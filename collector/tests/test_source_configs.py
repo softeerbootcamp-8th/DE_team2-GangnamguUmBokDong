@@ -36,8 +36,8 @@ def _api_keys(monkeypatch):
 
 
 class TestAllSourcesLoad:
-    def test_seven_sources_exist(self):
-        assert len(SOURCE_IDS) == 7
+    def test_nine_sources_exist(self):
+        assert len(SOURCE_IDS) == 9
 
     @pytest.mark.parametrize("source_id", SOURCE_IDS)
     def test_loads_without_error(self, source_id):
@@ -167,8 +167,8 @@ class TestSeoulSourcesEndToEnd:
 
 
 class TestKmaSourceEndToEnd:
-    def test_weather_ultra_short_term_end_to_end(self):
-        config = config_loader.load("weather_ultra_short_term", base_dir=SOURCES_DIR)
+    def test_weather_ultra_short_live_end_to_end(self):
+        config = config_loader.load("weather_ultra_short_live", base_dir=SOURCES_DIR)
 
         def handler(request):
             params = dict(request.url.params)
@@ -197,11 +197,11 @@ class TestKmaSourceEndToEnd:
         assert result.artifacts.silver is not None
 
     @pytest.mark.parametrize(
-        "source_id", ["weather_ultra_short_term", "weather_short_term_forecast"]
+        "source_id", ["weather_ultra_short_live", "weather_short_term_forecast"]
     )
     def test_weather_grids_cover_25_seoul_gu_one_to_one(self, source_id):
-        """db-loader/gu_mapping.py의 `_GRID_TO_GU_TABLE`은 여기 grids 목록과 1:1로
-        맞춰 25개 구 전부를 대표하도록 만들어졌다. 격자를 늘리거나 줄일 때 db-loader
+        """loader/gu_mapping.py의 `_GRID_TO_GU_TABLE`은 여기 grids 목록과 1:1로
+        맞춰 25개 구 전부를 대표하도록 만들어졌다. 격자를 늘리거나 줄일 때 loader
         쪽 테이블과 어긋나면 일부 구의 weather_current/weather_forecast가 조용히
         비게 되므로, 최소한 "정확히 25개, 중복 없음"은 여기서 회귀로 잡는다."""
         config = config_loader.load(source_id, base_dir=SOURCES_DIR)

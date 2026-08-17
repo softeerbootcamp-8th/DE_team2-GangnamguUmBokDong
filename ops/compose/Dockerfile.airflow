@@ -3,6 +3,7 @@
 # bind mount한다 (docker-compose.yml 참고) — 코드 변경 시 이미지 재빌드가 필요 없다.
 FROM python:3.11-slim
 
+RUN apt-get update && apt-get install -y libgomp1 && rm -rf /var/lib/apt/lists/*
 RUN pip install --no-cache-dir uv
 
 WORKDIR /workspace

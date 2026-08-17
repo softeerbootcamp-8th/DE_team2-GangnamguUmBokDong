@@ -8,7 +8,7 @@ fixture 패턴 재사용). 각 테스트 후 전역을 리셋해 테스트 간 �
 import numpy as np
 import pandas as pd
 import pytest
-from ml_common.rolling_window_features import count_visible_in_window
+from ml_core.rolling_window_features import count_visible_in_window
 
 from inference import config
 from inference import predict_single as ps

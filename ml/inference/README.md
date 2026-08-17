@@ -15,7 +15,7 @@
 
 ```bash
 cd ml/inference
-uv sync   # pyproject.toml/uv.lock 기준 .venv 생성 — pandas/numpy + ml_common(editable) 포함
+uv sync   # pyproject.toml/uv.lock 기준 .venv 생성 — pandas/numpy + ml_core(editable) 포함
 ```
 
 `training`이 먼저 모델을 학습해둬야 한다 ([training/README.md](../training/README.md)):
@@ -23,7 +23,7 @@ uv sync   # pyproject.toml/uv.lock 기준 .venv 생성 — pandas/numpy + ml_com
 `{rental,return}_station_categories.json`, `{rental,return}_conformal_correction.json`.
 
 **단일 시점 예측을 쓰려면 추가로 fallback 프로필 2개를 한 번 만들어야 한다**
-(`feature_engineering`이 만든 `station_hour_merged_2025.parquet`/`population_2025.parquet`이
+(`feature_engine`이 만든 `station_hour_merged_2025.parquet`/`population_2025.parquet`이
 먼저 있어야 함):
 
 ```bash

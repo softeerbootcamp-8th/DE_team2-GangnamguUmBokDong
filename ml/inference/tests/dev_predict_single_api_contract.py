@@ -1,7 +1,7 @@
 """predict_single.py의 두 가지 API 계약을 검증한다 (PR 리뷰에서 지적된 문제 재발 방지).
 
 1. **5분 tick 단위 시각 지정** — 공개 API가 `date`+`hour`만 받으면 17:05/17:10/17:15
-   같은 요청을 전부 17:00 기준으로 뭉개 계산하게 된다(feature_engineering의 학습
+   같은 요청을 전부 17:00 기준으로 뭉개 계산하게 된다(feature_engine의 학습
    그리드는 5분 tick인데 서빙 인터페이스가 그 정밀도를 못 받는 문제). `minute`
    인자가 실제로 target_ts/lag·rolling 앵커에 반영되는지 확인한다.
 2. **배치 실패의 완결성 계약** — `predict_demand_multi_hour_all_stations()`가 일부
@@ -86,7 +86,7 @@ def _set_station_master(station_ids: list[str]) -> None:
 
 
 def _fake_predict(df: pd.DataFrame, model_name: str, exposure_col: str | None = None) -> pd.DataFrame:
-    """ml_common.scoring.predict() 대역 — 실제 학습된 booster 파일 없이 배치 조립/실패
+    """ml_core.scoring.predict() 대역 — 실제 학습된 booster 파일 없이 배치 조립/실패
     처리 로직만 검증하려고 항상 고정값을 낸다."""
     return pd.DataFrame({
         "station_id": df["station_id"].to_numpy(),
@@ -225,7 +225,7 @@ def test_predict_demand_multi_hour_all_stations_no_failures_when_all_known(monke
 
 def test_single_station_cli_saves_to_s3(monkeypatch):
     """단일 정류소 CLI 실행 시 single_prediction_key 경로로 parquet이 저장되는지 검증한다."""
-    from ml_common import s3_io
+    from core import s3 as s3_io
 
     trips = pd.DataFrame([_trip("ST-100", "2025-06-01 09:00:00", "2025-06-01 09:05:00")])
     _set_rental_events(trips)
@@ -264,7 +264,7 @@ def test_single_station_cli_saves_to_s3(monkeypatch):
 
 def test_single_station_multi_hour_cli_saves_to_s3(monkeypatch):
     """단일 정류소 다중 시간대(n_hours>1) CLI 실행 시 S3 저장 검증."""
-    from ml_common import s3_io
+    from core import s3 as s3_io
 
     trips = pd.DataFrame([_trip("ST-100", "2025-06-01 09:00:00", "2025-06-01 09:05:00")])
     _set_rental_events(trips)

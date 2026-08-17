@@ -1,23 +1,23 @@
 """배치 조회 CLI(`predict_rental_demand.py`/`predict_return_demand.py`)가 공유하는 실행기.
 
-실제 채점 로직(`predict()`, booster 로드 등)은 `ml_common/scoring.py`(training의
+실제 채점 로직(`predict()`, booster 로드 등)은 `ml_core/scoring.py`(training의
 `monitor_performance.py`/`compare_baselines.py`도 같이 씀)에 있다 — 이 모듈은 그 위에
 "station_id/기간을 골라 조회 -> 저장 -> 요약 출력"하는 배치 CLI 경험만 얹는다.
 
 이 프로젝트엔 실시간 서빙 API가 없으므로, CLI(`run_predict_cli`)는 이미 구축된
-`station_hour_features_multihorizon_2025.parquet`(feature_engineering이 만든 multi-horizon
+`station_hour_features_multihorizon_2025.parquet`(feature_engine이 만든 multi-horizon
 학습 테이블 — horizon=1..HORIZON_COUNT가 섞여 있음)에서 station_id/기간/horizon을 골라
 예측을 뽑아보는 용도다. 그 범위를 벗어난 날짜나 날씨·인구 데이터가 없는 미래 시점은
 예측할 수 없다 — 그러려면 해당 시점의 날씨·인구·최근 실적 데이터를 먼저
-`feature_engineering`의 피처마트 생성 파이프라인(`feature_engineering/spark/`)으로
+`feature_engine`의 피처마트 생성 파이프라인(`feature_engine/spark/`)으로
 넣어줘야 한다(그런 임의 시점 예측은 `predict_single.py`가 담당).
 """
 
 import argparse
 
 import pandas as pd
-from ml_common import s3_io
-from ml_common.scoring import predict, print_metrics
+from core import s3 as s3_io
+from ml_core.scoring import predict, print_metrics
 
 from . import config
 

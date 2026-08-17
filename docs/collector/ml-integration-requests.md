@@ -1,6 +1,6 @@
 # ML → collector 확인/요청 사항
 
-이번 S3/MinIO 데이터 파이프라인 전환(`feature_engineering`/`training`/`inference`가
+이번 S3/MinIO 데이터 파이프라인 전환(`feature_engine`/`training`/`inference`가
 로컬 `ml/data/processed_v2/*.parquet` 대신 collector가 Silver로 쌓는 S3 데이터를
 직접 읽도록 바꾸는 작업)을 진행하며 `collector` 쪽 확정이 필요한 사항을 정리한다.
 `collector` 모듈(어댑터/파이프라인/CLI)은 이번 작업에서 손대지 않았다 — 전부 이
@@ -12,7 +12,7 @@
 더 나와 6~9번으로 추가했다 — 특히 8번(생활인구 스키마)은 코드 수정만으로는
 완전히 해소되지 않는, 모델 feature 설계 자체에 관련된 사항이라 확인이 필요하다.
 
-**2026-08-16 갱신**: `KMA_APIHUB_KEY`를 실제로 넣고 `weather_ultra_short_term`/
+**2026-08-16 갱신**: `KMA_APIHUB_KEY`를 실제로 넣고 `weather_ultra_short_live`/
 `weather_short_term_forecast` 두 소스를 직접(수동으로 `collector/main.py` 실행)
 돌려서 raw 응답과 Silver 결과를 대조했다. 그 결과 6번(강수량 없음)이 실은 잘못된
 결론이었음을 확인해 정정했고(11번), 코드 버그 하나(12번)와 두 소스 다 애초에
@@ -26,7 +26,7 @@
 (`ml/data/processed_v2/*.parquet`를 Silver 파티션 구조로 변환해 MinIO에 넣어주는
 로컬 시딩 스크립트)를 기준 스키마로 개발했는데, 이번에 collector 팀이 실제
 예시 데이터(`ml/data/silver/`, 2026-08-15)를 줘서 비교해보니 소스 이름·컬럼명·
-수집 주기가 상당히 달랐다. `libs/ml_common/silver_schema.py`는 이제 실제 예시
+수집 주기가 상당히 달랐다. `libs/ml_core/silver_schema.py`는 이제 실제 예시
 데이터를 기준으로 다시 맞췄다 — `dev/seed_s3_from_local.py`는 아직 옛 스키마로
 로컬 MinIO에 데이터를 넣으므로, 이 스크립트로 시딩한 데이터로 테스트하면 다시
 어긋난다(별도 후속 작업 필요, 8번 참고 아래 목록에는 없음 — 이 문서는 collector
@@ -44,7 +44,7 @@
   ID가 서로 겹치는 것도 직접 확인했다(`ST-83`, `ST-280` 등 다수 공통).
 - **ML 쪽 반영**: `inference/predict_single.py`의 `_resolve_rental_stations()`를
   station_no 크로스워크(`normalize_station_no()`) 없이 station_id로 직접 매칭하도록
-  단순화했다. (배치 학습 쪽 `feature_engineering/spark/build_targets.py`가 읽는
+  단순화했다. (배치 학습 쪽 `feature_engine/spark/build_targets.py`가 읽는
   과거 이력 CSV는 여전히 raw 숫자라 그쪽 `_normalize_station_no()`는 그대로 둔다 —
   다른 원본 포맷이라 서로 영향 없음.)
 - **남은 확인 요청**: 이 형식이 앞으로도 계속 유지되는지(예를 들어 신규
@@ -71,12 +71,12 @@
 기준(`weather_forecast`, `living_population_per_population_grid`)으로 추측했었다.
 
 - **실제 예시 데이터로 확인한 결과, 둘 다 예상과 달랐고 구조도 더 복잡했다**:
-  - 날씨는 소스가 **2개**였다: `weather_ultra_short_term`(초단기실황, 10분 간격,
+  - 날씨는 소스가 **2개**였다: `weather_ultra_short_live`(초단기실황, 10분 간격,
     컬럼 `T1H`/`REH`/`WSD`/`RN1`/`PTY`)와 `weather_short_term_forecast`(단기예보,
     3시간 간격, 컬럼 `TMP`/`REH`/`WSD`/`POP`/`SKY`/`PTY`). ~~예보 쪽은 강수량(mm)이
     아니라 강수확률(%, `POP`)만 있어 `precip`과 단위가 안 맞는다~~ — **(2026-08-16
     정정) 이 결론은 틀렸다, raw엔 강수량(`PCP`)이 실제로 있고 YAML에만 안
-    선언돼 있었다, 6번 참고.** 지금은 `weather_ultra_short_term`(관측치)만 쓰고
+    선언돼 있었다, 6번 참고.** 지금은 `weather_ultra_short_live`(관측치)만 쓰고
     예보 쪽은 안 쓴다.
   - 인구도 소스가 **2개**였고 둘 다 우리가 가정한 이름·구조와 달랐다:
     `population_realtime`(실시간 인구, `AREA_NM`/`AREA_CD`/`AREA_CONGEST_LVL` 등
@@ -92,7 +92,7 @@
 `collector/storage.py`는 `write_silver()`(및 bronze/quarantine 관련 쓰기 함수)는
 있지만, 그 반대인 "silver 파티션을 읽어오는" 함수는 없다 — collector 입장에서는
 쓰기 전용이라 당연할 수 있지만, ML은 정확히 같은 키 규칙으로 다시 읽어야 해서
-`libs/ml_common/silver_schema.py` + `libs/ml_common/s3_io.py`에 **키 생성 규칙을
+`libs/ml_core/silver_schema.py` + `libs/ml_core/s3_io.py`에 **키 생성 규칙을
 독립적으로 복제**해 자체 구현했다(`collector`를 import하지 않음 — 서로 다른
 인스턴스에 독립 배포되는 모듈이라 의존 관계를 만들지 않는 게 이번 설계 원칙).
 
@@ -117,7 +117,7 @@
 
 - **지금 괜찮은 이유(추정)**: 추론은 "방금 지난 시각"을 짧은 수명의 프로세스가
   한 번 읽고 끝나는 구조라, 그 시점에 이미 `stage=completed`로 확정된 최신
-  silver를 읽을 가능성이 높다 — 학습(`feature_engineering`, 1년치 배치)과 달리
+  silver를 읽을 가능성이 높다 — 학습(`feature_engine`, 1년치 배치)과 달리
   "이미 백필로 여러 번 바뀐 과거 데이터를 다시 집계"하는 경로가 아니다.
 - **확인하고 싶은 것**: 그래도 실시간 추론이 매우 최근(예: 방금 지난 5분) 시각을
   읽을 때, 그 window가 아직 `PARTIAL`이거나 재시도 중이어서 완결되지 않은
@@ -128,7 +128,7 @@
 ## 6. (2026-08-16 정정) `weather_short_term_forecast`에 강수량(mm)이 없다고 했던 결론이 틀렸다
 
 ~~지금 `_get_recent_weather()`는 사실 "예보"가 아니라 "가장 최근 관측값"을 쓴다
-(`weather_ultra_short_term`, 10분 간격 관측치). horizon이 커져(예: 6시간 뒤)
+(`weather_ultra_short_live`, 10분 간격 관측치). horizon이 커져(예: 6시간 뒤)
 target_ts가 미래로 멀어지면 원래는 진짜 예보(`weather_short_term_forecast`,
 3시간 간격)를 써야 더 정확할 텐데, 그 소스엔 강수량이 없고 강수확률(`POP`, %)만
 있다.~~ (아래에서 정정)
@@ -149,7 +149,7 @@ normalize 정책 필요"라는 문구까지 있다 — 이게 정확히 `PCP`의
 빠진 것으로 보인다.
 
 - **지금 ML이 하는 일**: (정정 전과 동일) horizon과 무관하게 항상
-  `weather_ultra_short_term`의 "가장 최근 값"만 쓴다 — 이건 그대로 유지.
+  `weather_ultra_short_live`의 "가장 최근 값"만 쓴다 — 이건 그대로 유지.
 - **요청**:
   1. `weather_short_term_forecast.yaml`에 `PCP`(강수량)를 `columns:`로 추가해달라
      — 다만 raw 값이 순수 숫자가 아니라 `"강수없음"`/`"1mm 미만"`/`"10.0mm"`처럼
@@ -227,7 +227,7 @@ YAML 예시(210행 근처)에 `adapter_params.page_size: 1000`이 있어, 혹시
 
 ## 11. (2026-08-16 신규) 날씨 두 소스 다 자동 수집 스케줄이 없다
 
-`airflow/dags/`를 전부 확인해봤는데 `weather_ultra_short_term`(10분 주기)/
+`airflow/dags/`를 전부 확인해봤는데 `weather_ultra_short_live`(10분 주기)/
 `weather_short_term_forecast`(3시간 주기)를 실제로 자동으로 도는 스케줄에
 올려주는 DAG가 하나도 없다.
 
@@ -261,7 +261,7 @@ YAML 예시(210행 근처)에 `adapter_params.page_size: 1000`이 있어, 혹시
   `optional_missing: keep_null`로 조용히 null 처리되고, manifest는
   `kept=2075 dropped=0 completeness=1.000`으로 찍힌다 — raw와 직접 대조하지
   않는 한 이 유실을 알 방법이 없다.
-- `weather_ultra_short_term`(`getUltraSrtNcst`)은 지금은 격자당 8건뿐이라
+- `weather_ultra_short_live`(`getUltraSrtNcst`)은 지금은 격자당 8건뿐이라
   1000 밑이라 안 잘리는데, 코드가 맞아서가 아니라 이 엔드포인트 페이로드가
   작아서 우연히 안전한 것뿐이다 — 같은 코드를 쓰는 한 이 소스도 똑같이
   취약하다.
@@ -273,13 +273,13 @@ YAML 예시(210행 근처)에 `adapter_params.page_size: 1000`이 있어, 혹시
 
 raw 응답과 YAML `columns:` 선언을 대조한 결과:
 
-- `weather_ultra_short_term.yaml`의 `description`은 "초단기 실황·**예보**"라고
+- `weather_ultra_short_live.yaml`의 `description`은 "초단기 실황·**예보**"라고
   돼 있지만 실제로 부르는 건 `getUltraSrtNcst`(실황)뿐이다. `getUltraSrtFcst`
   (진짜 초단기예보)는 코드 전체에서 `collector/tests/test_kma_apihub.py`의
   예시 테스트에만 등장하고, 실제 소스로 설정된 적이 없다 — description이
   실제 동작과 안 맞는다.
 - 두 소스 다 raw엔 있는데 YAML `columns:`엔 없어서 조용히 버려지는 필드가
-  있다: `weather_ultra_short_term`은 `UUU`/`VEC`/`VVV`(바람 성분·풍향),
+  있다: `weather_ultra_short_live`은 `UUU`/`VEC`/`VVV`(바람 성분·풍향),
   `weather_short_term_forecast`는 `PCP`(강수량, 6번 참고)/`SNO`(적설).
 - `PCP`의 실제 raw 값 종류(참고용): `"강수없음"`, `"1mm 미만"`, `"1.0mm"`~
   `"17.0mm"`(숫자+"mm" 텍스트), 그리고 `"0"`(단위 없는 숫자 문자열)까지 섞여
