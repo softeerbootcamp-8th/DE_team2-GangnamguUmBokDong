@@ -26,13 +26,13 @@ def conn():
 
 
 def test_upsert_is_idempotent(conn):
-    rows = [{"sta_id": 999001, "sta_nm": "테스트역", "gu": "강남구", "sta_addr": "테스트역", "lat": 37.5, "lon": 127.0, "hold_cnt": 10}]
+    rows = [{"sta_id": "999001", "sta_nm": "테스트역", "gu": "강남구", "sta_addr": "테스트역", "lat": 37.5, "lon": 127.0, "hold_cnt": 10}]
 
     upsert(conn, "stations", rows, conflict_cols=["sta_id"], update_cols=["sta_nm", "gu", "sta_addr", "lat", "lon", "hold_cnt"])
     upsert(conn, "stations", rows, conflict_cols=["sta_id"], update_cols=["sta_nm", "gu", "sta_addr", "lat", "lon", "hold_cnt"])
 
     with conn.cursor() as cur:
-        cur.execute("SELECT COUNT(*) FROM stations WHERE sta_id = %s", (999001,))
+        cur.execute("SELECT COUNT(*) FROM stations WHERE sta_id = %s", ("999001",))
         [count] = cur.fetchone()
 
     assert count == 1
