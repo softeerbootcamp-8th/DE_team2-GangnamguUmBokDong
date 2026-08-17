@@ -16,7 +16,11 @@
   --baseline: #c3c2b7;
   --border: oklch(0.922 0 0);
 
-  --series-1: #2a78d6;
+  /* 따릉이 브랜드 컬러. 지도 상태색(status-*)은 정상/경고/심각 의미를 담고
+     있어 그대로 두고, 필터 탭·선택 표시 등 의미 없는 액션형 UI에만 쓴다. */
+  --brand-green: #2edb8c;
+  --brand-navy: #405260;
+  --accent-active: var(--brand-green);
   --series-stock: #1f9d55;
   --diverging-red: #e34948;
   --diverging-blue: #2a78d6;
@@ -72,7 +76,6 @@
     --baseline: #383835;
     --border: rgba(255, 255, 255, 0.1);
 
-    --series-1: #3987e5;
     --series-stock: #34c876;
     --diverging-red: #e66767;
     --diverging-blue: #3987e5;
@@ -278,9 +281,11 @@ body {
 }
 
 .alert-tab.active {
-  background: var(--series-1);
-  border-color: var(--series-1);
-  color: #fff;
+  background: var(--accent-active);
+  border-color: var(--accent-active);
+  /* brand-green 배경엔 흰 글자 대비가 1.8:1로 너무 낮아(WCAG AA 미달) 안 보인다.
+     라이트/다크 모드 어디서든 배경색이 고정이라 브랜드 남색을 고정 텍스트색으로 쓴다. */
+  color: var(--brand-navy);
 }
 
 .region-select {
@@ -323,7 +328,7 @@ body {
 }
 
 .alert-item.selected {
-  border-color: var(--series-1);
+  border-color: var(--accent-active);
 }
 
 .status-icon {
