@@ -41,7 +41,7 @@ CREATE TABLE IF NOT EXISTS forecast_points (
     PRIMARY KEY (sta_id, predicted_dttm)
 );
 
--- 기상청 초단기 실황(현재 날씨). db-loader가 자치구별 최신 관측 1건만 upsert한다.
+-- 기상청 초단기 실황(현재 날씨). loader가 자치구별 최신 관측 1건만 upsert한다.
 CREATE TABLE IF NOT EXISTS weather_current (
     gu              TEXT NOT NULL,
     observed_at     TIMESTAMPTZ NOT NULL,
@@ -54,17 +54,23 @@ CREATE TABLE IF NOT EXISTS weather_current (
 );
 
 -- 기상청 단기예보(미래 날씨). 동일 (gu, forecast_dttm)에 대해 가장 최근 발표만 upsert로 남긴다.
+-- 대시보드에서 상세 기상 수치(습도, 풍속, 강수량)와 발표시각까지 표시 가능하다.
 CREATE TABLE IF NOT EXISTS weather_forecast (
-    gu              TEXT NOT NULL,
-    forecast_dttm   TIMESTAMPTZ NOT NULL,
-    temperature     DOUBLE PRECISION,
-    precip_prob     DOUBLE PRECISION,
-    sky_cond        INTEGER,
-    pty_type        INTEGER,
+    gu                   TEXT NOT NULL,
+    forecast_dttm        TIMESTAMPTZ NOT NULL,
+    sky_cond             INTEGER,
+    pty_type             INTEGER,
+    temperature          DOUBLE PRECISION,
+    precip_prob          DOUBLE PRECISION,
+    precip_amount        DOUBLE PRECISION,
+    humidity             DOUBLE PRECISION,
+    wind_speed           DOUBLE PRECISION,
+    base_dttm            TIMESTAMPTZ NOT NULL,
+    updated_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (gu, forecast_dttm)
 );
 
--- 서울시 문화/공연 행사 정보. db-loader가 종료되지 않은 행사만 upsert한다.
+-- 서울시 문화/공연 행사 정보. loader가 종료되지 않은 행사만 upsert한다.
 CREATE TABLE IF NOT EXISTS cultural_events (
     event_id        TEXT PRIMARY KEY,
     title           TEXT NOT NULL,

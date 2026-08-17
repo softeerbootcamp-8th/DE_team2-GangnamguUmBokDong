@@ -1,5 +1,5 @@
 """monitor_performance.py의 판정 로직(decide_retrain) 검증 — 실제 모델/데이터 없이
-순수 로직만 합성 입력으로 확인한다. ml_common/common_config.py의 임계값(기본 10%/15%p)을
+순수 로직만 합성 입력으로 확인한다. ml_core/common_config.py의 임계값(기본 10%/15%p)을
 그대로 적용하는지, 경계값에서 정확히 판정이 갈리는지가 핵심이다.
 """
 

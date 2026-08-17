@@ -1,5 +1,5 @@
 export function formatClock(date: Date, opts: Intl.DateTimeFormatOptions = { hour: "2-digit", minute: "2-digit", second: "2-digit" }): string {
-  return date.toLocaleTimeString("ko-KR", opts);
+  return date.toLocaleTimeString("ko-KR", { hour12: false, ...opts });
 }
 
 export function formatIsoTime(iso: string, opts?: Intl.DateTimeFormatOptions): string {

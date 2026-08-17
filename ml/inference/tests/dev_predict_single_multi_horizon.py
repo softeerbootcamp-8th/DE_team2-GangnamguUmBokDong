@@ -80,7 +80,7 @@ def _set_station_master(station_ids: list[str]) -> None:
 
 
 def _fake_predict_echo_temp(df: pd.DataFrame, model_name: str, exposure_col: str | None = None) -> pd.DataFrame:
-    """ml_common.scoring.predict() 대역 — pred_mean에 그 행의 temp를 그대로 담아 반환해서,
+    """ml_core.scoring.predict() 대역 — pred_mean에 그 행의 temp를 그대로 담아 반환해서,
     배치 조립 단계에서 각 horizon에 실제로 어떤 temp 값이 들어갔는지 결과에서 역추적할 수
     있게 한다(날씨 배열 resolve가 올바른지 확인하는 용도)."""
     return pd.DataFrame({
@@ -121,7 +121,7 @@ def test_build_feature_record_lag_rolling_fixed_across_horizon():
         horizon=5,
     )
 
-    from ml_common.model_contract import LAG_ROLLING_FEATURE_COLUMNS
+    from ml_core.model_contract import LAG_ROLLING_FEATURE_COLUMNS
 
     for col in LAG_ROLLING_FEATURE_COLUMNS:
         assert record_h1[col] == pytest.approx(record_h5[col]), col

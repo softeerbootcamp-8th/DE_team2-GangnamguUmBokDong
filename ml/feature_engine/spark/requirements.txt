@@ -1,0 +1,13 @@
+# feature_engine/ 전용 의존성 — EMR 8.0.0 기준(Python 3.11 기본값)에 맞춘다.
+# 메인 requirements.txt(src/, pandas/LightGBM 로컬 파이프라인)와 별도로 관리한다 —
+# 메인 venv는 최신 Python을 쓰는데, PySpark는 그렇게 최신 버전을 지원하지 않는다
+# (cloudpickle/py4j 직렬화가 깨짐). 로컬에서 이 패키지를 테스트하려면 Python 3.11로
+# 별도 venv를 만들어야 한다:
+#
+#   /opt/homebrew/bin/python3.11 -m venv .venv-spark
+#   ./.venv-spark/bin/pip install -r feature_engine/requirements.txt
+#
+pyspark==3.5.3
+pandas
+pyarrow
+pytest

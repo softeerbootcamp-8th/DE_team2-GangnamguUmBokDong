@@ -1,7 +1,7 @@
 """매달 챔피언 모델의 실측 성능을 확인해서 재학습이 필요한지 판단한다.
 
 **기준을 "절대 수치"가 아니라 "baseline 대비 상대 악화율"로 잡은 이유와 임계값
-10%(deviance)/15%p(커버리지)의 근거는 [common_config.py](../../libs/ml_common/common_config.py)에
+10%(deviance)/15%p(커버리지)의 근거는 [common_config.py](../../libs/ml_core/common_config.py)에
 적어뒀다 — 계절성 때문에 절대 임계값은 계절과 뒤섞이고, 실측한 노이즈 바닥
 (run-to-run 편차 0.3~0.5%, embargo 파라미터 스윕 편차 ~0.6%)보다 한참 위로 잡아야
 순수 변동으로 오탐이 안 난다. 이 파일은 그 기준을 실제로 적용만 한다.
@@ -19,10 +19,10 @@ from datetime import date
 
 import numpy as np
 import pandas as pd
-from ml_common import s3_io
-from ml_common.metrics import poisson_deviance as _poisson_deviance
-from ml_common.paths import model_json_key
-from ml_common.scoring import predict
+from core import s3 as s3_io
+from ml_core.metrics import poisson_deviance as _poisson_deviance
+from ml_core.paths import model_json_key
+from ml_core.scoring import predict
 
 from . import config
 

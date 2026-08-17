@@ -1,54 +1,22 @@
-"""seoul-pop-normalizer CLI를 실행하는 Airflow Task builder.
+"""seoul-pop-normalizer CLI를 실행하는 태스크 빌더.
 
-seoul-pop-normalizer 호출 계약:
-
-    cd seoul-pop-normalizer && uv run python main.py \
-        --window-start <window_start> [--baseline-date-mode latest]
-
-exit 0 = 성공, non-zero = 실패(Airflow retry 대상). strict 모드(기본값)는
-플래그를 붙이지 않는다.
+`--baseline-date-mode`는 normalizer 자신의 docstring이 명시한 두 값을 그대로 쓴다:
+strict(기본, 정확한 날짜 파티션 없으면 실패) / latest(Airflow fallback 태스크용,
+가장 최근 파티션으로 대체). 5분 DAG는 strict를 먼저 시도하고, 실패하면(그날
+아침 daily DAG가 아직 안 돌았을 때) latest로 재시도하는 두 태스크 쌍으로 구성한다.
 """
 
-from datetime import timedelta
+from __future__ import annotations
 
-from airflow.operators.bash import BashOperator
+from orchestration.task_builder import REPO_ROOT, build_module_task
+from orchestration.templates import KST_WINDOW_START
 
-from callbacks.task_callbacks import log_task_failure, log_task_retry
-from orchestration.collector_task import COLLECTOR_WINDOW_START
-
-NORMALIZER_DIR = "/workspace/seoul-pop-normalizer"
+NORMALIZER_DIR = str(REPO_ROOT / "normalizer")
 
 
-def build_normalizer_task(
-    task_id: str,
-    *,
-    baseline_date_mode: str = "strict",
-    trigger_rule: str = "all_success",
-) -> BashOperator:
-    """living_population_normalized 정규화 Task를 생성한다.
-
-    Args:
-        task_id: Airflow task id(예: "normalize_pop_grid", "normalize_pop_grid_fallback").
-        baseline_date_mode: "strict"(기본) 또는 "latest". "strict"면 CLI에 플래그를
-            붙이지 않는다(모듈 기본값과 동일하므로).
-        trigger_rule: 이 Task가 실행되는 조건(Airflow TriggerRule 문자열).
-
-    Returns:
-        seoul-pop-normalizer CLI를 실행하는 BashOperator.
-    """
-    mode_flag = "" if baseline_date_mode == "strict" else f" --baseline-date-mode {baseline_date_mode}"
-    return BashOperator(
-        task_id=task_id,
-        bash_command=(
-            f"cd {NORMALIZER_DIR} && "
-            "env -u VIRTUAL_ENV uv run python main.py "
-            f"--window-start {COLLECTOR_WINDOW_START}"
-            f"{mode_flag}"
-        ),
-        retries=2,
-        retry_delay=timedelta(seconds=30),
-        execution_timeout=timedelta(minutes=4),
-        trigger_rule=trigger_rule,
-        on_retry_callback=log_task_retry,
-        on_failure_callback=log_task_failure,
+def build_normalizer_task(dag, task_id: str, baseline_date_mode: str, *, trigger_rule="all_success"):
+    cmd = (
+        f"uv run --frozen python main.py --window-start {KST_WINDOW_START} "
+        f"--baseline-date-mode {baseline_date_mode}"
     )
+    return build_module_task(dag, task_id, NORMALIZER_DIR, cmd, trigger_rule=trigger_rule)
