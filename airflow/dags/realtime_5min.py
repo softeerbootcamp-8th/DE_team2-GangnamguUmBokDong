@@ -16,6 +16,8 @@
                                                    v         |
                                       population_normalized -┘
 
+    weather_10min / weather_3h가 쓴 최신 Silver ------------┘ (추론기가 시점 기준 조회)
+
 population_realtime Silver는 inference 전에 반드시 normalizer를 거쳐 보정된 상태여야 한다.
 strict가 성공하면 fallback은 skipped되고, strict가 실패하면 fallback(latest)이 실행된다.
 ``population_normalized``는 둘 중 하나가 성공한 경우에만 통과하는 합류 지점이다.
@@ -24,6 +26,7 @@ strict가 성공하면 fallback은 skipped되고, strict가 실패하면 fallbac
 
 Airflow dependency는 실제 데이터 계약을 기준으로 둔다.
 - population_realtime -> normalizer -> inference
+- weather_10min/weather_3h의 최신 Silver -> inference (cross-DAG snapshot 계약)
 - bike_station_realtime -> stations -> station_stock
 - inference + station_stock -> forecast_points
 
@@ -34,11 +37,9 @@ DAG 안에서 API 호출, 페이지네이션, S3 저장, 데이터 검증, 모�
 """
 
 import pendulum
-from airflow import DAG
+from airflow.providers.standard.operators.empty import EmptyOperator
 from airflow.task.trigger_rule import TriggerRule
 from airflow.timetables.trigger import CronTriggerTimetable
-from airflow.providers.standard.operators.empty import EmptyOperator
-
 from config.schedules import CATCHUP, MAX_ACTIVE_RUNS, REALTIME_5MIN_CRON, TIMEZONE
 from config.sources import (
     NORMALIZER_BASELINE_MODE_FALLBACK,
@@ -50,6 +51,8 @@ from orchestration.db_loader_task import build_db_loader_task
 from orchestration.inference_task import build_inference_task
 from orchestration.normalizer_task import build_normalizer_task
 
+from airflow import DAG
+
 with DAG(
     dag_id="realtime_5min",
     schedule=CronTriggerTimetable(REALTIME_5MIN_CRON, timezone=TIMEZONE),
@@ -59,7 +62,6 @@ with DAG(
     tags=["realtime", "5min"],
 ) as dag:
     collector_tasks = {source_id: build_collector_task(dag, source_id) for source_id in REALTIME_5MIN_SOURCES}
-
     load_stations = build_db_loader_task(dag, "stations")
     load_station_stock = build_db_loader_task(dag, "station_stock")
     collector_tasks["bike_station_realtime"] >> load_stations >> load_station_stock

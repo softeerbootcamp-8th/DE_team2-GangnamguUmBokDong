@@ -15,6 +15,7 @@ resolve되려면 cwd가 `ml/`이어야 하고, 환경은 `inference` 프로젝�
 from __future__ import annotations
 
 from config.schedules import INFERENCE_EXECUTION_TIMEOUT
+
 from orchestration.task_builder import REPO_ROOT, build_module_task
 from orchestration.templates import KST_DATE, KST_HOUR, KST_MINUTE
 
@@ -24,7 +25,8 @@ ML_DIR = str(REPO_ROOT / "ml")
 def build_inference_task(dag):
     cmd = (
         "uv --project inference run python -m inference.predict_single "
-        f"--all-stations --date {KST_DATE} --hour {KST_HOUR} --minute {KST_MINUTE}"
+        f"--all-stations --date {KST_DATE} --hour {KST_HOUR} --minute {KST_MINUTE} "
+        "--n-hours 12"
     )
     return build_module_task(
         dag,

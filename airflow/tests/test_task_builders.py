@@ -43,6 +43,23 @@ def test_inference_task_cwd_is_ml_not_ml_inference(dag):
     assert task.cwd.endswith("/ml")
     assert "uv --project inference run python -m inference.predict_single" in task.bash_command
     assert "--all-stations" in task.bash_command
+    assert "--n-hours 12" in task.bash_command
+    assert "// 5" in task.bash_command
+    assert ".replace(" in task.bash_command
+
+
+def test_all_pipeline_tasks_floor_manual_run_to_same_five_minute_window(dag):
+    """수동 trigger의 19:33도 모든 모듈에서 동일하게 19:30으로 내림한다."""
+    tasks = [
+        build_collector_task(dag, "bike_station_realtime"),
+        build_normalizer_task(dag, "normalize", "strict"),
+        build_inference_task(dag),
+        build_db_loader_task(dag, "station_stock"),
+    ]
+
+    for task in tasks:
+        assert "// 5" in task.bash_command
+        assert "second=0" in task.bash_command
 
 
 def test_db_loader_task_table_flag(dag):

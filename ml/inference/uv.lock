@@ -70,10 +70,23 @@ requires-dist = [
 ]
 
 [[package]]
+name = "holidays"
+version = "0.102"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "python-dateutil" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/b4/bd/129ac0572cbc7357fc9aec05af37c2db4384edf850476e412f57454b5f76/holidays-0.102.tar.gz", hash = "sha256:fc29b2fc76d262c822a200c50095e2dadc974b3e41e245875a33f1436bafe7d3", size = 978332, upload-time = "2026-08-03T17:11:34.693Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/7f/b9/1304d15e603617bb65877025f4c11ddb20c09ce2d7e3600995a633a9ab3b/holidays-0.102-py3-none-any.whl", hash = "sha256:ea1116491db82fc56612cad4b6c6f49272a13d73f006b073a3b77e98848c9fbf", size = 1575281, upload-time = "2026-08-03T17:11:32.906Z" },
+]
+
+[[package]]
 name = "inference"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
+    { name = "holidays" },
     { name = "ml-core" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "numpy", version = "2.5.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
@@ -88,6 +101,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "holidays", specifier = ">=0.65" },
     { name = "ml-core", editable = "../../libs/ml_core" },
     { name = "numpy" },
     { name = "pandas" },

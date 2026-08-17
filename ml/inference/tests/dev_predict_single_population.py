@@ -41,3 +41,53 @@ def test_recent_population_never_falls_back_to_raw_population(monkeypatch):
 
     assert result.empty
     assert all("living_population_normalized" in prefix for prefix in prefixes)
+
+
+def test_station_master_uses_latest_daily_master_and_realtime_capacity(monkeypatch):
+    """일 단위 master에 최신 실시간 이름과 capacity를 보강한다."""
+    master = pd.DataFrame(
+        [{"RNTLS_ID": "ST-10", "ADDR1": "서울시 마포구", "ADDR2": "427", "LAT": 37.55, "LOT": 126.91}]
+    )
+    realtime = pd.DataFrame(
+        [{"stationId": "ST-10", "stationName": "서교동 사거리", "rackTotCnt": 15}]
+    )
+
+    def list_keys(prefix):
+        if prefix == ps.silver_schema.STATION_MASTER_PREFIX:
+            return [f"{prefix}dt=2026-08-17/hh=03/0300.parquet"]
+        return [f"{prefix}dt=2026-08-17/hh=15/1505.parquet"]
+
+    monkeypatch.setattr(ps.s3_io, "list_keys", list_keys)
+    monkeypatch.setattr(
+        ps.s3_io,
+        "read_parquet",
+        lambda key: master if "bike_station_master" in key else realtime,
+    )
+    ps._station_master = None
+
+    result = ps._get_station_master()
+
+    assert result.loc["ST-10", "station_name"] == "서교동 사거리"
+    assert result.loc["ST-10", "capacity"] == 15
+    assert pd.isna(result.loc["ST-10", "grid_id"])
+
+
+def test_missing_population_profile_uses_nan_fallback(monkeypatch):
+    """선택 산출물인 인구 profile이 없어도 NaN 피처로 추론을 계속한다."""
+    monkeypatch.setattr(ps.s3_io, "read_parquet", lambda key: None)
+    ps._population_profile = None
+
+    result = ps._population_fallback("unknown-grid", pd.Timestamp("2026-08-17 19:30"))
+
+    assert all(pd.isna(value) for value in result.values())
+    assert ps._population_profile == {}
+
+
+def test_missing_analysis_summary_uses_korean_holiday_calendar(monkeypatch):
+    """선택 산출물이 없어도 2026년 공휴일 feature를 계산한다."""
+    monkeypatch.setattr(ps.config, "load_holidays_2025", lambda: (_ for _ in ()).throw(FileNotFoundError))
+    ps._holidays = None
+
+    result = ps._get_holidays()
+
+    assert "2026-08-15" in result

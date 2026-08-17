@@ -62,6 +62,14 @@ export default function App() {
     api.regions().then(setRegionCenters);
   }, []);
 
+  // 첫 화면부터 세 하단 패널이 비어 있지 않도록, 데이터가 도착하면 가장
+  // 긴급한 대여소(서버가 urgency 내림차순으로 반환)를 기본 선택한다.
+  useEffect(() => {
+    if (selectedStationId === null && alerts.length > 0) {
+      setSelectedStationId(alerts[0].sta_id);
+    }
+  }, [alerts, selectedStationId]);
+
   useEffect(() => {
     if (selectedStationId === null) {
       setForecast(null);
@@ -118,6 +126,20 @@ export default function App() {
                             </option>
                           ))}
                         </select>
+                        <div className="alert-tabs" role="tablist" aria-label="지도 표시 범위">
+                          {MAP_FILTER_TABS.map((tab) => (
+                            <button
+                              key={tab.key}
+                              type="button"
+                              role="tab"
+                              aria-selected={mapFilterMode === tab.key}
+                              className={`alert-tab${mapFilterMode === tab.key ? " active" : ""}`}
+                              onClick={() => setMapFilterMode(tab.key)}
+                            >
+                              {tab.label}
+                            </button>
+                          ))}
+                        </div>
                       </span>
                       <span className="text-xs text-muted-foreground">기준 시각 {stationsUpdatedAt ? formatClock(stationsUpdatedAt) : "-"}</span>
                     </div>
@@ -128,6 +150,7 @@ export default function App() {
                           alerts={filteredAlerts}
                           selectedStationId={selectedStationId}
                           onSelect={setSelectedStationId}
+                          mapFilterMode={mapFilterMode}
                           regionCenters={regionCenters}
                           selectedRegion={selectedRegion}
                         />

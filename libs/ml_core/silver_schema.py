@@ -18,12 +18,20 @@ from __future__ import annotations
 
 import pandas as pd
 
+STATION_MASTER_SOURCE_ID = "bike_station_master"
+STATION_MASTER_PREFIX = f"silver/{STATION_MASTER_SOURCE_ID}/"
+# Spark feature pipeline이 사용하는 기존 정적 마스터 계약. 실시간 inference는
+# Collector가 쓴 STATION_MASTER_PREFIX의 최신 파티션을 사용한다.
 STATION_MASTER_KEY = "silver/station/station_master.parquet"
 
 # 실제 예시 데이터에 station 마스터 샘플이 없어 아직 검증 못 했다 — 지금은
 # dev/seed_s3_from_local.py 기준을 그대로 둔다(docs/collector/ml-integration-requests.md
 # 확인 요청 참고).
 STATION_COLUMN_MAP = {
+    "RNTLS_ID": "station_id",
+    "ADDR2": "station_name",
+    "LAT": "lat",
+    "LOT": "lon",
     "sta_id": "station_id",
     "sta_no": "station_no",
     "sta_nm": "station_name",
@@ -89,12 +97,32 @@ POPULATION_COLUMN_MAP = {
 BIKE_REALTIME_SOURCE_ID = "bike_station_realtime"
 RENTAL_SOURCE_ID = "bike_rental_history"
 WEATHER_SOURCE_ID = "weather_ultra_short_live"
+WEATHER_ULTRA_FORECAST_SOURCE_ID = "weather_ultra_short_forecast"
+WEATHER_SHORT_FORECAST_SOURCE_ID = "weather_short_term_forecast"
 POPULATION_SOURCE_ID = "living_population_grid"
 NORMALIZED_POPULATION_SOURCE_ID = "living_population_normalized"
 
+WEATHER_FORECAST_COLUMN_MAPS = {
+    WEATHER_ULTRA_FORECAST_SOURCE_ID: {
+        "T1H": "temp",
+        "RN1": "precip",
+        "WSD": "wind",
+        "REH": "humidity",
+    },
+    WEATHER_SHORT_FORECAST_SOURCE_ID: {
+        "TMP": "temp",
+        "PCP": "precip",
+        "WSD": "wind",
+        "REH": "humidity",
+    },
+}
+
 BIKE_REALTIME_TICK_MINUTES = 5
 RENTAL_TICK_MINUTES = 5
-WEATHER_TICK_MINUTES = 10
+# weather_10min DAG은 10분 간격으로 쓰지만 realtime_5min/e2e DAG도 자신의
+# window_start로 동일한 소스를 수집한다. :05/:15 파일을 누락하지 않도록
+# 추론 조회는 5분 key 그리드를 사용한다.
+WEATHER_TICK_MINUTES = 5
 
 
 def silver_key(source_id: str, window_start: pd.Timestamp) -> str:
@@ -131,8 +159,13 @@ def rental_tick_keys(anchor_ts: pd.Timestamp, lookback_hours: float) -> list[str
 
 
 def weather_tick_keys(anchor_ts: pd.Timestamp, lookback_hours: float = 3.0) -> list[str]:
-    """`weather_ultra_short_live`의 10분 tick 키 목록(오래된 것부터 최신 순)."""
+    """`weather_ultra_short_live`의 5분 수집 키 목록(오래된 것부터 최신 순)."""
     return _tick_keys(WEATHER_SOURCE_ID, anchor_ts, lookback_hours, WEATHER_TICK_MINUTES)
+
+
+def source_prefix(source_id: str) -> str:
+    """source_id 하나의 Silver 전체 파티션 prefix."""
+    return f"silver/{source_id}/"
 
 
 def population_daily_prefix(day: pd.Timestamp) -> str:
