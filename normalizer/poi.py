@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from functools import lru_cache
 
 
+from pathlib import Path
+
 # pyrefly: ignore [missing-import]
 import shapefile
 import shapely
@@ -15,7 +17,7 @@ from shapely.geometry import shape
 from shapely.geometry.base import BaseGeometry
 from shapely.ops import transform as shapely_transform
 
-DEFAULT_POI_SHP_PATH = "data/poi_areas/seoul_121_poi_areas.shp"
+DEFAULT_POI_SHP_PATH = str(Path(__file__).parent / "data" / "poi_areas" / "seoul_121_poi_areas.shp")
 
 _TO_EPSG5179 = Transformer.from_crs("EPSG:4326", "EPSG:5179", always_xy=True)
 
