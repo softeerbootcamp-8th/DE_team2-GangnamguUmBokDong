@@ -5,7 +5,6 @@
 
 import pandas as pd
 import pytest
-from ml_core import common_config
 
 from training import config
 from training.monitor_performance import _recent_month_range, decide_retrain
@@ -68,38 +67,36 @@ def test_both_thresholds_breached_gives_two_reasons():
 @pytest.mark.parametrize(
     "as_of,lookback_months,expected",
     [
-        # INCREMENTAL_LOOKBACK_HOURS(기본 840시간=35일)가 어떤 한 달(최대 31일)보다도
-        # 기니까, "지난달 말일"은 이 마진 하에서 절대 안전할 수 없다 — 아래 네 케이스
-        # 전부 최소 한 번(대개 두 번) 더 밀려서 "지난달"이 아니라 "지지난달" 이전이
-        # 끝이 된다. 정확한 값은 실제 _recent_month_range() 알고리즘으로 직접 재계산해
-        # 둔 것(달마다 일수가 달라 손으로 어림하면 틀리기 쉬움) — 아래 boundary 테스트가
-        # 그 알고리즘 자체(밀어내는 조건)를 별도로 검증한다.
-        ("2026-01-15", 1, ("2025-11-01", "2025-11-30")),
-        ("2026-01-01", 1, ("2025-10-01", "2025-10-31")),
-        ("2026-03-01", 3, ("2025-10-01", "2025-12-31")),
-        ("2025-06-10", 1, ("2025-04-01", "2025-04-30")),
+        # TRAINING_SAFETY_MARGIN_DAYS(기본 7일)는 한 달보다 짧아서, as_of의 날짜에
+        # 따라 "지난달 말일"이 이미 안전한 경우(마진 안 밀림)와 안 밀려야 하는 경우가
+        # 둘 다 생긴다 — 이 파라미터라이즈가 그 두 경우를 실제 _recent_month_range()
+        # 알고리즘으로 재계산해 고정해둔 것.
+        ("2026-01-15", 1, ("2025-12-01", "2025-12-31")),  # 15일 지남(>=7일) — 안 밀림
+        ("2026-01-01", 1, ("2025-11-01", "2025-11-30")),  # 1일밖에 안 지남 — 한 달 더 밀림
+        ("2026-03-01", 3, ("2025-11-01", "2026-01-31")),
+        ("2025-06-10", 1, ("2025-05-01", "2025-05-31")),  # 10일 지남(>=7일) — 안 밀림
     ],
 )
 def test_recent_month_range(as_of, lookback_months, expected):
     """'완결된' 최근 N개월 범위를 정확히 계산해야 한다 — 이번 달(진행 중)뿐 아니라,
-    INCREMENTAL_LOOKBACK_HOURS 안에 들어와 아직 rental_count가 사후 보정될 수 있는
+    TRAINING_SAFETY_MARGIN_DAYS 안에 들어와 아직 rental_count가 사후 보정될 수 있는
     달도 전부 제외해야 한다(그냥 "지난달까지"가 아님 — 모듈 docstring 참고)."""
     assert _recent_month_range(lookback_months, as_of=as_of) == expected
 
 
-def test_recent_month_range_end_never_within_incremental_lookback_of_as_of():
-    """실제 INCREMENTAL_LOOKBACK_HOURS 기준으로, 반환된 end가 그 마진보다 더 최근이면
+def test_recent_month_range_end_never_within_safety_margin_of_as_of():
+    """실제 TRAINING_SAFETY_MARGIN_DAYS 기준으로, 반환된 end가 그 마진보다 더 최근이면
     안 된다 — 이게 이번 수정의 핵심 불변조건이다(리뷰에서 지적된 문제)."""
     for as_of in ["2026-08-01", "2026-08-17", "2026-01-01", "2025-12-31", "2026-03-15"]:
         _, end = _recent_month_range(1, as_of=as_of)
-        gap_hours = (pd.Timestamp(as_of) - pd.Timestamp(end)).total_seconds() / 3600
-        assert gap_hours >= common_config.INCREMENTAL_LOOKBACK_HOURS, f"as_of={as_of}, end={end}, gap={gap_hours}h"
+        gap_days = (pd.Timestamp(as_of) - pd.Timestamp(end)).days
+        assert gap_days >= config.TRAINING_SAFETY_MARGIN_DAYS, f"as_of={as_of}, end={end}, gap={gap_days}일"
 
 
 def test_recent_month_range_boundary_exactly_at_cutoff_is_safe(monkeypatch):
-    """end가 정확히 as_of - INCREMENTAL_LOOKBACK_HOURS와 같으면(더 밀어낼 필요 없음)
+    """end가 정확히 as_of - TRAINING_SAFETY_MARGIN_DAYS와 같으면(더 밀어낼 필요 없음)
     그 달을 그대로 쓴다 — '>' 비교라 경계값 자체는 안전하다고 판정돼야 한다."""
-    monkeypatch.setattr(common_config, "INCREMENTAL_LOOKBACK_HOURS", 240)  # 10일, 계산이 깔끔한 값으로 고정
+    monkeypatch.setattr(config, "TRAINING_SAFETY_MARGIN_DAYS", 10)  # 계산이 깔끔한 값으로 고정
 
     # 2026-01-31 말일 기준 정확히 10일 뒤인 2026-02-10에 실행하면 경계에 정확히 걸친다.
     assert _recent_month_range(1, as_of="2026-02-10") == ("2026-01-01", "2026-01-31")
