@@ -61,7 +61,8 @@ from collections.abc import Sequence
 
 import numpy as np
 import pandas as pd
-from core import s3 as s3_io, silver_schema
+from core import s3 as s3_io
+from ml_core import silver_schema
 from ml_core.model_contract import (
     FEATURE_COLUMN_DTYPES,
     FEATURE_COLUMNS,
