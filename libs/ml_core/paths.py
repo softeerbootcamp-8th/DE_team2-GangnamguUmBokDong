@@ -47,8 +47,32 @@ TRAIN_MONTHS = [f"{TRAIN_YEAR % 100:02d}{m:02d}" for m in range(1, 13)]
 RENTAL_PARQUET_DIR = os.environ.get("RENTAL_PARQUET_DIR", "parquet")
 
 # training이 만들고(학습), inference가 읽는(서빙) 모델 아티팩트 — dev/
-# S3_DATA_CATALOG.md에 정의된 `models/` prefix를 그대로 쓴다.
+# S3_DATA_CATALOG.md에 정의된 `models/` prefix를 그대로 쓴다. 이제 학습은 항상
+# 아래 아카이브 prefix에 쓰고, 챌린저가 챔피언을 이길 때만(training/promotion.py)
+# 이 prefix로 파일명 그대로 복사된다 — 이 prefix에 직접 학습 결과를 쓰는 코드
+# 경로는 없다.
 MODELS_PREFIX = os.environ.get("MODELS_PREFIX", "models")
+
+# 학습한 모든 모델(챔피언이 됐는지와 무관하게)을 보존하는 아카이브 — 날짜/프로필별로
+# 나뉘어 있어 "언제 어떤 프로필로 학습했는지"를 그대로 찾을 수 있다.
+MODELS_ARCHIVE_PREFIX = os.environ.get("MODELS_ARCHIVE_PREFIX", f"{MODELS_PREFIX}/archive")
+
+
+def archive_models_prefix(date: str, profile_name: str) -> str:
+    """한 번의 학습 시도(날짜 + 프로필 조합)가 쓸 아카이브 prefix를 만든다.
+
+    이 prefix를 `train_common.train_target(..., models_prefix=...)`에 그대로
+    넘기면, `model_key`/`model_json_key`가 만드는 파일명(예: "rental_poisson.txt")
+    자체는 챔피언 경로와 완전히 동일하게 유지되고 위치만 여기로 바뀐다 — 나중에
+    챔피언으로 승격할 때 파일명을 그대로 복사만 하면 되는 이유다.
+
+    args:
+        date: "YYYY-MM-DD" — 학습을 실행한 날짜
+        profile_name: 이 학습에 쓴 프로필 이름(common_config.PROFILE_NAME)
+    returns:
+        str: "{MODELS_ARCHIVE_PREFIX}/dt={date}/{profile_name}"
+    """
+    return f"{MODELS_ARCHIVE_PREFIX}/dt={date}/{profile_name}"
 
 
 def model_key(model_name: str, suffix: str, models_prefix: str | None = None) -> str:

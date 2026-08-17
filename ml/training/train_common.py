@@ -17,7 +17,7 @@ import lightgbm as lgb
 import numpy as np
 import pandas as pd
 from core import s3 as s3_io
-from ml_core import model_io
+from ml_core import common_config, model_io
 from ml_core.metrics import pinball_loss as _pinball_loss
 from ml_core.metrics import poisson_deviance as _poisson_deviance
 from ml_core.model_contract import (
@@ -331,6 +331,14 @@ def train_target(
     # 매달 실측 성능과 비교할 baseline을 잡을 수 있다 — 그 baseline을 여기서 남긴다.
     if is_primary:
         s3_io.write_json(model_json_key(model_name, "metrics", models_prefix), metrics)
+        # 임베고 등 프로필 값이 바뀌면 이 모델을 서빙할 feature_engine/inference도
+        # 같은 프로필을 써야 한다 — 어떤 프로필로 학습됐는지를 모델 파일 옆에 그대로
+        # 남겨서, 나중에 이 모델을 찾았을 때 재현/서빙 조건을 바로 알 수 있게 한다
+        # (training/promotion.py가 챔피언 승격 시 이 파일도 그대로 복사한다).
+        s3_io.write_json(
+            model_json_key(model_name, "profile", models_prefix),
+            {"profile_name": common_config.PROFILE_NAME, **common_config.PROFILE},
+        )
 
     return metrics
 
