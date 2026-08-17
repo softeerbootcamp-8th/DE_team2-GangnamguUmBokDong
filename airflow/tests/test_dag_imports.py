@@ -15,6 +15,20 @@ def test_e2e_realtime_dag_id():
     assert e2e_realtime_dag.dag.dag_id == "e2e_realtime"
 
 
+def test_realtime_population_is_normalized_before_inference():
+    normalized = realtime_5min_dag.dag.get_task("population_normalized")
+    assert normalized.upstream_task_ids == {"run_normalizer_strict", "run_normalizer_fallback"}
+    assert "population_normalized" in realtime_5min_dag.dag.get_task("run_inference").upstream_task_ids
+    assert "collect_population_realtime" not in realtime_5min_dag.dag.get_task("run_inference").upstream_task_ids
+
+
+def test_e2e_population_is_normalized_before_inference():
+    normalized = e2e_realtime_dag.dag.get_task("population_normalized")
+    assert normalized.upstream_task_ids == {"run_normalizer_strict", "run_normalizer_fallback"}
+    assert "population_normalized" in e2e_realtime_dag.dag.get_task("run_inference").upstream_task_ids
+    assert "collect_population_realtime" not in e2e_realtime_dag.dag.get_task("run_inference").upstream_task_ids
+
+
 def test_realtime_gold_waits_for_inference_and_station_stock():
     upstream = realtime_5min_dag.dag.get_task("load_forecast_points").upstream_task_ids
     assert upstream == {"run_inference", "load_station_stock"}
