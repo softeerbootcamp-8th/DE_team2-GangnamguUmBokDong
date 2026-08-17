@@ -588,22 +588,13 @@ def _get_recent_bike_status(anchor_ts: pd.Timestamp, lookback_hours: float = 1.0
 
 
 def _get_recent_population(target_ts: pd.Timestamp, lookback_days: int = 7) -> pd.DataFrame:
-    """target_ts와 같은 시각대(hour-of-day)의 가장 최근 Silver 생활인구 스냅샷을 읽는다(격자별).
+    """target_ts 이전의 가장 최근 Normalizer Silver 인구 스냅샷을 읽는다(격자별).
 
-    `living_population_grid`는 다른 실시간 소스와 달리 **하루에 파일 1개**만
-    쌓인다 — 그 파일 안에 `YMD`(날짜)+`TT`(시각, "00"~"23")로 24시간 데이터가 전부
-    들어있고, collector job이 실제로 몇 시·몇 분에 그 파일을 쓰는지(파일명의
-    hh=/HHMM)는 알 수 없다. 그래서 시간별 키를 추측하는 대신 그 날짜의 dt=.../
-    prefix를 LIST해서 존재하는 파일을 찾는다.
-
-    실제 예시 데이터로 확인한 중요한 특성: 파일의 **수집일(경로의 dt=)과 내용의
-    YMD가 다르다** — 2026-08-15에 수집된 파일인데 내용은 `YMD=20260811`(4일 전)
-    데이터였다. 생활인구 원천 자체가 공표 지연이 있어 "가장 최근 수집분"이 며칠
-    전 데이터를 담고 있는 게 정상이라는 뜻이다. 그래서 target_ts의 날짜와 파일
-    내용의 YMD를 맞추려 하지 않고, **가장 최근 dt= 파티션 하나를 찾아 그 안에서
-    TT(시각)만 맞춰** 쓴다 — "정확히 그 날짜"가 아니라 "구할 수 있는 가장 최근
-    스냅샷의 같은 시간대 패턴"이라는 뜻이다(자세한 내용은
-    `docs/collector/ml-integration-requests.md`).
+    Normalizer는 `population_realtime`을 기준 격자에 반영한 결과를
+    `silver/living_population_normalized/dt=.../hh=.../HHMM.parquet`에 저장한다.
+    추론은 원본 `living_population_grid`로 우회하지 않고 이 보정 결과만
+    소비한다. 미래 horizon에는 동일한 시각의 파일이 아직 없으므로,
+    target_ts를 넘지 않는 가장 최근 스냅샷을 선택한다.
 
     실제 예시 데이터에는 나이대x성별 인구(`M00`~`M70`/`F00`~`F70`)만 있고 우리가
     쓰는 `pop_resd`/`pop_long_foreign`/`pop_short_foreign` 구분 자체가 없다 —
@@ -613,7 +604,7 @@ def _get_recent_population(target_ts: pd.Timestamp, lookback_days: int = 7) -> p
     자리는 채우되, 실제 국적별 구성은 반영하지 못하는 한계가 있다.
 
     args:
-        target_ts: 조회하려는 시각(시각대만 사용, 날짜는 "가장 최근 수집분" 탐색에만 씀)
+        target_ts: 조회 기준 시각(이 시각보다 나중에 생성된 스냅샷은 제외)
         lookback_days: 오늘치 파티션이 없으면 며칠 전까지 대신 찾아볼지
     returns:
         pd.DataFrame: grid_id로 인덱싱된 pop_resd/pop_long_foreign/pop_short_foreign/pop_total
@@ -628,25 +619,25 @@ def _get_recent_population(target_ts: pd.Timestamp, lookback_days: int = 7) -> p
     if target_ts in _recent_population_by_ts:
         return _recent_population_by_ts[target_ts]
 
-    target_hour = f"{target_ts.hour:02d}"
     result = pd.DataFrame(columns=["pop_resd", "pop_long_foreign", "pop_short_foreign", "pop_total"])
+    cutoff_key = silver_schema.silver_key(silver_schema.NORMALIZED_POPULATION_SOURCE_ID, target_ts)
     for day_offset in range(lookback_days + 1):
         day = target_ts - pd.Timedelta(days=day_offset)
-        keys = s3_io.list_keys(silver_schema.population_daily_prefix(day))
+        keys = [
+            key
+            for key in s3_io.list_keys(silver_schema.normalized_population_daily_prefix(day))
+            if key.endswith(".parquet") and key <= cutoff_key
+        ]
         if not keys:
             continue
         df = s3_io.read_parquet(max(keys))
         if df is None or df.empty:
             continue
         df = df.rename(columns=silver_schema.POPULATION_COLUMN_MAP)
-        rows = df[df["TT"] == target_hour]
-        if rows.empty:
-            continue
-        rows = rows.copy()
-        rows["pop_resd"] = rows["pop_total"]
-        rows["pop_long_foreign"] = 0.0
-        rows["pop_short_foreign"] = 0.0
-        result = rows.set_index("grid_id")[["pop_resd", "pop_long_foreign", "pop_short_foreign", "pop_total"]]
+        df["pop_resd"] = df["pop_total"]
+        df["pop_long_foreign"] = 0.0
+        df["pop_short_foreign"] = 0.0
+        result = df.set_index("grid_id")[["pop_resd", "pop_long_foreign", "pop_short_foreign", "pop_total"]]
         break
 
     _recent_population_by_ts[target_ts] = result
@@ -1808,5 +1799,3 @@ def main(argv: list[str] | None = None) -> None:
 
 if __name__ == "__main__":
     main()
-
-

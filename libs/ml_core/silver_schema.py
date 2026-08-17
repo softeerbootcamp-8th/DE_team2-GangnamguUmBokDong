@@ -90,6 +90,7 @@ BIKE_REALTIME_SOURCE_ID = "bike_station_realtime"
 RENTAL_SOURCE_ID = "bike_rental_history"
 WEATHER_SOURCE_ID = "weather_ultra_short_live"
 POPULATION_SOURCE_ID = "living_population_grid"
+NORMALIZED_POPULATION_SOURCE_ID = "living_population_normalized"
 
 BIKE_REALTIME_TICK_MINUTES = 5
 RENTAL_TICK_MINUTES = 5
@@ -143,6 +144,11 @@ def population_daily_prefix(day: pd.Timestamp) -> str:
     return f"silver/{POPULATION_SOURCE_ID}/dt={day:%Y-%m-%d}/"
 
 
+def normalized_population_daily_prefix(day: pd.Timestamp) -> str:
+    """Normalizer가 5분마다 쓰는 보정 인구 Silver의 날짜 prefix를 반환한다."""
+    return f"silver/{NORMALIZED_POPULATION_SOURCE_ID}/dt={day:%Y-%m-%d}/"
+
+
 def predictions_key(window_start: pd.Timestamp) -> str:
     """추론 결과 저장 키 — Silver와 같은 dt=/hh= 파티션 규칙, 최상위 prefix만 다르다."""
     return f"predictions/dt={window_start:%Y-%m-%d}/hh={window_start:%H}/inference_{window_start:%H%M}.parquet"
@@ -163,4 +169,3 @@ def single_prediction_key(station_id: str, window_start: pd.Timestamp) -> str:
         S3 객체 키 문자열 (예: "predictions/single/dt=2026-08-15/hh=17/ST-2000_1700.parquet")
     """
     return f"predictions/single/dt={window_start:%Y-%m-%d}/hh={window_start:%H}/{station_id}_{window_start:%H%M}.parquet"
-
