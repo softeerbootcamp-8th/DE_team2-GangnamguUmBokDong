@@ -11,3 +11,12 @@ def test_weather_tick_keys_include_realtime_five_minute_window():
 
     assert keys[-1] == "silver/weather_ultra_short_live/dt=2026-08-17/hh=18/1835.parquet"
     assert "silver/weather_ultra_short_live/dt=2026-08-17/hh=18/1830.parquet" in keys
+
+
+def test_normalized_population_tick_keys_cover_one_hour_without_future_tick():
+    keys = silver_schema.normalized_population_tick_keys(pd.Timestamp("2026-08-17 20:27"))
+
+    assert len(keys) == 13
+    assert keys[0] == "silver/living_population_normalized/dt=2026-08-17/hh=19/1925.parquet"
+    assert keys[-1] == "silver/living_population_normalized/dt=2026-08-17/hh=20/2025.parquet"
+    assert not any(key.endswith("/2030.parquet") for key in keys)

@@ -125,6 +125,7 @@ RENTAL_TICK_MINUTES = 5
 # window_start로 동일한 소스를 수집한다. :05/:15 파일을 누락하지 않도록
 # 추론 조회는 5분 key 그리드를 사용한다.
 WEATHER_TICK_MINUTES = 5
+NORMALIZED_POPULATION_TICK_MINUTES = 5
 
 
 def silver_key(source_id: str, window_start: pd.Timestamp) -> str:
@@ -163,6 +164,16 @@ def rental_tick_keys(anchor_ts: pd.Timestamp, lookback_hours: float) -> list[str
 def weather_tick_keys(anchor_ts: pd.Timestamp, lookback_hours: float = 3.0) -> list[str]:
     """`weather_ultra_short_live`의 5분 수집 키 목록(오래된 것부터 최신 순)."""
     return _tick_keys(WEATHER_SOURCE_ID, anchor_ts, lookback_hours, WEATHER_TICK_MINUTES)
+
+
+def normalized_population_tick_keys(anchor_ts: pd.Timestamp, lookback_hours: float = 1.0) -> list[str]:
+    """`living_population_normalized`의 5분 tick 키 목록(오래된 것부터 최신 순)."""
+    return _tick_keys(
+        NORMALIZED_POPULATION_SOURCE_ID,
+        anchor_ts,
+        lookback_hours,
+        NORMALIZED_POPULATION_TICK_MINUTES,
+    )
 
 
 def source_prefix(source_id: str) -> str:

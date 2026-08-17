@@ -725,7 +725,7 @@ def _get_recent_bike_status(anchor_ts: pd.Timestamp, lookback_hours: float = 1.0
     return pd.DataFrame(columns=["bike_count", "capacity", "stockout_flag"])
 
 
-def _get_recent_population(target_ts: pd.Timestamp, lookback_days: int = 7) -> pd.DataFrame:
+def _get_recent_population(target_ts: pd.Timestamp, lookback_hours: float = 1.0) -> pd.DataFrame:
     """target_ts 이전의 가장 최근 Normalizer Silver 인구 스냅샷을 읽는다(격자별).
 
     Normalizer는 `population_realtime`을 기준 격자에 반영한 결과를
@@ -743,7 +743,7 @@ def _get_recent_population(target_ts: pd.Timestamp, lookback_days: int = 7) -> p
 
     args:
         target_ts: 조회 기준 시각(이 시각보다 나중에 생성된 스냅샷은 제외)
-        lookback_days: 오늘치 파티션이 없으면 며칠 전까지 대신 찾아볼지
+        lookback_hours: target_ts tick이 없으면 몇 시간 전까지 대신 찾아볼지
     returns:
         pd.DataFrame: grid_id로 인덱싱된 pop_resd/pop_long_foreign/pop_short_foreign/pop_total
             (lookback 안에 데이터가 전혀 없으면 빈 DataFrame — 호출부가
@@ -758,25 +758,15 @@ def _get_recent_population(target_ts: pd.Timestamp, lookback_days: int = 7) -> p
         return _recent_population_by_ts[target_ts]
 
     result = pd.DataFrame(columns=["pop_resd", "pop_long_foreign", "pop_short_foreign", "pop_total"])
-    cutoff_key = silver_schema.silver_key(silver_schema.NORMALIZED_POPULATION_SOURCE_ID, target_ts)
-    for day_offset in range(lookback_days + 1):
-        day = target_ts - pd.Timedelta(days=day_offset)
-        keys = [
-            key
-            for key in s3_io.list_keys(silver_schema.normalized_population_daily_prefix(day))
-            if key.endswith(".parquet") and key <= cutoff_key
-        ]
-        if not keys:
-            continue
-        df = s3_io.read_parquet(max(keys))
-        if df is None or df.empty:
-            continue
-        df = df.rename(columns=silver_schema.POPULATION_COLUMN_MAP)
-        df["pop_resd"] = df["pop_total"]
-        df["pop_long_foreign"] = 0.0
-        df["pop_short_foreign"] = 0.0
-        result = df.set_index("grid_id")[["pop_resd", "pop_long_foreign", "pop_short_foreign", "pop_total"]]
-        break
+    keys = silver_schema.normalized_population_tick_keys(target_ts, lookback_hours)
+    for df in reversed(s3_io.read_parquet_many(keys)):  # target_ts에 가장 가까운 것부터
+        if df is not None and not df.empty:
+            df = df.rename(columns=silver_schema.POPULATION_COLUMN_MAP).copy()
+            df["pop_resd"] = df["pop_total"]
+            df["pop_long_foreign"] = 0.0
+            df["pop_short_foreign"] = 0.0
+            result = df.set_index("grid_id")[["pop_resd", "pop_long_foreign", "pop_short_foreign", "pop_total"]]
+            break
 
     _recent_population_by_ts[target_ts] = result
     return result
