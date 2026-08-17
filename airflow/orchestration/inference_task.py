@@ -4,11 +4,12 @@
 predict_return_demand.py는 2025년 고정 테스트 구간만 읽는 백테스트 CLI이고,
 run_full_pipeline.py는 로컬 데모 전용이라고 자체 docstring에 명시되어 있다.
 
-호출 방식은 ml/inference/README.md가 실제로 검증해 보여주는 패턴을 그대로 따른다:
-`cd ml && ./inference/.venv/bin/python -m inference.predict_single ...`.
+호출 방식은 ml/inference/README.md 패턴을 개선하여 `uv run`을 직접 사용한다:
+`cd ml && uv --project inference run python -m inference.predict_single ...`.
 `inference` 패키지가 `ml/inference/`에 있어 `-m inference.predict_single`이
-resolve되려면 cwd가 `ml/`이어야 하고, venv는 `ml/inference/`의 것이므로 `uv run
---project`가 아니라 venv 바이너리를 직접 호출한다(README에서 검증된 방식).
+resolve되려면 cwd가 `ml/`이어야 하고, 환경은 `inference` 프로젝트의 것을 써야 하므로
+`uv --project inference run` 명령어로 실행한다. (로컬 Mac과 Docker(Linux) 환경을
+오갈 때, 심볼릭 링크 등 가상환경이 깨져도 uv가 자동으로 감지해 복구해 준다.)
 """
 
 from __future__ import annotations
@@ -22,7 +23,7 @@ ML_DIR = str(REPO_ROOT / "ml")
 
 def build_inference_task(dag):
     cmd = (
-        "./inference/.venv/bin/python -m inference.predict_single "
+        "uv --project inference run python -m inference.predict_single "
         f"--all-stations --date {KST_DATE} --hour {KST_HOUR} --minute {KST_MINUTE}"
     )
     return build_module_task(
