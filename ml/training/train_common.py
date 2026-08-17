@@ -38,7 +38,7 @@ __all__ = [
 
 
 def load_training_table() -> pd.DataFrame:
-    """multi-horizon feature 테이블에서 학습에 필요한 컬럼만 읽는다.
+    """multi-horizon feature 테이블에서 학습에 필요한 컬럼·기간만 읽는다.
 
     `pd.read_parquet(..., columns=[...])`로 필요한 컬럼만 골라 읽는다 — 전체 컬럼을 읽은
     뒤 `df[FEATURE_COLUMNS]`로 다시 골라내면 안 쓸 컬럼까지 한 번 더 메모리에 올렸다가
@@ -46,12 +46,22 @@ def load_training_table() -> pd.DataFrame:
     multi-horizon 테이블은 원본 feature 테이블의 최대 HORIZON_COUNT배 행 수라 이 절약이
     특히 중요하다.
 
+    `date_range=(TRAIN_START, TEST_END)`도 같이 넘긴다 — 테이블이 `date` 파티션으로
+    쌓여있으므로(`feature_engineering/spark/build_multi_horizon_features.py`) 이
+    학습 구간에 해당하는 파티션만 나열/다운로드한다. 안 그러면 그동안 쌓인 전체
+    히스토리를 매번 다 받은 뒤 `_split()`에서 대부분 버리게 된다 — 쌓인 기간이
+    늘어날수록 이 낭비가 계속 커진다.
+
     returns:
         pd.DataFrame: FEATURE_COLUMNS + rental_count/return_count(라벨) +
             rental_exposure(대여 exposure offset) + date(`_split()` 경계 기준)
     """
     needed = sorted(set(FEATURE_COLUMNS) | {"rental_count", "return_count", "rental_exposure", "date"})
-    df = s3_io.read_parquet(config.MULTI_HORIZON_FEATURES_TABLE_PARQUET, columns=needed)
+    df = s3_io.read_parquet(
+        config.MULTI_HORIZON_FEATURES_TABLE_PARQUET,
+        columns=needed,
+        date_range=(config.TRAIN_START, config.TEST_END),
+    )
     if df is None:
         raise FileNotFoundError(f"S3에 없음: {config.MULTI_HORIZON_FEATURES_TABLE_PARQUET}")
     return df

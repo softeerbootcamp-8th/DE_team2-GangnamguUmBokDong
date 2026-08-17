@@ -98,7 +98,11 @@ def put_object_bytes(key: str, body: bytes) -> None:
     _client().put_object(Bucket=_bucket(), Key=key, Body=body)
 
 
-def read_parquet(key: str, columns: list[str] | None = None) -> pd.DataFrame | None:
+def read_parquet(
+    key: str,
+    columns: list[str] | None = None,
+    date_range: tuple[str, str] | None = None,
+) -> pd.DataFrame | None:
     """S3의 parquet을 pandas DataFrame으로 읽는다 — 파일 1개짜리 객체와 Spark가
     쓰는 다중 파트 "디렉터리"(`key`가 실제 객체가 아니라 prefix이고 그 아래
     `part-00000-....parquet` 여러 개 + `_SUCCESS`가 있는 형태) 둘 다 지원한다.
@@ -111,9 +115,17 @@ def read_parquet(key: str, columns: list[str] | None = None) -> pd.DataFrame | N
     args:
         key: 읽을 parquet 객체의 전체 키, 또는 Spark 다중 파트 출력의 prefix
         columns: 읽을 컬럼만 지정(None이면 전체)
+        date_range: (start, end) "YYYY-MM-DD" 문자열(둘 다 포함) — 지정하면 `key`가
+            Spark `partitionBy("date")`로 쓰인 `key/date=YYYY-MM-DD/part-*.parquet`
+            레이아웃이라고 보고 `_read_parquet_by_date_range()`로 위임한다(그
+            함수 docstring 참고). None이면(기본) prefix 전체를 읽는다 — 파티션
+            없는 데이터셋(station_master 등)은 계속 이 경로를 쓴다.
     returns:
         pd.DataFrame, 키(이자 prefix)가 아무것도 없으면 None
     """
+    if date_range is not None:
+        return _read_parquet_by_date_range(key, date_range, columns=columns)
+
     body = get_object_bytes(key)
     if body is not None:
         return pq.read_table(io.BytesIO(body), columns=columns).to_pandas()
@@ -124,6 +136,52 @@ def read_parquet(key: str, columns: list[str] | None = None) -> pd.DataFrame | N
         return None
     frames = [df for df in read_parquet_many(part_keys, columns=columns) if df is not None]
     return pd.concat(frames, ignore_index=True) if frames else None
+
+
+def _read_parquet_by_date_range(
+    key: str, date_range: tuple[str, str], columns: list[str] | None
+) -> pd.DataFrame | None:
+    """`date=` Hive 파티션 레이아웃에서 지정한 날짜 범위의 서브prefix만 나열/다운로드한다.
+
+    쌓인 전체 기간이 아니라 실제로 필요한 기간 크기에만 네트워크/메모리 비용이
+    비례하게 하려는 용도다(예: training의 고정 학습 구간, monitor_performance의
+    최근 N개월) — prefix 전체를 나열하는 `read_parquet()`의 기본 경로는 쌓인
+    전체 히스토리를 매번 다 훑는다.
+
+    Spark는 파티션 컬럼 값을 파일 내용에 넣지 않고 디렉터리명(`date=YYYY-MM-DD/`)
+    으로만 표현한다(Hive 컨벤션) — 그래서 파일에서 읽은 결과엔 "date" 컬럼이 아예
+    없다. 여기서는 그 값을 파일 내용을 파싱해 역추출할 필요 없이, 애초에 그 값으로
+    직접 만든 서브prefix를 순회하는 것이므로 반복 중인 날짜 문자열을 그대로 붙인다.
+
+    args:
+        key: Spark `partitionBy("date")` 출력의 prefix(파티션 폴더들의 부모)
+        date_range: (start, end) "YYYY-MM-DD" 문자열, 둘 다 포함
+        columns: 읽을 컬럼(None이면 전체) — "date"가 포함돼도/안 돼도 결과에는
+            항상 복원된 "date"가 있고, 지정 시 그 컬럼 순서를 그대로 맞춰 반환한다
+    returns:
+        pd.DataFrame, 범위 안에 데이터가 하나도 없으면 None
+    """
+    start, end = date_range
+    prefix = key if key.endswith("/") else f"{key}/"
+    file_columns = [c for c in columns if c != "date"] if columns is not None else None
+
+    frames = []
+    for day in pd.date_range(start, end, freq="D"):
+        date_str = day.strftime("%Y-%m-%d")
+        part_keys = sorted(k for k in list_keys(f"{prefix}date={date_str}/") if k.endswith(".parquet"))
+        if not part_keys:
+            continue
+        for df in read_parquet_many(part_keys, columns=file_columns):
+            if df is None:
+                continue
+            df = df.copy()
+            df["date"] = date_str
+            frames.append(df)
+
+    if not frames:
+        return None
+    result = pd.concat(frames, ignore_index=True)
+    return result[columns] if columns is not None else result
 
 
 def read_parquet_many(keys: list[str], columns: list[str] | None = None, max_workers: int = 16) -> list[pd.DataFrame | None]:

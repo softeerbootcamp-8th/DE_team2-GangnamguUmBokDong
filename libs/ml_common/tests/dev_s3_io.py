@@ -55,6 +55,35 @@ def test_read_parquet_reads_spark_style_multi_part_directory():
     assert sorted(result["a"].tolist()) == [1, 2, 3, 4]
 
 
+def test_read_parquet_date_range_reads_only_requested_partitions():
+    """Spark의 partitionBy("date") 출력(key/date=YYYY-MM-DD/part-*.parquet, 파일
+    내용엔 date 컬럼이 없음 — Hive 컨벤션)에서 date_range로 지정한 날짜만 나열/
+    다운로드하고, 범위 밖 파티션은 아예 안 건드리는지 확인한다."""
+    # Spark처럼 파일 내용엔 "date" 컬럼이 없다 — 파티션 폴더명에만 있음.
+    s3_io.write_parquet(pd.DataFrame({"a": [1, 2]}), "mh/date=2025-11-01/part-00000.parquet")
+    s3_io.write_parquet(pd.DataFrame({"a": [3]}), "mh/date=2025-11-02/part-00000.parquet")
+    # 범위 밖 — 읽히면 안 된다.
+    s3_io.write_parquet(pd.DataFrame({"a": [999]}), "mh/date=2025-12-01/part-00000.parquet")
+
+    result = s3_io.read_parquet("mh", date_range=("2025-11-01", "2025-11-02"))
+
+    assert sorted(result["a"].tolist()) == [1, 2, 3]
+    assert sorted(result["date"].unique().tolist()) == ["2025-11-01", "2025-11-02"]
+
+
+def test_read_parquet_date_range_with_columns_keeps_date_and_requested_order():
+    s3_io.write_parquet(pd.DataFrame({"a": [1], "b": [10]}), "mh2/date=2025-11-01/part-00000.parquet")
+
+    result = s3_io.read_parquet("mh2", columns=["date", "a"], date_range=("2025-11-01", "2025-11-01"))
+
+    assert list(result.columns) == ["date", "a"]
+    assert result["date"].tolist() == ["2025-11-01"]
+
+
+def test_read_parquet_date_range_missing_partitions_returns_none():
+    assert s3_io.read_parquet("mh3", date_range=("2025-01-01", "2025-01-02")) is None
+
+
 def test_read_json_missing_key_returns_none():
     assert s3_io.read_json("no/such/file.json") is None
 
