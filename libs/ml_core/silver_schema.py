@@ -9,7 +9,7 @@
 
 키 생성 규칙(`silver_key()`)은 `collector/storage.py`의 `_layer_key()`와 정확히
 같은 문자열 포맷을 쓴다 — 그래야 실제 collector가 나중에 쓰기 시작해도 같은
-위치를 가리킨다. `ml_common`은 `collector`를 import하지 않는다(서로 다른
+위치를 가리킨다. `ml_core`은 `collector`를 import하지 않는다(서로 다른
 인스턴스에 독립 배포되는 모듈이라 의존 관계를 만들면 안 됨) — 같은 규칙을
 독립적으로 복제해서 쓴다.
 """

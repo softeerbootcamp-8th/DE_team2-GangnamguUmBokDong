@@ -1,7 +1,7 @@
 """training(학습 중 평가)과 inference(서빙 성능 모니터링)가 공유하는 평가 지표 함수.
 
 `training/train_common.py`(학습 직후 테스트셋 평가), `training/monitor_performance.py`
-(매달 실측 성능 재평가), `ml_common/scoring.py`의 `print_metrics()`(배치 조회 결과 검증)가
+(매달 실측 성능 재평가), `ml_core/scoring.py`의 `print_metrics()`(배치 조회 결과 검증)가
 전부 같은 정의의 poisson deviance/pinball loss를 써야 baseline과 최신 값을 정확히
 비교할 수 있다 — 각자 재구현하면 부동소수점 수준의 미세한 차이라도 조용히 갈라질
 위험이 있어 한 곳으로 모았다.

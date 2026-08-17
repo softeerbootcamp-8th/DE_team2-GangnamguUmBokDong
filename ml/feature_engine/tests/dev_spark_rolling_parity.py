@@ -10,14 +10,14 @@ src/rolling_window_features.py(pandas, 이미 검증된 기준 구현)와 정확
 
 import pandas as pd
 import pytest
-from ml_common import common_config as pandas_config
-from ml_common.rolling_window_features import (
+from ml_core import common_config as pandas_config
+from ml_core.rolling_window_features import (
     censored_rolling_counts as pandas_censored_rolling_counts,
 )
-from ml_common.rolling_window_features import (
+from ml_core.rolling_window_features import (
     future_rolling_counts as pandas_future_rolling_counts,
 )
-from ml_common.rolling_window_features import (
+from ml_core.rolling_window_features import (
     lookup_count_at_ticks as pandas_lookup_count_at_ticks,
 )
 

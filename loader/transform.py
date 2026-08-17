@@ -262,7 +262,7 @@ def forecast_points_from_predictions(df: pd.DataFrame, batch_run_at: datetime) -
 
     station_id("ST-101" 등)와 stations.sta_id("101" 등, bike_station_realtime의
     raw stationId를 그대로 씀)가 같은 값 공간인지는 실제 데이터로 아직 확정되지
-    않았다 — libs/ml_common/silver_schema.py의 컬럼 매핑이 둘 다 raw stationId를
+    않았다 — libs/ml_core/silver_schema.py의 컬럼 매핑이 둘 다 raw stationId를
     그대로 통과시키는 것처럼 보이지만, 실제 Seoul OpenAPI 응답으로 검증 전까지는
     가정으로만 남겨둔다.
     """

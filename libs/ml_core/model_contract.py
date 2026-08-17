@@ -5,14 +5,14 @@
 **정확히 같은 순서·같은 station_id 카테고리 인코딩**으로 feature를 넣어야 한다 —
 하나라도 어긋나면 모델이 조용히 엉뚱한 컬럼을 다른 의미로 읽는 사고가 난다. 이
 계약(feature 목록 + station_id 카테고리 저장/로드)을 두 인스턴스가 각자 복사해
-두면 한쪽만 고치고 잊어버리는 사고가 나므로, `ml_common/`으로 모아 양쪽이 같은
+두면 한쪽만 고치고 잊어버리는 사고가 나므로, `ml_core/`으로 모아 양쪽이 같은
 모듈을 import하게 한다.
 
 `LAG_ROLLING_FEATURE_COLUMNS`는 `common_config.LAG_HOURS`/`ROLLING_WINDOWS`에서
 결정적으로 유도되는 이름 목록이다 — 실제 값을 계산하는 로직(`feature_engine/spark/build_features.py`)은
 여기 없다(그건 feature_engine의 책임). `feature_engine/spark/build_features.py`는 이 상수를 그대로
 import해서 자기가 만드는 컬럼 이름이 이 계약과 어긋나지 않게 맞춘다 — 즉 "스키마
-정의"는 `ml_common/`이 소유하고, "그 스키마를 실제로 채우는 계산"은 feature_engine이
+정의"는 `ml_core/`이 소유하고, "그 스키마를 실제로 채우는 계산"은 feature_engine이
 소유하는 구조다.
 
 **dtype도 같은 이유로 계약에 포함**: `NATIVE_COLUMN_DTYPES`/`FEATURE_COLUMN_DTYPES`는

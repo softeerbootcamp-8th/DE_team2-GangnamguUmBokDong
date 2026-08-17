@@ -12,7 +12,7 @@ dependencies = [
 package = false
 
 [tool.uv.sources]
-ml_common = { path = "../libs/ml_common", editable = true }
+ml_core = { path = "../libs/ml_core", editable = true }
 
 [dependency-groups]
 dev = [

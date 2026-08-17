@@ -22,7 +22,7 @@ ml/data/parquet/서울특별시 공공자전거 대여이력 정보_2501.parquet
 ml/data/output/analysis_summary.json
 ```
 
-총 약 1.1GB. 폴더 구조를 정확히 그대로 유지해야 한다(`libs/ml_common/paths.py`가
+총 약 1.1GB. 폴더 구조를 정확히 그대로 유지해야 한다(`libs/ml_core/paths.py`가
 `ml/` 기준 상대경로로 이 경로들을 계산함 — 모든 명령은 반드시 `ml/` 디렉터리에서
 실행할 것).
 
@@ -51,7 +51,7 @@ cd ml
 (cd inference && uv sync)             # pandas만
 ```
 
-`libs/ml_common`은 각 폴더의 `pyproject.toml`이 `path = "../../libs/ml_common"`로
+`libs/ml_core`은 각 폴더의 `pyproject.toml`이 `path = "../../libs/ml_core"`로
 editable 참조하므로 따로 sync할 필요 없음(각 uv sync에 자동 포함).
 
 ## 3. 피처 생성 (2차 정제, Spark)

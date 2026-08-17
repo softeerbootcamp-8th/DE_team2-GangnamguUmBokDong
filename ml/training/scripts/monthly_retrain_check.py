@@ -6,7 +6,7 @@
 그 자리에서 덮어씀)을 트리거하려면 `--execute`를 명시해야 한다 — 매달 자동으로
 돌리는 운영 환경에서는 그 스케줄러(cron/EMR step 등)가 `--execute`로 호출하면 된다.
 
-기준(어느 정도 악화되면 재학습할지)은 [common_config.py](../../../libs/ml_common/common_config.py)에서
+기준(어느 정도 악화되면 재학습할지)은 [common_config.py](../../../libs/ml_core/common_config.py)에서
 관리한다 — 여기서는 그 기준을 적용만 한다.
 
 **주의**: `--execute`는 재학습된 모델로 챔피언을 즉시 덮어쓴다(챌린저를 따로 만들어
@@ -22,7 +22,7 @@ import argparse
 import json
 import subprocess
 
-from ml_common.paths import ML_ROOT
+from ml_core.paths import ML_ROOT
 
 from .. import config
 from ..monitor_performance import MODEL_SPECS, check_all_models

@@ -29,7 +29,7 @@ def build_population_profile() -> pd.DataFrame:
     df = s3_io.read_parquet(config.POPULATION_PARQUET)
     if df is None:
         raise FileNotFoundError(f"S3에 없음: {config.POPULATION_PARQUET}")
-    # .dt.dayofweek/.dt.hour는 기본 int32를 낸다 — ml_common/model_contract.NATIVE_COLUMN_DTYPES와
+    # .dt.dayofweek/.dt.hour는 기본 int32를 낸다 — ml_core/model_contract.NATIVE_COLUMN_DTYPES와
     # 맞춰 int8로.
     df["dow"] = df["hour_ts"].dt.dayofweek.astype("int8")
     df["hour"] = df["hour_ts"].dt.hour.astype("int8")
@@ -43,7 +43,7 @@ def build_population_profile() -> pd.DataFrame:
     ).reset_index()
 
     # groupby().mean()은 float32 원본(pop_resd 등)을 집계해도 항상 float64를
-    # 낸다 — ml_common/model_contract.FEATURE_COLUMN_DTYPES와 맞춰 다운캐스트.
+    # 낸다 — ml_core/model_contract.FEATURE_COLUMN_DTYPES와 맞춰 다운캐스트.
     mean_cols = ["pop_resd_mean", "pop_long_foreign_mean", "pop_short_foreign_mean", "pop_total_mean"]
     profile[mean_cols] = profile[mean_cols].astype("float32")
     profile["n_samples"] = profile["n_samples"].astype("int32")

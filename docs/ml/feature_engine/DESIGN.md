@@ -75,7 +75,7 @@ tick으로 전환): 2,582개 활성 정류소 × 8,760시간 = 22,618,320행. `r
   "서비스 없음"이 "수요 0"으로 잘못 학습되지 않는다.
 
 sparse 타겟/rolling 카운트를 그리드의 특정 tick에서 조회하려면
-`ml_common.rolling_window_features.lookup_count_at_ticks()`를 쓴다 — "그 tick 이하
+`ml_core.rolling_window_features.lookup_count_at_ticks()`를 쓴다 — "그 tick 이하
 중 가장 최근 delta 이후의 값"을 찾는 as-of 조회다.
 
 ## 2. lag/rolling — 시간 기준(gap-aware), tick 밀도 무관
@@ -104,7 +104,7 @@ sparse 타겟/rolling 카운트를 그리드의 특정 tick에서 조회하려�
 완료)와 서빙 시점(방금 지난 데이터의 4~8%만 로그에 보임)의 분포가 어긋난다
 (train-serving skew). `build_rolling_rental_features.py`가 `[T-embargo-window,
 T-embargo)` 윈도우로 그 시점에 실제로 관측 가능했던 값만 계산해서
-(`ml_common.rolling_window_features.censored_rolling_counts()`), `features.py`가
+(`ml_core.rolling_window_features.censored_rolling_counts()`), `features.py`가
 대여의 "직전 1시간"에 해당하는 항(`rental_lag_1h`, `roll_mean/std_3h·24h`의 최신
 tick)만 이 값으로 대체한다. 반납은 반납 이벤트 자체가 로그 시점이라 이 문제가
 없어서 raw 값을 그대로 쓴다. 자세한 설계는 [REALTIME_FEATURES.md](../REALTIME_FEATURES.md).
@@ -143,7 +143,7 @@ tick)만 이 값으로 대체한다. 반납은 반납 이벤트 자체가 로그
 
 ## 6. 하이퍼파라미터 프로필
 
-censoring 윈도우/LightGBM 파라미터 등은 `ml_common/common_config.py`가
-`ML_PROFILE` 환경변수(기본 `default`)로 `ml_common/profiles/{이름}.json`을 읽어
+censoring 윈도우/LightGBM 파라미터 등은 `ml_core/common_config.py`가
+`ML_PROFILE` 환경변수(기본 `default`)로 `ml_core/profiles/{이름}.json`을 읽어
 제공한다. 개별 환경변수(`ROLLING_EMBARGO_MINUTES=45` 등)는 프로필 값 위에
-추가로 덮어쓸 수 있다 — 상세는 [ml_common README](../../libs/ml_common/README.md).
+추가로 덮어쓸 수 있다 — 상세는 [ml_core README](../../libs/ml_core/README.md).

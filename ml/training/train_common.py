@@ -17,15 +17,15 @@ import lightgbm as lgb
 import numpy as np
 import pandas as pd
 from core import s3 as s3_io
-from ml_common import model_io
-from ml_common.metrics import pinball_loss as _pinball_loss
-from ml_common.metrics import poisson_deviance as _poisson_deviance
-from ml_common.model_contract import (
+from ml_core import model_io
+from ml_core.metrics import pinball_loss as _pinball_loss
+from ml_core.metrics import poisson_deviance as _poisson_deviance
+from ml_core.model_contract import (
     FEATURE_COLUMNS,
     load_station_dtype,
     station_categories_path,
 )
-from ml_common.paths import model_json_key, model_key
+from ml_core.paths import model_json_key, model_key
 
 from . import config
 

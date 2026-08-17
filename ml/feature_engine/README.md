@@ -23,16 +23,16 @@ Spark로** 담당한다.
 Spark 구현이 이미 pandas와 정확히 같은 값을 낸다는 것을 parity 테스트
 (`dev_spark_rolling_parity.py`/`dev_spark_build_features.py`/`dev_spark_incremental.py`)로
 확인했으므로, 피처엔지니어링(2차정제)은 Spark 코드만 유지한다. `feature_engine/legacy/`가
-`ml_common`(파라미터·경로 계약, `<repo-root>/libs/ml_common/` — `ml/`과 별도로
+`ml_core`(파라미터·경로 계약, `<repo-root>/libs/ml_core/` — `ml/`과 별도로
 관리되는 공유 라이브러리)만 참조하고 `spark/`를 import하지 않으므로, Spark
-쪽을 EMR에 올릴 때는 `feature_engine/spark/` + `libs/ml_common/` 디렉터리만 있으면
+쪽을 EMR에 올릴 때는 `feature_engine/spark/` + `libs/ml_core/` 디렉터리만 있으면
 된다. 분류 근거는 [../LEGACY_AUDIT.md](../LEGACY_AUDIT.md) 참고.
 
 ## 세팅
 
 ```bash
 cd ml/feature_engine
-uv sync   # pyproject.toml/uv.lock 기준 .venv 생성 — pyspark(Python 3.11) + ml_common(editable) 포함
+uv sync   # pyproject.toml/uv.lock 기준 .venv 생성 — pyspark(Python 3.11) + ml_core(editable) 포함
 ```
 
 필요한 원본 데이터(이미 `ml/data/`에 있어야 함)는 [DATA_CATALOG.md](../DATA_CATALOG.md) 참고.
@@ -55,7 +55,7 @@ spark-submit --deploy-mode cluster feature_engine/spark/run_pipeline.py
 실험할 때 챔피언 산출물을 덮어쓸 걱정 없이
 `ROLLING_EMBARGO_MINUTES=45 ./feature_engine/.venv/bin/python -m feature_engine.spark.run_pipeline`처럼
 환경변수만 바꿔 실행하면 된다(또는 `ML_PROFILE=embargo45`로 프로필째 교체 —
-[ml_common README](../../libs/ml_common/README.md) 참고).
+[ml_core README](../../libs/ml_core/README.md) 참고).
 
 **주의**: Spark 스크립트/테스트는 반드시 `feature_engine/.venv`(uv, Python 3.11)로
 실행할 것. `training`/`inference`의 venv는 pyspark가 지원하지 않는 Python
@@ -84,7 +84,7 @@ cd ml
 ./feature_engine/.venv/bin/python -m pytest feature_engine/tests/dev_spark_rolling_parity.py feature_engine/tests/dev_spark_build_features.py feature_engine/tests/dev_spark_incremental.py -q
 ```
 
-`dev_spark_rolling_parity.py`/`dev_spark_incremental.py`는 pandas(`ml_common.rolling_window_features`,
+`dev_spark_rolling_parity.py`/`dev_spark_incremental.py`는 pandas(`ml_core.rolling_window_features`,
 이미 검증된 기준 구현)와 Spark 버전이 정확히 같은 결과를 내는지 대조하는 핵심
 회귀 테스트다 — `spark/` 쪽을 고치면 반드시 다시 통과하는지 확인해야 한다.
 
@@ -105,8 +105,8 @@ legacy 전용 테스트(1차 정제 진단, 옛 pandas 2차정제 단위 테스�
 | `data/processed_v2/spark/{PARAM_COMBO_ID}/rolling_rental_features_2025.parquet` | 2차정제(Spark) | point-in-time censored 대여 카운트(sparse) |
 | `data/processed_v2/spark/{PARAM_COMBO_ID}/station_hour_features_2025.parquet` | 2차정제(Spark) | **최종 feature 테이블** — `training/`이 읽는 입력 |
 
-`training`/`inference`는 `ml_common.paths`를 통해 이 경로를 그대로 읽는다 —
-`libs/ml_common/paths.py`가 `feature_engine/spark/config.py`와 정확히 같은 공식
+`training`/`inference`는 `ml_core.paths`를 통해 이 경로를 그대로 읽는다 —
+`libs/ml_core/paths.py`가 `feature_engine/spark/config.py`와 정확히 같은 공식
 (`FEATURE_ENGINEERING_OUTPUT_ROOT`/`FEATURE_PARAM_COMBO_ID` 환경변수 포함)으로
 `{PARAM_COMBO_ID}` 경로를 계산하므로 별도 복사/심링크가 필요 없다. 다른 파라미터
 조합으로 실험할 때는 두 환경변수를 Spark 실행/training·inference 실행 양쪽에

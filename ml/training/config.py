@@ -1,16 +1,16 @@
 """training(LightGBM 학습) 전용 경로·상수.
 
 `feature_engine`이 만든 multi-horizon feature 테이블을 S3에서 읽어
-(`MULTI_HORIZON_FEATURES_TABLE_PARQUET`, `ml_common/`에서 공유) `MODELS_PREFIX`
+(`MULTI_HORIZON_FEATURES_TABLE_PARQUET`, `ml_core/`에서 공유) `MODELS_PREFIX`
 (S3 키 prefix, `models/`)에 학습 결과를 저장한다. `inference`도 같은
-`MODELS_PREFIX`를 읽어야 하므로 그 값 자체는 `ml_common/paths.py`가 소유하고,
+`MODELS_PREFIX`를 읽어야 하므로 그 값 자체는 `ml_core/paths.py`가 소유하고,
 여기서는 학습에만 쓰는 값(split 기간, quantile 목록 등)을 정의한다.
 """
 
 import os
 
-from ml_common import common_config
-from ml_common.paths import (
+from ml_core import common_config
+from ml_core.paths import (
     MODELS_PREFIX,
     MULTI_HORIZON_FEATURES_TABLE_PARQUET,
     PROCESSED_V2_PREFIX,

@@ -33,7 +33,7 @@ EMR 대상이다(로컬 검증은 짧은 기간의 합성 데이터로만).
 
 from __future__ import annotations
 
-from ml_common.model_contract import LAG_ROLLING_FEATURE_COLUMNS
+from ml_core.model_contract import LAG_ROLLING_FEATURE_COLUMNS
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 

@@ -2,7 +2,7 @@
 
 `src/experiment_log.py`(학습 실행 기록, append-only 로그)와는 목적이 다르다 — 여기는
 "지금 상태" 하나만 알면 되는 워터마크라 파일 하나에 최신값만 덮어쓴다. Spark의
-파일 리더/라이터를 쓰지 않고 `ml_common.s3_io`(boto3)로 직접 처리한다 — 워터마크
+파일 리더/라이터를 쓰지 않고 `ml_core.s3_io`(boto3)로 직접 처리한다 — 워터마크
 파일은 초소형(몇십 바이트)이라 Spark를 띄울 이유가 없다. `path`는 `config.
 WATERMARK_PATH`(s3a:// 스킴이 아니라 순수 S3 키 — config.py의 `OUTPUT_ROOT_KEY`
 참고)를 그대로 받는다.

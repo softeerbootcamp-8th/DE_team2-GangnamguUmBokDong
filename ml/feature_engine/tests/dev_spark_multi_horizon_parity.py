@@ -8,7 +8,7 @@ lag/rolling(anchor 쪽)은 그대로, 날씨/캘린더/타겟(target 쪽)만 (k-
 
 import pandas as pd
 import pytest
-from ml_common.model_contract import LAG_ROLLING_FEATURE_COLUMNS
+from ml_core.model_contract import LAG_ROLLING_FEATURE_COLUMNS
 
 pyspark = pytest.importorskip("pyspark")
 

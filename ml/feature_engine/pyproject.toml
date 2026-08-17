@@ -6,7 +6,7 @@ requires-python = "==3.11.*"
 dependencies = [
     "pyspark==3.5.3",
     "pyproj",
-    "ml_common",
+    "ml_core",
 ]
 
 [dependency-groups]
@@ -16,4 +16,4 @@ dev = ["pytest", "moto[s3]>=5.2.2"]
 package = false
 
 [tool.uv.sources]
-ml_common = { path = "../../libs/ml_common", editable = true }
+ml_core = { path = "../../libs/ml_core", editable = true }

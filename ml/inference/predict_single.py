@@ -62,13 +62,13 @@ from collections.abc import Sequence
 import numpy as np
 import pandas as pd
 from core import s3 as s3_io, silver_schema
-from ml_common.model_contract import (
+from ml_core.model_contract import (
     FEATURE_COLUMN_DTYPES,
     FEATURE_COLUMNS,
     RENTAL_EXPOSURE_DTYPE,
     load_station_dtype,
 )
-from ml_common.scoring import predict
+from ml_core.scoring import predict
 
 from . import config
 
@@ -1025,7 +1025,7 @@ def _build_feature_row(
     df.attrs["population_fallback"] = population_fallback
 
     # Python 스칼라로 조립한 행이라 기본 float64/int64로 들어와 있다 — 학습 데이터
-    # (feature_engine이 다운캐스트한 float32/int8/int16, ml_common.model_contract.FEATURE_COLUMN_DTYPES)와
+    # (feature_engine이 다운캐스트한 float32/int8/int16, ml_core.model_contract.FEATURE_COLUMN_DTYPES)와
     # dtype을 맞춘다. 값 자체는 바뀌지 않지만(LightGBM은 어차피 내부적으로 캐스팅해서
     # 예측 결과에 영향 없음) 학습/서빙 스키마가 정확히 일치해야 한다는 이 프로젝트의
     # 원칙(model_contract.py 모듈 docstring)을 dtype까지 지키기 위함.

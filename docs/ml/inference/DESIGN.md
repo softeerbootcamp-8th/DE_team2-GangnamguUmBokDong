@@ -21,11 +21,11 @@ importance 1위)이다 — "이미 일어난 일"이라 사용자가 시나리�
 - **`_get_history_by_station()`** — `station_hour_merged_2025.parquet`(시간 단위
   집계). 반납(return) 전체와 대여의 `lag_24h/168h`처럼 지연 관측 문제가 없거나
   예측 시점엔 이미 해소된 피처에 쓴다.
-- **`_get_rental_events_by_station()`**(`ml_common.trip_events.load_rental_trip_events()`) —
+- **`_get_rental_events_by_station()`**(`ml_core.trip_events.load_rental_trip_events()`) —
   트립 단위(start_dt/end_dt) 원본. 대여의 "직전 1시간" 4개(`rental_lag_1h`,
   `roll_mean/std_3h·24h`)에 쓴다 — 대여는 반납이 완료돼야 로그에 잡히는 지연
   관측 문제가 있어서, 시간 단위 집계만으로는 그 시점에 실제로 관측 가능했던
-  값을 재현할 수 없기 때문이다(`ml_common.rolling_window_features.count_visible_in_window()`로
+  값을 재현할 수 없기 때문이다(`ml_core.rolling_window_features.count_visible_in_window()`로
   계산). 실제 서비스로 갈 때는 이 두 함수만 각각 실시간 소스(집계 스토어 /
   트립 이벤트 버퍼)로 교체하면 나머지 로직은 그대로 재사용된다.
 
@@ -69,15 +69,15 @@ feature 각각을 독립적으로 대체하는 방식이라 여러 시간 앞을
 별도 보정 로직을 얹는 복잡도 대비 이득이 낮다고 판단해 지금은 month까지만
 유지한다.
 
-## 4. `ml_common/`에서 가져오는 것과 이 폴더에 남은 것
+## 4. `ml_core/`에서 가져오는 것과 이 폴더에 남은 것
 
-- `ml_common.model_contract.FEATURE_COLUMNS`/`load_station_dtype()` — training이
+- `ml_core.model_contract.FEATURE_COLUMNS`/`load_station_dtype()` — training이
   저장한 station_id 카테고리를 그대로 로드해야 모델이 station_id를 올바르게
   해석한다(모델 계약, [training/DESIGN.md](../training/DESIGN.md) 4절 참고).
-- `ml_common.scoring.predict()` — 저장된 booster 채점 로직(exposure 복원,
+- `ml_core.scoring.predict()` — 저장된 booster 채점 로직(exposure 복원,
   conformal 보정 적용) — `monitor_performance.py`와 동일한 로직을 씀.
-- `ml_common.rolling_window_features.count_visible_in_window()`,
-  `ml_common.trip_events.load_rental_trip_events()` — point-in-time censoring을
+- `ml_core.rolling_window_features.count_visible_in_window()`,
+  `ml_core.trip_events.load_rental_trip_events()` — point-in-time censoring을
   배치(`feature_engine`)와 서빙(이 폴더)이 같은 규칙으로 계산해야 한다.
 
 이 폴더에 남은 건 "서빙 시나리오 조립"(fallback 판정, 프로필 조회, CLI/함수

@@ -18,19 +18,19 @@ station_master/targets/station_status/weather/population(예전엔 "이미 S3에
 `common_config.py`(ml/ 루트, 순수 상수 모듈 — pandas/pyspark 등 무거운 의존성 없음)에서
 가져온다. 이 파일이 `src/`를 직접 import하지 않는 건 그대로 유지한다 — `common_config.py`
 하나만 두 패키지가 같이 참조하는 구조라 EMR에 이 패키지만 올려도 그 작은 파일 하나만
-같이 올리면 된다. 같은 이유로 `libs/ml_common/paths.py`도 import하지 않고 같은 이름의
+같이 올리면 된다. 같은 이유로 `libs/ml_core/paths.py`도 import하지 않고 같은 이름의
 상수를 독립적으로 다시 정의한다 — **두 파일이 가리키는 실제 키는 반드시 같아야
 하므로, 한쪽을 고치면 다른 쪽도 같이 고칠 것.** 컬럼명 매핑·source_id는 대신
-`libs/ml_common/silver_schema.py`를 그대로 import해서 쓴다(그건 순수 상수/문자열
+`libs/ml_core/silver_schema.py`를 그대로 import해서 쓴다(그건 순수 상수/문자열
 모듈이라 가볍고, `inference`의 실시간 조회와 같은 스키마를 보장해야 해서 중복을
 피했다).
 """
 
 import os
 
-from ml_common import common_config
+from ml_core import common_config
 
-# ml_common.s3_io가 boto3 쪽에서 쓰는 것과 같은 환경변수 — 기본값은 dev/MinIO의
+# ml_core.s3_io가 boto3 쪽에서 쓰는 것과 같은 환경변수 — 기본값은 dev/MinIO의
 # 기본 버킷 이름("local-dev", dev/s3_client.py와 동일). 합성 데이터로 Spark
 # DataFrame을 직접 만들어 쓰는 테스트는 이 값을 몰라도 되므로(실제 S3 I/O를
 # 안 함), strict하게 요구하지 않고 소프트 기본값을 둔다.
@@ -87,10 +87,10 @@ PARAM_COMBO_ID = os.environ.get(
     "FEATURE_PARAM_COMBO_ID",
     f"w{ROLLING_WINDOW_MINUTES}_e{ROLLING_EMBARGO_MINUTES}_t{ROLLING_TICK_MINUTES}",
 )
-# libs/ml_common/paths.py의 FEATURE_ENGINEERING_OUTPUT_DIR과 동일 공식
+# libs/ml_core/paths.py의 FEATURE_ENGINEERING_OUTPUT_DIR과 동일 공식
 # ("processed/features/{조합ID}") — dev/S3_DATA_CATALOG.md의 prefix를 따른다.
 _OUTPUT_PREFIX = os.environ.get("FEATURE_ENGINEERING_OUTPUT_PREFIX", "processed/features")
-# Spark가 아니라 plain boto3(ml_common.s3_io)로 읽고 쓰는 워터마크용 — s3a:// 스킴이
+# Spark가 아니라 plain boto3(ml_core.s3_io)로 읽고 쓰는 워터마크용 — s3a:// 스킴이
 # 필요 없는 순수 키(watermark.py 참고, Spark 리더/라이터를 안 씀).
 OUTPUT_ROOT_KEY = f"{_OUTPUT_PREFIX}/{PARAM_COMBO_ID}"
 OUTPUT_ROOT = _s3a(OUTPUT_ROOT_KEY)
@@ -98,7 +98,7 @@ ROLLING_RENTAL_FEATURES_PARQUET = f"{OUTPUT_ROOT}/rolling_rental_features_2025.p
 MERGED_TABLE_PARQUET = f"{OUTPUT_ROOT}/station_hour_merged_2025.parquet"
 FEATURES_TABLE_PARQUET = f"{OUTPUT_ROOT}/station_hour_features_2025.parquet"
 # FEATURES_TABLE_PARQUET의 각 행(T0)을 horizon=1..HORIZON_COUNT로 self-join한 학습 테이블
-# (build_multi_horizon_features.py) — libs/ml_common/paths.py의 같은 이름 상수와 동일 공식.
+# (build_multi_horizon_features.py) — libs/ml_core/paths.py의 같은 이름 상수와 동일 공식.
 MULTI_HORIZON_FEATURES_TABLE_PARQUET = f"{OUTPUT_ROOT}/station_hour_features_multihorizon_2025.parquet"
 WATERMARK_PATH = f"{OUTPUT_ROOT_KEY}/_watermark.json"
 

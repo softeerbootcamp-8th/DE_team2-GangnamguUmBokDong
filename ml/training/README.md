@@ -10,7 +10,7 @@
 
 ```bash
 cd ml/training
-uv sync   # pyproject.toml/uv.lock 기준 .venv 생성 — lightgbm/pandas/numpy + ml_common(editable) 포함
+uv sync   # pyproject.toml/uv.lock 기준 .venv 생성 — lightgbm/pandas/numpy + ml_core(editable) 포함
 brew install libomp   # macOS에서 LightGBM 실행에 필요
 ```
 
@@ -40,8 +40,8 @@ cd ml
 | `{rental,return}_metrics.json` | 테스트셋 평가 지표(다음 모니터링의 baseline) |
 
 로컬 개발 시 이 경로가 기본값이고, 실제 배포에서는 `MODELS_ROOT` 환경변수로
-override할 수 있다(`inference`도 같은 값을 봐야 하므로 `ml_common.paths`가
-두 폴더 공통 기본 경로를 정의 — [ml_common README](../../libs/ml_common/README.md)).
+override할 수 있다(`inference`도 같은 값을 봐야 하므로 `ml_core.paths`가
+두 폴더 공통 기본 경로를 정의 — [ml_core README](../../libs/ml_core/README.md)).
 
 ## 하이퍼파라미터 스윕 / 실험 (legacy)
 
@@ -76,7 +76,7 @@ override할 수 있다(`inference`도 같은 값을 봐야 하므로 `ml_common.
 ## 실험용 노트북 / 청크 학습 (git에 안 올림)
 
 `training/experiments/`에 프로덕션 코드를 전혀 건드리지 않는 실험들이 있다(전부
-`training.train_common`/`ml_common`에서 읽기 전용으로 값만 가져다 씀) — 로컬
+`training.train_common`/`ml_core`에서 읽기 전용으로 값만 가져다 씀) — 로컬
 산출물이라 저장소 `.gitignore`의 `experiments/` 규칙대로 **git에 올리지
 않는다**(로컬 디스크에는 그대로 있고, 필요하면 그대로 실행 가능):
 
@@ -94,5 +94,5 @@ override할 수 있다(`inference`도 같은 값을 봐야 하므로 `ml_common.
 
 ```bash
 cd ml
-./training/.venv/bin/python -m pytest training/tests/ ../libs/ml_common/tests -q
+./training/.venv/bin/python -m pytest training/tests/ ../libs/ml_core/tests -q
 ```

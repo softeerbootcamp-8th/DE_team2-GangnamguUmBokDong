@@ -1078,7 +1078,7 @@ README/`run_full_pipeline.py`의 엔트리포인트로 쓰이고 있음을 재�
 
 상세는 [LEGACY_AUDIT.md](LEGACY_AUDIT.md) 참고.
 
-## 30. 환경 관리를 uv로 전환 + `common`을 `libs/ml_common/`으로 분리(독립 라이브러리화)
+## 30. 환경 관리를 uv로 전환 + `common`을 `libs/ml_core/`으로 분리(독립 라이브러리화)
 
 **배경 1(uv)**: 사용자가 환경 관리를 pip+venv(공용 `.venv`/`.venv-spark`,
 `requirements.txt`)에서 `uv`로 바꾸기로 함 — `feature_engine`/`training`/`inference`
@@ -1088,36 +1088,36 @@ EMR 8.0.0 기본값), 나머지 둘은 `>=3.11`. 세 폴더가 실제로 무엇�
 grep으로 정확히 추적해 의존성을 채웠다(예: inference는 lightgbm을 직접 import
 안 하지만 `common.scoring`을 통해 씀 — 직접 import하는 것만 명시).
 
-**배경 2(ml_common 분리)**: 사용자가 "본 레포에서는 `common`을 `ml`과 같은
-계층의 `lib/` 폴더 아래 `ml_common`으로 따로 만들어 넣을 것"이라고 확정 —
+**배경 2(ml_core 분리)**: 사용자가 "본 레포에서는 `common`을 `ml`과 같은
+계층의 `lib/` 폴더 아래 `ml_core`으로 따로 만들어 넣을 것"이라고 확정 —
 `lib/`가 이 저장소의 다른 서비스(`client`/`etl`/`infra`/`weather-etl`)와도
 공유될 수 있는 자리라 `common`이란 일반적인 이름은 충돌 위험이 있어서
-`ml_common`으로 이름 붙임. `ml/common/` → `<repo-root>/libs/ml_common/`로
-`git mv`, 패키지 import명도 `common` → `ml_common`으로 전부 변경(처음엔
-디렉터리를 `ml-common`으로 만들었다가 오타였다고 정정받아 `ml_common`으로
-다시 바꿈 — 디렉터리명/프로젝트명/import명이 전부 `ml_common`으로 통일).
+`ml_core`으로 이름 붙임. `ml/common/` → `<repo-root>/libs/ml_core/`로
+`git mv`, 패키지 import명도 `common` → `ml_core`으로 전부 변경(처음엔
+디렉터리를 `ml-core`으로 만들었다가 오타였다고 정정받아 `ml_core`으로
+다시 바꿈 — 디렉터리명/프로젝트명/import명이 전부 `ml_core`으로 통일).
 feature_engine/training/inference/legacy/experiments 전체에서 `from common import`/
 `common.X`/`common/X` 패턴 60여 곳을 일괄 치환(대부분 perl — macOS 기본
 `sed -E`는 `\b`(단어 경계)를 지원하지 않아 처음에 조용히 실패했었음, GNU
 sed 없어서 perl로 교체).
 
 **진짜 문제 하나 발견**: `common/paths.py`의 `ML_ROOT = Path(__file__).resolve().parents[1]`은
-"내 파일 위치에서 두 칸 위가 `ml/`"라는 가정이었는데, `ml_common`이 `ml/`의
+"내 파일 위치에서 두 칸 위가 `ml/`"라는 가정이었는데, `ml_core`이 `ml/`의
 형제 디렉터리가 되면서(조상이 아니라 다른 가지) 이 가정 자체가 깨졌다 — `ml/`은
 `__file__`의 parents 체인 어디에도 없다. **cwd 기준으로 바꿔서 해결**
 (`ML_ROOT = Path.cwd()`) — 이 저장소 전체가 "`cd ml` 다음에 실행"을 전제로
 하므로(모든 README의 실행 명령이 그렇게 시작함) 그 컨벤션에 기대는 게
-`ml_common`이 자기 위치를 몰라도 되게(진짜 독립 라이브러리답게) 만드는
+`ml_core`이 자기 위치를 몰라도 되게(진짜 독립 라이브러리답게) 만드는
 가장 단순한 방법이었다. `training/scripts/monthly_retrain_check.py`가
 `ML_ROOT`를 쓰고 있어서 심볼 자체는 유지하고 계산 방식만 바꿈 — 이 파일이
 쓰던 `SPARK_PYTHON = ML_ROOT / ".venv-spark" / ...`도 uv 전환 이후 안 맞게 된
 옛 경로라 `feature_engine/.venv`로 같이 갱신.
 
-**검증**: `libs/ml_common/`은 `ml/pytest.ini`의 `dev_*.py` 규칙을 더 이상
+**검증**: `libs/ml_core/`은 `ml/pytest.ini`의 `dev_*.py` 규칙을 더 이상
 상속받지 못해서(다른 rootdir) 자체 `pyproject.toml`에 같은 규칙을 추가.
-세 폴더 모두 `uv sync`로 실제 `.venv` 재생성 + `uv lock`으로 `ml_common`
-editable 의존성이 새 경로(`../../libs/ml_common`)로 정확히 잡히는지 확인,
-전체 회귀 테스트 57개(`ml_common` 17 + `training` 9 + `inference` 8 +
+세 폴더 모두 `uv sync`로 실제 `.venv` 재생성 + `uv lock`으로 `ml_core`
+editable 의존성이 새 경로(`../../libs/ml_core`)로 정확히 잡히는지 확인,
+전체 회귀 테스트 57개(`ml_core` 17 + `training` 9 + `inference` 8 +
 `feature_engine` legacy 11 + Spark parity 12) 재실행 전부 통과 — 대량 치환이
 아무 것도 깨뜨리지 않았음을 확인.
 
@@ -1126,4 +1126,4 @@ editable 의존성이 새 경로(`../../libs/ml_common`)로 정확히 잡히는�
 `common`으로 불렸던 시점의 기록이라 그대로 둔다(이 저장소의 결정 로그
 컨벤션 — 과거 기록은 그때 사실을 남기고, 최신 상태는 README/LEGACY_AUDIT.md가
 반영). 자세한 파일별 변경 목록은 [LEGACY_AUDIT.md](LEGACY_AUDIT.md)의
-"환경 관리 — uv + `libs/ml_common/`" 절 참고.
+"환경 관리 — uv + `libs/ml_core/`" 절 참고.

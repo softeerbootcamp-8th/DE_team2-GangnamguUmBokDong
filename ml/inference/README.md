@@ -15,7 +15,7 @@
 
 ```bash
 cd ml/inference
-uv sync   # pyproject.toml/uv.lock 기준 .venv 생성 — pandas/numpy + ml_common(editable) 포함
+uv sync   # pyproject.toml/uv.lock 기준 .venv 생성 — pandas/numpy + ml_core(editable) 포함
 ```
 
 `training`이 먼저 모델을 학습해둬야 한다 ([training/README.md](../training/README.md)):

@@ -60,7 +60,7 @@ offset으로 보정한다. 반납은 거치대 상태와 무관하게 항상 성
 **LightGBM은 `init_score`를 모델 파일에 저장하지 않는다.** 학습 시
 `eta = init_score + tree(x)`로 적합되지만 `predict()`는 `tree(x)`의 objective
 역변환(Poisson이면 `exp(tree(x))`)만 반환한다 — 그래서 실제 예측값은 항상
-`exposure * booster.predict(X)`로 직접 복원해야 한다(`ml_common/scoring.py`가
+`exposure * booster.predict(X)`로 직접 복원해야 한다(`ml_core/scoring.py`가
 이 규칙을 지킴).
 
 ## 3. Quantile(P10/50/90) + split-conformal 보정
@@ -76,22 +76,22 @@ Romano et al. CQR) — 테스트셋 P10~P90 커버리지가 이론값(기본 0.8
 `train_target()`이 전체 데이터 기준 station_id `CategoricalDtype`을 한 번만
 고정하고 `{model_name}_station_categories.json`에 저장한다. split(train/valid/test)마다
 따로 `astype("category")`하면 LightGBM 카테고리 코드(정수)가 어긋나 조용히
-오염되는 흔한 실수라 명시적으로 피한다. `inference`는 `ml_common/model_contract.py`의
+오염되는 흔한 실수라 명시적으로 피한다. `inference`는 `ml_core/model_contract.py`의
 `load_station_dtype()`으로 이 파일을 그대로 읽어 인코딩을 재현한다 — 이 계약이
 깨지면(둘이 다른 카테고리 순서를 쓰면) 모델이 station_id를 조용히 잘못
 해석한다.
 
-## 5. `ml_common/`으로 뺀 것과 이 폴더에 남은 것
+## 5. `ml_core/`으로 뺀 것과 이 폴더에 남은 것
 
 학습(`train_target()`, split, conformal correction)과 서빙(`predict()`)이
 정확히 같은 **모델 계약**(feature 목록, station_id 인코딩, 평가 지표 정의)을
 써야 한다 — 그래서 `FEATURE_COLUMNS`/`station_categories_path`/`load_station_dtype`은
-`ml_common/model_contract.py`로, `poisson_deviance`/`pinball_loss`는 `ml_common/metrics.py`로,
-채점 로직(`predict()`)은 `ml_common/scoring.py`로 뺐다. 이 폴더에는 학습에만
+`ml_core/model_contract.py`로, `poisson_deviance`/`pinball_loss`는 `ml_core/metrics.py`로,
+채점 로직(`predict()`)은 `ml_core/scoring.py`로 뺐다. 이 폴더에는 학습에만
 필요한 것(`_split`, `_prepare_xy`, `_conformal_correction`, `train_target()`
 자체, LightGBM 파라미터 튜닝)만 남는다.
 
-`monitor_performance.py`/`scripts/compare_baselines.py`가 `ml_common/scoring.py`의
+`monitor_performance.py`/`scripts/compare_baselines.py`가 `ml_core/scoring.py`의
 `predict()`를 가져다 쓰는 이유도 같다 — "저장된 모델로 채점"하는 로직은
 서빙 전용이 아니라 평가/모니터링에서도 똑같이 필요하다.
 
@@ -103,7 +103,7 @@ Poisson deviance가 계절성에 강하게 비례한다는 걸 실측으로 확�
 6월 1.259, +42%) — 고정 baseline 대비로 여름철을 평가하면 모델이 멀쩡해도
 "재학습 필요"로 오탐이 난다. 임계값(deviance 10%, 커버리지 15%p)의 근거는
 실측 노이즈 바닥(재학습 run-to-run 편차 0.3~0.5%, embargo 스윕 편차 0.6%)보다
-한참 위로 잡은 것 — `ml_common/common_config.py` 주석 참고.
+한참 위로 잡은 것 — `ml_core/common_config.py` 주석 참고.
 
 **아직 미구현**: 고정 baseline 대신 최근 N개월 이동평균(rolling baseline) 대비로
 바꾸는 개선(history.md 9번 항목 마지막 문단) — 계절이 서서히 바뀌는 건 흡수하고
@@ -112,7 +112,7 @@ Poisson deviance가 계절성에 강하게 비례한다는 걸 실측으로 확�
 ## 7. 실험 격리 원칙
 
 `scripts/run_embargo_sweep.py`, `scripts/build_embargo_candidate.py` 같은 스윕
-스크립트는 `feature_engine`/`ml_common`/`training`을 전부 가져다 쓰지만, 산출물은
+스크립트는 `feature_engine`/`ml_core`/`training`을 전부 가져다 쓰지만, 산출물은
 항상 `models/experiments/{run_id}/`, `data/processed_v2/experiments/`처럼 챔피언
 경로와 분리된 곳에 쓴다 — 스윕이 실패하거나 중간에 멈춰도 챔피언 아티팩트는
 안전하다. `experiment_log.py`가 실행마다 (run_id, git_sha, dirty, params, metrics)를

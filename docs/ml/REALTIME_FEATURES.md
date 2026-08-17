@@ -1,7 +1,7 @@
 # Point-in-Time 대여 카운트 (Train-Serving Skew 대응)
 
 이 문서는 5분마다 갱신되는 실시간 서빙 롤링 피처에서 발생하는 **우측 절단
-(right-censoring) train-serving skew**를 다룬다. 핵심 로직(`ml_common/rolling_window_features.py`,
+(right-censoring) train-serving skew**를 다룬다. 핵심 로직(`ml_core/rolling_window_features.py`,
 `feature_engine/spark/build_rolling_rental_features.py`)은 이미 기존 배치 파이프라인
 ([feature_engine/DESIGN.md](feature_engine/DESIGN.md), [inference/DESIGN.md](inference/DESIGN.md))에 실제로 연결돼 있다 —
 학습 쪽은 `feature_engine/spark/build_features.py`의 `_add_rental_lag_rolling`(4-2절), 추론 쪽은
@@ -76,7 +76,7 @@ offset으로 다루고 있다 ([training/DESIGN.md](training/DESIGN.md) 2절). �
 
 ## 3. 핵심 규칙 (학습·서빙이 반드시 동일하게 지켜야 하는 계약)
 
-구현은 [`ml_common/rolling_window_features.py`](../libs/ml_common/rolling_window_features.py) 하나에 몰아뒀다(`ml/`과 별도로 관리되는 `libs/ml_common/` 라이브러리):
+구현은 [`ml_core/rolling_window_features.py`](../libs/ml_core/rolling_window_features.py) 하나에 몰아뒀다(`ml/`과 별도로 관리되는 `libs/ml_core/` 라이브러리):
 
 | 함수 | 용도 |
 |---|---|

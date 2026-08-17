@@ -12,7 +12,7 @@ quantile P10/50/90)으로 학습·추론하는 파이프라인.
 
 | 폴더 | 역할 | 실행 환경 |
 |---|---|---|
-| **[../libs/ml_common/](../libs/ml_common/README.md)** | 세 인스턴스가 공유하는 파라미터·경로·핵심 알고리즘(censoring 로직, 모델 계약, 채점 함수). `ml/`과 별도로 관리되는 독립 라이브러리(`<repo-root>/libs/ml_common/`) — 아래 세 폴더가 각자 editable 의존성으로 참조 | 어디든(가벼운 순수 로직) |
+| **[../libs/ml_core/](../libs/ml_core/README.md)** | 세 인스턴스가 공유하는 파라미터·경로·핵심 알고리즘(censoring 로직, 모델 계약, 채점 함수). `ml/`과 별도로 관리되는 독립 라이브러리(`<repo-root>/libs/ml_core/`) — 아래 세 폴더가 각자 editable 의존성으로 참조 | 어디든(가벼운 순수 로직) |
 | **[feature_engine/](feature_engine/README.md)** | station×5분tick feature 테이블 생성(Spark, EMR/로컬 `local[*]` 단일 노드) — **본 서비스 코드는 `spark/`뿐**. pandas 1차/2차정제는 전부 `legacy/`(로컬 테스트 입력 준비용, `LEGACY_AUDIT.md` 참고) | `feature_engine/.venv`(uv, Python 3.11)/EMR |
 | **[training/](training/README.md)** | feature 테이블로 LightGBM 대여/반납 모델 학습, 성능 모니터링 | `training/.venv`(uv) |
 | **[inference/](inference/README.md)** | 학습된 모델로 배치 조회 + 단일 시점 예측 | `inference/.venv`(uv) |
@@ -32,7 +32,7 @@ quantile P10/50/90)으로 학습·추론하는 파이프라인.
 cd ml
 brew install libomp   # macOS에서 LightGBM 실행에 필요
 
-# 각 폴더의 venv를 uv로 준비(최초 1회, 폴더별로) — ml_common은 editable 의존성으로 같이 설치됨
+# 각 폴더의 venv를 uv로 준비(최초 1회, 폴더별로) — ml_core은 editable 의존성으로 같이 설치됨
 (cd feature_engine && uv sync)
 (cd training && uv sync)
 (cd inference && uv sync)
@@ -56,7 +56,7 @@ brew install libomp   # macOS에서 LightGBM 실행에 필요
 
 ```bash
 cd ml
-./training/.venv/bin/python -m pytest ../libs/ml_common/tests training/tests -q
+./training/.venv/bin/python -m pytest ../libs/ml_core/tests training/tests -q
 ./inference/.venv/bin/python -m pytest inference/tests -q
 ./feature_engine/.venv/bin/python -m pytest feature_engine/tests/dev_spark_rolling_parity.py feature_engine/tests/dev_spark_build_features.py feature_engine/tests/dev_spark_incremental.py -q
 ```
@@ -69,7 +69,7 @@ cd ml
 테스트 파일은 `test_*.py`가 아니라 **`dev_*.py`**로 짓는다(`pytest.ini`의
 `python_files = dev_*.py`) — ML의 train/valid/**test** split(`TEST_START`,
 `multi_horizon_test.parquet` 등)과 "test_"가 겹쳐서 헷갈리는 걸 피하기 위함.
-`libs/ml_common/`은 `ml/` 밖이라 이 설정을 상속받지 못해서 자체 `pyproject.toml`에
+`libs/ml_core/`은 `ml/` 밖이라 이 설정을 상속받지 못해서 자체 `pyproject.toml`에
 같은 규칙을 따로 정의해뒀다.
 
 Spark 관련 테스트는 반드시 `feature_engine/.venv`(uv, Python 3.11)로 실행할 것 —
@@ -90,14 +90,14 @@ Spark 관련 테스트는 반드시 `feature_engine/.venv`(uv, Python 3.11)로 �
 | 문서 | 내용 |
 |---|---|
 | **README.md** (이 문서) | 폴더 구조, 빠른 시작 |
-| **[../libs/ml_common/README.md](../libs/ml_common/README.md)** | 공유 로직, 프로필 시스템, 타임존 규칙 |
+| **[../libs/ml_core/README.md](../libs/ml_core/README.md)** | 공유 로직, 프로필 시스템, 타임존 규칙 |
 | **[feature_engine/README.md](feature_engine/README.md)** / **[DESIGN.md](feature_engine/DESIGN.md)** | 데이터 파이프라인: 실행 방법 / 설계 배경 |
 | **[training/README.md](training/README.md)** / **[DESIGN.md](training/DESIGN.md)** | 모델 학습: 실행 방법 / 설계 배경 |
 | **[inference/README.md](inference/README.md)** / **[DESIGN.md](inference/DESIGN.md)** | 추론: 실행 방법 / 설계 배경 |
 | **[history.md](history.md)** | 의사결정 히스토리(시간순) — 무엇을 왜 그렇게 결정했는지 |
 | **[adr/](adr/)** | 개별 아키텍처 결정 기록(ADR) — 굵직한 결정 하나당 파일 하나, `adr/template.md` 형식 |
 | **[DATA_CATALOG.md](DATA_CATALOG.md)** | `data/`의 모든 원본·참고 데이터 소스별 상세 |
-| **[REALTIME_FEATURES.md](REALTIME_FEATURES.md)** | point-in-time 대여 카운트 설계(train-serving skew 대응) — 지금도 유효, 경로만 `feature_engine`/`ml_common`/`inference`로 갱신해서 읽을 것 |
+| **[REALTIME_FEATURES.md](REALTIME_FEATURES.md)** | point-in-time 대여 카운트 설계(train-serving skew 대응) — 지금도 유효, 경로만 `feature_engine`/`ml_core`/`inference`로 갱신해서 읽을 것 |
 | **[LEGACY_AUDIT.md](LEGACY_AUDIT.md)** | 파일별 사용/레거시 분류 기록 — 각 폴더 `legacy/`로 옮긴 파일과 그 이유, Spark 로직 정합성 검증 결과 |
 
 ## 꼭 알아야 할 핵심 제약
@@ -106,6 +106,6 @@ Spark 관련 테스트는 반드시 `feature_engine/.venv`(uv, Python 3.11)로 �
 - **날씨는 예보가 아닌 관측치** — 실제 예보 API 연동은 보류 상태 (train-serve skew 한계 있음).
 - **생활인구는 250m 격자 기준** — 격자 ID를 좌표로 역산해 정류소와 직접 매칭 (`feature_engine/legacy/grid.py`, 1차정제 전용).
 - **단일 시점 예측은 실시간 데이터 결측에 대비한 fallback 내장** — [inference/DESIGN.md](inference/DESIGN.md) 참고.
-- **타임존은 KST(Asia/Seoul)로 통일** — [../libs/ml_common/README.md](../libs/ml_common/README.md) 참고.
+- **타임존은 KST(Asia/Seoul)로 통일** — [../libs/ml_core/README.md](../libs/ml_core/README.md) 참고.
 
 각 제약의 배경과 대안 검토 과정은 [history.md](history.md)/각 폴더 `DESIGN.md`에 자세히 정리돼 있다.

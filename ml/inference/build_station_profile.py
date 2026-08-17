@@ -32,7 +32,7 @@ def build_station_profile() -> pd.DataFrame:
     if df is None:
         raise FileNotFoundError(f"S3에 없음: {config.MERGED_TABLE_PARQUET}")
     dt = pd.to_datetime(df["date"])
-    # .dt.dayofweek/.dt.month는 기본 int32를 낸다 — ml_common/model_contract.NATIVE_COLUMN_DTYPES와
+    # .dt.dayofweek/.dt.month는 기본 int32를 낸다 — ml_core/model_contract.NATIVE_COLUMN_DTYPES와
     # 맞춰 int8로(둘 다 0~11 범위라 여유 있음).
     df["dow"] = dt.dt.dayofweek.astype("int8")
     df["month"] = dt.dt.month.astype("int8")
@@ -49,7 +49,7 @@ def build_station_profile() -> pd.DataFrame:
     profile[["rental_std", "return_std"]] = profile[["rental_std", "return_std"]].fillna(0.0)
 
     # groupby().mean()/std()는 정수 컬럼(rental_count 등 int16)을 집계해도
-    # 항상 float64를 낸다 — ml_common/model_contract.FEATURE_COLUMN_DTYPES와 맞춰
+    # 항상 float64를 낸다 — ml_core/model_contract.FEATURE_COLUMN_DTYPES와 맞춰
     # float32로 다운캐스트(predict_single.py가 이 값을 그대로 lag/rolling
     # feature 자리에 fallback으로 채우므로).
     mean_std_cols = ["rental_mean", "rental_std", "return_mean", "return_std"]

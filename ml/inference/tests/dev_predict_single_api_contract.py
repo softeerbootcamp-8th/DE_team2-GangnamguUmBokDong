@@ -86,7 +86,7 @@ def _set_station_master(station_ids: list[str]) -> None:
 
 
 def _fake_predict(df: pd.DataFrame, model_name: str, exposure_col: str | None = None) -> pd.DataFrame:
-    """ml_common.scoring.predict() 대역 — 실제 학습된 booster 파일 없이 배치 조립/실패
+    """ml_core.scoring.predict() 대역 — 실제 학습된 booster 파일 없이 배치 조립/실패
     처리 로직만 검증하려고 항상 고정값을 낸다."""
     return pd.DataFrame({
         "station_id": df["station_id"].to_numpy(),

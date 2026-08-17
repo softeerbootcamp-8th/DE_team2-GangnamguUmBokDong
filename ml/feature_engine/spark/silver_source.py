@@ -3,9 +3,9 @@ weather/population)을 직접 만든다 — `config.py`가 예전에 "이미 S3�
 하던 입력을 이제 이 모듈이 Silver 원본에서 만들어낸다. 이 패키지는 이제
 `ml/data/processed_v2/*` 같은 로컬 파생 데이터를 전혀 보지 않는다 — Silver만 본다.
 
-컬럼명 매핑(`RENT_DT`->`start_dt` 등)은 `libs/ml_common/silver_schema.py`의
+컬럼명 매핑(`RENT_DT`->`start_dt` 등)은 `libs/ml_core/silver_schema.py`의
 COLUMN_MAP들을 그대로 재사용한다 — `inference/predict_single.py`의 실시간 조회가
-같은 Silver를 같은 이름으로 읽으므로, 매핑을 한 곳(`ml_common`)에만 두고 두 패키지가
+같은 Silver를 같은 이름으로 읽으므로, 매핑을 한 곳(`ml_core`)에만 두고 두 패키지가
 같이 참조해야 스키마가 바뀔 때 한쪽만 고치고 잊어버리는 사고를 막는다.
 
 Spark는 boto3로 파일 하나씩 긁는 `inference`와 달리 **glob 하나로 한 해 전체의
@@ -20,7 +20,7 @@ Spark는 boto3로 파일 하나씩 긁는 `inference`와 달리 **glob 하나로
 
 from __future__ import annotations
 
-from ml_common import silver_schema
+from ml_core import silver_schema
 from pyspark.sql import Column, DataFrame, SparkSession, Window
 from pyspark.sql import functions as F
 
@@ -40,7 +40,7 @@ def _silver_glob(source_id: str) -> str:
 
 
 def _rename(df: DataFrame, column_map: dict[str, str]) -> DataFrame:
-    """ml_common.silver_schema의 COLUMN_MAP({원본: 우리이름})을 그대로 적용한다."""
+    """ml_core.silver_schema의 COLUMN_MAP({원본: 우리이름})을 그대로 적용한다."""
     for src, dst in column_map.items():
         if src in df.columns:
             df = df.withColumnRenamed(src, dst)

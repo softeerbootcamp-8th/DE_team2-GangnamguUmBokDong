@@ -1,6 +1,6 @@
 """배치 조회 CLI(`predict_rental_demand.py`/`predict_return_demand.py`)가 공유하는 실행기.
 
-실제 채점 로직(`predict()`, booster 로드 등)은 `ml_common/scoring.py`(training의
+실제 채점 로직(`predict()`, booster 로드 등)은 `ml_core/scoring.py`(training의
 `monitor_performance.py`/`compare_baselines.py`도 같이 씀)에 있다 — 이 모듈은 그 위에
 "station_id/기간을 골라 조회 -> 저장 -> 요약 출력"하는 배치 CLI 경험만 얹는다.
 
@@ -17,7 +17,7 @@ import argparse
 
 import pandas as pd
 from core import s3 as s3_io
-from ml_common.scoring import predict, print_metrics
+from ml_core.scoring import predict, print_metrics
 
 from . import config
 

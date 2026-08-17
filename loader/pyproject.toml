@@ -16,16 +16,16 @@ package = false
 
 [tool.uv.sources]
 core = { path = "../libs/core", editable = true }
-ml_common = { path = "../libs/ml_common", editable = true }
+ml_core = { path = "../libs/ml_core", editable = true }
 
 [dependency-groups]
 dev = [
     "moto[s3]>=5.2.2",
     "pytest>=9.1.1",
-    # forecast_points 키 컨벤션이 ml_common.silver_schema.predictions_key()와 갈라지지
+    # forecast_points 키 컨벤션이 ml_core.silver_schema.predictions_key()와 갈라지지
     # 않는지 확인하는 계약 테스트 전용 — 런타임(main.py/s3_reader.py)은 이 의존성을
     # 쓰지 않는다(무거운 lightgbm 등을 배포 환경에 끌고 오지 않기 위해).
-    "ml_common",
+    "ml_core",
 ]
 
 [tool.pytest.ini_options]

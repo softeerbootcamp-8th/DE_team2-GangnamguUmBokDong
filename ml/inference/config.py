@@ -1,12 +1,12 @@
 """inference(배치 조회 CLI + 단일 시점 예측) 전용 경로·상수.
 
 `feature_engine`이 만든 산출물(merged table, hourly profile 등)과 `training`이
-저장한 모델(`ml_common/paths.py`의 `MODELS_PREFIX`)을 S3에서 읽기만 한다 — 이
+저장한 모델(`ml_core/paths.py`의 `MODELS_PREFIX`)을 S3에서 읽기만 한다 — 이
 패키지가 새로 만들어 쓰는 산출물(fallback 프로필 제외)은 없다.
 """
 
-from ml_common import common_config
-from ml_common.paths import (
+from ml_core import common_config
+from ml_core.paths import (
     ANALYSIS_SUMMARY_JSON,
     MERGED_TABLE_PARQUET,
     MODELS_PREFIX,

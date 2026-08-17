@@ -2,7 +2,7 @@
 
 import pandas as pd
 
-from ml_common.trip_events import normalize_station_no
+from ml_core.trip_events import normalize_station_no
 
 
 def test_valid_numeric_strings_are_zero_padded():

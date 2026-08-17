@@ -1,15 +1,15 @@
-# ml_common — 세 인스턴스가 공유하는 로직
+# ml_core — 세 인스턴스가 공유하는 로직
 
 `ml/feature_engine`/`ml/training`/`ml/inference`가 서로 다른 인스턴스에서 따로
 배포되지만, 아래 계약(파라미터·경로·핵심 알고리즘)만큼은 세 쪽이 정확히 같은
 값/로직을 써야 한다. 여기 모아두지 않으면 한쪽만 고치고 잊어버려 조용히
 갈라지는(train-serving skew와 같은 종류의) 사고가 난다.
 
-**이 프로젝트는 `ml/`과 별도로 관리되는 독립 라이브러리다** — `<repo-root>/libs/ml_common/`에
+**이 프로젝트는 `ml/`과 별도로 관리되는 독립 라이브러리다** — `<repo-root>/libs/ml_core/`에
 있고, `ml/`의 형제(sibling) 디렉터리다(같은 `lib/` 아래에 다른 서비스의 공유
-라이브러리가 더 생길 수 있어서 `common`이 아니라 `ml_common`으로 이름을 붙였다).
+라이브러리가 더 생길 수 있어서 `common`이 아니라 `ml_core`으로 이름을 붙였다).
 `ml/feature_engine`/`ml/training`/`ml/inference`는 각자의 `pyproject.toml`에서
-`ml_common`을 editable path 의존성으로 참조한다(`uv sync`로 설치).
+`ml_core`을 editable path 의존성으로 참조한다(`uv sync`로 설치).
 
 이 폴더는 순수 pandas 로직(+ 일부 lightgbm)만 담는다 — `ml/feature_engine/spark/`는
 pyspark 의존성이 있어 별도로 분리돼 있고, `common_config.py`만 예외적으로
@@ -25,12 +25,12 @@ pyspark 의존성이 있어 별도로 분리돼 있고, `common_config.py`만 �
 | `rolling_window_features.py` | point-in-time censoring 핵심 로직(차분 배열, as-of 조회) | `feature_engine`(배치), `inference`(서빙 시뮬레이션) |
 | `trip_events.py` | 대여이력 원본 로딩 + station_no 정규화 | `feature_engine`(배치), `inference`(실시간 시뮬레이션) |
 | `model_contract.py` | `FEATURE_COLUMNS`(모델 입력 스키마), station_id 카테고리 저장/로드 | `training`(학습), `inference`(서빙) |
-| `metrics.py` | poisson deviance, pinball loss | `training`, `ml_common/scoring.py` |
+| `metrics.py` | poisson deviance, pinball loss | `training`, `ml_core/scoring.py` |
 | `scoring.py` | 저장된 booster로 채점(`predict()`) | `inference`, `training/monitor_performance.py`, `training/legacy/scripts/compare_baselines.py` |
 
 ## 경로 계약(`paths.py`)에서 꼭 알아야 할 것
 
-`ml_common`은 `ml/`의 형제 디렉터리라 자기 파일 경로(`__file__`)로는 `ml/`
+`ml_core`은 `ml/`의 형제 디렉터리라 자기 파일 경로(`__file__`)로는 `ml/`
 위치를 알아낼 수 없다(조상 디렉터리가 아니라 아예 다른 가지에 있음). 그래서
 `DATA_DIR`/`MODELS_DIR`/`ML_ROOT`의 기본값은 **현재 작업 디렉터리(cwd)** 기준이다
 — 이 저장소의 모든 명령이 `cd ml` 다음에 실행되는 걸 전제로 하므로(각 폴더
@@ -71,9 +71,9 @@ ML_PROFILE=default ./feature_engine/.venv/bin/python -m feature_engine.spark.run
 
 ```bash
 cd ml
-./training/.venv/bin/python -m pytest ../libs/ml_common/tests/ -q
+./training/.venv/bin/python -m pytest ../libs/ml_core/tests/ -q
 ```
 
-`ml_common` 자체는 별도 `.venv`를 두지 않는다 — `training`/`inference`/`feature_engine`
-중 어느 쪽이든 `ml_common`을 editable 의존성으로 이미 갖고 있으므로 그 `.venv`의
+`ml_core` 자체는 별도 `.venv`를 두지 않는다 — `training`/`inference`/`feature_engine`
+중 어느 쪽이든 `ml_core`을 editable 의존성으로 이미 갖고 있으므로 그 `.venv`의
 pytest를 그대로 쓰면 된다.

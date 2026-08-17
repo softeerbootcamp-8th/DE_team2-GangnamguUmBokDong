@@ -23,7 +23,7 @@
 2차정제(Spark)를 테스트해볼 입력을 만드는 용도일 뿐 본 서비스 경로가 아니다 —
 배경은 [LEGACY_AUDIT.md](LEGACY_AUDIT.md) 참고.
 
-`libs/ml_common/paths.py`(각 폴더가 editable 의존성으로 참조하는 공유 라이브러리)가
+`libs/ml_core/paths.py`(각 폴더가 editable 의존성으로 참조하는 공유 라이브러리)가
 Spark 산출물 경로(`data/processed_v2/spark/{FEATURE_PARAM_COMBO_ID}/...`)를
 `feature_engine/spark/config.py`와 정확히 같은 공식으로 계산하므로, dataset 단계가
 쓴 파일을 training/inference가 그대로 읽는다(파라미터 조합을 바꾸려면

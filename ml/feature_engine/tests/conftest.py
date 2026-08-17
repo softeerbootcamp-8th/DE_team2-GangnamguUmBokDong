@@ -23,7 +23,7 @@ os.environ.setdefault("PYSPARK_DRIVER_PYTHON", sys.executable)
 # timestamp_ntz/timestamp(tz-aware) 왕복 어긋남 방지 — feature_engine/spark_session.py 참고.
 os.environ.setdefault("TZ", "Asia/Seoul")
 
-# watermark.py는 Spark가 아니라 ml_common.s3_io(boto3)로 직접 S3를 두드린다 — 테스트가
+# watermark.py는 Spark가 아니라 ml_core.s3_io(boto3)로 직접 S3를 두드린다 — 테스트가
 # WATERMARK_PATH를 로컬 tmp_path 문자열로 monkeypatch해도(dev_spark_incremental.py),
 # s3_io는 그 문자열을 그대로 S3 키로 써버려 실제 MinIO를 오염시킨다(실제로 한 번
 # `private/var/folders/.../_watermark.json` 키로 새 나간 적이 있음). moto로 완전히

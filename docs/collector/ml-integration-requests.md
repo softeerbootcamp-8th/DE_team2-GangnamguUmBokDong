@@ -26,7 +26,7 @@
 (`ml/data/processed_v2/*.parquet`를 Silver 파티션 구조로 변환해 MinIO에 넣어주는
 로컬 시딩 스크립트)를 기준 스키마로 개발했는데, 이번에 collector 팀이 실제
 예시 데이터(`ml/data/silver/`, 2026-08-15)를 줘서 비교해보니 소스 이름·컬럼명·
-수집 주기가 상당히 달랐다. `libs/ml_common/silver_schema.py`는 이제 실제 예시
+수집 주기가 상당히 달랐다. `libs/ml_core/silver_schema.py`는 이제 실제 예시
 데이터를 기준으로 다시 맞췄다 — `dev/seed_s3_from_local.py`는 아직 옛 스키마로
 로컬 MinIO에 데이터를 넣으므로, 이 스크립트로 시딩한 데이터로 테스트하면 다시
 어긋난다(별도 후속 작업 필요, 8번 참고 아래 목록에는 없음 — 이 문서는 collector
@@ -92,7 +92,7 @@
 `collector/storage.py`는 `write_silver()`(및 bronze/quarantine 관련 쓰기 함수)는
 있지만, 그 반대인 "silver 파티션을 읽어오는" 함수는 없다 — collector 입장에서는
 쓰기 전용이라 당연할 수 있지만, ML은 정확히 같은 키 규칙으로 다시 읽어야 해서
-`libs/ml_common/silver_schema.py` + `libs/ml_common/s3_io.py`에 **키 생성 규칙을
+`libs/ml_core/silver_schema.py` + `libs/ml_core/s3_io.py`에 **키 생성 규칙을
 독립적으로 복제**해 자체 구현했다(`collector`를 import하지 않음 — 서로 다른
 인스턴스에 독립 배포되는 모듈이라 의존 관계를 만들지 않는 게 이번 설계 원칙).
 
