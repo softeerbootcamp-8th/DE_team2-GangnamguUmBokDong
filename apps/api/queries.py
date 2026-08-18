@@ -21,22 +21,11 @@ def _group_by_sta_id(rows: list[dict]) -> dict[str, list[dict]]:
 
 
 def fetch_stations() -> list[dict]:
-    """최신 미래예측 배치 대상 대여소의 마스터 + 최신 재고를 반환한다."""
+    """대여소 마스터와 각 대여소의 최신 재고를 반환한다."""
     query = """
-        WITH latest_batch AS (
-            SELECT max(batch_run_at) AS batch_run_at
-            FROM forecast_points
-            WHERE predicted_dttm > now()
-        ), forecasted_stations AS (
-            SELECT DISTINCT sta_id
-            FROM forecast_points
-            WHERE batch_run_at = (SELECT batch_run_at FROM latest_batch)
-              AND predicted_dttm > now()
-        )
         SELECT s.sta_id, s.sta_nm, s.gu, s.sta_addr, s.lat, s.lon, s.hold_cnt,
                stock.parking_bike_tot_cnt, stock.observed_at AS base_dttm
         FROM stations s
-        JOIN forecasted_stations forecasted ON forecasted.sta_id = s.sta_id
         JOIN LATERAL (
             SELECT parking_bike_tot_cnt, observed_at
             FROM station_stock

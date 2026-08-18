@@ -44,7 +44,10 @@ bootstrap:
 	./ops/bootstrap/bootstrap.sh
 
 up:
-	$(COMPOSE) up -d --build
+	@$(COMPOSE) up -d --build || { \
+		$(COMPOSE) logs --no-color airflow-init postgres-schema-init; \
+		exit 1; \
+	}
 
 down:
 	$(COMPOSE) down

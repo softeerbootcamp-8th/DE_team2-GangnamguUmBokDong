@@ -18,9 +18,9 @@ def test_repo_root_resolves_to_repository_root():
     assert (REPO_ROOT / "ml" / "inference").is_dir()
 
 
-def test_collector_task_uses_kst_window_start_and_no_virtual_env(dag):
+def test_collector_task_uses_kst_window_start_and_own_project_environment(dag):
     task = build_collector_task(dag, "bike_station_realtime")
-    assert task.bash_command.startswith("env -u VIRTUAL_ENV ")
+    assert task.bash_command.startswith("env -u VIRTUAL_ENV -u UV_PROJECT_ENVIRONMENT ")
     assert "uv run --frozen python main.py --source bike_station_realtime" in task.bash_command
     assert "astimezone" in task.bash_command
     assert task.cwd == COLLECTOR_DIR
