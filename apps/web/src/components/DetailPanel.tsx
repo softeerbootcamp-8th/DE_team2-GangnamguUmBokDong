@@ -28,14 +28,25 @@ export function DetailPanel({ stationId, reasons, onFocusEvent }: Props) {
   const [detail, setDetail] = useState<StationDetail | null>(null);
   const [events, setEvents] = useState<CulturalEvent[] | null>(null);
   const [radiusKm, setRadiusKm] = useState<number | null>(null);
+  const [focusedEventId, setFocusedEventId] = useState<string | null>(null);
 
-  // 대여소를 바꾸면 이전 대여소에서 골라둔 탭·지도에 띄워둔 행사 포커스가
-  // 그대로 유지될 이유가 없다.
+  // 대여소를 바꾸면 이전 대여소에서 골라둔 탭이 그대로 유지될 이유가 없다.
+  // 탭이 "주변 행사"에서 벗어나면(정보/날씨로 이동, 혹은 여기서 info로
+  // 리셋되는 경우 포함) 아래 effect가 지도에 띄운 행사 포커스도 같이 지운다.
   useEffect(() => {
     setTab("info");
-    onFocusEvent(null);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [stationId]);
+
+  // "주변 행사" 탭을 벗어나면 포커싱한 행사가 더 이상 의미 없으니 지도 표시를
+  // 지우고, 대여소 포커싱으로 돌아가게 한다(StationMap.tsx가 focusedEvent가
+  // null이 되면 다시 선택된 대여소로 지도를 옮긴다).
+  useEffect(() => {
+    if (tab !== "events") {
+      setFocusedEventId(null);
+      onFocusEvent(null);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tab]);
 
   useEffect(() => {
     if (stationId === null) {
@@ -124,22 +135,34 @@ export function DetailPanel({ stationId, reasons, onFocusEvent }: Props) {
           <p className="empty-state">주변에 진행 중인 행사가 없습니다.</p>
         ) : (
           <ul className="event-list">
-            {events.map((event) => (
-              <li key={event.event_id}>
-                <button
-                  type="button"
-                  className="event-item"
-                  onClick={() => radiusKm !== null && onFocusEvent({ lat: event.lat, lon: event.lon, radiusKm })}
-                >
-                  <span className="event-item-title">{event.title}</span>
-                  <span className="event-item-meta">
-                    {[event.place, [event.start_date, event.end_date].filter(Boolean).join(" ~ "), `${event.distance_km}km`]
-                      .filter(Boolean)
-                      .join(" · ")}
-                  </span>
-                </button>
-              </li>
-            ))}
+            {events.map((event) => {
+              const isFocused = focusedEventId === event.event_id;
+              return (
+                <li key={event.event_id}>
+                  <button
+                    type="button"
+                    className={`event-item${isFocused ? " selected" : ""}`}
+                    onClick={() => {
+                      if (radiusKm === null) return;
+                      if (isFocused) {
+                        setFocusedEventId(null);
+                        onFocusEvent(null);
+                      } else {
+                        setFocusedEventId(event.event_id);
+                        onFocusEvent({ lat: event.lat, lon: event.lon, radiusKm });
+                      }
+                    }}
+                  >
+                    <span className="event-item-title">{event.title}</span>
+                    <span className="event-item-meta">
+                      {[event.place, [event.start_date, event.end_date].filter(Boolean).join(" ~ "), `${event.distance_km}km`]
+                        .filter(Boolean)
+                        .join(" · ")}
+                    </span>
+                  </button>
+                </li>
+              );
+            })}
           </ul>
         )
       ) : (

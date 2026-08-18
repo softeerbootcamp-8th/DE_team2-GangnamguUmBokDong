@@ -360,6 +360,11 @@ function StationMarkers({
   stationsRef.current = stations;
 
   useEffect(() => {
+    // 행사에 포커스가 있는 동안은 아래 focusedEvent effect가 지도 이동을
+    // 맡는다 — 여기서 대여소로 다시 옮기면 서로 화면을 뺏어간다. 행사 포커스가
+    // 풀리면(탭 이동, 같은 행사 재클릭 등) 그때 이 effect가 다시 대여소로
+    // 돌아온다.
+    if (focusedEvent) return;
     if (selectedStationId === null) return;
     const station = stationsRef.current.find((s) => s.sta_id === selectedStationId);
     if (!station) return;
@@ -368,7 +373,7 @@ function StationMarkers({
     // 시점에 툭 튀는 것처럼 보인다. setView는 애니메이션 없이 한 번에
     // 이동시켜서 지도와 마커가 항상 같은 프레임에 같이 자리 잡는다.
     map.setView([station.lat, station.lon], Math.max(map.getZoom(), COUNT_LABEL_MIN_ZOOM));
-  }, [selectedStationId, map]);
+  }, [selectedStationId, focusedEvent, map]);
 
   // 주변 행사 탭에서 행사를 고르면 그 위치로 지도를 옮겨서 보여준다. 선택된
   // 대여소는 이미 검은 테두리로 구분되므로, 여기서는 행사 자체의 영향 범위를

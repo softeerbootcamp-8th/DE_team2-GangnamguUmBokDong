@@ -393,6 +393,10 @@ body {
   background: var(--gridline);
 }
 
+.event-item.selected {
+  border-color: var(--series-1);
+}
+
 .event-item-title {
   font-size: 13px;
   font-weight: 600;
