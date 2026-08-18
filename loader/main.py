@@ -40,7 +40,7 @@ def run(table: str, window_start: datetime) -> None:
     target_table = _TABLE_ALIASES.get(table, table)
 
     with get_connection() as conn:
-        upsert(conn, target_table, rows, spec.conflict_cols, spec.update_cols)
+        upsert(conn, target_table, rows, spec.conflict_cols, spec.update_cols, guard_col=spec.guard_col)
         conn.commit()
 
     print(f"upserted {len(rows)} rows into {target_table}")

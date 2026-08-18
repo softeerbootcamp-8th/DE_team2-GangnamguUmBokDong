@@ -193,7 +193,7 @@ def weather_forecast_ultra_from_silver(df: pd.DataFrame) -> list[dict]:
             "sky_cond": _to_int(row.get("SKY")),       # SKY: 하늘상태 코드(1:맑음, 3:구름많음, 4:흐림)
             "pty_type": _to_int(row.get("PTY")),       # PTY: 강수형태 코드
             "temperature": _to_float(row.get("T1H")),  # T1H: 기온(°C)
-            "precip_prob": None,                       # 초단기예보에는 강수확률(POP)이 없음
+            "precip_prob": _to_float(row.get("POP")),  # POP: 강수확률(%)
             "precip_amount": _parse_precip_str(row.get("RN1")),  # RN1: 1시간 강수량(mm)
             "humidity": _to_float(row.get("REH")),     # REH: 습도(%)
             "wind_speed": _to_float(row.get("WSD")),   # WSD: 풍속(m/s)

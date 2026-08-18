@@ -12,6 +12,7 @@ from transform import (
     stations_from_silver,
     weather_current_from_silver,
     weather_forecast_from_silver,
+    weather_forecast_ultra_from_silver,
 )
 
 GANGNAM_STATION = {
@@ -92,6 +93,18 @@ def test_weather_forecast_from_silver_keeps_latest_issued():
     assert len(records) == 1
     assert records[0]["temperature"] == 28.0
     assert records[0]["precip_prob"] == 30.0
+
+
+def test_weather_forecast_ultra_from_silver_maps_pop_to_precip_prob():
+    df = pd.DataFrame(
+        [
+            {**SEOUL_GRID, "baseDate": "20260816", "baseTime": "0930", "fcstDate": "20260816", "fcstTime": "1000", "T1H": "27", "POP": "40", "RN1": "강수없음", "SKY": "1", "PTY": "0"},
+        ]
+    )
+
+    [record] = weather_forecast_ultra_from_silver(df)
+
+    assert record["precip_prob"] == 40.0
 
 
 def test_cultural_events_from_silver_filters_ended_events():

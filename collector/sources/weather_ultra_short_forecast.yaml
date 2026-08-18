@@ -82,3 +82,15 @@ columns:
   LGT:
     types: [float]
     range: {min: 0, max: 100}
+  POP:
+    types: [float]
+    range: {min: 0, max: 100}
+  UUU:
+    types: [float]
+    range: {min: -50, max: 50}
+  VVV:
+    types: [float]
+    range: {min: -50, max: 50}
+  VEC:
+    types: [float]
+    range: {min: 0, max: 360}

@@ -82,3 +82,19 @@ columns:
   PTY:
     types: [int]
     enum: [0, 1, 2, 3, 4]
+  UUU:
+    types: [float]
+    range: {min: -50, max: 50}
+  VVV:
+    types: [float]
+    range: {min: -50, max: 50}
+  VEC:
+    types: [float]
+    range: {min: 0, max: 360}
+  WAV:
+    types: [float]
+    range: {min: 0, max: 20}
+  # PCP와 같은 응답에 오는 적설 범주 표기("적설없음", "1.0cm 미만" 등)라 같은
+  # precip 캐스터를 쓴다(`core.precip._NONE_LABELS`에 "적설없음" 포함).
+  SNO:
+    types: [precip]

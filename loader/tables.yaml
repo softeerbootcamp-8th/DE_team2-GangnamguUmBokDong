@@ -33,6 +33,10 @@ weather_current:
     - rainfall
     - pty_type
 
+# weather_forecast와 weather_forecast_ultra는 loader/main.py의 _TABLE_ALIASES에 의해
+# 같은 물리 테이블(weather_forecast)을 공유한다. 두 소스는 서로 다른 Airflow DAG(3h/30분)로
+# 실행 순서 보장 없이 이 테이블에 upsert하므로, guard_col(base_dttm)로 더 오래된 발표가
+# 더 최신 발표를 덮어쓰지 못하게 막는다.
 weather_forecast:
   source_id: weather_short_term_forecast
   transform: weather_forecast_from_silver
@@ -48,6 +52,7 @@ weather_forecast:
     - humidity
     - wind_speed
     - base_dttm
+  guard_col: base_dttm
 
 weather_forecast_ultra:
   source_id: weather_ultra_short_forecast
@@ -64,6 +69,7 @@ weather_forecast_ultra:
     - humidity
     - wind_speed
     - base_dttm
+  guard_col: base_dttm
 
 cultural_events:
   source_id: cultural_event

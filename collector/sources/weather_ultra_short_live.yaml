@@ -63,9 +63,20 @@ columns:
   WSD:
     types: [float]
     range: {min: 0, max: 50}
+  # 같은 이름이지만 예보 계열(weather_ultra_short_forecast, weather_short_term_forecast)의
+  # RN1/PCP와 달리 실황은 이미 숫자값으로 온다. precip 캐스터를 쓰지 않는다.
   RN1:
     types: [float]
     range: {min: 0, max: 500}
   PTY:
     types: [int]
     enum: [0, 1, 2, 3, 5, 6, 7]
+  UUU:
+    types: [float]
+    range: {min: -50, max: 50}
+  VVV:
+    types: [float]
+    range: {min: -50, max: 50}
+  VEC:
+    types: [float]
+    range: {min: 0, max: 360}
