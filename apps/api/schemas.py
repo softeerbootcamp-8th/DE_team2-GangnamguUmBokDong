@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import date, datetime
 from typing import Literal
 
 from pydantic import BaseModel
@@ -55,3 +55,14 @@ class DispatchCenter(BaseModel):
     region: str
     lat: float
     lon: float
+
+
+class CulturalEvent(BaseModel):
+    event_id: str
+    title: str
+    category: str | None
+    place: str | None
+    start_date: date | None
+    end_date: date | None
+    is_free: str | None
+    distance_km: float

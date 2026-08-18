@@ -30,6 +30,25 @@ from queries import now_utc
 
 STATIONS = json.loads((Path(__file__).parent / "seed_data" / "stations_seoul.json").read_text(encoding="utf-8"))
 
+# cultural_events는 stations_seoul.json과 달리 실제 수집 파이프라인이 아직 없어서
+# (collector/loader 쪽 작업, #99 참고) 실측 데이터가 없다. /stations/{id}/events를
+# 로컬에서 눈으로 확인해볼 수 있도록 실제 대여소 좌표 근처에 지어낸 이벤트 몇 개만
+# 넣는다 — sta_id 102(망원역)/301(경복궁역)/2301(강남 현대고 인근) 좌표를 기준으로,
+# 반경(NEARBY_EVENT_RADIUS_KM=1.5km) 안/밖 경계와 "이미 끝난 행사 제외" 필터를 같이
+# 확인할 수 있게 구성했다.
+SEED_EVENTS = [
+    # 망원역(102) 반경 안, 진행 중
+    ("seed-event-1", "망원 한강 벚꽃 야시장", "축제", "마포구", "망원한강공원", -2, 5, "무료", 37.5540, 126.9020),
+    # 망원역(102) 반경 안이지만 이미 종료 — end_date 필터 확인용
+    ("seed-event-2", "지난달 마포 프리마켓", "행사", "마포구", "망원동 주민센터", -40, -30, "무료", 37.5560, 126.9110),
+    # 경복궁역(301) 반경 안, 진행 중
+    ("seed-event-3", "경복궁 야간 특별관람", "전시/관람", "종로구", "경복궁", -1, 10, "유료", 37.5780, 126.9700),
+    # 강남 현대고(2301) 반경 안, 진행 중
+    ("seed-event-4", "강남역 버스킹 페스티벌", "공연", "강남구", "강남역 8번출구", 0, 3, "무료", 37.5220, 127.0230),
+    # 강남 현대고(2301) 기준으로는 반경 밖(약 5km) — distance 필터 확인용
+    ("seed-event-5", "잠실 한강 불꽃축제", "축제", "송파구", "잠실한강공원", 2, 2, "무료", 37.5205, 127.0730),
+]
+
 
 def seed() -> None:
     """STATIONS를 골드 테이블에 채운다. 몇 번을 다시 실행해도 결과가 같도록,
@@ -96,7 +115,41 @@ def seed() -> None:
             forecast_rows,
         )
 
-    print(f"seeded {len(STATIONS)} stations")
+        today = now_utc().date()
+        cur.executemany(
+            """
+            INSERT INTO cultural_events
+                (event_id, title, category, gu, place, start_date, end_date, is_free, lat, lon)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (event_id) DO UPDATE SET
+                title = EXCLUDED.title,
+                category = EXCLUDED.category,
+                gu = EXCLUDED.gu,
+                place = EXCLUDED.place,
+                start_date = EXCLUDED.start_date,
+                end_date = EXCLUDED.end_date,
+                is_free = EXCLUDED.is_free,
+                lat = EXCLUDED.lat,
+                lon = EXCLUDED.lon
+            """,
+            [
+                (
+                    event_id,
+                    title,
+                    category,
+                    gu,
+                    place,
+                    today + timedelta(days=start_offset),
+                    today + timedelta(days=end_offset),
+                    is_free,
+                    lat,
+                    lon,
+                )
+                for event_id, title, category, gu, place, start_offset, end_offset, is_free, lat, lon in SEED_EVENTS
+            ],
+        )
+
+    print(f"seeded {len(STATIONS)} stations, {len(SEED_EVENTS)} cultural events")
 
 
 if __name__ == "__main__":
