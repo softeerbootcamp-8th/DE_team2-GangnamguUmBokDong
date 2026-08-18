@@ -1,5 +1,4 @@
 from datetime import UTC, date, datetime
-from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -129,13 +128,22 @@ def test_cultural_events_from_silver_filters_ended_events():
     assert records[0]["end_date"] == date(2026, 8, 20)
 
 
-def test_cultural_events_from_silver_defaults_today_to_kst_now(monkeypatch):
+# UTC 2026-08-15 16:30 = KST 2026-08-16 01:30. UTC와 KST의 날짜(date)가 갈라지는
+# 자정 근방 시각을 골라야, today를 UTC로 잘못 계산하는 회귀를 테스트가 실제로 잡아낸다.
+_FIXED_INSTANT_UTC = datetime(2026, 8, 15, 16, 30, tzinfo=UTC)
+
+
+def _fixed_now_datetime():
     class FixedDatetime(datetime):
         @classmethod
         def now(cls, tz=None):
-            return datetime(2026, 8, 16, 23, 30, tzinfo=ZoneInfo("Asia/Seoul"))
+            return _FIXED_INSTANT_UTC.astimezone(tz) if tz else _FIXED_INSTANT_UTC
 
-    monkeypatch.setattr(transform, "datetime", FixedDatetime)
+    return FixedDatetime
+
+
+def test_cultural_events_from_silver_defaults_today_to_kst_now(monkeypatch):
+    monkeypatch.setattr(transform, "datetime", _fixed_now_datetime())
     df = pd.DataFrame(
         [
             {
@@ -154,16 +162,13 @@ def test_cultural_events_from_silver_defaults_today_to_kst_now(monkeypatch):
 
     records = cultural_events_from_silver(df)
 
+    # KST 기준 today는 2026-08-16이므로 end_date(08-15)는 이미 종료되어 제외된다.
+    # today를 UTC로 잘못 계산하면 today가 08-15가 되어 이 행사가 남아버린다.
     assert records == []
 
 
 def test_performance_events_from_silver_defaults_today_to_kst_now(monkeypatch):
-    class FixedDatetime(datetime):
-        @classmethod
-        def now(cls, tz=None):
-            return datetime(2026, 8, 16, 23, 30, tzinfo=ZoneInfo("Asia/Seoul"))
-
-    monkeypatch.setattr(transform, "datetime", FixedDatetime)
+    monkeypatch.setattr(transform, "datetime", _fixed_now_datetime())
     df = pd.DataFrame(
         [
             {
