@@ -9,32 +9,32 @@
 set -euo pipefail
 
 cd /workspace/airflow
-uv sync --frozen
+# CI의 `make sync-all`이 호스트 경로에 만든 airflow/.venv는 컨테이너 안에서
+# interpreter 링크가 유효하지 않다. bind mount 위의 그 디렉터리를 uv가 지우고
+# 다시 만드는 동안 `Directory not empty`가 발생할 수 있으므로, Airflow 자체 환경은
+# 이미지/컨테이너 전용 경로에 둔다. 모듈별 BashOperator 환경과는 공유하지 않는다.
+AIRFLOW_UV_ENVIRONMENT=/opt/venvs/airflow
+UV_PROJECT_ENVIRONMENT="$AIRFLOW_UV_ENVIRONMENT" uv sync --frozen
 
 case "${1:-api-server}" in
     init)
-        uv run airflow db migrate
+        UV_PROJECT_ENVIRONMENT="$AIRFLOW_UV_ENVIRONMENT" uv run airflow db migrate
         # 5개 모듈은 Airflow와 별개의 uv 프로젝트다 — BashOperator가 처음 스케줄될 때
         # 콜드 네트워크 sync로 타임아웃을 먹지 않도록 컨테이너 기동 시 한 번 예열한다.
-        # 다만 예열은 최적화일 뿐 Airflow DB 초기화의 성공 조건은 아니다. 일시적인
-        # 패키지 다운로드 실패 하나가 전체 Compose 기동을 막지 않게 경고만 남긴다.
-        # 실제 task는 각 모듈에서 `uv run --frozen`을 다시 실행하므로 lock 불일치나
-        # 지속적인 다운로드 문제는 해당 task에서 명시적으로 실패한다.
+        # 프로젝트명을 먼저 출력해 CI에서도 어느 lock 환경에서 실패했는지 알 수 있게 한다.
         for proj in collector normalizer nowcaster ml/inference loader; do
             echo "[airflow-init] prewarming $proj"
-            if ! (cd "/workspace/$proj" && uv sync --frozen); then
-                echo "[airflow-init] WARNING: failed to prewarm $proj; task-time uv run will retry" >&2
-            fi
+            (cd "/workspace/$proj" && uv sync --frozen)
         done
         ;;
     api-server)
-        exec uv run airflow api-server
+        exec env UV_PROJECT_ENVIRONMENT="$AIRFLOW_UV_ENVIRONMENT" uv run airflow api-server
         ;;
     scheduler)
-        exec uv run airflow scheduler
+        exec env UV_PROJECT_ENVIRONMENT="$AIRFLOW_UV_ENVIRONMENT" uv run airflow scheduler
         ;;
     dag-processor)
-        exec uv run airflow dag-processor
+        exec env UV_PROJECT_ENVIRONMENT="$AIRFLOW_UV_ENVIRONMENT" uv run airflow dag-processor
         ;;
     *)
         exec "$@"
