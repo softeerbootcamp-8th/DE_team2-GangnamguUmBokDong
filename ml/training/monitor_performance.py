@@ -21,6 +21,7 @@ import numpy as np
 import pandas as pd
 from core import s3 as s3_io
 from ml_core.metrics import poisson_deviance as _poisson_deviance
+from ml_core.model_contract import FEATURE_COLUMNS
 from ml_core.paths import model_json_key
 from ml_core.scoring import predict
 
@@ -95,10 +96,14 @@ def evaluate_recent_performance(
     lookback_months = lookback_months or config.MONITOR_LOOKBACK_MONTHS
     start, end = _recent_month_range(lookback_months, as_of)
 
-    df = s3_io.read_parquet(config.MULTI_HORIZON_FEATURES_TABLE_PARQUET)
+    # date_range로 이번에 볼 N개월 파티션만 받는다 — 그동안 쌓인 전체 히스토리를 매달
+    # 실행할 때마다 다 받으면, 실행 비용이 "최근 N개월"이 아니라 "서비스 시작 이후
+    # 전체 기간"에 비례해서 계속 커진다(s3_io.py 모듈 docstring 참고).
+    needed = sorted(set(FEATURE_COLUMNS) | {target_col, "date", "horizon"} | ({exposure_col} if exposure_col else set()))
+    df = s3_io.read_parquet(config.MULTI_HORIZON_FEATURES_TABLE_PARQUET, columns=needed, date_range=(start, end))
     if df is None:
         raise FileNotFoundError(f"S3에 없음: {config.MULTI_HORIZON_FEATURES_TABLE_PARQUET}")
-    df = df[(df["date"] >= start) & (df["date"] <= end) & (df["horizon"] == horizon)].reset_index(drop=True)
+    df = df[df["horizon"] == horizon].reset_index(drop=True)
     if df.empty:
         raise ValueError(
             f"{start}~{end} 구간·horizon={horizon}에 feature mart 데이터가 없음 — 최신 데이터가 반영됐는지 확인하세요"

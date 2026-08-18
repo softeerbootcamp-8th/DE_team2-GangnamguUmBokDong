@@ -174,5 +174,8 @@ if __name__ == "__main__":
             anchor_input = anchor_input.filter(F.minute(F.col("hour_ts")) == 0)
 
     result = build_multi_horizon_features(spark, features, anchor_df=anchor_input)
-    result.write.mode("overwrite").parquet(config.MULTI_HORIZON_FEATURES_TABLE_PARQUET)
+    # date 파티션으로 써야 training/monitor_performance가 ml_common.s3_io.read_parquet()의
+    # date_range로 필요한 기간만 읽을 수 있다(전체 히스토리를 매번 훑지 않음) — s3_io.py
+    # 모듈 docstring 참고.
+    result.write.mode("overwrite").partitionBy("date").parquet(config.MULTI_HORIZON_FEATURES_TABLE_PARQUET)
     print(f"multi-horizon features -> {config.MULTI_HORIZON_FEATURES_TABLE_PARQUET}")
