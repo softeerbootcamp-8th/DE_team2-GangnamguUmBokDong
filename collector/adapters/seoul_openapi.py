@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import json
 import os
+from datetime import timedelta
 from typing import TYPE_CHECKING
 
 import httpx
@@ -104,7 +105,16 @@ class SeoulOpenApiAdapter:
         path_suffix_template = params.get("path_suffix", "")
         suffix = ""
         if path_suffix_template:
-            suffix = path_suffix_template.format(window_start=window.window_start)
+            # `window_last`는 이 윈도우가 시작하기 직전 순간이다. 시간 단위 파라미터를
+            # 받는 API에서 매시 끝자락이 누락되는 것을 막는다 — 19:00 윈도우가
+            # window_start의 시를 쓰면 19시대를 요청해 18:55~19:00 데이터를 아무도
+            # 가져가지 않는다. window_last를 쓰면 그 윈도우가 18시대를 한 번 더
+            # 완결시키고 19:05부터 19시대로 넘어간다.
+            suffix = path_suffix_template.format(
+                window_start=window.window_start,
+                window_end=window.window_end,
+                window_last=window.window_start - timedelta(seconds=1),
+            )
         # citydata_ppltn은 페이지네이션 대신 POI001~POI116 순회
         if service == "citydata_ppltn":
             expected = 116

@@ -6,7 +6,14 @@ adapter_params:
   service: tbCycleRentData
   page_size: 1000
   root_key: rentData.row
-  path_suffix: "/{window_start:%Y-%m-%d}/{window_start:%Y-%m-%d}"
+  # 이 API는 `/{날짜}/{시}`를 받아 그 한 시간치를 준다(하루치가 아니다). 시 자리에
+  # 날짜를 넣으면 유효한 시가 아니라 API가 00시로 폴백하므로, 하루 종일 00시대만
+  # 반복 수집하게 된다.
+  #
+  # window_last(윈도우 직전 순간)를 쓰는 이유는 매시 끝자락 누락을 막기 위해서다.
+  # window_start를 쓰면 19:00 윈도우가 19시대를 요청해 18:55~19:00 대여를 아무도
+  # 가져가지 않는다.
+  path_suffix: "/{window_last:%Y-%m-%d}/{window_last:%H}"
 
 schedule:
   interval: 5m
