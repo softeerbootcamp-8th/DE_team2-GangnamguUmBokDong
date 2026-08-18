@@ -1,0 +1,40 @@
+source_id: bike_station_master
+description: 따릉이 대여소 마스터
+
+adapter: seoul_openapi
+adapter_params:
+  service: bikeStationMaster
+  page_size: 1000
+  root_key: bikeStationMaster.row
+
+schedule:
+  interval: 1d
+
+storage:
+  bronze_format: json
+  silver_format: parquet
+  partition: [dt, hh]
+
+quality:
+  max_drop_ratio: 0.05
+  max_missing_ratio: 0.0
+  allow_empty: false
+
+policies:
+  required_missing: drop_row
+  required_outlier: drop_row
+  optional_missing: keep_null
+  optional_outlier: set_null
+
+columns:
+  RNTLS_ID:
+    types: [str]
+    required: true
+  ADDR1:
+    types: [str]
+  ADDR2:
+    types: [str]
+  LAT:
+    types: [float]
+  LOT:
+    types: [float]

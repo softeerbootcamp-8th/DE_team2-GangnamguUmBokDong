@@ -1,6 +1,26 @@
-"""queries.py: _haversine_km 테스트 (#102, 대여소 주변 행사 검색에 쓰는 거리 계산)."""
+"""queries.py 테스트: 대여소 조회(fetch_stations), 행사 거리 계산(_haversine_km, #102)."""
 
+import queries
 from queries import _haversine_km
+
+
+def test_fetch_stations_does_not_require_forecasts(monkeypatch):
+    """미래 예측이 없어도 대여소와 최신 재고를 조회한다."""
+    expected = [{"sta_id": "ST-1", "parking_bike_tot_cnt": 3}]
+    captured = {}
+
+    def fake_fetch_all(query, params=None):
+        captured["query"] = query
+        captured["params"] = params
+        return expected
+
+    monkeypatch.setattr(queries, "fetch_all", fake_fetch_all)
+
+    assert queries.fetch_stations() == expected
+    assert "FROM stations s" in captured["query"]
+    assert "FROM station_stock" in captured["query"]
+    assert "forecast_points" not in captured["query"]
+    assert captured["params"] is None
 
 
 def test_same_point_is_zero_distance():

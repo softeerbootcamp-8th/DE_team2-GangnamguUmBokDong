@@ -1,7 +1,6 @@
-"""점진적 감소 가중평균 + 결측 재조정 + 전체 결측 폴백 체인.
+"""과거 관측치 기반 가중평균 및 결측 폴백 추정을 수행한다.
 
-S3/IO를 모르는 순수 함수. 호출자가 이미 "결측 또는 공휴일 타입 불일치"를
-`None`으로 표시해 넘겨준다고 가정한다.
+S3/IO 의존성이 없는 순수 함수로 구성되어 있습니다.
 """
 
 from __future__ import annotations
@@ -14,9 +13,14 @@ def estimate(
     extended: list[float | None] = (),
     historical_avg: float | None = None,
 ) -> tuple[float, str]:
-    """`candidates`는 [1주전, 2주전, 3주전, 4주전] 값(결측/불일치는 None).
+    """과거 관측치를 바탕으로 가중평균 또는 폴백 방식을 적용해 값을 추정한다.
 
-    반환값: (추정치, estimation_method)
+    args:
+        candidates: 1~4주 전 관측값 목록 (결측값은 None)
+        extended: 5~8주 전 관측값 목록
+        historical_avg: 격자의 과거 전체 평균값
+    returns:
+        (추정치, 추정 방식) 튜플
     """
     valid = [(week, value) for week, value in zip((1, 2, 3, 4), candidates) if value is not None]
 

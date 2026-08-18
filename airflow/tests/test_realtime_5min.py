@@ -4,7 +4,6 @@ from datetime import timedelta
 
 from airflow.providers.standard.operators.bash import BashOperator
 from airflow.timetables.trigger import CronTriggerTimetable
-
 from config.schedules import EXECUTION_TIMEOUT_OVERRIDES, REALTIME_5MIN_CRON, TIMEZONE
 from config.sources import REALTIME_5MIN_SOURCES
 from dags.realtime_5min import dag
@@ -24,6 +23,7 @@ def test_expected_tasks_exist():
         "load_station_stock",
         "run_normalizer_strict",
         "run_normalizer_fallback",
+        "population_normalized",
         "run_inference",
         "load_forecast_points",
     }
@@ -55,19 +55,18 @@ def test_normalizer_strict_then_fallback():
     assert "--baseline-date-mode strict" in strict.bash_command
 
 
-def test_inference_depends_on_all_three_collectors_but_not_normalizer():
-    """ml/inference/predict_single.py는 normalizer 출력을 소비하지 않는다 — 설계 판단을
-    회귀 테스트로 고정한다."""
+def test_inference_waits_for_realtime_bikes_and_normalized_population():
+    """날씨는 별도 DAG의 최신 Silver를 읽고, 이 DAG의 실시간 입력은 직접 기다린다."""
     run_inference = dag.get_task("run_inference")
     upstream_ids = {t.task_id for t in run_inference.upstream_list}
 
     assert upstream_ids == {
         "collect_bike_rental_history",
         "collect_bike_station_realtime",
-        "collect_population_realtime",
+        "population_normalized",
     }
-    assert "run_normalizer_strict" not in upstream_ids
-    assert "run_normalizer_fallback" not in upstream_ids
+    assert "collect_population_realtime" not in upstream_ids
+    assert "collect_weather_ultra_short_live" not in dag.task_ids
 
 
 def test_inference_then_load_forecast_points():
@@ -85,7 +84,7 @@ def test_collector_task_execution_contract():
     assert "--source bike_station_realtime" in task.bash_command
     assert "--window-start" in task.bash_command
     assert "astimezone" in task.bash_command
-    assert "env -u VIRTUAL_ENV" in task.bash_command
+    assert task.bash_command.startswith("env -u VIRTUAL_ENV -u UV_PROJECT_ENVIRONMENT ")
 
 
 def test_living_population_grid_timeout_override_not_used_in_this_dag():

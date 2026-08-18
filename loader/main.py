@@ -1,15 +1,4 @@
-"""loader CLI 진입점.
-
-Airflow가 `uv run python main.py --table <table> --window-start <window_start>` 형태로
-호출하는 것을 전제로 한다. Silver(또는 ml/inference 추론 결과)를 읽어 변환한 뒤
-Gold DB에 upsert하고, 성공하면 0, 실패하면 0이 아닌 코드로 종료한다.
-
-`window_start`는 Airflow DAG의 KST(+09:00) 오프셋 문자열을 그대로 받는다 — collector와
-동일한 오프셋이어야 한다(offset이 다르면 `%H`/`%HHMM`로 찍는 S3 파티션 키가 서로
-어긋난다).
-
-    uv run python main.py --table stations --window-start 2026-08-16T14:05:00+09:00
-"""
+"""Silver 계층 데이터를 읽어 Gold DB에 Upsert하는 CLI 진입점 모듈."""
 
 from __future__ import annotations
 
@@ -18,12 +7,18 @@ import sys
 from datetime import datetime
 
 from core.db import get_connection
+from core.upsert import upsert
 
 from config import TABLE_SPECS
-from core.upsert import upsert
 
 
 def run(table: str, window_start: datetime) -> None:
+    """지정된 테이블 스펙에 따라 S3 데이터를 읽고 변환하여 Gold DB에 Upsert한다.
+
+    args:
+        table: 대상 테이블 스펙 식별자
+        window_start: 수집 기준 시각 (KST)
+    """
     spec = TABLE_SPECS[table]
     silver = spec.read(window_start)
 
@@ -34,8 +29,10 @@ def run(table: str, window_start: datetime) -> None:
     else:
         rows = spec.transform(silver)
 
-    # 논리 spec 이름 → 물리 테이블 이름 매핑
-    # 여러 소스가 같은 골드 테이블로 병합되는 경우를 처리한다.
+    # 논리 spec 이름 → 물리 DB 테이블 이름 매핑
+    # 서로 다른 여러 데이터 소스가 단일 Gold 테이블로 통합 적재되는 경우를 처리한다:
+    # 1) 문화/공연 행사: cultural_event(문화행사)와 performance_event(공연행사) → cultural_events 테이블로 병합
+    # 2) 날씨 예보: weather_short_term_forecast(단기)와 weather_ultra_short_forecast(초단기) → weather_forecast 테이블로 병합
     _TABLE_ALIASES = {
         "cultural_events_performance": "cultural_events",
         "weather_forecast_ultra": "weather_forecast",
@@ -50,6 +47,7 @@ def run(table: str, window_start: datetime) -> None:
 
 
 def main() -> int:
+    """CLI 인자를 파싱하고 테이블 적재 파이프라인을 실행한다 (성공 0, 실패 1)."""
     parser = argparse.ArgumentParser(description="Silver parquet을 읽어 Gold DB에 upsert한다.")
     parser.add_argument("--table", required=True, choices=sorted(TABLE_SPECS))
     parser.add_argument("--window-start", required=True, help="ISO8601 시각(KST), 예: 2026-08-16T14:05:00+09:00")
@@ -59,7 +57,7 @@ def main() -> int:
 
     try:
         run(args.table, window_start)
-    except Exception as exc:  # noqa: BLE001 - CLI 최상위: 실패를 종료 코드로 변환하기 위해 넓게 잡는다
+    except Exception as exc:  # noqa: BLE001 - CLI 최상위: 실패를 종료 코드로 변환하기 위해 포괄 처리
         print(f"loader failed: {exc}", file=sys.stderr)
         return 1
     return 0

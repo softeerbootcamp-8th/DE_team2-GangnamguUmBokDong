@@ -36,7 +36,7 @@ def build_rolling_rental_features(
     args:
         spark: SparkSession
         output_path: 지정하면 이 경로에 overwrite로 저장(전체 빌드용). None이면 저장하지
-            않고 DataFrame만 반환(증분 빌드는 run_pipeline.py가 append 여부를 직접 결정).
+            않고 DataFrame만 반환(증분 빌드는 run_pipeline.py가 저장 방식을 직접 결정).
         since: load_rental_trip_events()에 그대로 전달 (증분 재계산용)
     returns:
         DataFrame: station_id, tick, count (sparse step function)

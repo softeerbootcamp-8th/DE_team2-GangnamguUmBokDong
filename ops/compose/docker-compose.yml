@@ -19,6 +19,23 @@ services:
       timeout: 5s
       retries: 10
 
+  # docker-entrypoint-initdb.d는 postgres-data 볼륨을 처음 만들 때만 실행된다.
+  # 이미 존재하는 로컬 볼륨에도 새 Gold 테이블을 반영하도록, idempotent한
+  # 002_gold_schema.sh를 Compose 기동마다 한 번 더 적용한다.
+  postgres-schema-init:
+    image: postgres:16
+    environment:
+      PGHOST: postgres
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      PGPASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_APP_DB: ${POSTGRES_APP_DB:-app}
+    volumes:
+      - ../postgres/init:/docker-entrypoint-initdb.d:ro
+    command: ["bash", "/docker-entrypoint-initdb.d/002_gold_schema.sh"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
   minio:
     image: minio/minio
     command: server /data --console-address ":9001"
@@ -76,8 +93,8 @@ services:
     volumes:
       - ../..:/workspace
     depends_on:
-      postgres:
-        condition: service_healthy
+      postgres-schema-init:
+        condition: service_completed_successfully
 
   airflow-webserver:
     build:
@@ -162,6 +179,39 @@ services:
       airflow-init:
         condition: service_completed_successfully
 
+  api:
+    build:
+      context: ../..
+      dockerfile: ops/compose/Dockerfile.airflow
+    command:
+      - bash
+      - -lc
+      - cd /workspace/apps/api && env -u VIRTUAL_ENV uv run --frozen uvicorn main:app --host 0.0.0.0 --port 8000
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_APP_DB:-app}
+    ports:
+      - "${API_PORT:-8000}:8000"
+    volumes:
+      - ../..:/workspace
+    depends_on:
+      postgres-schema-init:
+        condition: service_completed_successfully
+
+  web:
+    image: node:20-alpine
+    working_dir: /workspace/apps/web
+    command: sh -c "npm ci && npm run dev -- --host 0.0.0.0"
+    environment:
+      VITE_API_BASE: http://localhost:${API_PORT:-8000}
+    ports:
+      - "${WEB_PORT:-5173}:5173"
+    volumes:
+      - ../..:/workspace
+      - web-node-modules:/workspace/apps/web/node_modules
+    depends_on:
+      - api
+
 volumes:
   postgres-data:
   minio-data:
+  web-node-modules:
