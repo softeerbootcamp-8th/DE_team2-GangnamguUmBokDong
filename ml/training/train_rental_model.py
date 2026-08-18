@@ -4,8 +4,9 @@
 horizon=1..HORIZON_COUNT 전체를 학습한다(history.md 18번 항목 — "horizon을 feature로").
 
 **항상 아카이브에 저장한다(챔피언에 직접 쓰지 않음)** — `training/promotion.py`가
-이 결과를 챔피언과 비교해 조건을 만족할 때만 챔피언 경로로 파일명 그대로 복사한다
-(`training/scripts/monthly_retrain_check.py` 참고). 날짜/프로필은
+이 결과를 챔피언과 비교해 조건을 만족할 때만 챔피언 포인터가 이 아카이브
+prefix를 가리키도록 원자적으로 전환한다(`training/scripts/monthly_retrain_check.py`
+참고). 날짜/프로필은
 `MODEL_ARCHIVE_DATE`/`ML_PROFILE` 환경변수로 정해진다(둘 다 미지정 시 오늘 날짜 /
 "default" 프로필 — 수동 실행 시 그대로 씀).
 """

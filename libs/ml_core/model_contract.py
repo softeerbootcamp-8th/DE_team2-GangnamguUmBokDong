@@ -29,7 +29,7 @@ import pandas as pd
 from core import s3 as s3_io
 
 from . import common_config
-from .paths import MODELS_PREFIX
+from .paths import MODELS_PREFIX, read_champion_prefix
 
 RENTAL_FEATURE_COLUMNS = [*common_config.BASE_FEATURE_COLUMNS, "rental_lag_1h"]
 RETURN_FEATURE_COLUMNS = [*common_config.BASE_FEATURE_COLUMNS, "return_lag_1h"]
@@ -102,11 +102,20 @@ def load_station_dtype(model_name: str, models_prefix: str | None = None) -> pd.
 
     args:
         model_name: "rental" 또는 "return"
-        models_prefix: station_categories_path() 참고
+        models_prefix: None이면 "지금 챔피언"의 archive_prefix를
+            `read_champion_prefix()`로 구해서 쓴다(그 함수 docstring 참고 —
+            `ml_core.scoring`의 `load_boosters()`/`load_conformal_correction()`과
+            같은 프로세스 캐시를 공유해서, 한 프로세스 안에서는 booster/보정값/
+            station_categories가 항상 같은 archive_prefix에서 나오게 한다).
+            명시적으로 주면(실험/스윕 등) 그 값을 그대로 쓴다.
     returns:
         pd.CategoricalDtype: 학습 시점과 동일한 순서의 station_id 카테고리
+    raises:
+        FileNotFoundError: station_categories가 없을 때, 또는(models_prefix가
+            None인데) 아직 한 번도 승격된 적 없을 때
     """
-    categories = s3_io.read_json(station_categories_path(model_name, models_prefix))
+    resolved_prefix = models_prefix if models_prefix is not None else read_champion_prefix(model_name)
+    categories = s3_io.read_json(station_categories_path(model_name, resolved_prefix))
     if categories is None:
-        raise FileNotFoundError(f"station_categories 없음: {station_categories_path(model_name, models_prefix)}")
+        raise FileNotFoundError(f"station_categories 없음: {station_categories_path(model_name, resolved_prefix)}")
     return pd.CategoricalDtype(categories=categories)

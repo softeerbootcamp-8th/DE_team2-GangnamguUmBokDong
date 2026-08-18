@@ -26,7 +26,7 @@ from ml_core.model_contract import (
     load_station_dtype,
     station_categories_path,
 )
-from ml_core.paths import model_json_key, model_key
+from ml_core.paths import archive_models_prefix, model_json_key, model_key
 
 from . import config
 
@@ -246,8 +246,8 @@ def train_target(
     df: pd.DataFrame,
     target_col: str,
     model_name: str,
+    models_prefix: str,
     exposure_col: str | None = None,
-    models_prefix: str | None = None,
 ) -> dict:
     """대여 또는 반납 하나를 학습한다 — Poisson(+exposure offset) 1개 + quantile(P10/50/90) 3개.
 
@@ -258,16 +258,19 @@ def train_target(
         df: features.build_features()를 거친 전체 feature 테이블
         target_col: "rental_count" 또는 "return_count"
         model_name: 저장 파일명 접두사 ("rental" 또는 "return")
+        models_prefix: 저장할 S3 키 prefix — 항상 명시적으로 줘야 한다(기본값 없음).
+            학습은 항상 아카이브(`ml_core.paths.archive_models_prefix()`)에 쓰고
+            챔피언 자리(`config.MODELS_PREFIX`)에는 절대 직접 안 쓴다 — 챔피언은
+            `ml_core.paths.write_champion_pointer()`가 archive_prefix를 가리키는
+            포인터만 원자적으로 바꿔서 정해지므로(`training/promotion.py` 참고),
+            여기서 `models_prefix`에 `config.MODELS_PREFIX`를 넘기면 그 밑에 아무도
+            안 읽는 고아 파일이 생긴다.
         exposure_col: Poisson exposure offset으로 쓸 컬럼명. None이면 offset 없이
             (exposure=1) 학습 — 반납 모델은 항상 None
-        models_prefix: 저장할 S3 키 prefix. None이면 챔피언 prefix(config.MODELS_PREFIX)
-            — 하이퍼파라미터 스윕 등 실험 실행은 자신만의 prefix를 넘겨서 챔피언
-            아티팩트를 덮어쓰지 않는다.
     returns:
         dict: poisson_deviance_test, rmse_test, best_iteration, pinball_test_q{10,50,90},
             p10_p90_coverage_raw_test, conformal_correction, p10_p90_coverage_calibrated_test
     """
-    models_prefix = models_prefix or config.MODELS_PREFIX
     is_primary = config.LGB_MACHINE_RANK == 0  # 분산 학습 시 최종 평가/아티팩트 저장은 이 머신만 담당
     feature_columns = _FEATURE_COLUMNS_BY_MODEL[model_name]
     train_df, valid_df, test_df = _split(df)
@@ -418,7 +421,8 @@ def train_target(
         # 임베고 등 프로필 값이 바뀌면 이 모델을 서빙할 feature_engine/inference도
         # 같은 프로필을 써야 한다 — 어떤 프로필로 학습됐는지를 모델 파일 옆에 그대로
         # 남겨서, 나중에 이 모델을 찾았을 때 재현/서빙 조건을 바로 알 수 있게 한다
-        # (training/promotion.py가 챔피언 승격 시 이 파일도 그대로 복사한다).
+        # (챔피언으로 승격되면 training/promotion.py가 이 archive_prefix를 포인터로
+        # 가리키므로, 이 파일도 그 포인터를 통해 그대로 조회된다 — 별도 복사 없음).
         s3_io.write_json(
             model_json_key(model_name, "profile", models_prefix),
             {"profile_name": common_config.PROFILE_NAME, **common_config.PROFILE},
@@ -431,11 +435,15 @@ if __name__ == "__main__":
     # 대여/반납은 이제 완전히 분리된 데이터셋이라 테이블을 따로 읽는다 — 실제
     # 운영 엔트리포인트는 train_rental_model.py/train_return_model.py(모델
     # 아카이브 경로/프로필까지 처리)이고, 이 블록은 로컬 ad-hoc 실행용이다.
+    # models_prefix에 기본값이 없으므로(챔피언 자리에 직접 못 씀) 여기서도
+    # 실제 엔트리포인트와 똑같이 아카이브 경로를 명시적으로 계산해서 넘긴다.
+    _archive_prefix = archive_models_prefix(config.today_kst().isoformat(), common_config.PROFILE_NAME)
+
     rental_df = load_training_table("rental")
-    rental_metrics = train_target(rental_df, "rental_count", "rental", exposure_col="rental_exposure")
+    rental_metrics = train_target(rental_df, "rental_count", "rental", _archive_prefix, exposure_col="rental_exposure")
     del rental_df
 
     return_df = load_training_table("return")
-    return_metrics = train_target(return_df, "return_count", "return", exposure_col=None)
+    return_metrics = train_target(return_df, "return_count", "return", _archive_prefix, exposure_col=None)
 
     print(json.dumps({"rental": rental_metrics, "return": return_metrics}, indent=2, ensure_ascii=False))

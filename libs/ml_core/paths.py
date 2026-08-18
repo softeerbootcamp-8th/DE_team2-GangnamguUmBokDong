@@ -17,7 +17,11 @@ s3_io._bucket()`가 읽음)로 정해지고, 이 파일은 그 버킷 "안"에�
 """
 
 import os
+from datetime import UTC, datetime
+from functools import cache
 from pathlib import Path
+
+from core import s3 as s3_io
 
 from . import common_config
 
@@ -54,10 +58,10 @@ TRAIN_MONTHS = [f"{TRAIN_YEAR % 100:02d}{m:02d}" for m in range(1, 13)]
 RENTAL_PARQUET_DIR = os.environ.get("RENTAL_PARQUET_DIR", "parquet")
 
 # training이 만들고(학습), inference가 읽는(서빙) 모델 아티팩트 — dev/
-# S3_DATA_CATALOG.md에 정의된 `models/` prefix를 그대로 쓴다. 이제 학습은 항상
-# 아래 아카이브 prefix에 쓰고, 챌린저가 챔피언을 이길 때만(training/promotion.py)
-# 이 prefix로 파일명 그대로 복사된다 — 이 prefix에 직접 학습 결과를 쓰는 코드
-# 경로는 없다.
+# S3_DATA_CATALOG.md에 정의된 `models/` prefix를 그대로 쓴다. 학습은 항상 아래
+# 아카이브 prefix에 쓴다 — 이 prefix에 booster/JSON을 직접 쓰는 코드 경로는
+# 없다. 대신 `champion/{model_name}.json` 포인터가 "지금 챔피언은 어느
+# archive_prefix인지"를 가리키고(아래 참고), 실제 파일은 항상 archive에만 있다.
 MODELS_PREFIX = os.environ.get("MODELS_PREFIX", "models")
 
 # 학습한 모든 모델(챔피언이 됐는지와 무관하게)을 보존하는 아카이브 — 날짜/프로필별로
@@ -71,7 +75,8 @@ def archive_models_prefix(date: str, profile_name: str) -> str:
     이 prefix를 `train_common.train_target(..., models_prefix=...)`에 그대로
     넘기면, `model_key`/`model_json_key`가 만드는 파일명(예: "rental_poisson.txt")
     자체는 챔피언 경로와 완전히 동일하게 유지되고 위치만 여기로 바뀐다 — 나중에
-    챔피언으로 승격할 때 파일명을 그대로 복사만 하면 되는 이유다.
+    챔피언으로 승격할 때는 이 경로를 `write_champion_pointer()`로 가리키기만
+    하면 된다(파일 복사 없음, 아래 참고).
 
     args:
         date: "YYYY-MM-DD" — 학습을 실행한 날짜
@@ -83,21 +88,92 @@ def archive_models_prefix(date: str, profile_name: str) -> str:
 
 
 def model_key(model_name: str, suffix: str, models_prefix: str | None = None) -> str:
-    """모델 아티팩트 하나의 S3 키를 만든다 (예: model_key("rental", "poisson") -> "models/rental_poisson.txt").
+    """모델 아티팩트 하나의 S3 키를 만든다 (예: model_key("rental", "poisson", archive_prefix) -> "{archive_prefix}/rental_poisson.txt").
 
     args:
         model_name: "rental" 또는 "return"
         suffix: "poisson"/"q10"/"q50"/"q90"
-        models_prefix: None이면 챔피언 prefix(MODELS_PREFIX) — 하이퍼파라미터 스윕 등
-            실험 실행은 자신만의 prefix(예: "models/experiments/{run_id}")를 넘겨서
-            챔피언 아티팩트를 덮어쓰지 않는다.
+        models_prefix: None이면 정적 MODELS_PREFIX를 그대로 쓴다 — 이제 챔피언
+            아티팩트는 여기 없으므로(위 MODELS_PREFIX 설명 참고), "지금 챔피언"을
+            읽고 싶으면 호출부가 먼저 `read_champion_prefix(model_name)`으로
+            archive_prefix를 구해 명시적으로 넘겨야 한다. 하이퍼파라미터 스윕 등
+            실험 실행도 마찬가지로 자신만의 prefix(예: "models/experiments/{run_id}")를
+            명시적으로 넘긴다.
     """
     return f"{models_prefix or MODELS_PREFIX}/{model_name}_{suffix}.txt"
 
 
 def model_json_key(model_name: str, kind: str, models_prefix: str | None = None) -> str:
-    """모델 부속 JSON(conformal_correction/station_categories/metrics)의 S3 키를 만든다."""
+    """모델 부속 JSON(conformal_correction/station_categories/metrics)의 S3 키를 만든다.
+
+    args: model_key() 참고 — models_prefix=None의 의미가 동일하다.
+    """
     return f"{models_prefix or MODELS_PREFIX}/{model_name}_{kind}.json"
+
+
+def champion_pointer_key(model_name: str) -> str:
+    """model_name(rental/return)의 챔피언 포인터 위치."""
+    return f"{MODELS_PREFIX}/champion/{model_name}.json"
+
+
+@cache
+def read_champion_prefix(model_name: str) -> str:
+    """지금 챔피언이 가리키는 archive_prefix를 읽는다.
+
+    **왜 파일 복사가 아니라 포인터인가**: 예전엔 승격할 때 archive의 파일 8개
+    (booster 4개 + station_categories/conformal_correction/metrics/profile)를
+    챔피언 prefix로 하나씩 복사했다 — S3는 여러 키에 걸친 트랜잭션을 지원하지
+    않으므로, 복사가 절반쯤 끝난 순간 inference가 실행되면 booster는 새
+    버전인데 station_categories는 옛 버전인 식으로 섞인 모델을 읽을 수 있었다
+    (station_id 카테고리 코드가 학습 시점의 정렬 순서에 의존하므로, 이렇게
+    섞이면 성능 저하가 아니라 엉뚱한 정류소에 대한 예측이 조용히 나간다).
+    archive 자체는 학습이 끝난 뒤 다시 안 바뀌는 immutable 산출물이므로, "지금
+    챔피언이 어느 archive_prefix인지"를 가리키는 포인터 객체 하나만 원자적으로
+    바꾸면 파일을 복사할 필요가 아예 없다 — 단일 키에 대한 PUT은 원자적이라,
+    어느 시점에 이 함수를 부르든 완전히 예전 archive_prefix 또는 완전히 새
+    archive_prefix 둘 중 하나만 보이고 중간 상태는 존재하지 않는다.
+
+    **`@cache`가 필요한 이유(프로세스 "내" 일관성 — 프로세스 "간"이 아님)**: 이
+    함수는 여러 모듈(`ml_core.scoring`의 `load_boosters()`/`load_conformal_correction()`,
+    `ml_core.model_contract`의 `load_station_dtype()`)이 같은 import로 나눠
+    부른다. 캐시가 없으면 한 프로세스 안에서도 이 셋을 부르는 시점 사이에
+    승격이 끼어들 경우 서로 다른 archive_prefix를 읽어버릴 수 있다 — 이 함수를
+    `@cache`로 감싸면 이 프로세스가 사는 동안 최초 호출 시점의 값 하나로
+    고정되어, 그 프로세스 안에서 booster/correction/station_categories가
+    항상 같은 archive_prefix에서 나온다. 다른 프로세스(다음 5분 주기 inference 등)가
+    승격 이후 새 값을 보는 것은 정상이고 문제없다 — 막아야 하는 건 프로세스
+    "하나"가 자기 안에서 신/구 버전을 섞어 쓰는 경우뿐이다. 테스트에서 승격을
+    흉내내려면 `read_champion_prefix.cache_clear()`로 캐시를 비울 것.
+
+    args:
+        model_name: "rental" 또는 "return"
+    returns:
+        str: 챔피언이 가리키는 archive_prefix
+    raises:
+        FileNotFoundError: 아직 한 번도 승격된 적 없음(포인터 자체가 없음)
+    """
+    pointer = s3_io.read_json(champion_pointer_key(model_name))
+    if pointer is None:
+        raise FileNotFoundError(f"챔피언 포인터 없음: {champion_pointer_key(model_name)} (아직 승격된 적 없음)")
+    return pointer["archive_prefix"]
+
+
+def write_champion_pointer(model_name: str, archive_prefix: str) -> dict:
+    """model_name의 챔피언이 archive_prefix를 가리키도록 원자적으로 전환한다.
+
+    `training.promotion.promote_challenger()`가 승격 시 이 함수 하나만 부른다 —
+    더 이상 archive 파일을 챔피언 자리로 복사하지 않는다(`read_champion_prefix()`
+    docstring 참고).
+
+    args:
+        model_name: "rental" 또는 "return"
+        archive_prefix: 새로 챔피언이 될 archive_prefix(`archive_models_prefix()`가 만든 값)
+    returns:
+        dict: 실제로 기록된 포인터 내용
+    """
+    record = {"archive_prefix": archive_prefix, "promoted_at": datetime.now(UTC).isoformat()}
+    s3_io.write_json(champion_pointer_key(model_name), record)
+    return record
 
 
 # --- feature_engine 1차 정제 산출물 (이번 phase는 "이미 어딘가 있다"고

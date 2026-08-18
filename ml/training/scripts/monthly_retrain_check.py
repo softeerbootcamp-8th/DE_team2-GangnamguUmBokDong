@@ -10,13 +10,16 @@
 관리한다 — 여기서는 그 기준을 적용만 한다.
 
 **챌린저/챔피언 흐름**: 학습은 항상 아카이브(`ml_core.paths.archive_models_prefix()`
-— 날짜+프로필별로 분리)에 쓰고, 챔피언 경로(`models/`)는 직접 덮어쓰지 않는다.
-`training.promotion.should_promote()`가 챌린저(방금 학습한 것)와 챔피언(현재
-`models/{model_name}_metrics.json`)을 비교해, 챌린저가 기준을 만족할 때만
-`promotion.promote_challenger()`로 아카이브 파일을 챔피언 자리로 **같은 파일명
-그대로** 복사한다. 만족 못 하면 다른 프로필(`libs/ml_core/profiles/*.json`)로
-다시 시도하고, 가진 프로필을 전부 써도 못 넘으면 챔피언을 그대로 두고 다음 달을
-기약한다(정상 종료 — 예외를 던지지 않는다).
+— 날짜+프로필별로 분리)에 쓰고, 챔피언 경로(`models/`)에는 booster/JSON을 직접
+쓰지 않는다. `training.promotion.should_promote()`가 챌린저(방금 학습한 것)와
+챔피언(현재 챔피언 포인터가 가리키는 archive의 `metrics.json`)을 비교해, 챌린저가
+기준을 만족할 때만 `promotion.promote_challenger()`로 챔피언 포인터
+(`models/champion/{model_name}.json`)가 그 아카이브 prefix를 가리키도록 원자적으로
+전환한다 — 파일을 복사하지 않는다(승격 도중 파일이 부분적으로만 바뀌어 서로 다른
+버전이 섞이는 문제를 피하기 위함, `ml_core.paths.read_champion_prefix()` docstring
+참고). 만족 못 하면 다른 프로필(`libs/ml_core/profiles/*.json`)로 다시 시도하고,
+가진 프로필을 전부 써도 못 넘으면 챔피언을 그대로 두고 다음 달을 기약한다(정상
+종료 — 예외를 던지지 않는다).
 
 **프로필마다 별도 프로세스가 필요한 이유**: `ml_core.common_config`는 프로세스가
 시작할 때 `ML_PROFILE` 환경변수로 프로필 값을 한 번만 읽어 모듈 전역 상수로
@@ -169,8 +172,8 @@ def _attempt_promotion(model_name: str, champion_metrics: dict | None) -> bool:
 
         if promote:
             archive_prefix = archive_models_prefix(archive_date, profile_name)
-            copied = promote_challenger(model_name, archive_prefix)
-            _notify(f"[{model_name}] '{profile_name}' 챌린저를 챔피언으로 승격 — {len(copied)}개 파일 교체")
+            promote_challenger(model_name, archive_prefix)
+            _notify(f"[{model_name}] '{profile_name}' 챌린저를 챔피언으로 승격 — 포인터가 {archive_prefix}를 가리키도록 전환")
             return True
 
         _notify(f"[{model_name}] '{profile_name}' 챌린저가 기준 미달 — 다음 프로필 시도")

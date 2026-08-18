@@ -7,9 +7,10 @@
 순수 변동으로 오탐이 안 난다. 이 파일은 그 기준을 실제로 적용만 한다.
 
 **baseline**은 "이 모델이 마지막으로 학습됐을 때 테스트셋에서 낸 성능"
-(`models/{model_name}_metrics.json`, `train_common.train_target()`이 학습 시점에
-저장해둠)이다. 매달 이 값과 "최근 `config.MONITOR_LOOKBACK_MONTHS`개월 실측"을
-비교한다.
+(`{model_name}_metrics.json`, `train_common.train_target()`이 학습 시점에
+챔피언의 archive_prefix 밑에 저장해둠 — `ml_core.paths.read_champion_prefix()`로
+"지금 챔피언"이 가리키는 위치를 찾는다)이다. 매달 이 값과 "최근
+`config.MONITOR_LOOKBACK_MONTHS`개월 실측"을 비교한다.
 
 실행: `python -m training.monitor_performance` (ml/ 디렉토리에서, 대여/반납 둘 다 확인)
 """
@@ -22,7 +23,7 @@ import pandas as pd
 from core import s3 as s3_io
 from ml_core.metrics import poisson_deviance as _poisson_deviance
 from ml_core.model_contract import RENTAL_FEATURE_COLUMNS, RETURN_FEATURE_COLUMNS
-from ml_core.paths import model_json_key
+from ml_core.paths import model_json_key, read_champion_prefix
 from ml_core.scoring import predict
 
 from . import config
@@ -46,9 +47,11 @@ def _load_baseline_metrics(model_name: str) -> dict:
     returns:
         dict: train_target()이 반환했던 것과 같은 키의 metrics
     raises:
-        FileNotFoundError: 아직 한 번도 학습 안 해서 baseline이 없는 모델
+        FileNotFoundError: 아직 한 번도 승격된 적 없어 챔피언 포인터가 없거나
+            (`read_champion_prefix()`), 포인터는 있는데 metrics.json이 없을 때
     """
-    key = model_json_key(model_name, "metrics")
+    archive_prefix = read_champion_prefix(model_name)
+    key = model_json_key(model_name, "metrics", archive_prefix)
     data = s3_io.read_json(key)
     if data is None:
         raise FileNotFoundError(f"baseline metrics 없음: {key}")
