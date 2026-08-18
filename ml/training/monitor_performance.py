@@ -51,10 +51,22 @@ def _load_baseline_metrics(model_name: str) -> dict:
 
 
 def _recent_month_range(lookback_months: int, as_of: date | None = None) -> tuple[str, str]:
-    """최근 완결된 lookback_months개월의 (시작일, 종료일) "YYYY-MM-DD" 문자열을 만든다.
+    """최근 "완전히 확정된" lookback_months개월의 (시작일, 종료일) "YYYY-MM-DD" 문자열을 만든다.
 
-    "완결된" 개월만 본다 — 이번 달은 아직 안 끝났으니 제외(부분 데이터로 성능을
-    오판하지 않기 위함).
+    "이번 달 제외 = 완결"이 아니다 — 대여이력은 반납 완료 시에만 Silver에
+    나타나므로(`feature_engine/spark/run_pipeline.py` 참고), `rental_count`는
+    한동안 계속 사후 보정될 수 있다. 그래서 "지난달 말일"이 아니라 "그 달의
+    마지막 날이 `as_of - config.TRAINING_SAFETY_MARGIN_DAYS`보다 확실히 이전인
+    가장 최근 달"을 끝으로 잡는다 — 안 그러면(예: 8/1에 실행) 7/31까지를 확정된
+    걸로 보고 baseline과 비교하는데, 그 구간은 며칠 뒤 증분 실행에서
+    rental_count가 또 바뀔 수 있어 "재학습 필요" 판정이 아직 안정화되지 않은
+    값으로 오염된다.
+
+    마진은 `feature_engine`의 `INCREMENTAL_LOOKBACK_HOURS`(35일 — feature mart
+    자체가 사후 보정을 계속 반영하는 폭이 넓은 안전 마진)가 아니라 `training/
+    config.py`의 `TRAINING_SAFETY_MARGIN_DAYS`(7일 — "이 정도면 거의 다
+    반납됐다"는 실용적 기준, 학습 구간 계산과 동일)를 그대로 재사용한다 —
+    35일을 쓰면 모니터링이 항상 두세 달 전 데이터만 보게 돼 너무 뒤처진다.
 
     args:
         lookback_months: 몇 개월치를 볼지
@@ -63,7 +75,12 @@ def _recent_month_range(lookback_months: int, as_of: date | None = None) -> tupl
         tuple[str, str]: (start_date, end_date)
     """
     as_of_ts = pd.Timestamp(as_of) if as_of is not None else pd.Timestamp.now().normalize()
-    end = as_of_ts.replace(day=1) - pd.Timedelta(days=1)  # 지난달 마지막 날
+    safe_cutoff = as_of_ts - pd.Timedelta(days=config.TRAINING_SAFETY_MARGIN_DAYS)
+
+    end = as_of_ts.replace(day=1) - pd.Timedelta(days=1)  # 지난달 마지막 날(후보)
+    while end > safe_cutoff:  # 아직 사후 보정 대상이면 그 이전 달로 계속 밀어낸다
+        end = end.replace(day=1) - pd.Timedelta(days=1)
+
     start = (end - pd.DateOffset(months=lookback_months - 1)).replace(day=1)
     return start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")
 

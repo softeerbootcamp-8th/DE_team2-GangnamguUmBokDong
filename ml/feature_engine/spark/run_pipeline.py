@@ -191,4 +191,11 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as exc:
+        # training/scripts/monthly_retrain_check.py가 이 스크립트를 subprocess로
+        # 띄운다 — 표준출력이 그대로 스트리밍되므로, 실패 사유를 알아보기 쉬운
+        # 한 줄로 여기 남겨야 오케스트레이터 로그만 보고도 원인을 알 수 있다.
+        print(f"[run_pipeline] 실패: {exc}", flush=True)
+        raise
