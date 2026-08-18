@@ -66,18 +66,18 @@ class TestReadGridSilver:
         assert sorted(result.column("CELL_ID").to_pylist()) == ["가가00000000", "가가00000001"]
 
     def test_excludes_nowcast_with_different_schema(self):
-        real = pa.table({"YMD": ["20260812"], "CELL_ID": ["가가00000000"], "SPOP": [10.0]})
-        nowcast = pa.table({"CELL_ID": ["가가00000001"], "SPOP": [20.0], "is_estimated": [True]})
-        _put_parquet("silver/living_population_grid/dt=2026-08-12/hh=00/0000.parquet", real)
+        measured = pa.table({"CELL_ID": ["가가00000000"], "SPOP": [10.0]})
+        nowcast = pa.table({"grid_id": ["가가99999999"], "estimated_population": [999]})
+        _put_parquet("silver/living_population_grid/dt=2026-08-12/hh=14/1400.parquet", measured)
         _put_parquet("silver/living_population_grid/dt=2026-08-12/hh=00/nowcast.parquet", nowcast)
 
         result = storage.read_grid_silver(date(2026, 8, 12))
 
-        assert result.column_names == real.column_names
-        assert result.column("CELL_ID").to_pylist() == ["가가00000000"]
+        assert result.schema == measured.schema
+        assert result.to_pylist() == measured.to_pylist()
 
-    def test_raises_when_only_nowcast_exists(self):
-        nowcast = pa.table({"CELL_ID": ["가가00000001"], "is_estimated": [True]})
+    def test_raises_when_date_prefix_contains_only_nowcast(self):
+        nowcast = pa.table({"grid_id": ["가가99999999"], "estimated_population": [999]})
         _put_parquet("silver/living_population_grid/dt=2026-08-12/hh=00/nowcast.parquet", nowcast)
 
         with pytest.raises(storage.PartitionNotFoundError):
