@@ -142,6 +142,45 @@ def test_fetch_yields_raw_response_unmodified():
     assert results[0].payload == raw
 
 
+def test_population_fetch_uses_configured_poi_range_and_does_not_stop_at_gap():
+    config = _StubConfig(
+        {
+            "service": "citydata_ppltn",
+            "page_size": 1000,
+            "root_key": "SeoulRtd.citydata_ppltn",
+            "poi_start": 117,
+            "poi_end": 121,
+        }
+    )
+    calls = []
+
+    def handler(request):
+        calls.append(str(request.url))
+        poi_id = request.url.path.rstrip("/").rsplit("/", 1)[-1]
+        if poi_id == "POI119":
+            body = {"RESULT": {"RESULT.CODE": "INFO-200"}}
+        else:
+            body = {
+                "RESULT": {"RESULT.CODE": "INFO-000"},
+                "SeoulRtd.citydata_ppltn": [{"AREA_CD": poi_id}],
+            }
+        return httpx.Response(200, content=json.dumps(body).encode())
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    results = list(SeoulOpenApiAdapter.fetch(config, window=None, client=client))
+
+    assert [result.key for result in results] == [
+        "poi-POI117",
+        "poi-POI118",
+        "poi-POI119",
+        "poi-POI120",
+        "poi-POI121",
+    ]
+    assert results[0].expected_total == 5
+    assert all(result.error is None for result in results)
+    assert any("/POI121/" in url for url in calls)
+
+
 def test_normalize_concatenates_rows_across_chunks():
     chunk1 = _body(total=3, rows=[{"a": "1"}, {"a": "2"}])
     chunk2 = _body(total=3, rows=[{"a": "3"}])

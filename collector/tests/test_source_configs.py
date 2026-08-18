@@ -13,10 +13,11 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-import config.loader as config_loader
 import httpx
-import pipeline
 import pytest
+
+import config.loader as config_loader
+import pipeline
 from adapters import (  # noqa: F401 — @adapter 등록을 위한 import
     kma_apihub,
     seoul_openapi,
@@ -45,6 +46,23 @@ class TestAllSourcesLoad:
         assert config.source_id == source_id
         assert config.adapter in ("seoul_openapi", "kma_apihub")
         assert config.config_version.startswith("sha256:")
+
+    def test_bike_rental_history_request_and_numeric_types_match_api_contract(self):
+        config = config_loader.load("bike_rental_history", base_dir=SOURCES_DIR)
+
+        assert config.adapter_params["path_suffix"] == (
+            "/{window_start:%Y-%m-%d}/{window_start:%H}"
+        )
+        assert config.columns["USE_MIN"].types == ("int",)
+        assert config.columns["USE_DST"].types == ("float",)
+        assert config.columns["BIRTH_YEAR"].types == ("int",)
+        assert config.columns["RNUM"].types == ("int",)
+
+    def test_population_realtime_covers_current_121_pois(self):
+        config = config_loader.load("population_realtime", base_dir=SOURCES_DIR)
+
+        assert config.adapter_params["poi_start"] == 1
+        assert config.adapter_params["poi_end"] == 121
 
 
 class TestOptionalKeysOmittable:

@@ -6,7 +6,7 @@ adapter_params:
   service: tbCycleRentData
   page_size: 1000
   root_key: rentData.row
-  path_suffix: "/{window_start:%Y-%m-%d}/{window_start:%Y-%m-%d}"
+  path_suffix: "/{window_start:%Y-%m-%d}/{window_start:%H}"
 
 schedule:
   interval: 5m
@@ -53,15 +53,15 @@ columns:
   RTN_HOLD:
     types: [str]
   USE_MIN:
-    types: [str, int]
+    types: [int]
   USE_DST:
-    types: [str, float]
+    types: [float]
   USR_CLS_CD:
     types: [str]
   SEX_CD:
     types: [str]
   BIRTH_YEAR:
-    types: [str, int]
+    types: [int]
   RENT_STATION_ID:
     types: [str]
   RETURN_STATION_ID:
@@ -73,4 +73,4 @@ columns:
   END_INDEX:
     types: [int]
   RNUM:
-    types: [str, int]
+    types: [int]

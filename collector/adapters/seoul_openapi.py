@@ -94,10 +94,16 @@ class SeoulOpenApiAdapter:
         suffix = ""
         if path_suffix_template:
             suffix = path_suffix_template.format(window_start=window.window_start)
-        # citydata_ppltn은 페이지네이션 대신 POI001~POI116 순회
+        # citydata_ppltn은 페이지네이션 대신 YAML에 선언된 POI 범위를 순회한다.
+        # 장소가 늘어날 때 공통 코드를 고치지 않고 poi_end만 갱신할 수 있게 한다.
         if service == "citydata_ppltn":
-            expected = 116
-            for i in range(1, expected + 1):
+            poi_start = int(params.get("poi_start", 1))
+            poi_end = int(params["poi_end"])
+            if poi_start < 1 or poi_end < poi_start:
+                raise ValueError("citydata_ppltn의 poi_start/poi_end 범위가 올바르지 않습니다")
+
+            expected = poi_end - poi_start + 1
+            for i in range(poi_start, poi_end + 1):
                 poi_id = f"POI{i:03d}"
                 key = f"poi-{poi_id}"
                 
@@ -111,19 +117,39 @@ class SeoulOpenApiAdapter:
                     body = json.loads(response.content)
                     wrapper = _extract(body, wrapper_key)
                 except (httpx.RequestError, httpx.HTTPStatusError, json.JSONDecodeError):
-                    yield FetchResult(key=key, payload=None, error=FetchErrorKind.TRANSIENT, expected_total=expected if i == 1 else None)
+                    yield FetchResult(
+                        key=key,
+                        payload=None,
+                        error=FetchErrorKind.TRANSIENT,
+                        expected_total=expected if i == poi_start else None,
+                    )
                     continue
 
                 code = body.get("RESULT.CODE") or body.get("RESULT", {}).get("RESULT.CODE")
                 category = _classify(code)
 
                 if category is None:
-                    yield FetchResult(key=key, payload=response.content, error=None, expected_total=expected if i == 1 else None)
+                    yield FetchResult(
+                        key=key,
+                        payload=response.content,
+                        error=None,
+                        expected_total=expected if i == poi_start else None,
+                    )
                 elif category is FetchErrorKind.FATAL:
-                    yield FetchResult(key=key, payload=None, error=category, expected_total=expected if i == 1 else None)
+                    yield FetchResult(
+                        key=key,
+                        payload=None,
+                        error=category,
+                        expected_total=expected if i == poi_start else None,
+                    )
                     return
                 else:
-                    yield FetchResult(key=key, payload=None, error=category, expected_total=expected if i == 1 else None)
+                    yield FetchResult(
+                        key=key,
+                        payload=None,
+                        error=category,
+                        expected_total=expected if i == poi_start else None,
+                    )
             return
 
         # total을 모르면 몇 페이지를 더 돌아야 하는지 알 수 없다.
