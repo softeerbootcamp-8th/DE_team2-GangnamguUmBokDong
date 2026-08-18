@@ -4,7 +4,7 @@
 
     collect_bike_rental_history -----------------------------┐
                                                              |
-    collect_bike_station_realtime ---------------------------+-> run_inference
+    collect_bike_station_realtime ---------------------------+-> run_inference -> compute_urgency -> load_station_urgency
         |                                                    |       |
         -> load_stations -> load_station_stock --------------|-------+-> load_forecast_points
                                                              |
@@ -29,6 +29,9 @@ Airflow dependency는 실제 데이터 계약을 기준으로 둔다.
 - weather_10min/weather_3h의 최신 Silver -> inference (cross-DAG snapshot 계약)
 - bike_station_realtime -> stations -> station_stock
 - inference + station_stock -> forecast_points
+- inference -> compute_urgency(rebalance, S3만 읽음) -> load_station_urgency
+  (load_station_stock/load_forecast_points와 독립적으로 병렬 실행됨 — 대여소별
+  긴급도 계산이 RDS가 아니라 S3(재고 이력·예측 결과)만 읽기 때문. 이유: #107)
 
 ## 금지 사항
 
@@ -50,6 +53,7 @@ from orchestration.collector_task import build_collector_task
 from orchestration.db_loader_task import build_db_loader_task
 from orchestration.inference_task import build_inference_task
 from orchestration.normalizer_task import build_normalizer_task
+from orchestration.urgency_task import build_urgency_task
 
 from airflow import DAG
 
@@ -91,3 +95,7 @@ with DAG(
 
     load_forecast_points = build_db_loader_task(dag, "forecast_points")
     [run_inference, load_station_stock] >> load_forecast_points
+
+    compute_urgency = build_urgency_task(dag)
+    load_station_urgency = build_db_loader_task(dag, "station_urgency")
+    run_inference >> compute_urgency >> load_station_urgency

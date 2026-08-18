@@ -33,6 +33,7 @@ from orchestration.normalizer_task import (
     build_normalizer_task,
     build_station_master_enrichment_task,
 )
+from orchestration.urgency_task import build_urgency_task
 
 from airflow import DAG
 
@@ -79,3 +80,7 @@ with DAG(
 
     load_forecast_points = build_db_loader_task(dag, "forecast_points")
     [run_inference, load_station_stock] >> load_forecast_points
+
+    compute_urgency = build_urgency_task(dag)
+    load_station_urgency = build_db_loader_task(dag, "station_urgency")
+    run_inference >> compute_urgency >> load_station_urgency
