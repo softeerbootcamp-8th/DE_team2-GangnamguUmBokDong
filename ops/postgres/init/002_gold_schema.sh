@@ -2,9 +2,11 @@
 # 대시보드(apps/api)가 읽고, 예측 배치(ml/predict)가 쓰는 골드 테이블을 만든다.
 # 001에서 만든 앱 DB($POSTGRES_APP_DB) 안에 생성한다.
 #
-# urgency_score, action_type, predicted_bikes, shared_rate 같은 파생값은 테이블에
-# 없다. 재고·예측이 바뀔 때마다 같이 갱신해야 하는 별도 테이블을 두는 대신,
-# apps/api가 요청 시점에 station_stock + forecast_points를 조합해 계산한다.
+# predicted_bikes, shared_rate 같은 요청 시점에만 의미 있는 파생값은 테이블에
+# 없다 — apps/api가 station_stock + forecast_points를 조합해 그때그때 계산한다.
+# urgency_score/action_type은 예외다 — 배치(rebalance/)가 5분마다 미리 계산해
+# station_urgency 테이블(003_station_urgency.sh)에 적재하고, apps/api는 그 결과만
+# 조회한다(이유: #107).
 set -euo pipefail
 
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_APP_DB" <<-'EOSQL'
