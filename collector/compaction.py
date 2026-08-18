@@ -57,6 +57,7 @@ _ARROW_TYPES = {
     "int": pa.int64(),
     "float": pa.float64(),
     "bool": pa.bool_(),
+    "precip": pa.float64(),  # 강수량 범주 문자열을 mm 실수로 바꾼 결과
 }
 
 # 출처 구분: compaction은 실시간 수집 데이터, bootstrap은 초기 로드 과거 데이터.

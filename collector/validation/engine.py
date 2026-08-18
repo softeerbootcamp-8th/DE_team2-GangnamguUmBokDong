@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from config.schema import ColumnSpec, Policies, SourceConfig
+from core.precip import parse_precip
 from validation.registry import get_policy, get_row_policy, get_row_policy_params_model
 from validation.types import Action, Issue, IssueKind, RowVerdict, RunContext
 
@@ -36,6 +37,9 @@ _CASTERS: dict[str, Callable[[Any], Any]] = {
     "int": int,
     "float": float,
     "bool": _parse_bool,
+    # 기상청 강수량 범주 표기 전용. loader도 같은 규칙을 써야 silver와 RDB의 값이
+    # 갈리지 않으므로 `core`에 둔다.
+    "precip": parse_precip,
 }
 
 

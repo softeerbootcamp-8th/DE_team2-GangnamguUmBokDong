@@ -61,7 +61,9 @@ class ColumnSpec(BaseModel):
     # Pydantic 모델 configuration
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    types: tuple[Literal["str", "int", "float", "bool"], ...] = Field(min_length=1)
+    # "precip"은 기상청 강수량 범주 표기("강수없음", "30.0~50.0mm" 등)를 mm 실수로
+    # 바꾸는 전용 캐스터다. 규칙은 `core.precip`에 있고 loader와 공유한다.
+    types: tuple[Literal["str", "int", "float", "bool", "precip"], ...] = Field(min_length=1)
     required: bool = False
     range: Range | None = None
     enum: tuple[Any, ...] | None = None

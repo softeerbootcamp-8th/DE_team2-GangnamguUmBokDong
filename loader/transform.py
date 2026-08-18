@@ -8,10 +8,12 @@
 from __future__ import annotations
 
 import hashlib
+import math
 from datetime import UTC, date, datetime, timedelta
 
 import pandas as pd
 
+from core.precip import parse_precip
 from gu_mapping import grid_to_gu, latlon_to_gu
 
 _KST = timedelta(hours=9)
@@ -137,24 +139,24 @@ def weather_forecast_from_silver(df: pd.DataFrame) -> list[dict]:
 
 
 def _parse_precip_str(value) -> float | None:
-    """기상청 강수량 문자열('강수없음', '1.0mm 미만', '30.0~50.0mm' 등)을 float으로 변환한다.
+    """기상청 강수량 표기를 float으로 변환한다. 해석할 수 없으면 None.
 
-    단기예보(PCP)와 초단기예보(RN1)는 숫자가 아닌 범위 문자열을 반환하는 경우가 있다.
-    범위인 경우 하한값을 사용하고, '강수없음'은 0.0으로 변환한다.
+    변환 규칙은 `core.precip.parse_precip`이 갖는다 — collector가 silver에 쓸 때
+    쓰는 것과 같은 함수다. 여기서 하는 일은 결측·해석 실패를 예외 대신 None으로
+    바꾸는 것뿐이다(upsert에서 그 컬럼이 NULL이 된다).
+
+    collector가 `types: [precip]`으로 저장하기 시작한 뒤로 silver의 PCP·RN1은
+    이미 실수다. 그래도 문자열 경로를 남겨 둔다 — 전환 이전에 쌓인 silver를
+    다시 읽을 때 필요하다.
     """
     if value is None or value == "":
         return None
-    text = str(value).strip()
-    if text in ("강수없음", "적설없음"):
-        return 0.0
-    if "미만" in text:
-        return 0.5  # "1.0mm 미만" → 0에 가까운 값
-    # "30.0~50.0mm" → 30.0
-    text = text.replace("mm", "").strip()
-    if "~" in text:
-        text = text.split("~")[0]
+    if isinstance(value, float) and math.isnan(value):
+        # 숫자 컬럼의 결측은 pandas에서 NaN으로 온다. float()를 그냥 통과하므로
+        # 여기서 막지 않으면 NaN이 그대로 RDB에 들어간다.
+        return None
     try:
-        return float(text)
+        return parse_precip(value)
     except (TypeError, ValueError):
         return None
 

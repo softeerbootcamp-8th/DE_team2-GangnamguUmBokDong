@@ -3,6 +3,7 @@ from datetime import UTC, date, datetime
 import pandas as pd
 
 from transform import (
+    _parse_precip_str,
     cultural_events_from_silver,
     forecast_points_from_predictions,
     station_stock_from_silver,
@@ -170,3 +171,34 @@ def test_forecast_points_from_predictions_rounds_half_to_even():
 
     assert record["predicted_rent_cnt"] == round(2.5)
     assert record["predicted_return_cnt"] == round(1.5)
+
+
+class TestParsePrecipStr:
+    """강수량 변환 규칙 자체는 `core.precip`이 갖는다 — collector가 silver에 쓸 때와
+    같은 값이 나와야 하기 때문이다. 여기서 보는 것은 loader 쪽 껍데기의 계약이다:
+    해석할 수 없는 값은 예외가 아니라 None(= 해당 컬럼 결측)이어야 한다."""
+
+    def test_uses_the_shared_rule(self):
+        assert _parse_precip_str("30.0~50.0mm") == 30.0
+        assert _parse_precip_str("강수없음") == 0.0
+        assert _parse_precip_str("1.0mm 미만") == 0.5
+
+    def test_at_least_is_not_dropped(self):
+        """상한 없는 표기가 None으로 떨어지면 폭우 예보가 통째로 결측이 된다."""
+        assert _parse_precip_str("50.0mm 이상") == 50.0
+
+    def test_numeric_silver_passes_through(self):
+        """collector가 이미 숫자로 저장한 silver를 읽는 경로."""
+        assert _parse_precip_str(2.0) == 2.0
+
+    def test_missing_values_become_none(self):
+        assert _parse_precip_str(None) is None
+        assert _parse_precip_str("") is None
+
+    def test_nan_becomes_none(self):
+        """숫자 컬럼의 결측은 pandas에서 NaN으로 온다. float()가 통과시켜 버리므로
+        따로 막지 않으면 NaN이 그대로 RDB로 간다."""
+        assert _parse_precip_str(float("nan")) is None
+
+    def test_unparseable_becomes_none(self):
+        assert _parse_precip_str("맑음") is None
