@@ -17,17 +17,20 @@ def get_connection() -> Connection:
     return psycopg.connect(database_url)
 
 
-def execute(query: str, params: Sequence[Any] | None = None) -> None:
+def execute(query: str, params: Sequence[Any] | None = None) -> int:
     """지정된 SQL 쿼리를 실행하고 트랜잭션을 커밋한다.
 
     args:
         query: 실행할 SQL 문자열
         params: 쿼리 바인딩 파라미터 (선택)
+    returns:
+        영향받은 행 수(UPDATE/DELETE의 조건부 성공 여부를 rowcount로 판단할 때 씀)
     """
     with get_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(query, params)
-        conn.commit()
+            conn.commit()
+            return cur.rowcount
 
 
 def fetch_all(query: str, params: Sequence[Any] | None = None) -> list[dict]:
