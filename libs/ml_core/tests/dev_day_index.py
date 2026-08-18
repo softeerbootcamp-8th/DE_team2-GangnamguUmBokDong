@@ -30,5 +30,8 @@ def test_same_calendar_year_far_apart_dates_are_far_in_day_index():
     assert d2 - d1 > 300
 
 
-def test_fits_in_uint16_for_realistic_years():
-    assert day_index(date(2100, 1, 1)) < 65536
+def test_fits_in_int16_for_realistic_years():
+    """Spark엔 unsigned 타입이 없어 day는 ShortType(부호 있는 16비트, 최대 32,767)로
+    저장된다 — 2000-01-01 기준 약 서기 2089년까지가 그 한계다. TRAIN_YEAR(2025)
+    기준으로는 한참 여유 있는 범위인지 확인한다."""
+    assert day_index(date(2080, 1, 1)) < 32768

@@ -7,19 +7,29 @@
 다에서 제외된다. feature mart가 특정 구간까지 아직 안 쌓였으면 학습이 빈 데이터로
 진행되다가 lgb.train() 안에서 알아보기 힘든 에러로 죽을 수 있다 — 이 테스트가 그
 경우 `_split()` 단계에서 먼저 걸러지는지 확인한다.
+
+`_split()`은 이제 `date`(문자열) 대신 `day`(2000-01-01 기준 경과일수)만 본다 —
+실제 multi-horizon 테이블에 `date` 컬럼 자체가 없어졌기 때문(Spark 파티션 컬럼이라
+파일 내용엔 없음, train_common.load_training_table() 참고). 테스트는 가독성을 위해
+날짜 문자열로 입력을 쓰되 `_day()`로 day 정수로 변환해서 넣는다.
 """
 
 from datetime import date
 
 import pandas as pd
 import pytest
+from ml_core.day_index import day_index
 
 from training import config
 from training.train_common import _split
 
 
+def _day(date_str: str) -> int:
+    return day_index(date.fromisoformat(date_str))
+
+
 def _make_df(dates: list[str]) -> pd.DataFrame:
-    return pd.DataFrame({"date": dates, "value": range(len(dates))})
+    return pd.DataFrame({"day": [_day(d) for d in dates], "value": range(len(dates))})
 
 
 def test_split_raises_when_test_days_of_month_have_no_rows(monkeypatch):
@@ -45,9 +55,9 @@ def test_split_buckets_rows_by_day_of_month(monkeypatch):
 
     train, valid, test = _split(df)
 
-    assert sorted(train["date"]) == ["2026-01-01", "2026-02-01"]
-    assert sorted(valid["date"]) == ["2026-01-20", "2026-02-20"]
-    assert sorted(test["date"]) == ["2026-01-24", "2026-02-24"]
+    assert sorted(train["day"]) == sorted(_day(d) for d in ["2026-01-01", "2026-02-01"])
+    assert sorted(valid["day"]) == sorted(_day(d) for d in ["2026-01-20", "2026-02-20"])
+    assert sorted(test["day"]) == sorted(_day(d) for d in ["2026-01-24", "2026-02-24"])
 
 
 def test_split_excludes_rows_past_safety_cutoff(monkeypatch):
@@ -74,6 +84,6 @@ def test_split_excludes_rows_outside_train_year(monkeypatch):
 
     train, valid, test = _split(df)
 
-    assert list(train["date"]) == ["2026-01-01"]
-    assert list(valid["date"]) == ["2026-01-20"]
-    assert list(test["date"]) == ["2026-01-24"]
+    assert list(train["day"]) == [_day("2026-01-01")]
+    assert list(valid["day"]) == [_day("2026-01-20")]
+    assert list(test["day"]) == [_day("2026-01-24")]

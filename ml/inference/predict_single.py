@@ -794,7 +794,7 @@ def _build_target_time_fields(
     fields = {
         "station_id": station_id,  # 모델 feature는 아니지만 출력 식별용으로 그대로 둔다
         "station_no": int(station_row["station_no"]),
-        "capacity": float(station_row["capacity"]),
+        "capacity": int(station_row["capacity"]),  # 거치대 수 — 항상 정수(model_contract 참고)
         "lat": float(station_row["lat"]),
         "lon": float(station_row["lon"]),
         "temp": temp,
@@ -916,7 +916,7 @@ def _build_feature_row(
     df.attrs["population_fallback"] = population_fallback
 
     # Python 스칼라로 조립한 행이라 기본 float64/int64로 들어와 있다 — 학습 데이터
-    # (feature_engine이 다운캐스트한 float32/int8/int16/uint16, ml_core.model_contract의
+    # (feature_engine이 다운캐스트한 float32/int8/int16, ml_core.model_contract의
     # RENTAL/RETURN_FEATURE_COLUMN_DTYPES)와 dtype을 맞춘다. 값 자체는 바뀌지 않지만
     # (LightGBM은 어차피 내부적으로 캐스팅해서 예측 결과에 영향 없음) 학습/서빙
     # 스키마가 정확히 일치해야 한다는 이 프로젝트의 원칙(model_contract.py 모듈

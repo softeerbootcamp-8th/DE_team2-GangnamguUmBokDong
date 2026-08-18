@@ -12,12 +12,14 @@ tree(x)의 objective 역변환(Poisson이면 exp(tree(x)))일 뿐 init_score를 
 
 import json
 import zlib
+from datetime import date
 
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
 from core import s3 as s3_io
 from ml_core import common_config, model_io
+from ml_core.day_index import DAY_INDEX_EPOCH, day_index
 from ml_core.metrics import pinball_loss as _pinball_loss
 from ml_core.metrics import poisson_deviance as _poisson_deviance
 from ml_core.model_contract import (
@@ -87,16 +89,22 @@ def load_training_table(model_name: str) -> pd.DataFrame:
     쌓여있으므로(`feature_engineering/spark/build_multi_horizon_features.py`) 이
     학습 구간에 해당하는 파티션만 나열/다운로드한다. 안 그러면 그동안 쌓인 전체
     히스토리를 매번 다 받은 뒤 `_split()`에서 대부분 버리게 된다 — 쌓인 기간이
-    늘어날수록 이 낭비가 계속 커진다.
+    늘어날수록 이 낭비가 계속 커진다. 이 `date_range`는 S3 키 경로(`date=YYYY-MM-DD/`)
+    기준 파티션 선택일 뿐이고, `date`는 Spark가 파일 내용엔 안 넣는 파티션 컬럼이라
+    (`core.s3._read_parquet_by_date_range()` docstring 참고) `columns=`에 넣으면
+    읽을 때마다 그 문자열을 행 수만큼 새로 복제해 만들어야 한다 — `_split()`이 이제
+    `day`(이미 BASE_FEATURE_COLUMNS에 있어 어차피 읽음)만으로 경계를 가르므로
+    `date`는 아예 요청하지 않는다.
 
     args:
         model_name: "rental" 또는 "return"
     returns:
         pd.DataFrame: feature_columns + 라벨(rental_count/return_count) +
-            (rental이면) rental_exposure + date(`_split()` 경계 기준)
+            (rental이면) rental_exposure — `day`가 feature_columns에 이미 있어
+            `_split()`의 경계 판정에 그대로 쓰인다
     """
     feature_columns = _FEATURE_COLUMNS_BY_MODEL[model_name]
-    extra = {_TARGET_COL_BY_MODEL[model_name], "date"}
+    extra = {_TARGET_COL_BY_MODEL[model_name]}
     if model_name == "rental":
         extra.add("rental_exposure")
     needed = sorted(set(feature_columns) | extra)
@@ -127,7 +135,7 @@ def _split(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     표본 추출 자체가 누출을 만들지는 않는다.
 
     args:
-        df: date 컬럼(YYYY-MM-DD)을 포함한 feature 테이블
+        df: `day`(2000-01-01 기준 경과일수, ml_core.day_index) 컬럼을 포함한 feature 테이블
     returns:
         tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]: (train, valid, test)
     raises:
@@ -137,11 +145,16 @@ def _split(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
             바로 알 수 있게 한다(monitor_performance.evaluate_recent_performance()의
             같은 패턴 참고).
     """
-    train_year_str = str(config.TRAIN_YEAR)
-    safe_end = min(f"{train_year_str}-12-31", config.safety_cutoff_date().isoformat())
-    df = df[(df["date"].str[:4] == train_year_str) & (df["date"] <= safe_end)]
+    start_day = day_index(date(config.TRAIN_YEAR, 1, 1))
+    safe_end = min(date(config.TRAIN_YEAR, 12, 31), config.safety_cutoff_date())
+    safe_end_day = day_index(safe_end)
+    df = df[(df["day"] >= start_day) & (df["day"] <= safe_end_day)]
 
-    day_of_month = df["date"].str[8:10].astype(int)
+    # day(정수)를 실제 달력 날짜로 되돌려 일(day-of-month)만 뽑는다 — day_index는
+    # 연 경계를 위해 단조증가하게 설계된 값이라 "그 달의 며칠인지"는 선형식으로
+    # 못 구하고 실제 날짜로 복원해야 한다(월마다 일수가 달라서).
+    real_dates = pd.Timestamp(DAY_INDEX_EPOCH) + pd.to_timedelta(df["day"], unit="D")
+    day_of_month = real_dates.dt.day
     valid_mask = day_of_month.isin(config.VALID_DAYS_OF_MONTH)
     test_mask = day_of_month.isin(config.TEST_DAYS_OF_MONTH)
 
@@ -152,8 +165,8 @@ def _split(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     if train.empty or valid.empty or test.empty:
         raise ValueError(
             f"학습 구간에 데이터가 없음 — train {len(train)}행, valid {len(valid)}행, "
-            f"test {len(test)}행 ({train_year_str}년, ~{safe_end}까지) — feature mart가 "
-            "이 구간까지 쌓였는지 확인하세요"
+            f"test {len(test)}행 ({config.TRAIN_YEAR}년, ~{safe_end.isoformat()}까지) — "
+            "feature mart가 이 구간까지 쌓였는지 확인하세요"
         )
 
     if config.TRAIN_SAMPLE_FRAC < 1.0:
@@ -278,7 +291,7 @@ def train_target(
     # station_categories는 샤딩 전 전체 df 기준이어야 한다 — 그래야 카테고리 코드가
     # 모든 머신에서 동일하게 매겨져(station_no -> code) 분산 학습 시 어긋나지 않는다.
     # int()로 감싸는 이유: station_no 컬럼은 model_contract.NATIVE_COLUMN_DTYPES에 따라
-    # uint16이라 .unique()가 numpy.uint16 배열을 반환한다 — 이걸 그대로
+    # int16이라 .unique()가 numpy.int16 배열을 반환한다 — 이걸 그대로
     # s3_io.write_json()에 넘기면 json.dumps가 numpy 정수 타입을 직렬화하지 못해 죽는다.
     station_categories = sorted(int(s) for s in df["station_no"].unique())
     station_dtype = pd.CategoricalDtype(categories=station_categories)

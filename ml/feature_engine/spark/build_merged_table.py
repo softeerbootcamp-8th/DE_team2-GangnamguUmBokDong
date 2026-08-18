@@ -56,15 +56,27 @@ from .rolling_window_features import (
 
 # src/build_merged_table.py의 NATIVE_COLUMN_DTYPES와 동일한 근거(값 범위 실측)로
 # 매핑한 Spark 타입 — bike_count 0~478, rental/return_count 0~245 등은 전부
-# ShortType/ByteType 범위 안. day는 2000-01-01 기준 경과일수(ml_core.day_index) —
-# 부호 있는 16비트(ShortType)로도 지금 값 범위엔 충분(uint16 캐스팅은 pandas/학습
-# 쪽 model_contract.NATIVE_COLUMN_DTYPES가 담당 — Spark엔 unsigned 타입이 없음).
+# ShortType/ByteType 범위 안. day(2000-01-01 기준 경과일수, ml_core.day_index)/
+# station_no도 ShortType(부호 있는 16비트, 지금 값 범위엔 충분) — Spark엔 unsigned
+# 타입이 없어(uint 계열 자체가 없음) 이 값 그대로가 최종 저장 타입이고, pandas/학습
+# 쪽 model_contract.NATIVE_COLUMN_DTYPES도 같은 int16으로 맞춘다(uint16으로 선언해도
+# 여기서 이미 int16 범위로 잘려 있어 의미가 없다).
 NATIVE_COLUMN_DTYPES = {
     "bike_count": ShortType(),
     "stockout_flag": ByteType(),
     "rental_count": ShortType(),
     "return_count": ShortType(),
-    "capacity": FloatType(),
+    # capacity(거치대 수)는 원래 "LEFT JOIN이라 결측 가능"이라는 이유로 float32였는데,
+    # 실제로는 이 join이 결측을 낼 수 없다 — active_station_ids(rental_targets/
+    # return_targets의 station_id 합집합)는 이미 silver_source.read_rental_trips()의
+    # INNER JOIN(대여 쪽)과 build_targets.py의 end_station_id null 필터(반납 쪽)를
+    # 거쳐서 항상 station_master의 부분집합이다. status도 그 active_station_ids로
+    # 한 번 더 걸러지므로, 여기 capacity를 채우는 LEFT JOIN 시점엔 좌변의 station_id
+    # 집합이 이미 master의 부분집합이라 이 join이 실제로 결측을 낼 수 없다(2026-08
+    # 확인, 코드 경로 추적 — station_no와 결측 이유가 아예 없다는 점이 다름).
+    # 항상 정수(거치대 개수)라 ShortType으로 줄인다 — 최대 대여소 규모는 실측 데이터
+    # 없이 확인 못 했지만 int16(32,767) 여유는 충분히 안전하다고 판단.
+    "capacity": ShortType(),
     "lat": FloatType(),
     "lon": FloatType(),
     "temp": FloatType(),
@@ -78,8 +90,7 @@ NATIVE_COLUMN_DTYPES = {
     # station_id(텍스트, "ST-2565")는 모델 feature에서 station_no(정수 일련번호)로
     # 대체됐다 — Parquet dictionary encoding이 to_pandas()에서 안 살아남아 매 학습
     # 읽기마다 object dtype 문자열 배열을 통째로 materialize하는 비용이 있었는데,
-    # station_no는 처음부터 정수라 그 비용 자체가 없다(day와 같은 이유로 여기선
-    # ShortType, pandas 쪽 uint16 다운캐스트는 model_contract.NATIVE_COLUMN_DTYPES 담당).
+    # station_no는 처음부터 정수라 그 비용 자체가 없다.
     "station_no": ShortType(),
 }
 

@@ -126,7 +126,11 @@ def evaluate_recent_performance(
     # 전체 기간"에 비례해서 계속 커진다(s3_io.py 모듈 docstring 참고).
     table_path = _TRAINING_TABLE_BY_MODEL[model_name]
     feature_columns = _FEATURE_COLUMNS_BY_MODEL[model_name]
-    needed = sorted(set(feature_columns) | {target_col, "date", "horizon"} | ({exposure_col} if exposure_col else set()))
+    # "date"는 안 넣는다 — Spark 파티션 컬럼이라 파일엔 없고, columns=에 넣으면
+    # 읽을 때마다 그 문자열을 행 수만큼 복제해 만들어야 하는데(core.s3
+    # ._read_parquet_by_date_range() 참고) 이 함수는 그 값을 실제로 쓰지 않는다
+    # (date_range로 이미 파티션 자체를 걸렀고, horizon 필터는 별도 컬럼으로 함).
+    needed = sorted(set(feature_columns) | {target_col, "horizon"} | ({exposure_col} if exposure_col else set()))
     df = s3_io.read_parquet(table_path, columns=needed, date_range=(start, end))
     if df is None:
         raise FileNotFoundError(f"S3에 없음: {table_path}")
