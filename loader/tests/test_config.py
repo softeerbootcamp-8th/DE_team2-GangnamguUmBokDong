@@ -51,3 +51,33 @@ def test_default_reader_still_uses_read_silver(monkeypatch):
 
     assert captured["source_id"] == "bike_station_realtime"
     assert isinstance(result, pd.DataFrame)
+
+
+def test_stations_table_spec_updates_grid_columns():
+    spec = TABLE_SPECS["stations"]
+
+    assert "grid_nx" in spec.update_cols
+    assert "grid_ny" in spec.update_cols
+
+
+def test_weather_current_table_spec_uses_grid_conflict_key():
+    spec = TABLE_SPECS["weather_current"]
+
+    assert spec.conflict_cols == ["nx", "ny"]
+    assert "gu" in spec.update_cols
+
+
+def test_weather_forecast_table_spec_uses_grid_conflict_key():
+    spec = TABLE_SPECS["weather_forecast"]
+
+    assert spec.conflict_cols == ["nx", "ny", "forecast_dttm"]
+    assert "gu" in spec.update_cols
+    assert spec.guard_col == "base_dttm"
+
+
+def test_weather_forecast_ultra_table_spec_uses_grid_conflict_key():
+    spec = TABLE_SPECS["weather_forecast_ultra"]
+
+    assert spec.conflict_cols == ["nx", "ny", "forecast_dttm"]
+    assert "gu" in spec.update_cols
+    assert spec.guard_col == "base_dttm"

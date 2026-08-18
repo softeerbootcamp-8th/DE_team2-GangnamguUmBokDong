@@ -10,6 +10,8 @@ stations:
     - lat
     - lon
     - hold_cnt
+    - grid_nx
+    - grid_ny
 
 station_stock:
   source_id: bike_station_realtime
@@ -20,12 +22,18 @@ station_stock:
   update_cols:
     - parking_bike_tot_cnt
 
+# weather_current/weather_forecast는 gu(자치구) 대신 격자(nx, ny)를 조인 키로 쓴다.
+# gu는 표시용 파생 컬럼으로만 남는다(넓은 구에 여러 격자가 걸치는 문제를 gu 단위
+# 조인으로는 해소할 수 없어서, docs/superpowers/specs/2026-08-19-weather-grid-matching-design.md
+# 참고).
 weather_current:
   source_id: weather_ultra_short_live
   transform: weather_current_from_silver
   conflict_cols:
-    - gu
+    - nx
+    - ny
   update_cols:
+    - gu
     - observed_at
     - temperature
     - humidity
@@ -41,9 +49,11 @@ weather_forecast:
   source_id: weather_short_term_forecast
   transform: weather_forecast_from_silver
   conflict_cols:
-    - gu
+    - nx
+    - ny
     - forecast_dttm
   update_cols:
+    - gu
     - sky_cond
     - pty_type
     - temperature
@@ -58,9 +68,11 @@ weather_forecast_ultra:
   source_id: weather_ultra_short_forecast
   transform: weather_forecast_ultra_from_silver
   conflict_cols:
-    - gu
+    - nx
+    - ny
     - forecast_dttm
   update_cols:
+    - gu
     - sky_cond
     - pty_type
     - temperature
