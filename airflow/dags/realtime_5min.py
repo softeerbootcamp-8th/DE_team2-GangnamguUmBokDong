@@ -4,7 +4,7 @@
 
     collect_bike_rental_history -----------------------------┐
                                                              |
-    collect_bike_station_realtime ---------------------------+-> run_inference -> compute_urgency -> load_station_urgency
+    collect_bike_station_realtime ---------------------------+-> run_inference
         |                                                    |       |
         -> load_stations -> load_station_stock --------------|-------+-> load_forecast_points
                                                              |
@@ -17,6 +17,10 @@
                                       population_normalized -┘
 
     weather_10min / weather_3h가 쓴 최신 Silver ------------┘ (추론기가 시점 기준 조회)
+
+    run_inference -> compute_urgency -+-> load_station_urgency
+                                       └-> compute_routes -+-> load_rebalance_routes
+                                                            └-> load_rebalance_route_stops
 
 population_realtime Silver는 inference 전에 반드시 normalizer를 거쳐 보정된 상태여야 한다.
 strict가 성공하면 fallback은 skipped되고, strict가 실패하면 fallback(latest)이 실행된다.
@@ -32,6 +36,9 @@ Airflow dependency는 실제 데이터 계약을 기준으로 둔다.
 - inference -> compute_urgency(rebalance, S3만 읽음) -> load_station_urgency
   (load_station_stock/load_forecast_points와 독립적으로 병렬 실행됨 — 대여소별
   긴급도 계산이 RDS가 아니라 S3(재고 이력·예측 결과)만 읽기 때문. 이유: #107)
+- compute_urgency -> compute_routes(rebalance, urgency_score/bike_qty를 다시
+  계산 + dispatched 넷팅을 위한 좁은 RDS 조회 하나) -> load_rebalance_routes,
+  load_rebalance_route_stops. 이유: #109
 
 ## 금지 사항
 
@@ -53,6 +60,7 @@ from orchestration.collector_task import build_collector_task
 from orchestration.db_loader_task import build_db_loader_task
 from orchestration.inference_task import build_inference_task
 from orchestration.normalizer_task import build_normalizer_task
+from orchestration.routes_task import build_routes_task
 from orchestration.urgency_task import build_urgency_task
 
 from airflow import DAG
@@ -99,3 +107,8 @@ with DAG(
     compute_urgency = build_urgency_task(dag)
     load_station_urgency = build_db_loader_task(dag, "station_urgency")
     run_inference >> compute_urgency >> load_station_urgency
+
+    compute_routes = build_routes_task(dag)
+    load_rebalance_routes = build_db_loader_task(dag, "rebalance_routes")
+    load_rebalance_route_stops = build_db_loader_task(dag, "rebalance_route_stops")
+    compute_urgency >> compute_routes >> [load_rebalance_routes, load_rebalance_route_stops]

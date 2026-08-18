@@ -30,6 +30,9 @@ DB_LOADER_EXECUTION_TIMEOUT = timedelta(seconds=120)
 # 실측 데이터 없음(placeholder) — S3 tick 5~6개 + 예측 결과 1개만 읽는 순수 계산이라
 # 추론보다는 가볍게 잡았다. 로컬에서 1회 실행 시간을 재본 뒤 조정.
 URGENCY_EXECUTION_TIMEOUT = timedelta(seconds=180)
+# 실측 데이터 없음(placeholder) — urgency 계산을 다시 하고 dispatched 넷팅을 위한
+# RDS 조회 하나가 추가되는 정도라 URGENCY_EXECUTION_TIMEOUT과 비슷하게 잡았다.
+ROUTES_EXECUTION_TIMEOUT = timedelta(seconds=180)
 
 MAX_ACTIVE_RUNS = 1
 CATCHUP = False

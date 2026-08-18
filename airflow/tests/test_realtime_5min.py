@@ -28,6 +28,9 @@ def test_expected_tasks_exist():
         "load_forecast_points",
         "compute_urgency",
         "load_station_urgency",
+        "compute_routes",
+        "load_rebalance_routes",
+        "load_rebalance_route_stops",
     }
     assert set(dag.task_ids) == expected
 
@@ -89,6 +92,24 @@ def test_inference_then_compute_urgency_then_load_station_urgency():
     assert {t.task_id for t in compute_urgency.upstream_list} == {"run_inference"}
     assert load_station_urgency.task_id in {t.task_id for t in compute_urgency.downstream_list}
     assert {t.task_id for t in load_station_urgency.upstream_list} == {"compute_urgency"}
+
+
+def test_compute_urgency_then_compute_routes_then_load_rebalance_tables():
+    """라우트 생성(rebalance/routes.py)도 urgency와 마찬가지로 S3만 읽는다(dispatched
+    넷팅을 위한 좁은 RDS 조회 하나 제외) — compute_urgency에만 의존하고
+    load_station_urgency와는 독립적으로 병렬 실행된다(이유: #109)."""
+    compute_urgency = dag.get_task("compute_urgency")
+    compute_routes = dag.get_task("compute_routes")
+    load_rebalance_routes = dag.get_task("load_rebalance_routes")
+    load_rebalance_route_stops = dag.get_task("load_rebalance_route_stops")
+
+    assert compute_routes.task_id in {t.task_id for t in compute_urgency.downstream_list}
+    assert {t.task_id for t in compute_routes.upstream_list} == {"compute_urgency"}
+
+    downstream_ids = {t.task_id for t in compute_routes.downstream_list}
+    assert downstream_ids == {"load_rebalance_routes", "load_rebalance_route_stops"}
+    assert {t.task_id for t in load_rebalance_routes.upstream_list} == {"compute_routes"}
+    assert {t.task_id for t in load_rebalance_route_stops.upstream_list} == {"compute_routes"}
 
 
 def test_collector_task_execution_contract():

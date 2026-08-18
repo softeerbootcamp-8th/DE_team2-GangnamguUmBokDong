@@ -33,6 +33,7 @@ from orchestration.normalizer_task import (
     build_normalizer_task,
     build_station_master_enrichment_task,
 )
+from orchestration.routes_task import build_routes_task
 from orchestration.urgency_task import build_urgency_task
 
 from airflow import DAG
@@ -84,3 +85,8 @@ with DAG(
     compute_urgency = build_urgency_task(dag)
     load_station_urgency = build_db_loader_task(dag, "station_urgency")
     run_inference >> compute_urgency >> load_station_urgency
+
+    compute_routes = build_routes_task(dag)
+    load_rebalance_routes = build_db_loader_task(dag, "rebalance_routes")
+    load_rebalance_route_stops = build_db_loader_task(dag, "rebalance_route_stops")
+    compute_urgency >> compute_routes >> [load_rebalance_routes, load_rebalance_route_stops]
