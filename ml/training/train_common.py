@@ -21,7 +21,8 @@ from ml_core import common_config, model_io
 from ml_core.metrics import pinball_loss as _pinball_loss
 from ml_core.metrics import poisson_deviance as _poisson_deviance
 from ml_core.model_contract import (
-    FEATURE_COLUMNS,
+    RENTAL_FEATURE_COLUMNS,
+    RETURN_FEATURE_COLUMNS,
     load_station_dtype,
     station_categories_path,
 )
@@ -30,13 +31,21 @@ from ml_core.paths import model_json_key, model_key
 from . import config
 
 __all__ = [
-    "FEATURE_COLUMNS",
+    "RENTAL_FEATURE_COLUMNS",
+    "RETURN_FEATURE_COLUMNS",
     "load_station_dtype",
     "load_training_table",
     "run_and_notify_on_failure",
     "station_categories_path",
     "train_target",
 ]
+
+_FEATURE_COLUMNS_BY_MODEL = {"rental": RENTAL_FEATURE_COLUMNS, "return": RETURN_FEATURE_COLUMNS}
+_TARGET_COL_BY_MODEL = {"rental": "rental_count", "return": "return_count"}
+_TRAINING_TABLE_BY_MODEL = {
+    "rental": config.RENTAL_MULTI_HORIZON_FEATURES_TABLE_PARQUET,
+    "return": config.RETURN_MULTI_HORIZON_FEATURES_TABLE_PARQUET,
+}
 
 
 def run_and_notify_on_failure(label: str, main_fn):
@@ -61,43 +70,60 @@ def run_and_notify_on_failure(label: str, main_fn):
         raise
 
 
-def load_training_table() -> pd.DataFrame:
-    """multi-horizon feature 테이블에서 학습에 필요한 컬럼·기간만 읽는다.
+def load_training_table(model_name: str) -> pd.DataFrame:
+    """model_name(대여/반납)에 맞는 multi-horizon feature 테이블에서 학습에 필요한
+    컬럼·기간만 읽는다.
+
+    대여/반납은 완전히 분리된 데이터셋이라(서로 상대방의 lag를 안 봄) 읽는 테이블
+    경로와 feature 컬럼 목록이 model_name에 따라 다르다.
 
     `pd.read_parquet(..., columns=[...])`로 필요한 컬럼만 골라 읽는다 — 전체 컬럼을 읽은
-    뒤 `df[FEATURE_COLUMNS]`로 다시 골라내면 안 쓸 컬럼까지 한 번 더 메모리에 올렸다가
+    뒤 `df[feature_columns]`로 다시 골라내면 안 쓸 컬럼까지 한 번 더 메모리에 올렸다가
     버리는 이중 보유가 생긴다(history.md 18번 항목, multi-horizon 실험에서 실측된 병목).
     multi-horizon 테이블은 원본 feature 테이블의 최대 HORIZON_COUNT배 행 수라 이 절약이
     특히 중요하다.
 
-    `date_range=(TRAIN_START, TEST_END)`도 같이 넘긴다 — 테이블이 `date` 파티션으로
+    `date_range=(TRAIN_YEAR-01-01, 안전 상한)`도 같이 넘긴다 — 테이블이 `date` 파티션으로
     쌓여있으므로(`feature_engineering/spark/build_multi_horizon_features.py`) 이
     학습 구간에 해당하는 파티션만 나열/다운로드한다. 안 그러면 그동안 쌓인 전체
     히스토리를 매번 다 받은 뒤 `_split()`에서 대부분 버리게 된다 — 쌓인 기간이
     늘어날수록 이 낭비가 계속 커진다.
 
+    args:
+        model_name: "rental" 또는 "return"
     returns:
-        pd.DataFrame: FEATURE_COLUMNS + rental_count/return_count(라벨) +
-            rental_exposure(대여 exposure offset) + date(`_split()` 경계 기준)
+        pd.DataFrame: feature_columns + 라벨(rental_count/return_count) +
+            (rental이면) rental_exposure + date(`_split()` 경계 기준)
     """
-    needed = sorted(set(FEATURE_COLUMNS) | {"rental_count", "return_count", "rental_exposure", "date"})
-    df = s3_io.read_parquet(
-        config.MULTI_HORIZON_FEATURES_TABLE_PARQUET,
-        columns=needed,
-        date_range=(config.TRAIN_START, config.TEST_END),
-    )
+    feature_columns = _FEATURE_COLUMNS_BY_MODEL[model_name]
+    extra = {_TARGET_COL_BY_MODEL[model_name], "date"}
+    if model_name == "rental":
+        extra.add("rental_exposure")
+    needed = sorted(set(feature_columns) | extra)
+
+    table_path = _TRAINING_TABLE_BY_MODEL[model_name]
+    train_year_end = f"{config.TRAIN_YEAR}-12-31"
+    safe_end = min(train_year_end, config.safety_cutoff_date().isoformat())
+    df = s3_io.read_parquet(table_path, columns=needed, date_range=(f"{config.TRAIN_YEAR}-01-01", safe_end))
     if df is None:
-        raise FileNotFoundError(f"S3에 없음: {config.MULTI_HORIZON_FEATURES_TABLE_PARQUET}")
+        raise FileNotFoundError(f"S3에 없음: {table_path}")
     return df
 
 
 def _split(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """config의 TRAIN/VALID/TEST 기간으로 시간 순 split한다 (랜덤 split 금지 — lag feature 누출 방지).
+    """config.TRAIN_YEAR 1년치를 day-of-month 기준으로 train/valid/test로 나눈다
+    (랜덤 split 금지 — lag feature 누출 방지).
 
-    구간을 먼저 시간 순으로 확정한 뒤에만 `config.{TRAIN,VALID,TEST}_SAMPLE_FRAC`으로
-    행을 표본 추출한다(기본 1.0=표본 없음) — multi-horizon 테이블은 원본의 최대
+    매달 `config.VALID_DAYS_OF_MONTH`(기본 3, 20일)는 valid, `config.TEST_DAYS_OF_MONTH`
+    (기본 7, 24일)는 test, 나머지는 train — 12개월 전체를 계절성 편중 없이 학습에
+    쓰면서도, 같은 날짜가 반복되므로 연중 패턴을 고르게 검증/평가할 수 있다.
+    `config.safety_cutoff_date()`를 넘는(아직 라벨이 확정 안 됐을 수 있는) 날짜는
+    셋 다에서 제외한다.
+
+    구간을 먼저 확정한 뒤에만 `config.{TRAIN,VALID,TEST}_SAMPLE_FRAC`으로 행을
+    표본 추출한다(기본 1.0=표본 없음) — multi-horizon 테이블은 원본의 최대
     HORIZON_COUNT배라 학습 머신 RAM에 안 맞을 수 있다(history.md 18번 항목이 실제로
-    겪은 OOM과 같은 종류). 시간 경계를 먼저 자르고 그 안에서만 무작위 표본을 뽑으므로
+    겪은 OOM과 같은 종류). 날짜로 먼저 나누고 그 안에서만 무작위 표본을 뽑으므로
     표본 추출 자체가 누출을 만들지는 않는다.
 
     args:
@@ -105,23 +131,29 @@ def _split(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     returns:
         tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]: (train, valid, test)
     raises:
-        ValueError: 세 구간 중 하나라도 행이 0개일 때 — `config.py`의 TRAIN/VALID/TEST
-            구간이 이제 "오늘 - 안전마진" 기준으로 매번 동적으로 계산되므로(고정
-            캘린더 달이 아님), feature mart가 그 구간까지 아직 안 쌓였으면 조용히
-            빈 데이터로 학습을 시도하다 lgb.train() 안에서 알아보기 힘든 에러로
-            죽을 수 있다 — 여기서 먼저 걸러서 원인을 바로 알 수 있게 한다
-            (monitor_performance.evaluate_recent_performance()의 같은 패턴 참고).
+        ValueError: 세 구간 중 하나라도 행이 0개일 때 — feature mart가 TRAIN_YEAR
+            구간까지 아직 안 쌓였으면 조용히 빈 데이터로 학습을 시도하다 lgb.train()
+            안에서 알아보기 힘든 에러로 죽을 수 있다 — 여기서 먼저 걸러서 원인을
+            바로 알 수 있게 한다(monitor_performance.evaluate_recent_performance()의
+            같은 패턴 참고).
     """
-    train = df[(df["date"] >= config.TRAIN_START) & (df["date"] <= config.TRAIN_END)]
-    valid = df[(df["date"] >= config.VALID_START) & (df["date"] <= config.VALID_END)]
-    test = df[(df["date"] >= config.TEST_START) & (df["date"] <= config.TEST_END)]
+    train_year_str = str(config.TRAIN_YEAR)
+    safe_end = min(f"{train_year_str}-12-31", config.safety_cutoff_date().isoformat())
+    df = df[(df["date"].str[:4] == train_year_str) & (df["date"] <= safe_end)]
+
+    day_of_month = df["date"].str[8:10].astype(int)
+    valid_mask = day_of_month.isin(config.VALID_DAYS_OF_MONTH)
+    test_mask = day_of_month.isin(config.TEST_DAYS_OF_MONTH)
+
+    train = df[~(valid_mask | test_mask)]
+    valid = df[valid_mask]
+    test = df[test_mask]
 
     if train.empty or valid.empty or test.empty:
         raise ValueError(
-            f"학습 구간에 데이터가 없음 — train {len(train)}행({config.TRAIN_START}~{config.TRAIN_END}), "
-            f"valid {len(valid)}행({config.VALID_START}~{config.VALID_END}), "
-            f"test {len(test)}행({config.TEST_START}~{config.TEST_END}) — feature mart가 이 구간까지 "
-            "쌓였는지 확인하세요"
+            f"학습 구간에 데이터가 없음 — train {len(train)}행, valid {len(valid)}행, "
+            f"test {len(test)}행 ({train_year_str}년, ~{safe_end}까지) — feature mart가 "
+            "이 구간까지 쌓였는지 확인하세요"
         )
 
     if config.TRAIN_SAMPLE_FRAC < 1.0:
@@ -134,7 +166,7 @@ def _split(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
 
 
 def _prepare_xy(
-    df: pd.DataFrame, target_col: str, station_dtype: pd.CategoricalDtype
+    df: pd.DataFrame, target_col: str, station_dtype: pd.CategoricalDtype, feature_columns: list[str]
 ) -> tuple[pd.DataFrame, pd.Series]:
     """feature/label을 분리하고 station_id를 지정된 CategoricalDtype으로 맞춘다.
 
@@ -143,10 +175,11 @@ def _prepare_xy(
         target_col: "rental_count" 또는 "return_count"
         station_dtype: train/valid/test 전체에서 동일해야 하는 station_id 카테고리
             (split마다 따로 astype("category")하면 LightGBM 카테고리 코드가 어긋남)
+        feature_columns: RENTAL_FEATURE_COLUMNS 또는 RETURN_FEATURE_COLUMNS
     returns:
         tuple[pd.DataFrame, pd.Series]: (X, y)
     """
-    X = df[FEATURE_COLUMNS].copy()
+    X = df[feature_columns].copy()
     X["station_id"] = X["station_id"].astype(station_dtype)
     y = df[target_col]
     return X, y
@@ -236,6 +269,7 @@ def train_target(
     """
     models_prefix = models_prefix or config.MODELS_PREFIX
     is_primary = config.LGB_MACHINE_RANK == 0  # 분산 학습 시 최종 평가/아티팩트 저장은 이 머신만 담당
+    feature_columns = _FEATURE_COLUMNS_BY_MODEL[model_name]
     train_df, valid_df, test_df = _split(df)
 
     # station_categories는 샤딩 전 전체 df 기준이어야 한다 — 그래야 카테고리 코드가
@@ -250,9 +284,9 @@ def train_target(
         f"train={len(train_df):,} valid={len(valid_df):,} test={len(test_df):,}"
     )
 
-    X_train, y_train = _prepare_xy(train_df, target_col, station_dtype)
-    X_valid, y_valid = _prepare_xy(valid_df, target_col, station_dtype)
-    X_test, y_test = _prepare_xy(test_df, target_col, station_dtype)
+    X_train, y_train = _prepare_xy(train_df, target_col, station_dtype, feature_columns)
+    X_valid, y_valid = _prepare_xy(valid_df, target_col, station_dtype, feature_columns)
+    X_test, y_test = _prepare_xy(test_df, target_col, station_dtype, feature_columns)
 
     # exposure 컬럼은 원본 DataFrame에서 뽑아쓰는 마지막 용도다 — 뽑자마자 바로
     # del해서 X_*/y_*로 이미 변환된 train_df/valid_df/test_df를 이중으로 메모리에
@@ -394,9 +428,14 @@ def train_target(
 
 
 if __name__ == "__main__":
-    df = load_training_table()
+    # 대여/반납은 이제 완전히 분리된 데이터셋이라 테이블을 따로 읽는다 — 실제
+    # 운영 엔트리포인트는 train_rental_model.py/train_return_model.py(모델
+    # 아카이브 경로/프로필까지 처리)이고, 이 블록은 로컬 ad-hoc 실행용이다.
+    rental_df = load_training_table("rental")
+    rental_metrics = train_target(rental_df, "rental_count", "rental", exposure_col="rental_exposure")
+    del rental_df
 
-    rental_metrics = train_target(df, "rental_count", "rental", exposure_col="rental_exposure")
-    return_metrics = train_target(df, "return_count", "return", exposure_col=None)
+    return_df = load_training_table("return")
+    return_metrics = train_target(return_df, "return_count", "return", exposure_col=None)
 
     print(json.dumps({"rental": rental_metrics, "return": return_metrics}, indent=2, ensure_ascii=False))

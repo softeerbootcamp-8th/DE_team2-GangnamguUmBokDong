@@ -1,6 +1,6 @@
 """반납 수요 모델 학습: 순수 Poisson(거치대 상태 무관, exposure 보정 없음) + quantile P10/P50/P90.
 
-`horizon`(몇 시간 뒤를 예측하는지)이 FEATURE_COLUMNS에 포함돼 있어, 한 모델이
+`horizon`(몇 시간 뒤를 예측하는지)이 RETURN_FEATURE_COLUMNS에 포함돼 있어, 한 모델이
 horizon=1..HORIZON_COUNT 전체를 학습한다(history.md 18번 항목 — "horizon을 feature로").
 
 **항상 아카이브에 저장한다(챔피언에 직접 쓰지 않음)** — `training/promotion.py`가
@@ -29,7 +29,7 @@ def main() -> dict:
     archive_date = os.environ.get("MODEL_ARCHIVE_DATE", today_kst().isoformat())
     models_prefix = archive_models_prefix(archive_date, common_config.PROFILE_NAME)
 
-    df = load_training_table()
+    df = load_training_table("return")
     metrics = train_target(df, "return_count", "return", exposure_col=None, models_prefix=models_prefix)
     print(json.dumps(metrics, indent=2, ensure_ascii=False))
     return metrics

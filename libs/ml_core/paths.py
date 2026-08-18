@@ -116,27 +116,19 @@ POPULATION_PARQUET = f"{PROCESSED_V2_PREFIX}/population_2025.parquet"
 # 같은 값이어야 한다(위 모듈 docstring 참고) ---
 MERGED_TABLE_PARQUET = f"{FEATURE_ENGINEERING_OUTPUT_DIR}/station_hour_merged_2025.parquet"
 FEATURES_TABLE_PARQUET = f"{FEATURE_ENGINEERING_OUTPUT_DIR}/station_hour_features_2025.parquet"
-# FEATURES_TABLE_PARQUET의 각 행(T0, 5분 tick)을 horizon=1..HORIZON_COUNT만큼 self-join해
-# "T0의 lag/rolling + T0+(horizon-1)시간의 날씨/캘린더/타겟"으로 조합한 학습 테이블
-# (build_multi_horizon_features.py) — training이 이제 이 테이블만 읽는다.
-MULTI_HORIZON_FEATURES_TABLE_PARQUET = f"{FEATURE_ENGINEERING_OUTPUT_DIR}/station_hour_features_multihorizon_2025.parquet"
+# FEATURES_TABLE_PARQUET의 각 행(T0, 20분 tick)을 horizon=1..HORIZON_COUNT만큼 self-join해
+# "T0의 lag + T0+(horizon-1)시간의 날씨/캘린더/타겟"으로 조합한 학습 테이블
+# (build_multi_horizon_features.py) — 대여/반납이 서로 다른 lag/타겟을 쓰는 완전히
+# 분리된 데이터셋이라 출력도 둘로 나뉜다. training이 이제 이 테이블들만 읽는다.
+RENTAL_MULTI_HORIZON_FEATURES_TABLE_PARQUET = (
+    f"{FEATURE_ENGINEERING_OUTPUT_DIR}/station_hour_features_multihorizon_rental_2025.parquet"
+)
+RETURN_MULTI_HORIZON_FEATURES_TABLE_PARQUET = (
+    f"{FEATURE_ENGINEERING_OUTPUT_DIR}/station_hour_features_multihorizon_return_2025.parquet"
+)
 ROLLING_RENTAL_FEATURES_PARQUET = f"{FEATURE_ENGINEERING_OUTPUT_DIR}/rolling_rental_features_2025.parquet"
 
 # --- inference가 만드는 fallback 프로필(위 MERGED_TABLE_PARQUET/POPULATION_PARQUET
 # 기반) — 파라미터 조합과 무관하게 챔피언 경로 하나만 씀 ---
 STATION_HOURLY_PROFILE_PARQUET = f"{PROCESSED_V2_PREFIX}/station_hourly_profile.parquet"
 POPULATION_HOURLY_PROFILE_PARQUET = f"{PROCESSED_V2_PREFIX}/population_hourly_profile.parquet"
-
-# 1차 정제 산출물(원본 CSV -> parquet) — analysis_summary.json은 feature_engine(공휴일
-# 목록 재사용)과 inference(predict_single.py가 서빙 시점의 is_holiday 계산)가 같이 읽는다.
-ANALYSIS_SUMMARY_JSON = f"{PROCESSED_V2_PREFIX}/output/analysis_summary.json"
-
-
-def load_holidays_2025() -> set[str]:
-    """analysis_summary.json의 holidays_2025 목록을 'YYYY-MM-DD' 문자열 set으로 반환한다."""
-    from core import s3 as s3_io
-
-    summary = s3_io.read_json(ANALYSIS_SUMMARY_JSON)
-    if summary is None:
-        raise FileNotFoundError(f"S3에 없음: {ANALYSIS_SUMMARY_JSON}")
-    return set(summary["holidays_2025"])

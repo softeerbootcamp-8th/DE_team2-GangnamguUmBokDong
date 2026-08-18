@@ -37,7 +37,7 @@ append 방식(이전 구현)은 워터마크 이하 행을 전부 버렸기 때�
 INCREMENTAL_LOOKBACK_HOURS`보다 최신인 날짜는 아직 위 사후 보정 대상이다 — 다음
 증분 실행 때 `rental_count`가 더 늘어날 수 있으므로, 그 구간을 학습/평가에 "확정된
 라벨"로 쓰면 안 된다(과소집계된 값을 정답으로 학습하는 셈). 다만 `training/
-config.py`의 `TRAIN_END`/`TEST_END`, `monitor_performance.py`의 "완결된 달만
+config.py`의 `safety_cutoff_date()`, `monitor_performance.py`의 "완결된 달만
 본다" 로직은 이 35일 전체가 아니라 더 짧은 `TRAINING_SAFETY_MARGIN_DAYS`(기본
 7일 — "이 정도면 거의 다 반납됐다"는 실용적 판단)만 뺀다 — 35일을 그대로 쓰면
 학습/모니터링이 항상 한두 달 뒤처진 데이터만 보게 돼서다. 즉 완전한 안전(35일)과

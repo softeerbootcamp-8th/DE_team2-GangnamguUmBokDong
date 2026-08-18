@@ -49,9 +49,9 @@ def build_station_profile() -> pd.DataFrame:
     profile[["rental_std", "return_std"]] = profile[["rental_std", "return_std"]].fillna(0.0)
 
     # groupby().mean()/std()는 정수 컬럼(rental_count 등 int16)을 집계해도
-    # 항상 float64를 낸다 — ml_core/model_contract.FEATURE_COLUMN_DTYPES와 맞춰
-    # float32로 다운캐스트(predict_single.py가 이 값을 그대로 lag/rolling
-    # feature 자리에 fallback으로 채우므로).
+    # 항상 float64를 낸다 — ml_core/model_contract의 RENTAL/RETURN_FEATURE_COLUMN_DTYPES와
+    # 맞춰 float32로 다운캐스트(predict_single.py가 이 값을 그대로 lag feature
+    # 자리에 fallback으로 채우므로).
     mean_std_cols = ["rental_mean", "rental_std", "return_mean", "return_std"]
     profile[mean_std_cols] = profile[mean_std_cols].astype("float32")
     profile["n_samples"] = profile["n_samples"].astype("int32")

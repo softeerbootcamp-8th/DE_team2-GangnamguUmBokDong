@@ -10,6 +10,7 @@ dependencies = [
     "pyarrow",
     "lightgbm",
     "boto3==1.43.69",
+    "holidays>=0.65",
 ]
 
 [dependency-groups]

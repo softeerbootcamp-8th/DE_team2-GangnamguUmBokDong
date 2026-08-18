@@ -1,6 +1,6 @@
 """대여 수요 모델 학습: Poisson(+exposure offset, 품절 보정) + quantile P10/P50/P90.
 
-`horizon`(몇 시간 뒤를 예측하는지)이 FEATURE_COLUMNS에 포함돼 있어, 한 모델이
+`horizon`(몇 시간 뒤를 예측하는지)이 RENTAL_FEATURE_COLUMNS에 포함돼 있어, 한 모델이
 horizon=1..HORIZON_COUNT 전체를 학습한다(history.md 18번 항목 — "horizon을 feature로").
 
 **항상 아카이브에 저장한다(챔피언에 직접 쓰지 않음)** — `training/promotion.py`가
@@ -29,7 +29,7 @@ def main() -> dict:
     archive_date = os.environ.get("MODEL_ARCHIVE_DATE", today_kst().isoformat())
     models_prefix = archive_models_prefix(archive_date, common_config.PROFILE_NAME)
 
-    df = load_training_table()
+    df = load_training_table("rental")
     metrics = train_target(
         df, "rental_count", "rental", exposure_col="rental_exposure", models_prefix=models_prefix
     )

@@ -6,8 +6,9 @@
 공유한다 — 서빙 경로와 모니터링/평가 경로가 각자 채점 로직을 따로 구현하면
 train-serve skew와 같은 종류의 사고(두 경로가 조용히 다른 값을 냄)가 날 수 있다.
 
-입력 DataFrame은 반드시 `feature_engine`의 `build_features.build_features()`를 거친
-스키마여야 한다(`ml_core.model_contract.FEATURE_COLUMNS` 포함).
+입력 DataFrame은 반드시 `feature_engine`의 `build_features.build_rental_features()`/
+`build_return_features()`를 거친 스키마여야 한다(`ml_core.model_contract`의
+`RENTAL_FEATURE_COLUMNS`/`RETURN_FEATURE_COLUMNS` 포함).
 """
 
 from functools import cache
@@ -15,14 +16,18 @@ from functools import cache
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
-
 from core import s3 as s3_io
 
 from . import metrics, model_io
-from .model_contract import FEATURE_COLUMNS, load_station_dtype
+from .model_contract import (
+    RENTAL_FEATURE_COLUMNS,
+    RETURN_FEATURE_COLUMNS,
+    load_station_dtype,
+)
 from .paths import model_json_key, model_key
 
 BOOSTER_SUFFIXES = ["poisson", "q10", "q50", "q90"]
+_FEATURE_COLUMNS_BY_MODEL = {"rental": RENTAL_FEATURE_COLUMNS, "return": RETURN_FEATURE_COLUMNS}
 
 
 @cache
@@ -68,15 +73,16 @@ def predict(df: pd.DataFrame, model_name: str, exposure_col: str | None = None) 
     """station×tick feature 행마다 point(poisson) + quantile(P10/50/90, conformal 보정 적용) 예측.
 
     args:
-        df: feature_engine의 build_features.build_features()와 동일한 스키마의 DataFrame
-            (station_id, date, hour, ml_core.model_contract.FEATURE_COLUMNS 포함)
+        df: feature_engine의 build_features.build_rental_features()/build_return_features()와
+            동일한 스키마의 DataFrame (station_id, date, hour + model_name에 맞는
+            RENTAL_FEATURE_COLUMNS/RETURN_FEATURE_COLUMNS 포함)
         model_name: "rental" 또는 "return"
         exposure_col: Poisson exposure 컬럼명. None이면 exposure=1로 간주 (반납 모델)
     returns:
         pd.DataFrame: station_id, date, hour, pred_mean, pred_p10, pred_p50, pred_p90
     """
     station_dtype = load_station_dtype(model_name)
-    X = df[FEATURE_COLUMNS].copy()
+    X = df[_FEATURE_COLUMNS_BY_MODEL[model_name]].copy()
     X["station_id"] = X["station_id"].astype(station_dtype)
 
     boosters = load_boosters(model_name)

@@ -2,7 +2,6 @@
 
 import pandas as pd
 import pytest
-
 from core import s3
 
 

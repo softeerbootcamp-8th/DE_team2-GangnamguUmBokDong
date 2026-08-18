@@ -1,10 +1,10 @@
 """training(LightGBM 학습) 전용 경로·상수.
 
 `feature_engine`이 만든 multi-horizon feature 테이블을 S3에서 읽어
-(`MULTI_HORIZON_FEATURES_TABLE_PARQUET`, `ml_core/`에서 공유) `MODELS_PREFIX`
-(S3 키 prefix, `models/`)에 학습 결과를 저장한다. `inference`도 같은
-`MODELS_PREFIX`를 읽어야 하므로 그 값 자체는 `ml_core/paths.py`가 소유하고,
-여기서는 학습에만 쓰는 값(split 기간, quantile 목록 등)을 정의한다.
+(`RENTAL_MULTI_HORIZON_FEATURES_TABLE_PARQUET`/`RETURN_..._PARQUET`, `ml_core/`에서
+공유) `MODELS_PREFIX`(S3 키 prefix, `models/`)에 학습 결과를 저장한다. `inference`도
+같은 `MODELS_PREFIX`를 읽어야 하므로 그 값 자체는 `ml_core/paths.py`가 소유하고,
+여기서는 학습에만 쓰는 값(split 기준, quantile 목록 등)을 정의한다.
 """
 
 import os
@@ -14,11 +14,18 @@ from zoneinfo import ZoneInfo
 from ml_core import common_config
 from ml_core.paths import (
     MODELS_PREFIX,
-    MULTI_HORIZON_FEATURES_TABLE_PARQUET,
     PROCESSED_V2_PREFIX,
+    RENTAL_MULTI_HORIZON_FEATURES_TABLE_PARQUET,
+    RETURN_MULTI_HORIZON_FEATURES_TABLE_PARQUET,
 )
 
-__all__ = ["MODELS_PREFIX", "MULTI_HORIZON_FEATURES_TABLE_PARQUET", "PROCESSED_V2_PREFIX", "today_kst"]
+__all__ = [
+    "MODELS_PREFIX",
+    "PROCESSED_V2_PREFIX",
+    "RENTAL_MULTI_HORIZON_FEATURES_TABLE_PARQUET",
+    "RETURN_MULTI_HORIZON_FEATURES_TABLE_PARQUET",
+    "today_kst",
+]
 
 _KST = ZoneInfo("Asia/Seoul")
 
@@ -33,70 +40,45 @@ def today_kst() -> date:
     """
     return datetime.now(_KST).date()
 
-# --- 학습/검증/평가 기간 (시간 순 split, walk-forward) ---
-# multi-horizon 테이블은 원본 feature 테이블의 최대 HORIZON_COUNT(기본 12)배 행 수라
-# (T0 앵커를 5분 tick 전체로 유지하는 채로) 기존처럼 10~12개월을 통째로 쓰면 단일 머신
-# LightGBM이 감당 못 한다(history.md 18번 항목이 실제로 겪은 OOM과 같은 종류) — 그래서
-# TRAIN/VALID/TEST 합쳐 한 달 분량(기본 20/5/5일)만 쓴다. 예전엔 이 구간이 "2025-11"로
-# 고정돼 있었는데, 매달 자동으로 재학습하는 지금은 그러면 다음 달 재학습도 계속 같은
-# 옛날 데이터만 보게 된다 — 그래서 매번 "오늘 기준" 안전한 최근 구간으로 슬라이딩한다
-# (아래 _default_window()). 실제 학습 머신에서 기간을 늘리거나 재현용으로 특정 구간을
-# 고정하고 싶으면 TRAIN_START 등 6개 환경변수로 이 계산값을 그대로 override할 수 있다
-# (TRAIN_SAMPLE_FRAC 등(아래)과 조합해서 씀).
+
+# --- 학습/검증/평가 split (day-of-month 기준) ---
+# 예전엔 TRAIN/VALID/TEST를 시간 순(walk-forward)으로 연속 구간(20/5/5일)만 뽑아
+# 썼다 — multi-horizon 테이블이 원본의 최대 HORIZON_COUNT배 행 수라 단일 머신
+# LightGBM이 1년 전체를 못 받았기 때문(history.md 18번 항목). 이제 대여/반납을
+# 완전히 분리하고 lag도 1개만 남겨(공통 feature 24->12, lag/rolling 14->2) 행당
+# 크기가 크게 줄어서, 표본 추출(TRAIN/VALID/TEST_SAMPLE_FRAC)과 조합하면 연중
+# 특정 날짜(매달 3/20일=valid, 7/24일=test, 나머지=train)를 흩뿌려 뽑는 방식으로
+# TRAIN_YEAR 1년 전체를 다 학습에 쓸 수 있다 — 계절성을 연속 구간 하나보다 훨씬
+# 고르게 커버한다.
 #
 # 대여이력은 반납이 완료돼야 Silver에 나타난다(feature_engine/spark/run_pipeline.py의
 # 날짜 파티션 overwrite 보정과 같은 이유) — 그래서 가장 최근 TRAINING_SAFETY_MARGIN_DAYS
-# (기본 7일)는 rental_count 집계가 아직 안 끝났을 수 있어 학습/평가 라벨로 쓰지 않는다.
-# feature_engine의 INCREMENTAL_LOOKBACK_HOURS(35일 — 사후 보정을 계속 반영하기 위한
-# feature mart 쪽 마진)와는 목적이 다른, "이 정도 지났으면 라벨을 믿고 학습해도 된다"는
-# 별도의(더 짧은) 마진이다.
+# (기본 7일)는 rental_count 집계가 아직 안 끝났을 수 있어 학습/평가 라벨로 쓰지 않는다
+# (TRAIN_YEAR가 이미 지난 해라면 사실상 영향 없음 — "오늘"에 가까운 올해를 학습할 때만
+# 실제로 걸러진다). feature_engine의 INCREMENTAL_LOOKBACK_HOURS(35일 — 사후 보정을
+# 계속 반영하기 위한 feature mart 쪽 마진)와는 목적이 다른, "이 정도 지났으면 라벨을
+# 믿고 학습해도 된다"는 별도의(더 짧은) 마진이다.
 TRAINING_SAFETY_MARGIN_DAYS = int(os.environ.get("TRAINING_SAFETY_MARGIN_DAYS", "7"))
-TRAIN_DAYS = int(os.environ.get("TRAIN_DAYS", "20"))
-VALID_DAYS = int(os.environ.get("VALID_DAYS", "5"))
-TEST_DAYS = int(os.environ.get("TEST_DAYS", "5"))
+TRAIN_YEAR = int(os.environ.get("TRAIN_YEAR", "2025"))
+VALID_DAYS_OF_MONTH = frozenset(int(d) for d in os.environ.get("VALID_DAYS_OF_MONTH", "3,20").split(","))
+TEST_DAYS_OF_MONTH = frozenset(int(d) for d in os.environ.get("TEST_DAYS_OF_MONTH", "7,24").split(","))
 
 
-def _default_window(as_of: date | None = None) -> tuple[str, str, str, str, str, str]:
-    """"as_of - TRAINING_SAFETY_MARGIN_DAYS"를 안전 상한으로 TRAIN/VALID/TEST를
-    시간 순(TRAIN이 가장 오래됨)으로 슬라이딩 배분한다.
+def safety_cutoff_date(as_of: date | None = None) -> date:
+    """`as_of - TRAINING_SAFETY_MARGIN_DAYS` — 이 날짜를 넘는 라벨은 아직 확정되지
+    않았을 수 있어 학습/평가에 쓰지 않는다.
 
     args:
         as_of: 기준 날짜(기본 오늘) — 테스트에서 날짜를 고정하기 위한 override
-    returns:
-        tuple[str, str, str, str, str, str]: (train_start, train_end, valid_start,
-            valid_end, test_start, test_end) "YYYY-MM-DD"
     """
     as_of = as_of or today_kst()
-    test_end = as_of - timedelta(days=TRAINING_SAFETY_MARGIN_DAYS)
-    test_start = test_end - timedelta(days=TEST_DAYS - 1)
-    valid_end = test_start - timedelta(days=1)
-    valid_start = valid_end - timedelta(days=VALID_DAYS - 1)
-    train_end = valid_start - timedelta(days=1)
-    train_start = train_end - timedelta(days=TRAIN_DAYS - 1)
-    return (
-        train_start.isoformat(),
-        train_end.isoformat(),
-        valid_start.isoformat(),
-        valid_end.isoformat(),
-        test_start.isoformat(),
-        test_end.isoformat(),
-    )
+    return as_of - timedelta(days=TRAINING_SAFETY_MARGIN_DAYS)
 
-
-_DEFAULT_TRAIN_START, _DEFAULT_TRAIN_END, _DEFAULT_VALID_START, _DEFAULT_VALID_END, _DEFAULT_TEST_START, _DEFAULT_TEST_END = (
-    _default_window()
-)
-TRAIN_START = os.environ.get("TRAIN_START", _DEFAULT_TRAIN_START)
-TRAIN_END = os.environ.get("TRAIN_END", _DEFAULT_TRAIN_END)
-VALID_START = os.environ.get("VALID_START", _DEFAULT_VALID_START)
-VALID_END = os.environ.get("VALID_END", _DEFAULT_VALID_END)
-TEST_START = os.environ.get("TEST_START", _DEFAULT_TEST_START)
-TEST_END = os.environ.get("TEST_END", _DEFAULT_TEST_END)
 
 QUANTILE_ALPHAS = [0.1, 0.5, 0.9]
 
 # multi-horizon 테이블은 원본 feature 테이블의 최대 HORIZON_COUNT(기본 12)배 행 수라(T0
-# 앵커를 5분 tick 전체로 유지 — feature_engine/spark/build_multi_horizon_features.py
+# 앵커를 tick 전체로 유지 — feature_engine/spark/build_multi_horizon_features.py
 # 참고), 학습 머신 RAM에 안 맞으면 OOM이 난다(history.md 18번 항목이 실제로 겪은 문제와
 # 같은 종류 — 그때는 train/valid/test 각각 다른 비율로 표본을 뽑아 해결했다). 기본값은
 # "표본 없음"(1.0)이라 실행해보고 OOM이 나면 실제 학습 머신 스펙에 맞춰 낮출 것 — 정확한

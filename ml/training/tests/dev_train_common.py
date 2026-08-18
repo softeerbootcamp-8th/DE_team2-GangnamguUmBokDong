@@ -1,10 +1,15 @@
-"""train_common._split()이 빈 구간을 조용히 통과시키지 않고 바로 에러를 내는지 검증한다.
+"""train_common._split()이 day-of-month 기준으로 train/valid/test를 정확히 나누고,
+빈 구간을 조용히 통과시키지 않고 바로 에러를 내는지 검증한다.
 
-`config.py`의 TRAIN/VALID/TEST 구간이 이제 "오늘 - 안전마진" 기준으로 매번 동적으로
-계산되므로(고정 캘린더 달이 아님), feature mart가 그 구간까지 아직 안 쌓였으면
-학습이 빈 데이터로 진행되다가 lgb.train() 안에서 알아보기 힘든 에러로 죽을 수 있다 —
-이 테스트가 그 경우 `_split()` 단계에서 먼저 걸러지는지 확인한다.
+매달 `config.VALID_DAYS_OF_MONTH`/`TEST_DAYS_OF_MONTH`에 속하는 날짜는 valid/test로,
+나머지는 train으로 분류한다 — `config.TRAIN_YEAR` 밖 날짜나
+`config.safety_cutoff_date()`를 넘는(아직 라벨이 확정 안 됐을 수 있는) 날짜는 셋
+다에서 제외된다. feature mart가 특정 구간까지 아직 안 쌓였으면 학습이 빈 데이터로
+진행되다가 lgb.train() 안에서 알아보기 힘든 에러로 죽을 수 있다 — 이 테스트가 그
+경우 `_split()` 단계에서 먼저 걸러지는지 확인한다.
 """
+
+from datetime import date
 
 import pandas as pd
 import pytest
@@ -17,31 +22,58 @@ def _make_df(dates: list[str]) -> pd.DataFrame:
     return pd.DataFrame({"date": dates, "value": range(len(dates))})
 
 
-def test_split_raises_when_test_window_has_no_rows(monkeypatch):
-    monkeypatch.setattr(config, "TRAIN_START", "2026-01-01")
-    monkeypatch.setattr(config, "TRAIN_END", "2026-01-05")
-    monkeypatch.setattr(config, "VALID_START", "2026-01-06")
-    monkeypatch.setattr(config, "VALID_END", "2026-01-06")
-    monkeypatch.setattr(config, "TEST_START", "2026-01-07")
-    monkeypatch.setattr(config, "TEST_END", "2026-01-07")
+def test_split_raises_when_test_days_of_month_have_no_rows(monkeypatch):
+    monkeypatch.setattr(config, "TRAIN_YEAR", 2026)
+    monkeypatch.setattr(config, "VALID_DAYS_OF_MONTH", frozenset({20}))
+    monkeypatch.setattr(config, "TEST_DAYS_OF_MONTH", frozenset({24}))
+    monkeypatch.setattr(config, "safety_cutoff_date", lambda as_of=None: date(2026, 1, 31))
 
-    # feature mart가 2026-01-06까지만 쌓여있는 상황(test 구간 데이터 없음)을 흉내낸다.
-    df = _make_df(["2026-01-01", "2026-01-02", "2026-01-06"])
+    # 2026-01-24(test)에 해당하는 행이 전혀 없다.
+    df = _make_df(["2026-01-01", "2026-01-20"])
 
     with pytest.raises(ValueError, match="학습 구간에 데이터가 없음"):
         _split(df)
 
 
-def test_split_succeeds_when_all_windows_have_rows(monkeypatch):
-    monkeypatch.setattr(config, "TRAIN_START", "2026-01-01")
-    monkeypatch.setattr(config, "TRAIN_END", "2026-01-02")
-    monkeypatch.setattr(config, "VALID_START", "2026-01-03")
-    monkeypatch.setattr(config, "VALID_END", "2026-01-03")
-    monkeypatch.setattr(config, "TEST_START", "2026-01-04")
-    monkeypatch.setattr(config, "TEST_END", "2026-01-04")
+def test_split_buckets_rows_by_day_of_month(monkeypatch):
+    monkeypatch.setattr(config, "TRAIN_YEAR", 2026)
+    monkeypatch.setattr(config, "VALID_DAYS_OF_MONTH", frozenset({20}))
+    monkeypatch.setattr(config, "TEST_DAYS_OF_MONTH", frozenset({24}))
+    monkeypatch.setattr(config, "safety_cutoff_date", lambda as_of=None: date(2026, 12, 31))
 
-    df = _make_df(["2026-01-01", "2026-01-02", "2026-01-03", "2026-01-04"])
+    df = _make_df(["2026-01-01", "2026-01-20", "2026-01-24", "2026-02-01", "2026-02-20", "2026-02-24"])
 
     train, valid, test = _split(df)
 
-    assert len(train) == 2 and len(valid) == 1 and len(test) == 1
+    assert sorted(train["date"]) == ["2026-01-01", "2026-02-01"]
+    assert sorted(valid["date"]) == ["2026-01-20", "2026-02-20"]
+    assert sorted(test["date"]) == ["2026-01-24", "2026-02-24"]
+
+
+def test_split_excludes_rows_past_safety_cutoff(monkeypatch):
+    monkeypatch.setattr(config, "TRAIN_YEAR", 2026)
+    monkeypatch.setattr(config, "VALID_DAYS_OF_MONTH", frozenset({20}))
+    monkeypatch.setattr(config, "TEST_DAYS_OF_MONTH", frozenset({24}))
+    monkeypatch.setattr(config, "safety_cutoff_date", lambda as_of=None: date(2026, 1, 21))
+
+    # 01-24(test)는 안전 마진을 넘어서 통째로 제외돼야 하므로 test 구간에 데이터가
+    # 없다는 에러가 나야 한다.
+    df = _make_df(["2026-01-01", "2026-01-20", "2026-01-24"])
+
+    with pytest.raises(ValueError, match="학습 구간에 데이터가 없음"):
+        _split(df)
+
+
+def test_split_excludes_rows_outside_train_year(monkeypatch):
+    monkeypatch.setattr(config, "TRAIN_YEAR", 2026)
+    monkeypatch.setattr(config, "VALID_DAYS_OF_MONTH", frozenset({20}))
+    monkeypatch.setattr(config, "TEST_DAYS_OF_MONTH", frozenset({24}))
+    monkeypatch.setattr(config, "safety_cutoff_date", lambda as_of=None: date(2026, 12, 31))
+
+    df = _make_df(["2025-01-01", "2025-01-20", "2025-01-24", "2026-01-01", "2026-01-20", "2026-01-24"])
+
+    train, valid, test = _split(df)
+
+    assert list(train["date"]) == ["2026-01-01"]
+    assert list(valid["date"]) == ["2026-01-20"]
+    assert list(test["date"]) == ["2026-01-24"]

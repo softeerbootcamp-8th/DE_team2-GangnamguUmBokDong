@@ -54,7 +54,6 @@ RETURN_TARGETS_PARQUET = os.environ.get("RETURN_TARGETS_PARQUET", _s3a("processe
 STATION_STATUS_PARQUET = os.environ.get("STATION_STATUS_PARQUET", _s3a("processed_v2/station_status_2025.parquet"))
 WEATHER_PARQUET = os.environ.get("WEATHER_PARQUET", _s3a("processed_v2/weather_2025.parquet"))
 POPULATION_PARQUET = os.environ.get("POPULATION_PARQUET", _s3a("processed_v2/population_2025.parquet"))
-ANALYSIS_SUMMARY_JSON = os.environ.get("ANALYSIS_SUMMARY_JSON", _s3a("processed_v2/output/analysis_summary.json"))
 
 # --- 학습 대상 연도 (Silver glob을 이 연도로 좁히는 데 씀 — silver_source.py) ---
 TRAIN_YEAR = int(os.environ.get("TRAIN_YEAR", "2025"))
@@ -69,10 +68,6 @@ ROLLING_EMBARGO_MINUTES = common_config.ROLLING_EMBARGO_MINUTES
 # 간격의 모든 T에 대해 예측 (build_targets.py의 future_rolling_counts()).
 TARGET_HORIZON_MINUTES = common_config.TARGET_HORIZON_MINUTES
 GRID_TICK_MINUTES = common_config.GRID_TICK_MINUTES
-
-# --- lag/rolling 피처 파라미터 (src/config.py와 동일 — common_config.py에서 공유) ---
-LAG_HOURS = common_config.LAG_HOURS
-ROLLING_WINDOWS = common_config.ROLLING_WINDOWS
 
 # --- 배치예측 horizon 개수 (common_config.py에서 공유 — build_multi_horizon_features.py 참고) ---
 HORIZON_COUNT = common_config.HORIZON_COUNT
@@ -98,8 +93,11 @@ ROLLING_RENTAL_FEATURES_PARQUET = f"{OUTPUT_ROOT}/rolling_rental_features_2025.p
 MERGED_TABLE_PARQUET = f"{OUTPUT_ROOT}/station_hour_merged_2025.parquet"
 FEATURES_TABLE_PARQUET = f"{OUTPUT_ROOT}/station_hour_features_2025.parquet"
 # FEATURES_TABLE_PARQUET의 각 행(T0)을 horizon=1..HORIZON_COUNT로 self-join한 학습 테이블
-# (build_multi_horizon_features.py) — libs/ml_core/paths.py의 같은 이름 상수와 동일 공식.
-MULTI_HORIZON_FEATURES_TABLE_PARQUET = f"{OUTPUT_ROOT}/station_hour_features_multihorizon_2025.parquet"
+# (build_multi_horizon_features.py). 대여/반납이 서로 다른 lag/타겟을 쓰는 완전히
+# 분리된 데이터셋이라 출력도 둘로 나뉜다 — libs/ml_core/paths.py의 같은 이름
+# 상수와 동일 공식.
+RENTAL_MULTI_HORIZON_FEATURES_TABLE_PARQUET = f"{OUTPUT_ROOT}/station_hour_features_multihorizon_rental_2025.parquet"
+RETURN_MULTI_HORIZON_FEATURES_TABLE_PARQUET = f"{OUTPUT_ROOT}/station_hour_features_multihorizon_return_2025.parquet"
 WATERMARK_PATH = f"{OUTPUT_ROOT_KEY}/_watermark.json"
 
 # --- 증분 재생성 시 얼마나 과거까지 다시 계산해서 겹치는 구간을 보정할지 (common_config.py에서 공유) ---

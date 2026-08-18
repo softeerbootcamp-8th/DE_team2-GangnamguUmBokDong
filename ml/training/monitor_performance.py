@@ -21,7 +21,7 @@ import numpy as np
 import pandas as pd
 from core import s3 as s3_io
 from ml_core.metrics import poisson_deviance as _poisson_deviance
-from ml_core.model_contract import FEATURE_COLUMNS
+from ml_core.model_contract import RENTAL_FEATURE_COLUMNS, RETURN_FEATURE_COLUMNS
 from ml_core.paths import model_json_key
 from ml_core.scoring import predict
 
@@ -31,6 +31,11 @@ MODEL_SPECS = [
     ("rental", "rental_count", "rental_exposure"),
     ("return", "return_count", None),
 ]
+_FEATURE_COLUMNS_BY_MODEL = {"rental": RENTAL_FEATURE_COLUMNS, "return": RETURN_FEATURE_COLUMNS}
+_TRAINING_TABLE_BY_MODEL = {
+    "rental": config.RENTAL_MULTI_HORIZON_FEATURES_TABLE_PARQUET,
+    "return": config.RETURN_MULTI_HORIZON_FEATURES_TABLE_PARQUET,
+}
 
 
 def _load_baseline_metrics(model_name: str) -> dict:
@@ -116,10 +121,12 @@ def evaluate_recent_performance(
     # date_range로 이번에 볼 N개월 파티션만 받는다 — 그동안 쌓인 전체 히스토리를 매달
     # 실행할 때마다 다 받으면, 실행 비용이 "최근 N개월"이 아니라 "서비스 시작 이후
     # 전체 기간"에 비례해서 계속 커진다(s3_io.py 모듈 docstring 참고).
-    needed = sorted(set(FEATURE_COLUMNS) | {target_col, "date", "horizon"} | ({exposure_col} if exposure_col else set()))
-    df = s3_io.read_parquet(config.MULTI_HORIZON_FEATURES_TABLE_PARQUET, columns=needed, date_range=(start, end))
+    table_path = _TRAINING_TABLE_BY_MODEL[model_name]
+    feature_columns = _FEATURE_COLUMNS_BY_MODEL[model_name]
+    needed = sorted(set(feature_columns) | {target_col, "date", "horizon"} | ({exposure_col} if exposure_col else set()))
+    df = s3_io.read_parquet(table_path, columns=needed, date_range=(start, end))
     if df is None:
-        raise FileNotFoundError(f"S3에 없음: {config.MULTI_HORIZON_FEATURES_TABLE_PARQUET}")
+        raise FileNotFoundError(f"S3에 없음: {table_path}")
     df = df[df["horizon"] == horizon].reset_index(drop=True)
     if df.empty:
         raise ValueError(

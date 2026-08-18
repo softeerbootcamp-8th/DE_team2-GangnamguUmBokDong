@@ -1,9 +1,10 @@
-"""feature_engine.build_features()의 lag/rolling 정확성 검증.
+"""feature_engine.build_features()의 return_lag_1h/rental_lag_1h 정확성 검증.
 
 가장 중요하게 확인하는 것: `build_merged_table.py`의 station 활성 구간 필터링
-때문에 그리드에 구멍(결측 시간대)이 생길 수 있는데, 그 상태에서도 lag/rolling이
-"행 개수"가 아니라 "실제 경과 시간" 기준으로 정확히 계산되는지 — 이게 깨지면
-구멍 근처에서 "24시간 전"이 실제로는 27시간 전 값을 가져오는 조용한 버그가 된다.
+때문에 그리드에 구멍(결측 시간대)이 생길 수 있는데, 그 상태에서도 return_lag_1h가
+self-join(`_exact_hour_lag`) 기반이라 "정확히 1시간 전 행이 그리드에 있는지"로
+정확히 판정되는지 — 행 개수(위치) 기준이었다면 구멍 근처에서 엉뚱한 시점 값을
+가져오는 조용한 버그가 됐을 것이다.
 """
 
 import pandas as pd
@@ -53,8 +54,8 @@ def _grid(station: str, hours) -> pd.DataFrame:
     )
 
 
-def test_return_lag_matches_hand_computation_on_dense_grid(spark, tmp_path):
-    """구멍 없는 그리드에서는 lag_24h/168h, roll_mean_3h가 손으로 계산한 값과 정확히 같아야 한다."""
+def test_return_lag_1h_matches_hand_computation_on_dense_grid(spark, tmp_path):
+    """구멍 없는 그리드에서는 return_lag_1h가 손으로 계산한 shift(1)과 정확히 같아야 한다."""
     hours = pd.date_range("2025-06-01 00:00", periods=200, freq="h")
     pdf = _grid("A", hours)
     rolling_path = _write_rolling_parquet(tmp_path, [])
@@ -66,23 +67,19 @@ def test_return_lag_matches_hand_computation_on_dense_grid(spark, tmp_path):
     out["hour_ts"] = out["hour_ts"].astype(pdf["hour_ts"].dtype)
 
     series = pdf.set_index("hour_ts")["return_count"]
-    expected_lag24 = series.shift(24)
-    got_lag24 = out.set_index("hour_ts")["return_lag_24h"]
-    pd.testing.assert_series_equal(got_lag24, expected_lag24, check_names=False, check_dtype=False)
-
-    expected_roll_mean_3h = series.shift(1).rolling(window=3, min_periods=1).mean()
-    got_roll_mean_3h = out.set_index("hour_ts")["return_roll_mean_3h"]
-    pd.testing.assert_series_equal(got_roll_mean_3h, expected_roll_mean_3h, check_names=False, check_dtype=False)
+    expected_lag1 = series.shift(1)
+    got_lag1 = out.set_index("hour_ts")["return_lag_1h"]
+    pd.testing.assert_series_equal(got_lag1, expected_lag1, check_names=False, check_dtype=False)
 
 
-def test_lag_and_rolling_are_gap_aware_not_row_count_based(spark, tmp_path):
-    """그리드에 구멍(결측 시간대)이 있을 때 lag/rolling이 실제 경과시간 기준으로 동작해야 한다.
+def test_return_lag_1h_is_gap_aware_not_row_count_based(spark, tmp_path):
+    """그리드에 구멍(결측 시간대)이 있을 때 return_lag_1h가 실제 경과시간 기준으로 동작해야 한다.
 
     2025-06-05 00:00~05:00(6시간) 구간을 통째로 그리드에서 뺀 station을 만들고:
-    - 구멍 바로 다음 행에서 lag_24h는 "정확히 24시간 전 행이 그리드에 있는지"로 판정돼야
-      한다(행 개수 기준이면 구멍 때문에 실제로는 30시간 전 값을 잘못 가져오게 됨).
-    - roll_mean_3h는 구멍 근처에서 실제로 존재하는 행만 평균에 반영해야 한다(존재하는
-      행 개수가 3개 미만이면 그만큼만 평균 내고, 구멍 너머 먼 시점 값이 섞이면 안 됨).
+    - 구멍 바로 다음 행(06:00)의 lag_1h는 "정확히 1시간 전(05:00) 행이 그리드에 있는지"로
+      판정돼야 한다 — 05:00은 구멍 안이라 없으므로 NaN이어야 한다(행 개수 기준이면
+      구멍 바로 앞의 실제 존재하는 행 값을 잘못 가져오게 됨).
+    - 그 다음 행(07:00)의 1시간 전(06:00)은 그리드에 있으므로 정상적으로 값이 나와야 한다.
     """
     all_hours = pd.date_range("2025-06-01 00:00", periods=240, freq="h")
     gap_start = pd.Timestamp("2025-06-05 00:00")
@@ -97,23 +94,13 @@ def test_lag_and_rolling_are_gap_aware_not_row_count_based(spark, tmp_path):
 
     series = pdf.set_index("hour_ts")["return_count"]
 
-    # 구멍 바로 다음 행(06:00): 24시간 전(전날 06:00)은 그리드에 존재하므로 정상적으로 값이 나와야 함
+    # 구멍 바로 다음 행(06:00): 1시간 전(05:00)은 구멍 안이라 그리드에 없음 -> NaN이어야 함
     row_after_gap = pd.Timestamp("2025-06-05 06:00")
-    expected_lag24_after_gap = series.get(row_after_gap - pd.Timedelta(hours=24))
-    assert out.loc[row_after_gap, "return_lag_24h"] == expected_lag24_after_gap
+    assert pd.isna(out.loc[row_after_gap, "return_lag_1h"]), (
+        "구멍 직후 return_lag_1h가 채워짐 -> row-count 기반 버그 의심"
+    )
 
-    # 구멍 안(예: 만약 04:00이 있었다면)의 24시간 전인 06-04 04:00은 있지만, 구멍 자체는 그리드에 없으므로
-    # 그 행 자체가 결과에 없음 -> 대신 "24시간 뒤에 구멍이 있는 행"인 06-04 00:00~05:00 각각에 대해,
-    # 그로부터 24시간 뒤(06-05 00:00~05:00, 즉 구멍) 행이 없으므로 그 시각을 24h-lag로 참조하는 행(06-06 00:00~05:00)의
-    # lag_24h가 null이어야 한다.
-    for h in pd.date_range("2025-06-06 00:00", "2025-06-06 05:00", freq="h"):
-        assert pd.isna(out.loc[h, "return_lag_24h"]), f"{h}: 구멍(24시간 전 결측)인데 lag_24h가 채워짐 -> row-count 기반 버그 의심"
-
-    # roll_mean_3h: 구멍 바로 다음 행(06:00)의 "직전 3시간"은 05:00(없음, 구멍),04:00(없음, 구멍),03:00(없음, 구멍)
-    # 이므로 표본이 0개 -> NaN이어야 한다(먼 시점 값이 섞여 들어오면 안 됨).
-    assert pd.isna(out.loc[row_after_gap, "return_roll_mean_3h"]), "구멍 직후 roll_mean_3h가 채워짐 -> 먼 시점 값이 섞여 들어온 것으로 의심"
-
-    # 07:00의 "직전 3시간"은 06:00(있음, 방금 계산한 행) 하나뿐 -> 그 값만으로 평균 나야 함
+    # 07:00의 1시간 전(06:00)은 그리드에 있으므로 정상적으로 그 값이 나와야 한다.
     row_2h_after_gap = pd.Timestamp("2025-06-05 07:00")
-    expected_single_sample_mean = float(series.get(row_after_gap))
-    assert out.loc[row_2h_after_gap, "return_roll_mean_3h"] == pytest.approx(expected_single_sample_mean)
+    expected = float(series.get(row_after_gap))
+    assert out.loc[row_2h_after_gap, "return_lag_1h"] == pytest.approx(expected)

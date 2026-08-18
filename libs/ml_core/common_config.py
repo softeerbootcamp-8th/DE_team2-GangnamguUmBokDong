@@ -86,12 +86,19 @@ GRID_TICK_MINUTES = _int_env("GRID_TICK_MINUTES", _PROFILE["GRID_TICK_MINUTES"])
 # 범위와 inference의 기본 예측 구간 수가 이 값 하나를 같이 참조한다.
 HORIZON_COUNT = _int_env("HORIZON_COUNT", _PROFILE["HORIZON_COUNT"])
 
-# --- lag/rolling 피처 파라미터 ---
-LAG_HOURS = _PROFILE["LAG_HOURS"]  # t-1h, 전일 동시간, 전주 동요일 동시간
-ROLLING_WINDOWS = _PROFILE["ROLLING_WINDOWS"]  # rolling mean/std
-
-# --- 모델 입력 feature 스키마(lag/rolling 제외) — feature_engine이 만들고, training이
+# --- 모델 입력 feature 스키마(lag 제외) — feature_engine이 만들고, training이
 # 학습에 쓰고, inference가 동일 순서로 맞춰야 하는 "모델 계약"의 일부라 공유한다.
+#
+# 피처 중요도 분석 결과 gain이 낮거나(wind/humidity/pop 세부분류) 다른 피처와
+# 중복 정보였던(month, is_weekend/is_next_day_off/is_prev_day_off, hour/dow의
+# sin·cos 순환 인코딩) 컬럼을 정리하고 핵심만 남겼다:
+# - `is_holiday` 하나가 주말+공휴일을 전부 흡수(과거의 is_weekend/is_next_day_off/
+#   is_prev_day_off를 대체) — 다음날/전날 조회가 없어져 연도 경계 처리도 단순해짐.
+# - `hour`/`dow`를 sin/cos로 순환 인코딩하지 않고 원값 그대로 둔다 — 순환
+#   인코딩은 "휴일 여부가 날마다 완전히 다른 패턴을 만든다"는 걸 모델에 감춘다.
+# - `month`/`date` 대신 `day`(2000-01-01 기준 경과일수, ml_core.day_index)를 쓴다
+#   — month 순환 인코딩과 달리 연도 경계(작년 12월과 올해 1월이 가깝고, 같은 해
+#   1월과 12월은 멀다)를 올바르게 표현한다.
 BASE_FEATURE_COLUMNS = [
     "station_id",
     "capacity",
@@ -99,23 +106,11 @@ BASE_FEATURE_COLUMNS = [
     "lon",
     "temp",
     "precip",
-    "wind",
-    "humidity",
-    "pop_resd",
-    "pop_long_foreign",
-    "pop_short_foreign",
     "pop_total",
     "hour",
     "dow",
-    "month",
     "is_holiday",
-    "is_weekend",
-    "is_next_day_off",  # 다음날이 휴일(공휴일 또는 주말)인지 — "내일 쉬는 날이라 오늘 저녁 대여가 늘 것" 같은 패턴
-    "is_prev_day_off",  # 전날이 휴일(공휴일 또는 주말)이었는지 — 연휴 다음날 패턴 반영
-    "hour_sin",
-    "hour_cos",
-    "dow_sin",
-    "dow_cos",
+    "day",
     "horizon",
 ]
 

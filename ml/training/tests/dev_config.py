@@ -1,36 +1,32 @@
-"""training.config._default_window()의 "오늘 - 안전마진" 슬라이딩 구간 계산을 검증한다."""
+"""training.config.safety_cutoff_date()와 day-of-month split 상수를 검증한다."""
 
 from datetime import date, timedelta
 
 from training.config import (
-    TEST_DAYS,
-    TRAIN_DAYS,
+    TEST_DAYS_OF_MONTH,
+    TRAIN_YEAR,
     TRAINING_SAFETY_MARGIN_DAYS,
-    VALID_DAYS,
-    _default_window,
+    VALID_DAYS_OF_MONTH,
+    safety_cutoff_date,
 )
 
-_ONE_DAY = timedelta(days=1)
 
-
-def test_test_end_is_exactly_safety_margin_before_as_of():
+def test_safety_cutoff_is_exactly_margin_before_as_of():
     as_of = date(2026, 8, 17)
-    *_, test_end = _default_window(as_of)
-    assert test_end == (as_of - timedelta(days=TRAINING_SAFETY_MARGIN_DAYS)).isoformat()
+    assert safety_cutoff_date(as_of) == as_of - timedelta(days=TRAINING_SAFETY_MARGIN_DAYS)
 
 
-def test_windows_are_contiguous_and_non_overlapping():
-    train_start, train_end, valid_start, valid_end, test_start, test_end = _default_window(date(2026, 8, 17))
-    # 시간 순으로 하루씩 이어붙어야 한다(빈틈/겹침 없음).
-    assert date.fromisoformat(train_end) + _ONE_DAY == date.fromisoformat(valid_start)
-    assert date.fromisoformat(valid_end) + _ONE_DAY == date.fromisoformat(test_start)
-    assert date.fromisoformat(train_start) <= date.fromisoformat(train_end)
-    assert date.fromisoformat(valid_start) <= date.fromisoformat(valid_end)
-    assert date.fromisoformat(test_start) <= date.fromisoformat(test_end)
+def test_safety_cutoff_defaults_to_today():
+    # as_of 미지정 시 today_kst() 기준으로 계산돼야 한다 — 정확한 값 대신 "오늘보다
+    # 마진만큼 과거"라는 관계만 확인한다(테스트 실행 시각에 의존하지 않기 위함).
+    from training.config import today_kst
+
+    assert safety_cutoff_date() == today_kst() - timedelta(days=TRAINING_SAFETY_MARGIN_DAYS)
 
 
-def test_window_sizes_match_configured_day_counts():
-    train_start, train_end, valid_start, valid_end, test_start, test_end = _default_window(date(2026, 8, 17))
-    assert (date.fromisoformat(train_end) - date.fromisoformat(train_start)).days + 1 == TRAIN_DAYS
-    assert (date.fromisoformat(valid_end) - date.fromisoformat(valid_start)).days + 1 == VALID_DAYS
-    assert (date.fromisoformat(test_end) - date.fromisoformat(test_start)).days + 1 == TEST_DAYS
+def test_valid_and_test_days_of_month_do_not_overlap():
+    assert not (VALID_DAYS_OF_MONTH & TEST_DAYS_OF_MONTH)
+
+
+def test_train_year_is_a_plausible_calendar_year():
+    assert 2000 <= TRAIN_YEAR <= 2100

@@ -23,15 +23,13 @@ def execute(query: str, params: Sequence[Any] | None = None) -> None:
 
 def fetch_all(query: str, params: Sequence[Any] | None = None) -> list[dict]:
     """쿼리를 실행하고 모든 결과를 dict 리스트로 반환한다."""
-    with get_connection() as conn:
-        with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute(query, params)
-            return cur.fetchall()
+    with get_connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(query, params)
+        return cur.fetchall()
 
 
 def fetch_one(query: str, params: Sequence[Any] | None = None) -> dict | None:
     """쿼리를 실행하고 단일 결과를 dict로 반환한다."""
-    with get_connection() as conn:
-        with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute(query, params)
-            return cur.fetchone()
+    with get_connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(query, params)
+        return cur.fetchone()
