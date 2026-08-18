@@ -1,37 +1,30 @@
-"""테이블별 실행 스펙(silver source_id, transform 함수, upsert 충돌/갱신 컬럼)을 모은다.
-
-main.py가 `--table`로 받은 이름을 이 레지스트리에서 찾아 실행한다.
-"""
+"""테이블별 S3 읽기, 변환 함수 및 DB Upsert 스펙 레지스트리를 정의한다."""
 
 from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 
 import pandas as pd
+import yaml
 
-import s3_reader
+import reader
 import transform
 
-SOURCE_BIKE_STATION_REALTIME = "bike_station_realtime"
-SOURCE_WEATHER_ULTRA_SHORT_LIVE = "weather_ultra_short_live"
-SOURCE_WEATHER_SHORT_TERM_FORECAST = "weather_short_term_forecast"
-SOURCE_CULTURAL_EVENT = "cultural_event"
-SOURCE_PERFORMANCE_EVENT = "performance_event"
-SOURCE_WEATHER_ULTRA_SHORT_FORECAST = "weather_ultra_short_forecast"
-# ml/inference가 predictions/dt=.../hh=.../inference_{HHMM}.parquet에 쓰는 결과물 —
-# collector가 정의한 source_id가 아니라 의도를 나타내는 sentinel일 뿐이며,
-# read_predictions()가 실제 읽기 경로를 담당한다(TABLE_SPECS["forecast_points"] 참고).
-SOURCE_ML_PREDICTIONS = "ml_predictions"
+_TABLES_YAML_PATH = Path(__file__).parent / "tables.yaml"
 
 
 def _read_silver_as_pandas(source_id: str, window_start: datetime) -> pd.DataFrame:
-    return s3_reader.read_silver(source_id, window_start).to_pandas()
+    """지정된 Silver 소스의 Parquet 데이터를 Pandas DataFrame으로 읽어온다."""
+    return reader.read_silver(source_id, window_start).to_pandas()
 
 
 @dataclass(frozen=True)
 class TableSpec:
+    """Gold 테이블별 S3 소스, 변환 함수, DB Upsert 충돌 및 갱신 컬럼 스펙."""
+
     source_id: str
     transform: Callable
     conflict_cols: list[str]
@@ -39,59 +32,32 @@ class TableSpec:
     reader: Callable[[datetime], pd.DataFrame] | None = None
 
     def read(self, window_start: datetime) -> pd.DataFrame:
+        """지정된 윈도우 시각의 S3 데이터를 읽어 Pandas DataFrame으로 반환한다."""
         if self.reader is not None:
             return self.reader(window_start)
         return _read_silver_as_pandas(self.source_id, window_start)
 
 
-TABLE_SPECS: dict[str, TableSpec] = {
-    "stations": TableSpec(
-        source_id=SOURCE_BIKE_STATION_REALTIME,
-        transform=transform.stations_from_silver,
-        conflict_cols=["sta_id"],
-        update_cols=["sta_nm", "gu", "sta_addr", "lat", "lon", "hold_cnt"],
-    ),
-    "station_stock": TableSpec(
-        source_id=SOURCE_BIKE_STATION_REALTIME,
-        transform=transform.station_stock_from_silver,
-        conflict_cols=["sta_id", "observed_at"],
-        update_cols=["parking_bike_tot_cnt"],
-    ),
-    "weather_current": TableSpec(
-        source_id=SOURCE_WEATHER_ULTRA_SHORT_LIVE,
-        transform=transform.weather_current_from_silver,
-        conflict_cols=["gu"],
-        update_cols=["observed_at", "temperature", "humidity", "wind_speed", "rainfall", "pty_type"],
-    ),
-    "weather_forecast": TableSpec(
-        source_id=SOURCE_WEATHER_SHORT_TERM_FORECAST,
-        transform=transform.weather_forecast_from_silver,
-        conflict_cols=["gu", "forecast_dttm"],
-        update_cols=["sky_cond", "pty_type", "temperature", "precip_prob", "precip_amount", "humidity", "wind_speed", "base_dttm"],
-    ),
-    "weather_forecast_ultra": TableSpec(
-        source_id=SOURCE_WEATHER_ULTRA_SHORT_FORECAST,
-        transform=transform.weather_forecast_ultra_from_silver,
-        conflict_cols=["gu", "forecast_dttm"],
-        update_cols=["sky_cond", "pty_type", "temperature", "precip_prob", "precip_amount", "humidity", "wind_speed", "base_dttm"],
-    ),
-    "cultural_events": TableSpec(
-        source_id=SOURCE_CULTURAL_EVENT,
-        transform=transform.cultural_events_from_silver,
-        conflict_cols=["event_id"],
-        update_cols=["title", "category", "gu", "place", "start_date", "end_date", "is_free", "lat", "lon"],
-    ),
-    "cultural_events_performance": TableSpec(
-        source_id=SOURCE_PERFORMANCE_EVENT,
-        transform=transform.performance_events_from_silver,
-        conflict_cols=["event_id"],
-        update_cols=["title", "category", "gu", "place", "start_date", "end_date", "is_free", "lat", "lon"],
-    ),
-    "forecast_points": TableSpec(
-        source_id=SOURCE_ML_PREDICTIONS,
-        transform=transform.forecast_points_from_predictions,
-        conflict_cols=["sta_id", "predicted_dttm"],
-        update_cols=["predicted_rent_cnt", "predicted_return_cnt", "batch_run_at"],
-        reader=lambda window_start: s3_reader.read_predictions(window_start).to_pandas(),
-    ),
-}
+def _load_table_specs() -> dict[str, TableSpec]:
+    """tables.yaml을 읽어 TableSpec 레지스트리 딕셔너리를 생성한다."""
+    raw_specs = yaml.safe_load(_TABLES_YAML_PATH.read_text(encoding="utf-8"))
+    specs: dict[str, TableSpec] = {}
+
+    for table_name, raw in raw_specs.items():
+        transform_fn = getattr(transform, raw["transform"])
+
+        reader_fn = None
+        if raw.get("reader") == "read_predictions":
+            reader_fn = lambda ws: reader.read_predictions(ws).to_pandas()
+
+        specs[table_name] = TableSpec(
+            source_id=raw["source_id"],
+            transform=transform_fn,
+            conflict_cols=raw["conflict_cols"],
+            update_cols=raw["update_cols"],
+            reader=reader_fn,
+        )
+    return specs
+
+
+TABLE_SPECS: dict[str, TableSpec] = _load_table_specs()

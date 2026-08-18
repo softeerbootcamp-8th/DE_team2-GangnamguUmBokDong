@@ -1,10 +1,4 @@
-"""seoul-pop-normalizer CLI 진입점.
-
-    cd seoul-pop-normalizer
-    uv run python main.py --window-start 2026-08-15T14:05:00+09:00 [--baseline-date-mode latest]
-
-exit 0 = 성공, non-zero = 실패(Airflow retry 대상).
-"""
+"""서울 생활인구 격자 베이스라인과 실시간 POI 인구를 공간 정규화하는 CLI 진입점."""
 
 from __future__ import annotations
 
@@ -12,6 +6,7 @@ import argparse
 import sys
 from datetime import date, datetime
 
+# pyrefly: ignore [missing-import]
 import pyarrow as pa
 
 import grid
@@ -25,11 +20,10 @@ DEFAULT_BASELINE_MODE = "strict"
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """CLI 인자를 파싱한다.
 
-    Args:
-        argv: 파싱할 인자 목록. 생략하면 `sys.argv`를 그대로 쓴다.
-
-    Returns:
-        `window_start`, `baseline_date_mode` 필드를 담은 네임스페이스.
+    args:
+        argv: 파싱할 인자 목록 (생략 시 sys.argv 사용)
+    returns:
+        window_start 및 baseline_date_mode가 포함된 Namespace
     """
     parser = argparse.ArgumentParser(prog="main.py")
     parser.add_argument("--window-start", required=True, help="ISO8601, KST 오프셋(+09:00) 포함")
@@ -43,10 +37,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def _resolve_baseline_date(window_start: datetime, mode: str) -> date:
-    """baseline 날짜를 결정한다.
+    """모드에 따라 사용할 격자 인구 베이스라인 날짜를 결정한다.
 
-    strict: window_start의 날짜. 해당 파티션이 없으면 예외(spec 3.7 — 조용한 폴백 금지).
-    latest: S3에 존재하는 가장 최신 dt= 파티션(Airflow fallback 태스크 전용).
+    args:
+        window_start: 수집 기준 시각
+        mode: 베이스라인 선택 모드 ('strict'는 당일, 'latest'는 최신 파티션)
+    returns:
+        결정된 베이스라인 날짜
+    raises:
+        storage.PartitionNotFoundError: strict 모드에서 해당 일자 파티션이 없을 때
     """
     if mode == "strict":
         baseline_date = window_start.date()
@@ -59,11 +58,13 @@ def _resolve_baseline_date(window_start: datetime, mode: str) -> date:
 
 
 def _filter_grid_rows_for_hour(grid_table: pa.Table, hour: int) -> dict[str, merge.GridCell]:
-    """TT가 window_start.hour와 같은 행만 남기고, CELL_ID 중복은 마지막 값으로 정리한다.
+    """해당 시간대(TT)의 격자 데이터만 필터링하여 GridCell 맵으로 변환한다.
 
-    실측 버그(plan.md): living_population_grid는 CELL_ID당 하루 24행(TT별)을 가지므로
-    이 필터링을 빠뜨리면 결과가 24배 가까이 부풀려진다. null SPOP·연령대(마스킹 `*`가
-    collector에서 이미 null로 정규화된 것)는 0.0으로 취급한다(spec 3.5).
+    args:
+        grid_table: 24시간 생활인구 격자 테이블
+        hour: 대상 시각 (0~23)
+    returns:
+        CELL_ID를 키로 하는 GridCell 딕셔너리
     """
     hour_str = f"{hour:02d}"
     cells: dict[str, merge.GridCell] = {}
@@ -84,11 +85,13 @@ def _filter_grid_rows_for_hour(grid_table: pa.Table, hour: int) -> dict[str, mer
 def _build_poi_snapshots(
     poi_areas: tuple[poi.PoiArea, ...], realtime_table: pa.Table
 ) -> list[merge.PoiSnapshot]:
-    """POI 폴리곤과 해당 window의 실시간 인구 행을 AREA_CD로 조인한다.
+    """POI 지오메트리와 실시간 인구 관측치를 결합하여 PoiSnapshot 목록을 생성한다.
 
-    shapefile에는 있지만 이번 window의 population_realtime 응답에 없는 AREA_CD는
-    이번 window에 영향이 없는 것으로 보고 건너뛴다(이 계획의 설계 가정 — spec에
-    명시되지 않은 부분).
+    args:
+        poi_areas: POI 영역 지오메트리 목록
+        realtime_table: 실시간 POI 인구 수집 테이블
+    returns:
+        결합된 PoiSnapshot 목록
     """
     realtime_by_code = {row["AREA_CD"]: row for row in realtime_table.to_pylist()}
     snapshots: list[merge.PoiSnapshot] = []
@@ -117,7 +120,14 @@ _OUTPUT_SCHEMA = pa.schema(
 
 
 def run(window_start: datetime, baseline_date_mode: str) -> int:
-    """무상태 정규화 실행 1회. 항상 서울 전체 격자를 출력한다(spec 3.6)."""
+    """격자 베이스라인과 실시간 POI 인구를 합성하여 정규화된 Silver 테이블을 생성한다.
+
+    args:
+        window_start: 수집 기준 시각
+        baseline_date_mode: 베이스라인 날짜 선택 모드 ('strict' 또는 'latest')
+    returns:
+        종료 코드 (성공 시 0)
+    """
     baseline_date = _resolve_baseline_date(window_start, baseline_date_mode)
 
     grid_table = storage.read_grid_silver(baseline_date)
@@ -151,6 +161,7 @@ def run(window_start: datetime, baseline_date_mode: str) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """CLI 진입점으로 인자를 파싱하고 정규화 파이프라인을 실행한다."""
     args = parse_args(argv)
     window_start = datetime.fromisoformat(args.window_start)
     try:

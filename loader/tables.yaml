@@ -1,0 +1,110 @@
+stations:
+  source_id: bike_station_realtime
+  transform: stations_from_silver
+  conflict_cols:
+    - sta_id
+  update_cols:
+    - sta_nm
+    - gu
+    - sta_addr
+    - lat
+    - lon
+    - hold_cnt
+
+station_stock:
+  source_id: bike_station_realtime
+  transform: station_stock_from_silver
+  conflict_cols:
+    - sta_id
+    - observed_at
+  update_cols:
+    - parking_bike_tot_cnt
+
+weather_current:
+  source_id: weather_ultra_short_live
+  transform: weather_current_from_silver
+  conflict_cols:
+    - gu
+  update_cols:
+    - observed_at
+    - temperature
+    - humidity
+    - wind_speed
+    - rainfall
+    - pty_type
+
+weather_forecast:
+  source_id: weather_short_term_forecast
+  transform: weather_forecast_from_silver
+  conflict_cols:
+    - gu
+    - forecast_dttm
+  update_cols:
+    - sky_cond
+    - pty_type
+    - temperature
+    - precip_prob
+    - precip_amount
+    - humidity
+    - wind_speed
+    - base_dttm
+
+weather_forecast_ultra:
+  source_id: weather_ultra_short_forecast
+  transform: weather_forecast_ultra_from_silver
+  conflict_cols:
+    - gu
+    - forecast_dttm
+  update_cols:
+    - sky_cond
+    - pty_type
+    - temperature
+    - precip_prob
+    - precip_amount
+    - humidity
+    - wind_speed
+    - base_dttm
+
+cultural_events:
+  source_id: cultural_event
+  transform: cultural_events_from_silver
+  conflict_cols:
+    - event_id
+  update_cols:
+    - title
+    - category
+    - gu
+    - place
+    - start_date
+    - end_date
+    - is_free
+    - lat
+    - lon
+
+cultural_events_performance:
+  source_id: performance_event
+  transform: performance_events_from_silver
+  conflict_cols:
+    - event_id
+  update_cols:
+    - title
+    - category
+    - gu
+    - place
+    - start_date
+    - end_date
+    - is_free
+    - lat
+    - lon
+
+forecast_points:
+  source_id: ml_predictions
+  transform: forecast_points_from_predictions
+  conflict_cols:
+    - sta_id
+    - predicted_dttm
+  update_cols:
+    - predicted_rent_cnt
+    - predicted_return_cnt
+    - batch_run_at
+  reader: read_predictions
