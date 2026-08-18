@@ -15,9 +15,16 @@ case "${1:-api-server}" in
     init)
         uv run airflow db migrate
         # 5개 모듈은 Airflow와 별개의 uv 프로젝트다 — BashOperator가 처음 스케줄될 때
-        # 콜드 네트워크 sync로 타임아웃을 먹지 않도록 컨테이너 기동 시 한 번 예열해둔다.
+        # 콜드 네트워크 sync로 타임아웃을 먹지 않도록 컨테이너 기동 시 한 번 예열한다.
+        # 다만 예열은 최적화일 뿐 Airflow DB 초기화의 성공 조건은 아니다. 일시적인
+        # 패키지 다운로드 실패 하나가 전체 Compose 기동을 막지 않게 경고만 남긴다.
+        # 실제 task는 각 모듈에서 `uv run --frozen`을 다시 실행하므로 lock 불일치나
+        # 지속적인 다운로드 문제는 해당 task에서 명시적으로 실패한다.
         for proj in collector normalizer nowcaster ml/inference loader; do
-            (cd "/workspace/$proj" && uv sync --frozen)
+            echo "[airflow-init] prewarming $proj"
+            if ! (cd "/workspace/$proj" && uv sync --frozen); then
+                echo "[airflow-init] WARNING: failed to prewarm $proj; task-time uv run will retry" >&2
+            fi
         done
         ;;
     api-server)
