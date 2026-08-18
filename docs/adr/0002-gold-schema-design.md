@@ -51,3 +51,18 @@ station_stock을 `(sta_id, observed_at)`을 기본키로 하는 이력 테이블
 
 ## 결과
 `/alerts`가 매 요청마다 전체 대여소를 스캔하며 재계산하던 부하가 없어지고, 배치가 이미 계산해둔 값을 조회만 한다. 대신 두 테이블 간(station_stock/forecast_points ↔ station_urgency) 동기화 시점 차이가 생긴다 — station_urgency는 항상 "가장 최근 배치 시점" 기준 값이라 실시간 재고와 완벽히 일치하지 않을 수 있지만, 5분 배치 주기 안에서는 오차가 무시할 만하다고 본다.
+
+---
+
+# 재배치 라우트(rebalance_routes/rebalance_route_stops) 테이블 추가, station_urgency에 bike_qty 보강
+
+## 배경
+station_urgency로 "어디가 급한지"는 알아도 "트럭이 몇 대를 옮길지"는 없었다. urgency_score 계산 내부에는 이미 초과/부족 대수(`_max_overshoot`/`_max_deficit`/`_max_unmet_demand`)가 있었지만 결과에 노출되지 않아, 이 값을 `bike_qty`라는 이름으로 뽑아 `station_urgency`에 컬럼을 추가했다. 아직 이 스키마로 실 데이터가 쌓이지 않아(003_station_urgency.sh가 develop에 머지되기 전) 새 마이그레이션 파일 대신 003 자체를 고쳤다 — 위 "Alembic 없이 CREATE TABLE IF NOT EXISTS를 직접 고친다"는 첫 결정 그대로다.
+
+라우트 자체는 지금까지의 "파생값은 테이블로 안 둔다" 원칙과 다르다 — urgency_score와 달리 라우트는 계산 결과가 아니라 **운영자가 조작하는 상태를 가진 리소스**(proposed → dispatched → completed)라서, 원본이 되어야 한다.
+
+## 결정
+`rebalance_routes`(route_id PK, region, status, proposed_at/dispatched_at/completed_at)와 `rebalance_route_stops`(route_id+visit_order PK, sta_id, action, bike_cnt) 두 테이블을 추가한다(004_rebalance_routes.sh). `rebalance/routes.py`가 매 사이클 `proposed` 라우트를 새로 만들어 loader가 insert하고, 상태 전이(dispatched/completed)는 운영자가 대시보드에서 조작(#110)하므로 두 테이블 다 `update_cols=[]`(DO NOTHING)로 적재한다 — 배치 재실행이 운영자가 바꿔놓은 status를 덮어쓰면 안 되기 때문이다.
+
+## 결과
+`rebalance_routes`/`rebalance_route_stops`는 station_stock/forecast_points/station_urgency와 달리 배치가 "덮어쓰는" 게 아니라 "계속 쌓이면서 상태만 바뀌는" 테이블이라, 지금까지의 두 패턴(이력 누적, 최신 1건 upsert)과는 다른 세 번째 패턴이다. 오래된 완료/취소 라우트를 언제까지 남겨둘지(보존 기간)는 아직 정하지 않았다 — 트래픽이 쌓이면 그때 정리 정책을 추가한다.
