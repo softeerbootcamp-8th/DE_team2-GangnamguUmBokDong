@@ -370,11 +370,24 @@ function StationMarkers({
     map.setView([station.lat, station.lon], Math.max(map.getZoom(), COUNT_LABEL_MIN_ZOOM));
   }, [selectedStationId, map]);
 
-  // 주변 행사 탭에서 행사를 고르면 그 위치로 지도를 옮겨서 보여준다.
+  // 주변 행사 탭에서 행사를 고르면 지도를 옮겨서 보여주는데, 행사 위치로만
+  // setView하면 원(적용 면적)의 중심인 대여소가 화면 밖으로 빠질 수 있다 —
+  // 검색 반경 원 전체(대여소 중심 ± radiusKm)가 한 화면에 들어오게 fitBounds로
+  // 옮겨서, 초록 점(행사)이 항상 그 원 안에 있는 걸 눈으로 확인할 수 있게 한다.
   useEffect(() => {
-    if (!focusedEvent) return;
-    map.setView([focusedEvent.lat, focusedEvent.lon], Math.max(map.getZoom(), COUNT_LABEL_MIN_ZOOM));
-  }, [focusedEvent, map]);
+    if (!focusedEvent || selectedStationId === null) return;
+    const station = stationsRef.current.find((s) => s.sta_id === selectedStationId);
+    if (!station) return;
+    const latDelta = focusedEvent.radiusKm / 111;
+    const lonDelta = focusedEvent.radiusKm / (111 * Math.cos((station.lat * Math.PI) / 180));
+    map.fitBounds(
+      L.latLngBounds(
+        [station.lat - latDelta, station.lon - lonDelta],
+        [station.lat + latDelta, station.lon + lonDelta],
+      ),
+      { padding: [24, 24] },
+    );
+  }, [focusedEvent, selectedStationId, map]);
 
   const selectedStation = useMemo(
     () => stations.find((s) => s.sta_id === selectedStationId) ?? null,
