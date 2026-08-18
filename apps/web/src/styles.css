@@ -269,6 +269,15 @@ body {
   padding-bottom: 4px;
 }
 
+/* AlertList의 .alert-tabs는 스크롤되는 목록 위에 붙어있는 헤더라 sticky·
+   아래쪽 여백이 필요하지만, 지도 패널 헤더처럼 한 줄짜리 툴바에 나란히 놓일
+   땐 그 여백 때문에 옆의 select/버튼과 세로 중심이 안 맞는다. */
+.alert-tabs--inline {
+  position: static;
+  padding-bottom: 0;
+  background: transparent;
+}
+
 .alert-tab {
   padding: 4px 10px;
   border-radius: 999px;
@@ -289,7 +298,7 @@ body {
 }
 
 .region-select {
-  padding: 2px 8px;
+  padding: 4px 10px;
   border-radius: 999px;
   border: 1px solid var(--border);
   background: var(--surface-1);

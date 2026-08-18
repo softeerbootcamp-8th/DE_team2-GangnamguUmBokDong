@@ -101,9 +101,9 @@ function haversineKm(a: { lat: number; lon: number }, b: { lat: number; lon: num
 // 필터링 없이 기존 동작(모든 대여소 표시) 그대로 둔다.
 function applyMapFilter(
   stations: StationSummary[],
-  alertsByStation: Map<number, Alert>,
+  alertsByStation: Map<string, Alert>,
   mode: MapFilterMode,
-  selectedStationId: number | null,
+  selectedStationId: string | null,
 ): StationSummary[] {
   if (mode === "all") return stations;
 
@@ -255,6 +255,7 @@ interface Props {
   alerts: Alert[];
   selectedStationId: string | null;
   onSelect: (stationId: string) => void;
+  mapFilterMode: MapFilterMode;
   regionCenters: DispatchCenter[];
   selectedRegion: string;
 }
