@@ -51,6 +51,7 @@ class DateResult:
     status: str
     rows: int | None = None
     dropped: int | None = None
+    out_of_range: int = 0
     archive_key: str | None = None
     silver_present: bool = False
     error: str | None = None
@@ -124,11 +125,23 @@ def load_date(
     schema = archive_schema(scfg)
     tables: list[pa.Table] = []
     dropped = 0
+    out_of_range = 0
     column_issues: dict[str, dict[str, int]] = {}
 
     try:
         for window, group in sorted(group_by_window(rows, bcfg).items()):
             started = datetime.fromisoformat(window)
+            if started.date() != day:
+                # API 경로는 경계 시각에 다른 날짜의 관측을 섞어 줄 수 있다(`bikeListHist`
+                # 실측). silver 키가 `day`로 고정되는 불변식을 이 시점에 지키지 않으면
+                # 하류 compaction이 조용히 다른 날짜 데이터를 섞게 된다.
+                out_of_range += len(group)
+                logger.warning(
+                    f"stage=bootstrap source={scfg.source_id} date={day} "
+                    f"out_of_range_date={started.date()} rows={len(group)} "
+                    "대상 날짜가 아니라 버림"
+                )
+                continue
             ctx = RunContext(
                 source_id=scfg.source_id,
                 window_start=started,
@@ -151,10 +164,16 @@ def load_date(
             tables.append(conform(table, schema))
     except Exception as exc:  # noqa: BLE001 — 어느 예외든 이 날짜만 실패로 격리한다
         logger.error(f"stage=bootstrap status=failed source={scfg.source_id} date={day} reason={exc}")
-        return DateResult(day=day, status="failed", error=str(exc), silver_present=silver_present)
+        return DateResult(
+            day=day, status="failed", error=str(exc),
+            out_of_range=out_of_range, silver_present=silver_present,
+        )
 
     if not tables:
-        return DateResult(day=day, status="empty", rows=0, dropped=dropped, silver_present=silver_present)
+        return DateResult(
+            day=day, status="empty", rows=0, dropped=dropped,
+            out_of_range=out_of_range, silver_present=silver_present,
+        )
 
     table = pa.concat_tables(tables)
     if bcfg.dedup:
@@ -167,15 +186,16 @@ def load_date(
         "source_kind": SOURCE_KIND_BOOTSTRAP,
         "rows": table.num_rows,
         "dropped": dropped,
+        "out_of_range": out_of_range,
         "column_issues": column_issues,
         "silver_present": silver_present,
         "loaded_at": datetime.now(tz=_KST).isoformat(),
     })
     logger.info(
         f"stage=bootstrap status=loaded source={scfg.source_id} date={day} "
-        f"rows={table.num_rows} dropped={dropped} key={archive_key}"
+        f"rows={table.num_rows} dropped={dropped} out_of_range={out_of_range} key={archive_key}"
     )
     return DateResult(
         day=day, status="loaded", rows=table.num_rows, dropped=dropped,
-        archive_key=archive_key, silver_present=silver_present,
+        out_of_range=out_of_range, archive_key=archive_key, silver_present=silver_present,
     )

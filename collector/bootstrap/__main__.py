@@ -140,10 +140,12 @@ def main(argv: list[str] | None = None) -> int:
     summary = " ".join(f"{status}={count}" for status, count in sorted(tally.items()))
     overlapped = sum(1 for r in results if r.silver_present)
     dropped_total = sum(r.dropped or 0 for r in results)
+    out_of_range_total = sum(r.out_of_range for r in results)
     abort_note = " aborted=true" if aborted else ""
+    out_of_range_note = f" out_of_range={out_of_range_total}" if out_of_range_total else ""
     print(
         f"source={args.source} dates={len(days)} {summary} "
-        f"silver_overlap={overlapped} dropped={dropped_total}{abort_note}"
+        f"silver_overlap={overlapped} dropped={dropped_total}{out_of_range_note}{abort_note}"
     )
 
     return exit_code_for(results)

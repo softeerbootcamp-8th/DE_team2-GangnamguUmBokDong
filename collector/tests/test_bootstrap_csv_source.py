@@ -184,6 +184,47 @@ class TestFilenameRangeFilter:
         assert result[date(2026, 6, 1)].num_rows == 1
 
 
+class TestMissingHeaderAcrossVintages:
+    """vintage마다 컬럼 수가 다르다 — 매핑에 있는 헤더가 CSV에 없어도 죽지 않아야 한다."""
+
+    def _cfg_with_bike_se_cd(self, **overrides):
+        fields = {
+            "kind": "csv",
+            "encoding": "cp949",
+            "column_map": {
+                "자전거번호": "BIKE_ID", "대여일시": "RENT_DT",
+                "이용자종류": "USR_CLS_CD", "성별": "SEX_CD",
+                "자전거구분": "BIKE_SE_CD",
+            },
+            "value_map": {
+                "USR_CLS_CD": {"내국인": "USR_001", "외국인": "USR_002", "비회원": "USR_003"},
+                "SEX_CD": {"m": "M", "f": "F"},
+            },
+            "window": {"from_column": "RENT_DT", "format": "%Y-%m-%d %H:%M:%S"},
+        }
+        fields.update(overrides)
+        return BootstrapConfig.model_validate(fields)
+
+    def test_reads_both_17_and_16_column_files_in_same_directory(self, tmp_path):
+        (tmp_path / "wide.csv").write_text(
+            "자전거번호,대여일시,이용자종류,성별,자전거구분\n"
+            "SPB-WIDE,2026-06-01 00:10:00,내국인,M,일반자전거\n",
+            encoding="cp949",
+        )
+        (tmp_path / "narrow.csv").write_text(
+            "자전거번호,대여일시,이용자종류,성별\n"
+            "SPB-NARROW,2026-06-01 00:20:00,내국인,M\n",
+            encoding="cp949",
+        )
+
+        result = read_by_date(self._cfg_with_bike_se_cd(), tmp_path, {date(2026, 6, 1)})
+
+        rows = {row["BIKE_ID"]: row for row in result[date(2026, 6, 1)].to_pylist()}
+        assert set(rows) == {"SPB-WIDE", "SPB-NARROW"}
+        assert rows["SPB-WIDE"]["BIKE_SE_CD"] == "일반자전거"
+        assert rows["SPB-NARROW"]["BIKE_SE_CD"] == ""
+
+
 class TestArrowReturnType:
     def test_returns_pyarrow_table_with_string_columns(self, tmp_path):
         d = _write(tmp_path, "SPB-1,2026-06-01 00:10:00,내국인,M\n")

@@ -23,7 +23,8 @@ class TestLoad:
 
         assert cfg.column_map["자전거번호"] == "BIKE_ID"
         assert cfg.column_map["대여대여소ID"] == "RENT_STATION_ID"
-        assert len(cfg.column_map) == 16
+        assert cfg.column_map["자전거구분"] == "BIKE_SE_CD"
+        assert len(cfg.column_map) == 17
 
     def test_rental_value_map_is_the_verified_mapping(self):
         """빈도로 추정하면 USR_002/USR_003이 뒤집힌다. 조인으로 확정한 값이다."""

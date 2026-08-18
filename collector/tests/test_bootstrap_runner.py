@@ -150,6 +150,44 @@ class TestLoadDate:
         assert result.status == "empty"
         assert read_parquet("archive/t_source/dt=2026-06-01.parquet", as_pandas=False) is None
 
+    def test_out_of_range_window_is_dropped_and_counted(self):
+        """API가 경계 시각에 다른 날짜의 관측을 섞어 줄 수 있다 — target day가 아닌
+        시간대 그룹은 archive에 넣지 않고 out_of_range로 집계한다."""
+        rows = _rows("2026-06-01 09:05:00") + [
+            {"BIKE_ID": "SPB-OOR", "RENT_DT": "2026-05-31 23:30:00"},
+        ]
+
+        result = load_date(_source_config(), _bootstrap_config(), DAY, rows)
+
+        assert result.status == "loaded"
+        assert result.rows == 1
+        assert result.out_of_range == 1
+        table = read_parquet("archive/t_source/dt=2026-06-01.parquet", as_pandas=False)
+        assert table.column("BIKE_ID").to_pylist() == ["SPB-0"]
+
+    def test_out_of_range_count_is_recorded_in_manifest(self):
+        rows = _rows("2026-06-01 09:05:00") + [
+            {"BIKE_ID": "SPB-OOR", "RENT_DT": "2026-05-31 23:30:00"},
+        ]
+
+        load_date(_source_config(), _bootstrap_config(), DAY, rows)
+
+        manifest = read_archive_manifest("t_source", DAY)
+        assert manifest["out_of_range"] == 1
+
+    def test_all_rows_out_of_range_is_empty(self):
+        rows = [{"BIKE_ID": "SPB-OOR", "RENT_DT": "2026-05-31 23:30:00"}]
+
+        result = load_date(_source_config(), _bootstrap_config(), DAY, rows)
+
+        assert result.status == "empty"
+        assert result.out_of_range == 1
+
+    def test_no_out_of_range_rows_records_zero(self):
+        result = load_date(_source_config(), _bootstrap_config(), DAY, _rows("2026-06-01 09:05:00"))
+
+        assert result.out_of_range == 0
+
     def test_all_rows_dropped_by_validation_is_empty_not_skipped(self):
         """행은 있었으나 검증에서 전량 폐기된 경우도 '처리할 게 없었다'는 empty다.
 

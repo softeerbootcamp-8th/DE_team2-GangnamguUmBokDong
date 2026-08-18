@@ -24,6 +24,10 @@ column_map:
   이용자종류: USR_CLS_CD
   대여대여소ID: RENT_STATION_ID
   반납대여소ID: RETURN_STATION_ID
+  # vintage에 따라 이 컬럼이 없을 수 있다(2501: 17컬럼에 존재, 2606: 16컬럼에 없음).
+  # 없는 파일에서는 read_by_date가 빈 문자열로 채우고 검증 엔진이 결측으로 처리한다.
+  # 값 자체는 API의 BIKE_SE_CD(일반자전거/새싹자전거)와 동일해 value_map이 필요 없다.
+  자전거구분: BIKE_SE_CD
 
 # API 수집분은 코드를, CSV는 한글을 쓴다. archive를 한 체계로 통일한다.
 # 이 대응은 같은 날 API 1,000건과 CSV를 (자전거번호, 대여일시)로 조인해 확정했다.
