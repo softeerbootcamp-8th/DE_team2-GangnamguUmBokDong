@@ -42,10 +42,13 @@ P10/P50/P90)를 반환한다. 생활인구(`population`)는 있으면 넣고, �
 있을 때보다는 정확도가 낮다. 반환값의 `lag_fallback_used`/`lag_data_freshness`로
 이번 예측이 실시간 데이터를 얼마나 썼는지 확인할 수 있다.
 
-**인구 데이터도 같은 방식으로 대비된다**: `population`을 안 주면
-`population_hourly_profile.parquet`(격자×시간×요일별 2025년 평균,
-`build_population_profile.py`로 생성)에서 그 정류소가 속한 격자의 평소
-인구로 대체한다. 인구 프로필은 **month을 키에 넣지 않는다** — 실측 기준
+**인구 데이터도 같은 방식으로 대비된다**: `population`을 안 주면 먼저
+`living_population_normalized`(`normalizer`가 실시간 도시데이터로 보정한
+생활인구, `_get_recent_population()` 참고 — 학습/평가는 원본
+`living_population_grid`를 그대로 쓴다)에서 실시간 조회를 시도하고, 그마저
+없으면 `population_hourly_profile.parquet`(격자×시간×요일별 2025년 평균,
+`build_population_profile.py`로 생성, **원본 기준**)에서 그 정류소가 속한
+격자의 평소 인구로 대체한다. 인구 프로필은 **month을 키에 넣지 않는다** — 실측 기준
 생활인구는 월별로는 거의 안 변하고(최대/최소 1.05배) 시간대별로만 크게
 변해서(1.42배, 출퇴근 패턴), station 프로필처럼 월을 나누면 표본만 줄고
 얻는 게 적다. 대체 여부는 반환값의 `population_source`(`"provided"` 또는
@@ -595,34 +598,37 @@ def _get_recent_bike_status(anchor_ts: pd.Timestamp, lookback_hours: float = 1.0
     return pd.DataFrame(columns=["bike_count", "capacity", "stockout_flag"])
 
 
-def _get_recent_population(target_ts: pd.Timestamp, lookback_days: int = 7) -> pd.DataFrame:
-    """target_ts와 같은 시각대(hour-of-day)의 가장 최근 Silver 생활인구 스냅샷을 읽는다(격자별).
+def _get_recent_population(target_ts: pd.Timestamp, lookback_hours: float = 1.0) -> pd.DataFrame:
+    """target_ts 시각(또는 그 근처)의 `living_population_normalized`(정규화된 생활인구) 스냅샷을 읽는다(격자별).
 
-    `living_population_grid`는 다른 실시간 소스와 달리 **하루에 파일 1개**만
-    쌓인다 — 그 파일 안에 `YMD`(날짜)+`TT`(시각, "00"~"23")로 24시간 데이터가 전부
-    들어있고, collector job이 실제로 몇 시·몇 분에 그 파일을 쓰는지(파일명의
-    hh=/HHMM)는 알 수 없다. 그래서 시간별 키를 추측하는 대신 그 날짜의 dt=.../
-    prefix를 LIST해서 존재하는 파일을 찾는다.
+    **원본이 아니라 정규화된 소스를 쓴다**: `living_population_grid`(원본, 하루
+    1개 파일에 공표 지연까지 있어 "지금 이 순간"을 못 담음)를 그대로 서빙에 쓰면
+    실시간 추론 시점과 동떨어진 인구값이 들어간다. `normalizer`(舊
+    seoul-pop-normalizer)가 원본 생활인구 추정치를 그 시각의 실시간 도시데이터
+    (`population_realtime`, POI 121개 지점)로 보정해 5분마다 `living_population_normalized`에
+    쌓아두므로, 서빙엔 이 보정된 값을 쓴다(`docs/normalizer/implementation_plan.md`).
+    **학습/평가는 이 함수와 무관하게 여전히 원본을 그대로 쓴다** —
+    `feature_engine/spark/silver_source.py`의 `read_population()`은 안 바뀌었다.
+    정답 라벨(피처마트)은 사후 보정 없는 실측 그대로여야 학습-서빙 간 값의 의미가
+    갈리지 않는다.
 
-    실제 예시 데이터로 확인한 중요한 특성: 파일의 **수집일(경로의 dt=)과 내용의
-    YMD가 다르다** — 2026-08-15에 수집된 파일인데 내용은 `YMD=20260811`(4일 전)
-    데이터였다. 생활인구 원천 자체가 공표 지연이 있어 "가장 최근 수집분"이 며칠
-    전 데이터를 담고 있는 게 정상이라는 뜻이다. 그래서 target_ts의 날짜와 파일
-    내용의 YMD를 맞추려 하지 않고, **가장 최근 dt= 파티션 하나를 찾아 그 안에서
-    TT(시각)만 맞춰** 쓴다 — "정확히 그 날짜"가 아니라 "구할 수 있는 가장 최근
-    스냅샷의 같은 시간대 패턴"이라는 뜻이다(자세한 내용은
-    `docs/collector/ml-integration-requests.md`).
+    `weather_ultra_short_live`/`bike_station_realtime`과 같은 5분 tick 소스라
+    `_get_recent_weather()`/`_get_recent_bike_status()`와 동일한 패턴을 쓴다 —
+    target_ts를 5분 단위로 내림한 키가 있으면 그걸, 없으면(정규화 지연 등)
+    거슬러 올라가 가장 최근 값을 대신 쓴다. 원본과 달리 시각이 이미 S3 키
+    경로(dt=/hh=/HHMM)에 있어 파일 내용에 YMD/TT 컬럼이 없다 — 그래서 원본처럼
+    "그 안에서 TT만 맞춰 거르는" 과정이 필요 없다.
 
-    실제 예시 데이터에는 나이대x성별 인구(`M00`~`M70`/`F00`~`F70`)만 있고 우리가
-    쓰는 `pop_resd`/`pop_long_foreign`/`pop_short_foreign` 구분 자체가 없다 —
-    세부 breakdown은 만들 수 없어 `SPOP`(총 생활인구)을 `pop_total`로 쓰고,
-    `pop_resd`는 `pop_total`과 같다고 근사(전부 내국인으로 간주)한 뒤
-    `pop_long_foreign`/`pop_short_foreign`은 0으로 둔다 — 모델이 쓰는 4개 컬럼
-    자리는 채우되, 실제 국적별 구성은 반영하지 못하는 한계가 있다.
+    실제 예시 데이터 기준으로 나이대x성별 인구(`M00`~`M70`/`F00`~`F70`)만 있고
+    우리가 쓰는 `pop_resd`/`pop_long_foreign`/`pop_short_foreign` 구분 자체가
+    없다(정규화된 소스도 원본과 물리 스키마가 같아 이 한계는 그대로 남는다) —
+    `SPOP`(총 생활인구, normalizer가 보정한 값)을 `pop_total`로 쓰고, `pop_resd`는
+    `pop_total`과 같다고 근사(전부 내국인으로 간주)한 뒤 `pop_long_foreign`/
+    `pop_short_foreign`은 0으로 둔다.
 
     args:
-        target_ts: 조회하려는 시각(시각대만 사용, 날짜는 "가장 최근 수집분" 탐색에만 씀)
-        lookback_days: 오늘치 파티션이 없으면 며칠 전까지 대신 찾아볼지
+        target_ts: 조회하려는 시각(horizon에 따라 미래일 수 있음)
+        lookback_hours: target_ts 키가 없을 때 몇 시간 전까지 대신 찾아볼지
     returns:
         pd.DataFrame: grid_id로 인덱싱된 pop_resd/pop_long_foreign/pop_short_foreign/pop_total
             (lookback 안에 데이터가 전혀 없으면 빈 DataFrame — 호출부가
@@ -636,26 +642,16 @@ def _get_recent_population(target_ts: pd.Timestamp, lookback_days: int = 7) -> p
     if target_ts in _recent_population_by_ts:
         return _recent_population_by_ts[target_ts]
 
-    target_hour = f"{target_ts.hour:02d}"
+    keys = silver_schema.population_normalized_tick_keys(target_ts, lookback_hours)
     result = pd.DataFrame(columns=["pop_resd", "pop_long_foreign", "pop_short_foreign", "pop_total"])
-    for day_offset in range(lookback_days + 1):
-        day = target_ts - pd.Timedelta(days=day_offset)
-        keys = s3_io.list_keys(silver_schema.population_daily_prefix(day))
-        if not keys:
-            continue
-        df = s3_io.read_parquet(max(keys))
-        if df is None or df.empty:
-            continue
-        df = df.rename(columns=silver_schema.POPULATION_COLUMN_MAP)
-        rows = df[df["TT"] == target_hour]
-        if rows.empty:
-            continue
-        rows = rows.copy()
-        rows["pop_resd"] = rows["pop_total"]
-        rows["pop_long_foreign"] = 0.0
-        rows["pop_short_foreign"] = 0.0
-        result = rows.set_index("grid_id")[["pop_resd", "pop_long_foreign", "pop_short_foreign", "pop_total"]]
-        break
+    for df in reversed(s3_io.read_parquet_many(keys)):  # target_ts에 가장 가까운 것부터
+        if df is not None and not df.empty:
+            df = df.rename(columns=silver_schema.POPULATION_COLUMN_MAP).copy()
+            df["pop_resd"] = df["pop_total"]
+            df["pop_long_foreign"] = 0.0
+            df["pop_short_foreign"] = 0.0
+            result = df.set_index("grid_id")[["pop_resd", "pop_long_foreign", "pop_short_foreign", "pop_total"]]
+            break
 
     _recent_population_by_ts[target_ts] = result
     return result

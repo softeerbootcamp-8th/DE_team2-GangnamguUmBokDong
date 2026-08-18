@@ -90,10 +90,18 @@ BIKE_REALTIME_SOURCE_ID = "bike_station_realtime"
 RENTAL_SOURCE_ID = "bike_rental_history"
 WEATHER_SOURCE_ID = "weather_ultra_short_live"
 POPULATION_SOURCE_ID = "living_population_grid"
+# `normalizer`(舊 seoul-pop-normalizer)가 5분마다 만드는, 실시간 도시데이터(population_realtime)로
+# 보정한 생활인구 — 물리 스키마는 POPULATION_SOURCE_ID와 동일(CELL_ID/SPOP/H_DNG_CD/
+# 나이대x성별)하지만 YMD/TT 컬럼이 없다(시각이 이미 S3 키 경로에 있음 — silver_key()와
+# 동일한 dt=/hh=/HHMM 규칙). 서빙(inference)의 실시간 인구 조회 전용 — 학습/평가는
+# 여전히 POPULATION_SOURCE_ID(원본)를 그대로 쓴다(feature_engine/spark/silver_source.py
+# 참고, 정답 라벨은 사후 보정 없는 실측 그대로여야 하므로).
+POPULATION_NORMALIZED_SOURCE_ID = "living_population_normalized"
 
 BIKE_REALTIME_TICK_MINUTES = 5
 RENTAL_TICK_MINUTES = 5
 WEATHER_TICK_MINUTES = 10
+POPULATION_NORMALIZED_TICK_MINUTES = 5
 
 
 def silver_key(source_id: str, window_start: pd.Timestamp) -> str:
@@ -132,6 +140,11 @@ def rental_tick_keys(anchor_ts: pd.Timestamp, lookback_hours: float) -> list[str
 def weather_tick_keys(anchor_ts: pd.Timestamp, lookback_hours: float = 3.0) -> list[str]:
     """`weather_ultra_short_live`의 10분 tick 키 목록(오래된 것부터 최신 순)."""
     return _tick_keys(WEATHER_SOURCE_ID, anchor_ts, lookback_hours, WEATHER_TICK_MINUTES)
+
+
+def population_normalized_tick_keys(anchor_ts: pd.Timestamp, lookback_hours: float = 1.0) -> list[str]:
+    """`living_population_normalized`의 5분 tick 키 목록(오래된 것부터 최신 순)."""
+    return _tick_keys(POPULATION_NORMALIZED_SOURCE_ID, anchor_ts, lookback_hours, POPULATION_NORMALIZED_TICK_MINUTES)
 
 
 def population_daily_prefix(day: pd.Timestamp) -> str:
