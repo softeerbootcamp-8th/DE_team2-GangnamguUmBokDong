@@ -91,18 +91,22 @@ def weather_current_from_silver(df: pd.DataFrame) -> list[dict]:
     returns:
         weather_current 테이블 적재용 자치구별 최신 실황 레코드 목록
     """
-    by_gu: dict[str, dict] = {}
+    by_grid: dict[tuple[int, int], dict] = {}
     for row in df.to_dict("records"):
-        gu = grid_to_gu(row["nx"], row["ny"])
+        nx, ny = int(row["nx"]), int(row["ny"])
+        gu = grid_to_gu(nx, ny)
         if gu is None:
             continue
         observed_at = _kst_to_utc(str(row["baseDate"]), str(row["baseTime"]))
 
-        # 최신 데이터 보장: 이미 담긴 구의 데이터보다 과거 시간이면 무시한다
-        existing = by_gu.get(gu)
+        # 최신 데이터 보장: 이미 담긴 격자의 데이터보다 과거 시간이면 무시한다
+        key = (nx, ny)
+        existing = by_grid.get(key)
         if existing is not None and existing["observed_at"] >= observed_at:
             continue
-        by_gu[gu] = {
+        by_grid[key] = {
+            "nx": nx,
+            "ny": ny,
             "gu": gu,
             "observed_at": observed_at,
             "temperature": _to_float(row.get("T1H")),  # T1H: 기온(°C)
@@ -111,7 +115,7 @@ def weather_current_from_silver(df: pd.DataFrame) -> list[dict]:
             "rainfall": _to_float(row.get("RN1")),     # RN1: 1시간 강수량(mm)
             "pty_type": _to_int(row.get("PTY")),       # PTY: 강수형태 코드
         }
-    return list(by_gu.values())
+    return list(by_grid.values())
 
 
 def weather_forecast_from_silver(df: pd.DataFrame) -> list[dict]:
@@ -122,18 +126,21 @@ def weather_forecast_from_silver(df: pd.DataFrame) -> list[dict]:
     returns:
         weather_forecast 테이블 적재용 예보 레코드 목록
     """
-    by_key: dict[tuple[str, datetime], dict] = {}
+    by_key: dict[tuple[int, int, datetime], dict] = {}
     for row in df.to_dict("records"):
-        gu = grid_to_gu(row["nx"], row["ny"])
+        nx, ny = int(row["nx"]), int(row["ny"])
+        gu = grid_to_gu(nx, ny)
         if gu is None:
             continue
         forecast_dttm = _kst_to_utc(str(row["fcstDate"]), str(row["fcstTime"]))
         base_dttm = _kst_to_utc(str(row["baseDate"]), str(row["baseTime"]))
-        key = (gu, forecast_dttm)
+        key = (nx, ny, forecast_dttm)
         existing = by_key.get(key)
         if existing is not None and existing["base_dttm"] >= base_dttm:
             continue
         by_key[key] = {
+            "nx": nx,
+            "ny": ny,
             "gu": gu,
             "forecast_dttm": forecast_dttm,
             "sky_cond": _to_int(row.get("SKY")),       # SKY: 하늘상태 코드(1:맑음, 3:구름많음, 4:흐림)
@@ -179,18 +186,21 @@ def weather_forecast_ultra_from_silver(df: pd.DataFrame) -> list[dict]:
     returns:
         weather_forecast 테이블 적재용 초단기예보 레코드 목록
     """
-    by_key: dict[tuple[str, datetime], dict] = {}
+    by_key: dict[tuple[int, int, datetime], dict] = {}
     for row in df.to_dict("records"):
-        gu = grid_to_gu(row["nx"], row["ny"])
+        nx, ny = int(row["nx"]), int(row["ny"])
+        gu = grid_to_gu(nx, ny)
         if gu is None:
             continue
         forecast_dttm = _kst_to_utc(str(row["fcstDate"]), str(row["fcstTime"]))
         base_dttm = _kst_to_utc(str(row["baseDate"]), str(row["baseTime"]))
-        key = (gu, forecast_dttm)
+        key = (nx, ny, forecast_dttm)
         existing = by_key.get(key)
         if existing is not None and existing["base_dttm"] >= base_dttm:
             continue
         by_key[key] = {
+            "nx": nx,
+            "ny": ny,
             "gu": gu,
             "forecast_dttm": forecast_dttm,
             "sky_cond": _to_int(row.get("SKY")),       # SKY: 하늘상태 코드(1:맑음, 3:구름많음, 4:흐림)

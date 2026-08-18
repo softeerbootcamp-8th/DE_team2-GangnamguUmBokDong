@@ -86,6 +86,8 @@ def test_weather_current_from_silver_keeps_latest_per_gu():
 
     assert len(records) == 1
     assert records[0]["gu"] == "종로구"
+    assert records[0]["nx"] == 60
+    assert records[0]["ny"] == 127
     assert records[0]["temperature"] == 29.0
 
 
@@ -100,6 +102,8 @@ def test_weather_forecast_from_silver_keeps_latest_issued():
     records = weather_forecast_from_silver(df)
 
     assert len(records) == 1
+    assert records[0]["nx"] == 60
+    assert records[0]["ny"] == 127
     assert records[0]["temperature"] == 28.0
     assert records[0]["precip_prob"] == 30.0
 
@@ -114,6 +118,8 @@ def test_weather_forecast_ultra_from_silver_maps_pop_to_precip_prob():
     [record] = weather_forecast_ultra_from_silver(df)
 
     assert record["precip_prob"] == 40.0
+    assert record["nx"] == 60
+    assert record["ny"] == 127
 
 
 def test_cultural_events_from_silver_filters_ended_events():
