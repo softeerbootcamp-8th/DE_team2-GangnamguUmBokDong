@@ -1,23 +1,4 @@
-"""위경도·기상청 격자를 서울 자치구(gu) 이름으로 변환한다.
-
-`stations`의 stationName에는 구 이름이 없고, 기상 격자(nx, ny)도 구 정보를 직접
-주지 않는다. 여기서 위경도 -> gu는 서울시 행정구역 경계(assets/seoul_gu_boundary.geojson)
-기준 point-in-polygon으로 처리한다(정확한 좌표이므로 포함 여부 판정이 적절함).
-
-기상 격자(nx, ny) -> gu는 다르다. 격자 간격(5km)이 굵어서, point-in-polygon으로도
-"가장 가까운 구 중심점"으로도 완전히 풀리지 않는다: 면적이 작거나 폭이 좁은 구
-(중구·성동구·광진구·동작구 등)는 그 구 폴리곤 안에 격자 교차점이 아예 없을 뿐 아니라,
-주변 정수 격자 어디를 봐도 이웃한 더 큰 구의 중심점이 항상 더 가깝다 — 기하학적으로
-계산만으로는 이 구들을 영영 대표 격자에 배정할 수 없다.
-
-그래서 grid_to_gu는 기하 계산으로 실시간 판정하는 대신, `collector/sources/
-weather_*.yaml`이 요청하는 격자 목록과 1:1로 맞춘 **고정 매핑 테이블**
-(`_GRID_TO_GU_TABLE`, 25개 구 전부를 커버)을 1순위로 쓴다. 이 테이블은 각 구
-중심점에 가장 가까운 정수 격자를 그리디하게(이미 다른 구가 선점한 격자는 건너뛰고
-차순위로) 배정해 만들었으므로, 여기 실린 격자는 항상 의도한 그 구 하나로만
-매핑된다. 테이블에 없는 격자(collector 설정이 바뀌어 새로운 격자가 들어오는 경우
-등)에 한해서만 point-in-polygon -> 최근접 구 중심점 순으로 기하 계산에 fallback한다.
-"""
+"""위경도 좌표 및 기상청 격자(nx, ny)를 서울시 자치구(gu) 이름으로 매핑한다."""
 
 from __future__ import annotations
 
@@ -29,14 +10,10 @@ from shapely.geometry import Point, shape
 
 _BOUNDARY_PATH = Path(__file__).parent / "assets" / "seoul_gu_boundary.geojson"
 
-# 서울 시내 격자(5km 간격)가 인접 구로 잘못 배정되는 것은 막지 않되, 부산처럼 서울과
-# 무관한 좌표까지 "가장 가까운 구"로 우겨넣는 것은 막기 위한 거리 상한(degree).
-# 서울 시가지 반경(~15km)의 두 배 이상 여유를 둔 값이다.
+# 서울 시내 격자(5km 간격)가 인접 구로 잘못 배정되는 것은 막지 않되, 서울 밖 좌표 방지용 거리 상한(degree)
 _MAX_NEAREST_GU_DEGREES = 0.3
 
-# collector/sources/weather_ultra_short_live.yaml, weather_short_term_forecast.yaml의
-# grids 목록과 반드시 같은 25개 좌표를 유지해야 한다(각 구 중심점에 가장 가까운
-# 정수 격자를 그리디 배정한 결과 — loader/implementation-plan.md 참고).
+# collector/sources/weather_*.yaml의 25개 자치구 대표 격자 1:1 매핑 테이블
 _GRID_TO_GU_TABLE: dict[tuple[int, int], str] = {
     (61, 125): "강남구",
     (63, 126): "강동구",
@@ -70,6 +47,7 @@ _GU_CENTROIDS: list[tuple[str, float, float]] | None = None
 
 
 def _load_gu_polygons() -> list[tuple[str, object]]:
+    """서울시 자치구 경계 GeoJSON을 읽어 (구 이름, Polygon) 목록을 반환한다."""
     global _GU_POLYGONS
     if _GU_POLYGONS is None:
         data = json.loads(_BOUNDARY_PATH.read_text(encoding="utf-8"))
@@ -81,6 +59,7 @@ def _load_gu_polygons() -> list[tuple[str, object]]:
 
 
 def _load_gu_centroids() -> list[tuple[str, float, float]]:
+    """서울시 자치구별 중심점 좌표 (구 이름, lat, lon) 목록을 반환한다."""
     global _GU_CENTROIDS
     if _GU_CENTROIDS is None:
         _GU_CENTROIDS = [
@@ -90,7 +69,14 @@ def _load_gu_centroids() -> list[tuple[str, float, float]]:
 
 
 def latlon_to_gu(lat: float, lon: float) -> str | None:
-    """위경도(WGS84)가 속한 서울 자치구 이름을 반환한다. 서울 밖이면 None."""
+    """위경도(WGS84) 좌표가 속한 서울 자치구 이름을 반환한다 (서울 경계 밖이면 None).
+
+    args:
+        lat: 위도 (WGS84)
+        lon: 경도 (WGS84)
+    returns:
+        매핑된 서울 자치구 이름 또는 None
+    """
     point = Point(lon, lat)
     for gu_name, polygon in _load_gu_polygons():
         if polygon.contains(point):
@@ -99,19 +85,20 @@ def latlon_to_gu(lat: float, lon: float) -> str | None:
 
 
 def _nearest_gu(lat: float, lon: float) -> str | None:
-    """25개 구 중심점 중 (lat, lon)에 가장 가까운 구를 반환한다. 상한 밖이면 None."""
+    """25개 자치구 중심점 중 주어진 위경도에 가장 가까운 자치구 이름을 반환한다."""
     nearest_gu, nearest_dist = None, None
     for gu_name, gu_lat, gu_lon in _load_gu_centroids():
+        # 유클리드 거리 계산: sqrt(dx^2 + dy^2)
         dist = math.hypot(lat - gu_lat, lon - gu_lon)
         if nearest_dist is None or dist < nearest_dist:
             nearest_gu, nearest_dist = gu_name, dist
+    # (안전 장치) 계산된 최단 거리가 거리 상한 이내인 경우에만 해당 구 반환
     if nearest_dist is not None and nearest_dist <= _MAX_NEAREST_GU_DEGREES:
         return nearest_gu
     return None
 
 
-# 기상청 격자(nx, ny) <-> 위경도 변환 계수. 기상청이 공개한 Lambert Conformal Conic
-# 변환식(격자 간격 5km, 표준위도 30/60도, 기준점 (128E, 38N) -> (nx=43, ny=136))을 그대로 쓴다.
+# 기상청 5km 격자(nx, ny) <-> 위경도 변환을 위한 람베르트 등각원추투영 공식 계수
 _RE = 6371.00877  # 지구 반경(km)
 _GRID = 5.0  # 격자 간격(km)
 _SLAT1 = 30.0  # 투영 표준위도1(degree)
@@ -125,7 +112,14 @@ _DEGRAD = math.pi / 180.0
 
 
 def grid_to_latlon(nx: float, ny: float) -> tuple[float, float]:
-    """기상청 격자(nx, ny)를 (lat, lon)으로 변환한다."""
+    """기상청 격자 좌표(nx, ny)를 WGS84 위경도 좌표(lat, lon)로 변환한다.
+
+    args:
+        nx: 기상청 X 격자 좌표
+        ny: 기상청 Y 격자 좌표
+    returns:
+        (lat, lon) 위경도 좌표 튜플
+    """
     re = _RE / _GRID
     slat1 = _SLAT1 * _DEGRAD
     slat2 = _SLAT2 * _DEGRAD
@@ -153,15 +147,22 @@ def grid_to_latlon(nx: float, ny: float) -> tuple[float, float]:
 
 
 def grid_to_gu(nx: float, ny: float) -> str | None:
-    """기상청 격자(nx, ny)가 속한 서울 자치구 이름을 반환한다. 서울과 무관하면 None.
+    """기상청 격자 좌표(nx, ny)를 서울 자치구 이름으로 매핑한다.
 
-    `_GRID_TO_GU_TABLE`에 있는 격자는 그 값을 그대로 쓴다(25개 구 전부를 보장하는
-    고정 배정). 테이블에 없는 격자만 point-in-polygon -> 최근접 구 중심점 순으로
-    기하 계산에 fallback한다.
+    사전 정의된 25개 자치구 1:1 고정 매핑 테이블을 우선 조회하며,
+    미등록 격자는 Point-in-Polygon 및 최근접 중심점 순으로 계산합니다.
+
+    args:
+        nx: 기상청 X 격자 좌표
+        ny: 기상청 Y 격자 좌표
+    returns:
+        매핑된 서울 자치구 이름 또는 None
     """
     key = (int(nx), int(ny))
+    # (1순위) 미리 정의된 격자-자치구 매핑 테이블 조회
     if key in _GRID_TO_GU_TABLE:
         return _GRID_TO_GU_TABLE[key]
 
+    # (2순위 fallback) 테이블에 없는 격자는 위경도로 변환 후 geometry 기반 매핑
     lat, lon = grid_to_latlon(nx, ny)
     return latlon_to_gu(lat, lon) or _nearest_gu(lat, lon)
