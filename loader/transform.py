@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 
 from core.precip import parse_precip
-from gu_mapping import grid_to_gu, latlon_to_gu
+from gu_mapping import grid_to_gu, latlon_to_grid, latlon_to_gu
 
 _KST = timedelta(hours=9)
 
@@ -42,6 +42,7 @@ def stations_from_silver(df: pd.DataFrame) -> list[dict]:
         gu = latlon_to_gu(lat, lon)
         if gu is None:
             continue  # 서울 자치구 경계 밖(인접 도시 접경) 정거장은 제외
+        grid_nx, grid_ny = latlon_to_grid(lat, lon)
         records.append(
             {
                 "sta_id": str(row["stationId"]),
@@ -51,6 +52,8 @@ def stations_from_silver(df: pd.DataFrame) -> list[dict]:
                 "lat": lat,
                 "lon": lon,
                 "hold_cnt": int(row["rackTotCnt"]),
+                "grid_nx": grid_nx,
+                "grid_ny": grid_ny,
             }
         )
     return records

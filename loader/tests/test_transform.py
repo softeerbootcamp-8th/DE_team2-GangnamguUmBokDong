@@ -46,6 +46,15 @@ def test_stations_from_silver_skips_rows_outside_seoul_gu_boundary():
     assert [r["sta_id"] for r in records] == ["101"]
 
 
+def test_stations_from_silver_includes_nearest_grid():
+    df = pd.DataFrame([GANGNAM_STATION])
+
+    [record] = stations_from_silver(df)
+
+    assert record["grid_nx"] == 61
+    assert record["grid_ny"] == 126
+
+
 def test_station_stock_from_silver_uses_given_observed_at():
     df = pd.DataFrame([{**GANGNAM_STATION, "parkingBikeTotCnt": 15}])
     observed_at = datetime(2026, 8, 16, 0, 5, tzinfo=UTC)
