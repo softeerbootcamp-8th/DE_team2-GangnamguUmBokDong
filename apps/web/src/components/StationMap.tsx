@@ -376,8 +376,8 @@ function StationMarkers({
   }, [selectedStationId, focusedEvent, map]);
 
   // 주변 행사 탭에서 행사를 고르면 그 위치로 지도를 옮겨서 보여준다. 선택된
-  // 대여소는 이미 검은 테두리로 구분되므로, 여기서는 행사 자체의 영향 범위를
-  // 보여주는 게 목적이라 행사 위치를 기준으로 옮긴다.
+  // 대여소는 이미 검은 테두리로 구분되므로, 여기서는 행사 위치를 기준으로
+  // 옮겨서 대여소와 행사 사이의 거리를 눈으로 확인할 수 있게 한다.
   useEffect(() => {
     if (!focusedEvent) return;
     map.setView([focusedEvent.lat, focusedEvent.lon], Math.max(map.getZoom(), COUNT_LABEL_MIN_ZOOM));
@@ -407,9 +407,10 @@ function StationMarkers({
           interactive={false}
         />
       )}
-      {/* 주변 행사 탭에서 고른 행사의 위치(초록 점)와 그 행사의 영향 범위(원) —
-          적용 면적을 눈으로 확인할 수 있게. 대여소는 이미 검은 테두리로 구분돼
-          있어서 원은 행사 자체를 기준으로 그린다. */}
+      {/* 주변 행사 탭에서 고른 행사의 위치(초록 점)와, 이 행사를 찾을 때 쓴
+          대여소 기준 검색 반경(원, radius_km — 실측된 행사 고유의 영향
+          범위가 아니라 백엔드가 후보를 추릴 때 쓴 검색 반경이다). 대여소는
+          이미 검은 테두리로 구분돼 있어서 원은 행사 위치를 기준으로 그린다. */}
       {focusedEvent && (
         <Circle
           center={[focusedEvent.lat, focusedEvent.lon]}
