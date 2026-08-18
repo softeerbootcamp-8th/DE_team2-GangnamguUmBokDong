@@ -108,3 +108,15 @@ forecast_points:
     - predicted_return_cnt
     - batch_run_at
   reader: read_predictions
+
+station_urgency:
+  source_id: rebalance_urgency
+  transform: station_urgency_from_urgency_batch
+  conflict_cols:
+    - sta_id
+  update_cols:
+    - urgency_score
+    - minutes_until_critical
+    - action_type
+    - batch_run_at
+  reader: read_urgency

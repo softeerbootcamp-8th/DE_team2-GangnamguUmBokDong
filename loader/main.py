@@ -24,7 +24,7 @@ def run(table: str, window_start: datetime) -> None:
 
     if table == "station_stock":
         rows = spec.transform(silver, observed_at=window_start)
-    elif table == "forecast_points":
+    elif table in ("forecast_points", "station_urgency"):
         rows = spec.transform(silver, batch_run_at=window_start)
     else:
         rows = spec.transform(silver)

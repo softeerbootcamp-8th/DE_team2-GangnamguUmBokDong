@@ -5,7 +5,7 @@ import boto3
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from reader import read_predictions, read_silver
+from reader import read_predictions, read_silver, read_urgency
 from tests.conftest import TEST_BUCKET
 
 
@@ -37,5 +37,21 @@ def test_read_predictions_round_trips_parquet():
     )
 
     result = read_predictions(window_start)
+
+    assert result.to_pydict() == table.to_pydict()
+
+
+def test_read_urgency_round_trips_parquet():
+    table = pa.table({"sta_id": ["101"], "urgency_score": [48.7]})
+    buffer = io.BytesIO()
+    pq.write_table(table, buffer)
+
+    window_start = datetime(2026, 8, 16, 14, 5, tzinfo=UTC)
+    key = "urgency/dt=2026-08-16/hh=14/urgency_1405.parquet"
+    boto3.client("s3", region_name="us-east-1").put_object(
+        Bucket=TEST_BUCKET, Key=key, Body=buffer.getvalue()
+    )
+
+    result = read_urgency(window_start)
 
     assert result.to_pydict() == table.to_pydict()

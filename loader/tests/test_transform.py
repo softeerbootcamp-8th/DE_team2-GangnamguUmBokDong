@@ -8,6 +8,7 @@ from transform import (
     forecast_points_from_predictions,
     performance_events_from_silver,
     station_stock_from_silver,
+    station_urgency_from_urgency_batch,
     stations_from_silver,
     weather_current_from_silver,
     weather_forecast_from_silver,
@@ -235,3 +236,27 @@ def test_forecast_points_from_predictions_rounds_half_to_even():
 
     assert record["predicted_rent_cnt"] == round(2.5)
     assert record["predicted_return_cnt"] == round(1.5)
+
+
+def test_station_urgency_from_urgency_batch_maps_columns():
+    df = pd.DataFrame(
+        [
+            {
+                "sta_id": "101",
+                "urgency_score": 48.7,
+                "minutes_until_critical": 0,
+                "action_type": "supply_needed",
+            }
+        ]
+    )
+    batch_run_at = datetime(2026, 8, 16, 5, 5, tzinfo=UTC)
+
+    [record] = station_urgency_from_urgency_batch(df, batch_run_at=batch_run_at)
+
+    assert record == {
+        "sta_id": "101",
+        "urgency_score": 48.7,
+        "minutes_until_critical": 0,
+        "action_type": "supply_needed",
+        "batch_run_at": batch_run_at,
+    }
