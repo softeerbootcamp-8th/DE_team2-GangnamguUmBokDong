@@ -27,6 +27,7 @@ export function DetailPanel({ stationId, reasons, onFocusEvent }: Props) {
   const [tab, setTab] = useState<Tab>("info");
   const [detail, setDetail] = useState<StationDetail | null>(null);
   const [events, setEvents] = useState<CulturalEvent[] | null>(null);
+  const [eventsError, setEventsError] = useState(false);
   const [radiusKm, setRadiusKm] = useState<number | null>(null);
   const [focusedEventId, setFocusedEventId] = useState<string | null>(null);
 
@@ -67,12 +68,18 @@ export function DetailPanel({ stationId, reasons, onFocusEvent }: Props) {
     if (stationId === null || tab !== "events") return;
     let cancelled = false;
     setEvents(null);
-    api.events(stationId).then((data) => {
-      if (!cancelled) {
-        setEvents(data.events);
-        setRadiusKm(data.radius_km);
-      }
-    });
+    setEventsError(false);
+    api
+      .events(stationId)
+      .then((data) => {
+        if (!cancelled) {
+          setEvents(data.events);
+          setRadiusKm(data.radius_km);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setEventsError(true);
+      });
     return () => {
       cancelled = true;
     };
@@ -129,7 +136,9 @@ export function DetailPanel({ stationId, reasons, onFocusEvent }: Props) {
           </dl>
         )
       ) : tab === "events" ? (
-        events === null ? (
+        eventsError ? (
+          <p className="empty-state">주변 행사 정보를 불러오지 못했습니다.</p>
+        ) : events === null ? (
           <p className="empty-state">불러오는 중...</p>
         ) : events.length === 0 ? (
           <p className="empty-state">주변에 진행 중인 행사가 없습니다.</p>
