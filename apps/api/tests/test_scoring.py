@@ -4,11 +4,18 @@ PR #40 리뷰에서 지적된 대로(#55) 예측 구간 전체를 스캔하는 �
 대한 안전망. hold_cnt=0, 정원 초과, 예측 없음 등 경계값을 우선 다룬다.
 """
 
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 
-from scoring import _max_deficit, _max_overshoot, _max_unmet_demand, _severity, urgency_score
+from scoring import (
+    _max_deficit,
+    _max_overshoot,
+    _max_unmet_demand,
+    _severity,
+    _trend_time_to_critical,
+    urgency_score,
+)
 
-NOW = datetime(2024, 1, 1, 12, 0, 0)
+NOW = datetime(2024, 1, 1, 12, 0, 0, tzinfo=UTC)
 
 
 def _point(rent: int, ret: int, predicted_bikes: int, action_type: str) -> dict:
@@ -18,6 +25,14 @@ def _point(rent: int, ret: int, predicted_bikes: int, action_type: str) -> dict:
         "predicted_bikes": predicted_bikes,
         "action_type": action_type,
     }
+
+
+def _history(before: int, now_count: int) -> list[dict]:
+    """10분 전 재고(before)에서 지금(now_count)까지 두 시점짜리 재고 이력을 만든다."""
+    return [
+        {"observed_at": NOW - timedelta(minutes=10), "parking_bike_tot_cnt": before},
+        {"observed_at": NOW, "parking_bike_tot_cnt": now_count},
+    ]
 
 
 class TestSeverity:
@@ -96,6 +111,33 @@ class TestMaxUnmetDemand:
         assert _max_unmet_demand(current=2, hold_cnt=10, points=points) == 9
 
 
+class TestTrendTimeToCritical:
+    def test_fewer_than_two_history_points_returns_none(self):
+        assert _trend_time_to_critical(current=5, hold_cnt=10, stock_history=[], now=NOW) is None
+        single = [{"observed_at": NOW, "parking_bike_tot_cnt": 5}]
+        assert _trend_time_to_critical(current=5, hold_cnt=10, stock_history=single, now=NOW) is None
+
+    def test_declining_trend_detects_supply_needed(self):
+        # 10분 새 10 -> 5, 분당 -0.5. 지금 재고(5) 기준 0석까지 10분.
+        history = _history(before=10, now_count=5)
+        assert _trend_time_to_critical(current=5, hold_cnt=10, stock_history=history, now=NOW) == (10.0, "supply_needed")
+
+    def test_rising_trend_detects_retrieval_needed(self):
+        # 10분 새 5 -> 10, 분당 +0.5. 정원(10)까지 이미 도달해 0분.
+        history = _history(before=5, now_count=10)
+        assert _trend_time_to_critical(current=5, hold_cnt=10, stock_history=history, now=NOW) == (10.0, "retrieval_needed")
+
+    def test_flat_trend_returns_none(self):
+        history = _history(before=5, now_count=5)
+        assert _trend_time_to_critical(current=5, hold_cnt=10, stock_history=history, now=NOW) is None
+
+    def test_trend_slower_than_first_forecast_min_is_discarded(self):
+        # 분당 -0.1로 아주 완만해서 0석까지 500분 -> FIRST_FORECAST_MIN(60분) 이후라
+        # 예측모델이 그 구간을 담당하므로 추세 감지는 버려야 한다.
+        history = _history(before=51, now_count=50)
+        assert _trend_time_to_critical(current=50, hold_cnt=100, stock_history=history, now=NOW) is None
+
+
 class TestUrgencyScore:
     def test_current_at_or_below_threshold_is_immediate_supply_needed(self):
         # hold_cnt=10, SUPPLY_LOW_STOCK_RATIO=0.2 -> 임계값 2. current=1은 그 이하.
@@ -145,3 +187,21 @@ class TestUrgencyScore:
             current=2, hold_cnt=10, stock_history=[], points=points, now=NOW
         )
         assert (score, time_to_critical, action_type) == (48.7, 0, "supply_needed")
+
+    def test_trend_detected_sooner_than_forecast_wins_and_still_scores_severity(self):
+        # 재고 이력상 추세로는 10분 뒤 위험(_trend_time_to_critical), 예측으로는
+        # 180분 뒤 위험(_forecast_time_to_critical) -> 둘 다 candidates에 들어가고
+        # 더 이른 추세 쪽이 채택돼야 한다(#96 리뷰: stock_history=[]만 쓰면 이 경로가
+        # 전혀 실행되지 않는다는 지적). severity는 감지 경로와 무관하게 points로
+        # 계산되므로 forecast만 있던 기존 케이스(180분, score 5.0)보다
+        # slack이 줄어 score가 커진다.
+        history = _history(before=10, now_count=5)
+        points = [
+            _point(rent=1, ret=0, predicted_bikes=4, action_type="normal"),
+            _point(rent=1, ret=0, predicted_bikes=3, action_type="normal"),
+            _point(rent=8, ret=0, predicted_bikes=0, action_type="supply_needed"),
+        ]
+        score, time_to_critical, action_type = urgency_score(
+            current=5, hold_cnt=10, stock_history=history, points=points, now=NOW
+        )
+        assert (score, time_to_critical, action_type) == (28.3, 10, "supply_needed")
