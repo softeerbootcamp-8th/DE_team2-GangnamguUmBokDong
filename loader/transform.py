@@ -3,11 +3,19 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import logging
 from datetime import UTC, date, datetime, timedelta
+from functools import lru_cache
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pandas as pd
 from gu_mapping import grid_to_gu, latlon_to_gu
+
+logger = logging.getLogger(__name__)
+
+_STADIUM_COORDS_PATH = Path(__file__).parent / "assets" / "stadium_coords.json"
 
 _KST = timedelta(hours=9)
 
@@ -247,40 +255,63 @@ def performance_events_from_silver(df: pd.DataFrame, today: date | None = None) 
     """
     today = today or datetime.now(ZoneInfo("Asia/Seoul")).date()
     records = []
+    unmapped_codes: set[str] = set()
     for row in df.to_dict("records"):
         end_date = _parse_date(row.get("EDATE"))
         # 1. 이미 종료된 행사는 제외
         if end_date is not None and end_date < today:
             continue
-        title = row.get("TITLE", "")
-        place = row.get("SCH_CODE_B", "")
+        # 2. 제목이 없는 행은 건너뛴다 — 스키마 변경 이전 Silver 파티션을 백필로
+        #    다시 읽으면 컬럼명이 전부 달라 title이 비고, event_id가 sha256("")로
+        #    모든 행에서 같아져 한 행으로 뭉개진다.
+        title = row.get("TITLE") or ""
+        if not str(title).strip():
+            continue
+        # SCH_CODE_A/B는 숫자 코드라 화면에 그대로 쓸 수 없다. 사람이 읽는 이름은
+        # CODE_TITLE_A/B로 따로 오므로 표시용 필드에는 그쪽을 쓴다.
+        place = row.get("CODE_TITLE_B", "")
         schedule_id = row.get("SCH_SEQ")
 
-        # 2. 일정 순번이 있으면 사용하고, 없으면 제목+시설+시작일 해시로 event_id를 생성한다.
+        # 3. 일정 순번이 있으면 사용하고, 없으면 제목+시설+시작일 해시로 event_id를 생성한다.
         event_id = (
             str(schedule_id)
             if schedule_id
             else hashlib.sha256(f"{title}{place}{row.get('SDATE', '')}".encode()).hexdigest()
         )
 
-        # 3. 유/무료 여부 정규화
-        use_pay = str(row.get("USE_PAY") or "")
-        is_free = "무료" if "무료" in use_pay else "유료"
+        # 4. USE_PAY는 자유 텍스트(가격표·안내 URL·"없음" 등)라 유/무료로 정규화하지
+        #    않고 원문을 그대로 싣는다.
+        is_free = row.get("USE_PAY")
 
-        # 4. 원본 API가 좌표와 자치구를 제공하지 않으므로 해당 필드는 null로 둔다.
+        # 5. 원본 API가 좌표를 주지 않으므로 시설 코드로 좌표 마스터를 조회해 채운다.
+        #    마스터에 없는 코드(시설 신설 등)는 좌표 없이 적재하고 경고만 남긴다 —
+        #    행을 버리는 것보다 낫지만, 좌표가 없으면 반경 조회에는 잡히지 않는다.
+        stadium_code = str(row.get("SCH_CODE_B") or "")
+        coords = _stadium_coords().get(stadium_code)
+        if coords is None:
+            unmapped_codes.add(stadium_code)
+        lat, lon, gu = coords if coords else (None, None, None)
+
         records.append(
             {
                 "event_id": event_id,
                 "title": title,
-                "category": row.get("SCH_CODE_A"),
-                "gu": None,
+                "category": row.get("CODE_TITLE_A"),
+                "gu": gu,
                 "place": place,
                 "start_date": _parse_date(row.get("SDATE")),
                 "end_date": end_date,
                 "is_free": is_free,
-                "lat": None,
-                "lon": None,
+                "lat": lat,
+                "lon": lon,
             }
+        )
+
+    if unmapped_codes:
+        logger.warning(
+            "stadium_coords에 없는 시설 코드 %s — 해당 행사는 좌표 없이 적재되어 "
+            "주변 행사 조회에 잡히지 않는다. assets/stadium_coords.json에 추가가 필요하다.",
+            sorted(unmapped_codes),
         )
     return records
 
@@ -328,6 +359,21 @@ def _to_int(value) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+@lru_cache(maxsize=1)
+def _stadium_coords() -> dict[str, tuple[float, float, str | None]]:
+    """시설 코드(SCH_CODE_B) → (위도, 경도, 자치구) 조회 테이블을 반환한다.
+
+    자치구는 좌표에서 도출하므로(gu_mapping) 마스터 파일에는 좌표만 둔다 —
+    자치구 경계와 좌표가 따로 갱신되며 어긋나는 일을 막는다.
+    """
+    raw = json.loads(_STADIUM_COORDS_PATH.read_text(encoding="utf-8"))
+    return {
+        code: (entry["lat"], entry["lon"], latlon_to_gu(entry["lat"], entry["lon"]))
+        for code, entry in raw.items()
+        if not code.startswith("_")
+    }
 
 
 def _parse_date(value) -> date | None:

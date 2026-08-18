@@ -1,6 +1,7 @@
 from datetime import UTC, date, datetime
 
 import pandas as pd
+import pytest
 import transform
 from transform import (
     cultural_events_from_silver,
@@ -193,10 +194,12 @@ def test_performance_events_from_silver_maps_stadium_schedule_fields():
             {
                 "SCH_SEQ": "S002",
                 "TITLE": "잠실 야구 경기",
-                "SCH_CODE_A": "경기",
-                "SCH_CODE_B": "잠실야구장",
-                "SDATE": "2026-08-20",
-                "EDATE": "2026-08-21",
+                "SCH_CODE_A": "1",
+                "SCH_CODE_B": "8",
+                "CODE_TITLE_A": "스포츠경기",
+                "CODE_TITLE_B": "잠실야구장",
+                "SDATE": "20260820",
+                "EDATE": "20260821",
                 "USE_PAY": "입장료 무료",
             }
         ]
@@ -208,16 +211,107 @@ def test_performance_events_from_silver_maps_stadium_schedule_fields():
         {
             "event_id": "S002",
             "title": "잠실 야구 경기",
-            "category": "경기",
-            "gu": None,
+            "category": "스포츠경기",
+            "gu": "송파구",
             "place": "잠실야구장",
             "start_date": date(2026, 8, 20),
             "end_date": date(2026, 8, 21),
-            "is_free": "무료",
-            "lat": None,
-            "lon": None,
+            "is_free": "입장료 무료",
+            "lat": 37.512183,
+            "lon": 127.072680,
         }
     ]
+
+
+def test_performance_events_from_silver_skips_rows_without_title():
+    # backfill(max_age 7d)이 스키마 변경 이전 Silver 파티션을 다시 읽으면 컬럼이
+    # 전부 구 이름(SVCID/SVCNM/PLACENM)이라 title이 비고 event_id가 sha256("")로
+    # 모든 행에서 같아진다 — 빈 제목 한 행으로 뭉개져 upsert되는 것을 막는다.
+    df = pd.DataFrame(
+        [
+            {"SVCID": "OLD1", "SVCNM": "구 스키마 행사 1", "PLACENM": "여의도한강공원"},
+            {"SVCID": "OLD2", "SVCNM": "구 스키마 행사 2", "PLACENM": "잠실야구장"},
+        ]
+    )
+
+    records = performance_events_from_silver(df, today=date(2026, 8, 18))
+
+    assert records == []
+
+
+def test_performance_events_from_silver_uses_code_titles_not_codes():
+    # SCH_CODE_A/B는 숫자 코드("1", "8")이고 사람이 읽는 이름은 CODE_TITLE_A/B에
+    # 따로 온다. 코드를 그대로 실으면 화면에 카테고리 "1", 장소 "8"이 노출된다.
+    df = pd.DataFrame(
+        [
+            {
+                "SCH_SEQ": "S020",
+                "TITLE": "프로야구 (롯데:두산)",
+                "SCH_CODE_A": "1",
+                "SCH_CODE_B": "8",
+                "CODE_TITLE_A": "스포츠경기",
+                "CODE_TITLE_B": "잠실야구장",
+                "SDATE": "20260820",
+                "EDATE": "20260821",
+                "USE_PAY": "VIP석 60,000원",
+            }
+        ]
+    )
+
+    records = performance_events_from_silver(df, today=date(2026, 8, 18))
+
+    assert records[0]["category"] == "스포츠경기"
+    assert records[0]["place"] == "잠실야구장"
+
+
+def test_performance_events_from_silver_fills_coords_from_stadium_code():
+    # 원본 API는 좌표를 주지 않는다. 시설 코드(SCH_CODE_B)로 좌표 마스터를 조회해
+    # 채워야 apps/api의 위경도 반경 조회(fetch_nearby_events)에 걸린다.
+    df = pd.DataFrame(
+        [
+            {
+                "SCH_SEQ": "S010",
+                "TITLE": "프로야구 (롯데:두산)",
+                "SCH_CODE_A": "1",
+                "SCH_CODE_B": "8",  # 잠실야구장
+                "SDATE": "20260820",
+                "EDATE": "20260821",
+                "USE_PAY": "VIP석 60,000원",
+            }
+        ]
+    )
+
+    records = performance_events_from_silver(df, today=date(2026, 8, 18))
+
+    assert len(records) == 1
+    assert records[0]["lat"] == pytest.approx(37.512183)
+    assert records[0]["lon"] == pytest.approx(127.072680)
+    # gu는 좌표에서 도출한다(자치구 경계 폴리곤 재사용).
+    assert records[0]["gu"] == "송파구"
+
+
+def test_performance_events_from_silver_keeps_unmapped_stadium_without_coords():
+    # 시설이 신설되어 좌표 마스터에 없는 코드가 오면, 행은 살리고 좌표만 비운다.
+    df = pd.DataFrame(
+        [
+            {
+                "SCH_SEQ": "S011",
+                "TITLE": "신규 시설 행사",
+                "SCH_CODE_A": "1",
+                "SCH_CODE_B": "999",
+                "SDATE": "20260820",
+                "EDATE": "20260821",
+                "USE_PAY": "무료",
+            }
+        ]
+    )
+
+    records = performance_events_from_silver(df, today=date(2026, 8, 18))
+
+    assert len(records) == 1
+    assert records[0]["lat"] is None
+    assert records[0]["lon"] is None
+    assert records[0]["gu"] is None
 
 
 def test_forecast_points_from_predictions_maps_columns_and_converts_kst_to_utc():
