@@ -1,7 +1,11 @@
 """S3 read/write: 아카이브(4주 lookback), collector 실측 silver 읽기, nowcast 추정 파일 쓰기/삭제.
 
-collector/storage.py의 경로 컨벤션(`{layer}/{source_id}/dt=.../hh=.../HHMM.parquet`)을
-그대로 재사용하되, collector 코드를 import하지 않고 이 파일 안에서 다시 구현한다.
+archive 경로 규칙은 `core.layout`이 갖는다 — collector의 compaction도 같은 계층에
+쓰므로 한쪽만 바뀌면 조용히 어긋난다.
+
+silver 경로 컨벤션(`silver/{source_id}/dt=.../hh=.../HHMM.parquet`)은 아직 여기서 다시
+구현한다. collector·loader·ml_core에도 같은 규칙이 흩어져 있어, 옮기려면 네 모듈을
+동시에 건드려야 하므로 별도 작업으로 둔다.
 """
 
 from __future__ import annotations
@@ -10,6 +14,8 @@ from datetime import date
 
 import pyarrow as pa
 
+from core.layout import archive_key as _archive_key
+from core.layout import archive_prefix
 from core.s3 import (
     delete_object,
     list_keys,
@@ -28,10 +34,6 @@ def _grid_date_prefix(target_date: date) -> str:
 
 def _nowcast_key(target_date: date) -> str:
     return f"{_grid_date_prefix(target_date)}hh=00/{_NOWCAST_FILENAME}"
-
-
-def _archive_key(target_date: date) -> str:
-    return f"archive/{GRID_SOURCE_ID}/dt={target_date:%Y-%m-%d}.parquet"
 
 
 def read_real_grid_silver(target_date: date) -> pa.Table | None:
@@ -54,14 +56,14 @@ def read_real_grid_silver(target_date: date) -> pa.Table | None:
 
 def write_archive(target_date: date, table: pa.Table) -> str:
     """해당 날짜의 데이터를 아카이브 parquet으로 저장하고 저장된 key를 반환한다."""
-    key = _archive_key(target_date)
+    key = _archive_key(GRID_SOURCE_ID, target_date)
     write_parquet(table, key)
     return key
 
 
 def list_archive_dates() -> list[date]:
     """아카이브에 존재하는 날짜를 오름차순으로 나열한다."""
-    prefix = f"archive/{GRID_SOURCE_ID}/"
+    prefix = archive_prefix(GRID_SOURCE_ID)
     dates = []
     for key in list_keys(prefix):
         if not key.endswith(".parquet"):
@@ -74,7 +76,7 @@ def list_archive_dates() -> list[date]:
 
 def read_archive(target_date: date) -> pa.Table | None:
     """해당 날짜의 아카이브를 읽는다. 없으면 None(4주 lookback 중 결측으로 처리)."""
-    key = _archive_key(target_date)
+    key = _archive_key(GRID_SOURCE_ID, target_date)
     return read_parquet(key, as_pandas=False)
 
 

@@ -1,5 +1,6 @@
-"""4개 DAG 모듈이 문법/의존성 에러 없이 로드되는지 확인한다."""
+"""DAG 모듈이 문법/의존성 에러 없이 로드되는지 확인한다."""
 
+import dags.daily_compaction as daily_compaction_dag
 import dags.daily_population_and_events as daily_dag
 import dags.realtime_5min as realtime_5min_dag
 import dags.weather_3h as weather_3h_dag
@@ -20,3 +21,7 @@ def test_weather_3h_dag_id():
 
 def test_daily_population_and_events_dag_id():
     assert daily_dag.dag.dag_id == "daily_population_and_events"
+
+
+def test_daily_compaction_dag_id():
+    assert daily_compaction_dag.dag.dag_id == "daily_compaction"

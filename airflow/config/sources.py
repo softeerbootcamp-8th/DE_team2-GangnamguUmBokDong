@@ -13,5 +13,14 @@ DAILY_POPULATION_SOURCE = "living_population_grid"
 DAILY_EVENT_SOURCE = "cultural_event"
 PERFORMANCE_EVENT_SOURCE = "performance_event"
 
+# 하루치 silver를 archive로 묶을 대상. 예보 2종(weather_ultra_short_forecast,
+# weather_short_term_forecast)은 사후 재현이 불가해 archive 가치가 낮아 제외한다.
+# cultural_event·performance_event·living_population_grid는 하루 1파일이라 묶을 것이 없다.
+COMPACTION_SOURCES = (
+    "bike_rental_history",
+    "bike_station_realtime",
+    "weather_ultra_short_live",
+)
+
 NORMALIZER_BASELINE_MODE_PRIMARY = "strict"
 NORMALIZER_BASELINE_MODE_FALLBACK = "latest"

@@ -96,6 +96,19 @@ class Storage(BaseModel):
     partition: tuple[str, ...] = Field(min_length=1)
 
 
+class Compaction(BaseModel):
+    """하루치 silver를 archive로 묶을 때의 소스별 옵션."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    # 윈도우마다 같은 구간을 다시 받는 소스에서 켠다. path_suffix가 날짜 단위인데
+    # 주기가 그보다 짧으면 윈도우끼리 같은 기록을 중복 수집한다(bike_rental_history).
+    #
+    # 스냅샷 소스에는 켜면 안 된다 — 재고가 안 변하면 연속 윈도우가 같은 값을 내는
+    # 것이 정상인데, 그걸 지우면 시계열이 무너진다.
+    dedup: bool = False
+
+
 class Quality(BaseModel):
     """배치를 버릴지 판단하는 완결성 기준."""
 
@@ -167,6 +180,7 @@ class SourceConfig(BaseModel):
     quality: 품질 기준
     fetch: API 호출에 사용할 수 있는 최대 시간
     backfill: 백필
+    compaction: 하루치 압축 옵션
     policies: 컬럼 정책과 행 정책
     columns: 데이터 스키마(key=컬럼명, value=컬럼 스펙)
     config_version: 설정 버전
@@ -184,6 +198,7 @@ class SourceConfig(BaseModel):
     quality: Quality
     fetch: Fetch | None = None
     backfill: Backfill | None = None
+    compaction: Compaction | None = None
     policies: Policies
     columns: dict[str, ColumnSpec]
     config_version: str = ""

@@ -32,6 +32,12 @@ backfill:
   enabled: true
   max_age: 7d
 
+compaction:
+  # API가 시간 단위라 한 시간 안의 12개 윈도우가 같은 시간대를 누적으로 받아온다
+  # (5분 증분을 보려면 이 누적이 필요하다). 그대로 이어붙이면 같은 대여 기록이
+  # 최대 12번 들어가므로 archive를 만들 때 걷어낸다.
+  dedup: true
+
 policies:
   required_missing: drop_row
   required_outlier: drop_row
