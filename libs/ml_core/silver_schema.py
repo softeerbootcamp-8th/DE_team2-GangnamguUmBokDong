@@ -102,7 +102,9 @@ WEATHER_SOURCE_ID = "weather_ultra_short_live"
 WEATHER_ULTRA_FORECAST_SOURCE_ID = "weather_ultra_short_forecast"
 WEATHER_SHORT_FORECAST_SOURCE_ID = "weather_short_term_forecast"
 POPULATION_SOURCE_ID = "living_population_grid"
-NORMALIZED_POPULATION_SOURCE_ID = "living_population_normalized"
+# `normalizer`가 5분마다 만드는, population_realtime으로 보정한 생활인구.
+# inference의 실시간 인구 조회 전용이며 학습/평가는 POPULATION_SOURCE_ID를 사용한다.
+POPULATION_NORMALIZED_SOURCE_ID = "living_population_normalized"
 
 WEATHER_FORECAST_COLUMN_MAPS = {
     WEATHER_ULTRA_FORECAST_SOURCE_ID: {
@@ -121,11 +123,12 @@ WEATHER_FORECAST_COLUMN_MAPS = {
 
 BIKE_REALTIME_TICK_MINUTES = 5
 RENTAL_TICK_MINUTES = 5
-# weather_10min DAG은 10분 간격으로 쓰지만 realtime_5min/e2e DAG도 자신의
-# window_start로 동일한 소스를 수집한다. :05/:15 파일을 누락하지 않도록
-# 추론 조회는 5분 key 그리드를 사용한다.
+
+# #89 E2E에서는 realtime_5min에서도 weather Silver가 5분 window_start로 생길 수 있으므로
+# :05/:15 파일까지 조회 대상에 포함한다.
 WEATHER_TICK_MINUTES = 5
-NORMALIZED_POPULATION_TICK_MINUTES = 5
+
+POPULATION_NORMALIZED_TICK_MINUTES = 5
 
 
 def silver_key(source_id: str, window_start: pd.Timestamp) -> str:
@@ -166,20 +169,22 @@ def weather_tick_keys(anchor_ts: pd.Timestamp, lookback_hours: float = 3.0) -> l
     return _tick_keys(WEATHER_SOURCE_ID, anchor_ts, lookback_hours, WEATHER_TICK_MINUTES)
 
 
-def normalized_population_tick_keys(anchor_ts: pd.Timestamp, lookback_hours: float = 1.0) -> list[str]:
-    """`living_population_normalized`의 5분 tick 키 목록(오래된 것부터 최신 순)."""
-    return _tick_keys(
-        NORMALIZED_POPULATION_SOURCE_ID,
-        anchor_ts,
-        lookback_hours,
-        NORMALIZED_POPULATION_TICK_MINUTES,
-    )
-
-
 def source_prefix(source_id: str) -> str:
     """source_id 하나의 Silver 전체 파티션 prefix."""
     return f"silver/{source_id}/"
 
+
+def population_normalized_tick_keys(
+    anchor_ts: pd.Timestamp,
+    lookback_hours: float = 1.0,
+) -> list[str]:
+    """`living_population_normalized`의 5분 tick 키 목록(오래된 것부터 최신 순)."""
+    return _tick_keys(
+        POPULATION_NORMALIZED_SOURCE_ID,
+        anchor_ts,
+        lookback_hours,
+        POPULATION_NORMALIZED_TICK_MINUTES,
+    )
 
 def population_daily_prefix(day: pd.Timestamp) -> str:
     """`living_population_grid`는 하루 1개 파일(YMD/TT 컬럼으로 그날 24시간을 전부
@@ -192,7 +197,7 @@ def population_daily_prefix(day: pd.Timestamp) -> str:
 
 def normalized_population_daily_prefix(day: pd.Timestamp) -> str:
     """Normalizer가 5분마다 쓰는 보정 인구 Silver의 날짜 prefix를 반환한다."""
-    return f"silver/{NORMALIZED_POPULATION_SOURCE_ID}/dt={day:%Y-%m-%d}/"
+    return f"silver/{POPULATION_NORMALIZED_SOURCE_ID}/dt={day:%Y-%m-%d}/"
 
 
 def predictions_key(window_start: pd.Timestamp) -> str:

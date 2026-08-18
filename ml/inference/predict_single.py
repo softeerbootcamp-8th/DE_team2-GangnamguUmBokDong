@@ -42,10 +42,13 @@ P10/P50/P90)를 반환한다. 생활인구(`population`)는 있으면 넣고, �
 있을 때보다는 정확도가 낮다. 반환값의 `lag_fallback_used`/`lag_data_freshness`로
 이번 예측이 실시간 데이터를 얼마나 썼는지 확인할 수 있다.
 
-**인구 데이터도 같은 방식으로 대비된다**: `population`을 안 주면
-`population_hourly_profile.parquet`(격자×시간×요일별 2025년 평균,
-`build_population_profile.py`로 생성)에서 그 정류소가 속한 격자의 평소
-인구로 대체한다. 인구 프로필은 **month을 키에 넣지 않는다** — 실측 기준
+**인구 데이터도 같은 방식으로 대비된다**: `population`을 안 주면 먼저
+`living_population_normalized`(`normalizer`가 실시간 도시데이터로 보정한
+생활인구, `_get_recent_population()` 참고 — 학습/평가는 원본
+`living_population_grid`를 그대로 쓴다)에서 실시간 조회를 시도하고, 그마저
+없으면 `population_hourly_profile.parquet`(격자×시간×요일별 2025년 평균,
+`build_population_profile.py`로 생성, **원본 기준**)에서 그 정류소가 속한
+격자의 평소 인구로 대체한다. 인구 프로필은 **month을 키에 넣지 않는다** — 실측 기준
 생활인구는 월별로는 거의 안 변하고(최대/최소 1.05배) 시간대별로만 크게
 변해서(1.42배, 출퇴근 패턴), station 프로필처럼 월을 나누면 표본만 줄고
 얻는 게 적다. 대체 여부는 반환값의 `population_source`(`"provided"` 또는
@@ -54,6 +57,14 @@ P10/P50/P90)를 반환한다. 생활인구(`population`)는 있으면 넣고, �
 한계: 정류소/격자 자체가 2025년에 데이터가 없었거나(신규 정류소 등) 프로필도
 없는 경우엔 fallback도 NaN이 된다. LightGBM은 결측을 네이티브로 처리하므로
 예측은 나오지만 정확도는 더 떨어진다.
+
+**재고(stockout)도 값 자체는 "품절 아님"으로 조용히 대체하지만, 대체 여부는
+반드시 확인 가능해야 한다**: `stockout`을 안 주면 Silver `bike_station_realtime`
+실시간 조회를 시도하고, 그 station의 데이터 자체가 없으면 `False`(품절 아님)로
+기본값을 쓴다 — 이 기본값이 `rental_exposure`를 1.0(정상)으로 만들어 실제로는
+품절이었을 수도 있는 시간대의 대여 수요를 과대평가할 수 있다. population과 똑같이
+반환값의 `stockout_source`(`"provided"` 또는 `"fallback"`)로 그 여부를 확인할 것 —
+`_stockout_from_status()` 참고.
 """
 
 import gc
@@ -726,24 +737,36 @@ def _get_recent_bike_status(anchor_ts: pd.Timestamp, lookback_hours: float = 1.0
 
 
 def _get_recent_population(target_ts: pd.Timestamp, lookback_hours: float = 1.0) -> pd.DataFrame:
-    """target_ts 이전의 가장 최근 Normalizer Silver 인구 스냅샷을 읽는다(격자별).
+    """target_ts 시각(또는 그 근처)의 `living_population_normalized`(정규화된 생활인구) 스냅샷을 읽는다(격자별).
 
-    Normalizer는 `population_realtime`을 기준 격자에 반영한 결과를
-    `silver/living_population_normalized/dt=.../hh=.../HHMM.parquet`에 저장한다.
-    추론은 원본 `living_population_grid`로 우회하지 않고 이 보정 결과만
-    소비한다. 미래 horizon에는 동일한 시각의 파일이 아직 없으므로,
-    target_ts를 넘지 않는 가장 최근 스냅샷을 선택한다.
+    **원본이 아니라 정규화된 소스를 쓴다**: `living_population_grid`(원본, 하루
+    1개 파일에 공표 지연까지 있어 "지금 이 순간"을 못 담음)를 그대로 서빙에 쓰면
+    실시간 추론 시점과 동떨어진 인구값이 들어간다. `normalizer`(舊
+    seoul-pop-normalizer)가 원본 생활인구 추정치를 그 시각의 실시간 도시데이터
+    (`population_realtime`, POI 121개 지점)로 보정해 5분마다 `living_population_normalized`에
+    쌓아두므로, 서빙엔 이 보정된 값을 쓴다(`docs/normalizer/implementation_plan.md`).
+    **학습/평가는 이 함수와 무관하게 여전히 원본을 그대로 쓴다** —
+    `feature_engine/spark/silver_source.py`의 `read_population()`은 안 바뀌었다.
+    정답 라벨(피처마트)은 사후 보정 없는 실측 그대로여야 학습-서빙 간 값의 의미가
+    갈리지 않는다.
 
-    실제 예시 데이터에는 나이대x성별 인구(`M00`~`M70`/`F00`~`F70`)만 있고 우리가
-    쓰는 `pop_resd`/`pop_long_foreign`/`pop_short_foreign` 구분 자체가 없다 —
-    세부 breakdown은 만들 수 없어 `SPOP`(총 생활인구)을 `pop_total`로 쓰고,
-    `pop_resd`는 `pop_total`과 같다고 근사(전부 내국인으로 간주)한 뒤
-    `pop_long_foreign`/`pop_short_foreign`은 0으로 둔다 — 모델이 쓰는 4개 컬럼
-    자리는 채우되, 실제 국적별 구성은 반영하지 못하는 한계가 있다.
+    `weather_ultra_short_live`/`bike_station_realtime`과 같은 5분 tick 소스라
+    `_get_recent_weather()`/`_get_recent_bike_status()`와 동일한 패턴을 쓴다 —
+    target_ts를 5분 단위로 내림한 키가 있으면 그걸, 없으면(정규화 지연 등)
+    거슬러 올라가 가장 최근 값을 대신 쓴다. 원본과 달리 시각이 이미 S3 키
+    경로(dt=/hh=/HHMM)에 있어 파일 내용에 YMD/TT 컬럼이 없다 — 그래서 원본처럼
+    "그 안에서 TT만 맞춰 거르는" 과정이 필요 없다.
+
+    실제 예시 데이터 기준으로 나이대x성별 인구(`M00`~`M70`/`F00`~`F70`)만 있고
+    우리가 쓰는 `pop_resd`/`pop_long_foreign`/`pop_short_foreign` 구분 자체가
+    없다(정규화된 소스도 원본과 물리 스키마가 같아 이 한계는 그대로 남는다) —
+    `SPOP`(총 생활인구, normalizer가 보정한 값)을 `pop_total`로 쓰고, `pop_resd`는
+    `pop_total`과 같다고 근사(전부 내국인으로 간주)한 뒤 `pop_long_foreign`/
+    `pop_short_foreign`은 0으로 둔다.
 
     args:
-        target_ts: 조회 기준 시각(이 시각보다 나중에 생성된 스냅샷은 제외)
-        lookback_hours: target_ts tick이 없으면 몇 시간 전까지 대신 찾아볼지
+        target_ts: 조회하려는 시각(horizon에 따라 미래일 수 있음)
+        lookback_hours: target_ts 키가 없을 때 몇 시간 전까지 대신 찾아볼지
     returns:
         pd.DataFrame: grid_id로 인덱싱된 pop_resd/pop_long_foreign/pop_short_foreign/pop_total
             (lookback 안에 데이터가 전혀 없으면 빈 DataFrame — 호출부가
@@ -757,8 +780,8 @@ def _get_recent_population(target_ts: pd.Timestamp, lookback_hours: float = 1.0)
     if target_ts in _recent_population_by_ts:
         return _recent_population_by_ts[target_ts]
 
+    keys = silver_schema.population_normalized_tick_keys(target_ts, lookback_hours)
     result = pd.DataFrame(columns=["pop_resd", "pop_long_foreign", "pop_short_foreign", "pop_total"])
-    keys = silver_schema.normalized_population_tick_keys(target_ts, lookback_hours)
     for df in reversed(s3_io.read_parquet_many(keys)):  # target_ts에 가장 가까운 것부터
         if df is not None and not df.empty:
             df = df.rename(columns=silver_schema.POPULATION_COLUMN_MAP).copy()
@@ -1323,7 +1346,9 @@ def predict_demand_multi_hour(
         list[dict]: 길이 n_hours. 각 원소는
             {station_id, date, hour, minute, horizon, rental: {pred_mean/p10/p50/p90,
             lag_fallback_used, lag_data_freshness}, return: {pred_mean/p10/p50/p90},
-            population_source}
+            population_source, stockout_source("provided"|"fallback" — 실시간 재고
+            데이터가 없어 "품절 아님"으로 보수적 기본값을 썼는지, `_stockout_from_status()`
+            참고)}
     raises:
         ValueError: station_id가 station_master에 없거나 hour/minute이 범위를 벗어나거나
             n_hours가 1~HORIZON_COUNT 밖이거나 날씨 시퀀스 길이가 n_hours와 다를 때
@@ -1337,7 +1362,7 @@ def predict_demand_multi_hour(
 
     anchor_ts = _target_timestamp(date, hour, minute)
     lag_features, lag_fallback_fields = _lag_rolling_features(station_id, anchor_ts)
-    stockout = _resolve_live_stockout(station_id, anchor_ts, stockout)
+    stockout, stockout_fallback = _resolve_live_stockout(station_id, anchor_ts, stockout)
 
     records = []
     population_fallbacks = []
@@ -1395,6 +1420,7 @@ def predict_demand_multi_hour(
                 "pred_p90": float(rt["pred_p90"]),
             },
             "population_source": "fallback" if population_fallbacks[i] else "provided",
+            "stockout_source": "fallback" if stockout_fallback else "provided",
         })
 
     return results
@@ -1523,6 +1549,7 @@ def predict_demand_multi_hour_all_stations(
     row_stations: list[str] = []
     row_horizons: list[int] = []
     population_fallback_by_row: list[bool] = []
+    stockout_fallback_by_row: list[bool] = []
     for h in range(1, n_hours + 1):
         target_ts = anchor_ts + pd.Timedelta(hours=h - 1)
         t_temp = None if temp is None else _resolve_weather_for_horizon(temp, h, n_hours, "temp")
@@ -1533,9 +1560,7 @@ def predict_demand_multi_hour_all_stations(
             target_ts, t_temp, t_precip, t_wind, t_humidity, as_of_ts=anchor_ts
         )
         for sid in alive_station_ids:
-            sid_stockout = stockout
-            if sid_stockout is None:
-                sid_stockout = bool(bike_status.loc[sid, "stockout_flag"]) if sid in bike_status.index else False
+            sid_stockout, sid_stockout_fallback = _stockout_from_status(sid, bike_status, stockout)
             target_fields, population_fallback = _build_target_time_fields(
                 sid, master.loc[sid], target_ts, t_temp, t_precip, t_wind, t_humidity,
                 None, None, 0.0, 0.0, sid_stockout, h,
@@ -1544,6 +1569,7 @@ def predict_demand_multi_hour_all_stations(
             row_stations.append(sid)
             row_horizons.append(h)
             population_fallback_by_row.append(population_fallback)
+            stockout_fallback_by_row.append(sid_stockout_fallback)
         if on_progress is not None:
             on_progress(h, n_hours)
 
@@ -1581,6 +1607,7 @@ def predict_demand_multi_hour_all_stations(
                 "pred_p50": float(rt["pred_p50"]), "pred_p90": float(rt["pred_p90"]),
             },
             "population_source": "fallback" if population_fallback_by_row[i] else "provided",
+            "stockout_source": "fallback" if stockout_fallback_by_row[i] else "provided",
         })
 
     return {
@@ -1615,14 +1642,43 @@ def _resolve_live_weather(
     return temp, precip, wind, humidity
 
 
-def _resolve_live_stockout(station_id: str, anchor_ts: pd.Timestamp, stockout: bool | None) -> bool:
-    """stockout이 None이면 anchor_ts 기준 Silver 실시간 재고 현황으로 대체한다."""
+def _stockout_from_status(station_id: str, status: pd.DataFrame | None, stockout: bool | None) -> tuple[bool, bool]:
+    """이미 조회해둔 재고 현황(status)에서 station_id의 stockout 여부를 찾는다.
+
+    조회 자체는 하지 않는다 — `predict_demand_multi_hour_all_stations()`처럼
+    여러 station에 같은 배치 조회 결과를 재사용하려는 호출부가 쓴다.
+
+    `population_source`(population_fallback)와 같은 이유로 fallback 여부를 같이
+    반환한다 — 재고 정보가 없어 "품절 아님"으로 기본값을 쓴 경우, rental_exposure가
+    1.0(정상)으로 들어가 실제로 품절이었을 수도 있는 시간대의 수요를 과대평가하게
+    된다. 이 값을 호출부가 반환값에 그대로 실어야(`stockout_source`) 그 왜곡이
+    조용히 묻히지 않는다.
+
+    args:
+        station_id: 정류소 ID
+        status: `_get_recent_bike_status()` 결과, 또는 stockout이 이미 주어져
+            조회 자체를 안 했으면 None
+        stockout: 호출부가 직접 준 값(주면 그대로 사용 — fallback 아님)
+    returns:
+        tuple[bool, bool]: (stockout 값, stockout_fallback — status에 station_id가
+            없어 보수적 기본값을 썼는지)
+    """
     if stockout is not None:
-        return stockout
-    status = _get_recent_bike_status(anchor_ts)
-    if station_id in status.index:
-        return bool(status.loc[station_id, "stockout_flag"])
-    return False  # 재고 정보 자체가 없으면 "품절 아님"으로 보수적 기본값
+        return stockout, False
+    if status is not None and station_id in status.index:
+        return bool(status.loc[station_id, "stockout_flag"]), False
+    return False, True  # 재고 정보 자체가 없으면 "품절 아님"으로 보수적 기본값
+
+
+def _resolve_live_stockout(station_id: str, anchor_ts: pd.Timestamp, stockout: bool | None) -> tuple[bool, bool]:
+    """stockout이 None이면 anchor_ts 기준 Silver 실시간 재고 현황을 그 자리에서 조회해 대체한다.
+
+    returns:
+        tuple[bool, bool]: `_stockout_from_status()`와 동일 — (stockout 값, stockout_fallback)
+    """
+    if stockout is not None:
+        return stockout, False
+    return _stockout_from_status(station_id, _get_recent_bike_status(anchor_ts), None)
 
 
 def predict_rental_demand(
@@ -1671,7 +1727,9 @@ def predict_rental_demand(
             None이면 Silver `bike_station_realtime`에서 anchor_ts(T0) 기준 실시간 조회
     returns:
         dict: station_id, date, hour, minute, horizon, pred_mean, pred_p10, pred_p50,
-            pred_p90, lag_fallback_used, lag_data_freshness, population_source
+            pred_p90, lag_fallback_used, lag_data_freshness, population_source,
+            stockout_source("provided"|"fallback" — 실시간 재고 데이터가 없어
+            "품절 아님"으로 보수적 기본값을 썼는지, `_stockout_from_status()` 참고)
     raises:
         ValueError: station_id가 station_master에 없거나 hour/minute/horizon이
             범위를 벗어날 때(`_build_feature_record()` 참고)
@@ -1679,10 +1737,21 @@ def predict_rental_demand(
     anchor_ts = _target_timestamp(date, hour, minute)
     target_ts = anchor_ts + pd.Timedelta(hours=horizon - 1)
     temp, precip, wind, humidity = _resolve_live_weather(
-        target_ts, temp, precip, wind, humidity, as_of_ts=anchor_ts
+        target_ts,
+        temp,
+        precip,
+        wind,
+        humidity,
+        as_of_ts=anchor_ts,
     )
-    stockout = _resolve_live_stockout(station_id, anchor_ts, stockout)
-    return _predict_at(
+
+    stockout, stockout_fallback = _resolve_live_stockout(
+        station_id,
+        anchor_ts,
+        stockout,
+    )
+
+    result = _predict_at( 
         "rental",
         "rental_exposure",
         station_id=station_id,
@@ -1700,6 +1769,8 @@ def predict_rental_demand(
         pop_short_foreign=pop_short_foreign,
         stockout=stockout,
     )
+    result["stockout_source"] = "fallback" if stockout_fallback else "provided"
+    return result
 
 
 def predict_return_demand(
@@ -1865,6 +1936,7 @@ def main(argv: list[str] | None = None) -> None:
                 "return_pred_p50": r["return"]["pred_p50"], "return_pred_p90": r["return"]["pred_p90"],
                 "lag_data_freshness": r["rental"]["lag_data_freshness"],
                 "population_source": r["population_source"],
+                "stockout_source": r["stockout_source"],
             })
         out_df = pd.DataFrame(rows)
         window_start = _target_timestamp(args.date, args.hour, args.minute)
@@ -1914,6 +1986,7 @@ def main(argv: list[str] | None = None) -> None:
                 "return_pred_p50": r["return"]["pred_p50"], "return_pred_p90": r["return"]["pred_p90"],
                 "lag_data_freshness": r["rental"]["lag_data_freshness"],
                 "population_source": r["population_source"],
+                "stockout_source": r["stockout_source"],
             })
         out_df = pd.DataFrame(rows)
         s3_io.write_parquet(out_df, out_path)
@@ -1943,6 +2016,7 @@ def main(argv: list[str] | None = None) -> None:
         "return_pred_p90": return_res["pred_p90"],
         "lag_data_freshness": rental_res["lag_data_freshness"],
         "population_source": rental_res["population_source"],
+        "stockout_source": rental_res["stockout_source"],
     }]
     out_df = pd.DataFrame(rows)
     s3_io.write_parquet(out_df, out_path)
