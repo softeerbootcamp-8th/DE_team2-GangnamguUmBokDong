@@ -48,6 +48,7 @@ weather_forecast:
     - humidity
     - wind_speed
     - base_dttm
+  expire_col: forecast_dttm
 
 weather_forecast_ultra:
   source_id: weather_ultra_short_forecast
@@ -64,6 +65,7 @@ weather_forecast_ultra:
     - humidity
     - wind_speed
     - base_dttm
+  expire_col: forecast_dttm
 
 cultural_events:
   source_id: cultural_event
@@ -80,6 +82,7 @@ cultural_events:
     - is_free
     - lat
     - lon
+  expire_col: end_date
 
 cultural_events_performance:
   source_id: performance_event
@@ -96,6 +99,7 @@ cultural_events_performance:
     - is_free
     - lat
     - lon
+  expire_col: end_date
 
 forecast_points:
   source_id: ml_predictions
@@ -108,3 +112,4 @@ forecast_points:
     - predicted_return_cnt
     - batch_run_at
   reader: read_predictions
+  expire_col: predicted_dttm

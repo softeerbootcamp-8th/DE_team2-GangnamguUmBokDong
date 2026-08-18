@@ -30,6 +30,11 @@ class TableSpec:
     conflict_cols: list[str]
     update_cols: list[str]
     reader: Callable[[datetime], pd.DataFrame] | None = None
+    expire_col: str | None = None
+    """만료 판정에 쓰는 컬럼(예: forecast_dttm, predicted_dttm, end_date). 지정된
+    테이블은 적재 직후 유예기간이 지난 행을 정리한다(loader/retention_config.py,
+    main.py의 _delete_expired 참고). None이면 정리 대상이 아니다(마스터 데이터나
+    최신 1건만 유지하는 테이블 등)."""
 
     def read(self, window_start: datetime) -> pd.DataFrame:
         """지정된 윈도우 시각의 S3 데이터를 읽어 Pandas DataFrame으로 반환한다."""
@@ -56,6 +61,7 @@ def _load_table_specs() -> dict[str, TableSpec]:
             conflict_cols=raw["conflict_cols"],
             update_cols=raw["update_cols"],
             reader=reader_fn,
+            expire_col=raw.get("expire_col"),
         )
     return specs
 

@@ -10,6 +10,21 @@ from core.db import get_connection
 from core.upsert import upsert
 
 from config import TABLE_SPECS
+from retention_config import DATE_TYPED_EXPIRE_TABLES, RETENTION_GRACE
+
+
+def _expire_cutoff(target_table: str, window_start: datetime):
+    """target_table의 만료 기준 시각(또는 날짜)을 계산한다. window_start에서
+    유예기간(retention_config.RETENTION_GRACE)만큼 뺀 시점보다 오래된 행이 삭제 대상이다."""
+    cutoff = window_start - RETENTION_GRACE[target_table]
+    return cutoff.date() if target_table in DATE_TYPED_EXPIRE_TABLES else cutoff
+
+
+def _delete_expired(conn, target_table: str, expire_col: str, cutoff) -> int:
+    """target_table에서 expire_col < cutoff인 행을 지우고 지운 행 수를 반환한다."""
+    with conn.cursor() as cur:
+        cur.execute(f"DELETE FROM {target_table} WHERE {expire_col} < %(cutoff)s", {"cutoff": cutoff})
+        return cur.rowcount
 
 
 def run(table: str, window_start: datetime) -> None:
@@ -41,6 +56,10 @@ def run(table: str, window_start: datetime) -> None:
 
     with get_connection() as conn:
         upsert(conn, target_table, rows, spec.conflict_cols, spec.update_cols)
+        if spec.expire_col:
+            cutoff = _expire_cutoff(target_table, window_start)
+            deleted = _delete_expired(conn, target_table, spec.expire_col, cutoff)
+            print(f"deleted {deleted} expired rows from {target_table} (expire_col={spec.expire_col}, cutoff={cutoff})")
         conn.commit()
 
     print(f"upserted {len(rows)} rows into {target_table}")
