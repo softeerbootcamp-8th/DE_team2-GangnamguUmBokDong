@@ -1,8 +1,7 @@
-"""구조화 로그 설정 — 고정 필드(source_id·window·attempt) 주입.
+"""구조화 로그 설정 - 모든 로그에 source_id·window·attempt를 고정 필드로 붙인다.
 
-행 상세는 quarantine 파일이 담당한다.
-조각마다, 그리고 라운드마다 로그를 남기지도 않는다. 
-아래 3줄이 한 배치의 정상 출력 전부다.
+행 상세는 quarantine 파일이 담당하므로, 조각·라운드 단위로는 로그를 남기지 않는다.
+정상 배치의 출력은 다음 3줄이 전부다.
 
     INFO  source_id=bike_station_realtime window=2026-08-12T14:10Z
           stage=bronze_written parts=3/3 rounds=1 rows=2765 bytes=482113 ms=1203
@@ -10,29 +9,13 @@
           dropped=25 drop_ratio=0.009 completeness=0.991
     INFO  source_id=… stage=completed revision=1 key=s3://…/1410.parquet
 
+누락·폐기가 있으면 해당 단계 로그가 WARN·ERROR로 바뀌고 원인(`missing`,
+`failure_reason`)이 붙는다. 수집 게이트(`fetch_error`)와 폐기 게이트
+(`quality_gate`)는 사유가 다르므로, 로그만 보고도 재시도할 문제인지 config를
+고쳐야 할 문제인지 구분된다. 백필로 silver가 갱신되면 `revision` 변화가 남아
+하류 재처리를 추적하는 유일한 기록이 된다.
 
-누락이 발생하면 첫 줄이 WARN이 되고 무엇이 빠졌는지 붙는다.
-
-    WARN  source_id=… stage=bronze_written parts=2/3 rounds=3
-          missing=page-02001-02765 missing_rows=765 completeness=0.717
-
-실패 시에는 `failure_reason`을 함께 남긴다. 수집 게이트와 폐기 게이트는 사유가 다르므로
-로그만 봐도 재시도할 실패인지 config를 고칠 실패인지 구분된다.
-
-    ERROR source_id=… stage=validated status=FAILED failure_reason=quality_gate
-          dropped=412 drop_ratio=0.149
-    ERROR source_id=… stage=bronze_written status=FAILED failure_reason=fetch_error
-          missing_ratio=0.638 reason=budget_exceeded
-
-백필 실행은 `revision` 변화를 남긴다. 이 한 줄이 "silver 내용이 언제 바뀌었는지"의
-유일한 기록이므로 하류 재처리를 추적할 때 쓰인다.
-
-    INFO  source_id=… mode=backfill parts=1 filled=page-02001-02765
-          revision=1→2 completeness=0.717→1.0
-
-
-## 주의
-- boto3 · httpx의 기본 로거가 시끄러우면 레벨을 따로 낮춘다.
+주의: boto3·httpx의 기본 로거가 시끄러우면 레벨을 따로 낮춘다.
 """
 
 from __future__ import annotations
