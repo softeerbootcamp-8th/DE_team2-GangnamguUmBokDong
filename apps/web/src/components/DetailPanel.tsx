@@ -3,26 +3,38 @@ import { api } from "../api";
 import type { CulturalEvent, StationDetail } from "../api";
 import { formatIsoTime } from "../format";
 
-type Tab = "info" | "events";
+export interface FocusedEvent {
+  lat: number;
+  lon: number;
+  radiusKm: number;
+}
+
+type Tab = "info" | "events" | "weather";
 
 const TABS: { key: Tab; label: string }[] = [
   { key: "info", label: "대여소 정보" },
-  { key: "events", label: "행사" },
+  { key: "events", label: "주변 행사" },
+  { key: "weather", label: "주변 날씨" },
 ];
 
 interface Props {
   stationId: string | null;
   reasons: string[];
+  onFocusEvent: (event: FocusedEvent | null) => void;
 }
 
-export function DetailPanel({ stationId, reasons }: Props) {
+export function DetailPanel({ stationId, reasons, onFocusEvent }: Props) {
   const [tab, setTab] = useState<Tab>("info");
   const [detail, setDetail] = useState<StationDetail | null>(null);
   const [events, setEvents] = useState<CulturalEvent[] | null>(null);
+  const [radiusKm, setRadiusKm] = useState<number | null>(null);
 
-  // 대여소를 바꾸면 이전 대여소에서 골라둔 탭이 그대로 유지될 이유가 없다.
+  // 대여소를 바꾸면 이전 대여소에서 골라둔 탭·지도에 띄워둔 행사 포커스가
+  // 그대로 유지될 이유가 없다.
   useEffect(() => {
     setTab("info");
+    onFocusEvent(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [stationId]);
 
   useEffect(() => {
@@ -45,7 +57,10 @@ export function DetailPanel({ stationId, reasons }: Props) {
     let cancelled = false;
     setEvents(null);
     api.events(stationId).then((data) => {
-      if (!cancelled) setEvents(data);
+      if (!cancelled) {
+        setEvents(data.events);
+        setRadiusKm(data.radius_km);
+      }
     });
     return () => {
       cancelled = true;
@@ -102,23 +117,35 @@ export function DetailPanel({ stationId, reasons }: Props) {
             )}
           </dl>
         )
-      ) : events === null ? (
-        <p className="empty-state">불러오는 중...</p>
-      ) : events.length === 0 ? (
-        <p className="empty-state">주변에 진행 중인 행사가 없습니다.</p>
+      ) : tab === "events" ? (
+        events === null ? (
+          <p className="empty-state">불러오는 중...</p>
+        ) : events.length === 0 ? (
+          <p className="empty-state">주변에 진행 중인 행사가 없습니다.</p>
+        ) : (
+          <ul className="event-list">
+            {events.map((event) => (
+              <li key={event.event_id}>
+                <button
+                  type="button"
+                  className="event-item"
+                  onClick={() => radiusKm !== null && onFocusEvent({ lat: event.lat, lon: event.lon, radiusKm })}
+                >
+                  <span className="event-item-title">{event.title}</span>
+                  <span className="event-item-meta">
+                    {[event.place, [event.start_date, event.end_date].filter(Boolean).join(" ~ "), `${event.distance_km}km`]
+                      .filter(Boolean)
+                      .join(" · ")}
+                  </span>
+                </button>
+              </li>
+            ))}
+          </ul>
+        )
       ) : (
-        <ul className="event-list">
-          {events.map((event) => (
-            <li key={event.event_id} className="event-item">
-              <span className="event-item-title">{event.title}</span>
-              <span className="event-item-meta">
-                {[event.place, [event.start_date, event.end_date].filter(Boolean).join(" ~ "), `${event.distance_km}km`]
-                  .filter(Boolean)
-                  .join(" · ")}
-              </span>
-            </li>
-          ))}
-        </ul>
+        // 날씨는 격자-구 매핑 정확도 문제(#99)가 팀 논의로 결론 나야 데이터 형태가
+        // 정해져서 아직 못 붙였다. 탭 자리만 미리 만들어둔다.
+        <p className="empty-state">주변 날씨는 준비 중입니다.</p>
       )}
     </div>
   );

@@ -381,6 +381,16 @@ body {
   padding: 8px;
   border-radius: 6px;
   border: 1px solid var(--border);
+  background: transparent;
+  text-align: left;
+  font: inherit;
+  color: inherit;
+  width: 100%;
+  cursor: pointer;
+}
+
+.event-item:hover {
+  background: var(--gridline);
 }
 
 .event-item-title {

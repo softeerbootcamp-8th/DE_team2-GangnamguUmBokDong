@@ -61,7 +61,14 @@ export interface CulturalEvent {
   start_date: string | null;
   end_date: string | null;
   is_free: string | null;
+  lat: number;
+  lon: number;
   distance_km: number;
+}
+
+export interface EventsResponse {
+  radius_km: number;
+  events: CulturalEvent[];
 }
 
 async function getJson<T>(path: string): Promise<T> {
@@ -76,7 +83,7 @@ export const api = {
   stations: () => getJson<StationSummary[]>("/stations"),
   station: (id: string) => getJson<StationDetail>(`/stations/${id}`),
   forecast: (id: string) => getJson<ForecastResponse>(`/stations/${id}/forecast`),
-  events: (id: string) => getJson<CulturalEvent[]>(`/stations/${id}/events`),
+  events: (id: string) => getJson<EventsResponse>(`/stations/${id}/events`),
   alerts: () => getJson<Alert[]>("/alerts"),
   status: () => getJson<StatusResponse>("/status"),
   regions: () => getJson<DispatchCenter[]>("/regions"),

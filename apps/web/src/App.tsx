@@ -3,6 +3,7 @@ import { api } from "./api";
 import type { Alert, DispatchCenter, ForecastResponse, StationSummary } from "./api";
 import { AlertList } from "./components/AlertList";
 import { DetailPanel } from "./components/DetailPanel";
+import type { FocusedEvent } from "./components/DetailPanel";
 import { ForecastPanel } from "./components/ForecastPanel";
 import { Header } from "./components/Header";
 import { StationMap } from "./components/StationMap";
@@ -35,6 +36,10 @@ export default function App() {
   // 공개 자료가 없어 최근접 근사로 배정한 값이다(apps/api/regions.py 참고).
   const [selectedRegion, setSelectedRegion] = useState<string>(ALL_REGIONS);
   const [regionCenters, setRegionCenters] = useState<DispatchCenter[]>([]);
+  // 대여소 상세의 "주변 행사" 탭에서 행사를 고르면 지도를 그 위치로 옮기고
+  // 초록 점 + 검색 반경 원을 띄운다. DetailPanel과 StationMap이 형제 컴포넌트라
+  // 공통 부모인 여기서 들고 내려보낸다.
+  const [focusedEvent, setFocusedEvent] = useState<FocusedEvent | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -130,6 +135,7 @@ export default function App() {
                           onSelect={setSelectedStationId}
                           regionCenters={regionCenters}
                           selectedRegion={selectedRegion}
+                          focusedEvent={focusedEvent}
                         />
                       </div>
                     </div>
@@ -176,7 +182,11 @@ export default function App() {
                 <section className="flex flex-col h-full gap-2 min-w-0 min-h-0">
                   <h2 className="text-base font-semibold tracking-tight">대여소 상세</h2>
                   <div className="flex-1 min-w-0 min-h-0">
-                    <DetailPanel stationId={selectedStationId} reasons={forecast?.reasons ?? []} />
+                    <DetailPanel
+                      stationId={selectedStationId}
+                      reasons={forecast?.reasons ?? []}
+                      onFocusEvent={setFocusedEvent}
+                    />
                   </div>
                 </section>
               </div>

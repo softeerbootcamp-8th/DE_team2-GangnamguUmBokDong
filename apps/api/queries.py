@@ -157,7 +157,7 @@ def fetch_nearby_events(lat: float, lon: float, today: date) -> list[dict]:
 
     events = []
     for row in rows:
-        distance_km = _haversine_km(lat, lon, row.pop("lat"), row.pop("lon"))
+        distance_km = _haversine_km(lat, lon, row["lat"], row["lon"])
         if distance_km <= NEARBY_EVENT_RADIUS_KM:
             events.append({**row, "distance_km": round(distance_km, 2)})
     return sorted(events, key=lambda e: e["distance_km"])
