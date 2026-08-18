@@ -5,7 +5,7 @@ import boto3
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from s3_reader import read_predictions, read_silver
+from reader import read_predictions, read_silver
 from tests.conftest import TEST_BUCKET
 
 

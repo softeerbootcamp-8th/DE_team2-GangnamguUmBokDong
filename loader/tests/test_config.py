@@ -25,7 +25,7 @@ def test_forecast_points_reader_delegates_to_read_predictions(monkeypatch):
         captured["window_start"] = window_start
         return pa.table({"station_id": ["101"]})
 
-    monkeypatch.setattr("config.s3_reader.read_predictions", fake_read_predictions)
+    monkeypatch.setattr("config.reader.read_predictions", fake_read_predictions)
 
     window_start = datetime(2026, 8, 16, 14, 5, tzinfo=UTC)
     result = TABLE_SPECS["forecast_points"].read(window_start)
@@ -44,7 +44,7 @@ def test_default_reader_still_uses_read_silver(monkeypatch):
         captured["window_start"] = window_start
         return pa.table({"stationId": ["101"]})
 
-    monkeypatch.setattr("config.s3_reader.read_silver", fake_read_silver)
+    monkeypatch.setattr("config.reader.read_silver", fake_read_silver)
 
     window_start = datetime(2026, 8, 16, 14, 5, tzinfo=UTC)
     result = TABLE_SPECS["stations"].read(window_start)
