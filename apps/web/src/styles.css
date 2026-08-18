@@ -16,7 +16,11 @@
   --baseline: #c3c2b7;
   --border: oklch(0.922 0 0);
 
-  --series-1: #2a78d6;
+  /* 따릉이 브랜드 컬러. 지도 상태색(status-*)은 정상/경고/심각 의미를 담고
+     있어 그대로 두고, 필터 탭·선택 표시 등 의미 없는 액션형 UI에만 쓴다. */
+  --brand-green: #2edb8c;
+  --brand-navy: #405260;
+  --accent-active: var(--brand-green);
   --series-stock: #1f9d55;
   --diverging-red: #e34948;
   --diverging-blue: #2a78d6;
@@ -86,8 +90,19 @@ body {
   flex: none;
 }
 
+.app-header-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.app-header-logo {
+  height: 28px;
+  width: auto;
+}
+
 .app-header h1 {
-  margin: 0 0 0 8px;
+  margin: 0;
   font-size: 18px;
   font-weight: 700;
   color: var(--text-primary);
@@ -234,6 +249,15 @@ body {
   padding-bottom: 4px;
 }
 
+/* AlertList의 .alert-tabs는 스크롤되는 목록 위에 붙어있는 헤더라 sticky·
+   아래쪽 여백이 필요하지만, 지도 패널 헤더처럼 한 줄짜리 툴바에 나란히 놓일
+   땐 그 여백 때문에 옆의 select/버튼과 세로 중심이 안 맞는다. */
+.alert-tabs--inline {
+  position: static;
+  padding-bottom: 0;
+  background: transparent;
+}
+
 .alert-tab {
   padding: 4px 10px;
   border-radius: 999px;
@@ -246,13 +270,15 @@ body {
 }
 
 .alert-tab.active {
-  background: var(--series-1);
-  border-color: var(--series-1);
-  color: #fff;
+  background: var(--accent-active);
+  border-color: var(--accent-active);
+  /* brand-green 배경엔 흰 글자 대비가 1.8:1로 너무 낮아(WCAG AA 미달) 안 보인다.
+     라이트/다크 모드 어디서든 배경색이 고정이라 브랜드 남색을 고정 텍스트색으로 쓴다. */
+  color: var(--brand-navy);
 }
 
 .region-select {
-  padding: 2px 8px;
+  padding: 4px 10px;
   border-radius: 999px;
   border: 1px solid var(--border);
   background: var(--surface-1);
@@ -291,7 +317,7 @@ body {
 }
 
 .alert-item.selected {
-  border-color: var(--series-1);
+  border-color: var(--accent-active);
 }
 
 .status-icon {
