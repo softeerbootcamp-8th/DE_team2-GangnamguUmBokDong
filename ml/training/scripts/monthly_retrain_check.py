@@ -183,6 +183,7 @@ def _attempt_promotion(model_name: str, champion_metrics: dict | None) -> bool:
 
 
 def main() -> list[dict]:
+    """월별 성능 점검 및 챌린저 모델 재학습/승격 프로세스를 실행한다."""
     parser = argparse.ArgumentParser(description="매달 챔피언 모델 성능 점검 + (옵션) 챌린저 재학습/승격 시도")
     parser.add_argument(
         "--execute",

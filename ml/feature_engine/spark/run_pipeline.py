@@ -223,6 +223,7 @@ def _run_incremental(spark, watermark: dict) -> None:
 
 
 def main() -> None:
+    """피처마트 파이프라인을 실행한다 (워터마크 유무에 따라 전체 빌드 또는 증분 실행)."""
     spark = get_spark()
     watermark = read_watermark(config.WATERMARK_PATH)
     if watermark is None:

@@ -1,3 +1,5 @@
+"""PostgreSQL(App DB) 연결 및 쿼리 실행 헬퍼 모듈."""
+
 import os
 from collections.abc import Sequence
 from typing import Any
