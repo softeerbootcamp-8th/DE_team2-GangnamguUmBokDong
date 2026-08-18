@@ -1,4 +1,4 @@
-"""#10 소스 YAML 7종 테스트.
+"""Collector 소스 YAML 10종 테스트.
 
 `sources/*.yaml` 전부가 config loader를 통과하는지, 이번에 늘어난 3개 키
 (`max_missing_ratio` · `fetch` · `backfill`)가 생략 가능한지, 그리고 실제
@@ -13,11 +13,10 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-import httpx
-import pytest
-
 import config.loader as config_loader
+import httpx
 import pipeline
+import pytest
 from adapters import (  # noqa: F401 — @adapter 등록을 위한 import
     kma_apihub,
     seoul_openapi,
@@ -36,8 +35,8 @@ def _api_keys(monkeypatch):
 
 
 class TestAllSourcesLoad:
-    def test_nine_sources_exist(self):
-        assert len(SOURCE_IDS) == 9
+    def test_ten_sources_exist(self):
+        assert len(SOURCE_IDS) == 10
 
     @pytest.mark.parametrize("source_id", SOURCE_IDS)
     def test_loads_without_error(self, source_id):

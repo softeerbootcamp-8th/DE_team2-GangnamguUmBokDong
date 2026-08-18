@@ -20,3 +20,12 @@ def build_normalizer_task(dag, task_id: str, baseline_date_mode: str, *, trigger
         f"--baseline-date-mode {baseline_date_mode}"
     )
     return build_module_task(dag, task_id, NORMALIZER_DIR, cmd, trigger_rule=trigger_rule)
+
+
+def build_station_master_enrichment_task(dag):
+    """API 대여소 master에 생활인구 CELL_ID를 보강하는 태스크를 만든다."""
+    cmd = (
+        f"uv run --frozen python station_master.py --window-start {KST_WINDOW_START} "
+        "--baseline-date-mode latest"
+    )
+    return build_module_task(dag, "enrich_station_master", NORMALIZER_DIR, cmd)

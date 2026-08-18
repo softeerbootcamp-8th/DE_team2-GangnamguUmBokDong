@@ -2,11 +2,10 @@ import os
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-import httpx
-import pytest
-
 import adapters.kma_apihub
 import adapters.seoul_openapi  # noqa: F401
+import httpx
+import pytest
 from adapters.base import Window, get_adapter
 from config import loader
 
@@ -41,6 +40,7 @@ def get_recent_window(source_id: str) -> Window:
 @pytest.mark.xfail(reason="현재 여러 소스의 YAML 설정과 실제 API 스키마/요청방식이 불일치하여 실패가 예상됨", strict=False)
 @pytest.mark.parametrize("source_id", [
     "bike_station_realtime",
+    "bike_station_master",
     "cultural_event",
     "bike_rental_history",
     "living_population_grid",

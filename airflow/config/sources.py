@@ -12,6 +12,7 @@ WEATHER_3H_SOURCE = "weather_short_term_forecast"
 DAILY_POPULATION_SOURCE = "living_population_grid"
 DAILY_EVENT_SOURCE = "cultural_event"
 PERFORMANCE_EVENT_SOURCE = "performance_event"
+STATION_MASTER_SOURCE = "bike_station_master"
 
 NORMALIZER_BASELINE_MODE_PRIMARY = "strict"
 NORMALIZER_BASELINE_MODE_FALLBACK = "latest"

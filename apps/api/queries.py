@@ -3,7 +3,6 @@ from datetime import UTC, datetime, timedelta
 
 from core.db import fetch_all, fetch_one
 
-
 STOCK_HISTORY_WINDOW_MIN = 25
 
 
@@ -22,11 +21,22 @@ def _group_by_sta_id(rows: list[dict]) -> dict[str, list[dict]]:
 
 
 def fetch_stations() -> list[dict]:
-    """대여소 마스터 + 최신 재고 한 줄씩을 합쳐서 전체 목록을 반환한다."""
+    """최신 미래예측 배치 대상 대여소의 마스터 + 최신 재고를 반환한다."""
     query = """
+        WITH latest_batch AS (
+            SELECT max(batch_run_at) AS batch_run_at
+            FROM forecast_points
+            WHERE predicted_dttm > now()
+        ), forecasted_stations AS (
+            SELECT DISTINCT sta_id
+            FROM forecast_points
+            WHERE batch_run_at = (SELECT batch_run_at FROM latest_batch)
+              AND predicted_dttm > now()
+        )
         SELECT s.sta_id, s.sta_nm, s.gu, s.sta_addr, s.lat, s.lon, s.hold_cnt,
                stock.parking_bike_tot_cnt, stock.observed_at AS base_dttm
         FROM stations s
+        JOIN forecasted_stations forecasted ON forecasted.sta_id = s.sta_id
         JOIN LATERAL (
             SELECT parking_bike_tot_cnt, observed_at
             FROM station_stock
@@ -58,11 +68,18 @@ def fetch_station(sta_id: str) -> dict | None:
 
 
 def fetch_forecast_points(sta_id: str, now: datetime) -> list[dict]:
-    """now 이후 시점의 예측 원본치(대여·반납량)를 시간순으로 반환한다."""
+    """미래 구간을 가진 최신 배치 한 건의 예측만 시간순으로 반환한다."""
     query = """
+        WITH latest_batch AS (
+            SELECT max(batch_run_at) AS batch_run_at
+            FROM forecast_points
+            WHERE predicted_dttm > %(now)s
+        )
         SELECT predicted_dttm, predicted_rent_cnt, predicted_return_cnt
         FROM forecast_points
-        WHERE sta_id = %(sta_id)s AND predicted_dttm > %(now)s
+        WHERE sta_id = %(sta_id)s
+          AND predicted_dttm > %(now)s
+          AND batch_run_at = (SELECT batch_run_at FROM latest_batch)
         ORDER BY predicted_dttm
     """
     return fetch_all(query, {"sta_id": sta_id, "now": now})
@@ -86,9 +103,16 @@ def fetch_all_stock_history(sta_ids: list[str], now: datetime) -> dict[str, list
 def fetch_all_forecast_points(sta_ids: list[str], now: datetime) -> dict[str, list[dict]]:
     """여러 대여소의 예측 원본치를 쿼리 1번으로 가져와 sta_id별로 묶어서 반환한다."""
     query = """
+        WITH latest_batch AS (
+            SELECT max(batch_run_at) AS batch_run_at
+            FROM forecast_points
+            WHERE predicted_dttm > %(now)s
+        )
         SELECT sta_id, predicted_dttm, predicted_rent_cnt, predicted_return_cnt
         FROM forecast_points
-        WHERE sta_id = ANY(%(sta_ids)s) AND predicted_dttm > %(now)s
+        WHERE sta_id = ANY(%(sta_ids)s)
+          AND predicted_dttm > %(now)s
+          AND batch_run_at = (SELECT batch_run_at FROM latest_batch)
         ORDER BY sta_id, predicted_dttm
     """
     rows = fetch_all(query, {"sta_ids": sta_ids, "now": now})
@@ -97,8 +121,17 @@ def fetch_all_forecast_points(sta_ids: list[str], now: datetime) -> dict[str, li
 
 
 def fetch_batch_run_at(now: datetime) -> datetime:
-    """가장 최근 예측 배치 실행 시각. 배치 결과가 아직 없으면 지금을 5분 단위로 내림해 대신한다.    """
-    row = fetch_one("SELECT max(batch_run_at) as latest FROM forecast_points")
+    """미래 예측이 있는 최신 배치 시각. 결과가 없으면 전체 최신값 또는 현재 시각."""
+    row = fetch_one(
+        """
+        SELECT COALESCE(
+            max(batch_run_at) FILTER (WHERE predicted_dttm > %(now)s),
+            max(batch_run_at)
+        ) AS latest
+        FROM forecast_points
+        """,
+        {"now": now},
+    )
     latest = row["latest"] if row else None
     return latest if latest is not None else _floor_to_5min(now)
 

@@ -67,6 +67,14 @@ export default function App() {
     api.regions().then(setRegionCenters);
   }, []);
 
+  // 첫 화면부터 세 하단 패널이 비어 있지 않도록, 데이터가 도착하면 가장
+  // 긴급한 대여소(서버가 urgency 내림차순으로 반환)를 기본 선택한다.
+  useEffect(() => {
+    if (selectedStationId === null && alerts.length > 0) {
+      setSelectedStationId(alerts[0].sta_id);
+    }
+  }, [alerts, selectedStationId]);
+
   useEffect(() => {
     if (selectedStationId === null) {
       setForecast(null);

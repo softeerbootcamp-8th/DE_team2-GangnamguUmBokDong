@@ -67,12 +67,16 @@ P10/P50/P90)를 반환한다. 생활인구(`population`)는 있으면 넣고, �
 `_stockout_from_status()` 참고.
 """
 
+import gc
+import re
 import sys
 from collections.abc import Sequence
 
+import holidays as holidays_lib
 import numpy as np
 import pandas as pd
 from core import s3 as s3_io
+from ml_core import scoring as scoring_io
 from ml_core import silver_schema
 from ml_core.model_contract import (
     FEATURE_COLUMN_DTYPES,
@@ -99,6 +103,7 @@ _station_master: pd.DataFrame | None = None
 _holidays: set[str] | None = None
 _raw_rental_trips: pd.DataFrame | None = None  # station_id/end_station_id 매칭까지 끝난 원본 트립
 _recent_population_by_ts: dict[pd.Timestamp, pd.DataFrame] = {}  # _get_recent_population() 캐시 — target_ts별로 한 번만 S3에서 읽는다
+_weather_forecast_snapshot_cache: dict[tuple[str, pd.Timestamp], pd.DataFrame | None] = {}
 
 # 이 모듈의 실시간 캐시는 "프로세스 생애주기 동안 딱 한 번"만 채워진다(기존과 동일한
 # 철학) — 실제 서빙은 5분마다 새 프로세스(cron/배치 실행)로 도는 걸 전제라, 프로세스
@@ -418,35 +423,90 @@ def _rental_visible_batch_all_stations(
 
 
 def _get_station_master() -> pd.DataFrame:
-    """Silver `station` 정류소 마스터를 station_id 인덱스로 캐시해 반환한다.
+    """최신 CELL_ID 보강 정류소 마스터를 station_id 인덱스로 캐시해 반환한다.
 
-    (feature_engine이 쓰는 1차정제 산출물 `config.STATION_MASTER_PARQUET`와는
-    별개 — 이건 collector Silver의 station_master를 실시간 조회용으로 직접 읽는다.
-    두 소스가 정류소 신설/폐쇄 시점에 따라 잠깐 어긋날 수 있으나, 서빙은 항상
-    "지금 실제로 존재하는 정류소" 기준이어야 하므로 Silver를 우선한다.)
+    normalizer의 station master 후처리가 API LAT/LOT를 실제 생활인구 격자와
+    공간 조인해 grid_id를 만든다. capacity와 이름은 일일 master 생성 이후 바뀔
+    수 있으므로 최신 bike realtime Silver로 한 번 더 보강한다.
 
     returns:
         pd.DataFrame: station_id로 인덱싱된 정류소 마스터 (station_no, capacity, lat, lon, grid_id)
     """
     global _station_master
     if _station_master is None:
-        raw = s3_io.read_parquet(silver_schema.STATION_MASTER_KEY)
+        keys = [
+            key
+            for key in s3_io.list_keys(silver_schema.STATION_MASTER_ENRICHED_PREFIX)
+            if key.endswith(".parquet")
+        ]
+        if not keys:
+            raise FileNotFoundError(
+                f"S3에 없음: {silver_schema.STATION_MASTER_ENRICHED_PREFIX} 아래 parquet"
+            )
+        raw = s3_io.read_parquet(max(keys))
         if raw is None:
-            raise FileNotFoundError(f"S3에 없음: {silver_schema.STATION_MASTER_KEY}")
-        _station_master = raw.rename(columns=silver_schema.STATION_COLUMN_MAP).set_index("station_id")
+            raise FileNotFoundError(f"S3에 없음: {max(keys)}")
+        master = raw.rename(columns=silver_schema.STATION_COLUMN_MAP)
+
+        realtime_keys = [
+            key
+            for key in s3_io.list_keys(f"silver/{silver_schema.BIKE_REALTIME_SOURCE_ID}/")
+            if key.endswith(".parquet")
+        ]
+        if realtime_keys:
+            realtime = s3_io.read_parquet(max(realtime_keys))
+            if realtime is not None:
+                realtime = realtime.rename(columns=silver_schema.BIKE_REALTIME_COLUMN_MAP)
+                supplement = realtime[["station_id", "station_name", "capacity"]].rename(
+                    columns={"station_name": "station_name_live", "capacity": "capacity_live"}
+                )
+                master = master.merge(supplement, on="station_id", how="left")
+                for column in ("station_name", "capacity"):
+                    live_column = f"{column}_live"
+                    if column in master:
+                        master[column] = master[live_column].combine_first(master[column])
+                    else:
+                        master[column] = master[live_column]
+                master = master.drop(columns=["station_name_live", "capacity_live"])
+        if "station_name" not in master:
+            master["station_name"] = master.get("ADDR1")
+        if "capacity" not in master:
+            master["capacity"] = np.nan
+        if "grid_id" not in master:
+            raise ValueError("보강 station master에 grid_id 컬럼이 없음")
+        grid_coverage = float(master["grid_id"].notna().mean())
+        if grid_coverage < 0.95:
+            raise ValueError(f"보강 station master의 grid_id 매핑률이 기준 미달: {grid_coverage:.3%}")
+        _station_master = master.set_index("station_id")
     return _station_master
 
 
 def _get_holidays() -> set[str]:
-    """2025년 공휴일 목록을 캐시해 반환한다.
+    """대한민국 공휴일 목록을 캐시해 반환한다.
+
+    학습과 동일한 2025 목록은 기존 analysis_summary를 우선 재사용한다. 운영
+    환경에 그 선택 산출물이 없거나 2026년 이후를 예측할 때도 동작하도록
+    python-holidays의 2025~2035 대한민국 달력을 합친다.
 
     returns:
-        set[str]: 'YYYY-MM-DD' 형식의 2025년 공휴일 집합
+        set[str]: 'YYYY-MM-DD' 형식의 공휴일 집합
     """
     global _holidays
     if _holidays is None:
-        _holidays = config.load_holidays_2025()
+        try:
+            configured = config.load_holidays_2025()
+        except FileNotFoundError:
+            configured = set()
+        korea = holidays_lib.KR(years=range(2025, 2036))
+        _holidays = configured | {day.isoformat() for day in korea}
     return _holidays
+
+
+def _nanmean_or_nan(values: Sequence[float]) -> float:
+    """전부 결측인 profile fallback은 경고 없이 NaN으로 유지한다."""
+    array = np.asarray(values, dtype=float)
+    valid = array[~np.isnan(array)]
+    return float(valid.mean()) if valid.size else np.nan
 
 
 def _get_station_profile() -> dict[tuple[str, int, int, int], dict[str, float]]:
@@ -506,16 +566,17 @@ def _get_population_profile() -> dict[tuple[str, int, int], dict[str, float]]:
     if _population_profile is None:
         df = s3_io.read_parquet(config.POPULATION_HOURLY_PROFILE_PARQUET)
         if df is None:
-            raise FileNotFoundError(f"S3에 없음: {config.POPULATION_HOURLY_PROFILE_PARQUET}")
-        _population_profile = {
-            (r.grid_id, r.hour, r.dow): {
-                "pop_resd_mean": r.pop_resd_mean,
-                "pop_long_foreign_mean": r.pop_long_foreign_mean,
-                "pop_short_foreign_mean": r.pop_short_foreign_mean,
-                "pop_total_mean": r.pop_total_mean,
+            _population_profile = {}
+        else:
+            _population_profile = {
+                (r.grid_id, r.hour, r.dow): {
+                    "pop_resd_mean": r.pop_resd_mean,
+                    "pop_long_foreign_mean": r.pop_long_foreign_mean,
+                    "pop_short_foreign_mean": r.pop_short_foreign_mean,
+                    "pop_total_mean": r.pop_total_mean,
+                }
+                for r in df.itertuples()
             }
-            for r in df.itertuples()
-        }
     return _population_profile
 
 
@@ -545,36 +606,113 @@ def _population_fallback(grid_id: str, ts: pd.Timestamp) -> dict[str, float]:
 # "그 시점 근처의 최근 값 하나"만 있으면 되므로 조회 범위가 훨씬 좁다. ---
 
 
-def _get_recent_weather(target_ts: pd.Timestamp, lookback_hours: float = 3) -> dict[str, float]:
-    """target_ts 시각(또는 그 근처)의 Silver 기상 관측값을 읽는다(서울 전체 공유).
+def _precip_mm(value: object) -> float:
+    """KMA의 숫자/문자열 강수량 표기를 모델 입력 단위(mm)로 바꾼다."""
+    if value is None or pd.isna(value):
+        return np.nan
+    if isinstance(value, (int, float, np.number)):
+        return float(value)
+    text = str(value).strip().replace(" ", "")
+    if not text or "강수없음" in text:
+        return 0.0
+    numbers = [float(token) for token in re.findall(r"\d+(?:\.\d+)?", text)]
+    if not numbers:
+        return np.nan
+    if "미만" in text:
+        return numbers[0] / 2
+    if "~" in text and len(numbers) >= 2:
+        return sum(numbers[:2]) / 2
+    return numbers[0]
 
-    `weather_ultra_short_live`(기상청 초단기실황, 10분 간격)을 쓴다 — 실제로는
-    `weather_short_term_forecast`(예보, 3시간 간격)도 있지만 그쪽은 강수량(mm)이
-    아니라 강수확률(%)만 제공해 `precip`과 단위가 안 맞고, 이 함수가 원래
-    "그 시점 근처 가장 최근 관측값"을 찾는 용도라 관측 소스가 의미상으로도 더
-    맞는다(자세한 내용은 `docs/collector/ml-integration-requests.md`). target_ts
-    키가 정확히 있으면 그걸, 없으면(수집 지연 또는 아직 도착 안 한 미래 시각)
-    거슬러 올라가 가장 최근 값을 대신 쓴다.
+
+def _weather_values(df: pd.DataFrame, column_map: dict[str, str]) -> dict[str, float] | None:
+    """서울 25개 격자의 값을 평균해 추론기가 쓰는 단일 날씨 벡터로 만든다."""
+    if df is None or df.empty:
+        return None
+    values = df.rename(columns=column_map)
+    required = {"temp", "precip", "wind", "humidity"}
+    if not required.issubset(values.columns):
+        return None
+    values = values.copy()
+    values["precip"] = values["precip"].map(_precip_mm)
+    for column in ("temp", "wind", "humidity"):
+        values[column] = pd.to_numeric(values[column], errors="coerce")
+    means = values[list(required)].mean(numeric_only=True)
+    if means.isna().any():
+        return None
+    return {column: float(means[column]) for column in ("temp", "precip", "wind", "humidity")}
+
+
+def _latest_forecast_snapshot(source_id: str, as_of_ts: pd.Timestamp) -> pd.DataFrame | None:
+    """as_of_ts에 이미 발행된 source의 최신 Silver 예보 파일을 반환한다."""
+    cache_key = (source_id, as_of_ts.floor("5min"))
+    if cache_key in _weather_forecast_snapshot_cache:
+        return _weather_forecast_snapshot_cache[cache_key]
+    cutoff = silver_schema.silver_key(source_id, as_of_ts)
+    keys = [
+        key
+        for key in s3_io.list_keys(silver_schema.source_prefix(source_id))
+        if key.endswith(".parquet") and key <= cutoff
+    ]
+    result = s3_io.read_parquet(max(keys)) if keys else None
+    _weather_forecast_snapshot_cache[cache_key] = result
+    return result
+
+
+def _forecast_weather(source_id: str, target_ts: pd.Timestamp, as_of_ts: pd.Timestamp) -> dict[str, float] | None:
+    """최신 발행본에서 target_ts와 가장 가까운 시간의 예보를 선택한다."""
+    df = _latest_forecast_snapshot(source_id, as_of_ts)
+    if df is None or df.empty or not {"fcstDate", "fcstTime"}.issubset(df.columns):
+        return None
+    valid_ts = pd.to_datetime(
+        df["fcstDate"].astype(str).str.zfill(8) + df["fcstTime"].astype(str).str.zfill(4),
+        format="%Y%m%d%H%M",
+        errors="coerce",
+    )
+    distances = (valid_ts - target_ts).abs()
+    if distances.isna().all() or distances.min() > pd.Timedelta(minutes=35):
+        return None
+    selected = df.loc[distances == distances.min()]
+    return _weather_values(selected, silver_schema.WEATHER_FORECAST_COLUMN_MAPS[source_id])
+
+
+def _get_recent_weather(
+    target_ts: pd.Timestamp,
+    lookback_hours: float = 3,
+    *,
+    as_of_ts: pd.Timestamp | None = None,
+) -> dict[str, float]:
+    """가용 시점 기준으로 실황·초단기예보·단기예보를 선택한다(서울 평균).
+
+    현재 horizon은 `weather_10min`의 초단기실황을 사용한다. 미래 horizon은 같은
+    DAG의 초단기예보를 먼저 찾고, 범위를 벗어나면 `weather_3h`의 단기예보를 쓴다.
+    모든 조회는 as_of_ts 이전에 저장된 파일만 선택해 미래 정보 누출을 막는다.
 
     args:
         target_ts: 조회하려는 시각(horizon에 따라 미래일 수 있음)
         lookback_hours: target_ts 키가 없을 때 몇 시간 전까지 대신 찾아볼지
+        as_of_ts: 추론 기준 시각. 생략하면 target_ts와 같음
     returns:
         dict[str, float]: temp, precip, wind, humidity
     raises:
         ValueError: target_ts부터 lookback_hours시간 전까지 전부 데이터가 없을 때
     """
-    keys = silver_schema.weather_tick_keys(target_ts, lookback_hours)
+    as_of_ts = target_ts if as_of_ts is None else as_of_ts
+    if target_ts > as_of_ts:
+        for source_id in (
+            silver_schema.WEATHER_ULTRA_FORECAST_SOURCE_ID,
+            silver_schema.WEATHER_SHORT_FORECAST_SOURCE_ID,
+        ):
+            forecast = _forecast_weather(source_id, target_ts, as_of_ts)
+            if forecast is not None:
+                return forecast
+
+    keys = silver_schema.weather_tick_keys(as_of_ts, lookback_hours)
     for df in reversed(s3_io.read_parquet_many(keys)):  # target_ts에 가장 가까운 것부터
-        if df is not None and not df.empty:
-            row = df.rename(columns=silver_schema.WEATHER_COLUMN_MAP).iloc[-1]
-            return {
-                "temp": float(row["temp"]),
-                "precip": float(row["precip"]),
-                "wind": float(row["wind"]),
-                "humidity": float(row["humidity"]),
-            }
-    raise ValueError(f"최근 {lookback_hours}시간 안에 날씨 데이터가 없습니다(target_ts={target_ts})")
+        weather = _weather_values(df, silver_schema.WEATHER_COLUMN_MAP)
+        if weather is not None:
+            return weather
+    raise ValueError(f"최근 {lookback_hours}시간 안에 날씨 데이터가 없습니다(as_of_ts={as_of_ts})")
 
 
 def _get_recent_bike_status(anchor_ts: pd.Timestamp, lookback_hours: float = 1.0) -> pd.DataFrame:
@@ -714,13 +852,13 @@ def _lag_rolling_features(
 
             mean_val = vals.mean()
             if pd.isna(mean_val):  # 윈도우 전체가 비어있을 때만 fallback
-                mean_val = float(np.nanmean([_profile_stat(station_id, t, mean_key) for t in idx]))
+                mean_val = _nanmean_or_nan([_profile_stat(station_id, t, mean_key) for t in idx])
                 fallback_fields.append(f"{prefix}_roll_mean_{window}h")
             out[f"{prefix}_roll_mean_{window}h"] = mean_val
 
             std_val = vals.std()
             if pd.isna(std_val):  # 표본이 0~1개라 표준편차를 못 구할 때도 포함
-                std_val = float(np.nanmean([_profile_stat(station_id, t, std_key) for t in idx]))
+                std_val = _nanmean_or_nan([_profile_stat(station_id, t, std_key) for t in idx])
                 fallback_fields.append(f"{prefix}_roll_std_{window}h")
             out[f"{prefix}_roll_std_{window}h"] = std_val
 
@@ -772,13 +910,13 @@ def _censored_rental_recent(
 
         mean_val = vals.mean()
         if pd.isna(mean_val):  # anchor 전체가 데이터 커버리지 밖일 때만 fallback
-            mean_val = float(np.nanmean([_profile_stat(station_id, t, mean_key) for t in anchors]))
+            mean_val = _nanmean_or_nan([_profile_stat(station_id, t, mean_key) for t in anchors])
             fallback_fields.append(f"rental_roll_mean_{window}h")
         out[f"rental_roll_mean_{window}h"] = mean_val
 
         std_val = vals.std()
         if pd.isna(std_val):  # 표본이 0~1개라 표준편차를 못 구할 때도 포함
-            std_val = float(np.nanmean([_profile_stat(station_id, t, std_key) for t in anchors]))
+            std_val = _nanmean_or_nan([_profile_stat(station_id, t, std_key) for t in anchors])
             fallback_fields.append(f"rental_roll_std_{window}h")
         out[f"rental_roll_std_{window}h"] = std_val
 
@@ -1148,14 +1286,14 @@ def _rental_recent_batch(
         mean_vals = sub.mean(axis=1)  # skipna 기본 True
         missing_mean = mean_vals.isna()
         for sid in station_index[missing_mean]:
-            mean_vals.loc[sid] = float(np.nanmean([_profile_stat(sid, t, mean_key) for t in anchors]))
+            mean_vals.loc[sid] = _nanmean_or_nan([_profile_stat(sid, t, mean_key) for t in anchors])
             fallback[sid].append(f"rental_roll_mean_{window}h")
         out[f"rental_roll_mean_{window}h"] = mean_vals
 
         std_vals = sub.std(axis=1)  # ddof=1 기본값, 표본 0~1개면 NaN(원본과 동일)
         missing_std = std_vals.isna()
         for sid in station_index[missing_std]:
-            std_vals.loc[sid] = float(np.nanmean([_profile_stat(sid, t, std_key) for t in anchors]))
+            std_vals.loc[sid] = _nanmean_or_nan([_profile_stat(sid, t, std_key) for t in anchors])
             fallback[sid].append(f"rental_roll_std_{window}h")
         out[f"rental_roll_std_{window}h"] = std_vals
 
@@ -1234,7 +1372,9 @@ def predict_demand_multi_hour(
         h_precip = None if precip is None else _resolve_weather_for_horizon(precip, h, n_hours, "precip")
         h_wind = None if wind is None else _resolve_weather_for_horizon(wind, h, n_hours, "wind")
         h_humidity = None if humidity is None else _resolve_weather_for_horizon(humidity, h, n_hours, "humidity")
-        h_temp, h_precip, h_wind, h_humidity = _resolve_live_weather(target_ts, h_temp, h_precip, h_wind, h_humidity)
+        h_temp, h_precip, h_wind, h_humidity = _resolve_live_weather(
+            target_ts, h_temp, h_precip, h_wind, h_humidity, as_of_ts=anchor_ts
+        )
         target_fields, population_fallback = _build_target_time_fields(
             station_id, station_row, target_ts,
             h_temp, h_precip, h_wind, h_humidity,
@@ -1249,6 +1389,11 @@ def predict_demand_multi_hour(
     batch_df = pd.DataFrame(records).astype(FEATURE_COLUMN_DTYPES)
     batch_df["rental_exposure"] = batch_df["rental_exposure"].astype(RENTAL_EXPOSURE_DTYPE)
     rental_batch = predict(batch_df, "rental", exposure_col="rental_exposure")
+    # 전체 배치 CLI는 rental/return을 한 번씩만 채점한다. rental Booster 4개를
+    # 캐시에 둔 채 return Booster 4개를 더 읽으면 컨테이너 peak memory가 커지므로
+    # 첫 모델군을 명시적으로 해제한다.
+    scoring_io.load_boosters.cache_clear()
+    gc.collect()
     return_batch = predict(batch_df, "return", exposure_col=None)
 
     results = []
@@ -1411,7 +1556,9 @@ def predict_demand_multi_hour_all_stations(
         t_precip = None if precip is None else _resolve_weather_for_horizon(precip, h, n_hours, "precip")
         t_wind = None if wind is None else _resolve_weather_for_horizon(wind, h, n_hours, "wind")
         t_humidity = None if humidity is None else _resolve_weather_for_horizon(humidity, h, n_hours, "humidity")
-        t_temp, t_precip, t_wind, t_humidity = _resolve_live_weather(target_ts, t_temp, t_precip, t_wind, t_humidity)
+        t_temp, t_precip, t_wind, t_humidity = _resolve_live_weather(
+            target_ts, t_temp, t_precip, t_wind, t_humidity, as_of_ts=anchor_ts
+        )
         for sid in alive_station_ids:
             sid_stockout, sid_stockout_fallback = _stockout_from_status(sid, bike_status, stockout)
             target_fields, population_fallback = _build_target_time_fields(
@@ -1430,8 +1577,13 @@ def predict_demand_multi_hour_all_stations(
     # 정류소×horizon마다 반복하면 그 자체가 병목이었다(history.md 23번 항목).
     batch_df = pd.DataFrame(all_records).astype(FEATURE_COLUMN_DTYPES)
     batch_df["rental_exposure"] = batch_df["rental_exposure"].astype(RENTAL_EXPOSURE_DTYPE)
+    print(f"[inference] feature batch ready rows={len(batch_df):,}", flush=True)
     rental_batch = predict(batch_df, "rental", exposure_col="rental_exposure")
+    print("[inference] rental scoring complete", flush=True)
+    scoring_io.load_boosters.cache_clear()
+    gc.collect()
     return_batch = predict(batch_df, "return", exposure_col=None)
+    print("[inference] return scoring complete", flush=True)
 
     results = []
     for i, record in enumerate(all_records):
@@ -1467,7 +1619,13 @@ def predict_demand_multi_hour_all_stations(
 
 
 def _resolve_live_weather(
-    target_ts: pd.Timestamp, temp: float | None, precip: float | None, wind: float | None, humidity: float | None
+    target_ts: pd.Timestamp,
+    temp: float | None,
+    precip: float | None,
+    wind: float | None,
+    humidity: float | None,
+    *,
+    as_of_ts: pd.Timestamp | None = None,
 ) -> tuple[float, float, float, float]:
     """넷 중 하나라도 None이면 target_ts 기준 Silver 실시간 날씨로 나머지도 같이 채운다.
 
@@ -1476,7 +1634,7 @@ def _resolve_live_weather(
     같은 관측 하나에서 나온 값끼리 일관되게 채워지도록 조회는 항상 한 번만 한다.)
     """
     if temp is None or precip is None or wind is None or humidity is None:
-        weather = _get_recent_weather(target_ts)
+        weather = _get_recent_weather(target_ts, as_of_ts=as_of_ts)
         temp = weather["temp"] if temp is None else temp
         precip = weather["precip"] if precip is None else precip
         wind = weather["wind"] if wind is None else wind
@@ -1643,8 +1801,11 @@ def predict_return_demand(
         ValueError: station_id가 station_master에 없거나 hour/minute/horizon이
             범위를 벗어날 때(`_build_feature_record()` 참고)
     """
-    target_ts = _target_timestamp(date, hour, minute) + pd.Timedelta(hours=horizon - 1)
-    temp, precip, wind, humidity = _resolve_live_weather(target_ts, temp, precip, wind, humidity)
+    anchor_ts = _target_timestamp(date, hour, minute)
+    target_ts = anchor_ts + pd.Timedelta(hours=horizon - 1)
+    temp, precip, wind, humidity = _resolve_live_weather(
+        target_ts, temp, precip, wind, humidity, as_of_ts=anchor_ts
+    )
     return _predict_at(
         "return",
         None,
@@ -1852,5 +2013,3 @@ def main(argv: list[str] | None = None) -> None:
 
 if __name__ == "__main__":
     main()
-
-

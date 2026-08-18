@@ -7,11 +7,15 @@ collector/storage.py와 loader/s3_reader.py는 window_start 객체가 들고 있
 모든 태스크 빌더는 이 파일의 상수만 가져다 쓰고, 각자 시간대 변환을 다시 하지
 않는다 — KST 오프셋(+09:00)만 파이프라인 전체에서 사용한다.
 
-4개 DAG 모두 CronTriggerTimetable(시간 기반) 스케줄이라 logical_date가 항상
-채워진다.
+수동 trigger의 logical_date는 19:33처럼 5분 경계가 아닐 수 있다. 모든
+컴포넌트가 같은 Silver key를 사용하고 inference의 5분 그리드 계약을
+만족하도록 공통 기준 시각을 5분 단위로 내림한다.
 """
 
-KST_WINDOW_START = '{{ (dag_run.logical_date or dag_run.start_date).astimezone(macros.dateutil.tz.gettz("Asia/Seoul")).isoformat() }}'
-KST_DATE = '{{ (dag_run.logical_date or dag_run.start_date).astimezone(macros.dateutil.tz.gettz("Asia/Seoul")).strftime("%Y-%m-%d") }}'
-KST_HOUR = '{{ (dag_run.logical_date or dag_run.start_date).astimezone(macros.dateutil.tz.gettz("Asia/Seoul")).hour }}'
-KST_MINUTE = '{{ (dag_run.logical_date or dag_run.start_date).astimezone(macros.dateutil.tz.gettz("Asia/Seoul")).minute }}'
+_KST_RUN_TS = '(dag_run.logical_date or dag_run.start_date).astimezone(macros.dateutil.tz.gettz("Asia/Seoul"))'
+_KST_WINDOW_TS = f"{_KST_RUN_TS}.replace(minute=({_KST_RUN_TS}.minute // 5) * 5, second=0, microsecond=0)"
+
+KST_WINDOW_START = "{{ " + _KST_WINDOW_TS + ".isoformat() }}"
+KST_DATE = "{{ " + _KST_WINDOW_TS + '.strftime("%Y-%m-%d") }}'
+KST_HOUR = "{{ " + _KST_WINDOW_TS + ".hour }}"
+KST_MINUTE = "{{ " + _KST_WINDOW_TS + ".minute }}"
