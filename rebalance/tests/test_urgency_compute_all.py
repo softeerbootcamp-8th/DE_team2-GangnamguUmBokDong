@@ -32,23 +32,50 @@ def _put_tick(window_start: datetime, rows: list[dict]) -> None:
     _put_parquet(key, pa.Table.from_pylist(rows))
 
 
+_GANGNAM_LAT, _GANGNAM_LON = 37.5172, 127.0473
+
+
+def _tick_row(sta_id: str, current: int, hold_cnt: int) -> dict:
+    return {
+        "stationId": sta_id,
+        "parkingBikeTotCnt": current,
+        "rackTotCnt": hold_cnt,
+        "stationLatitude": _GANGNAM_LAT,
+        "stationLongitude": _GANGNAM_LON,
+    }
+
+
 def test_compute_all_detects_declining_trend_without_predictions():
     # 14:00에 10대 -> 14:05(anchor)에 5대. hold_cnt(rackTotCnt)=10.
-    _put_tick(pd.Timestamp(2026, 8, 16, 14, 0), [{"stationId": "101", "parkingBikeTotCnt": 10, "rackTotCnt": 10}])
-    _put_tick(ANCHOR, [{"stationId": "101", "parkingBikeTotCnt": 5, "rackTotCnt": 10}])
+    _put_tick(pd.Timestamp(2026, 8, 16, 14, 0), [_tick_row("101", current=10, hold_cnt=10)])
+    _put_tick(ANCHOR, [_tick_row("101", current=5, hold_cnt=10)])
 
     result = compute_all(ANCHOR)
 
-    assert list(result.columns) == ["sta_id", "urgency_score", "minutes_until_critical", "action_type"]
+    assert list(result.columns) == [
+        "sta_id",
+        "lat",
+        "lon",
+        "urgency_score",
+        "minutes_until_critical",
+        "action_type",
+        "bike_qty",
+    ]
     [row] = result.to_dict("records")
     assert row["sta_id"] == "101"
-    # 분당 -1대 추세, 현재 5대 -> 0석까지 5분. 예측 없어 severity 0.
-    assert (row["urgency_score"], row["minutes_until_critical"], row["action_type"]) == (0.0, 5, "supply_needed")
+    assert (row["lat"], row["lon"]) == (_GANGNAM_LAT, _GANGNAM_LON)
+    # 분당 -1대 추세, 현재 5대 -> 0석까지 5분. 예측 없어 severity 0, bike_qty도 0.
+    assert (row["urgency_score"], row["minutes_until_critical"], row["action_type"], row["bike_qty"]) == (
+        0.0,
+        5,
+        "supply_needed",
+        0,
+    )
 
 
 def test_compute_all_combines_stock_history_with_predictions():
-    _put_tick(pd.Timestamp(2026, 8, 16, 14, 0), [{"stationId": "101", "parkingBikeTotCnt": 5, "rackTotCnt": 10}])
-    _put_tick(ANCHOR, [{"stationId": "101", "parkingBikeTotCnt": 5, "rackTotCnt": 10}])
+    _put_tick(pd.Timestamp(2026, 8, 16, 14, 0), [_tick_row("101", current=5, hold_cnt=10)])
+    _put_tick(ANCHOR, [_tick_row("101", current=5, hold_cnt=10)])
 
     predictions_key = f"predictions/dt={ANCHOR:%Y-%m-%d}/hh={ANCHOR:%H}/inference_{ANCHOR:%H%M}.parquet"
     predictions = pd.DataFrame(
@@ -80,6 +107,12 @@ def test_compute_all_combines_stock_history_with_predictions():
     [row] = result.to_dict("records")
     # 재고 추세는 평탄(0)이라 트렌드 감지 없음 -> 예측 감지로 2번째(index 1)
     # 지점에서 처음 supply_needed -> (1+1)*60=120분 뒤. severity는 _max_deficit(현재
-    # 5 -> 1건 대여로 4 -> 8건 대여로 -4, 최대 부족량 4) 기준 ratio=4/10, score=8.3.
+    # 5 -> 1건 대여로 4 -> 8건 대여로 -4, 최대 부족량 4) 기준 ratio=4/10, score=8.3,
+    # bike_qty도 같은 부족량(4).
     assert row["sta_id"] == "101"
-    assert (row["urgency_score"], row["minutes_until_critical"], row["action_type"]) == (8.3, 120, "supply_needed")
+    assert (row["urgency_score"], row["minutes_until_critical"], row["action_type"], row["bike_qty"]) == (
+        8.3,
+        120,
+        "supply_needed",
+        4,
+    )

@@ -17,6 +17,15 @@ _BIKE_REALTIME_SOURCE_ID = "bike_station_realtime"
 _BIKE_REALTIME_TICK_MINUTES = 5
 
 
+def anchor_timestamp(date: str, hour: int, minute: int) -> pd.Timestamp:
+    """date+hour+minute(KST 벽시계 시각)을 합쳐 anchor 시각을 만든다. S3 dt=/hh=/HHMM
+    파티션 키(추론기·loader와 동일 규칙)를 그대로 여기서도 쓴다. main.py/routes_main.py
+    둘 다 쓰는 공용 헬퍼라 reader.py에 둔다. ml/inference의 _target_timestamp와 같은
+    이유로 pd.Timestamp를 쓴다(naive datetime을 datetime.strptime으로 직접 만들면
+    tzinfo 누락으로 오해되기 쉬움)."""
+    return pd.Timestamp(date) + pd.Timedelta(hours=hour, minutes=minute)
+
+
 def _silver_key(source_id: str, window_start: datetime) -> str:
     return f"silver/{source_id}/dt={window_start:%Y-%m-%d}/hh={window_start:%H}/{window_start:%H%M}.parquet"
 
@@ -40,16 +49,17 @@ def _bike_realtime_tick_keys(anchor: datetime, lookback_minutes: int) -> list[tu
 def read_recent_stock(anchor: datetime, lookback_minutes: int = 25) -> dict[str, list[dict]]:
     """최근 lookback_minutes 동안의 5분 tick 재고 이력을 대여소별로 묶어서 반환한다.
 
-    각 포인트는 {"observed_at", "parking_bike_tot_cnt", "hold_cnt"}를 담는다 —
-    urgency.urgency_score의 stock_history 인자(과거 apps/api/queries.py의
-    fetch_all_stock_history와 동일한 형태)로 바로 쓸 수 있고, hold_cnt는 가장 최근
-    포인트에서 "현재 재고/정원"을 뽑아 쓰는 용도다(rebalance/urgency.py 참고). 같은
-    tick 파일(bike_station_realtime)에 재고(parkingBikeTotCnt)와 정원(rackTotCnt)이
-    함께 있어 별도 RDS 조회가 필요 없다.
+    각 포인트는 {"observed_at", "parking_bike_tot_cnt", "hold_cnt", "lat", "lon"}를
+    담는다 — urgency.urgency_score의 stock_history 인자(과거 apps/api/queries.py의
+    fetch_all_stock_history와 동일한 형태)로 바로 쓸 수 있고, hold_cnt/lat/lon은
+    가장 최근 포인트에서 "현재 재고/정원/위경도"를 뽑아 쓰는 용도다(rebalance/urgency.py,
+    routes.py 참고 — routes.py가 권역 배정에 쓰는 위경도도 같은 tick 파일에 있어
+    별도 RDS 조회가 필요 없다).
     """
     history: dict[str, list[dict]] = {}
+    columns = ["stationId", "parkingBikeTotCnt", "rackTotCnt", "stationLatitude", "stationLongitude"]
     for observed_at, key in _bike_realtime_tick_keys(anchor, lookback_minutes):
-        df = read_parquet(key, columns=["stationId", "parkingBikeTotCnt", "rackTotCnt"])
+        df = read_parquet(key, columns=columns)
         if df is None or df.empty:
             continue
         for row in df.itertuples(index=False):
@@ -58,6 +68,8 @@ def read_recent_stock(anchor: datetime, lookback_minutes: int = 25) -> dict[str,
                     "observed_at": observed_at,
                     "parking_bike_tot_cnt": int(row.parkingBikeTotCnt),
                     "hold_cnt": int(row.rackTotCnt),
+                    "lat": float(row.stationLatitude),
+                    "lon": float(row.stationLongitude),
                 }
             )
     return history

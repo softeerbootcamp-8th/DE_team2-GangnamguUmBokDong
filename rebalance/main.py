@@ -11,18 +11,10 @@ import argparse
 import sys
 from datetime import datetime
 
-import pandas as pd
 from core.s3 import write_parquet
 
 import urgency
-
-
-def _anchor_timestamp(date: str, hour: int, minute: int) -> pd.Timestamp:
-    """date+hour+minute(KST 벽시계 시각)을 합쳐 anchor 시각을 만든다. S3 dt=/hh=/HHMM
-    파티션 키(추론기·loader와 동일 규칙)를 그대로 여기서도 쓴다. ml/inference의
-    _target_timestamp와 같은 이유로 pd.Timestamp를 쓴다(naive datetime을
-    datetime.strptime으로 직접 만들면 tzinfo 누락으로 오해되기 쉬움)."""
-    return pd.Timestamp(date) + pd.Timedelta(hours=hour, minutes=minute)
+from reader import anchor_timestamp
 
 
 def _urgency_key(window_start: datetime) -> str:
@@ -36,7 +28,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--minute", type=int, required=True)
     args = parser.parse_args(argv)
 
-    anchor = _anchor_timestamp(args.date, args.hour, args.minute)
+    anchor = anchor_timestamp(args.date, args.hour, args.minute)
     result = urgency.compute_all(anchor)
 
     out_path = _urgency_key(anchor)

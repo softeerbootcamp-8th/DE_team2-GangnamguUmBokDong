@@ -111,6 +111,15 @@ def _severity(ratio: float) -> float:
     return 1 - math.exp(-ratio / SEVERITY_SCALE)
 
 
+def bike_qty(current: int, hold_cnt: int, action_type: str, points: list[dict]) -> int:
+    """실제로 옮겨야 할 자전거 대수. urgency_score의 severity 계산에 쓰이는 것과
+    같은 로직이다(회수필요는 정원 초과분, 공급필요는 부족분과 미충족수요 중 더 큰
+    값) — 재배치 라우트 생성(rebalance/routes.py)이 "몇 대를 실을지" 정하는 데 쓴다."""
+    if action_type == "retrieval_needed":
+        return _max_overshoot(current, hold_cnt, points)
+    return max(_max_deficit(current, points), _max_unmet_demand(current, hold_cnt, points))
+
+
 def urgency_score(
     current: int,
     hold_cnt: int,
@@ -157,10 +166,7 @@ def urgency_score(
     # hold_cnt=0(신규/이상 등록 등)인 대여소가 들어오면 division by zero로 배치가
     # 죽으므로, 최소 1로 방어한다.
     safe_hold_cnt = max(hold_cnt, 1)
-    if action_type == "retrieval_needed":
-        ratio = _max_overshoot(current, hold_cnt, points) / safe_hold_cnt
-    else:
-        ratio = max(_max_deficit(current, points), _max_unmet_demand(current, hold_cnt, points)) / safe_hold_cnt
+    ratio = bike_qty(current, hold_cnt, action_type, points) / safe_hold_cnt
     impact_factor = _severity(ratio)
 
     score = round(100 * time_factor * impact_factor, 1)
@@ -208,9 +214,15 @@ def compute_all(anchor: datetime) -> pd.DataFrame:
         rows.append(
             {
                 "sta_id": sta_id,
+                "lat": history[-1]["lat"],
+                "lon": history[-1]["lon"],
                 "urgency_score": score,
                 "minutes_until_critical": minutes,
                 "action_type": action_type,
+                "bike_qty": bike_qty(current, hold_cnt, action_type, points),
             }
         )
-    return pd.DataFrame(rows, columns=["sta_id", "urgency_score", "minutes_until_critical", "action_type"])
+    return pd.DataFrame(
+        rows,
+        columns=["sta_id", "lat", "lon", "urgency_score", "minutes_until_critical", "action_type", "bike_qty"],
+    )
