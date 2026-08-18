@@ -50,7 +50,8 @@ def _set_return_history(station_id: str, point, return_count: float = 0.0) -> No
 
 def _set_station_master(station_ids: list[str]) -> None:
     ps._station_master = pd.DataFrame(
-        {"capacity": [10.0] * len(station_ids), "lat": [37.5] * len(station_ids), "lon": [127.0] * len(station_ids),
+        {"station_no": list(range(1, len(station_ids) + 1)),
+         "capacity": [10.0] * len(station_ids), "lat": [37.5] * len(station_ids), "lon": [127.0] * len(station_ids),
          "grid_id": ["G1"] * len(station_ids)},
         index=pd.Index(station_ids, name="station_id"),
     )

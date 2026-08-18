@@ -22,12 +22,17 @@ from . import config
 def build_station_profile() -> pd.DataFrame:
     """station x hour x dow x month별 대여/반납 평균·표준편차 프로필을 만든다.
 
+    station_id(텍스트)가 아니라 station_no(정수)로 묶는다 — predict_single.py의
+    lag/rolling 계산이 station_no 기준으로 통일됐고(model_contract.BASE_FEATURE_COLUMNS
+    참고), MERGED_TABLE_PARQUET 자체도 station_no만 담도록 바뀌었다(station_id는
+    이 큰 테이블엔 아예 없음, build_merged_table.py 모듈 docstring 참고).
+
     returns:
-        pd.DataFrame: station_id, hour, dow, month, rental_mean, rental_std,
+        pd.DataFrame: station_no, hour, dow, month, rental_mean, rental_std,
             return_mean, return_std, n_samples
     """
     df = s3_io.read_parquet(
-        config.MERGED_TABLE_PARQUET, columns=["station_id", "date", "hour", "rental_count", "return_count"]
+        config.MERGED_TABLE_PARQUET, columns=["station_no", "date", "hour", "rental_count", "return_count"]
     )
     if df is None:
         raise FileNotFoundError(f"S3에 없음: {config.MERGED_TABLE_PARQUET}")
@@ -37,7 +42,7 @@ def build_station_profile() -> pd.DataFrame:
     df["dow"] = dt.dt.dayofweek.astype("int8")
     df["month"] = dt.dt.month.astype("int8")
 
-    profile = df.groupby(["station_id", "hour", "dow", "month"], observed=True).agg(
+    profile = df.groupby(["station_no", "hour", "dow", "month"], observed=True).agg(
         rental_mean=("rental_count", "mean"),
         rental_std=("rental_count", "std"),
         return_mean=("return_count", "mean"),
@@ -59,7 +64,7 @@ def build_station_profile() -> pd.DataFrame:
     s3_io.write_parquet(profile, config.STATION_HOURLY_PROFILE_PARQUET)
     print(
         f"station_hourly_profile: {profile.shape[0]:,}행 "
-        f"({df['station_id'].nunique()}개 정류소 x 24시간 x 7요일 x 12개월), "
+        f"({df['station_no'].nunique()}개 정류소 x 24시간 x 7요일 x 12개월), "
         f"그룹당 표본 수 min={profile['n_samples'].min()} max={profile['n_samples'].max()} "
         f"-> {config.STATION_HOURLY_PROFILE_PARQUET}"
     )

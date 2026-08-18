@@ -2,9 +2,9 @@
 
 **왜 따로 뺐는가**: 학습(`training/train_common.py`)과 서빙(`inference/predict_common.py`,
 `inference/predict_single.py`)이 서로 다른 인스턴스에서 돌아가지만, 둘 다 LightGBM에
-**정확히 같은 순서·같은 station_id 카테고리 인코딩**으로 feature를 넣어야 한다 —
+**정확히 같은 순서·같은 station_no 카테고리 인코딩**으로 feature를 넣어야 한다 —
 하나라도 어긋나면 모델이 조용히 엉뚱한 컬럼을 다른 의미로 읽는 사고가 난다. 이
-계약(feature 목록 + station_id 카테고리 저장/로드)을 두 인스턴스가 각자 복사해
+계약(feature 목록 + station_no 카테고리 저장/로드)을 두 인스턴스가 각자 복사해
 두면 한쪽만 고치고 잊어버리는 사고가 나므로, `ml_core/`으로 모아 양쪽이 같은
 모듈을 import하게 한다.
 
@@ -58,6 +58,11 @@ NATIVE_COLUMN_DTYPES = {
     "is_holiday": "int8",
     "horizon": "int8",  # 1~HORIZON_COUNT(기본 12) — common_config.HORIZON_COUNT 참고
     "day": "uint16",
+    # station_no(station_id 대신 모델이 실제로 쓰는 정류소 카테고리 키)도 day와
+    # 같은 이유로 uint16 — 카테고리 코드 자체는 load_station_dtype()이 별도 관리한다
+    # (아래 _feature_column_dtypes()가 station_no는 이 dtype 매핑에서 빼고 카테고리로만
+    # 다룬다 — station_id를 빼던 것과 같은 이유).
+    "station_no": "uint16",
     # int16이 아니라 float32인 이유: 둘 다 결측 가능하다 — 배치(feature_engine)는
     # LEFT JOIN 결과가 그리드 구멍에서 null일 수 있고, 서빙(predict_single.py)은
     # profile fallback마저 실패하면 np.nan을 그대로 채운다. pandas의 plain int16은
@@ -70,9 +75,9 @@ RENTAL_EXPOSURE_DTYPE = "float32"  # features.py의 rental_exposure와 동일(FE
 
 
 def _feature_column_dtypes(feature_columns: list[str]) -> dict[str, str]:
-    """station_id(카테고리 코드는 load_station_dtype()이 별도 관리)를 뺀 나머지
+    """station_no(카테고리 코드는 load_station_dtype()이 별도 관리)를 뺀 나머지
     feature 컬럼의 dtype 매핑을 만든다."""
-    return {col: NATIVE_COLUMN_DTYPES[col] for col in feature_columns if col != "station_id"}
+    return {col: NATIVE_COLUMN_DTYPES[col] for col in feature_columns if col != "station_no"}
 
 
 # pandas DataFrame.astype(dict)는 dict에 그 df에 없는 키가 하나라도 있으면
@@ -84,7 +89,7 @@ RETURN_FEATURE_COLUMN_DTYPES = _feature_column_dtypes(RETURN_FEATURE_COLUMNS)
 
 
 def station_categories_path(model_name: str, models_prefix: str | None = None) -> str:
-    """model_name에 대응하는 station_id 카테고리 목록 json의 S3 키를 반환한다.
+    """model_name에 대응하는 station_no 카테고리 목록 json의 S3 키를 반환한다.
 
     args:
         model_name: "rental" 또는 "return"
@@ -98,7 +103,7 @@ def station_categories_path(model_name: str, models_prefix: str | None = None) -
 
 
 def load_station_dtype(model_name: str, models_prefix: str | None = None) -> pd.CategoricalDtype:
-    """학습 때 고정한 station_id 카테고리 목록을 그대로 불러온다 (predict에서 코드 어긋남 방지용).
+    """학습 때 고정한 station_no 카테고리 목록을 그대로 불러온다 (predict에서 코드 어긋남 방지용).
 
     args:
         model_name: "rental" 또는 "return"
@@ -109,7 +114,7 @@ def load_station_dtype(model_name: str, models_prefix: str | None = None) -> pd.
             station_categories가 항상 같은 archive_prefix에서 나오게 한다).
             명시적으로 주면(실험/스윕 등) 그 값을 그대로 쓴다.
     returns:
-        pd.CategoricalDtype: 학습 시점과 동일한 순서의 station_id 카테고리
+        pd.CategoricalDtype: 학습 시점과 동일한 순서의 station_no 카테고리
     raises:
         FileNotFoundError: station_categories가 없을 때, 또는(models_prefix가
             None인데) 아직 한 번도 승격된 적 없을 때

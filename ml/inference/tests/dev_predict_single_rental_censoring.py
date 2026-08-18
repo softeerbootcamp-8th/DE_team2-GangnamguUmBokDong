@@ -15,6 +15,8 @@ from ml_core.rolling_window_features import count_visible_in_window
 from inference import config
 from inference import predict_single as ps
 
+STATION_NO = 1  # 테스트 station "A"의 station_no — profile fallback 조회에만 쓰인다
+
 
 def _trip(station, start, end=None):
     return {
@@ -67,7 +69,7 @@ def _set_return_history(station_id: str, point, return_count: float) -> None:
 
 
 def _set_profile(entries: dict) -> None:
-    """entries: {(station_id, hour, dow, month): {"rental_mean":..., "rental_std":..., ...}}"""
+    """entries: {(station_no, hour, dow, month): {"rental_mean":..., "rental_std":..., ...}}"""
     ps._station_profile = entries
 
 
@@ -84,7 +86,7 @@ def test_rental_lag_1h_matches_count_visible_in_window():
     _set_profile({})
 
     target_ts = pd.Timestamp("2025-06-01 10:00:00")
-    out, fallback = ps._lag_rolling_features("A", target_ts)
+    out, fallback = ps._lag_rolling_features("A", STATION_NO, target_ts)
 
     expected = count_visible_in_window(
         trips, as_of=target_ts, window_minutes=config.ROLLING_WINDOW_MINUTES, embargo_minutes=config.ROLLING_EMBARGO_MINUTES
@@ -102,7 +104,7 @@ def test_rental_recent_zero_trips_in_window_is_not_fallback():
     _set_profile({})
 
     target_ts = pd.Timestamp("2025-06-01 10:00:00")  # 윈도우 [08:20,09:20) 안에 트립 없음
-    out, fallback = ps._lag_rolling_features("A", target_ts)
+    out, fallback = ps._lag_rolling_features("A", STATION_NO, target_ts)
 
     assert out["rental_lag_1h"] == 0.0
     assert "rental_lag_1h" not in fallback
@@ -114,7 +116,7 @@ def test_rental_recent_fallback_when_target_outside_coverage():
     _set_return_history("A", "2026-08-01 07:00:00", 0.0)
     _set_profile(
         {
-            ("A", h, dow, m): {"rental_mean": 7.0, "rental_std": 1.5, "return_mean": 3.0, "return_std": 0.5}
+            (STATION_NO, h, dow, m): {"rental_mean": 7.0, "rental_std": 1.5, "return_mean": 3.0, "return_std": 0.5}
             for h in range(24)
             for dow in range(7)
             for m in range(1, 13)
@@ -122,7 +124,7 @@ def test_rental_recent_fallback_when_target_outside_coverage():
     )
 
     target_ts = pd.Timestamp("2026-08-01 08:00:00")  # 트립 커버리지(2025-06-01 하루)와 전혀 안 겹침
-    out, fallback = ps._lag_rolling_features("A", target_ts)
+    out, fallback = ps._lag_rolling_features("A", STATION_NO, target_ts)
 
     assert "rental_lag_1h" in fallback
     assert out["rental_lag_1h"] == pytest.approx(7.0)
@@ -135,7 +137,7 @@ def test_return_lag_1h_uses_exactly_one_hour_ago_history():
     _set_return_history("A", target_ts - pd.Timedelta(hours=1), 4.0)
     _set_profile({})
 
-    out, fallback = ps._lag_rolling_features("A", target_ts)
+    out, fallback = ps._lag_rolling_features("A", STATION_NO, target_ts)
 
     assert out["return_lag_1h"] == 4.0
     assert "return_lag_1h" not in fallback
@@ -148,14 +150,14 @@ def test_return_lag_1h_falls_back_to_profile_when_missing():
     ps._history_by_station = {}  # station "A"에 대한 return_count 자체가 없음
     _set_profile(
         {
-            ("A", h, dow, m): {"rental_mean": 0.0, "rental_std": 0.0, "return_mean": 9.0, "return_std": 2.0}
+            (STATION_NO, h, dow, m): {"rental_mean": 0.0, "rental_std": 0.0, "return_mean": 9.0, "return_std": 2.0}
             for h in range(24)
             for dow in range(7)
             for m in range(1, 13)
         }
     )
 
-    out, fallback = ps._lag_rolling_features("A", target_ts)
+    out, fallback = ps._lag_rolling_features("A", STATION_NO, target_ts)
 
     assert "return_lag_1h" in fallback
     assert out["return_lag_1h"] == pytest.approx(9.0)

@@ -38,7 +38,7 @@ def _synthetic_features_table(n_hours: int = 20) -> pd.DataFrame:
     """
     hours = pd.date_range("2025-06-01 00:00", periods=n_hours, freq="h")
     n = len(hours)
-    df = pd.DataFrame({"station_id": "A", "hour_ts": hours})
+    df = pd.DataFrame({"station_id": "A", "station_no": 1, "hour_ts": hours})
     df["rental_lag_1h"] = [1000.0 + i for i in range(n)]
     df["return_lag_1h"] = [1500.0 + i for i in range(n)]
     for col in ["temp", "precip", "pop_total", "rental_exposure"]:

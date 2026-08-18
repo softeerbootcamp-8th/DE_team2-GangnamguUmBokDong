@@ -99,8 +99,13 @@ HORIZON_COUNT = _int_env("HORIZON_COUNT", _PROFILE["HORIZON_COUNT"])
 # - `month`/`date` 대신 `day`(2000-01-01 기준 경과일수, ml_core.day_index)를 쓴다
 #   — month 순환 인코딩과 달리 연도 경계(작년 12월과 올해 1월이 가깝고, 같은 해
 #   1월과 12월은 멀다)를 올바르게 표현한다.
+# - `station_id`(텍스트, "ST-2565") 대신 station master의 station_no(정수 일련번호)를
+#   쓴다 — station_id는 출력/S3 키 등 식별 용도로는 계속 쓰이지만, 모델 feature
+#   자체를 정수로 두면 학습 데이터 읽기(core.s3.read_parquet)에서 Parquet dictionary
+#   encoding이 pandas Categorical로 안 살아나 매번 object dtype 문자열 배열을
+#   통째로 만드는 비용을 원천적으로 피한다(정수 컬럼은 그 디코딩 자체가 없음).
 BASE_FEATURE_COLUMNS = [
-    "station_id",
+    "station_no",
     "capacity",
     "lat",
     "lon",

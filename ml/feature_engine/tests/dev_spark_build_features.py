@@ -39,11 +39,21 @@ def _write_rolling_parquet(tmp_path, trips: list[dict]) -> str:
     return path
 
 
-def _grid(station: str, hours) -> pd.DataFrame:
+def _write_station_master(tmp_path) -> str:
+    """`_add_rental_lag_1h()`가 rolling 테이블(station_id 원본)을 station_no로 바꾸려고
+    참조하는 작은 크로스워크 — 이 테스트들은 rental_lag_1h 값 자체를 확인하지 않으므로
+    (`_write_rolling_parquet`의 더미 트립과 실제로 매칭될 필요가 없다) 파일이
+    존재하기만 하면 된다."""
+    path = tmp_path / "station_master_test.parquet"
+    pd.DataFrame([{"station_id": "unused", "station_no": 999}]).to_parquet(path, index=False)
+    return str(path)
+
+
+def _grid(station_no: int, hours) -> pd.DataFrame:
     hours = pd.to_datetime(hours)
     return pd.DataFrame(
         {
-            "station_id": station,
+            "station_no": station_no,
             "hour_ts": hours,
             "rental_count": 0,
             "return_count": [(i % 4) for i in range(len(hours))],
@@ -54,10 +64,11 @@ def _grid(station: str, hours) -> pd.DataFrame:
     )
 
 
-def test_return_lag_1h_matches_hand_computation_on_dense_grid(spark, tmp_path):
+def test_return_lag_1h_matches_hand_computation_on_dense_grid(spark, tmp_path, monkeypatch):
     """구멍 없는 그리드에서는 return_lag_1h가 손으로 계산한 shift(1)과 정확히 같아야 한다."""
+    monkeypatch.setattr(fe_config, "STATION_MASTER_PARQUET", _write_station_master(tmp_path))
     hours = pd.date_range("2025-06-01 00:00", periods=200, freq="h")
-    pdf = _grid("A", hours)
+    pdf = _grid(1, hours)
     rolling_path = _write_rolling_parquet(tmp_path, [])
 
     sdf = spark.createDataFrame(pdf)
@@ -72,7 +83,7 @@ def test_return_lag_1h_matches_hand_computation_on_dense_grid(spark, tmp_path):
     pd.testing.assert_series_equal(got_lag1, expected_lag1, check_names=False, check_dtype=False)
 
 
-def test_return_lag_1h_is_gap_aware_not_row_count_based(spark, tmp_path):
+def test_return_lag_1h_is_gap_aware_not_row_count_based(spark, tmp_path, monkeypatch):
     """그리드에 구멍(결측 시간대)이 있을 때 return_lag_1h가 실제 경과시간 기준으로 동작해야 한다.
 
     2025-06-05 00:00~05:00(6시간) 구간을 통째로 그리드에서 뺀 station을 만들고:
@@ -81,12 +92,13 @@ def test_return_lag_1h_is_gap_aware_not_row_count_based(spark, tmp_path):
       구멍 바로 앞의 실제 존재하는 행 값을 잘못 가져오게 됨).
     - 그 다음 행(07:00)의 1시간 전(06:00)은 그리드에 있으므로 정상적으로 값이 나와야 한다.
     """
+    monkeypatch.setattr(fe_config, "STATION_MASTER_PARQUET", _write_station_master(tmp_path))
     all_hours = pd.date_range("2025-06-01 00:00", periods=240, freq="h")
     gap_start = pd.Timestamp("2025-06-05 00:00")
     gap_end = pd.Timestamp("2025-06-05 05:00")  # 이 6시간(00~05시)을 그리드에서 제외
     kept_hours = [h for h in all_hours if not (gap_start <= h <= gap_end)]
 
-    pdf = _grid("A", kept_hours)
+    pdf = _grid(1, kept_hours)
     rolling_path = _write_rolling_parquet(tmp_path, [])
 
     sdf = spark.createDataFrame(pdf)

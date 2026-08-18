@@ -25,7 +25,7 @@ from __future__ import annotations
 
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
-from pyspark.sql.types import FloatType
+from pyspark.sql.types import FloatType, ShortType
 
 from . import config
 from .rolling_window_features import lookup_count_at_ticks
@@ -50,7 +50,7 @@ def _exact_hour_lag(df: DataFrame, value_col: str, lag_hours: int, out_col: str)
     """정확히 lag_hours시간 전의 value_col 값을 self-join으로 조회한다 (그리드에 그 시각이 없으면 null).
 
     args:
-        df: station_id, hour_ts를 포함한 DataFrame
+        df: station_no, hour_ts를 포함한 DataFrame
         value_col: 조회할 값 컬럼명
         lag_hours: 몇 시간 전인지
         out_col: 결과를 담을 새 컬럼명
@@ -58,13 +58,13 @@ def _exact_hour_lag(df: DataFrame, value_col: str, lag_hours: int, out_col: str)
         DataFrame: out_col이 추가된 df
     """
     shifted = df.select(
-        F.col("station_id").alias("_lag_station"),
+        F.col("station_no").alias("_lag_station"),
         (F.col("hour_ts") + F.expr(f"INTERVAL {lag_hours} HOURS")).alias("_lag_target_hour_ts"),
         F.col(value_col).alias(out_col),
     )
     joined = df.join(
         shifted,
-        (df["station_id"] == shifted["_lag_station"]) & (df["hour_ts"] == shifted["_lag_target_hour_ts"]),
+        (df["station_no"] == shifted["_lag_station"]) & (df["hour_ts"] == shifted["_lag_target_hour_ts"]),
         "left",
     )
     return joined.drop("_lag_station", "_lag_target_hour_ts")
@@ -80,22 +80,32 @@ def _add_rental_lag_1h(spark: SparkSession, df: DataFrame, rolling_parquet_path:
 
     `rolling_rental_features.py`(censored_rolling_counts, config.ROLLING_WINDOW_MINUTES/
     EMBARGO_MINUTES 기준 — 지금은 [T-100분, T-40분) 60분짜리 창)가 만든 sparse
-    step function을 그리드의 각 (station_id, hour_ts)에 대해 조회한다.
+    step function을 그리드의 각 (station_no, hour_ts)에 대해 조회한다.
+
+    `cumulative`는 Silver 트립(station_id 텍스트 원본)에서 곧바로 계산돼 station_id로
+    키가 잡혀 있다 — station_master를 작게 join해서 station_no로 바꾼 뒤 조회한다
+    (station_id는 df 쪽엔 이미 없으므로, df를 건드리지 않고 이 작은 테이블만 변환하는
+    쪽이 싸다 — cumulative는 트립이 실제로 있었던 시점만 담은 sparse 테이블이라
+    tick x station 전체 그리드인 df보다 훨씬 작다).
 
     args:
         spark: SparkSession
-        df: station_id, hour_ts를 포함한 DataFrame
+        df: station_no, hour_ts를 포함한 DataFrame
         rolling_parquet_path: build_rolling_rental_features.py가 만든 sparse step function 경로
     returns:
         DataFrame: rental_lag_1h 컬럼이 추가된 df
     """
-    cumulative = spark.read.parquet(rolling_parquet_path)
-    query = df.select("station_id", F.col("hour_ts").alias("tick"))
+    cumulative = spark.read.parquet(rolling_parquet_path)  # station_id, tick, count
+    master = spark.read.parquet(config.STATION_MASTER_PARQUET).select(
+        "station_id", F.col("station_no").cast(ShortType()).alias("station_no")
+    )
+    cumulative = cumulative.join(master, on="station_id", how="inner").drop("station_id")
+    query = df.select("station_no", F.col("hour_ts").alias("tick"))
     visible = lookup_count_at_ticks(
-        cumulative, query, station_col="station_id", tick_col="tick", query_tick_col="tick"
+        cumulative, query, station_col="station_no", tick_col="tick", query_tick_col="tick"
     )
     visible = visible.withColumnRenamed("tick", "hour_ts").withColumnRenamed("count", "rental_lag_1h")
-    return df.join(visible, on=["station_id", "hour_ts"], how="left")
+    return df.join(visible, on=["station_no", "hour_ts"], how="left")
 
 
 def _add_exposure(df: DataFrame) -> DataFrame:

@@ -86,7 +86,8 @@ def trips() -> pd.DataFrame:
     )
 
 
-def test_rental_lag_1h_matches_between_batch_and_single_point(spark, trips, tmp_path):
+def test_rental_lag_1h_matches_between_batch_and_single_point(spark, trips, tmp_path, monkeypatch):
+    station_no = 1
     cumulative = censored_rolling_counts(
         trips,
         window_minutes=fe_config.ROLLING_WINDOW_MINUTES,
@@ -99,6 +100,13 @@ def test_rental_lag_1h_matches_between_batch_and_single_point(spark, trips, tmp_
     rolling_path = str(tmp_path / "rolling_rental_features_test.parquet")
     cumulative.to_parquet(rolling_path, index=False)
 
+    # _add_rental_lag_1h()가 rolling 테이블(station_id 원본)을 station_no로 바꾸려고
+    # station_master를 읽는다 — 여기 station_id="A" <-> station_no=1로 매핑해둔다
+    # (build_features.py 모듈 docstring 참고).
+    master_path = str(tmp_path / "station_master_test.parquet")
+    pd.DataFrame([{"station_id": "A", "station_no": station_no}]).to_parquet(master_path, index=False)
+    monkeypatch.setattr(fe_config, "STATION_MASTER_PARQUET", master_path)
+
     # 그리드는 05-31 00:00부터 06-01 12:00까지 — 뒤쪽은 cumulative의 tick 커버리지
     # (최대 12:15, 트립들의 [T-100,T-40) 창이 미치는 범위) 안에 들어야 freshness
     # 가드에 안 걸린다. **GRID_TICK_MINUTES 그리드여야 한다** — 배치
@@ -106,7 +114,7 @@ def test_rental_lag_1h_matches_between_batch_and_single_point(spark, trips, tmp_
     # 전제로 하므로, batch 쪽 그리드가 다른 밀도면 애초에 비교가 성립하지 않는다.
     ticks = pd.date_range("2025-05-31 00:00", "2025-06-01 12:00", freq=f"{fe_config.GRID_TICK_MINUTES}min")
     df = pd.DataFrame(
-        {"station_id": "A", "hour_ts": ticks, "rental_count": [0] * len(ticks), "return_count": [0] * len(ticks)}
+        {"station_no": station_no, "hour_ts": ticks, "rental_count": [0] * len(ticks), "return_count": [0] * len(ticks)}
     )
     sdf = spark.createDataFrame(df)
     batch_out = (
@@ -121,6 +129,6 @@ def test_rental_lag_1h_matches_between_batch_and_single_point(spark, trips, tmp_
     check_targets = pd.date_range("2025-06-01 08:00", "2025-06-01 12:00", freq="h")
     for target_ts in check_targets:
         i = ticks.get_loc(target_ts)
-        single_out, fallback = ps._lag_rolling_features("A", target_ts)
+        single_out, fallback = ps._lag_rolling_features("A", station_no, target_ts)
         assert "rental_lag_1h" not in fallback, f"{target_ts}: 예상치 못한 fallback {fallback}"
         assert single_out["rental_lag_1h"] == pytest.approx(batch_out["rental_lag_1h"].iloc[i]), target_ts

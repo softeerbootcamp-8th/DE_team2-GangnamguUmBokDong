@@ -168,19 +168,19 @@ def _split(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
 def _prepare_xy(
     df: pd.DataFrame, target_col: str, station_dtype: pd.CategoricalDtype, feature_columns: list[str]
 ) -> tuple[pd.DataFrame, pd.Series]:
-    """feature/label을 분리하고 station_id를 지정된 CategoricalDtype으로 맞춘다.
+    """feature/label을 분리하고 station_no를 지정된 CategoricalDtype으로 맞춘다.
 
     args:
         df: feature 테이블의 한 split (train/valid/test 중 하나)
         target_col: "rental_count" 또는 "return_count"
-        station_dtype: train/valid/test 전체에서 동일해야 하는 station_id 카테고리
+        station_dtype: train/valid/test 전체에서 동일해야 하는 station_no 카테고리
             (split마다 따로 astype("category")하면 LightGBM 카테고리 코드가 어긋남)
         feature_columns: RENTAL_FEATURE_COLUMNS 또는 RETURN_FEATURE_COLUMNS
     returns:
         tuple[pd.DataFrame, pd.Series]: (X, y)
     """
     X = df[feature_columns].copy()
-    X["station_id"] = X["station_id"].astype(station_dtype)
+    X["station_no"] = X["station_no"].astype(station_dtype)
     y = df[target_col]
     return X, y
 
@@ -204,18 +204,18 @@ def _distributed_params() -> dict:
 
 
 def _shard_for_this_machine(df: pd.DataFrame) -> pd.DataFrame:
-    """data-parallel 분산 학습용으로 station_id 기준 이 머신의 몫만 남긴다.
+    """data-parallel 분산 학습용으로 station_no 기준 이 머신의 몫만 남긴다.
 
     LightGBM의 socket 기반 분산 학습(tree_learner="data"/"voting")은 전체 데이터를
     자동으로 나눠주지 않는다 — 각 머신이 미리 자기 몫만 들고 lgb.train()을 호출해야
-    한다. station_id를 머신 수로 나눠 배정하면 날짜 범위는 모든 머신에 동일하게
+    한다. station_no를 머신 수로 나눠 배정하면 날짜 범위는 모든 머신에 동일하게
     유지되면서 station 집합만 갈라져 train/valid split 로직을 그대로 재사용할 수 있다.
     `hash()`는 프로세스마다(PYTHONHASHSEED) 값이 달라 머신마다 다른 배정이 나올 수
     있으므로 대신 `zlib.crc32`로 고정된 배정을 쓴다.
     """
     if config.LGB_NUM_MACHINES <= 1:
         return df
-    station_rank = df["station_id"].astype(str).map(lambda s: zlib.crc32(s.encode()) % config.LGB_NUM_MACHINES)
+    station_rank = df["station_no"].astype(str).map(lambda s: zlib.crc32(s.encode()) % config.LGB_NUM_MACHINES)
     return df[station_rank == config.LGB_MACHINE_RANK]
 
 
@@ -276,8 +276,11 @@ def train_target(
     train_df, valid_df, test_df = _split(df)
 
     # station_categories는 샤딩 전 전체 df 기준이어야 한다 — 그래야 카테고리 코드가
-    # 모든 머신에서 동일하게 매겨져(station_id -> code) 분산 학습 시 어긋나지 않는다.
-    station_categories = sorted(df["station_id"].unique())
+    # 모든 머신에서 동일하게 매겨져(station_no -> code) 분산 학습 시 어긋나지 않는다.
+    # int()로 감싸는 이유: station_no 컬럼은 model_contract.NATIVE_COLUMN_DTYPES에 따라
+    # uint16이라 .unique()가 numpy.uint16 배열을 반환한다 — 이걸 그대로
+    # s3_io.write_json()에 넘기면 json.dumps가 numpy 정수 타입을 직렬화하지 못해 죽는다.
+    station_categories = sorted(int(s) for s in df["station_no"].unique())
     station_dtype = pd.CategoricalDtype(categories=station_categories)
 
     train_df = _shard_for_this_machine(train_df)

@@ -87,7 +87,7 @@ TRAIN_SAMPLE_FRAC = float(os.environ.get("TRAIN_SAMPLE_FRAC", "1.0"))
 VALID_SAMPLE_FRAC = float(os.environ.get("VALID_SAMPLE_FRAC", "1.0"))
 TEST_SAMPLE_FRAC = float(os.environ.get("TEST_SAMPLE_FRAC", "1.0"))
 
-CATEGORICAL_FEATURES = ["station_id"]
+CATEGORICAL_FEATURES = ["station_no"]
 
 # LightGBM 하이퍼파라미터 (common_config.py에서 공유 — feature_engine/spark의 SynapseML
 # 학습도 참고할 수 있게)

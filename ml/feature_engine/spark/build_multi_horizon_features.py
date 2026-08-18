@@ -46,7 +46,7 @@ from pyspark.sql import functions as F
 from . import config
 
 _COMMON_TARGET_COLUMNS = [
-    "station_id",
+    "station_no",
     "hour_ts",
     "capacity",
     "lat",
@@ -61,9 +61,15 @@ _COMMON_TARGET_COLUMNS = [
     "date",
 ]
 
-RENTAL_ANCHOR_COLUMNS = ["station_id", "hour_ts", "rental_lag_1h"]
+# station_id(텍스트)는 이 테이블에 아예 안 담는다 — horizon self-join으로 원본의
+# 최대 HORIZON_COUNT배까지 불어나는 테이블이라, 안 쓸 텍스트 컬럼을 그만큼 배로
+# 복제해 저장하는 낭비가 크다(공간뿐 아니라 Spark 쓰기 비용도). 조인 키/모델
+# feature 전부 station_no(정수) 하나로 충분하고, station_id가 필요한 곳(사람이 보는
+# 출력 등)은 그때그때 station_master로 작게 join해서 붙인다
+# (`inference/predict_common.py` 참고).
+RENTAL_ANCHOR_COLUMNS = ["station_no", "hour_ts", "rental_lag_1h"]
 RENTAL_TARGET_COLUMNS = [*_COMMON_TARGET_COLUMNS, "rental_exposure", "rental_count"]
-RETURN_ANCHOR_COLUMNS = ["station_id", "hour_ts", "return_lag_1h"]
+RETURN_ANCHOR_COLUMNS = ["station_no", "hour_ts", "return_lag_1h"]
 RETURN_TARGET_COLUMNS = [*_COMMON_TARGET_COLUMNS, "return_count"]
 
 
@@ -74,27 +80,27 @@ def _shift_for_horizon(anchor: DataFrame, target: DataFrame, horizon: int) -> Da
     없으면 자동으로 빠짐)을 반대 방향(과거가 아니라 미래 조회)으로 쓴다.
 
     args:
-        anchor: station_id, hour_ts=T0, lag 컬럼 1개만 담은 DataFrame
-        target: station_id, hour_ts, 날씨/캘린더/타겟/date를 담은 DataFrame
+        anchor: station_no, hour_ts=T0, lag 컬럼 1개만 담은 DataFrame
+        target: station_no, hour_ts, 날씨/캘린더/타겟/date를 담은 DataFrame
         horizon: 1~HORIZON_COUNT
     returns:
-        DataFrame: station_id, anchor_ts(T0), horizon, lag 1개, target 컬럼 중
-            station_id/hour_ts를 뺀 나머지(target_ts 기준)
+        DataFrame: station_no, anchor_ts(T0), horizon, lag 1개, target 컬럼 중
+            station_no/hour_ts를 뺀 나머지(target_ts 기준)
     """
     offset_hours = horizon - 1
     shifted_target = (
-        target.withColumnRenamed("station_id", "_tgt_station")
+        target.withColumnRenamed("station_no", "_tgt_station_no")
         .withColumn("_anchor_hour_ts", F.col("hour_ts") - F.expr(f"INTERVAL {offset_hours} HOURS"))
         .drop("hour_ts")
     )
     joined = anchor.join(
         shifted_target,
-        (anchor["station_id"] == shifted_target["_tgt_station"])
+        (anchor["station_no"] == shifted_target["_tgt_station_no"])
         & (anchor["hour_ts"] == shifted_target["_anchor_hour_ts"]),
         "inner",
     )
     joined = joined.withColumnRenamed("hour_ts", "anchor_ts").withColumn("horizon", F.lit(horizon).cast("tinyint"))
-    return joined.drop("_tgt_station", "_anchor_hour_ts")
+    return joined.drop("_tgt_station_no", "_anchor_hour_ts")
 
 
 def build_multi_horizon_features(
@@ -119,9 +125,10 @@ def build_multi_horizon_features(
             불필요, 로컬에서 좁은 기간만 학습할 때 규모를 줄이려고 추가된 옵션).
             None이면 features_df 전체를 anchor로도 쓴다(기존 동작과 동일).
     returns:
-        DataFrame: station_id, anchor_ts, horizon, lag 컬럼 1개(anchor_ts 기준),
+        DataFrame: station_no, anchor_ts, horizon, lag 컬럼 1개(anchor_ts 기준),
             날씨/인구/캘린더/(대여면 rental_exposure)/타겟 카운트/date(target_ts 기준)를
-            horizon 1..HORIZON_COUNT만큼 union한 것
+            horizon 1..HORIZON_COUNT만큼 union한 것 — station_id(텍스트)는 담지 않는다
+            (모듈 docstring의 station_no 전환 이유 참고)
     """
     del spark  # 시그니처 대칭용 — 이 함수 자체는 SparkSession을 직접 쓰지 않음
     anchor_source = anchor_df if anchor_df is not None else features_df

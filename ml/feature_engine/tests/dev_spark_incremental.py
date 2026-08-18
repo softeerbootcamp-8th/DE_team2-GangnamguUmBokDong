@@ -232,7 +232,7 @@ def test_incremental_corrects_rental_count_for_late_arriving_trip(spark, synthet
     late_start = start + pd.Timedelta(hours=WATERMARK_OFFSET_HOURS - 32)
     before = (
         spark.read.parquet(fe_config.FEATURES_TABLE_PARQUET)
-        .filter((F.col("station_id") == "A") & (F.col("hour_ts") == F.lit(late_start)))
+        .filter((F.col("station_no") == 1) & (F.col("hour_ts") == F.lit(late_start)))
         .select("rental_count")
         .collect()[0][0]
     )
@@ -257,7 +257,7 @@ def test_incremental_corrects_rental_count_for_late_arriving_trip(spark, synthet
 
     after = (
         spark.read.parquet(fe_config.FEATURES_TABLE_PARQUET)
-        .filter((F.col("station_id") == "A") & (F.col("hour_ts") == F.lit(late_start)))
+        .filter((F.col("station_no") == 1) & (F.col("hour_ts") == F.lit(late_start)))
         .select("rental_count")
         .collect()[0][0]
     )

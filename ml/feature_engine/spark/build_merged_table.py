@@ -75,6 +75,12 @@ NATIVE_COLUMN_DTYPES = {
     "dow": ByteType(),
     "is_holiday": ByteType(),
     "day": ShortType(),
+    # station_id(텍스트, "ST-2565")는 모델 feature에서 station_no(정수 일련번호)로
+    # 대체됐다 — Parquet dictionary encoding이 to_pandas()에서 안 살아남아 매 학습
+    # 읽기마다 object dtype 문자열 배열을 통째로 materialize하는 비용이 있었는데,
+    # station_no는 처음부터 정수라 그 비용 자체가 없다(day와 같은 이유로 여기선
+    # ShortType, pandas 쪽 uint16 다운캐스트는 model_contract.NATIVE_COLUMN_DTYPES 담당).
+    "station_no": ShortType(),
 }
 
 
@@ -127,9 +133,10 @@ def build_merged_table(spark: SparkSession, since: str | None = None) -> DataFra
             sparse step function이라 이 필터와 무관하게 항상 전체를 읽는다** — 위
             모듈 docstring 참고.
     returns:
-        DataFrame: 최종 병합 테이블 (station_id, rental_count, return_count, bike_count,
+        DataFrame: 최종 병합 테이블 (station_no, rental_count, return_count, bike_count,
             stockout_flag, capacity, lat, lon, temp, precip, pop_total, hour_ts,
-            date, day, hour, minute, dow, is_holiday)
+            date, day, hour, minute, dow, is_holiday) — station_id(텍스트)는 없다(아래
+            station_no 관련 주석 참고).
     """
     master = spark.read.parquet(config.STATION_MASTER_PARQUET)
     rental_targets = spark.read.parquet(config.TARGETS_PARQUET)  # sparse step function
@@ -175,7 +182,7 @@ def build_merged_table(spark: SparkSession, since: str | None = None) -> DataFra
     df = df.fillna(0, subset=["rental_count", "return_count"])
 
     df = df.join(
-        master.select("station_id", "capacity", "lat", "lon", "grid_id"), on="station_id", how="left"
+        master.select("station_id", "station_no", "capacity", "lat", "lon", "grid_id"), on="station_id", how="left"
     )
 
     df = df.withColumn("_hour_floor", F.date_trunc("hour", F.col("hour_ts")))
@@ -194,7 +201,12 @@ def build_merged_table(spark: SparkSession, since: str | None = None) -> DataFra
     # is_prev_day_off를 대체한다(다음날/전날 조회가 없어져 연도 경계 처리도 단순해짐).
     df = df.withColumn("is_holiday", (F.col("date").isin(list(holidays)) | (F.col("dow") >= 5)).cast("int"))
 
-    df = df.drop("grid_id")
+    # station_id(텍스트)는 위 join들의 키로만 쓰이고 결과엔 안 남긴다 — station_no(정수)로
+    # 이미 매 station이 유일하게 식별되고(모듈 docstring 참고), 이 테이블은 tick x station
+    # 전체 히스토리라 station_id를 담아두면 그만큼 저장/셔플 비용이 계속 붙는다. 사람이 보는
+    # station_id가 필요한 소비처(inference/build_station_profile.py 등)는 작은
+    # station_master로 따로 join해서 붙인다.
+    df = df.drop("grid_id", "station_id")
 
     for col_name, dtype in NATIVE_COLUMN_DTYPES.items():
         df = df.withColumn(col_name, F.col(col_name).cast(dtype))

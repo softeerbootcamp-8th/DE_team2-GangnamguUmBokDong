@@ -12,12 +12,20 @@
 예측할 수 없다 — 그러려면 해당 시점의 날씨·인구·최근 실적 데이터를 먼저
 `feature_engine`의 피처마트 생성 파이프라인(`feature_engine/spark/`)으로
 넣어줘야 한다(그런 임의 시점 예측은 `predict_single.py`가 담당).
+
+**station_id(텍스트)는 multi-horizon 테이블 자체엔 없다** — horizon self-join으로
+최대 HORIZON_COUNT배까지 불어나는 큰 테이블이라 station_no(정수)만 담는다
+(`feature_engine/spark/build_multi_horizon_features.py` 모듈 docstring 참고).
+이 CLI는 사람이 station_id로 조회/확인하는 용도라, 작은 station_master만 따로 읽어
+`--station-id`/`--station-ids`를 station_no로 바꿔 큰 테이블을 필터링하고, 결과를
+출력하기 직전에 station_id를 다시 붙인다.
 """
 
 import argparse
 
 import pandas as pd
 from core import s3 as s3_io
+from ml_core.paths import STATION_MASTER_PARQUET
 from ml_core.scoring import predict, print_metrics
 
 from . import config
@@ -26,6 +34,21 @@ _TRAINING_TABLE_BY_MODEL = {
     "rental": config.RENTAL_MULTI_HORIZON_FEATURES_TABLE_PARQUET,
     "return": config.RETURN_MULTI_HORIZON_FEATURES_TABLE_PARQUET,
 }
+
+
+def _load_station_master() -> pd.DataFrame:
+    """station_id<->station_no 크로스워크만 필요한 만큼만 읽는다 (작은 테이블).
+
+    station_master.parquet의 station_no는 원본(Silver) 타입 그대로 저장돼 있어
+    "00001"처럼 앞자리 0이 있는 문자열일 수 있다 — feature_engine이 multi-horizon
+    테이블을 만들 때는 이걸 정수로 캐스팅해서 쓰므로(build_merged_table.py), 여기서도
+    int로 통일해야 station_no 기준 join/필터가 실제로 매칭된다.
+    """
+    master = s3_io.read_parquet(STATION_MASTER_PARQUET, columns=["station_id", "station_no"])
+    if master is None:
+        raise FileNotFoundError(f"S3에 없음: {STATION_MASTER_PARQUET}")
+    master["station_no"] = master["station_no"].astype(int)
+    return master
 
 
 def run_predict_cli(model_name: str, target_col: str, exposure_col: str | None, default_output: str) -> pd.DataFrame:
@@ -63,13 +86,18 @@ def run_predict_cli(model_name: str, target_col: str, exposure_col: str | None, 
     if not (1 <= args.horizon <= config.HORIZON_COUNT):
         raise SystemExit(f"--horizon은 1~{config.HORIZON_COUNT} 사이여야 합니다: {args.horizon}")
 
+    master = _load_station_master()
+
     table_path = _TRAINING_TABLE_BY_MODEL[model_name]
     df = s3_io.read_parquet(table_path)
     if df is None:
         raise FileNotFoundError(f"S3에 없음: {table_path}")
     df = df[(df["date"] >= args.start_date) & (df["date"] <= args.end_date) & (df["horizon"] == args.horizon)]
     if args.station_id:
-        df = df[df["station_id"] == args.station_id]
+        match = master[master["station_id"] == args.station_id]
+        if match.empty:
+            raise SystemExit(f"station_id '{args.station_id}'를 station_master에서 찾을 수 없습니다.")
+        df = df[df["station_no"].isin(match["station_no"])]
         if df.empty:
             raise SystemExit(
                 f"station_id '{args.station_id}' 데이터가 없습니다 — "
@@ -77,9 +105,16 @@ def run_predict_cli(model_name: str, target_col: str, exposure_col: str | None, 
             )
     elif args.station_ids:
         requested = [s.strip() for s in args.station_ids.split(",") if s.strip()]
-        df = df[df["station_id"].isin(requested)]
-        found = set(df["station_id"].unique())
-        missing = [s for s in requested if s not in found]
+        matched_master = master[master["station_id"].isin(requested)]
+        unknown = [s for s in requested if s not in set(matched_master["station_id"])]
+        if unknown:
+            raise SystemExit(f"station_id {unknown}를 station_master에서 찾을 수 없습니다.")
+        df = df[df["station_no"].isin(matched_master["station_no"])]
+        found_nos = set(df["station_no"].unique())
+        missing = [
+            s for s in requested
+            if matched_master.loc[matched_master["station_id"] == s, "station_no"].iloc[0] not in found_nos
+        ]
         if missing:
             raise SystemExit(
                 f"station_id {missing} 데이터가 없습니다 — "
@@ -101,6 +136,10 @@ def run_predict_cli(model_name: str, target_col: str, exposure_col: str | None, 
 
     preds = predict(df, model_name, exposure_col=exposure_col)
     preds["actual"] = df[target_col].to_numpy()
+    # predict()는 station_no만 반환한다 — 사람이 보는 출력/저장 결과엔 station_id를
+    # 다시 붙여준다(작은 station_master와의 join이라 비용은 무시할 만함).
+    preds = preds.merge(master, on="station_no", how="left")
+    preds = preds[["station_id", "station_no", *[c for c in preds.columns if c not in ("station_id", "station_no")]]]
 
     out_path = args.out if args.out else default_output
     s3_io.write_parquet(preds, out_path)

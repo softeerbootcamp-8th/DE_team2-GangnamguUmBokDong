@@ -88,16 +88,20 @@ def predict(df: pd.DataFrame, model_name: str, exposure_col: str | None = None) 
 
     args:
         df: feature_engine의 build_features.build_rental_features()/build_return_features()와
-            동일한 스키마의 DataFrame (station_id, date, hour + model_name에 맞는
-            RENTAL_FEATURE_COLUMNS/RETURN_FEATURE_COLUMNS 포함)
+            동일한 스키마의 DataFrame (station_no, date, hour + model_name에 맞는
+            RENTAL_FEATURE_COLUMNS/RETURN_FEATURE_COLUMNS 포함) — feature_engine의
+            multi-horizon 테이블엔 station_id(텍스트)가 아예 없다(용량 절감,
+            build_multi_horizon_features.py 모듈 docstring 참고) — 사람이 보는
+            station_id가 필요한 호출부는 station_master로 직접 join해서 붙일 것
+            (`inference/predict_common.py` 참고)
         model_name: "rental" 또는 "return"
         exposure_col: Poisson exposure 컬럼명. None이면 exposure=1로 간주 (반납 모델)
     returns:
-        pd.DataFrame: station_id, date, hour, pred_mean, pred_p10, pred_p50, pred_p90
+        pd.DataFrame: station_no, date, hour, pred_mean, pred_p10, pred_p50, pred_p90
     """
     station_dtype = load_station_dtype(model_name)
     X = df[_FEATURE_COLUMNS_BY_MODEL[model_name]].copy()
-    X["station_id"] = X["station_id"].astype(station_dtype)
+    X["station_no"] = X["station_no"].astype(station_dtype)
 
     boosters = load_boosters(model_name)
     correction = load_conformal_correction(model_name)
@@ -109,7 +113,7 @@ def predict(df: pd.DataFrame, model_name: str, exposure_col: str | None = None) 
     pred_p50 = np.clip(boosters["q50"].predict(X), 0, None)  # count는 음수가 될 수 없음
     pred_p90 = boosters["q90"].predict(X) + correction
 
-    out = df[["station_id", "date", "hour"]].copy()
+    out = df[["station_no", "date", "hour"]].copy()
     out["pred_mean"] = pred_mean
     out["pred_p10"] = pred_p10
     out["pred_p50"] = pred_p50

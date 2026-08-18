@@ -79,7 +79,8 @@ def _set_return_history(station_id: str, point, return_count: float = 0.0) -> No
 
 def _set_station_master(station_ids: list[str]) -> None:
     ps._station_master = pd.DataFrame(
-        {"capacity": [10.0] * len(station_ids), "lat": [37.5] * len(station_ids), "lon": [127.0] * len(station_ids),
+        {"station_no": list(range(1, len(station_ids) + 1)),
+         "capacity": [10.0] * len(station_ids), "lat": [37.5] * len(station_ids), "lon": [127.0] * len(station_ids),
          "grid_id": ["G1"] * len(station_ids)},
         index=pd.Index(station_ids, name="station_id"),
     )
@@ -127,8 +128,8 @@ def test_lag_rolling_features_differ_by_minute_within_same_hour():
     _set_return_history("A", "2025-06-01 16:00:00")
     ps._station_profile = {}
 
-    out_1700, fb_1700 = ps._lag_rolling_features("A", pd.Timestamp("2025-06-01 17:00:00"))
-    out_1720, fb_1720 = ps._lag_rolling_features("A", pd.Timestamp("2025-06-01 17:20:00"))
+    out_1700, fb_1700 = ps._lag_rolling_features("A", 1, pd.Timestamp("2025-06-01 17:00:00"))
+    out_1720, fb_1720 = ps._lag_rolling_features("A", 1, pd.Timestamp("2025-06-01 17:20:00"))
 
     assert not ({"rental_lag_1h"} & set(fb_1700 + fb_1720))  # 둘 다 fallback 없이 계산됨
     assert out_1700["rental_lag_1h"] != out_1720["rental_lag_1h"]
@@ -151,7 +152,7 @@ def test_build_feature_record_honors_minute():
     )
 
     target_ts = pd.Timestamp("2025-06-01 17:40:00")
-    expected, expected_fallback = ps._lag_rolling_features("A", target_ts)
+    expected, expected_fallback = ps._lag_rolling_features("A", 1, target_ts)
 
     assert record["rental_lag_1h"] == pytest.approx(expected["rental_lag_1h"])
     assert set(fallback) == set(expected_fallback)
