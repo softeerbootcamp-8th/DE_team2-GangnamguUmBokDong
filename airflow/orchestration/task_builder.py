@@ -3,8 +3,8 @@
 
 Airflow는 각 모듈을 독립된 CLI로만 호출한다 — 모듈 내부 코드를 import하지 않는다.
 모든 모듈은 저마다 별도의 uv 프로젝트/venv를 유지하므로, Airflow 자체가
-`uv run airflow ...`로 떠 있어 설정된 VIRTUAL_ENV를 중첩된 uv run이 잘못 물려받지
-않도록 모든 명령 앞에 `env -u VIRTUAL_ENV`를 붙인다.
+`uv run airflow ...`로 떠 있어 설정된 VIRTUAL_ENV와 UV_PROJECT_ENVIRONMENT를
+중첩된 uv run이 잘못 물려받지 않도록 모든 명령 앞에서 두 환경변수를 제거한다.
 """
 
 from __future__ import annotations
@@ -13,7 +13,6 @@ from pathlib import Path
 
 from airflow.providers.standard.operators.bash import BashOperator
 from airflow.task.trigger_rule import TriggerRule
-
 from callbacks.task_callbacks import on_failure_callback, on_success_callback
 from config.schedules import (
     DEFAULT_EXECUTION_TIMEOUT,
@@ -40,7 +39,7 @@ def build_module_task(
 ) -> BashOperator:
     return BashOperator(
         task_id=task_id,
-        bash_command=f"env -u VIRTUAL_ENV {bash_command}",
+        bash_command=f"env -u VIRTUAL_ENV -u UV_PROJECT_ENVIRONMENT {bash_command}",
         cwd=module_dir,
         retries=retries,
         retry_delay=retry_delay,

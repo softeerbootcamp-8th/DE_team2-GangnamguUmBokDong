@@ -53,6 +53,24 @@ export interface DispatchCenter {
   lon: number;
 }
 
+export interface CulturalEvent {
+  event_id: string;
+  title: string;
+  category: string | null;
+  place: string | null;
+  start_date: string | null;
+  end_date: string | null;
+  is_free: string | null;
+  lat: number;
+  lon: number;
+  distance_km: number;
+}
+
+export interface EventsResponse {
+  radius_km: number;
+  events: CulturalEvent[];
+}
+
 async function getJson<T>(path: string): Promise<T> {
   const res = await fetch(`${API_BASE}${path}`);
   if (!res.ok) {
@@ -65,6 +83,7 @@ export const api = {
   stations: () => getJson<StationSummary[]>("/stations"),
   station: (id: string) => getJson<StationDetail>(`/stations/${id}`),
   forecast: (id: string) => getJson<ForecastResponse>(`/stations/${id}/forecast`),
+  events: (id: string) => getJson<EventsResponse>(`/stations/${id}/events`),
   alerts: () => getJson<Alert[]>("/alerts"),
   status: () => getJson<StatusResponse>("/status"),
   regions: () => getJson<DispatchCenter[]>("/regions"),

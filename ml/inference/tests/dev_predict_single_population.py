@@ -1,6 +1,8 @@
 """Normalizer Silver와 predict_single.py 인구 입력 계약을 검증한다."""
 
 import pandas as pd
+import pytest
+from ml_core import silver_schema
 
 from inference import predict_single as ps
 

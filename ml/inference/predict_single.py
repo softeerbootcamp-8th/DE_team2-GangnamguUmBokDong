@@ -1736,9 +1736,22 @@ def predict_rental_demand(
     """
     anchor_ts = _target_timestamp(date, hour, minute)
     target_ts = anchor_ts + pd.Timedelta(hours=horizon - 1)
-    temp, precip, wind, humidity = _resolve_live_weather(target_ts, temp, precip, wind, humidity)
-    stockout, stockout_fallback = _resolve_live_stockout(station_id, anchor_ts, stockout)
-    result = _predict_at(
+    temp, precip, wind, humidity = _resolve_live_weather(
+        target_ts,
+        temp,
+        precip,
+        wind,
+        humidity,
+        as_of_ts=anchor_ts,
+    )
+
+    stockout, stockout_fallback = _resolve_live_stockout(
+        station_id,
+        anchor_ts,
+        stockout,
+    )
+
+    result = _predict_at( 
         "rental",
         "rental_exposure",
         station_id=station_id,

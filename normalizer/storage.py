@@ -26,6 +26,7 @@ NORMALIZED_SOURCE_ID = "living_population_normalized"
 STATION_MASTER_SOURCE_ID = "bike_station_master"
 BIKE_REALTIME_SOURCE_ID = "bike_station_realtime"
 ENRICHED_STATION_MASTER_SOURCE_ID = "station_master_enriched"
+_NOWCAST_FILENAME = "nowcast.parquet"
 
 
 class PartitionNotFoundError(RuntimeError):
@@ -95,17 +96,24 @@ def find_latest_partition_date_on_or_before(source_id: str, reference_date: date
 
 
 def read_grid_silver(baseline_date: date) -> pa.Table:
-    """해당 베이스라인 날짜의 생활인구 격자 Parquet 파일들을 모두 읽어 단일 테이블로 병합한다.
+    """해당 베이스라인 날짜의 생활인구 격자 실측 Parquet 파일들을 읽어 단일 테이블로 병합한다.
+
+    같은 날짜 prefix에 nowcaster가 저장한 ``nowcast.parquet``은 추정치이며 실측과
+    스키마·의미가 다르므로 제외한다.
 
     args:
         baseline_date: 대상 베이스라인 날짜
     returns:
         병합된 PyArrow Table
     raises:
-        PartitionNotFoundError: 해당 날짜의 파티션이 없을 때
-    """
+        PartitionNotFoundError: 실측 Parquet 파티션이 없을 때
+    """  
     prefix = _silver_date_prefix(GRID_SOURCE_ID, baseline_date)
-    keys = [k for k in list_keys(prefix) if k.endswith(".parquet")]
+    keys = [
+        key
+        for key in list_keys(prefix)
+        if key.endswith(".parquet") and not key.endswith(_NOWCAST_FILENAME)
+    ]
 
     if not keys:
         raise PartitionNotFoundError(

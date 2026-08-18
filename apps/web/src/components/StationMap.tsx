@@ -4,8 +4,9 @@ import "leaflet/dist/leaflet.css";
 import { Delaunay } from "d3-delaunay";
 import L from "leaflet";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { CircleMarker, MapContainer, Marker, Polygon, TileLayer, Tooltip, useMapEvents } from "react-leaflet";
+import { Circle, CircleMarker, MapContainer, Marker, Polygon, TileLayer, Tooltip, useMapEvents } from "react-leaflet";
 import type { ActionType, Alert, DispatchCenter, StationSummary } from "../api";
+import type { FocusedEvent } from "./DetailPanel";
 import seoulBoundary from "../seoul_boundary.json";
 
 const ALL_REGIONS = "all"; // App.tsx의 선택 안 함 상태와 동일한 값이어야 한다.
@@ -34,6 +35,7 @@ const SEOUL_NE: [number, number] = [37.73, 127.21];
 const SEOUL_BOUNDS: L.LatLngBoundsExpression = [SEOUL_SW, SEOUL_NE];
 const SEOUL_MIN_ZOOM = 10; // 이보다 축소하면 서울 전체가 한 화면보다 작아져서 의미가 없다
 const REGION_FILL = "#2edb8c"; // 따릉이 브랜드 그린
+const EVENT_MARKER_COLOR = "#405260"; // 주변 행사 포커스 점·검색 반경 원(브랜드 네이비 — REGION_FILL과 동시에 떠도 구분되게)
 
 // 지역센터 관할의 실제 경계 데이터는 없다(apps/api/regions.py 참고). 그래서
 // "권역 면적"은 우리 배정 로직(최근접 지역센터)이 암묵적으로 정의하는 경계,
@@ -258,6 +260,7 @@ interface Props {
   mapFilterMode: MapFilterMode;
   regionCenters: DispatchCenter[];
   selectedRegion: string;
+  focusedEvent: FocusedEvent | null;
 }
 
 function StationMarkers({
@@ -268,6 +271,7 @@ function StationMarkers({
   mapFilterMode,
   regionCenters,
   selectedRegion,
+  focusedEvent,
 }: Props) {
   const [zoom, setZoom] = useState(DEFAULT_ZOOM);
   const [bounds, setBounds] = useState<L.LatLngBounds | null>(null);
@@ -357,6 +361,11 @@ function StationMarkers({
   stationsRef.current = stations;
 
   useEffect(() => {
+    // 행사에 포커스가 있는 동안은 아래 focusedEvent effect가 지도 이동을
+    // 맡는다 — 여기서 대여소로 다시 옮기면 서로 화면을 뺏어간다. 행사 포커스가
+    // 풀리면(탭 이동, 같은 행사 재클릭 등) 그때 이 effect가 다시 대여소로
+    // 돌아온다.
+    if (focusedEvent) return;
     if (selectedStationId === null) return;
     const station = stationsRef.current.find((s) => s.sta_id === selectedStationId);
     if (!station) return;
@@ -365,7 +374,15 @@ function StationMarkers({
     // 시점에 툭 튀는 것처럼 보인다. setView는 애니메이션 없이 한 번에
     // 이동시켜서 지도와 마커가 항상 같은 프레임에 같이 자리 잡는다.
     map.setView([station.lat, station.lon], Math.max(map.getZoom(), COUNT_LABEL_MIN_ZOOM));
-  }, [selectedStationId, map]);
+  }, [selectedStationId, focusedEvent, map]);
+
+  // 주변 행사 탭에서 행사를 고르면 그 위치로 지도를 옮겨서 보여준다. 선택된
+  // 대여소는 이미 검은 테두리로 구분되므로, 여기서는 행사 위치를 기준으로
+  // 옮겨서 대여소와 행사 사이의 거리를 눈으로 확인할 수 있게 한다.
+  useEffect(() => {
+    if (!focusedEvent) return;
+    map.setView([focusedEvent.lat, focusedEvent.lon], Math.max(map.getZoom(), COUNT_LABEL_MIN_ZOOM));
+  }, [focusedEvent, map]);
 
   const regionCell = useMemo(
     () => computeRegionCell(regionCenters, selectedRegion),
@@ -388,6 +405,26 @@ function StationMarkers({
         <Polygon
           positions={regionCell}
           pathOptions={{ color: REGION_FILL, weight: 2, fillColor: REGION_FILL, fillOpacity: 0.08 }}
+          interactive={false}
+        />
+      )}
+      {/* 주변 행사 탭에서 고른 행사의 위치(초록 점)와, 이 행사를 찾을 때 쓴
+          대여소 기준 검색 반경(원, radius_km — 실측된 행사 고유의 영향
+          범위가 아니라 백엔드가 후보를 추릴 때 쓴 검색 반경이다). 대여소는
+          이미 검은 테두리로 구분돼 있어서 원은 행사 위치를 기준으로 그린다. */}
+      {focusedEvent && (
+        <Circle
+          center={[focusedEvent.lat, focusedEvent.lon]}
+          radius={focusedEvent.radiusKm * 1000}
+          pathOptions={{ color: EVENT_MARKER_COLOR, weight: 1.5, fillColor: EVENT_MARKER_COLOR, fillOpacity: 0.06, dashArray: "4 4" }}
+          interactive={false}
+        />
+      )}
+      {focusedEvent && (
+        <CircleMarker
+          center={[focusedEvent.lat, focusedEvent.lon]}
+          radius={8}
+          pathOptions={{ color: IDLE_BORDER, weight: 2, fillColor: EVENT_MARKER_COLOR, fillOpacity: 1 }}
           interactive={false}
         />
       )}
@@ -475,6 +512,7 @@ export function StationMap({
   mapFilterMode,
   regionCenters,
   selectedRegion,
+  focusedEvent,
 }: Props) {
   return (
     <MapContainer
@@ -499,6 +537,7 @@ export function StationMap({
         mapFilterMode={mapFilterMode}
         regionCenters={regionCenters}
         selectedRegion={selectedRegion}
+        focusedEvent={focusedEvent}
       />
     </MapContainer>
   );
