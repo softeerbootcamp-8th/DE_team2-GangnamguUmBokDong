@@ -6,7 +6,7 @@ PR #40 리뷰에서 지적된 대로(#55) 예측 구간 전체를 스캔하는 �
 
 from datetime import datetime
 
-from scoring import _max_deficit, _max_overshoot, _severity, urgency_score
+from scoring import _max_deficit, _max_overshoot, _max_unmet_demand, _severity, urgency_score
 
 NOW = datetime(2024, 1, 1, 12, 0, 0)
 
@@ -73,6 +73,29 @@ class TestMaxDeficit:
         assert _max_deficit(current=5, points=points) == 0
 
 
+class TestMaxUnmetDemand:
+    def test_flat_net_change_at_low_stock_still_counts_demand(self):
+        # rent=ret=10 -> 순변화 0. _max_deficit은 이걸 0으로 보지만, 그 시간대가
+        # 시작할 때 이미 재고(2)가 threshold(hold_cnt=10*0.2=2) 이하였으므로
+        # _max_unmet_demand는 그때 들어온 대여 수요(10)를 그대로 잡아야 한다.
+        points = [_point(rent=10, ret=10, predicted_bikes=2, action_type="normal")]
+        assert _max_deficit(current=2, points=points) == 0
+        assert _max_unmet_demand(current=2, hold_cnt=10, points=points) == 10
+
+    def test_demand_above_threshold_is_ignored(self):
+        # 시간대 시작 시점 재고(5)가 threshold(2) 위였다면, 그 시간대의 대여
+        # 수요가 아무리 커도 이 함수가 잡을 신호가 아니다(다른 경로가 담당).
+        points = [_point(rent=10, ret=10, predicted_bikes=5, action_type="normal")]
+        assert _max_unmet_demand(current=5, hold_cnt=10, points=points) == 0
+
+    def test_worst_point_wins(self):
+        points = [
+            _point(rent=3, ret=3, predicted_bikes=2, action_type="normal"),
+            _point(rent=9, ret=9, predicted_bikes=2, action_type="normal"),
+        ]
+        assert _max_unmet_demand(current=2, hold_cnt=10, points=points) == 9
+
+
 class TestUrgencyScore:
     def test_current_at_or_below_threshold_is_immediate_supply_needed(self):
         # hold_cnt=10, SUPPLY_LOW_STOCK_RATIO=0.2 -> 임계값 2. current=1은 그 이하.
@@ -111,3 +134,14 @@ class TestUrgencyScore:
         )
         # 3번째(인덱스 2) 지점에서 처음 supply_needed -> (2+1)*60=180분 뒤.
         assert (score, time_to_critical, action_type) == (5.0, 180, "supply_needed")
+
+    def test_unmet_demand_scores_even_when_net_change_is_flat(self):
+        # PR #96 리뷰(#dragonjin520)에서 지적된 회귀 케이스: 대여/반납이 똑같이
+        # 10건씩 들어와 순변화는 0(_max_deficit=0)이지만, 재고가 이미 threshold
+        # 이하였던 시간대에 대여 수요가 컸다면 _max_unmet_demand가 severity를
+        # 대신 끌어올려서 score가 0으로 묻히면 안 된다.
+        points = [_point(rent=10, ret=10, predicted_bikes=2, action_type="normal")]
+        score, time_to_critical, action_type = urgency_score(
+            current=2, hold_cnt=10, stock_history=[], points=points, now=NOW
+        )
+        assert (score, time_to_critical, action_type) == (48.7, 0, "supply_needed")
