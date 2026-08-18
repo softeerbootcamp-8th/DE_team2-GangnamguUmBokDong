@@ -70,8 +70,8 @@ NATIVE_COLUMN_DTYPES = {
     "temp": FloatType(),
     "precip": FloatType(),
     "pop_total": FloatType(),
-    "hour": ByteType(),
-    "minute": ByteType(),
+    "hour": ByteType(),  # 더 이상 모델 feature가 아니다(minute이 대체) — 출력/CLI 식별용
+    "minute": ShortType(),  # 자정 기준 경과분(0~1439, ml_core.minute_of_day) — 실제 모델 feature
     "dow": ByteType(),
     "is_holiday": ByteType(),
     "day": ShortType(),
@@ -194,8 +194,12 @@ def build_merged_table(spark: SparkSession, since: str | None = None) -> DataFra
 
     df = df.withColumn("date", F.date_format("hour_ts", "yyyy-MM-dd"))
     df = df.withColumn("day", F.datediff(F.col("hour_ts"), F.lit(DAY_INDEX_EPOCH.isoformat())))
-    df = df.withColumn("hour", F.hour("hour_ts"))
-    df = df.withColumn("minute", F.minute("hour_ts"))
+    df = df.withColumn("hour", F.hour("hour_ts"))  # 더 이상 모델 feature 아님 — 출력/CLI 식별용
+    # minute = 자정 기준 경과분(hour*60+분, ml_core.minute_of_day와 동일 공식) — hour
+    # 대신 쓰는 실제 모델 feature. 그리드가 20분 tick이라 hour만 쓰면 같은 시간
+    # 안의 17:00/17:20/17:40이 모델에 전부 같은 값으로 보이는데, minute은 그
+    # 구분을 그대로 담는다.
+    df = df.withColumn("minute", F.hour("hour_ts") * 60 + F.minute("hour_ts"))
     df = df.withColumn("dow", F.weekday("hour_ts"))  # Monday=0 ... Sunday=6, pandas .dt.dayofweek와 동일
     # 주말 + 공휴일을 is_holiday 하나로 통합 — 과거의 is_weekend/is_next_day_off/
     # is_prev_day_off를 대체한다(다음날/전날 조회가 없어져 연도 경계 처리도 단순해짐).

@@ -75,6 +75,7 @@ from core import s3 as s3_io
 from ml_core import silver_schema
 from ml_core.day_index import day_index
 from ml_core.holidays_kr import korean_holidays
+from ml_core.minute_of_day import minute_of_day
 from ml_core.model_contract import (
     RENTAL_EXPOSURE_DTYPE,
     RENTAL_FEATURE_COLUMN_DTYPES,
@@ -448,18 +449,25 @@ def _get_holidays(year: int) -> set[str]:
 
 
 def _get_station_profile() -> dict[tuple[int, int, int, int], dict[str, float]]:
-    """station_hourly_profile.parquet을 (station_no, hour, dow, month) 키의 dict로 캐시해 반환한다.
+    """station_hourly_profile.parquet을 (station_no, minute, dow, month) 키의 dict로 캐시해 반환한다.
 
     station_id(텍스트)가 아니라 station_no(정수)로 키를 잡는다 — build_station_profile.py가
     이제 그 기준으로 프로필을 만든다(모델 feature 자체가 station_no로 바뀐 것과 동일한
     이유, model_contract.BASE_FEATURE_COLUMNS 참고).
 
+    hour가 아니라 minute(자정 기준 경과분)으로 묶는 이유: rental_count/return_count
+    자체가 60분짜리 미래 방향 롤링 합이라 한 hour 안의 tick들은 40분(2/3)이나 겹쳐서
+    거의 같은 값을 반복해서 보는 셈이다 — hour로 묶어 표본을 늘려도 독립적인 정보는
+    별로 안 늘고, 오히려 모델이 실제로 구분하는 tick 단위(minute, BASE_FEATURE_COLUMNS
+    참고)와 다른 값을 fallback으로 주게 된다(build_station_profile.py 모듈 docstring
+    참고).
+
     month을 키에 포함하는 이유: 계절에 따라 대여량 자체가 크게 달라져서
-    (실측 1월 대비 6월 약 2.44배), station x hour x dow로만 묶으면
+    (실측 1월 대비 6월 약 2.44배), station x minute x dow로만 묶으면
     1월 결측과 6월 결측이 똑같은 연간 평균으로 채워지는 문제가 생긴다.
 
     returns:
-        dict[tuple[int, int, int, int], dict[str, float]]: (station_no, hour, dow, month) ->
+        dict[tuple[int, int, int, int], dict[str, float]]: (station_no, minute, dow, month) ->
             {rental_mean, rental_std, return_mean, return_std}
     """
     global _station_profile
@@ -468,7 +476,7 @@ def _get_station_profile() -> dict[tuple[int, int, int, int], dict[str, float]]:
         if df is None:
             raise FileNotFoundError(f"S3에 없음: {config.STATION_HOURLY_PROFILE_PARQUET}")
         _station_profile = {
-            (r.station_no, r.hour, r.dow, r.month): {
+            (r.station_no, r.minute, r.dow, r.month): {
                 "rental_mean": r.rental_mean,
                 "rental_std": r.rental_std,
                 "return_mean": r.return_mean,
@@ -480,16 +488,16 @@ def _get_station_profile() -> dict[tuple[int, int, int, int], dict[str, float]]:
 
 
 def _profile_stat(station_no: int, ts: pd.Timestamp, stat_key: str) -> float:
-    """특정 시각(ts)의 (hour, dow, month)에 해당하는 station 평소 패턴 통계값을 조회한다.
+    """특정 시각(ts)의 (minute, dow, month)에 해당하는 station 평소 패턴 통계값을 조회한다.
 
     args:
         station_no: 정류소 일련번호(station_master 크로스워크로 얻은 정수)
-        ts: 조회할 시각 (hour/dayofweek/month를 사용 — month으로 계절성 반영)
+        ts: 조회할 시각 (minute_of_day/dayofweek/month를 사용 — month으로 계절성 반영)
         stat_key: "rental_mean" / "rental_std" / "return_mean" / "return_std" 중 하나
     returns:
         float: 프로필 값. 해당 station의 프로필이 아예 없으면 NaN
     """
-    entry = _get_station_profile().get((station_no, ts.hour, ts.dayofweek, ts.month))
+    entry = _get_station_profile().get((station_no, minute_of_day(ts), ts.dayofweek, ts.month))
     return entry[stat_key] if entry is not None else np.nan
 
 
@@ -792,7 +800,8 @@ def _build_target_time_fields(
         "temp": temp,
         "precip": precip,
         "pop_total": pop_total,
-        "hour": target_hour,
+        "hour": target_hour,  # 모델 feature는 아니지만 출력 식별용으로 그대로 둔다(minute이 대체)
+        "minute": minute_of_day(target_ts),
         "dow": dow,
         "is_holiday": int(target_date in holidays or dow >= 5),
         "day": day_index(target_ts.date()),

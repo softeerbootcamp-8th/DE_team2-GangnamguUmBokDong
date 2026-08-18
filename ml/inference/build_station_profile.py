@@ -1,16 +1,24 @@
-"""정류소 x 시간대 x 요일 x 월별 대여/반납 실적 프로필 ("평소 패턴") 생성.
+"""정류소 x tick(분) x 요일 x 월별 대여/반납 실적 프로필 ("평소 패턴") 생성.
 
 predict_single.py에서 실시간 실적 히스토리가 끊기거나 지연됐을 때, lag/rolling
-feature를 결측(NaN) 대신 "그 정류소가 이 달 이 요일 이 시간에 보통 어느 정도
+feature를 결측(NaN) 대신 "그 정류소가 이 달 이 요일 이 시각에 보통 어느 정도
 였는지"로 채우기 위한 fallback 테이블이다.
+
+**hour가 아니라 minute(자정 기준 경과분, ml_core.minute_of_day)으로 묶는다** —
+hour로 묶으면 표본이 늘어 보이지만(그 달의 그 요일 4~5일 x 시간당 tick 3개 =
+12~15개), rental_count/return_count 자체가 TARGET_HORIZON_MINUTES(60분)짜리
+미래 방향 롤링 합이라 한 시간 안의 tick들(예: 17:00/17:20/17:40)은 창이
+40분(2/3)이나 겹쳐 사실상 거의 같은 값을 반복해서 보는 것에 가깝다 — "추가
+표본"처럼 보이지만 독립적인 정보는 거의 안 늘어난다. 반면 모델이 실제로 보는
+feature(common_config.BASE_FEATURE_COLUMNS)는 hour가 아니라 minute이라, hour로
+뭉친 fallback은 모델이 학습한 tick 단위 구분과 어긋난 값을 돌려주게 된다.
+그러니 minute으로 묶어 표본은 그 달에 그 요일이 나온 횟수(4~5개)만 남기더라도,
+모델이 실제로 구분하는 단위와 일치하는 fallback을 주는 쪽이 낫다.
 
 **월(month)을 반드시 그룹 키에 포함해야 한다** — 계절에 따라 대여량 자체가
 크게 달라지기 때문이다 (실측 1월 2,291건/일 vs 6월 5,589건/일,
-약 2.44배 차이). station x hour x dow로만 묶으면 1월의 결측치와 6월의 결측치가
-똑같은 "연간 평균"으로 채워져 계절성이 통째로 사라지는 문제가 생긴다. 대신
-station x hour x dow x month로 묶으면 표본이 그 달에 그 요일이 나온 횟수
-(보통 4~5회)로 줄어드는 트레이드오프가 있지만, 계절성을 무시하는 것보다는
-훨씬 낫다.
+약 2.44배 차이). station x minute x dow로만 묶으면 1월의 결측치와 6월의 결측치가
+똑같은 "연간 평균"으로 채워져 계절성이 통째로 사라지는 문제가 생긴다.
 """
 
 import pandas as pd
@@ -20,7 +28,7 @@ from . import config
 
 
 def build_station_profile() -> pd.DataFrame:
-    """station x hour x dow x month별 대여/반납 평균·표준편차 프로필을 만든다.
+    """station x minute x dow x month별 대여/반납 평균·표준편차 프로필을 만든다.
 
     station_id(텍스트)가 아니라 station_no(정수)로 묶는다 — predict_single.py의
     lag/rolling 계산이 station_no 기준으로 통일됐고(model_contract.BASE_FEATURE_COLUMNS
@@ -28,11 +36,11 @@ def build_station_profile() -> pd.DataFrame:
     이 큰 테이블엔 아예 없음, build_merged_table.py 모듈 docstring 참고).
 
     returns:
-        pd.DataFrame: station_no, hour, dow, month, rental_mean, rental_std,
+        pd.DataFrame: station_no, minute, dow, month, rental_mean, rental_std,
             return_mean, return_std, n_samples
     """
     df = s3_io.read_parquet(
-        config.MERGED_TABLE_PARQUET, columns=["station_no", "date", "hour", "rental_count", "return_count"]
+        config.MERGED_TABLE_PARQUET, columns=["station_no", "date", "minute", "rental_count", "return_count"]
     )
     if df is None:
         raise FileNotFoundError(f"S3에 없음: {config.MERGED_TABLE_PARQUET}")
@@ -42,7 +50,7 @@ def build_station_profile() -> pd.DataFrame:
     df["dow"] = dt.dt.dayofweek.astype("int8")
     df["month"] = dt.dt.month.astype("int8")
 
-    profile = df.groupby(["station_no", "hour", "dow", "month"], observed=True).agg(
+    profile = df.groupby(["station_no", "minute", "dow", "month"], observed=True).agg(
         rental_mean=("rental_count", "mean"),
         rental_std=("rental_count", "std"),
         return_mean=("return_count", "mean"),
@@ -64,7 +72,7 @@ def build_station_profile() -> pd.DataFrame:
     s3_io.write_parquet(profile, config.STATION_HOURLY_PROFILE_PARQUET)
     print(
         f"station_hourly_profile: {profile.shape[0]:,}행 "
-        f"({df['station_no'].nunique()}개 정류소 x 24시간 x 7요일 x 12개월), "
+        f"({df['station_no'].nunique()}개 정류소 x 72tick x 7요일 x 12개월), "
         f"그룹당 표본 수 min={profile['n_samples'].min()} max={profile['n_samples'].max()} "
         f"-> {config.STATION_HOURLY_PROFILE_PARQUET}"
     )

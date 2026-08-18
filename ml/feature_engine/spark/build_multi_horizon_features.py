@@ -54,7 +54,8 @@ _COMMON_TARGET_COLUMNS = [
     "temp",
     "precip",
     "pop_total",
-    "hour",
+    "hour",  # 더 이상 모델 feature 아님(minute이 대체) — scoring.predict() 출력/CLI 식별용
+    "minute",  # 자정 기준 경과분 — 실제 모델 feature(common_config.BASE_FEATURE_COLUMNS)
     "dow",
     "is_holiday",
     "day",

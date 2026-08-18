@@ -69,7 +69,7 @@ def _set_return_history(station_id: str, point, return_count: float) -> None:
 
 
 def _set_profile(entries: dict) -> None:
-    """entries: {(station_no, hour, dow, month): {"rental_mean":..., "rental_std":..., ...}}"""
+    """entries: {(station_no, minute, dow, month): {"rental_mean":..., "rental_std":..., ...}}"""
     ps._station_profile = entries
 
 
@@ -116,8 +116,8 @@ def test_rental_recent_fallback_when_target_outside_coverage():
     _set_return_history("A", "2026-08-01 07:00:00", 0.0)
     _set_profile(
         {
-            (STATION_NO, h, dow, m): {"rental_mean": 7.0, "rental_std": 1.5, "return_mean": 3.0, "return_std": 0.5}
-            for h in range(24)
+            (STATION_NO, minute, dow, m): {"rental_mean": 7.0, "rental_std": 1.5, "return_mean": 3.0, "return_std": 0.5}
+            for minute in range(0, 1440, 20)
             for dow in range(7)
             for m in range(1, 13)
         }
@@ -150,8 +150,8 @@ def test_return_lag_1h_falls_back_to_profile_when_missing():
     ps._history_by_station = {}  # station "A"에 대한 return_count 자체가 없음
     _set_profile(
         {
-            (STATION_NO, h, dow, m): {"rental_mean": 0.0, "rental_std": 0.0, "return_mean": 9.0, "return_std": 2.0}
-            for h in range(24)
+            (STATION_NO, minute, dow, m): {"rental_mean": 0.0, "rental_std": 0.0, "return_mean": 9.0, "return_std": 2.0}
+            for minute in range(0, 1440, 20)
             for dow in range(7)
             for m in range(1, 13)
         }

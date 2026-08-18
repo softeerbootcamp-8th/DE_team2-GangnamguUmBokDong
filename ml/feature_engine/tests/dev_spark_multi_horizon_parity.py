@@ -47,6 +47,7 @@ def _synthetic_features_table(n_hours: int = 20) -> pd.DataFrame:
     df["lat"] = 37.5
     df["lon"] = 127.0
     df["hour"] = hours.hour
+    df["minute"] = hours.hour * 60 + hours.minute
     df["dow"] = hours.dayofweek
     df["is_holiday"] = (hours.dayofweek >= 5).astype(int)
     df["day"] = (hours.normalize() - _DAY_INDEX_EPOCH).days
@@ -66,7 +67,7 @@ def test_horizon_1_matches_source_row_exactly(spark):
     assert len(h1) == len(pdf)
     assert (h1["anchor_ts"].values == pdf["hour_ts"].values).all()
     assert "return_count" not in h1.columns  # 대여 데이터셋엔 반납 라벨이 없어야 함
-    for col in ["rental_lag_1h", "temp", "rental_exposure", "rental_count", "date", "hour", "day"]:
+    for col in ["rental_lag_1h", "temp", "rental_exposure", "rental_count", "date", "hour", "minute", "day"]:
         assert (h1[col].to_numpy() == pdf[col].to_numpy()).all(), col
 
 
@@ -87,7 +88,7 @@ def test_horizon_k_shifts_only_target_columns(spark):
         anchor_row = pdf.iloc[i]
         assert hk.loc[i, "anchor_ts"] == anchor_row["hour_ts"]
         assert hk.loc[i, "rental_lag_1h"] == anchor_row["rental_lag_1h"]
-        for col in ["temp", "rental_exposure", "rental_count", "date", "hour", "day"]:
+        for col in ["temp", "rental_exposure", "rental_count", "date", "hour", "minute", "day"]:
             assert hk.loc[i, col] == target_row[col], f"{col} at i={i}"
 
 

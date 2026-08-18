@@ -52,8 +52,10 @@ NATIVE_COLUMN_DTYPES = {
     "temp": "float32",
     "precip": "float32",
     "pop_total": "float32",
-    "hour": "int8",
-    "minute": "int8",
+    "hour": "int8",  # 더 이상 모델 feature가 아니다(minute이 대체) — 출력/CLI 식별용으로만 남음
+    # minute = 자정 기준 경과분(0~1439, ml_core.minute_of_day) — hour 대신 쓰는 실제
+    # 모델 feature. int8(-128~127) 범위를 넘어 int16 필요.
+    "minute": "int16",
     "dow": "int8",
     "is_holiday": "int8",
     "horizon": "int8",  # 1~HORIZON_COUNT(기본 12) — common_config.HORIZON_COUNT 참고

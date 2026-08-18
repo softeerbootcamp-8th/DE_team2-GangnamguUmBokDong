@@ -94,8 +94,8 @@ HORIZON_COUNT = _int_env("HORIZON_COUNT", _PROFILE["HORIZON_COUNT"])
 # sin·cos 순환 인코딩) 컬럼을 정리하고 핵심만 남겼다:
 # - `is_holiday` 하나가 주말+공휴일을 전부 흡수(과거의 is_weekend/is_next_day_off/
 #   is_prev_day_off를 대체) — 다음날/전날 조회가 없어져 연도 경계 처리도 단순해짐.
-# - `hour`/`dow`를 sin/cos로 순환 인코딩하지 않고 원값 그대로 둔다 — 순환
-#   인코딩은 "휴일 여부가 날마다 완전히 다른 패턴을 만든다"는 걸 모델에 감춘다.
+# - `dow`를 sin/cos로 순환 인코딩하지 않고 원값 그대로 둔다 — 순환 인코딩은
+#   "휴일 여부가 날마다 완전히 다른 패턴을 만든다"는 걸 모델에 감춘다.
 # - `month`/`date` 대신 `day`(2000-01-01 기준 경과일수, ml_core.day_index)를 쓴다
 #   — month 순환 인코딩과 달리 연도 경계(작년 12월과 올해 1월이 가깝고, 같은 해
 #   1월과 12월은 멀다)를 올바르게 표현한다.
@@ -104,6 +104,11 @@ HORIZON_COUNT = _int_env("HORIZON_COUNT", _PROFILE["HORIZON_COUNT"])
 #   자체를 정수로 두면 학습 데이터 읽기(core.s3.read_parquet)에서 Parquet dictionary
 #   encoding이 pandas Categorical로 안 살아나 매번 object dtype 문자열 배열을
 #   통째로 만드는 비용을 원천적으로 피한다(정수 컬럼은 그 디코딩 자체가 없음).
+# - `hour`(0~23) 대신 `minute`(자정 기준 경과분 0~1439, ml_core.minute_of_day) 하나로
+#   시각을 나타낸다 — 그리드 자체가 20분 tick인데 hour만 쓰면 같은 시간 안의
+#   17:00/17:20/17:40이 모델에 전부 같은 값으로 보인다. minute은 그 tick 구분을
+#   그대로 담으면서 hour가 주던 정보(시간대별 패턴)도 당연히 포함한다. `hour`는
+#   출력/CLI 조회 등 식별 용도로는 계속 남아있지만 더 이상 모델 feature가 아니다.
 BASE_FEATURE_COLUMNS = [
     "station_no",
     "capacity",
@@ -112,7 +117,7 @@ BASE_FEATURE_COLUMNS = [
     "temp",
     "precip",
     "pop_total",
-    "hour",
+    "minute",
     "dow",
     "is_holiday",
     "day",
