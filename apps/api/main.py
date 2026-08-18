@@ -1,8 +1,9 @@
+from core.forecast import enrich_forecast_points
+from core.regions import DISPATCH_CENTERS, nearest_region
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 import queries
-from regions import DISPATCH_CENTERS, nearest_region
 from schemas import (
     Alert,
     DispatchCenter,
@@ -11,7 +12,6 @@ from schemas import (
     StationSummary,
     StatusResponse,
 )
-from scoring import enrich_forecast_points, urgency_score
 
 app = FastAPI(title="GangnamguUmBokDong API")
 
@@ -70,8 +70,8 @@ def get_forecast(sta_id: str) -> dict:
 @app.get("/regions", response_model=list[DispatchCenter])
 def list_regions() -> list[dict]:
     """지역센터(권역) 목록과 좌표를 반환한다. 프론트가 권역 경계(보로노이)를
-    그리려면 대여소 배정에 쓰인 것과 같은 좌표를 알아야 하므로, 여기 하나(regions.py)만
-    출처로 둔다."""
+    그리려면 대여소 배정에 쓰인 것과 같은 좌표를 알아야 하므로, 여기 하나
+    (core.regions)만 출처로 둔다."""
     return [{"region": name, "lat": lat, "lon": lon} for name, lat, lon in DISPATCH_CENTERS]
 
 
@@ -85,32 +85,18 @@ def get_status() -> dict:
 def list_alerts() -> list[dict]:
     """전체 대여소의 재배치 우선순위 알림을 urgency_score 내림차순으로 반환한다.
 
-    대여소마다 재고 이력·예측치를 따로 조회하면 대여소 수만큼 쿼리가 늘어나므로
-    (N+1), 두 데이터 다 전체 대여소를 대상으로 한 번씩만 조회해 sta_id별로 나눠 쓴다.
+    urgency_score는 더 이상 요청마다 계산하지 않는다 — 5분 배치(rebalance/urgency.py)가
+    미리 계산해 station_urgency 테이블에 적재해두고, 여기서는 그 결과만 조회한다.
     """
-    now = queries.now_utc()
-    stations = queries.fetch_stations()
-    sta_ids = [station["sta_id"] for station in stations]
-    stock_history_by_station = queries.fetch_all_stock_history(sta_ids, now)
-    raw_points_by_station = queries.fetch_all_forecast_points(sta_ids, now)
-
-    alerts = []
-    for station in stations:
-        current = station["parking_bike_tot_cnt"]
-        hold_cnt = station["hold_cnt"]
-        stock_history = stock_history_by_station[station["sta_id"]]
-        raw_points = raw_points_by_station[station["sta_id"]]
-        points = enrich_forecast_points(current, hold_cnt, raw_points)
-
-        score, minutes, action_type = urgency_score(current, hold_cnt, stock_history, points, now)
-        alerts.append(
-            {
-                "sta_id": station["sta_id"],
-                "sta_nm": station["sta_nm"],
-                "action_type": action_type,
-                "urgency_score": score,
-                "minutes_until_critical": minutes,
-                "region": nearest_region(station["lat"], station["lon"]),
-            }
-        )
-    return sorted(alerts, key=lambda a: a["urgency_score"], reverse=True)
+    alerts = queries.fetch_alerts()
+    return [
+        {
+            "sta_id": row["sta_id"],
+            "sta_nm": row["sta_nm"],
+            "action_type": row["action_type"],
+            "urgency_score": row["urgency_score"],
+            "minutes_until_critical": row["minutes_until_critical"],
+            "region": nearest_region(row["lat"], row["lon"]),
+        }
+        for row in alerts
+    ]

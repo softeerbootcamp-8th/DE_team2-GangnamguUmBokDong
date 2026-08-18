@@ -100,24 +100,18 @@ def fetch_all_stock_history(sta_ids: list[str], now: datetime) -> dict[str, list
     return {sta_id: grouped.get(sta_id, []) for sta_id in sta_ids}
 
 
-def fetch_all_forecast_points(sta_ids: list[str], now: datetime) -> dict[str, list[dict]]:
-    """여러 대여소의 예측 원본치를 쿼리 1번으로 가져와 sta_id별로 묶어서 반환한다."""
+def fetch_alerts() -> list[dict]:
+    """전체 대여소의 재배치 우선순위 알림을 station_urgency(배치가 미리 계산한
+    결과)에서 urgency_score 내림차순으로 조회한다. region은 위경도가 있어야
+    계산되므로 stations와 조인해서 같이 가져온다."""
     query = """
-        WITH latest_batch AS (
-            SELECT max(batch_run_at) AS batch_run_at
-            FROM forecast_points
-            WHERE predicted_dttm > %(now)s
-        )
-        SELECT sta_id, predicted_dttm, predicted_rent_cnt, predicted_return_cnt
-        FROM forecast_points
-        WHERE sta_id = ANY(%(sta_ids)s)
-          AND predicted_dttm > %(now)s
-          AND batch_run_at = (SELECT batch_run_at FROM latest_batch)
-        ORDER BY sta_id, predicted_dttm
+        SELECT s.sta_id, s.sta_nm, s.lat, s.lon,
+               u.action_type, u.urgency_score, u.minutes_until_critical
+        FROM station_urgency u
+        JOIN stations s ON s.sta_id = u.sta_id
+        ORDER BY u.urgency_score DESC
     """
-    rows = fetch_all(query, {"sta_ids": sta_ids, "now": now})
-    grouped = _group_by_sta_id(rows)
-    return {sta_id: grouped.get(sta_id, []) for sta_id in sta_ids}
+    return fetch_all(query)
 
 
 def fetch_batch_run_at(now: datetime) -> datetime:
