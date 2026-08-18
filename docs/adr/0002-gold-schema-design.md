@@ -34,3 +34,16 @@ station_stock을 `(sta_id, observed_at)`을 기본키로 하는 이력 테이블
 
 ## 결과
 1시간 이내의 급격한 변화도 감지할 수 있다. 대신 테이블이 계속 커지므로, 트래픽이나 저장 용량이 문제가 되면 그때 오래된 행을 정리하는 배치를 추가한다.
+
+---
+
+# weather_forecast·forecast_points·cultural_events는 유예기간을 두고 loader가 직접 정리한다
+
+## 배경
+`weather_forecast`(`weather_forecast_ultra` 포함), `forecast_points`, `cultural_events`(`cultural_events_performance` 포함)는 전부 시각이 지나거나 만료된 행이 계속 쌓이기만 하고 지워지지 않는다([#116](https://github.com/softeerbootcamp-8th/DE_team2-GangnamguUmBokDong/issues/116), [#117](https://github.com/softeerbootcamp-8th/DE_team2-GangnamguUmBokDong/issues/117)). 지나간 시각이 되는 즉시 삭제하면 "그때 예보·예측이 실제와 얼마나 맞았는지" 사후 비교·분석할 데이터가 안 남는다.
+
+## 결정
+칼같이 즉시 삭제하지 않고 테이블별 유예기간(`loader/retention_config.py`의 `RETENTION_GRACE`: weather_forecast·forecast_points 2시간, cultural_events 3일)이 지난 뒤에만 지운다. 새 Airflow 태스크를 따로 만들지 않고, 5개 테이블 스펙이 전부 통과하는 기존 적재 진입점(`loader/main.py:run()`)이 upsert와 같은 트랜잭션으로 만료 행을 지운다. 정리 대상 테이블은 `tables.yaml`에 `expire_col`을 선언한 테이블로만 한정한다(`stations`처럼 마스터 데이터거나 `station_stock`처럼 최신 관측 이력 자체가 목적인 테이블은 대상이 아니다).
+
+## 결과
+`realtime_5min`·`weather_10min`·`weather_3h`·`daily_population_and_events` 4개 DAG 모두 이 진입점을 거치므로 별도 배선 없이 자동으로 커버된다. `cultural_events.end_date`는 DATE 컬럼이라 TIMESTAMPTZ cutoff와 비교하면 캐스팅이 모호해지므로, 이 테이블만 cutoff를 date로 변환해 비교한다(`DATE_TYPED_EXPIRE_TABLES`).
