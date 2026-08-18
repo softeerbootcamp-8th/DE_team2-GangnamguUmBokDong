@@ -1,15 +1,4 @@
-"""공간 조인(STRtree), 밀도 순차 갱신, 연령/성별 재분배.
-
-핵심 공식(spec 3.4/3.5, plan.md 4절):
-
-    D_new = (1 - W_intersect) * D_current + W_intersect * D_poi
-    SPOP_new = D_new * GRID_AREA_M2
-
-여러 POI가 한 격자에 겹치면 면적 내림차순(동률이면 AREA_CD 오름차순)으로
-정렬해 순차 적용한다(작은 POI가 마지막에 덮어씀). 연령/성별 재분배는
-마지막에 적용된 POI의 성비를 쓰고, 그 안에서 원본 연령대 비중을 그대로
-유지한다(spec 3.5의 (A) 채택안).
-"""
+"""공간 교차(STRtree)를 통해 격자 인구와 실시간 POI 인구를 합성하고 연령·성별을 재분배한다."""
 
 from __future__ import annotations
 
@@ -33,30 +22,30 @@ AGE_COLUMNS = MALE_AGE_COLUMNS + FEMALE_AGE_COLUMNS
 
 @dataclass(frozen=True)
 class GridCell:
-    """living_population_grid에서 온 격자 하나(해당 window의 TT 필터링 완료)."""
+    """생활인구 격자 데이터의 단일 셀 정보."""
 
     cell_id: str
     h_dng_cd: str
     spop: float
-    ages: dict[str, float]  # 28개 키, null은 호출자가 0.0으로 치환해서 넘김
+    ages: dict[str, float]
     geometry: BaseGeometry
 
 
 @dataclass(frozen=True)
 class PoiSnapshot:
-    """population_realtime의 해당 window 행 + POI 폴리곤을 합친 스냅샷."""
+    """실시간 POI 인구 관측치와 지오메트리가 결합된 스냅샷."""
 
     area_cd: str
     male_rate: float
     female_rate: float
-    pop_estimate: float  # (AREA_PPLTN_MIN + AREA_PPLTN_MAX) / 2
+    pop_estimate: float
     geometry: BaseGeometry
     area_m2: float
 
 
 @dataclass(frozen=True)
 class MergedCell:
-    """병합 결과(아직 반올림 전, float)."""
+    """POI 인구 합성이 완료된 격자 셀 정보(반올림 전 소수점 유지)."""
 
     cell_id: str
     h_dng_cd: str
@@ -67,10 +56,13 @@ class MergedCell:
 def find_overlaps(
     cells: list[GridCell], pois: list[PoiSnapshot]
 ) -> dict[str, list[tuple[PoiSnapshot, float]]]:
-    """STRtree로 격자-POI 겹침 후보를 좁힌 뒤, 실제 교차면적을 계산한다.
+    """STRtree 공간 인덱스를 활용하여 격자와 POI 간의 교차 영역 및 면적을 계산한다.
 
-    Returns:
-        cell_id -> [(poi, 교차면적_m2), ...] (겹치는 POI가 없는 cell_id는 키에서 제외).
+    args:
+        cells: 대상 GridCell 목록
+        pois: 대상 PoiSnapshot 목록
+    returns:
+        CELL_ID를 키로 하고 (PoiSnapshot, 교차면적_m2) 튜플 목록을 값으로 갖는 딕셔너리
     """
     if not pois:
         return {}
@@ -93,35 +85,51 @@ def find_overlaps(
 
 
 def _update_density(current_spop: float, poi: PoiSnapshot, intersection_area: float) -> float:
+    """격자와 POI의 겹침 비율에 따라 밀도 가중치를 적용하여 새로운 생활인구 합계를 계산한다."""
+    # 1. 격자 및 POI의 면적당 인구 밀도(명/m²) 계산
     d_current = current_spop / GRID_AREA_M2
     d_poi = poi.pop_estimate / poi.area_m2
+
+    # 2. 격자 전체 면적(62,500m²) 대비 POI와 겹친 면적의 가중치 비율(w)
     w = intersection_area / GRID_AREA_M2
+
+    # 3. 겹치지 않은 영역(1-w)은 기존 밀도, 겹친 영역(w)은 POI 실시간 밀도로 가중평균
     d_new = (1 - w) * d_current + w * d_poi
+
+    # 4. 갱신된 밀도를 격자 전체 면적에 곱해 최종 생활인구 산출
     return d_new * GRID_AREA_M2
 
 
 def _redistribute_ages(
     original_ages: dict[str, float], spop_new: float, male_rate: float, female_rate: float
 ) -> dict[str, float]:
+    """합성된 생활인구 총합과 POI 성비를 바탕으로 연령대별 인구를 재분배한다."""
+    # 1. 기존 격자의 남성 및 여성 인구 총합 계산
     male_total_orig = sum(original_ages[c] for c in MALE_AGE_COLUMNS)
     female_total_orig = sum(original_ages[c] for c in FEMALE_AGE_COLUMNS)
+
+    # 2. POI 실시간 성비(%)를 적용한 새로운 남녀 목표 총인구 산출
     male_total_new = spop_new * male_rate / 100.0
     female_total_new = spop_new * female_rate / 100.0
 
     result: dict[str, float] = {}
 
+    # 3. 남성 연령대(M00~M70): 기존 연령대 비중을 유지하며 새 남성 인구에 비례 배분
     if male_total_orig > 0:
         for c in MALE_AGE_COLUMNS:
             result[c] = male_total_new * (original_ages[c] / male_total_orig)
     else:
+        # 기존 남성 인구가 0이었던 경우 14개 연령대에 균등 배분
         even_share = male_total_new / len(MALE_AGE_COLUMNS)
         for c in MALE_AGE_COLUMNS:
             result[c] = even_share
 
+    # 4. 여성 연령대(F00~F70): 기존 연령대 비중을 유지하며 새 여성 인구에 비례 배분
     if female_total_orig > 0:
         for c in FEMALE_AGE_COLUMNS:
             result[c] = female_total_new * (original_ages[c] / female_total_orig)
     else:
+        # 기존 여성 인구가 0이었던 경우 14개 연령대에 균등 배분
         even_share = female_total_new / len(FEMALE_AGE_COLUMNS)
         for c in FEMALE_AGE_COLUMNS:
             result[c] = even_share
@@ -130,26 +138,31 @@ def _redistribute_ages(
 
 
 def merge_cell(cell: GridCell, overlapping: list[tuple[PoiSnapshot, float]]) -> MergedCell:
-    """격자 하나에 겹치는 POI들을 면적 내림차순으로 순차 적용한다.
+    """단일 격자에 겹치는 POI들을 면적 내림차순으로 순차 적용하여 최종 인구 및 성·연령 분포를 합성한다.
 
-    Args:
-        cell: 원본 격자.
-        overlapping: (poi, 교차면적_m2) 리스트. 순서는 무관(내부에서 정렬).
+    광역 POI의 배경 밀도를 먼저 반영하고 국소 핫스팟의 세부 특성이 최종 반영되도록 면적 내림차순으로 순차 적용합니다.
 
-    Returns:
-        병합된 결과(겹치는 POI가 없으면 원본 값을 그대로 pass-through).
+    args:
+        cell: 대상 GridCell 객체
+        overlapping: (PoiSnapshot, 교차면적_m2) 목록
+    returns:
+        합성된 MergedCell 객체
     """
+    # 1. 겹치는 POI가 없으면 기존 격자 데이터를 그대로 반환
     if not overlapping:
         return MergedCell(
             cell_id=cell.cell_id, h_dng_cd=cell.h_dng_cd, spop=cell.spop, ages=dict(cell.ages)
         )
 
+    # 2. 광역 POI를 먼저 반영하고 국소 POI가 최종 덮어쓰도록 면적 내림차순(동률 시 코드순) 정렬
     ordered = sorted(overlapping, key=lambda pair: (-pair[0].area_m2, pair[0].area_cd))
 
+    # 3. 큰 POI부터 작은 POI 순으로 밀도를 순차적 누적 갱신
     spop = cell.spop
     for poi, intersection_area in ordered:
         spop = _update_density(spop, poi, intersection_area)
 
+    # 4. 가장 국소적인 마지막 POI의 성비를 채택하여 28개 연령대 재분배
     last_poi = ordered[-1][0]
     ages = _redistribute_ages(cell.ages, spop, last_poi.male_rate, last_poi.female_rate)
 
@@ -157,10 +170,7 @@ def merge_cell(cell: GridCell, overlapping: list[tuple[PoiSnapshot, float]]) -> 
 
 
 def round_output_row(merged: MergedCell) -> dict[str, int | str]:
-    """int64 출력 스키마에 맞게 SPOP과 28개 연령 컬럼을 독립적으로 반올림한다.
-
-    반올림 오차로 SPOP != sum(연령 컬럼)이 ±1~2 정도 어긋날 수 있다(spec 3.5에서 허용).
-    """
+    """합성된 실수형 인구 데이터를 정수형(int64) 출력 레코드 형태로 반올림한다."""
     row: dict[str, int | str] = {
         "CELL_ID": merged.cell_id,
         "H_DNG_CD": merged.h_dng_cd,

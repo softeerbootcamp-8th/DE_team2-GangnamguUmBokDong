@@ -1,22 +1,22 @@
-"""기상청 API 허브 어댑터 
+"""기상청 API 허브 어댑터.
 
-## 데이터 소스
-기상청 초단기 실황·예보(10분) · 기상청 단기예보(3시간).
+기상청 초단기 실황·예보(10분)와 단기예보(3시간)를 수집한다. 이 API는 전체 행 수를
+미리 알려주지 않아 `expected_total`이 항상 None이고, 완결도는 행이 아니라
+(성공 격자 / 계획 격자)로 계산되어 manifest의 `missing.basis`가 `parts`가 된다.
+`base_date`·`base_time`은 window로 계산한다.
 
-expected_total은 None이다. 이 API는 전체 행 수를 미리 알려주지 않는다. 
-그래서 완결도가 행이 아니라 (성공 격자 / 계획 격자)으로 계산되고, manifest의 missing.basis가 parts가 된다. 
-base_date` · `base_time`은 window로 계산한다. 
+`time_rule`로 발표 주기에 맞춰 window를 API가 허용하는 시각으로 보정한다:
 
-## 주의
-- 인증키는 `KMA_APIHUB_KEY`에서 읽고 로그 · bronze에 남지 않게 마스킹한다.
-- 캐스팅은 검증 엔진의 `types`가 담당한다. pivot은 구조만 바꾸고 값은 문자열 그대로
-  둔다.
-- 실패 범주 판정은 base의 규칙을 따른다. 
+| time_rule | 소스 | 규칙 | 예시 |
+| --- | --- | --- | --- |
+| `hourly` | 초단기실황 | 매시 정각 | 14:40 → 14:00 |
+| `half_hourly` | 초단기예보 | 매시 30분 | 14:40 → 14:30 |
+| `vilage_fcst` | 단기예보 | 02, 05, 08...시 정각 | 05:05 → 02:00 |
 
-## time_rule을 통한 자체 보정 지원
-- `hourly`: 초단기실황 (매시 정각. 예: 14:40 -> 14:00)
-- `half_hourly`: 초단기예보 (매시 30분. 예: 14:40 -> 14:30)
-- `vilage_fcst`: 단기예보 (02, 05, 08...시 정각. 예: 05:05 -> 02:00)
+주의:
+- 인증키(`KMA_APIHUB_KEY`)는 로그·bronze에 남지 않게 마스킹한다.
+- 캐스팅은 검증 엔진의 `types`가 담당한다. pivot은 구조만 바꾸고 값은 문자열 그대로 둔다.
+- 실패 범주 판정은 base의 규칙을 따른다.
 """
 
 from __future__ import annotations

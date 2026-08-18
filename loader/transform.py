@@ -1,15 +1,11 @@
-"""Silver DataFrame을 Gold 테이블 upsert용 dict 레코드로 변환한다.
-
-대상 테이블이 5개로 고정돼 있어 collector 같은 YAML+정책 기반 범용 프레임워크는
-쓰지 않는다. 테이블마다 명시적인 순수 함수 하나씩 두는 편이 더 읽기 쉽다.
-`loader/implementation-plan.md` 1·2절의 컬럼 매핑을 그대로 구현한다.
-"""
+"""Silver 계층 DataFrame 및 ML 예측 결과를 Gold 테이블 규격 레코드로 변환한다."""
 
 from __future__ import annotations
 
 import hashlib
 import math
 from datetime import UTC, date, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -20,30 +16,32 @@ _KST = timedelta(hours=9)
 
 
 def _kst_to_utc(date_str: str, time_str: str) -> datetime:
-    """기상청 baseDate/fcstDate(YYYYMMDD) + baseTime/fcstTime(HHMM, KST)을 UTC로 변환한다."""
+    """기상청 일자(YYYYMMDD) 및 시각(HHMM, KST) 문자열을 UTC datetime으로 변환한다."""
     naive_kst = datetime.strptime(f"{date_str}{time_str}", "%Y%m%d%H%M").replace(tzinfo=UTC)
     return naive_kst - _KST
 
 
 def _kst_date_hm_to_utc(date_str: str, hour: int, minute: int) -> datetime:
-    """predict_single.py 출력의 date("YYYY-MM-DD", KST) + hour/minute(정수)을 UTC로 변환한다.
-
-    기상청 baseDate/fcstDate(YYYYMMDD, 대시 없음)와 형식이 달라 `_kst_to_utc`를
-    재사용하지 않고 별도 헬퍼로 둔다.
-    """
+    """ML 추론 결과 일자('YYYY-MM-DD', KST)와 시·분 정수를 UTC datetime으로 변환한다."""
     naive_kst = datetime.strptime(f"{date_str} {hour:02d}{minute:02d}", "%Y-%m-%d %H%M").replace(tzinfo=UTC)
     return naive_kst - _KST
 
 
 def stations_from_silver(df: pd.DataFrame) -> list[dict]:
-    """`bike_station_realtime` silver -> stations 레코드."""
+    """따릉이 실시간 대여소 Silver 데이터를 stations 테이블 레코드 목록으로 변환한다.
+
+    args:
+        df: bike_station_realtime Silver DataFrame
+    returns:
+        stations 테이블 적재용 레코드 딕셔너리 목록 (서울 경계 밖 제외)
+    """
     records = []
     for row in df.to_dict("records"):
         lat = float(row["stationLatitude"])
         lon = float(row["stationLongitude"])
         gu = latlon_to_gu(lat, lon)
         if gu is None:
-            continue  # 서울 자치구 경계 밖(인접 도시 접경) 정거장은 gu 스코프 테이블에서 제외
+            continue  # 서울 자치구 경계 밖(인접 도시 접경) 정거장은 제외
         records.append(
             {
                 "sta_id": str(row["stationId"]),
@@ -59,10 +57,13 @@ def stations_from_silver(df: pd.DataFrame) -> list[dict]:
 
 
 def station_stock_from_silver(df: pd.DataFrame, observed_at: datetime) -> list[dict]:
-    """`bike_station_realtime` silver -> station_stock 레코드. observed_at은 호출자가 결정한다.
+    """따릉이 실시간 대여소 Silver 데이터를 station_stock 테이블 레코드 목록으로 변환한다.
 
-    `stations`에 없는 sta_id는 FK 위반이 나므로, `stations_from_silver`와 동일하게
-    서울 자치구 경계 밖 정거장은 제외한다.
+    args:
+        df: bike_station_realtime Silver DataFrame
+        observed_at: 실측 기준 일시 (KST)
+    returns:
+        station_stock 테이블 적재용 레코드 딕셔너리 목록
     """
     records = []
     for row in df.to_dict("records"):
@@ -80,10 +81,12 @@ def station_stock_from_silver(df: pd.DataFrame, observed_at: datetime) -> list[d
 
 
 def weather_current_from_silver(df: pd.DataFrame) -> list[dict]:
-    """`weather_ultra_short_live` silver -> weather_current 레코드.
+    """기상청 초단기실황 Silver 데이터를 weather_current 테이블 레코드 목록으로 변환한다.
 
-    격자(nx, ny)를 gu로 변환한 뒤, 같은 gu에 여러 격자가 매핑되면 가장 최근 관측
-    (baseDate·baseTime 기준) 1건만 남긴다.
+    args:
+        df: weather_ultra_short_live Silver DataFrame
+    returns:
+        weather_current 테이블 적재용 자치구별 최신 실황 레코드 목록
     """
     by_gu: dict[str, dict] = {}
     for row in df.to_dict("records"):
@@ -91,26 +94,30 @@ def weather_current_from_silver(df: pd.DataFrame) -> list[dict]:
         if gu is None:
             continue
         observed_at = _kst_to_utc(str(row["baseDate"]), str(row["baseTime"]))
+
+        # 최신 데이터 보장: 이미 담긴 구의 데이터보다 과거 시간이면 무시한다
         existing = by_gu.get(gu)
         if existing is not None and existing["observed_at"] >= observed_at:
             continue
         by_gu[gu] = {
             "gu": gu,
             "observed_at": observed_at,
-            "temperature": _to_float(row.get("T1H")),
-            "humidity": _to_float(row.get("REH")),
-            "wind_speed": _to_float(row.get("WSD")),
-            "rainfall": _to_float(row.get("RN1")),
-            "pty_type": _to_int(row.get("PTY")),
+            "temperature": _to_float(row.get("T1H")),  # T1H: 기온(°C)
+            "humidity": _to_float(row.get("REH")),     # REH: 습도(%)
+            "wind_speed": _to_float(row.get("WSD")),   # WSD: 풍속(m/s)
+            "rainfall": _to_float(row.get("RN1")),     # RN1: 1시간 강수량(mm)
+            "pty_type": _to_int(row.get("PTY")),       # PTY: 강수형태 코드
         }
     return list(by_gu.values())
 
 
 def weather_forecast_from_silver(df: pd.DataFrame) -> list[dict]:
-    """`weather_short_term_forecast` silver -> weather_forecast 레코드.
+    """기상청 단기예보 Silver 데이터를 weather_forecast 테이블 레코드 목록으로 변환한다.
 
-    동일 (gu, forecast_dttm)에 대해 가장 최근에 발표된(base_dttm이 가장 늦은) 예보만 남긴다.
-    base_dttm은 대시보드에서 '(기상청 XX:XX 발표 기준)' 표시를 위해 보존한다.
+    args:
+        df: weather_short_term_forecast Silver DataFrame
+    returns:
+        weather_forecast 테이블 적재용 예보 레코드 목록
     """
     by_key: dict[tuple[str, datetime], dict] = {}
     for row in df.to_dict("records"):
@@ -126,13 +133,13 @@ def weather_forecast_from_silver(df: pd.DataFrame) -> list[dict]:
         by_key[key] = {
             "gu": gu,
             "forecast_dttm": forecast_dttm,
-            "sky_cond": _to_int(row.get("SKY")),
-            "pty_type": _to_int(row.get("PTY")),
-            "temperature": _to_float(row.get("TMP")),
-            "precip_prob": _to_float(row.get("POP")),
-            "precip_amount": _parse_precip_str(row.get("PCP")),
-            "humidity": _to_float(row.get("REH")),
-            "wind_speed": _to_float(row.get("WSD")),
+            "sky_cond": _to_int(row.get("SKY")),       # SKY: 하늘상태 코드(1:맑음, 3:구름많음, 4:흐림)
+            "pty_type": _to_int(row.get("PTY")),       # PTY: 강수형태 코드
+            "temperature": _to_float(row.get("TMP")),  # TMP: 1시간 기온(°C)
+            "precip_prob": _to_float(row.get("POP")),  # POP: 강수확률(%)
+            "precip_amount": _parse_precip_str(row.get("PCP")),  # PCP: 1시간 강수량(mm)
+            "humidity": _to_float(row.get("REH")),     # REH: 습도(%)
+            "wind_speed": _to_float(row.get("WSD")),   # WSD: 풍속(m/s)
             "base_dttm": base_dttm,
         }
     return list(by_key.values())
@@ -162,10 +169,12 @@ def _parse_precip_str(value) -> float | None:
 
 
 def weather_forecast_ultra_from_silver(df: pd.DataFrame) -> list[dict]:
-    """`weather_ultra_short_forecast` silver -> weather_forecast 레코드.
+    """기상청 초단기예보 Silver 데이터를 weather_forecast 테이블 레코드 목록으로 변환한다.
 
-    초단기예보는 단기예보와 컬럼명이 다르다(T1H/RN1 vs TMP/PCP, POP 없음).
-    동일 (gu, forecast_dttm)에 대해 가장 최근에 발표된 예보만 남긴다.
+    args:
+        df: weather_ultra_short_forecast Silver DataFrame
+    returns:
+        weather_forecast 테이블 적재용 초단기예보 레코드 목록
     """
     by_key: dict[tuple[str, datetime], dict] = {}
     for row in df.to_dict("records"):
@@ -181,28 +190,37 @@ def weather_forecast_ultra_from_silver(df: pd.DataFrame) -> list[dict]:
         by_key[key] = {
             "gu": gu,
             "forecast_dttm": forecast_dttm,
-            "sky_cond": _to_int(row.get("SKY")),
-            "pty_type": _to_int(row.get("PTY")),
-            "temperature": _to_float(row.get("T1H")),
-            "precip_prob": None,  # 초단기예보에는 강수확률(POP)이 없다
-            "precip_amount": _parse_precip_str(row.get("RN1")),
-            "humidity": _to_float(row.get("REH")),
-            "wind_speed": _to_float(row.get("WSD")),
+            "sky_cond": _to_int(row.get("SKY")),       # SKY: 하늘상태 코드(1:맑음, 3:구름많음, 4:흐림)
+            "pty_type": _to_int(row.get("PTY")),       # PTY: 강수형태 코드
+            "temperature": _to_float(row.get("T1H")),  # T1H: 기온(°C)
+            "precip_prob": None,                       # 초단기예보에는 강수확률(POP)이 없음
+            "precip_amount": _parse_precip_str(row.get("RN1")),  # RN1: 1시간 강수량(mm)
+            "humidity": _to_float(row.get("REH")),     # REH: 습도(%)
+            "wind_speed": _to_float(row.get("WSD")),   # WSD: 풍속(m/s)
             "base_dttm": base_dttm,
         }
     return list(by_key.values())
 
 
 def cultural_events_from_silver(df: pd.DataFrame, today: date | None = None) -> list[dict]:
-    """`cultural_event` silver -> cultural_events 레코드. 종료일이 지난 행사는 제외한다."""
-    today = today or datetime.now(UTC).date()
+    """서울시 문화행사 Silver 데이터를 cultural_events 테이블 레코드 목록으로 변환한다.
+
+    args:
+        df: cultural_event Silver DataFrame
+        today: 행사 유효성 검사용 기준 일자 (KST, 기본값: 오늘)
+    returns:
+        cultural_events 테이블 적재용 레코드 목록 (종료된 행사 제외)
+    """
+    today = today or datetime.now(ZoneInfo("Asia/Seoul")).date()
     records = []
     for row in df.to_dict("records"):
         end_date = _parse_date(row["END_DATE"])
+        # 이미 종료된 행사는 제외
         if end_date is not None and end_date < today:
             continue
         title = row["TITLE"]
         place = row["PLACE"]
+        # 제목 + 장소 + 시작일을 조합하여 고유 SHA256 event_id 생성
         event_id = hashlib.sha256(f"{title}{place}{row.get('STRTDATE', '')}".encode()).hexdigest()
         records.append(
             {
@@ -222,22 +240,33 @@ def cultural_events_from_silver(df: pd.DataFrame, today: date | None = None) -> 
 
 
 def performance_events_from_silver(df: pd.DataFrame, today: date | None = None) -> list[dict]:
-    """`performance_event` silver -> cultural_events 레코드. 종료일이 지난 행사는 제외한다."""
-    today = today or datetime.now(UTC).date()
+    """서울시 공공서비스예약(공연) Silver 데이터를 cultural_events 테이블 레코드 목록으로 변환한다.
+
+    args:
+        df: performance_event Silver DataFrame
+        today: 행사 유효성 검사용 기준 일자 (KST, 기본값: 오늘)
+    returns:
+        cultural_events 테이블 적재용 레코드 목록 (종료된 행사 제외)
+    """
+    today = today or datetime.now(ZoneInfo("Asia/Seoul")).date()
     records = []
     for row in df.to_dict("records"):
         end_date = _parse_date(row.get("SVCOPNENDDT"))
+        # 1. 이미 종료된 행사는 제외
         if end_date is not None and end_date < today:
             continue
         title = row.get("SVCNM", "")
         place = row.get("PLACENM", "")
         svcid = row.get("SVCID")
-        
+
+        # 2. 서울시 서비스ID(SVCID)가 있으면 사용하고, 없으면 제목+장소+시작일 해시로 event_id 생성
         event_id = str(svcid) if svcid else hashlib.sha256(f"{title}{place}{row.get('SVCOPNBGNDT', '')}".encode()).hexdigest()
-        
+
+        # 3. 유/무료 여부 정규화
         is_free_val = row.get("PAYATNM")
         is_free = "무료" if is_free_val == "무료" else "유료"
-        
+
+        # 4. cultural_events 공통 스키마에 맞게 매핑 (Y: 위도, X: 경도)
         records.append(
             {
                 "event_id": event_id,
@@ -256,17 +285,13 @@ def performance_events_from_silver(df: pd.DataFrame, today: date | None = None) 
 
 
 def forecast_points_from_predictions(df: pd.DataFrame, batch_run_at: datetime) -> list[dict]:
-    """ml/inference의 predict_single.py --all-stations 출력 -> forecast_points 레코드.
+    """ML 추론 결과 DataFrame을 forecast_points 테이블 레코드 목록으로 변환한다.
 
-    각 행의 date/hour/minute는 이미 그 horizon의 목표 시각이다
-    (predict_demand_multi_hour_all_stations()가 target_ts = anchor_ts + (horizon-1)h로
-    계산해서 채워 넣는다) — horizon을 여기서 다시 더하지 않는다.
-
-    station_id("ST-101" 등)와 stations.sta_id("101" 등, bike_station_realtime의
-    raw stationId를 그대로 씀)가 같은 값 공간인지는 실제 데이터로 아직 확정되지
-    않았다 — libs/ml_core/silver_schema.py의 컬럼 매핑이 둘 다 raw stationId를
-    그대로 통과시키는 것처럼 보이지만, 실제 Seoul OpenAPI 응답으로 검증 전까지는
-    가정으로만 남겨둔다.
+    args:
+        df: ML 추론 결과 DataFrame
+        batch_run_at: 배치 실행 시각 (KST)
+    returns:
+        forecast_points 테이블 적재용 예측 레코드 목록
     """
     records = []
     for row in df.to_dict("records"):
@@ -285,6 +310,7 @@ def forecast_points_from_predictions(df: pd.DataFrame, batch_run_at: datetime) -
 
 
 def _to_float(value) -> float | None:
+    """문자열 또는 숫자 값을 float으로 변환한다 (변환 불가 시 None)."""
     if value is None or value == "":
         return None
     try:
@@ -294,6 +320,7 @@ def _to_float(value) -> float | None:
 
 
 def _to_int(value) -> int | None:
+    """문자열 또는 숫자 값을 int로 변환한다 (변환 불가 시 None)."""
     if value is None or value == "":
         return None
     try:
@@ -303,12 +330,13 @@ def _to_int(value) -> int | None:
 
 
 def _parse_date(value) -> date | None:
+    """다양한 형식의 일자 문자열을 KST date 객체로 파싱한다."""
     if value is None or value == "":
         return None
     text = str(value).strip()
     for fmt in ("%Y-%m-%d", "%Y-%m-%d %H:%M:%S.%f", "%Y%m%d"):
         try:
-            return datetime.strptime(text, fmt).replace(tzinfo=UTC).date()
+            return datetime.strptime(text, fmt).replace(tzinfo=ZoneInfo("Asia/Seoul")).date()
         except ValueError:
             continue
     return None

@@ -1,7 +1,4 @@
-"""행 순회 → 판정 → 정책 디스패치 → 결과 집계.
-어댑터가 넘긴 list[dict]를 받아 silver 행 · quarantine 행 · manifest 집계를 만든다.
-소스 이름을 알지 못하고 판단 기준은 전부 config에서 온다.
-"""
+"""어댑터가 넘긴 행을 config 기준으로 판정·정책 디스패치해 silver·quarantine·집계로 만드는 검증 엔진."""
 
 from __future__ import annotations
 

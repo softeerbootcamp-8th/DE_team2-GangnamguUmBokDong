@@ -323,6 +323,12 @@ requires-dist = [
     { name = "pyarrow", specifier = ">=15.0.0" },
 ]
 
+[package.metadata.requires-dev]
+dev = [
+    { name = "moto", extras = ["s3"], specifier = ">=5.2.2" },
+    { name = "pytest", specifier = ">=9.1.1" },
+]
+
 [[package]]
 name = "cryptography"
 version = "50.0.0"

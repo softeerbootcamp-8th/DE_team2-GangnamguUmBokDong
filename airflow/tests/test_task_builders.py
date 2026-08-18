@@ -3,7 +3,11 @@
 from orchestration.collector_task import COLLECTOR_DIR, build_collector_task
 from orchestration.db_loader_task import DB_LOADER_DIR, build_db_loader_task
 from orchestration.inference_task import ML_DIR, build_inference_task
-from orchestration.normalizer_task import NORMALIZER_DIR, build_normalizer_task
+from orchestration.normalizer_task import (
+    NORMALIZER_DIR,
+    build_normalizer_task,
+    build_station_master_enrichment_task,
+)
 from orchestration.nowcasting_task import NOWCASTING_DIR, build_nowcasting_task
 from orchestration.task_builder import REPO_ROOT
 
@@ -14,9 +18,9 @@ def test_repo_root_resolves_to_repository_root():
     assert (REPO_ROOT / "ml" / "inference").is_dir()
 
 
-def test_collector_task_uses_kst_window_start_and_no_virtual_env(dag):
+def test_collector_task_uses_kst_window_start_and_own_project_environment(dag):
     task = build_collector_task(dag, "bike_station_realtime")
-    assert task.bash_command.startswith("env -u VIRTUAL_ENV ")
+    assert task.bash_command.startswith("env -u VIRTUAL_ENV -u UV_PROJECT_ENVIRONMENT ")
     assert "uv run --frozen python main.py --source bike_station_realtime" in task.bash_command
     assert "astimezone" in task.bash_command
     assert task.cwd == COLLECTOR_DIR
@@ -26,6 +30,14 @@ def test_normalizer_task_cwd_and_flags(dag):
     task = build_normalizer_task(dag, "run_normalizer_strict", "strict")
     assert task.cwd == NORMALIZER_DIR
     assert "--baseline-date-mode strict" in task.bash_command
+
+
+def test_station_master_enrichment_task_contract(dag):
+    task = build_station_master_enrichment_task(dag)
+    assert task.cwd == NORMALIZER_DIR
+    assert "python station_master.py" in task.bash_command
+    assert "--baseline-date-mode latest" in task.bash_command
+    assert "astimezone" in task.bash_command
 
 
 def test_nowcasting_task_uses_date_not_window_start(dag):
@@ -43,6 +55,23 @@ def test_inference_task_cwd_is_ml_not_ml_inference(dag):
     assert task.cwd.endswith("/ml")
     assert "uv --project inference run python -m inference.predict_single" in task.bash_command
     assert "--all-stations" in task.bash_command
+    assert "--n-hours 12" in task.bash_command
+    assert "// 5" in task.bash_command
+    assert ".replace(" in task.bash_command
+
+
+def test_all_pipeline_tasks_floor_manual_run_to_same_five_minute_window(dag):
+    """수동 trigger의 19:33도 모든 모듈에서 동일하게 19:30으로 내림한다."""
+    tasks = [
+        build_collector_task(dag, "bike_station_realtime"),
+        build_normalizer_task(dag, "normalize", "strict"),
+        build_inference_task(dag),
+        build_db_loader_task(dag, "station_stock"),
+    ]
+
+    for task in tasks:
+        assert "// 5" in task.bash_command
+        assert "second=0" in task.bash_command
 
 
 def test_db_loader_task_table_flag(dag):

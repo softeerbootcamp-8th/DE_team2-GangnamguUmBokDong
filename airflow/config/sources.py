@@ -12,6 +12,7 @@ WEATHER_3H_SOURCE = "weather_short_term_forecast"
 DAILY_POPULATION_SOURCE = "living_population_grid"
 DAILY_EVENT_SOURCE = "cultural_event"
 PERFORMANCE_EVENT_SOURCE = "performance_event"
+STATION_MASTER_SOURCE = "bike_station_master"
 
 # 하루치 silver를 archive로 묶을 대상. 예보 2종(weather_ultra_short_forecast,
 # weather_short_term_forecast)은 사후 재현이 불가해 archive 가치가 낮아 제외한다.

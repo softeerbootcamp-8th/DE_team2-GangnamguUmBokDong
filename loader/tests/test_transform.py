@@ -2,10 +2,12 @@ from datetime import UTC, date, datetime
 
 import pandas as pd
 
+import transform
 from transform import (
     _parse_precip_str,
     cultural_events_from_silver,
     forecast_points_from_predictions,
+    performance_events_from_silver,
     station_stock_from_silver,
     stations_from_silver,
     weather_current_from_silver,
@@ -125,6 +127,69 @@ def test_cultural_events_from_silver_filters_ended_events():
     assert len(records) == 1
     assert records[0]["title"] == "여름 재즈 페스티벌"
     assert records[0]["end_date"] == date(2026, 8, 20)
+
+
+# UTC 2026-08-15 16:30 = KST 2026-08-16 01:30. UTC와 KST의 날짜(date)가 갈라지는
+# 자정 근방 시각을 골라야, today를 UTC로 잘못 계산하는 회귀를 테스트가 실제로 잡아낸다.
+_FIXED_INSTANT_UTC = datetime(2026, 8, 15, 16, 30, tzinfo=UTC)
+
+
+def _fixed_now_datetime():
+    class FixedDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return _FIXED_INSTANT_UTC.astimezone(tz) if tz else _FIXED_INSTANT_UTC
+
+    return FixedDatetime
+
+
+def test_cultural_events_from_silver_defaults_today_to_kst_now(monkeypatch):
+    monkeypatch.setattr(transform, "datetime", _fixed_now_datetime())
+    df = pd.DataFrame(
+        [
+            {
+                "TITLE": "종료 임박 행사",
+                "CODENAME": "공연",
+                "GUNAME": "강남구",
+                "PLACE": "코엑스",
+                "STRTDATE": "2026-08-01",
+                "END_DATE": "2026-08-15",
+                "IS_FREE": "N",
+                "LAT": 37.5115,
+                "LOT": 127.0605,
+            }
+        ]
+    )
+
+    records = cultural_events_from_silver(df)
+
+    # KST 기준 today는 2026-08-16이므로 end_date(08-15)는 이미 종료되어 제외된다.
+    # today를 UTC로 잘못 계산하면 today가 08-15가 되어 이 행사가 남아버린다.
+    assert records == []
+
+
+def test_performance_events_from_silver_defaults_today_to_kst_now(monkeypatch):
+    monkeypatch.setattr(transform, "datetime", _fixed_now_datetime())
+    df = pd.DataFrame(
+        [
+            {
+                "SVCID": "S001",
+                "SVCNM": "종료 임박 공연",
+                "MINCLASSNM": "공연",
+                "AREANM": "강남구",
+                "PLACENM": "코엑스",
+                "SVCOPNBGNDT": "2026-08-01",
+                "SVCOPNENDDT": "2026-08-15",
+                "PAYATNM": "유료",
+                "Y": 37.5115,
+                "X": 127.0605,
+            }
+        ]
+    )
+
+    records = performance_events_from_silver(df)
+
+    assert records == []
 
 
 def test_forecast_points_from_predictions_maps_columns_and_converts_kst_to_utc():
