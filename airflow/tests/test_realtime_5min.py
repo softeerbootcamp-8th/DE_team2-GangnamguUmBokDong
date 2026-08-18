@@ -84,7 +84,7 @@ def test_collector_task_execution_contract():
     assert "--source bike_station_realtime" in task.bash_command
     assert "--window-start" in task.bash_command
     assert "astimezone" in task.bash_command
-    assert "env -u VIRTUAL_ENV" in task.bash_command
+    assert task.bash_command.startswith("env -u VIRTUAL_ENV -u UV_PROJECT_ENVIRONMENT ")
 
 
 def test_living_population_grid_timeout_override_not_used_in_this_dag():
