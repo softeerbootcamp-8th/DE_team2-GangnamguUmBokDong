@@ -113,7 +113,7 @@ export default function App() {
                       <span className="flex items-center gap-2">
                         <h2 className="text-base font-semibold tracking-tight">대여소 지도</h2>
                         <select
-                          className="region-select rounded border px-2 py-1 text-sm bg-background"
+                          className="region-select"
                           value={selectedRegion}
                           onChange={(e) => setSelectedRegion(e.target.value)}
                           aria-label="지역센터 필터"
@@ -126,17 +126,17 @@ export default function App() {
                             </option>
                           ))}
                         </select>
-                        <div className="alert-tabs" role="tablist" aria-label="지도 표시 범위">
-                          {MAP_FILTER_TABS.map((tab) => (
+                        <div className="alert-tabs alert-tabs--inline" role="tablist" aria-label="지도 표시 범위">
+                          {MAP_FILTER_TABS.map((t) => (
                             <button
-                              key={tab.key}
+                              key={t.key}
                               type="button"
                               role="tab"
-                              aria-selected={mapFilterMode === tab.key}
-                              className={`alert-tab${mapFilterMode === tab.key ? " active" : ""}`}
-                              onClick={() => setMapFilterMode(tab.key)}
+                              aria-selected={mapFilterMode === t.key}
+                              className={`alert-tab${mapFilterMode === t.key ? " active" : ""}`}
+                              onClick={() => setMapFilterMode(t.key)}
                             >
-                              {tab.label}
+                              {t.label}
                             </button>
                           ))}
                         </div>
