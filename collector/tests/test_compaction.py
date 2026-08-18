@@ -97,8 +97,17 @@ class TestArchiveSchema:
 
         schema = archive_schema(config)
 
-        assert schema.names == ["a", "_row_status", "_window_start"]
+        assert schema.names == ["a", "_row_status", "_window_start", "_source_kind"]
         assert schema.field("_window_start").type == pa.string()
+
+    def test_source_kind_is_part_of_the_schema(self):
+        """archive에 두 출처가 섞이므로 구분 컬럼이 스키마에 있어야 한다."""
+        config = _config(columns={"a": ColumnSpec(types=("str",))})
+
+        schema = archive_schema(config)
+
+        assert schema.names == ["a", "_row_status", "_window_start", "_source_kind"]
+        assert schema.field("_source_kind").type == pa.string()
 
     def test_column_order_follows_yaml(self):
         config = _config(columns={

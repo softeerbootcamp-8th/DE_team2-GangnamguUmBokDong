@@ -64,8 +64,17 @@ class TestCompactDate:
         compact_date(config, DAY, today=TODAY)
 
         table = read_parquet("archive/t_source/dt=2026-08-12.parquet", as_pandas=False)
-        assert table.schema.names == ["sta", "cnt", "_row_status", "_window_start"]
+        assert table.schema.names == ["sta", "cnt", "_row_status", "_window_start", "_source_kind"]
         assert table.schema.field("cnt").type == pa.int64()
+
+    def test_marks_rows_as_collector_sourced(self):
+        config = _config()
+        _put_silver("t_source", 5)
+
+        compact_date(config, DAY, today=TODAY)
+
+        table = read_parquet("archive/t_source/dt=2026-08-12.parquet", as_pandas=False)
+        assert set(table.column("_source_kind").to_pylist()) == {"collector"}
 
     def test_window_start_distinguishes_source_files(self):
         config = _config()
@@ -335,7 +344,7 @@ class TestDedup:
         compact_date(config, DAY, today=TODAY)
 
         table = read_parquet("archive/t_source/dt=2026-08-12.parquet", as_pandas=False)
-        assert table.schema.names == ["sta", "cnt", "_row_status", "_window_start"]
+        assert table.schema.names == ["sta", "cnt", "_row_status", "_window_start", "_source_kind"]
         assert table.schema.field("cnt").type == pa.int64()
 
     def test_distinct_rows_are_untouched(self):

@@ -21,6 +21,7 @@ from core.s3 import (
     get_object_bytes,
     list_keys,
     list_objects,
+    object_exists,
     put_object_bytes,
     read_json,
     write_json,
@@ -118,6 +119,14 @@ def write_archive(source_id: str, day: date, table: pq.Table) -> str:
     key = archive_key(source_id, day)
     write_parquet(table, key)
     return key
+
+
+def archive_exists(source_id: str, day: date) -> bool:
+    """해당 날짜의 archive가 이미 있는지 확인한다.
+
+    bootstrap이 재개 판단에 쓴다 — 상태 파일을 따로 두지 않고 결과물의 존재로 판정한다.
+    """
+    return object_exists(archive_key(source_id, day))
 
 
 def _archive_manifest_key(source_id: str, day: date) -> str:

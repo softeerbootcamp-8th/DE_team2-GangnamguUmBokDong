@@ -59,9 +59,22 @@ _ARROW_TYPES = {
     "bool": pa.bool_(),
 }
 
-# 검증 엔진이 붙이는 `_row_status`와 이 모듈이 붙이는 `_window_start`. 둘 다 언더스코어
-# 접두 메타 컬럼이라는 기존 관례를 따른다.
-_META_FIELDS = [("_row_status", pa.string()), ("_window_start", pa.string())]
+# 출처 구분: compaction은 실시간 수집 데이터, bootstrap은 초기 로드 과거 데이터.
+SOURCE_KIND_COLLECTOR = "collector"
+SOURCE_KIND_BOOTSTRAP = "bootstrap"
+
+# 검증 엔진이 붙이는 `_row_status`, 이 모듈이 붙이는 `_window_start`, 그리고 출처를
+# 나타내는 `_source_kind`. 셋 다 언더스코어 접두 메타 컬럼이라는 관례를 따른다.
+#
+# `_source_kind`가 필요한 이유는 `_window_start`의 의미가 출처마다 다르기 때문이다.
+# compaction은 "언제 수집했는지"(5분·10분 해상도), bootstrap은 "언제 일어났는지"
+# (시간 해상도)를 넣는다. 특히 bike_station_realtime은 행에 다른 시각 컬럼이 없어
+# 이 값이 유일한 시각인데, 과거는 시간 단위·현재는 5분 단위가 된다.
+_META_FIELDS = [
+    ("_row_status", pa.string()),
+    ("_window_start", pa.string()),
+    ("_source_kind", pa.string()),
+]
 
 _SILVER_KEY = re.compile(r"/dt=(\d{4}-\d{2}-\d{2})/hh=\d{2}/(\d{4})\.parquet$")
 
@@ -306,12 +319,15 @@ def compact_date(config: SourceConfig, day: date, *, today: date, force: bool = 
 
 
 def _read_conformed(key: str, schema: pa.Schema) -> pa.Table:
-    """silver 하나를 읽어 `_window_start`를 붙이고 목표 스키마에 맞춘다."""
+    """silver 하나를 읽어 메타 컬럼을 붙이고 목표 스키마에 맞춘다."""
     table = read_parquet(key, as_pandas=False)
     if table is None:
         raise ValueError(f"silver를 읽지 못했다: {key}")
     started = window_start_from_key(key)
     table = table.append_column("_window_start", pa.array([started] * table.num_rows, type=pa.string()))
+    table = table.append_column(
+        "_source_kind", pa.array([SOURCE_KIND_COLLECTOR] * table.num_rows, type=pa.string())
+    )
     return conform(table, schema)
 
 

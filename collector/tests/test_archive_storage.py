@@ -10,6 +10,7 @@ from datetime import date, datetime
 import boto3
 import pyarrow as pa
 
+import storage as storage_module
 from storage import (
     list_silver_objects,
     read_archive_manifest,
@@ -105,3 +106,13 @@ class TestListSilverObjects:
         objs = list_silver_objects("test_source", DAY)
 
         assert [o.key for o in objs] == ["silver/test_source/dt=2026-08-12/hh=14/1410.parquet"]
+
+
+class TestArchiveExists:
+    def test_false_when_absent(self):
+        assert storage_module.archive_exists("test_source", DAY) is False
+
+    def test_true_after_write(self):
+        write_archive("test_source", DAY, _table())
+
+        assert storage_module.archive_exists("test_source", DAY) is True
