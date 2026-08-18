@@ -26,6 +26,7 @@ NORMALIZED_SOURCE_ID = "living_population_normalized"
 STATION_MASTER_SOURCE_ID = "bike_station_master"
 BIKE_REALTIME_SOURCE_ID = "bike_station_realtime"
 ENRICHED_STATION_MASTER_SOURCE_ID = "station_master_enriched"
+_NOWCAST_FILENAME = "nowcast.parquet"
 
 
 class PartitionNotFoundError(RuntimeError):
@@ -79,9 +80,18 @@ def find_latest_partition_date_on_or_before(source_id: str, reference_date: date
 
 
 def read_grid_silver(baseline_date: date) -> pa.Table:
-    """해당 baseline 날짜의 living_population_grid silver 조각을 전부 읽어 이어붙인다."""
+    """해당 baseline 날짜의 collector 실측 grid silver만 읽어 이어붙인다.
+
+    같은 날짜 prefix에 nowcaster가 저장한 ``nowcast.parquet``은 추정치이며 실측과
+    스키마·의미가 다르므로 제외한다. 실측 parquet이 없으면 기존과 동일하게
+    ``PartitionNotFoundError``를 발생시킨다.
+    """
     prefix = _silver_date_prefix(GRID_SOURCE_ID, baseline_date)
-    keys = [k for k in list_keys(prefix) if k.endswith(".parquet")]
+    keys = [
+        key
+        for key in list_keys(prefix)
+        if key.endswith(".parquet") and not key.endswith(_NOWCAST_FILENAME)
+    ]
 
     if not keys:
         raise PartitionNotFoundError(
