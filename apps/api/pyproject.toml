@@ -13,3 +13,7 @@ package = false
 
 [tool.uv.sources]
 core = { path = "../../libs/core", editable = true }
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
