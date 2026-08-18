@@ -7,7 +7,6 @@ from datetime import UTC, date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import pandas as pd
-
 from gu_mapping import grid_to_gu, latlon_to_gu
 
 _KST = timedelta(hours=9)
@@ -238,7 +237,7 @@ def cultural_events_from_silver(df: pd.DataFrame, today: date | None = None) -> 
 
 
 def performance_events_from_silver(df: pd.DataFrame, today: date | None = None) -> list[dict]:
-    """서울시 공공서비스예약(공연) Silver 데이터를 cultural_events 테이블 레코드 목록으로 변환한다.
+    """서울시 체육시설 공연행사 Silver 데이터를 cultural_events 테이블 레코드 목록으로 변환한다.
 
     args:
         df: performance_event Silver DataFrame
@@ -249,34 +248,38 @@ def performance_events_from_silver(df: pd.DataFrame, today: date | None = None) 
     today = today or datetime.now(ZoneInfo("Asia/Seoul")).date()
     records = []
     for row in df.to_dict("records"):
-        end_date = _parse_date(row.get("SVCOPNENDDT"))
+        end_date = _parse_date(row.get("EDATE"))
         # 1. 이미 종료된 행사는 제외
         if end_date is not None and end_date < today:
             continue
-        title = row.get("SVCNM", "")
-        place = row.get("PLACENM", "")
-        svcid = row.get("SVCID")
+        title = row.get("TITLE", "")
+        place = row.get("SCH_CODE_B", "")
+        schedule_id = row.get("SCH_SEQ")
 
-        # 2. 서울시 서비스ID(SVCID)가 있으면 사용하고, 없으면 제목+장소+시작일 해시로 event_id 생성
-        event_id = str(svcid) if svcid else hashlib.sha256(f"{title}{place}{row.get('SVCOPNBGNDT', '')}".encode()).hexdigest()
+        # 2. 일정 순번이 있으면 사용하고, 없으면 제목+시설+시작일 해시로 event_id를 생성한다.
+        event_id = (
+            str(schedule_id)
+            if schedule_id
+            else hashlib.sha256(f"{title}{place}{row.get('SDATE', '')}".encode()).hexdigest()
+        )
 
         # 3. 유/무료 여부 정규화
-        is_free_val = row.get("PAYATNM")
-        is_free = "무료" if is_free_val == "무료" else "유료"
+        use_pay = str(row.get("USE_PAY") or "")
+        is_free = "무료" if "무료" in use_pay else "유료"
 
-        # 4. cultural_events 공통 스키마에 맞게 매핑 (Y: 위도, X: 경도)
+        # 4. 원본 API가 좌표와 자치구를 제공하지 않으므로 해당 필드는 null로 둔다.
         records.append(
             {
                 "event_id": event_id,
                 "title": title,
-                "category": row.get("MINCLASSNM"),
-                "gu": row.get("AREANM"),
+                "category": row.get("SCH_CODE_A"),
+                "gu": None,
                 "place": place,
-                "start_date": _parse_date(row.get("SVCOPNBGNDT")),
+                "start_date": _parse_date(row.get("SDATE")),
                 "end_date": end_date,
                 "is_free": is_free,
-                "lat": _to_float(row.get("Y")),
-                "lon": _to_float(row.get("X")),
+                "lat": None,
+                "lon": None,
             }
         )
     return records

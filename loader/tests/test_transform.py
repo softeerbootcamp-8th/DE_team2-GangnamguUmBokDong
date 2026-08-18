@@ -1,7 +1,6 @@
 from datetime import UTC, date, datetime
 
 import pandas as pd
-
 import transform
 from transform import (
     cultural_events_from_silver,
@@ -172,16 +171,13 @@ def test_performance_events_from_silver_defaults_today_to_kst_now(monkeypatch):
     df = pd.DataFrame(
         [
             {
-                "SVCID": "S001",
-                "SVCNM": "종료 임박 공연",
-                "MINCLASSNM": "공연",
-                "AREANM": "강남구",
-                "PLACENM": "코엑스",
-                "SVCOPNBGNDT": "2026-08-01",
-                "SVCOPNENDDT": "2026-08-15",
-                "PAYATNM": "유료",
-                "Y": 37.5115,
-                "X": 127.0605,
+                "SCH_SEQ": "S001",
+                "TITLE": "종료 임박 공연",
+                "SCH_CODE_A": "공연",
+                "SCH_CODE_B": "잠실실내체육관",
+                "SDATE": "2026-08-01",
+                "EDATE": "2026-08-15",
+                "USE_PAY": "유료",
             }
         ]
     )
@@ -189,6 +185,39 @@ def test_performance_events_from_silver_defaults_today_to_kst_now(monkeypatch):
     records = performance_events_from_silver(df)
 
     assert records == []
+
+
+def test_performance_events_from_silver_maps_stadium_schedule_fields():
+    df = pd.DataFrame(
+        [
+            {
+                "SCH_SEQ": "S002",
+                "TITLE": "잠실 야구 경기",
+                "SCH_CODE_A": "경기",
+                "SCH_CODE_B": "잠실야구장",
+                "SDATE": "2026-08-20",
+                "EDATE": "2026-08-21",
+                "USE_PAY": "입장료 무료",
+            }
+        ]
+    )
+
+    records = performance_events_from_silver(df, today=date(2026, 8, 18))
+
+    assert records == [
+        {
+            "event_id": "S002",
+            "title": "잠실 야구 경기",
+            "category": "경기",
+            "gu": None,
+            "place": "잠실야구장",
+            "start_date": date(2026, 8, 20),
+            "end_date": date(2026, 8, 21),
+            "is_free": "무료",
+            "lat": None,
+            "lon": None,
+        }
+    ]
 
 
 def test_forecast_points_from_predictions_maps_columns_and_converts_kst_to_utc():

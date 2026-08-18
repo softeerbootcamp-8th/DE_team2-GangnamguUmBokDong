@@ -3,9 +3,9 @@ description: 서울시 체육시설 공연행사 정보
 
 adapter: seoul_openapi
 adapter_params:
-  service: ListPublicReservationSport
+  service: stadiumScheduleInfo
   page_size: 1000
-  root_key: ListPublicReservationSport.row
+  root_key: stadiumScheduleInfo.row
 
 schedule:
   interval: 1d
@@ -31,29 +31,33 @@ policies:
   optional_outlier: set_null
 
 columns:
-  SVCID:
+  SCH_SEQ:
     types: [str]
     required: true
-  SVCNM:
+  TITLE:
     types: [str]
     required: true
-  MINCLASSNM:
-    types: [str]
-  AREANM:
-    types: [str]
-  PLACENM:
-    types: [str]
-  SVCOPNBGNDT:
+  SDATE:
     types: [str]
     required: true
-  SVCOPNENDDT:
+  EDATE:
     types: [str]
     required: true
-  PAYATNM:
+  USE_TIME:
     types: [str]
-  X:
-    types: [float]
-    range: { min: 126.7, max: 127.2 }
-  Y:
-    types: [float]
-    range: { min: 37.4, max: 37.7 }
+  USE_AGE:
+    types: [str]
+  USE_TARGET:
+    types: [str]
+  USE_PAY:
+    types: [str]
+  LINK_URL:
+    types: [str]
+  REG_DATE:
+    types: [str]
+  UPD_DATE:
+    types: [str]
+  SCH_CODE_A:
+    types: [str]
+  SCH_CODE_B:
+    types: [str]
