@@ -1,10 +1,13 @@
 from datetime import UTC, date, datetime
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
+import transform
 from transform import (
     cultural_events_from_silver,
     forecast_points_from_predictions,
+    performance_events_from_silver,
     station_stock_from_silver,
     stations_from_silver,
     weather_current_from_silver,
@@ -124,6 +127,63 @@ def test_cultural_events_from_silver_filters_ended_events():
     assert len(records) == 1
     assert records[0]["title"] == "여름 재즈 페스티벌"
     assert records[0]["end_date"] == date(2026, 8, 20)
+
+
+def test_cultural_events_from_silver_defaults_today_to_kst_now(monkeypatch):
+    class FixedDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 8, 16, 23, 30, tzinfo=ZoneInfo("Asia/Seoul"))
+
+    monkeypatch.setattr(transform, "datetime", FixedDatetime)
+    df = pd.DataFrame(
+        [
+            {
+                "TITLE": "종료 임박 행사",
+                "CODENAME": "공연",
+                "GUNAME": "강남구",
+                "PLACE": "코엑스",
+                "STRTDATE": "2026-08-01",
+                "END_DATE": "2026-08-15",
+                "IS_FREE": "N",
+                "LAT": 37.5115,
+                "LOT": 127.0605,
+            }
+        ]
+    )
+
+    records = cultural_events_from_silver(df)
+
+    assert records == []
+
+
+def test_performance_events_from_silver_defaults_today_to_kst_now(monkeypatch):
+    class FixedDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 8, 16, 23, 30, tzinfo=ZoneInfo("Asia/Seoul"))
+
+    monkeypatch.setattr(transform, "datetime", FixedDatetime)
+    df = pd.DataFrame(
+        [
+            {
+                "SVCID": "S001",
+                "SVCNM": "종료 임박 공연",
+                "MINCLASSNM": "공연",
+                "AREANM": "강남구",
+                "PLACENM": "코엑스",
+                "SVCOPNBGNDT": "2026-08-01",
+                "SVCOPNENDDT": "2026-08-15",
+                "PAYATNM": "유료",
+                "Y": 37.5115,
+                "X": 127.0605,
+            }
+        ]
+    )
+
+    records = performance_events_from_silver(df)
+
+    assert records == []
 
 
 def test_forecast_points_from_predictions_maps_columns_and_converts_kst_to_utc():
