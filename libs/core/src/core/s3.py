@@ -126,22 +126,43 @@ def _read_parquet_by_date_range(
     start, end = date_range
     prefix = key if key.endswith("/") else f"{key}/"
     file_columns = [c for c in columns if c != "date"] if columns is not None else None
+    date_strs = [day.strftime("%Y-%m-%d") for day in pd.date_range(start, end, freq="D")]
+
+    # 날짜별 LIST부터 병렬로 끝낸다 — 순서대로 하나씩 "LIST한 뒤 그 날짜 파일들을
+    # 내려받고, 그게 끝나야 다음 날짜 LIST를 시작"하는 계단식 패턴이면 학습처럼
+    # 몇 달치를 한 번에 읽을 때 그 사이 대기 시간이 그대로 쌓인다 — LIST 자체는
+    # 가벼운 호출이라 read_parquet_many()와 같은 동시성으로 먼저 다 끝내둔다.
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        keys_by_date = list(
+            pool.map(
+                lambda date_str: sorted(k for k in list_keys(f"{prefix}date={date_str}/") if k.endswith(".parquet")),
+                date_strs,
+            )
+        )
+
+    # 실제 파일 다운로드는 day 단위로 나눠 부르지 않고 전체 날짜 범위를 합친
+    # 키 목록 하나로 read_parquet_many()를 한 번만 호출한다 — 그래야 그 안의
+    # ThreadPoolExecutor가 날짜 경계와 무관하게 전체 구간에 대해 동시성을 최대로
+    # 활용한다(day마다 별도 풀을 새로 만들어 반복하면 그 사이 유휴 시간이 생김).
+    part_keys: list[str] = []
+    key_dates: list[str] = []
+    for date_str, day_keys in zip(date_strs, keys_by_date):
+        part_keys.extend(day_keys)
+        key_dates.extend([date_str] * len(day_keys))
+
+    if not part_keys:
+        return None
 
     # read_parquet()와 같은 이유로 Arrow Table 상태로만 모은다 — "date" 컬럼도
     # pandas .copy()+할당 대신 Arrow 레벨에서 상수 컬럼으로 붙여서, 조각마다 pandas
     # DataFrame을 따로 만들지 않는다(다중 파티션 읽기라 이 함수가 가장 큰 데이터를
     # 다룰 가능성이 높음 — training의 multi-horizon 테이블 읽기).
     tables = []
-    for day in pd.date_range(start, end, freq="D"):
-        date_str = day.strftime("%Y-%m-%d")
-        part_keys = sorted(k for k in list_keys(f"{prefix}date={date_str}/") if k.endswith(".parquet"))
-        if not part_keys:
+    for date_str, table in zip(key_dates, read_parquet_many(part_keys, columns=file_columns, as_pandas=False)):
+        if table is None:
             continue
-        for table in read_parquet_many(part_keys, columns=file_columns, as_pandas=False):
-            if table is None:
-                continue
-            date_column = pa.array([date_str] * table.num_rows)
-            tables.append(table.append_column("date", date_column))
+        date_column = pa.array([date_str] * table.num_rows)
+        tables.append(table.append_column("date", date_column))
 
     if not tables:
         return None

@@ -28,6 +28,7 @@ from pathlib import Path
 
 import pandas as pd
 import pytest
+from core import s3 as s3_io
 
 pyspark = pytest.importorskip("pyspark")
 
@@ -41,6 +42,7 @@ from feature_engine.spark.build_rolling_rental_features import (
 )
 from feature_engine.spark.run_pipeline import (
     _refresh_primary_tables,
+    _reject_if_legacy_flat_layout,
     _run_incremental,
 )
 from feature_engine.spark.watermark import read_watermark, write_watermark
@@ -311,3 +313,41 @@ def test_incremental_is_noop_when_no_new_data(spark, synthetic_environment, tmp_
     after_count = spark.read.parquet(fe_config.FEATURES_TABLE_PARQUET).count()
 
     assert before_count == after_count == N_HOURS * TICKS_PER_HOUR
+
+
+# --- 구버전 flat parquet(append 시절 잔재) 감지 회귀 테스트 ---
+# `_reject_if_legacy_flat_layout()`는 plain boto3(ml_core.s3_io)로 FEATURES_TABLE_KEY
+# prefix를 직접 조회한다 — 위 테스트들과 달리 Spark가 아니라 conftest.py의
+# moto 목 S3(_mock_bucket, autouse)를 그대로 쓰면 되므로 synthetic_environment
+# 픽스처(로컬 tmp_path 기반 Silver/Spark 산출물) 없이도 독립적으로 검증할 수 있다.
+
+
+def test_reject_if_legacy_flat_layout_passes_when_prefix_is_empty():
+    _reject_if_legacy_flat_layout()  # 첫 실행 전(아무 파일도 없음)에는 그냥 통과해야 함
+
+
+def test_reject_if_legacy_flat_layout_passes_when_only_partitioned_files_exist():
+    prefix = fe_config.FEATURES_TABLE_KEY
+    s3_io.put_object_bytes(f"{prefix}/date=2025-01-01/part-0000.parquet", b"dummy")
+
+    _reject_if_legacy_flat_layout()  # date= 파티션 파일만 있으면 통과해야 함
+
+
+def test_reject_if_legacy_flat_layout_raises_when_flat_file_exists():
+    prefix = fe_config.FEATURES_TABLE_KEY
+    # date= 파티션 없이 prefix 바로 밑에 있는 파일 — append 모드로 쓰던 시절의 흔적.
+    s3_io.put_object_bytes(f"{prefix}/part-0000.parquet", b"dummy")
+
+    with pytest.raises(RuntimeError, match="구버전 flat parquet"):
+        _reject_if_legacy_flat_layout()
+
+
+def test_reject_if_legacy_flat_layout_raises_even_when_partitioned_files_also_exist():
+    """구버전 flat 파일과 신버전 date= 파티션 파일이 섞여 있어도(가장 위험한 상태 —
+    이미 일부는 증분으로 갱신됐지만 나머지는 여전히 구버전인 경우) 걸려야 한다."""
+    prefix = fe_config.FEATURES_TABLE_KEY
+    s3_io.put_object_bytes(f"{prefix}/date=2025-01-01/part-0000.parquet", b"dummy")
+    s3_io.put_object_bytes(f"{prefix}/part-legacy.parquet", b"dummy")
+
+    with pytest.raises(RuntimeError, match="구버전 flat parquet"):
+        _reject_if_legacy_flat_layout()

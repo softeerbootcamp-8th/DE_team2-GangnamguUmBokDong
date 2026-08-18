@@ -55,6 +55,7 @@ config.py`의 `safety_cutoff_date()`, `monitor_performance.py`의 "완결된 달
 
 from datetime import datetime, timedelta
 
+from core import s3 as s3_io
 from pyspark.sql import functions as F
 
 from . import config
@@ -136,6 +137,37 @@ def _incremental_since(watermark_dt: datetime) -> datetime:
     return lookback_dt.replace(hour=0, minute=0, second=0, microsecond=0)
 
 
+def _reject_if_legacy_flat_layout() -> None:
+    """`FEATURES_TABLE_PARQUET` 밑에 `date=` 파티션이 아닌 구버전 flat parquet
+    파일(이 프로젝트가 append 모드로 쓰던 시절의 잔재)이 섞여 있으면 즉시 실패한다.
+
+    `_run_incremental()`의 dynamic partition overwrite는 이번 실행에 실제로 등장한
+    `date=` 파티션만 통째로 교체하고 그 밖의 파일은 손대지 않는다 — 만약 이 prefix에
+    (과거 `partitionBy("date")` 도입 이전에 append로 쌓아둔) 파티션 없는 flat 파일이
+    남아있다면, 그 뒤로 `spark.read.parquet(FEATURES_TABLE_PARQUET)`가 그 flat 파일과
+    새 `date=` 파티션 파일을 모두 읽어 겹치는 기간이 조용히 중복 집계된다.
+
+    이 상태를 자동으로 지우거나 그냥 넘어가지 않고 바로 실패시킨다 — 운영자가
+    직접 워터마크를 지우고 `_run_full_build()`(정적 overwrite라 디렉터리를 통째로
+    새로 씀)를 한 번 실행하거나, 구버전 파일을 수동으로 정리한 뒤 다시 실행하게
+    한다(그래야 어느 쪽이 맞는 판단인지 — 데이터를 버려도 되는지 — 운영자가 직접
+    확인할 수 있다).
+
+    raises:
+        RuntimeError: `date=`가 아닌 최상위 flat parquet 파일이 하나라도 있을 때
+    """
+    prefix = f"{config.FEATURES_TABLE_KEY}/"
+    flat_files = [key for key in s3_io.list_keys(prefix) if key.endswith(".parquet") and "date=" not in key]
+    if flat_files:
+        raise RuntimeError(
+            f"{prefix} 밑에 date= 파티션이 아닌 구버전 flat parquet 파일이 {len(flat_files)}개 "
+            f"남아있습니다(예: {flat_files[0]}). 이 상태로 증분 실행하면 그 파일까지 같이 읽혀서 "
+            "겹치는 기간이 중복 집계됩니다 — 워터마크를 지우고 _run_full_build()를 한 번 "
+            "실행하거나(디렉터리를 통째로 새로 씀), 구버전 파일을 수동으로 정리한 뒤 다시 "
+            "실행하세요."
+        )
+
+
 def _run_incremental(spark, watermark: dict) -> None:
     """워터마크가 있을 때 — lookback 구간(자정 경계로 내림)부터 다시 계산해서, 그
     구간에 걸리는 날짜 파티션을 통째로 덮어쓴다.
@@ -148,7 +180,12 @@ def _run_incremental(spark, watermark: dict) -> None:
     args:
         spark: SparkSession
         watermark: watermark.read_watermark()의 결과 (max_hour_ts 포함)
+    raises:
+        RuntimeError: `_reject_if_legacy_flat_layout()` 참고 — 구버전 flat parquet이
+            섞여 있으면 실제 재계산을 시작하기 전에 여기서 먼저 걸린다
     """
+    _reject_if_legacy_flat_layout()
+
     watermark_dt = datetime.fromisoformat(watermark["max_hour_ts"])
     since_dt = _incremental_since(watermark_dt)
     since_str = since_dt.strftime("%Y-%m-%d %H:%M:%S")

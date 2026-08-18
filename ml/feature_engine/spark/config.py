@@ -91,7 +91,11 @@ OUTPUT_ROOT_KEY = f"{_OUTPUT_PREFIX}/{PARAM_COMBO_ID}"
 OUTPUT_ROOT = _s3a(OUTPUT_ROOT_KEY)
 ROLLING_RENTAL_FEATURES_PARQUET = f"{OUTPUT_ROOT}/rolling_rental_features_2025.parquet"
 MERGED_TABLE_PARQUET = f"{OUTPUT_ROOT}/station_hour_merged_2025.parquet"
-FEATURES_TABLE_PARQUET = f"{OUTPUT_ROOT}/station_hour_features_2025.parquet"
+# 순수 키(s3a:// 스킴 없음) 버전도 같이 둔다 — run_pipeline.py가 증분 실행 전
+# ml_core.s3_io(boto3)로 이 prefix 밑에 구버전 flat parquet이 섞여 있는지
+# 점검할 때 필요(Spark 리더/라이터는 FEATURES_TABLE_PARQUET(s3a://)를 그대로 씀).
+FEATURES_TABLE_KEY = f"{OUTPUT_ROOT_KEY}/station_hour_features_2025.parquet"
+FEATURES_TABLE_PARQUET = _s3a(FEATURES_TABLE_KEY)
 # FEATURES_TABLE_PARQUET의 각 행(T0)을 horizon=1..HORIZON_COUNT로 self-join한 학습 테이블
 # (build_multi_horizon_features.py). 대여/반납이 서로 다른 lag/타겟을 쓰는 완전히
 # 분리된 데이터셋이라 출력도 둘로 나뉜다 — libs/ml_core/paths.py의 같은 이름
