@@ -7,8 +7,8 @@ import boto3
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
-
 import storage
+
 from tests.conftest import KST, TEST_BUCKET
 
 
@@ -64,6 +64,24 @@ class TestReadGridSilver:
         result = storage.read_grid_silver(date(2026, 8, 12))
 
         assert sorted(result.column("CELL_ID").to_pylist()) == ["가가00000000", "가가00000001"]
+
+    def test_excludes_nowcast_with_different_schema(self):
+        real = pa.table({"YMD": ["20260812"], "CELL_ID": ["가가00000000"], "SPOP": [10.0]})
+        nowcast = pa.table({"CELL_ID": ["가가00000001"], "SPOP": [20.0], "is_estimated": [True]})
+        _put_parquet("silver/living_population_grid/dt=2026-08-12/hh=00/0000.parquet", real)
+        _put_parquet("silver/living_population_grid/dt=2026-08-12/hh=00/nowcast.parquet", nowcast)
+
+        result = storage.read_grid_silver(date(2026, 8, 12))
+
+        assert result.column_names == real.column_names
+        assert result.column("CELL_ID").to_pylist() == ["가가00000000"]
+
+    def test_raises_when_only_nowcast_exists(self):
+        nowcast = pa.table({"CELL_ID": ["가가00000001"], "is_estimated": [True]})
+        _put_parquet("silver/living_population_grid/dt=2026-08-12/hh=00/nowcast.parquet", nowcast)
+
+        with pytest.raises(storage.PartitionNotFoundError):
+            storage.read_grid_silver(date(2026, 8, 12))
 
     def test_raises_when_date_prefix_has_no_parquet(self):
         with pytest.raises(storage.PartitionNotFoundError):
