@@ -38,7 +38,21 @@ def _load_profile() -> dict:
         return json.load(f)
 
 
-_PROFILE = _load_profile()
+def list_profile_names() -> list[str]:
+    """`PROFILES_DIR` 밑의 프로필 이름 목록을 반환한다(확장자 제외, 정렬됨).
+
+    `training/scripts/monthly_retrain_check.py`가 챌린저 재시도 때 어떤 프로필을
+    돌아가며 시도할지 정할 때 쓴다 — 새 프로필 파일을 추가하기만 하면 이 목록에
+    자동으로 잡힌다(코드 수정 불필요).
+    """
+    return sorted(p.stem for p in PROFILES_DIR.glob("*.json"))
+
+
+# 이 프로세스가 실제로 어떤 프로필을 쓰고 있는지 — 모델 아티팩트에 "어떤 프로필로
+# 학습됐는지"를 그대로 남겨야 해서(model_contract.py의 profile.json) public으로 둔다.
+PROFILE_NAME = os.environ.get("ML_PROFILE", "default")
+PROFILE = _load_profile()
+_PROFILE = PROFILE  # 기존 참조(아래) 호환용 별칭
 
 
 def _int_env(name: str, default: int) -> int:

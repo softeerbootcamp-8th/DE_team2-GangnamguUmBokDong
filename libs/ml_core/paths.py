@@ -22,10 +22,17 @@ from pathlib import Path
 from . import common_config
 
 # 로컬 subprocess로 형제 패키지의 venv 실행파일을 찾을 때만 쓰는 로컬 경로
-# 개념(예: training/scripts/monthly_retrain_check.py가 feature_engine의
+# 개념(예: training/scripts/monthly_retrain_check.py가 feature_engine/training의
 # .venv/bin/python을 실행) — 데이터 저장 위치와는 무관, 코드 자체는 여전히
 # 로컬(또는 EMR/EC2) 프로세스로 실행되므로 이 개념만 남겨둔다.
-ML_ROOT = Path.cwd()
+#
+# `Path.cwd()`가 아니라 이 파일 위치 기준으로 고정한다 — cwd 기준이면 스케줄러
+# (cron/systemd 등)가 "ml/"로 cd하지 않고 절대경로로 이 스크립트를 실행할 때
+# ML_ROOT가 엉뚱한 디렉터리가 되고, 그 아래 "feature_engine/.venv/bin/python"을
+# 못 찾아 RuntimeError가 난다 — 실행 위치와 무관하게 항상 이 저장소의 "ml/"을
+# 가리켜야 한다. 이 파일은 "libs/ml_core/paths.py"에 있으므로 parents[2]가
+# 저장소 루트다.
+ML_ROOT = Path(__file__).resolve().parents[2] / "ml"
 
 FEATURE_PARAM_COMBO_ID = os.environ.get(
     "FEATURE_PARAM_COMBO_ID",
@@ -47,8 +54,32 @@ TRAIN_MONTHS = [f"{TRAIN_YEAR % 100:02d}{m:02d}" for m in range(1, 13)]
 RENTAL_PARQUET_DIR = os.environ.get("RENTAL_PARQUET_DIR", "parquet")
 
 # training이 만들고(학습), inference가 읽는(서빙) 모델 아티팩트 — dev/
-# S3_DATA_CATALOG.md에 정의된 `models/` prefix를 그대로 쓴다.
+# S3_DATA_CATALOG.md에 정의된 `models/` prefix를 그대로 쓴다. 이제 학습은 항상
+# 아래 아카이브 prefix에 쓰고, 챌린저가 챔피언을 이길 때만(training/promotion.py)
+# 이 prefix로 파일명 그대로 복사된다 — 이 prefix에 직접 학습 결과를 쓰는 코드
+# 경로는 없다.
 MODELS_PREFIX = os.environ.get("MODELS_PREFIX", "models")
+
+# 학습한 모든 모델(챔피언이 됐는지와 무관하게)을 보존하는 아카이브 — 날짜/프로필별로
+# 나뉘어 있어 "언제 어떤 프로필로 학습했는지"를 그대로 찾을 수 있다.
+MODELS_ARCHIVE_PREFIX = os.environ.get("MODELS_ARCHIVE_PREFIX", f"{MODELS_PREFIX}/archive")
+
+
+def archive_models_prefix(date: str, profile_name: str) -> str:
+    """한 번의 학습 시도(날짜 + 프로필 조합)가 쓸 아카이브 prefix를 만든다.
+
+    이 prefix를 `train_common.train_target(..., models_prefix=...)`에 그대로
+    넘기면, `model_key`/`model_json_key`가 만드는 파일명(예: "rental_poisson.txt")
+    자체는 챔피언 경로와 완전히 동일하게 유지되고 위치만 여기로 바뀐다 — 나중에
+    챔피언으로 승격할 때 파일명을 그대로 복사만 하면 되는 이유다.
+
+    args:
+        date: "YYYY-MM-DD" — 학습을 실행한 날짜
+        profile_name: 이 학습에 쓴 프로필 이름(common_config.PROFILE_NAME)
+    returns:
+        str: "{MODELS_ARCHIVE_PREFIX}/dt={date}/{profile_name}"
+    """
+    return f"{MODELS_ARCHIVE_PREFIX}/dt={date}/{profile_name}"
 
 
 def model_key(model_name: str, suffix: str, models_prefix: str | None = None) -> str:

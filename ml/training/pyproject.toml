@@ -13,7 +13,7 @@ dependencies = [
 ]
 
 [dependency-groups]
-dev = ["pytest"]
+dev = ["pytest", "moto[s3]>=5.2.2"]
 
 [tool.uv]
 package = false

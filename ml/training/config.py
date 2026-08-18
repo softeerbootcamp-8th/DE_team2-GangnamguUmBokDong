@@ -8,6 +8,8 @@
 """
 
 import os
+from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from ml_core import common_config
 from ml_core.paths import (
@@ -16,21 +18,80 @@ from ml_core.paths import (
     PROCESSED_V2_PREFIX,
 )
 
-__all__ = ["MODELS_PREFIX", "MULTI_HORIZON_FEATURES_TABLE_PARQUET", "PROCESSED_V2_PREFIX"]
+__all__ = ["MODELS_PREFIX", "MULTI_HORIZON_FEATURES_TABLE_PARQUET", "PROCESSED_V2_PREFIX", "today_kst"]
+
+_KST = ZoneInfo("Asia/Seoul")
+
+
+def today_kst() -> date:
+    """KST(Asia/Seoul) 기준 오늘 날짜.
+
+    원본 데이터(트립 시각 등) 자체가 한국 로컬 wall-clock이라
+    `feature_engine/spark/spark_session.py`와 같은 이유로 KST로 통일한다 —
+    `date.today()`(시스템 타임존에 의존)를 그대로 쓰면 배포 환경의 타임존에 따라
+    "오늘"의 경계가 달라질 수 있다.
+    """
+    return datetime.now(_KST).date()
 
 # --- 학습/검증/평가 기간 (시간 순 split, walk-forward) ---
 # multi-horizon 테이블은 원본 feature 테이블의 최대 HORIZON_COUNT(기본 12)배 행 수라
 # (T0 앵커를 5분 tick 전체로 유지하는 채로) 기존처럼 10~12개월을 통째로 쓰면 단일 머신
-# LightGBM이 감당 못 한다(history.md 18번 항목이 실제로 겪은 OOM과 같은 종류) — 기본값은
-# 한 달치(2025년 11월)로 좁혀서 데이터량을 원래 단일 horizon 챔피언과 비슷한 규모로
-# 되돌린 것이다. 실제 학습 머신(더 큰 RAM/EMR 등)에서 더 긴 기간이 가능하면 이 6개
-# 환경변수로 코드를 안 고치고 늘릴 수 있다 — TRAIN_SAMPLE_FRAC 등(아래)과 조합해서 씀.
-TRAIN_START = os.environ.get("TRAIN_START", "2025-11-01")
-TRAIN_END = os.environ.get("TRAIN_END", "2025-11-20")
-VALID_START = os.environ.get("VALID_START", "2025-11-21")
-VALID_END = os.environ.get("VALID_END", "2025-11-25")
-TEST_START = os.environ.get("TEST_START", "2025-11-26")
-TEST_END = os.environ.get("TEST_END", "2025-11-30")
+# LightGBM이 감당 못 한다(history.md 18번 항목이 실제로 겪은 OOM과 같은 종류) — 그래서
+# TRAIN/VALID/TEST 합쳐 한 달 분량(기본 20/5/5일)만 쓴다. 예전엔 이 구간이 "2025-11"로
+# 고정돼 있었는데, 매달 자동으로 재학습하는 지금은 그러면 다음 달 재학습도 계속 같은
+# 옛날 데이터만 보게 된다 — 그래서 매번 "오늘 기준" 안전한 최근 구간으로 슬라이딩한다
+# (아래 _default_window()). 실제 학습 머신에서 기간을 늘리거나 재현용으로 특정 구간을
+# 고정하고 싶으면 TRAIN_START 등 6개 환경변수로 이 계산값을 그대로 override할 수 있다
+# (TRAIN_SAMPLE_FRAC 등(아래)과 조합해서 씀).
+#
+# 대여이력은 반납이 완료돼야 Silver에 나타난다(feature_engine/spark/run_pipeline.py의
+# 날짜 파티션 overwrite 보정과 같은 이유) — 그래서 가장 최근 TRAINING_SAFETY_MARGIN_DAYS
+# (기본 7일)는 rental_count 집계가 아직 안 끝났을 수 있어 학습/평가 라벨로 쓰지 않는다.
+# feature_engine의 INCREMENTAL_LOOKBACK_HOURS(35일 — 사후 보정을 계속 반영하기 위한
+# feature mart 쪽 마진)와는 목적이 다른, "이 정도 지났으면 라벨을 믿고 학습해도 된다"는
+# 별도의(더 짧은) 마진이다.
+TRAINING_SAFETY_MARGIN_DAYS = int(os.environ.get("TRAINING_SAFETY_MARGIN_DAYS", "7"))
+TRAIN_DAYS = int(os.environ.get("TRAIN_DAYS", "20"))
+VALID_DAYS = int(os.environ.get("VALID_DAYS", "5"))
+TEST_DAYS = int(os.environ.get("TEST_DAYS", "5"))
+
+
+def _default_window(as_of: date | None = None) -> tuple[str, str, str, str, str, str]:
+    """"as_of - TRAINING_SAFETY_MARGIN_DAYS"를 안전 상한으로 TRAIN/VALID/TEST를
+    시간 순(TRAIN이 가장 오래됨)으로 슬라이딩 배분한다.
+
+    args:
+        as_of: 기준 날짜(기본 오늘) — 테스트에서 날짜를 고정하기 위한 override
+    returns:
+        tuple[str, str, str, str, str, str]: (train_start, train_end, valid_start,
+            valid_end, test_start, test_end) "YYYY-MM-DD"
+    """
+    as_of = as_of or today_kst()
+    test_end = as_of - timedelta(days=TRAINING_SAFETY_MARGIN_DAYS)
+    test_start = test_end - timedelta(days=TEST_DAYS - 1)
+    valid_end = test_start - timedelta(days=1)
+    valid_start = valid_end - timedelta(days=VALID_DAYS - 1)
+    train_end = valid_start - timedelta(days=1)
+    train_start = train_end - timedelta(days=TRAIN_DAYS - 1)
+    return (
+        train_start.isoformat(),
+        train_end.isoformat(),
+        valid_start.isoformat(),
+        valid_end.isoformat(),
+        test_start.isoformat(),
+        test_end.isoformat(),
+    )
+
+
+_DEFAULT_TRAIN_START, _DEFAULT_TRAIN_END, _DEFAULT_VALID_START, _DEFAULT_VALID_END, _DEFAULT_TEST_START, _DEFAULT_TEST_END = (
+    _default_window()
+)
+TRAIN_START = os.environ.get("TRAIN_START", _DEFAULT_TRAIN_START)
+TRAIN_END = os.environ.get("TRAIN_END", _DEFAULT_TRAIN_END)
+VALID_START = os.environ.get("VALID_START", _DEFAULT_VALID_START)
+VALID_END = os.environ.get("VALID_END", _DEFAULT_VALID_END)
+TEST_START = os.environ.get("TEST_START", _DEFAULT_TEST_START)
+TEST_END = os.environ.get("TEST_END", _DEFAULT_TEST_END)
 
 QUANTILE_ALPHAS = [0.1, 0.5, 0.9]
 

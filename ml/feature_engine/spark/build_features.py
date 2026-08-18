@@ -201,5 +201,7 @@ if __name__ == "__main__":
     spark = get_spark()
     merged = spark.read.parquet(config.MERGED_TABLE_PARQUET)
     features_df = build_features(spark, merged)
-    features_df.write.mode("overwrite").parquet(config.FEATURES_TABLE_PARQUET)
+    # run_pipeline.py의 증분 실행이 date 파티션 단위로 overwrite하므로, 수동 실행도
+    # 같은 파티션 레이아웃을 유지해야 한다.
+    features_df.write.mode("overwrite").partitionBy("date").parquet(config.FEATURES_TABLE_PARQUET)
     print(f"features -> {config.FEATURES_TABLE_PARQUET}")
