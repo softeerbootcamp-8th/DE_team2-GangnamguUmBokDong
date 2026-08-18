@@ -6,6 +6,7 @@ from regions import DISPATCH_CENTERS, nearest_region
 from schemas import (
     Alert,
     DispatchCenter,
+    EventsResponse,
     ForecastResponse,
     StationDetail,
     StationSummary,
@@ -65,6 +66,18 @@ def get_forecast(sta_id: str) -> dict:
         # 아직 없다. 생기면 여기서 채운다.
         "reasons": [],
     }
+
+
+@app.get("/stations/{sta_id}/events", response_model=EventsResponse)
+def get_station_events(sta_id: str) -> dict:
+    """대여소 주변(queries.NEARBY_EVENT_RADIUS_KM 이내)에서 진행 중이거나 예정된
+    문화행사를 가까운 순으로 반환한다. 대여소가 없으면 404."""
+    station = queries.fetch_station(sta_id)
+    if station is None:
+        raise HTTPException(status_code=404, detail=f"station {sta_id} not found")
+    today = queries.now_utc().date()
+    events = queries.fetch_nearby_events(station["lat"], station["lon"], today)
+    return {"radius_km": queries.NEARBY_EVENT_RADIUS_KM, "events": events}
 
 
 @app.get("/regions", response_model=list[DispatchCenter])
