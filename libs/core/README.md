@@ -1,6 +1,6 @@
 # libs/core
 
-모든 서비스 및 파이프라인 모듈(`loader`, `normalizer`, `nowcaster`, `collector`, `ml` 등)에서 공통으로 사용하는 **PostgreSQL 데이터베이스 및 S3/MinIO 제네릭 입출력 공용 라이브러리**입니다.
+모든 서비스 및 파이프라인 모듈(`loader`, `normalizer`, `nowcaster`, `collector`, `ml` 등)에서 공통으로 사용하는 **PostgreSQL 데이터베이스 및 S3/MinIO 제네릭 입출력 공용 라이브러리**입니다. 여러 서비스가 똑같이 필요로 하는 소규모 도메인 유틸(권역 배정, urgency_score 계산에 쓰이는 파생값·튜닝 상수)도 여기 둡니다.
 
 ---
 
@@ -11,6 +11,9 @@
 | `db.py` | PostgreSQL(psycopg3) 연결 관리 및 기본 쿼리 실행 | `get_connection()`, `execute()`, `fetch_all()`, `fetch_one()` |
 | `upsert.py` | PostgreSQL 대량 Upsert (`INSERT ON CONFLICT DO UPDATE`) 쿼리 실행 | `upsert(conn, table, rows, conflict_cols, update_cols)` |
 | `s3.py` | S3 / MinIO 제네릭 I/O (Parquet, JSON, Bytes) 및 배치/스레드 병렬 처리 | `get_object_bytes`, `read_parquet`, `write_parquet`, `read_json`, `write_json`, `list_keys`, `delete_objects` |
+| `regions.py` | 대여소를 11개 지역센터 중 최근접으로 배정(apps/api, rebalance 공유) | `DISPATCH_CENTERS`, `nearest_region()` |
+| `forecast.py` | 예측 원본치를 누적해 예측 재고·action_type을 계산(apps/api, rebalance 공유) | `enrich_forecast_points()` |
+| `scoring_config.py` | urgency_score/enrich_forecast_points 계산에 쓰이는 튜닝 상수 | `SUPPLY_LOW_STOCK_RATIO`, `SEVERITY_SCALE` 등 |
 
 ---
 
