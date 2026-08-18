@@ -55,3 +55,27 @@ class DispatchCenter(BaseModel):
     region: str
     lat: float
     lon: float
+
+
+RouteStatus = Literal["proposed", "dispatched", "completed", "cancelled"]
+RouteAction = Literal["pickup", "dropoff"]
+
+
+class RouteStop(BaseModel):
+    visit_order: int
+    sta_id: str
+    sta_nm: str
+    lat: float
+    lon: float
+    action: RouteAction
+    bike_cnt: int
+
+
+class Route(BaseModel):
+    route_id: str
+    region: str
+    status: RouteStatus
+    proposed_at: datetime
+    dispatched_at: datetime | None
+    completed_at: datetime | None
+    stops: list[RouteStop]

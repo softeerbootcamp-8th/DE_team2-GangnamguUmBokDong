@@ -8,6 +8,7 @@ from schemas import (
     Alert,
     DispatchCenter,
     ForecastResponse,
+    Route,
     StationDetail,
     StationSummary,
     StatusResponse,
@@ -19,7 +20,7 @@ app = FastAPI(title="GangnamguUmBokDong API")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_methods=["GET"],
+    allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
 
@@ -100,3 +101,42 @@ def list_alerts() -> list[dict]:
         }
         for row in alerts
     ]
+
+
+@app.get("/routes", response_model=list[Route])
+def list_routes(region: str | None = None, status: str | None = None) -> list[dict]:
+    """재배치 라우트 목록을 스톱과 함께 반환한다. region/status로 필터링 가능."""
+    return queries.fetch_routes(region, status)
+
+
+@app.get("/routes/{route_id}", response_model=Route)
+def get_route(route_id: str) -> dict:
+    """라우트 하나를 스톱과 함께 반환한다. 없으면 404."""
+    route = queries.fetch_route(route_id)
+    if route is None:
+        raise HTTPException(status_code=404, detail=f"route {route_id} not found")
+    return route
+
+
+@app.post("/routes/{route_id}/dispatch", response_model=Route)
+def dispatch_route(route_id: str) -> dict:
+    """운영자가 라우트 실행을 선택했을 때 proposed -> dispatched로 전이한다.
+    없으면 404, proposed 상태가 아니면 409."""
+    result = queries.dispatch_route(route_id, queries.now_utc())
+    if result == "not_found":
+        raise HTTPException(status_code=404, detail=f"route {route_id} not found")
+    if result == "wrong_status":
+        raise HTTPException(status_code=409, detail=f"route {route_id} is not in proposed status")
+    return queries.fetch_route(route_id)
+
+
+@app.post("/routes/{route_id}/complete", response_model=Route)
+def complete_route(route_id: str) -> dict:
+    """운영자가 실행 완료를 표시했을 때 dispatched -> completed로 전이한다.
+    없으면 404, dispatched 상태가 아니면 409."""
+    result = queries.complete_route(route_id, queries.now_utc())
+    if result == "not_found":
+        raise HTTPException(status_code=404, detail=f"route {route_id} not found")
+    if result == "wrong_status":
+        raise HTTPException(status_code=409, detail=f"route {route_id} is not in dispatched status")
+    return queries.fetch_route(route_id)
