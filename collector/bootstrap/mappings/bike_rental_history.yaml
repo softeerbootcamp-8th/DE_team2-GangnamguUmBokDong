@@ -1,0 +1,42 @@
+# 서울특별시 공공자전거 대여이력 정보_YYMM.csv
+#
+# 이 vintage(2606)는 결측을 빈 문자열로 표기한다. `\N`은 0건이었고, collector의
+# _judge_column이 빈 문자열을 결측으로 판정하므로 na_values 없이 처리된다.
+# 다른 vintage가 `\N`을 쓸 가능성이 있어 항목은 남긴다.
+kind: csv
+encoding: cp949
+na_values: []
+
+column_map:
+  자전거번호: BIKE_ID
+  대여일시: RENT_DT
+  대여 대여소번호: RENT_ID
+  대여 대여소명: RENT_NM
+  대여거치대: RENT_HOLD
+  반납일시: RTN_DT
+  반납대여소번호: RTN_ID
+  반납대여소명: RTN_NM
+  반납거치대: RTN_HOLD
+  이용시간(분): USE_MIN
+  이용거리(M): USE_DST
+  생년: BIRTH_YEAR
+  성별: SEX_CD
+  이용자종류: USR_CLS_CD
+  대여대여소ID: RENT_STATION_ID
+  반납대여소ID: RETURN_STATION_ID
+
+# API 수집분은 코드를, CSV는 한글을 쓴다. archive를 한 체계로 통일한다.
+# 이 대응은 같은 날 API 1,000건과 CSV를 (자전거번호, 대여일시)로 조인해 확정했다.
+# 빈도로 추정하면 USR_002/USR_003이 뒤집힌다.
+value_map:
+  USR_CLS_CD:
+    내국인: USR_001
+    외국인: USR_002
+    비회원: USR_003
+  SEX_CD:
+    m: M
+    f: F
+
+window:
+  from_column: RENT_DT
+  format: "%Y-%m-%d %H:%M:%S"
