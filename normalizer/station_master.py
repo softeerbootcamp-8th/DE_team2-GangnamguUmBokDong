@@ -1,4 +1,4 @@
-"""대여소 API 위경도에 생활인구 250m CELL_ID를 보강한다."""
+"""대여소 API 위경도에 생활인구 250m CELL_ID와 기상청 5km 격자를 보강한다."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ from datetime import datetime
 import grid
 import pyarrow as pa
 import storage
+from core.weather_grid import latlon_to_grid
 from pyproj import Transformer
 from shapely import STRtree
 from shapely.geometry import Point
@@ -27,6 +28,8 @@ _OUTPUT_SCHEMA = pa.schema(
         ("lat", pa.float64()),
         ("lon", pa.float64()),
         ("grid_id", pa.string()),
+        ("weather_nx", pa.int64()),
+        ("weather_ny", pa.int64()),
     ]
 )
 
@@ -106,7 +109,11 @@ def enrich_station_master(
         latitude = _number(lat)
         longitude = _number(lon)
         grid_id = None
+        weather_nx = weather_ny = None
+        # 좌표가 유효할 때만 계산한다 — LAT/LOT가 0인 대여소는 _number()가 0.0을
+        # 돌려주므로, 이 가드 없이는 적도상 엉뚱한 격자 번호가 실린다.
         if _valid_wgs84(latitude, longitude):
+            weather_nx, weather_ny = latlon_to_grid(latitude, longitude)
             x, y = _TO_EPSG5179.transform(longitude, latitude)
             point = Point(x, y)
             candidates = tree.query(point)
@@ -123,6 +130,8 @@ def enrich_station_master(
             "lat": latitude,
             "lon": longitude,
             "grid_id": grid_id,
+            "weather_nx": weather_nx,
+            "weather_ny": weather_ny,
         }
 
     rows = list(rows_by_station.values())

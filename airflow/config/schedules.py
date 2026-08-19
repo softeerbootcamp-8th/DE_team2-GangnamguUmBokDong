@@ -13,7 +13,7 @@ WEATHER_3H_CRON = "0 */3 * * *"
 # 확인해 필요하면 조정한다.
 DAILY_CRON = "0 3 * * *"
 
-# 하루치 silver를 archive로 묶는 배치. 일 단위 수집(03:00)이 끝난 뒤에 돈다.
+# D-6 대여이력 재수집 후 같은 날짜의 silver를 archive로 묶는 배치.
 COMPACTION_CRON = "30 4 * * *"
 
 DEFAULT_RETRIES = 2
@@ -36,6 +36,9 @@ DB_LOADER_EXECUTION_TIMEOUT = timedelta(seconds=120)
 # 실측 데이터 없음(placeholder) — S3 tick 5~6개 + 예측 결과 1개만 읽는 순수 계산이라
 # 추론보다는 가볍게 잡았다. 로컬에서 1회 실행 시간을 재본 뒤 조정.
 URGENCY_EXECUTION_TIMEOUT = timedelta(seconds=180)
+# 실측 데이터 없음(placeholder) — urgency 계산을 다시 하고 dispatched 넷팅을 위한
+# RDS 조회 하나가 추가되는 정도라 URGENCY_EXECUTION_TIMEOUT과 비슷하게 잡았다.
+ROUTES_EXECUTION_TIMEOUT = timedelta(seconds=180)
 
 MAX_ACTIVE_RUNS = 1
 CATCHUP = False

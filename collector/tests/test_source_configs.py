@@ -16,6 +16,8 @@ from zoneinfo import ZoneInfo
 import httpx
 import pytest
 
+pytestmark = pytest.mark.usefixtures("_bucket")
+
 import config.loader as config_loader
 import pipeline
 from adapters import (  # noqa: F401 — @adapter 등록을 위한 import
@@ -83,6 +85,7 @@ class TestAllSourcesLoad:
 
         assert config.adapter_params["poi_start"] == 1
         assert config.adapter_params["poi_end"] == 121
+        assert config.adapter_params["concurrency"] == 4
 
     @pytest.mark.parametrize(
         "adapter_params",

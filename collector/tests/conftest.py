@@ -100,7 +100,7 @@ def _s3_env(monkeypatch):
     monkeypatch.setenv("S3_BUCKET", TEST_BUCKET)
 
 
-@pytest.fixture(autouse=True)
+@pytest.fixture
 def _bucket():
     with mock_aws():
         boto3.client("s3", region_name="us-east-1").create_bucket(Bucket=TEST_BUCKET)

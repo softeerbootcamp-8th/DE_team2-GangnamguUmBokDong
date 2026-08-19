@@ -3,6 +3,7 @@
 from datetime import date, datetime
 
 import pyarrow as pa
+import pytest
 
 from bootstrap.config import BootstrapConfig
 from bootstrap.runner import group_by_window, load_date
@@ -12,6 +13,8 @@ from config.schema import Storage as StorageConfig
 from core.s3 import read_parquet
 from storage import read_archive_manifest, write_silver
 from tests.conftest import KST
+
+pytestmark = pytest.mark.usefixtures("_bucket")
 
 DAY = date(2026, 6, 1)
 
