@@ -47,3 +47,87 @@ def _route_stops_key(window_start: datetime) -> str:
     return f"route_stops/dt={window_start:%Y-%m-%d}/hh={window_start:%H}/route_stops_{window_start:%H%M}.parquet"
 
 
+def read_silver(source_id: str, window_start: datetime) -> pq.Table:
+    """지정한 소스 및 윈도우 시각의 Silver Parquet 파일을 읽어 PyArrow Table로 반환한다.
+
+    args:
+        source_id: Silver 데이터 소스 식별자
+        window_start: 수집 윈도우 시작 시각 (KST)
+    returns:
+        읽어온 PyArrow Table
+    raises:
+        FileNotFoundError: 해당 S3 객체가 없을 때
+    """
+    key = _silver_key(source_id, window_start)
+    body = get_object_bytes(key)
+    if body is None:
+        raise FileNotFoundError(f"S3 object not found: {key}")
+    return pq.read_table(io.BytesIO(body))
+
+
+def read_predictions(window_start: datetime) -> pq.Table:
+    """지정한 윈도우 시각의 ML 추론 결과 Parquet 파일을 읽어 PyArrow Table로 반환한다.
+
+    args:
+        window_start: 추론 윈도우 시작 시각 (KST)
+    returns:
+        읽어온 PyArrow Table
+    raises:
+        FileNotFoundError: 해당 S3 객체가 없을 때
+    """
+    key = _predictions_key(window_start)
+    body = get_object_bytes(key)
+    if body is None:
+        raise FileNotFoundError(f"S3 object not found: {key}")
+    return pq.read_table(io.BytesIO(body))
+
+
+def read_urgency(window_start: datetime) -> pq.Table:
+    """지정한 윈도우 시각의 urgency 배치 결과 Parquet 파일을 읽어 PyArrow Table로 반환한다.
+
+    args:
+        window_start: urgency 배치 윈도우 시작 시각 (KST)
+    returns:
+        읽어온 PyArrow Table
+    raises:
+        FileNotFoundError: 해당 S3 객체가 없을 때
+    """
+    key = _urgency_key(window_start)
+    body = get_object_bytes(key)
+    if body is None:
+        raise FileNotFoundError(f"S3 object not found: {key}")
+    return pq.read_table(io.BytesIO(body))
+
+
+def read_routes(window_start: datetime) -> pq.Table:
+    """지정한 윈도우 시각의 라우트 배치 결과(헤더) Parquet 파일을 읽어 PyArrow Table로 반환한다.
+
+    args:
+        window_start: 라우트 배치 윈도우 시작 시각 (KST)
+    returns:
+        읽어온 PyArrow Table
+    raises:
+        FileNotFoundError: 해당 S3 객체가 없을 때
+    """
+    key = _routes_key(window_start)
+    body = get_object_bytes(key)
+    if body is None:
+        raise FileNotFoundError(f"S3 object not found: {key}")
+    return pq.read_table(io.BytesIO(body))
+
+
+def read_route_stops(window_start: datetime) -> pq.Table:
+    """지정한 윈도우 시각의 라우트 배치 결과(스톱) Parquet 파일을 읽어 PyArrow Table로 반환한다.
+
+    args:
+        window_start: 라우트 배치 윈도우 시작 시각 (KST)
+    returns:
+        읽어온 PyArrow Table
+    raises:
+        FileNotFoundError: 해당 S3 객체가 없을 때
+    """
+    key = _route_stops_key(window_start)
+    body = get_object_bytes(key)
+    if body is None:
+        raise FileNotFoundError(f"S3 object not found: {key}")
+    return pq.read_table(io.BytesIO(body))

@@ -115,19 +115,28 @@ def _severity(ratio: float) -> float:
     return 1 - math.exp(-ratio / SEVERITY_SCALE)
 
 
+def _severity_qty(current: int, hold_cnt: int, action_type: str, points: list[dict]) -> int:
+    """urgency_score의 심각도 계산에 쓰는 초과/부족량(회수필요는 정원 초과분,
+    공급필요는 부족분과 미충족수요 중 더 큰 값) — 예측 구간 전체에서 가장
+    심해지는 시점 기준이라 물리적 한계로 클램프하지 않은 원본값이다. 이 값은
+    "얼마나 위험한가"를 비교하는 랭킹 지표라, 지금 당장 트럭에 실을 수 있는
+    양과는 별개다(bike_qty 참고)."""
+    if action_type == "retrieval_needed":
+        return _max_overshoot(current, hold_cnt, points)
+    return max(_max_deficit(current, points), _max_unmet_demand(current, hold_cnt, points))
+
+
 def bike_qty(current: int, hold_cnt: int, action_type: str, points: list[dict]) -> int:
-    """실제로 트럭이 싣고 내릴 수 있는 자전거 대수. urgency_score의 severity
-    계산에 쓰이는 초과/부족량(_max_overshoot/_max_deficit/_max_unmet_demand)은
-    예측 구간 전체에서 가장 심해지는 시점 기준이라, 그 값을 그대로 쓰면 지금
-    당장의 물리적 한계를 넘어설 수 있다 — 회수필요는 지금 있는 것보다 많이
+    """실제로 트럭이 싣고 내릴 수 있는 자전거 대수. _severity_qty는 예측 구간
+    전체에서 가장 심해지는 시점 기준값이라, 그 값을 그대로 실물 이동량으로 쓰면
+    지금 당장의 물리적 한계를 넘어설 수 있다 — 회수필요는 지금 있는 것보다 많이
     실으라고 할 수 있고, 공급필요는 목적지 빈 거치대보다 많이 내리라고 할 수
     있다. 그래서 각각 지금 실을 수 있는 한도(현재 재고)와 내릴 수 있는 한도
     (빈 거치대 수)로 클램프한다. action_type이 normal이면 옮길 필요가 없다."""
     if action_type == "retrieval_needed":
-        return min(current, _max_overshoot(current, hold_cnt, points))
+        return min(current, _severity_qty(current, hold_cnt, action_type, points))
     if action_type == "supply_needed":
-        deficit = max(_max_deficit(current, points), _max_unmet_demand(current, hold_cnt, points))
-        return min(deficit, max(0, hold_cnt - current))
+        return min(_severity_qty(current, hold_cnt, action_type, points), max(0, hold_cnt - current))
     return 0
 
 
@@ -177,7 +186,7 @@ def urgency_score(
     # hold_cnt=0(신규/이상 등록 등)인 대여소가 들어오면 division by zero로 배치가
     # 죽으므로, 최소 1로 방어한다.
     safe_hold_cnt = max(hold_cnt, 1)
-    ratio = bike_qty(current, hold_cnt, action_type, points) / safe_hold_cnt
+    ratio = _severity_qty(current, hold_cnt, action_type, points) / safe_hold_cnt
     impact_factor = _severity(ratio)
 
     score = round(100 * time_factor * impact_factor, 1)
