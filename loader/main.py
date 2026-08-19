@@ -6,10 +6,14 @@ import argparse
 import sys
 from datetime import datetime
 
+from config import TABLE_SPECS
 from core.db import get_connection
 from core.upsert import upsert
 
-from config import TABLE_SPECS
+
+def _only_known_stations(rows: list[dict], known_station_ids: set[str]) -> list[dict]:
+    """stations FK가 존재하는 urgency row만 반환한다."""
+    return [row for row in rows if row["sta_id"] in known_station_ids]
 
 
 def run(table: str, window_start: datetime) -> None:
@@ -24,7 +28,7 @@ def run(table: str, window_start: datetime) -> None:
 
     if table == "station_stock":
         rows = spec.transform(silver, observed_at=window_start)
-    elif table == "forecast_points":
+    elif table in ("forecast_points", "station_urgency"):
         rows = spec.transform(silver, batch_run_at=window_start)
     else:
         rows = spec.transform(silver)
@@ -40,6 +44,16 @@ def run(table: str, window_start: datetime) -> None:
     target_table = _TABLE_ALIASES.get(table, table)
 
     with get_connection() as conn:
+        if table == "station_urgency" and rows:
+            station_ids = [row["sta_id"] for row in rows]
+            with conn.cursor() as cur:
+                cur.execute("SELECT sta_id FROM stations WHERE sta_id = ANY(%s)", (station_ids,))
+                known_station_ids = {row[0] for row in cur.fetchall()}
+            filtered_rows = _only_known_stations(rows, known_station_ids)
+            excluded_count = len(rows) - len(filtered_rows)
+            if excluded_count:
+                print(f"excluded {excluded_count} urgency rows absent from stations")
+            rows = filtered_rows
         upsert(conn, target_table, rows, spec.conflict_cols, spec.update_cols)
         conn.commit()
 

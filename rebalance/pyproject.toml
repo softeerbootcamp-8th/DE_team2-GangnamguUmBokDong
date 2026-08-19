@@ -1,0 +1,32 @@
+[project]
+name = "rebalance"
+version = "0.1.0"
+requires-python = "==3.11.*"
+dependencies = [
+    "core",
+    "boto3==1.43.69",
+    "pandas>=2.2.0,<3.0.0",
+    "pyarrow>=25.0.1",
+]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+core = { path = "../libs/core", editable = true }
+ml_core = { path = "../libs/ml_core", editable = true }
+
+[dependency-groups]
+dev = [
+    "moto[s3]>=5.2.2",
+    "pytest>=9.1.1",
+    # reader.py가 자체 재구현한 S3 키 컨벤션이 libs/ml_core.silver_schema와
+    # 갈라지지 않는지 확인하는 계약 테스트 전용 — 런타임(reader.py/main.py)은
+    # 이 의존성을 쓰지 않는다(무거운 lightgbm 등을 배포 환경에 끌고 오지
+    # 않기 위해, loader와 동일한 이유).
+    "ml_core",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
