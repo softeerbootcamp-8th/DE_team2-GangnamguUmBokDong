@@ -5,6 +5,10 @@
 # 다른 vintage가 `\N`을 쓸 가능성이 있어 항목은 남긴다.
 kind: csv
 encoding: cp949
+
+# 같은 디렉터리에 다른 소스의 CSV가 섞여 있어도 이 소스의 파일만 고른다
+# (실제로 `data/`에 ASOS 기상자료가 함께 있었다).
+file_pattern: "서울특별시 공공자전거 대여이력 정보_*.csv"
 na_values: []
 
 column_map:

@@ -43,6 +43,7 @@ from pathlib import Path
 import pyarrow as pa
 
 from bootstrap.config import BootstrapConfig
+from core.wind import wind_components
 
 logger = logging.getLogger(__name__)
 
@@ -89,7 +90,7 @@ def read_by_date(cfg: BootstrapConfig, csv_dir: Path, days: set[date]) -> dict[d
 
     args:
         cfg: 해당 소스의 bootstrap 설정
-        csv_dir: CSV들이 있는 디렉터리. `*.csv`만 읽는다.
+        csv_dir: CSV들이 있는 디렉터리. `cfg.file_pattern`에 맞는 파일만 읽는다.
         days: 담을 날짜 집합. 여기 없는 날짜의 행은 버린다.
     returns:
         `{날짜: pa.Table}`. 모든 컬럼은 문자열 타입이다. 행이 하나도 없는 날짜는
@@ -101,7 +102,7 @@ def read_by_date(cfg: BootstrapConfig, csv_dir: Path, days: set[date]) -> dict[d
     na_values = set(cfg.na_values)
     batches: dict[date, list[pa.RecordBatch]] = defaultdict(list)
 
-    for path in sorted(csv_dir.glob("*.csv")):
+    for path in sorted(csv_dir.glob(cfg.file_pattern)):
         overlaps = _file_overlaps_range(path, months)
         if overlaps is False:
             logger.info(
@@ -126,7 +127,14 @@ def _read_file_into_batches(
     batches: dict[date, list[pa.RecordBatch]],
 ) -> None:
     """CSV 한 파일을 청크 단위로 읽어 `batches`에 날짜별 RecordBatch를 쌓는다."""
-    physical_columns = list(cfg.column_map.values())
+    # 상수·분해 결과도 archive 스키마에 실려야 하므로 물리 컬럼 목록에 함께 넣는다.
+    # 분해의 재료가 된 CSV 헤더(`일시` 등)는 여기 없다 — collector 컬럼이 아니다.
+    physical_columns = [
+        *cfg.column_map.values(),
+        *cfg.constants,
+        *(target for spec in cfg.derived_time.values() for target in spec.into),
+        *((cfg.derived_wind.u, cfg.derived_wind.v) if cfg.derived_wind else ()),
+    ]
 
     with path.open(encoding=cfg.encoding, errors="replace", newline="") as handle:
         chunk: dict[date, dict[str, list[str]]] = {}
@@ -137,12 +145,18 @@ def _read_file_into_batches(
                 physical: ("" if raw.get(header) in na_values else (raw.get(header) or ""))
                 for header, physical in cfg.column_map.items()
             }
+            row.update(cfg.constants)
+            # 날짜 버킷팅(_row_date)이 분해 결과를 읽을 수 있어야 하므로 그보다 먼저 한다.
+            row.update(_derived_time_values(raw, cfg))
             day = _row_date(row, cfg)
             if day not in days:
                 continue
             for column, mapping in cfg.value_map.items():
                 if column in row and row[column] in mapping:
                     row[column] = mapping[row[column]]
+
+            # value_map이 풍속·풍향을 고칠 수도 있으므로 파생은 그 뒤에 계산한다.
+            row.update(_derived_wind_values(row, cfg))
 
             day_columns = chunk.setdefault(day, {name: [] for name in physical_columns})
             for name in physical_columns:
@@ -166,6 +180,72 @@ def _flush_chunk(
     for day, columns in chunk.items():
         arrays = {name: pa.array(values, type=pa.string()) for name, values in columns.items()}
         batches[day].append(pa.RecordBatch.from_pydict(arrays))
+
+
+def _derived_time_values(raw: dict, cfg: BootstrapConfig) -> dict[str, str]:
+    """`derived_time` 규칙으로 시각 컬럼을 분해한 물리 컬럼 값을 만든다.
+
+    args:
+        raw: CSV 원본 행(헤더 기준). 분해 재료는 매핑 전 헤더로 읽는다.
+        cfg: `derived_time`을 담은 설정.
+    returns:
+        물리 컬럼명 -> 형식이 적용된 문자열.
+    raises:
+        ValueError: 원본 값을 `parse` 형식으로 읽을 수 없을 때. 조용히 빈 값으로
+            넘기면 required 컬럼이 결측이 되어 행 전체가 폐기되므로 여기서 끊는다.
+    """
+    values: dict[str, str] = {}
+    for header, spec in cfg.derived_time.items():
+        text = (raw.get(header) or "").strip()
+        try:
+            parsed = datetime.strptime(text, spec.parse)
+        except ValueError as exc:
+            raise ValueError(
+                f"시각 컬럼 '{header}'을 '{spec.parse}' 형식으로 읽을 수 없다: {text!r}"
+            ) from exc
+        for target, fmt in spec.into.items():
+            values[target] = parsed.strftime(fmt)
+    return values
+
+
+def _derived_wind_values(row: dict, cfg: BootstrapConfig) -> dict[str, str]:
+    """`derived_wind` 규칙으로 UUU·VVV를 계산한다.
+
+    풍속·풍향 중 하나라도 결측이면 두 성분을 빈 문자열로 둔다 — 0으로 채우면 "무풍"이
+    되어 뜻이 달라진다(실측: 풍속·풍향 결측이 각 31건). 검증 엔진이 빈 문자열을
+    결측으로 판정해 `optional_missing` 정책이 걸린다.
+
+    소수 첫째 자리로 찍는 이유는 운영 수집분의 UUU·VVV가 그 자리까지만 오기 때문이다.
+    둘째 자리를 붙이면 같은 컬럼에 정밀도가 다른 값이 섞이는데, 입력인 풍속·풍향이
+    이미 반올림된 값이라 그 자리는 실제 정밀도가 아니다.
+
+    args:
+        row: 매핑·상수·분해·value_map까지 끝난 행.
+        cfg: `derived_wind`를 담은 설정.
+    returns:
+        `{u 컬럼: 값, v 컬럼: 값}`. 규칙이 없으면 빈 dict.
+    """
+    spec = cfg.derived_wind
+    if spec is None:
+        return {}
+
+    speed, direction = row.get(spec.speed, ""), row.get(spec.direction, "")
+    if not str(speed).strip() or not str(direction).strip():
+        return {spec.u: "", spec.v: ""}
+
+    u, v = wind_components(speed, direction)
+    return {spec.u: _format_component(u), spec.v: _format_component(v)}
+
+
+def _format_component(value: float) -> str:
+    """성분을 운영 수집분과 같은 소수 첫째 자리 문자열로 찍는다.
+
+    `+ 0.0`으로 음의 0을 없앤다. 북풍(`VEC=0`)이면 동서 성분이 정확히 `-0.0`이 되고,
+    절댓값이 0.05보다 작은 음수도 반올림 후 `-0.0`이 된다. 그대로 두면 수치적으로
+    같은 값이 `"0.0"`과 `"-0.0"` 두 표기로 archive에 섞이고, parquet의 double로도
+    음의 0이 남아 비교·집계에서 혼란을 준다.
+    """
+    return f"{round(value, 1) + 0.0:.1f}"
 
 
 def _row_date(row: dict, cfg: BootstrapConfig) -> date:

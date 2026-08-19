@@ -6,7 +6,7 @@ import pyarrow as pa
 import pytest
 
 from bootstrap.config import BootstrapConfig
-from bootstrap.csv_source import read_by_date
+from bootstrap.csv_source import _format_component, read_by_date
 
 HEADER = "자전거번호,대여일시,이용자종류,성별\n"
 
@@ -259,3 +259,230 @@ class TestChunkBoundary:
             for row in result[day].to_pylist()
         }
         assert total_bike_ids == {f"SPB-{i}" for i in range(n)}
+
+
+# ---------------------------------------------------------------------------
+# 상수 컬럼과 시각 컬럼 분해
+#
+# 기상청 ASOS 시간자료로 weather_ultra_short_live를 초기 로드할 때 필요하다.
+# 그 CSV는 required 컬럼 네 개(nx·ny·baseDate·baseTime)를 하나도 직접 주지 못한다 —
+# 격자가 없고(단일 관측 지점), `일시` 한 컬럼을 baseDate+baseTime 둘로 쪼개야 한다.
+# column_map은 헤더 하나를 컬럼 하나로 옮길 뿐이라 둘 다 표현할 수 없었고, 그대로
+# 돌리면 required_missing=drop_row 때문에 전 행이 폐기된다(실측 drop_ratio=1.000).
+# ---------------------------------------------------------------------------
+
+ASOS_HEADER = "일시,기온(°C),강수량(mm),풍속(m/s),풍향(16방위)\n"
+
+
+def _asos_cfg(**overrides):
+    fields = {
+        "kind": "csv",
+        "encoding": "cp949",
+        "column_map": {"기온(°C)": "T1H", "강수량(mm)": "RN1",
+                       "풍속(m/s)": "WSD", "풍향(16방위)": "VEC"},
+        "constants": {"nx": "60", "ny": "127"},
+        "derived_time": {
+            "일시": {
+                "parse": "%Y-%m-%d %H:%M",
+                "into": {"baseDate": "%Y%m%d", "baseTime": "%H%M"},
+            }
+        },
+        # ASOS는 무강수 시각의 강수량을 빈 문자열로 둔다 — 결측이 아니라 0이다.
+        "value_map": {"RN1": {"": "0"}},
+        "window": {"from_column": "baseDate", "format": "%Y%m%d"},
+    }
+    fields.update(overrides)
+    return BootstrapConfig.model_validate(fields)
+
+
+def _write_asos(tmp_path, body, name="weather_realtime_2026.csv"):
+    (tmp_path / name).write_text(ASOS_HEADER + body, encoding="cp949")
+    return tmp_path
+
+
+class TestConstantColumns:
+    def test_constants_appear_in_every_row(self, tmp_path):
+        d = _write_asos(tmp_path, "2026-06-01 00:00,25.1,,1.2,270\n2026-06-01 01:00,24.8,1.7,0.9,90\n")
+
+        rows = read_by_date(_asos_cfg(), d, {date(2026, 6, 1)})[date(2026, 6, 1)].to_pylist()
+
+        assert [r["nx"] for r in rows] == ["60", "60"]
+        assert [r["ny"] for r in rows] == ["127", "127"]
+
+    def test_constants_are_strings_so_the_validation_engine_casts_them(self, tmp_path):
+        """csv_source는 전 컬럼을 문자열로 넘기고 캐스팅은 검증 엔진의 types가 맡는다."""
+        d = _write_asos(tmp_path, "2026-06-01 00:00,25.1,,1.2,270\n")
+
+        table = read_by_date(_asos_cfg(), d, {date(2026, 6, 1)})[date(2026, 6, 1)]
+
+        assert table.schema.field("nx").type == pa.string()
+
+    def test_constant_colliding_with_column_map_is_rejected(self):
+        with pytest.raises(ValueError):
+            _asos_cfg(constants={"T1H": "0"})
+
+
+class TestDerivedTimeColumns:
+    def test_one_timestamp_column_becomes_two(self, tmp_path):
+        d = _write_asos(tmp_path, "2026-06-01 00:00,25.1,,1.2,270\n2026-06-01 13:40,24.8,1.7,0.9,90\n")
+
+        rows = read_by_date(_asos_cfg(), d, {date(2026, 6, 1)})[date(2026, 6, 1)].to_pylist()
+
+        assert [r["baseDate"] for r in rows] == ["20260601", "20260601"]
+        assert [r["baseTime"] for r in rows] == ["0000", "1340"]
+
+    def test_source_header_is_not_kept_as_a_column(self, tmp_path):
+        """`일시`는 collector 컬럼이 아니라 분해 재료다 — archive에 남으면 스키마가 어긋난다."""
+        d = _write_asos(tmp_path, "2026-06-01 00:00,25.1,,1.2,270\n")
+
+        table = read_by_date(_asos_cfg(), d, {date(2026, 6, 1)})[date(2026, 6, 1)]
+
+        assert "일시" not in table.schema.names
+        assert set(table.schema.names) == {"T1H", "RN1", "WSD", "VEC", "nx", "ny", "baseDate", "baseTime"}
+
+    def test_window_column_can_be_a_derived_column(self, tmp_path):
+        """날짜 버킷팅이 분해 결과를 읽어야 한다 — 분해가 _row_date보다 먼저 일어난다."""
+        d = _write_asos(tmp_path, "2026-06-01 23:00,25.1,,1.2,270\n2026-06-02 00:00,24.8,,0.9,90\n")
+
+        result = read_by_date(_asos_cfg(), d, {date(2026, 6, 1), date(2026, 6, 2)})
+
+        assert sorted(result) == [date(2026, 6, 1), date(2026, 6, 2)]
+        assert result[date(2026, 6, 1)].to_pylist()[0]["baseTime"] == "2300"
+        assert result[date(2026, 6, 2)].to_pylist()[0]["baseTime"] == "0000"
+
+    def test_unparseable_timestamp_raises(self, tmp_path):
+        d = _write_asos(tmp_path, "2026/06/01 00:00,25.1,,1.2,270\n")
+
+        with pytest.raises(ValueError):
+            read_by_date(_asos_cfg(), d, {date(2026, 6, 1)})
+
+    def test_derived_target_colliding_with_column_map_is_rejected(self):
+        with pytest.raises(ValueError):
+            _asos_cfg(derived_time={"일시": {"parse": "%Y-%m-%d %H:%M", "into": {"T1H": "%H%M"}}})
+
+
+class TestEmptyStringValueMap:
+    def test_blank_becomes_zero_because_asos_omits_no_precipitation(self, tmp_path):
+        """ASOS는 무강수를 빈 문자열로 둔다. 그대로 두면 검증 엔진이 결측으로 판정해
+        precip이 90% null이 된다(실측: 22,995행 중 20,352행이 빈값)."""
+        d = _write_asos(tmp_path, "2026-06-01 00:00,25.1,,1.2,270\n2026-06-01 01:00,24.8,1.7,0.9,90\n")
+
+        rows = read_by_date(_asos_cfg(), d, {date(2026, 6, 1)})[date(2026, 6, 1)].to_pylist()
+
+        assert [r["RN1"] for r in rows] == ["0", "1.7"]
+
+    def test_genuinely_missing_wind_stays_empty(self, tmp_path):
+        """풍속의 빈값은 실제 결측이다(실측 31건). 0으로 바꾸면 안 된다."""
+        d = _write_asos(tmp_path, "2026-06-01 00:00,25.1,,,\n")
+
+        rows = read_by_date(_asos_cfg(), d, {date(2026, 6, 1)})[date(2026, 6, 1)].to_pylist()
+
+        assert rows[0]["WSD"] == ""
+
+
+class TestFilePattern:
+    """한 디렉터리에 여러 소스의 CSV가 섞여 있을 수 있다. 실제로 `data/`에
+    따릉이 대여이력과 ASOS 기상자료가 함께 있었고, 파일명 YYMM이 요청 범위와 겹치면
+    다른 소스의 파일을 열어 시각 컬럼 파싱에서 죽었다."""
+
+    def test_only_matching_files_are_read(self, tmp_path):
+        (tmp_path / "weather_realtime_2026.csv").write_text(
+            ASOS_HEADER + "2026-06-01 00:00,25.1,,1.2,270\n", encoding="cp949")
+        # 다른 소스의 파일. 열면 `일시`가 없어 ValueError로 죽는다.
+        (tmp_path / "따릉이_2606.csv").write_text(
+            "자전거번호,대여일시\nSPB-1,2026-06-01 00:10:00\n", encoding="cp949")
+
+        cfg = _asos_cfg(file_pattern="weather_realtime_*.csv")
+        result = read_by_date(cfg, tmp_path, {date(2026, 6, 1)})
+
+        assert result[date(2026, 6, 1)].num_rows == 1
+
+    def test_default_pattern_reads_every_csv(self, tmp_path):
+        """기존 동작(패턴 미지정)은 그대로 유지한다."""
+        d = _write_asos(tmp_path, "2026-06-01 00:00,25.1,,1.2,270\n", name="a.csv")
+        _write_asos(d, "2026-06-01 01:00,24.8,,0.9,90\n", name="b.csv")
+
+        result = read_by_date(_asos_cfg(), d, {date(2026, 6, 1)})
+
+        assert result[date(2026, 6, 1)].num_rows == 2
+
+
+class TestDerivedWind:
+    """ASOS 시간자료에는 UUU·VVV가 없고 풍속·풍향만 있다. 같은 공식으로 채워
+    운영 수집분과 컬럼을 맞춘다(`core.wind` 참고 — 실API 대조 검증됨).
+
+    값을 소수 첫째 자리로 찍는 이유: 운영 수집분의 UUU·VVV가 그 자리까지만 온다.
+    재계산으로 둘째 자리를 붙이면 같은 컬럼에 정밀도가 다른 값이 섞인다 — 게다가
+    입력인 WSD·VEC가 이미 반올림된 값이라 그 자리는 실제 정밀도가 아니다.
+    """
+
+    def _cfg(self, **overrides):
+        return _asos_cfg(
+            derived_wind={"speed": "WSD", "direction": "VEC", "u": "UUU", "v": "VVV"},
+            **overrides,
+        )
+
+    def _rows(self, tmp_path, body):
+        d = _write_asos(tmp_path, body)
+        return read_by_date(self._cfg(), d, {date(2026, 6, 1)})[date(2026, 6, 1)].to_pylist()
+
+    def test_components_are_derived_from_speed_and_direction(self, tmp_path):
+        # 서풍(270도) 3.0m/s -> 동쪽으로 부는 바람: u=+3.0, v=0.0
+        rows = self._rows(tmp_path, "2026-06-01 00:00,25.1,,3.0,270\n")
+
+        assert rows[0]["UUU"] == "3.0"
+        assert rows[0]["VVV"] == "0.0"
+
+    def test_north_wind_has_negative_north_south_component(self, tmp_path):
+        rows = self._rows(tmp_path, "2026-06-01 00:00,25.1,,2.0,0\n")
+
+        assert rows[0]["UUU"] == "0.0"
+        assert rows[0]["VVV"] == "-2.0"
+
+    def test_rounded_to_one_decimal_like_the_operational_source(self, tmp_path):
+        rows = self._rows(tmp_path, "2026-06-01 00:00,25.1,,1.4,225\n")
+
+        # -1.4*sin(225) = 0.9899..., -1.4*cos(225) = 0.9899...
+        assert rows[0]["UUU"] == "1.0"
+        assert rows[0]["VVV"] == "1.0"
+
+    def test_missing_wind_leaves_components_empty(self, tmp_path):
+        """풍속 결측은 실측 31건 있다. 0으로 채우면 '무풍'이 되어 뜻이 달라진다."""
+        rows = self._rows(tmp_path, "2026-06-01 00:00,25.1,,,\n")
+
+        assert rows[0]["WSD"] == ""
+        assert rows[0]["UUU"] == ""
+        assert rows[0]["VVV"] == ""
+
+    def test_missing_direction_alone_also_leaves_components_empty(self, tmp_path):
+        rows = self._rows(tmp_path, "2026-06-01 00:00,25.1,,2.0,\n")
+
+        assert rows[0]["UUU"] == ""
+        assert rows[0]["VVV"] == ""
+
+    def test_negative_zero_is_normalised(self):
+        """북풍(VEC=0)이면 동서 성분이 정확히 -0.0이고, 절댓값 0.05 미만의 음수도
+        반올림 후 -0.0이 된다. 수치적으로 같은 값이 '0.0'과 '-0.0' 두 표기로 섞이면
+        archive에서 비교·집계가 혼란해진다."""
+        assert _format_component(-0.0) == "0.0"
+        assert _format_component(-0.04) == "0.0"
+        # 0.05 이상은 그대로 음수로 남아야 한다 — 정규화가 실제 값을 삼키면 안 된다.
+        assert _format_component(-0.06) == "-0.1"
+        assert _format_component(-1.25) == "-1.2"
+
+    def test_target_colliding_with_column_map_is_rejected(self):
+        with pytest.raises(ValueError):
+            _asos_cfg(derived_wind={"speed": "WSD", "direction": "VEC", "u": "T1H", "v": "VVV"})
+
+    def test_derivation_reads_values_after_value_map(self, tmp_path):
+        """value_map이 풍속을 고칠 수도 있으므로 파생은 그 뒤에 일어나야 한다."""
+        d = _write_asos(tmp_path, "2026-06-01 00:00,25.1,,-9,270\n")
+        cfg = _asos_cfg(
+            derived_wind={"speed": "WSD", "direction": "VEC", "u": "UUU", "v": "VVV"},
+            value_map={"RN1": {"": "0"}, "WSD": {"-9": "3.0"}},
+        )
+
+        rows = read_by_date(cfg, d, {date(2026, 6, 1)})[date(2026, 6, 1)].to_pylist()
+
+        assert rows[0]["WSD"] == "3.0"
+        assert rows[0]["UUU"] == "3.0"
