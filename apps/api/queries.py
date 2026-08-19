@@ -1,9 +1,33 @@
+import math
 from collections import defaultdict
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 
 from core.db import fetch_all, fetch_one
 
 STOCK_HISTORY_WINDOW_MIN = 25
+
+# station_urgency는 sta_id당 최신 1건만 upsert되므로(#124), 배치가 몇 회 연속으로
+# 멈춰도 마지막 값이 그대로 남는다. "낡은 값을 최신인 것처럼 보여주지 않는다"는
+# 원칙(#107)을 유지하려면 조회 시점에 신선도를 직접 걸러야 한다 — 5분 배치가
+# 한 번 밀리는 것까지는 허용하고, 그보다 오래되면 알림에서 제외한다.
+ALERTS_FRESHNESS_WINDOW_MIN = 10
+
+# 대여소 주변 몇 km 이내 행사를 "주변 행사"로 볼지. 지도의 주변 회수필요 후보
+# 반경(StationMap.tsx의 NEARBY_RADIUS_KM=1, 도보 이동 기준)보다 넉넉하게 잡았다
+# — 행사는 도보 범위를 넘어 대중교통으로도 사람을 끌어모으기 때문이다. 실측
+# 검증은 아직 없는 첫 추정값이라, 실제 행사-수요 상관관계 데이터가 쌓이면
+# 조정해야 한다(#102 완료 기준 참고).
+NEARBY_EVENT_RADIUS_KM = 1.5
+_EARTH_RADIUS_KM = 6371.0
+
+
+def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """두 위경도 지점 사이의 대권거리(직선거리)를 km로 반환한다."""
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+    h = math.sin(dphi / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dlambda / 2) ** 2
+    return 2 * _EARTH_RADIUS_KM * math.asin(math.sqrt(h))
 
 
 def _floor_to_5min(dt: datetime) -> datetime:
@@ -21,22 +45,11 @@ def _group_by_sta_id(rows: list[dict]) -> dict[str, list[dict]]:
 
 
 def fetch_stations() -> list[dict]:
-    """최신 미래예측 배치 대상 대여소의 마스터 + 최신 재고를 반환한다."""
+    """대여소 마스터와 각 대여소의 최신 재고를 반환한다."""
     query = """
-        WITH latest_batch AS (
-            SELECT max(batch_run_at) AS batch_run_at
-            FROM forecast_points
-            WHERE predicted_dttm > now()
-        ), forecasted_stations AS (
-            SELECT DISTINCT sta_id
-            FROM forecast_points
-            WHERE batch_run_at = (SELECT batch_run_at FROM latest_batch)
-              AND predicted_dttm > now()
-        )
         SELECT s.sta_id, s.sta_nm, s.gu, s.sta_addr, s.lat, s.lon, s.hold_cnt,
                stock.parking_bike_tot_cnt, stock.observed_at AS base_dttm
         FROM stations s
-        JOIN forecasted_stations forecasted ON forecasted.sta_id = s.sta_id
         JOIN LATERAL (
             SELECT parking_bike_tot_cnt, observed_at
             FROM station_stock
@@ -100,18 +113,22 @@ def fetch_all_stock_history(sta_ids: list[str], now: datetime) -> dict[str, list
     return {sta_id: grouped.get(sta_id, []) for sta_id in sta_ids}
 
 
-def fetch_alerts() -> list[dict]:
+def fetch_alerts(now: datetime) -> list[dict]:
     """전체 대여소의 재배치 우선순위 알림을 station_urgency(배치가 미리 계산한
-    결과)에서 urgency_score 내림차순으로 조회한다. region은 위경도가 있어야
-    계산되므로 stations와 조인해서 같이 가져온다."""
+    결과)에서 urgency_score 내림차순으로 조회한다. ALERTS_FRESHNESS_WINDOW_MIN보다
+    오래된 값(배치가 멈췄거나 지연된 대여소)은 낡은 값을 최신인 것처럼 보여주지
+    않기 위해 제외한다. region은 위경도가 있어야 계산되므로 stations와 조인해서
+    같이 가져온다."""
     query = """
         SELECT s.sta_id, s.sta_nm, s.lat, s.lon,
                u.action_type, u.urgency_score, u.minutes_until_critical
         FROM station_urgency u
         JOIN stations s ON s.sta_id = u.sta_id
+        WHERE u.batch_run_at >= %(cutoff)s
         ORDER BY u.urgency_score DESC
     """
-    return fetch_all(query)
+    cutoff = now - timedelta(minutes=ALERTS_FRESHNESS_WINDOW_MIN)
+    return fetch_all(query, {"cutoff": cutoff})
 
 
 def fetch_batch_run_at(now: datetime) -> datetime:
@@ -133,3 +150,40 @@ def fetch_batch_run_at(now: datetime) -> datetime:
 def now_utc() -> datetime:
     """UTC 현재 시각(timezone-aware)을 반환한다."""
     return datetime.now(UTC)
+
+
+def fetch_nearby_events(lat: float, lon: float, today: date) -> list[dict]:
+    """(lat, lon) 기준 NEARBY_EVENT_RADIUS_KM 이내에서 아직 끝나지 않은 문화행사를
+    가까운 순으로 반환한다.
+
+    cultural_events에 위경도 없는 색인이 없어서, SQL에서는 위경도 사각형으로
+    싸게 후보만 추리고(위도 1도 ≈ 111km 근사), 정확한 거리·반경 판정과 정렬은
+    Python에서 haversine으로 한다 — StationMap.tsx가 주변 회수필요 후보를
+    고를 때 쓰는 것과 같은 방식이다.
+    """
+    lat_delta = NEARBY_EVENT_RADIUS_KM / 111.0
+    lon_delta = NEARBY_EVENT_RADIUS_KM / (111.0 * math.cos(math.radians(lat)))
+    query = """
+        SELECT event_id, title, category, place, start_date, end_date, is_free, lat, lon
+        FROM cultural_events
+        WHERE lat BETWEEN %(min_lat)s AND %(max_lat)s
+          AND lon BETWEEN %(min_lon)s AND %(max_lon)s
+          AND (end_date IS NULL OR end_date >= %(today)s)
+    """
+    rows = fetch_all(
+        query,
+        {
+            "min_lat": lat - lat_delta,
+            "max_lat": lat + lat_delta,
+            "min_lon": lon - lon_delta,
+            "max_lon": lon + lon_delta,
+            "today": today,
+        },
+    )
+
+    events = []
+    for row in rows:
+        distance_km = _haversine_km(lat, lon, row["lat"], row["lon"])
+        if distance_km <= NEARBY_EVENT_RADIUS_KM:
+            events.append({**row, "distance_km": round(distance_km, 2)})
+    return sorted(events, key=lambda e: e["distance_km"])

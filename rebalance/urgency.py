@@ -9,10 +9,12 @@ station_urgency 테이블에 적재돼 apps/api/main.py:list_alerts()가 그 결
 
 from __future__ import annotations
 
+import logging
 import math
 from datetime import datetime
 
 import pandas as pd
+from core.db import fetch_all
 from core.forecast import enrich_forecast_points
 from core.scoring_config import (
     FIRST_FORECAST_MIN,
@@ -23,6 +25,8 @@ from core.scoring_config import (
 )
 
 import reader
+
+logger = logging.getLogger(__name__)
 
 
 def _regression_slope(xs: list[float], ys: list[float]) -> float:
@@ -112,12 +116,19 @@ def _severity(ratio: float) -> float:
 
 
 def bike_qty(current: int, hold_cnt: int, action_type: str, points: list[dict]) -> int:
-    """실제로 옮겨야 할 자전거 대수. urgency_score의 severity 계산에 쓰이는 것과
-    같은 로직이다(회수필요는 정원 초과분, 공급필요는 부족분과 미충족수요 중 더 큰
-    값) — 재배치 라우트 생성(rebalance/routes.py)이 "몇 대를 실을지" 정하는 데 쓴다."""
+    """실제로 트럭이 싣고 내릴 수 있는 자전거 대수. urgency_score의 severity
+    계산에 쓰이는 초과/부족량(_max_overshoot/_max_deficit/_max_unmet_demand)은
+    예측 구간 전체에서 가장 심해지는 시점 기준이라, 그 값을 그대로 쓰면 지금
+    당장의 물리적 한계를 넘어설 수 있다 — 회수필요는 지금 있는 것보다 많이
+    실으라고 할 수 있고, 공급필요는 목적지 빈 거치대보다 많이 내리라고 할 수
+    있다. 그래서 각각 지금 실을 수 있는 한도(현재 재고)와 내릴 수 있는 한도
+    (빈 거치대 수)로 클램프한다. action_type이 normal이면 옮길 필요가 없다."""
     if action_type == "retrieval_needed":
-        return _max_overshoot(current, hold_cnt, points)
-    return max(_max_deficit(current, points), _max_unmet_demand(current, hold_cnt, points))
+        return min(current, _max_overshoot(current, hold_cnt, points))
+    if action_type == "supply_needed":
+        deficit = max(_max_deficit(current, points), _max_unmet_demand(current, hold_cnt, points))
+        return min(deficit, max(0, hold_cnt - current))
+    return 0
 
 
 def urgency_score(
@@ -191,23 +202,65 @@ def _predicted_points_by_station(predictions: pd.DataFrame) -> dict[str, list[di
     return by_station
 
 
+def _known_station_ids() -> set[str]:
+    """stations 테이블에 실제로 존재하는 sta_id 집합. compute_all()의 계산은 전부
+    S3에서만 읽지만, 서울 자치구 경계 밖 좌표(loader/transform.py:stations_from_silver가
+    적재 시 거르는 대상)의 대여소가 결과에 남으면 station_urgency와
+    rebalance_route_stops 양쪽 다 sta_id FK 위반으로 loader 적재가 실패하므로,
+    이 필터 하나만 예외적으로 RDS를 읽는다(routes.py의 dispatched 넷팅 조회와
+    같은 성격)."""
+    rows = fetch_all("SELECT sta_id FROM stations")
+    return {row["sta_id"] for row in rows}
+
+
 def compute_all(anchor: datetime) -> pd.DataFrame:
     """anchor 시점 기준 전체 대여소의 urgency_score를 계산한다.
 
-    입력은 전부 S3(재고 이력·예측 결과)에서만 읽는다 — RDS는 이 배치가 만든 결과를
-    loader가 station_urgency에 적재할 때만 쓰인다(배치 자신은 RDS를 건드리지 않음).
+    입력은 대부분 S3(재고 이력·예측 결과)에서 읽는다 — RDS는 이 배치가 만든 결과를
+    loader가 station_urgency에 적재할 때 쓰이는 것 외에, sta_id FK 안전성 확인
+    (_known_station_ids)을 위해서만 좁게 읽는다.
     """
+    if anchor.minute % 5 or anchor.second or anchor.microsecond:
+        raise ValueError(f"anchor must align to a 5-minute tick: {anchor}")
+
     stock_history_by_station = reader.read_recent_stock(anchor)
     predictions = reader.read_predictions(anchor)
-    points_by_station = _predicted_points_by_station(predictions) if predictions is not None else {}
+    points_by_station = _predicted_points_by_station(predictions)
+
+    # 5분 snapshot 배치의 "현재 재고"는 anchor tick에서 직접 관측된 값만 쓴다.
+    # 5분 이내(예: 14:00을 14:05에 허용)로 느슨하게 잡으면 서로 다른 snapshot의
+    # 재고가 한 결과에 섞일 수 있으므로, 누락 station은 이번 batch에서 제외한다.
+    current_histories = {
+        sta_id: history
+        for sta_id, history in stock_history_by_station.items()
+        if history and history[-1]["observed_at"] == anchor
+    }
+    unsupported_stations = set(current_histories) - set(points_by_station)
+    if unsupported_stations:
+        # run_inference는 학습된 model category만 예측하고, 그 집합 안에서 partial이
+        # 발생하면 exit 1로 downstream을 막는다. 따라서 여기의 stock-only station은
+        # 신설 등 모델 미지원 대상으로 간주해 제외하되 운영 가시성을 위해 집계한다.
+        logger.warning(
+            "excluding %d current-stock stations without model predictions",
+            len(unsupported_stations),
+        )
+    computable_station_ids = set(current_histories) & set(points_by_station)
+
+    known_station_ids = _known_station_ids()
+    unknown_stations = computable_station_ids - known_station_ids
+    if unknown_stations:
+        logger.warning(
+            "excluding %d stations not present in stations table (outside Seoul gu boundary)",
+            len(unknown_stations),
+        )
+    computable_station_ids &= known_station_ids
 
     rows = []
-    for sta_id, history in stock_history_by_station.items():
-        if not history:
-            continue
+    for sta_id in sorted(computable_station_ids):
+        history = current_histories[sta_id]
         current = history[-1]["parking_bike_tot_cnt"]
         hold_cnt = history[-1]["hold_cnt"]
-        raw_points = points_by_station.get(sta_id, [])
+        raw_points = points_by_station[sta_id]
         points = enrich_forecast_points(current, hold_cnt, raw_points)
 
         score, minutes, action_type = urgency_score(current, hold_cnt, history, points, anchor)

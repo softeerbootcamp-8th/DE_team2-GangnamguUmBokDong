@@ -84,9 +84,11 @@ with DAG(
 
     compute_urgency = build_urgency_task(dag)
     load_station_urgency = build_db_loader_task(dag, "station_urgency")
-    run_inference >> compute_urgency >> load_station_urgency
+    run_inference >> compute_urgency
+    [compute_urgency, load_stations] >> load_station_urgency
 
     compute_routes = build_routes_task(dag)
     load_rebalance_routes = build_db_loader_task(dag, "rebalance_routes")
     load_rebalance_route_stops = build_db_loader_task(dag, "rebalance_route_stops")
-    compute_urgency >> compute_routes >> [load_rebalance_routes, load_rebalance_route_stops]
+    compute_urgency >> compute_routes >> load_rebalance_routes >> load_rebalance_route_stops
+    load_stations >> load_rebalance_route_stops

@@ -343,6 +343,8 @@ columns:
 
 `types`는 "이 타입으로 해석 가능해야 한다"는 뜻이다. 서울 API는 숫자도 문자열로 주므로, 해석에 성공하면 **캐스팅된 값이 silver에 들어간다**(정규화 겸용). 실패하면 `TYPE_ERROR`로 판정한다.
 
+쓸 수 있는 이름은 `str | int | float | bool | precip`이다. 앞의 넷은 파이썬 생성자를 그대로 부르고, `precip`은 기상청 강수량 범주 표기(`"강수없음"`, `"1.0mm 미만"`, `"30.0~50.0mm"`, `"50.0mm 이상"`, `"2.0mm"`, `"0"`이 한 응답에 섞여 나온다)를 mm 실수로 바꾸는 전용 캐스터다. 범위형은 하한을 취한다. 규칙을 `libs/core`의 `core.precip`에 둔 것은 loader도 같은 함수를 써야 silver와 RDB의 값이 갈리지 않기 때문이다 — collector가 숫자로 저장하기 전에 쌓인 silver를 loader가 다시 읽는 경로가 남아 있다.
+
 판정 결과는 `Issue(column, kind, required, raw_value, spec)`이고, `kind`는 `MISSING | TYPE_ERROR | OUTLIER` 중 하나다. 이 타입들은 `validation/types.py`에 모아 둔다. registry · policies · engine · loader 네 곳이 공유하는 어휘이므로 레지스트리와 분리한다.
 이 `Issue`는 집계용 기록이 아니라 **컬럼 정책의 두 번째 인자로 그대로 전달된다.**
 정책이 `issue.kind`를 볼 수 있어야 교정형 정책이 캐스팅 실패 값을 방어할 수 있다.

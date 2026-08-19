@@ -19,3 +19,25 @@ KST_WINDOW_START = "{{ " + _KST_WINDOW_TS + ".isoformat() }}"
 KST_DATE = "{{ " + _KST_WINDOW_TS + '.strftime("%Y-%m-%d") }}'
 KST_HOUR = "{{ " + _KST_WINDOW_TS + ".hour }}"
 KST_MINUTE = "{{ " + _KST_WINDOW_TS + ".minute }}"
+
+
+def kst_window_start_shifted(hours: int) -> str:
+    """공통 기준 시각을 `hours`시간 앞으로 당긴 `--window-start` 템플릿.
+
+    과거 윈도우를 다시 수집할 때 쓴다. 위 상수들과 같은 `_KST_WINDOW_TS`(5분 내림한
+    KST 시각)에서 출발하므로 시간대 변환이 두 갈래로 갈리지 않는다.
+
+    시간을 통째로 당기는 것이 중요하다. collector가 `path_suffix`를 계산할 때 쓰는
+    `window_last`(= window_start - 1초)도 같이 당겨지므로 그 시간대를 조회하게 되고,
+    silver도 그 시간대의 `dt`/`hh` 파티션에 쓰인다 — 데이터의 시각과 파티션이
+    어긋나지 않는다.
+
+    args:
+        hours: 몇 시간 앞으로 당길지. 양수여야 한다.
+    returns:
+        `--window-start`에 그대로 넣을 Jinja 템플릿 문자열.
+    """
+    if hours <= 0:
+        raise ValueError(f"hours는 양수여야 한다: {hours}")
+    shifted = f"({_KST_WINDOW_TS} - macros.timedelta(hours={hours}))"
+    return "{{ " + f"{shifted}.isoformat()" + " }}"

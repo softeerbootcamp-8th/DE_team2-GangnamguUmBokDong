@@ -185,7 +185,11 @@
 API 원본 필드를 그대로 통과시키므로, 이 표의 논리 컬럼명(`base_dttm`, `pop_grid_id`,
 `living_pop_tot`, `male_00_09` 등)이 아니라 아래 **물리 컬럼명 그대로 저장된다.**
 `base_dttm`은 `YMD`(날짜) + `TT`(0~23 시간대) 조합에 대응하고, `pop_grid_id`는
-`CELL_ID`(250m 격자 ID)에 대응한다. `living_pop_tot`은 `SPOP`에 대응하되, yaml에
+`CELL_ID`(250m 격자 ID)에 대응한다.
+
+`SPOP`과 `M00`~`F70`은 `types: [masked_float]`로 선언돼 있다. 이 캐스터가 마스킹 표기 `*`을
+**타입 오류가 아니라 결측(MISSING)으로** 판정시키므로, 아래 표의 "결측" 기준이 그대로
+manifest의 `column_issues.missing`과 `optional_missing` 정책에 걸린다(`core.masked` 참고). `living_pop_tot`은 `SPOP`에 대응하되, yaml에
 `required: true`가 없어 **실측 데이터에 null이 실제로 존재한다**(계획서와 달리 필수
 컬럼이 아님 — downstream에서 반드시 null 처리 필요).
 

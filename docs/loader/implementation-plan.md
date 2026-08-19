@@ -52,25 +52,31 @@ CREATE TABLE IF NOT EXISTS station_stock (
 ### 2-1. `weather_current` (초단기 실황 날씨)
 - **S3 Silver Parquet 추출 출처**: `weather_ultra_short_live`
 - **컬럼 매핑 (Silver -> Gold)**:
-  - 수집 격자 좌표 / 위치 정보 -> `gu` (자치구 이름으로 변환 매핑)
+  - `nx`, `ny` (int) -> `nx`, `ny` (조인 키, 그대로 유지)
+  - 격자 좌표 -> `gu` (표시용 파생 컬럼, `grid_to_gu`로 계산. PK 아님)
   - 파티션 시간(`dt`, `hh`) 또는 데이터 내부 시간 -> `observed_at` (TIMESTAMPTZ)
   - `T1H` (double) -> `temperature`
   - `REH` (double) -> `humidity`
   - `WSD` (double) -> `wind_speed`
   - `RN1` (double) -> `rainfall`
   - `PTY` (int64) -> `pty_type`
-- **처리 로직**: 이상치 정제 후 `gu`를 기준으로 최신 실황만 Upsert.
+- **처리 로직**: 이상치 정제 후 `(nx, ny)`를 기준으로 최신 실황만 Upsert. `gu`는 구 경계 왜곡을 피하기 위해 조인 키로 쓰지 않는다(자세한 배경은 `docs/superpowers/specs/2026-08-19-weather-grid-matching-design.md` 참고).
 
 ### 2-2. `weather_forecast` (단기 예보 날씨)
-- **S3 Silver Parquet 추출 출처**: `weather_short_term_forecast`
+- **S3 Silver Parquet 추출 출처**: `weather_short_term_forecast`(3시간)와 `weather_ultra_short_forecast`(30분)가 같은 물리 테이블을 공유한다.
 - **컬럼 매핑 (Silver -> Gold)**:
-  - 수집 격자 좌표 / 위치 정보 -> `gu` (자치구 이름으로 변환 매핑)
+  - `nx`, `ny` (int) -> `nx`, `ny` (조인 키)
+  - 격자 좌표 -> `gu` (표시용 파생 컬럼, PK 아님)
   - 예보 대상 시간 데이터 -> `forecast_dttm` (TIMESTAMPTZ)
-  - `TMP` (double) -> `temperature`
+  - `TMP`/`T1H` (double) -> `temperature`
   - `POP` (double) -> `precip_prob`
+  - `PCP`/`RN1` -> `precip_amount`
   - `SKY` (int64) -> `sky_cond`
   - `PTY` (int64) -> `pty_type`
-- **처리 로직**: 동일한 미래 시각(`forecast_dttm`)에 대해 가장 최근에 발표된 예보로 Upsert.
+  - `REH` (double) -> `humidity`
+  - `WSD` (double) -> `wind_speed`
+  - 발표 시각 -> `base_dttm` (TIMESTAMPTZ)
+- **처리 로직**: 동일한 `(nx, ny, forecast_dttm)`에 대해 가장 최근에 발표된(`base_dttm`이 가장 큰) 예보로 Upsert.
 
 ### 2-3. `cultural_events` (문화/공연 행사)
 - **S3 Silver Parquet 추출 출처**: `cultural_event`
@@ -89,8 +95,16 @@ CREATE TABLE IF NOT EXISTS station_stock (
 
 #### 신규 추가 DDL
 ```sql
--- 기상청 초단기 실황 (현재 날씨). 자치구별 최신 데이터 1건 유지(upsert).
+-- 대여소의 실제 최근접 기상 격자. weather_current/weather_forecast와 (nx, ny)로
+-- 직접 조인하기 위한 컬럼이다(gu 기준 조인은 구 경계 왜곡이 커서 쓰지 않는다).
+ALTER TABLE stations ADD COLUMN IF NOT EXISTS grid_nx INTEGER;
+ALTER TABLE stations ADD COLUMN IF NOT EXISTS grid_ny INTEGER;
+
+-- 기상청 초단기 실황 (현재 날씨). 격자별 최신 데이터 1건 유지(upsert).
+-- gu는 표시용 파생 컬럼이며 PK가 아니다(같은 gu에 여러 격자가 걸칠 수 있다).
 CREATE TABLE IF NOT EXISTS weather_current (
+    nx              INTEGER NOT NULL,
+    ny              INTEGER NOT NULL,
     gu              TEXT NOT NULL,
     observed_at     TIMESTAMPTZ NOT NULL,
     temperature     DOUBLE PRECISION,
@@ -98,18 +112,26 @@ CREATE TABLE IF NOT EXISTS weather_current (
     wind_speed      DOUBLE PRECISION,
     rainfall        DOUBLE PRECISION,
     pty_type        INTEGER,
-    PRIMARY KEY (gu)
+    PRIMARY KEY (nx, ny)
 );
 
--- 기상청 단기 예보 (미래 날씨). 동일 예측 시간에 대해 가장 최근 발표된 예보 하나만 남는다(upsert).
+-- 기상청 단기 예보 (미래 날씨). 동일 (nx, ny, forecast_dttm)에 대해 가장 최근
+-- 발표된 예보 하나만 남는다(upsert, guard_col: base_dttm).
 CREATE TABLE IF NOT EXISTS weather_forecast (
-    gu              TEXT NOT NULL,
-    forecast_dttm   TIMESTAMPTZ NOT NULL,
-    temperature     DOUBLE PRECISION,
-    precip_prob     DOUBLE PRECISION,
-    sky_cond        INTEGER,
-    pty_type        INTEGER,
-    PRIMARY KEY (gu, forecast_dttm)
+    nx                   INTEGER NOT NULL,
+    ny                   INTEGER NOT NULL,
+    gu                   TEXT NOT NULL,
+    forecast_dttm        TIMESTAMPTZ NOT NULL,
+    sky_cond             INTEGER,
+    pty_type             INTEGER,
+    temperature          DOUBLE PRECISION,
+    precip_prob          DOUBLE PRECISION,
+    precip_amount        DOUBLE PRECISION,
+    humidity             DOUBLE PRECISION,
+    wind_speed           DOUBLE PRECISION,
+    base_dttm            TIMESTAMPTZ NOT NULL,
+    updated_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (nx, ny, forecast_dttm)
 );
 
 -- 서울시 문화/공연 행사 정보.

@@ -279,6 +279,11 @@ def execute_window(
     existing = manifest_module.load(config.source_id, window_start)
     adapter_cls = get_adapter(config.adapter)
     window = Window(window_start=window_start, window_end=window_end)
+    planned_parts = (
+        adapter_cls.planned_parts(config, window)
+        if hasattr(adapter_cls, "planned_parts")
+        else None
+    )
 
     if existing and existing.stage == Stage.COMPLETED and not force and not (backfill and existing.missing.parts):
         # 분기 1: 이미 완결됐고 채울 누락도 없으면(또는 backfill이 아니면) 아무것도
@@ -298,6 +303,7 @@ def execute_window(
             skip=frozenset(have_parts), expected_total=existing.counts.expected,
             sleep_fn=sleep_fn,
             on_chunk=lambda key, payload: storage.write_bronze_part(config.source_id, window_start, key, payload),
+            planned_parts=planned_parts,
         )
         chunks = {**prior_chunks, **round_result.chunks}
         missing_keys = round_result.missing
@@ -326,6 +332,7 @@ def execute_window(
             adapter_cls.fetch, config, window, client=client,
             sleep_fn=sleep_fn,
             on_chunk=lambda key, payload: storage.write_bronze_part(config.source_id, window_start, key, payload),
+            planned_parts=planned_parts,
         )
         chunks = round_result.chunks
         missing_keys = round_result.missing

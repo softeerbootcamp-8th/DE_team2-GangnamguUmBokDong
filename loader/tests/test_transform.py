@@ -1,9 +1,10 @@
 from datetime import UTC, date, datetime
 
 import pandas as pd
-
+import pytest
 import transform
 from transform import (
+    _parse_precip_str,
     cultural_events_from_silver,
     forecast_points_from_predictions,
     performance_events_from_silver,
@@ -14,6 +15,7 @@ from transform import (
     stations_from_silver,
     weather_current_from_silver,
     weather_forecast_from_silver,
+    weather_forecast_ultra_from_silver,
 )
 
 GANGNAM_STATION = {
@@ -47,6 +49,15 @@ def test_stations_from_silver_skips_rows_outside_seoul_gu_boundary():
     assert [r["sta_id"] for r in records] == ["101"]
 
 
+def test_stations_from_silver_includes_nearest_grid():
+    df = pd.DataFrame([GANGNAM_STATION])
+
+    [record] = stations_from_silver(df)
+
+    assert record["grid_nx"] == 61
+    assert record["grid_ny"] == 126
+
+
 def test_station_stock_from_silver_uses_given_observed_at():
     df = pd.DataFrame([{**GANGNAM_STATION, "parkingBikeTotCnt": 15}])
     observed_at = datetime(2026, 8, 16, 0, 5, tzinfo=UTC)
@@ -78,6 +89,8 @@ def test_weather_current_from_silver_keeps_latest_per_gu():
 
     assert len(records) == 1
     assert records[0]["gu"] == "종로구"
+    assert records[0]["nx"] == 60
+    assert records[0]["ny"] == 127
     assert records[0]["temperature"] == 29.0
 
 
@@ -92,8 +105,24 @@ def test_weather_forecast_from_silver_keeps_latest_issued():
     records = weather_forecast_from_silver(df)
 
     assert len(records) == 1
+    assert records[0]["nx"] == 60
+    assert records[0]["ny"] == 127
     assert records[0]["temperature"] == 28.0
     assert records[0]["precip_prob"] == 30.0
+
+
+def test_weather_forecast_ultra_from_silver_maps_pop_to_precip_prob():
+    df = pd.DataFrame(
+        [
+            {**SEOUL_GRID, "baseDate": "20260816", "baseTime": "0930", "fcstDate": "20260816", "fcstTime": "1000", "T1H": "27", "POP": "40", "RN1": "강수없음", "SKY": "1", "PTY": "0"},
+        ]
+    )
+
+    [record] = weather_forecast_ultra_from_silver(df)
+
+    assert record["precip_prob"] == 40.0
+    assert record["nx"] == 60
+    assert record["ny"] == 127
 
 
 def test_cultural_events_from_silver_filters_ended_events():
@@ -175,16 +204,13 @@ def test_performance_events_from_silver_defaults_today_to_kst_now(monkeypatch):
     df = pd.DataFrame(
         [
             {
-                "SVCID": "S001",
-                "SVCNM": "종료 임박 공연",
-                "MINCLASSNM": "공연",
-                "AREANM": "강남구",
-                "PLACENM": "코엑스",
-                "SVCOPNBGNDT": "2026-08-01",
-                "SVCOPNENDDT": "2026-08-15",
-                "PAYATNM": "유료",
-                "Y": 37.5115,
-                "X": 127.0605,
+                "SCH_SEQ": "S001",
+                "TITLE": "종료 임박 공연",
+                "SCH_CODE_A": "공연",
+                "SCH_CODE_B": "잠실실내체육관",
+                "SDATE": "2026-08-01",
+                "EDATE": "2026-08-15",
+                "USE_PAY": "유료",
             }
         ]
     )
@@ -192,6 +218,132 @@ def test_performance_events_from_silver_defaults_today_to_kst_now(monkeypatch):
     records = performance_events_from_silver(df)
 
     assert records == []
+
+
+def test_performance_events_from_silver_maps_stadium_schedule_fields():
+    df = pd.DataFrame(
+        [
+            {
+                "SCH_SEQ": "S002",
+                "TITLE": "잠실 야구 경기",
+                "SCH_CODE_A": "1",
+                "SCH_CODE_B": "8",
+                "CODE_TITLE_A": "스포츠경기",
+                "CODE_TITLE_B": "잠실야구장",
+                "SDATE": "20260820",
+                "EDATE": "20260821",
+                "USE_PAY": "입장료 무료",
+            }
+        ]
+    )
+
+    records = performance_events_from_silver(df, today=date(2026, 8, 18))
+
+    assert records == [
+        {
+            "event_id": "S002",
+            "title": "잠실 야구 경기",
+            "category": "스포츠경기",
+            "gu": "송파구",
+            "place": "잠실야구장",
+            "start_date": date(2026, 8, 20),
+            "end_date": date(2026, 8, 21),
+            "is_free": "입장료 무료",
+            "lat": 37.512183,
+            "lon": 127.072680,
+        }
+    ]
+
+
+def test_performance_events_from_silver_skips_rows_without_title():
+    # backfill(max_age 7d)이 스키마 변경 이전 Silver 파티션을 다시 읽으면 컬럼이
+    # 전부 구 이름(SVCID/SVCNM/PLACENM)이라 title이 비고 event_id가 sha256("")로
+    # 모든 행에서 같아진다 — 빈 제목 한 행으로 뭉개져 upsert되는 것을 막는다.
+    df = pd.DataFrame(
+        [
+            {"SVCID": "OLD1", "SVCNM": "구 스키마 행사 1", "PLACENM": "여의도한강공원"},
+            {"SVCID": "OLD2", "SVCNM": "구 스키마 행사 2", "PLACENM": "잠실야구장"},
+        ]
+    )
+
+    records = performance_events_from_silver(df, today=date(2026, 8, 18))
+
+    assert records == []
+
+
+def test_performance_events_from_silver_uses_code_titles_not_codes():
+    # SCH_CODE_A/B는 숫자 코드("1", "8")이고 사람이 읽는 이름은 CODE_TITLE_A/B에
+    # 따로 온다. 코드를 그대로 실으면 화면에 카테고리 "1", 장소 "8"이 노출된다.
+    df = pd.DataFrame(
+        [
+            {
+                "SCH_SEQ": "S020",
+                "TITLE": "프로야구 (롯데:두산)",
+                "SCH_CODE_A": "1",
+                "SCH_CODE_B": "8",
+                "CODE_TITLE_A": "스포츠경기",
+                "CODE_TITLE_B": "잠실야구장",
+                "SDATE": "20260820",
+                "EDATE": "20260821",
+                "USE_PAY": "VIP석 60,000원",
+            }
+        ]
+    )
+
+    records = performance_events_from_silver(df, today=date(2026, 8, 18))
+
+    assert records[0]["category"] == "스포츠경기"
+    assert records[0]["place"] == "잠실야구장"
+
+
+def test_performance_events_from_silver_fills_coords_from_stadium_code():
+    # 원본 API는 좌표를 주지 않는다. 시설 코드(SCH_CODE_B)로 좌표 마스터를 조회해
+    # 채워야 apps/api의 위경도 반경 조회(fetch_nearby_events)에 걸린다.
+    df = pd.DataFrame(
+        [
+            {
+                "SCH_SEQ": "S010",
+                "TITLE": "프로야구 (롯데:두산)",
+                "SCH_CODE_A": "1",
+                "SCH_CODE_B": "8",  # 잠실야구장
+                "SDATE": "20260820",
+                "EDATE": "20260821",
+                "USE_PAY": "VIP석 60,000원",
+            }
+        ]
+    )
+
+    records = performance_events_from_silver(df, today=date(2026, 8, 18))
+
+    assert len(records) == 1
+    assert records[0]["lat"] == pytest.approx(37.512183)
+    assert records[0]["lon"] == pytest.approx(127.072680)
+    # gu는 좌표에서 도출한다(자치구 경계 폴리곤 재사용).
+    assert records[0]["gu"] == "송파구"
+
+
+def test_performance_events_from_silver_keeps_unmapped_stadium_without_coords():
+    # 시설이 신설되어 좌표 마스터에 없는 코드가 오면, 행은 살리고 좌표만 비운다.
+    df = pd.DataFrame(
+        [
+            {
+                "SCH_SEQ": "S011",
+                "TITLE": "신규 시설 행사",
+                "SCH_CODE_A": "1",
+                "SCH_CODE_B": "999",
+                "SDATE": "20260820",
+                "EDATE": "20260821",
+                "USE_PAY": "무료",
+            }
+        ]
+    )
+
+    records = performance_events_from_silver(df, today=date(2026, 8, 18))
+
+    assert len(records) == 1
+    assert records[0]["lat"] is None
+    assert records[0]["lon"] is None
+    assert records[0]["gu"] is None
 
 
 def test_forecast_points_from_predictions_maps_columns_and_converts_kst_to_utc():
@@ -238,6 +390,37 @@ def test_forecast_points_from_predictions_rounds_half_to_even():
 
     assert record["predicted_rent_cnt"] == round(2.5)
     assert record["predicted_return_cnt"] == round(1.5)
+
+
+class TestParsePrecipStr:
+    """강수량 변환 규칙 자체는 `core.precip`이 갖는다 — collector가 silver에 쓸 때와
+    같은 값이 나와야 하기 때문이다. 여기서 보는 것은 loader 쪽 껍데기의 계약이다:
+    해석할 수 없는 값은 예외가 아니라 None(= 해당 컬럼 결측)이어야 한다."""
+
+    def test_uses_the_shared_rule(self):
+        assert _parse_precip_str("30.0~50.0mm") == 30.0
+        assert _parse_precip_str("강수없음") == 0.0
+        assert _parse_precip_str("1.0mm 미만") == 0.5
+
+    def test_at_least_is_not_dropped(self):
+        """상한 없는 표기가 None으로 떨어지면 폭우 예보가 통째로 결측이 된다."""
+        assert _parse_precip_str("50.0mm 이상") == 50.0
+
+    def test_numeric_silver_passes_through(self):
+        """collector가 이미 숫자로 저장한 silver를 읽는 경로."""
+        assert _parse_precip_str(2.0) == 2.0
+
+    def test_missing_values_become_none(self):
+        assert _parse_precip_str(None) is None
+        assert _parse_precip_str("") is None
+
+    def test_nan_becomes_none(self):
+        """숫자 컬럼의 결측은 pandas에서 NaN으로 온다. float()가 통과시켜 버리므로
+        따로 막지 않으면 NaN이 그대로 RDB로 간다."""
+        assert _parse_precip_str(float("nan")) is None
+
+    def test_unparseable_becomes_none(self):
+        assert _parse_precip_str("맑음") is None
 
 
 def test_station_urgency_from_urgency_batch_maps_columns():

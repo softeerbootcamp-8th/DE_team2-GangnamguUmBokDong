@@ -8,6 +8,7 @@ tests/test_reader_key_contract.py(dev 전용 ml_core 의존)가 검증한다.
 
 from __future__ import annotations
 
+import math
 from datetime import datetime, timedelta
 
 import pandas as pd
@@ -54,27 +55,44 @@ def read_recent_stock(anchor: datetime, lookback_minutes: int = 25) -> dict[str,
     fetch_all_stock_history와 동일한 형태)로 바로 쓸 수 있고, hold_cnt/lat/lon은
     가장 최근 포인트에서 "현재 재고/정원/위경도"를 뽑아 쓰는 용도다(rebalance/urgency.py,
     routes.py 참고 — routes.py가 권역 배정에 쓰는 위경도도 같은 tick 파일에 있어
-    별도 RDS 조회가 필요 없다).
+    별도 RDS 조회가 필요 없다). stationLatitude/Longitude는 수집 스키마에서
+    optional이라 결측이면 NaN으로 들어오는데, 그대로 두면 nearest_region의 거리
+    계산이 전부 NaN이 되어 대여소가 엉뚱한 권역(항상 min()의 첫 항목)으로
+    배정되므로 이 시점에 걸러낸다.
     """
     history: dict[str, list[dict]] = {}
     columns = ["stationId", "parkingBikeTotCnt", "rackTotCnt", "stationLatitude", "stationLongitude"]
+    anchor_tick = _floor_to_tick(anchor, _BIKE_REALTIME_TICK_MINUTES)
     for observed_at, key in _bike_realtime_tick_keys(anchor, lookback_minutes):
         df = read_parquet(key, columns=columns)
+        if observed_at == anchor_tick and df is None:
+            raise FileNotFoundError(f"stock snapshot parquet not found for {anchor_tick}: {key}")
         if df is None or df.empty:
             continue
         for row in df.itertuples(index=False):
+            lat, lon = float(row.stationLatitude), float(row.stationLongitude)
+            if math.isnan(lat) or math.isnan(lon):
+                continue
             history.setdefault(str(row.stationId), []).append(
                 {
                     "observed_at": observed_at,
                     "parking_bike_tot_cnt": int(row.parkingBikeTotCnt),
                     "hold_cnt": int(row.rackTotCnt),
-                    "lat": float(row.stationLatitude),
-                    "lon": float(row.stationLongitude),
+                    "lat": lat,
+                    "lon": lon,
                 }
             )
     return history
 
 
-def read_predictions(window_start: datetime) -> pd.DataFrame | None:
-    """예측 배치 결과(대여소별 시간대별 대여·반납 원본치)를 읽는다. 파일이 없으면 None."""
-    return read_parquet(_predictions_key(window_start))
+def read_predictions(window_start: datetime) -> pd.DataFrame:
+    """예측 배치 결과를 읽고, 해당 anchor의 산출물이 없으면 실패한다.
+
+    compute_urgency는 run_inference의 직접 downstream이므로 파일 부재는 정상적인
+    trend-only 입력이 아니라 upstream 산출물 계약 위반이다.
+    """
+    key = _predictions_key(window_start)
+    predictions = read_parquet(key)
+    if predictions is None:
+        raise FileNotFoundError(f"prediction parquet not found for {window_start}: {key}")
+    return predictions

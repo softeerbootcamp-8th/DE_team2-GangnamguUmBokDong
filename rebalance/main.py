@@ -28,6 +28,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--minute", type=int, required=True)
     args = parser.parse_args(argv)
 
+    if args.minute % 5:
+        parser.error("--minute must be aligned to a 5-minute tick")
+
     anchor = anchor_timestamp(args.date, args.hour, args.minute)
     result = urgency.compute_all(anchor)
 

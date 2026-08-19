@@ -7,6 +7,7 @@ import queries
 from schemas import (
     Alert,
     DispatchCenter,
+    EventsResponse,
     ForecastResponse,
     StationDetail,
     StationSummary,
@@ -67,6 +68,18 @@ def get_forecast(sta_id: str) -> dict:
     }
 
 
+@app.get("/stations/{sta_id}/events", response_model=EventsResponse)
+def get_station_events(sta_id: str) -> dict:
+    """대여소 주변(queries.NEARBY_EVENT_RADIUS_KM 이내)에서 진행 중이거나 예정된
+    문화행사를 가까운 순으로 반환한다. 대여소가 없으면 404."""
+    station = queries.fetch_station(sta_id)
+    if station is None:
+        raise HTTPException(status_code=404, detail=f"station {sta_id} not found")
+    today = queries.now_utc().date()
+    events = queries.fetch_nearby_events(station["lat"], station["lon"], today)
+    return {"radius_km": queries.NEARBY_EVENT_RADIUS_KM, "events": events}
+
+
 @app.get("/regions", response_model=list[DispatchCenter])
 def list_regions() -> list[dict]:
     """지역센터(권역) 목록과 좌표를 반환한다. 프론트가 권역 경계(보로노이)를
@@ -88,7 +101,7 @@ def list_alerts() -> list[dict]:
     urgency_score는 더 이상 요청마다 계산하지 않는다 — 5분 배치(rebalance/urgency.py)가
     미리 계산해 station_urgency 테이블에 적재해두고, 여기서는 그 결과만 조회한다.
     """
-    alerts = queries.fetch_alerts()
+    alerts = queries.fetch_alerts(queries.now_utc())
     return [
         {
             "sta_id": row["sta_id"],
