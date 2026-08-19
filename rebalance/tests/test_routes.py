@@ -1,6 +1,6 @@
 """routes.py: 잔여수요 산출, dispatched 넷팅, 적재량 제약, 방문순서, 권역 배정 테스트.
 
-`_dispatched_qty`(RDS 접근)와 `urgency.compute_all`(S3 접근)은 monkeypatch로
+`_dispatched_qty`(RDS 접근)와 `reader.read_urgency_result`(S3 접근)는 monkeypatch로
 대체해서 순수 로직만 검증한다 — 실제 DB/S3 연동은 이 배치가 도는 Airflow
 환경에서 확인한다(#109 검증 방법 참고).
 """
@@ -223,7 +223,7 @@ class TestComputeAll:
                 _station("normal", "normal", bike_qty=0, urgency_score=0),
             ]
         )
-        monkeypatch.setattr(routes.urgency, "compute_all", lambda anchor: stations)
+        monkeypatch.setattr(routes.reader, "read_urgency_result", lambda anchor: stations)
         monkeypatch.setattr(routes, "_dispatched_qty", lambda: {("drop", "dropoff"): 8})
 
         route_rows, stop_rows = routes.compute_all(NOW)
@@ -236,7 +236,7 @@ class TestComputeAll:
 
     def test_no_remaining_need_produces_no_routes(self, monkeypatch):
         stations = pd.DataFrame([_station("normal", "normal", bike_qty=0, urgency_score=0)])
-        monkeypatch.setattr(routes.urgency, "compute_all", lambda anchor: stations)
+        monkeypatch.setattr(routes.reader, "read_urgency_result", lambda anchor: stations)
         monkeypatch.setattr(routes, "_dispatched_qty", dict)
 
         route_rows, stop_rows = routes.compute_all(NOW)

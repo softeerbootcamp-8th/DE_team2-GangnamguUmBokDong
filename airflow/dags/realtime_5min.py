@@ -37,10 +37,11 @@ Airflow dependency는 실제 데이터 계약을 기준으로 둔다.
   (compute는 RDS load와 병렬이지만, load_station_urgency는 stations FK를 위해
   load_stations도 기다린다. load_station_stock/load_forecast_points와는 독립적이다.
   이유: #107)
-- compute_urgency -> compute_routes(rebalance, urgency_score/bike_qty를 다시
-  계산 + dispatched 넷팅을 위한 좁은 RDS 조회 하나) -> load_rebalance_routes ->
-  load_rebalance_route_stops(순차 — route_id FK). load_rebalance_route_stops는
-  sta_id FK를 위해 load_stations도 기다린다. 이유: #109
+- compute_urgency -> compute_routes(rebalance, compute_urgency가 S3에 써둔
+  결과를 그대로 읽음 + dispatched 넷팅을 위한 좁은 RDS 조회 하나) ->
+  load_rebalance_routes -> load_rebalance_route_stops(순차 — route_id FK).
+  load_rebalance_route_stops는 sta_id FK를 위해 load_stations도 기다린다.
+  이유: #109
 
 ## 금지 사항
 

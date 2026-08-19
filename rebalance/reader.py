@@ -35,6 +35,14 @@ def _predictions_key(window_start: datetime) -> str:
     return f"predictions/dt={window_start:%Y-%m-%d}/hh={window_start:%H}/inference_{window_start:%H%M}.parquet"
 
 
+def _urgency_key(window_start: datetime) -> str:
+    """main.py(compute_urgency)가 쓰는 것과 같은 키 포맷 — loader/reader.py의
+    _urgency_key와도 반드시 같아야 한다(그쪽은 이 파일을 읽어 station_urgency에
+    적재한다). routes.py(compute_routes)도 read_urgency_result를 통해 같은
+    파일을 읽는다."""
+    return f"urgency/dt={window_start:%Y-%m-%d}/hh={window_start:%H}/urgency_{window_start:%H%M}.parquet"
+
+
 def _floor_to_tick(dt: datetime, tick_minutes: int) -> datetime:
     return dt - timedelta(minutes=dt.minute % tick_minutes, seconds=dt.second, microseconds=dt.microsecond)
 
@@ -96,3 +104,18 @@ def read_predictions(window_start: datetime) -> pd.DataFrame:
     if predictions is None:
         raise FileNotFoundError(f"prediction parquet not found for {window_start}: {key}")
     return predictions
+
+
+def read_urgency_result(anchor: datetime) -> pd.DataFrame:
+    """compute_urgency 배치(main.py)가 이미 계산해 S3에 써둔 urgency 결과를
+    읽는다. routes.py(compute_routes)가 urgency.compute_all()을 다시 부르지
+    않고 이 결과를 그대로 재사용하기 위한 함수다 — 둘 다 같은 anchor를 두 번
+    계산하는 낭비를 없애고, Airflow의 compute_urgency >> compute_routes
+    의존성이 실제 데이터 흐름과 일치하게 만든다. compute_routes는
+    compute_urgency의 직접 downstream이므로 파일 부재는 upstream 산출물
+    계약 위반이다(read_predictions와 같은 이유로 실패시킨다)."""
+    key = _urgency_key(anchor)
+    result = read_parquet(key)
+    if result is None:
+        raise FileNotFoundError(f"urgency result parquet not found for {anchor}: {key}")
+    return result

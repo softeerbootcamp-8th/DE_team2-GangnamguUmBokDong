@@ -9,16 +9,11 @@ from __future__ import annotations
 
 import argparse
 import sys
-from datetime import datetime
 
 from core.s3 import write_parquet
 
 import urgency
-from reader import anchor_timestamp
-
-
-def _urgency_key(window_start: datetime) -> str:
-    return f"urgency/dt={window_start:%Y-%m-%d}/hh={window_start:%H}/urgency_{window_start:%H%M}.parquet"
+from reader import _urgency_key, anchor_timestamp
 
 
 def main(argv: list[str] | None = None) -> int:
