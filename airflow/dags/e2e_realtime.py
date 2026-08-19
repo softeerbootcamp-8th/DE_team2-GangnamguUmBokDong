@@ -11,19 +11,15 @@ schedule=None으로 두어 개발/통합 검증 시에만 수동 실행한다.
 
 population_realtime Silver는 inference 전에 normalizer를 반드시 통과한다.
 weather_ultra_short_live Silver도 같은 window에 수집된 뒤 inference로 진입한다.
-strict가 성공하면 fallback은 skipped되고, strict가 실패하면 fallback(latest)이 실행된다.
-둘 중 하나가 성공한 경우 ``population_normalized`` 합류 task가 성공해 inference로 진행한다.
+normalizer는 한 번 실행으로 현재 시각과 향후 12시간 예측 시각을 모두 보정한다 —
+baseline이 항상 nowcaster 추정치라 예전의 strict/fallback 두 갈래는 없앴다.
 """
 
 import pendulum
-from airflow import DAG
 from airflow.providers.standard.operators.empty import EmptyOperator
 from airflow.task.trigger_rule import TriggerRule
-
 from config.schedules import TIMEZONE
 from config.sources import (
-    NORMALIZER_BASELINE_MODE_FALLBACK,
-    NORMALIZER_BASELINE_MODE_PRIMARY,
     REALTIME_5MIN_SOURCES,
     STATION_MASTER_SOURCE,
     WEATHER_10MIN_SOURCE,
@@ -37,6 +33,8 @@ from orchestration.normalizer_task import (
 )
 from orchestration.routes_task import build_routes_task
 from orchestration.urgency_task import build_urgency_task
+
+from airflow import DAG
 
 with DAG(
     dag_id="e2e_realtime",
@@ -56,20 +54,12 @@ with DAG(
     load_station_stock = build_db_loader_task(dag, "station_stock")
     collector_tasks["bike_station_realtime"] >> load_stations >> load_station_stock
 
-    run_normalizer_strict = build_normalizer_task(dag, "run_normalizer_strict", NORMALIZER_BASELINE_MODE_PRIMARY)
-    run_normalizer_fallback = build_normalizer_task(
-        dag,
-        "run_normalizer_fallback",
-        NORMALIZER_BASELINE_MODE_FALLBACK,
-        trigger_rule="all_failed",
-    )
+    run_normalizer = build_normalizer_task(dag)
     population_normalized = EmptyOperator(
         task_id="population_normalized",
         trigger_rule=TriggerRule.ONE_SUCCESS,
     )
-
-    collector_tasks["population_realtime"] >> run_normalizer_strict >> run_normalizer_fallback
-    [run_normalizer_strict, run_normalizer_fallback] >> population_normalized
+    collector_tasks["population_realtime"] >> run_normalizer >> population_normalized
 
     run_inference = build_inference_task(dag)
     inference_inputs = [

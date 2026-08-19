@@ -94,6 +94,38 @@ def _result_code(body: dict, wrapper_key: str) -> str | None:
     return top_level if isinstance(top_level, str) else None
 
 
+# citydata_ppltn 응답의 `FCST_PPLTN`은 `{FCST_TIME, FCST_CONGEST_LVL, FCST_PPLTN_MIN,
+# FCST_PPLTN_MAX}`가 12개 들어있는 중첩 배열이다. 검증 엔진의 `types`는 스칼라만
+# 다루므로 여기서 평탄한 슬롯 컬럼으로 펼친다 — 어댑터가 값에 손대지 않는다는 원칙은
+# 지킨다(문자열을 그대로 옮기고 캐스팅은 엔진이 한다).
+_FCST_ARRAY_KEY = "FCST_PPLTN"
+_FCST_SLOT_FIELDS = ("FCST_TIME", "FCST_CONGEST_LVL", "FCST_PPLTN_MIN", "FCST_PPLTN_MAX")
+# 실측(2026-08-19 POI001): 1시간 간격 12개. 슬롯 번호는 "n시간 후"가 아니다 —
+# 20:55 관측의 첫 예측이 22:00이었다. 몇 시의 예측인지는 `FCST_n_TIME`이 말해주고,
+# 소비자(normalizer)는 슬롯 번호가 아니라 그 값으로 시각을 맞춘다.
+_FCST_MAX_SLOTS = 12
+
+
+def _flatten_forecast(row: dict) -> dict:
+    """`FCST_PPLTN` 중첩 배열을 `FCST_1_TIME`~`FCST_12_PPLTN_MAX` 슬롯 컬럼으로 펼친다.
+
+    `FCST_TIME` 오름차순으로 슬롯 번호를 매긴다 — API가 시간순으로 준다는 보장이
+    문서에 없다. 값이 없는 슬롯은 키를 만들지 않아 엔진의 `optional_missing`이
+    결측으로 처리하게 둔다. 원본 중첩 키는 제거한다(parquet·격리 저장이 스칼라만 받는다).
+    """
+    forecasts = row.pop(_FCST_ARRAY_KEY, None)
+    if not isinstance(forecasts, list):
+        return row
+
+    datable = [f for f in forecasts if isinstance(f, dict) and isinstance(f.get("FCST_TIME"), str)]
+    for slot, forecast in enumerate(sorted(datable, key=lambda f: f["FCST_TIME"])[:_FCST_MAX_SLOTS], start=1):
+        for field in _FCST_SLOT_FIELDS:
+            value = forecast.get(field)
+            if value is not None:
+                row[f"FCST_{slot}_{field.removeprefix('FCST_')}"] = value
+    return row
+
+
 @dataclass(frozen=True, slots=True)
 class _PageOutcome:
     """페이지 하나의 조회 결과. 스레드풀 워커가 돌려주는 값이라 순수 데이터로 둔다."""
@@ -648,4 +680,7 @@ class SeoulOpenApiAdapter:
                 node = node.get(segment)
             if isinstance(node, list):
                 rows.extend(node)
+
+        if root_key in {"SeoulRtd.citydata_ppltn"}:
+            return [_flatten_forecast(row) for row in rows if isinstance(row, dict)]
         return rows

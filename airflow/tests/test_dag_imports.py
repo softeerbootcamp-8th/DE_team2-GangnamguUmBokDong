@@ -19,9 +19,11 @@ def test_e2e_realtime_dag_id():
 
 
 def test_realtime_population_is_normalized_before_inference():
+    normalizer = realtime_5min_dag.dag.get_task("run_normalizer")
     normalized = realtime_5min_dag.dag.get_task("population_normalized")
     inference = realtime_5min_dag.dag.get_task("run_inference")
-    assert normalized.upstream_task_ids == {"run_normalizer_strict", "run_normalizer_fallback"}
+    assert normalizer.upstream_task_ids == {"collect_population_realtime"}
+    assert normalized.upstream_task_ids == {"run_normalizer"}
     assert normalized.trigger_rule == TriggerRule.ONE_SUCCESS
     assert "population_normalized" in inference.upstream_task_ids
     assert "collect_population_realtime" not in inference.upstream_task_ids
@@ -31,9 +33,11 @@ def test_realtime_population_is_normalized_before_inference():
 
 
 def test_e2e_population_is_normalized_before_inference():
+    normalizer = e2e_realtime_dag.dag.get_task("run_normalizer")
     normalized = e2e_realtime_dag.dag.get_task("population_normalized")
     inference = e2e_realtime_dag.dag.get_task("run_inference")
-    assert normalized.upstream_task_ids == {"run_normalizer_strict", "run_normalizer_fallback"}
+    assert normalizer.upstream_task_ids == {"collect_population_realtime"}
+    assert normalized.upstream_task_ids == {"run_normalizer"}
     assert normalized.trigger_rule == TriggerRule.ONE_SUCCESS
     assert "population_normalized" in inference.upstream_task_ids
     assert "collect_population_realtime" not in inference.upstream_task_ids

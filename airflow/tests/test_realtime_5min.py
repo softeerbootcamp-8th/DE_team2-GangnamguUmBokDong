@@ -23,8 +23,7 @@ def test_expected_tasks_exist():
     expected = {f"collect_{s}" for s in REALTIME_5MIN_SOURCES} | {
         "load_stations",
         "load_station_stock",
-        "run_normalizer_strict",
-        "run_normalizer_fallback",
+        "run_normalizer",
         "population_normalized",
         "run_inference",
         "load_forecast_points",
@@ -54,19 +53,17 @@ def test_load_stations_depends_on_bike_station_realtime():
     assert load_stations.task_id in {t.task_id for t in collect.downstream_list}
 
 
-def test_normalizer_strict_then_fallback():
+def test_normalizer_is_a_single_task_after_population_collection():
+    """baseline이 항상 nowcaster 추정치이므로 strict/fallback 두 갈래가 필요 없다."""
     collect_population = dag.get_task("collect_population_realtime")
-    strict = dag.get_task("run_normalizer_strict")
-    fallback = dag.get_task("run_normalizer_fallback")
+    normalizer = dag.get_task("run_normalizer")
 
-    assert strict.task_id in {t.task_id for t in collect_population.downstream_list}
-    assert fallback.task_id in {t.task_id for t in strict.downstream_list}
-    assert fallback.trigger_rule == "all_failed"
-    assert "--baseline-date-mode latest" in fallback.bash_command
-    assert "--baseline-date-mode strict" in strict.bash_command
+    assert normalizer.task_id in {t.task_id for t in collect_population.downstream_list}
+    assert normalizer.trigger_rule == "all_success"
+    assert not [t for t in dag.task_ids if t.startswith("run_normalizer_")]
 
     normalized = dag.get_task("population_normalized")
-    assert normalized.upstream_task_ids == {"run_normalizer_strict", "run_normalizer_fallback"}
+    assert normalized.upstream_task_ids == {"run_normalizer"}
     assert normalized.trigger_rule == TriggerRule.ONE_SUCCESS
 
 

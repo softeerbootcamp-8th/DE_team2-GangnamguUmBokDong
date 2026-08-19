@@ -7,14 +7,13 @@ from datetime import date, datetime
 
 # pyrefly: ignore [missing-import]
 import pyarrow as pa
+
 # pyrefly: ignore [missing-import]
 import pyarrow.parquet as pq
-from botocore.exceptions import ClientError
 
 # pyrefly: ignore [missing-import]
 from core.s3 import (
     get_object_bytes,
-    list_common_prefixes,
     list_keys,
     write_json,
     write_parquet,
@@ -46,86 +45,32 @@ def _silver_date_prefix(source_id: str, baseline_date: date) -> str:
     return f"silver/{source_id}/dt={baseline_date:%Y-%m-%d}/"
 
 
-def list_partition_dates(source_id: str) -> list[date]:
-    """해당 소스의 S3 파티션에 존재하는 모든 날짜 목록을 오름차순으로 반환한다.
+def _nowcast_key(target_date: date) -> str:
+    """해당 일자의 nowcaster 추정치 parquet S3 키를 반환한다(`nowcaster/storage.py`와 같은 규칙)."""
+    return f"{_silver_date_prefix(GRID_SOURCE_ID, target_date)}hh=00/{_NOWCAST_FILENAME}"
+
+
+def read_nowcast_grid(target_date: date) -> pa.Table:
+    """해당 일자의 nowcaster 추정 격자(`nowcast.parquet`)를 읽는다.
+
+    **실측(`living_population_grid` 원본)을 쓰지 않는다.** 이 소스는 관측일이 수집일보다
+    4~5일 늦어(`docs/collector/source-config-audit.md` 5-20) `dt=오늘` 파티션 안의 값이
+    실은 4~5일 전 것이다. 그래서 "오늘"과 "12시간 뒤"의 baseline은 nowcaster가 만든
+    추정치(D-3~D+3)만이 제공할 수 있다. 스키마는 실측과 호환된다
+    (`H_DNG_CD`/`CELL_ID`/`TT`/`SPOP`/연령 28개 + `is_estimated`/`estimation_method`).
 
     args:
-        source_id: 소스 식별자
+        target_date: 대상 일자(미래일 수 있다 — nowcaster가 D+3까지 만든다)
     returns:
-        정렬된 파티션 날짜 목록
-    """
-    prefix = f"silver/{source_id}/"
-    dates: list[date] = []
-
-    for common_prefix in list_common_prefixes(prefix):
-        dt_segment = common_prefix[len(prefix):].rstrip("/")
-        if dt_segment.startswith("dt="):
-            dates.append(datetime.strptime(dt_segment[len("dt="):], "%Y-%m-%d").date())  # noqa: DTZ007
-    return sorted(dates)
-
-
-def partition_exists(source_id: str, baseline_date: date) -> bool:
-    """해당 소스의 특정 일자 파티션이 S3에 존재하는지 확인한다."""
-    return baseline_date in list_partition_dates(source_id)
-
-
-def find_latest_partition_date(source_id: str) -> date:
-    """해당 소스의 S3 파티션 중 가장 최신 날짜를 반환한다.
-
-    args:
-        source_id: 소스 식별자
-    returns:
-        가장 최신 파티션 날짜
+        읽어온 PyArrow Table
     raises:
-        PartitionNotFoundError: 존재하는 파티션이 없을 때
+        PartitionNotFoundError: 해당 일자의 추정치 파일이 없을 때
     """
-    dates = list_partition_dates(source_id)
-    if not dates:
-        raise PartitionNotFoundError(f"{source_id}에 존재하는 dt= 파티션이 없음")
-    return dates[-1]
-
-
-def find_latest_partition_date_on_or_before(source_id: str, reference_date: date) -> date:
-    """기준일보다 미래가 아닌 가장 최신 파티션 날짜를 반환한다."""
-    dates = [item for item in list_partition_dates(source_id) if item <= reference_date]
-    if not dates:
-        raise PartitionNotFoundError(
-            f"{source_id}에 dt<={reference_date:%Y-%m-%d} 파티션이 없음"
-        )
-    return dates[-1]
-
-
-def read_grid_silver(baseline_date: date) -> pa.Table:
-    """해당 베이스라인 날짜의 생활인구 격자 실측 Parquet 파일들을 읽어 단일 테이블로 병합한다.
-
-    같은 날짜 prefix에 nowcaster가 저장한 ``nowcast.parquet``은 추정치이며 실측과
-    스키마·의미가 다르므로 제외한다.
-
-    args:
-        baseline_date: 대상 베이스라인 날짜
-    returns:
-        병합된 PyArrow Table
-    raises:
-        PartitionNotFoundError: 실측 Parquet 파티션이 없을 때
-    """  
-    prefix = _silver_date_prefix(GRID_SOURCE_ID, baseline_date)
-    keys = [
-        key
-        for key in list_keys(prefix)
-        if key.endswith(".parquet") and not key.endswith(_NOWCAST_FILENAME)
-    ]
-
-    if not keys:
-        raise PartitionNotFoundError(
-            f"{GRID_SOURCE_ID}의 dt={baseline_date:%Y-%m-%d} 파티션이 없음"
-        )
-
-    tables = []
-    for key in sorted(keys):
-        body = get_object_bytes(key)
-        if body:
-            tables.append(pq.read_table(io.BytesIO(body)))
-    return pa.concat_tables(tables)
+    key = _nowcast_key(target_date)
+    body = get_object_bytes(key)
+    if body is None:
+        raise PartitionNotFoundError(f"{GRID_SOURCE_ID}의 nowcast 추정치 없음: {key}")
+    return pq.read_table(io.BytesIO(body))
 
 
 def read_realtime_silver(window_start: datetime) -> pa.Table:

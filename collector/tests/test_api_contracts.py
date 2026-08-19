@@ -1,5 +1,6 @@
 import os
 from datetime import datetime, timedelta
+from itertools import pairwise
 from zoneinfo import ZoneInfo
 
 import adapters.kma_apihub
@@ -79,3 +80,40 @@ def test_api_contract(source_id):
     # 설정된 컬럼들이 실제 응답 필드 목록의 부분집합인지 확인
     missing_columns = expected_columns - actual_columns
     assert not missing_columns, f"API 응답에 다음 설정된 컬럼들이 누락되었습니다: {missing_columns}"
+
+
+def test_population_forecast_slots_are_hourly_and_in_the_future():
+    """`FCST_PPLTN` 평탄화 결과가 normalizer의 전제(정시·1시간 간격·미래 시각)를 만족하는지 확인한다.
+
+    normalizer는 슬롯 번호를 "n시간 후"로 믿지 않고 `FCST_n_TIME`을 파싱해 시각을 맞춘다.
+    이 테스트는 그 파싱 전제(포맷·간격·미래성)가 API 쪽에서 깨지면 알려준다.
+    """
+    config = loader.load("population_realtime")
+    adapter_cls = get_adapter(config.adapter)
+
+    with httpx.Client() as client:
+        generator = adapter_cls.fetch(config, get_recent_window("population_realtime"), client=client)
+        try:
+            first_result = next(generator)
+        except StopIteration:
+            pytest.fail("API가 응답 조각을 하나도 반환하지 않았습니다.")
+
+    rows = adapter_cls.normalize([first_result.payload], config)
+    if not rows or rows[0].get("FCST_YN") != "Y":
+        pytest.skip("이 지점은 예측을 제공하지 않아 슬롯 검증을 건너뜁니다.")
+
+    row = rows[0]
+    times = []
+    for slot in range(1, 13):
+        raw = row.get(f"FCST_{slot}_TIME")
+        assert raw is not None, f"슬롯 {slot}의 FCST_TIME이 없습니다: {sorted(row)}"
+        times.append(datetime.strptime(raw, "%Y-%m-%d %H:%M").replace(tzinfo=KST))
+
+    assert times == sorted(times), f"슬롯이 시간순이 아닙니다: {times}"
+    assert all(t.minute == 0 for t in times), f"정시가 아닌 예측 시각이 있습니다: {times}"
+    intervals = {(b - a).total_seconds() for a, b in pairwise(times)}
+    assert intervals == {3600.0}, f"1시간 간격이 아닙니다: {intervals}"
+
+    observed = datetime.strptime(row["PPLTN_TIME"], "%Y-%m-%d %H:%M").replace(tzinfo=KST) \
+        if row.get("PPLTN_TIME") else datetime.now(KST)
+    assert times[0] > observed, f"첫 예측({times[0]})이 관측 시각({observed})보다 과거입니다."

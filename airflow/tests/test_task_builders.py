@@ -29,16 +29,19 @@ def test_collector_task_uses_kst_window_start_and_own_project_environment(dag):
 
 
 def test_normalizer_task_cwd_and_flags(dag):
-    task = build_normalizer_task(dag, "run_normalizer_strict", "strict")
+    task = build_normalizer_task(dag)
+    assert task.task_id == "run_normalizer"
     assert task.cwd == NORMALIZER_DIR
-    assert "--baseline-date-mode strict" in task.bash_command
+    assert "python main.py --window-start" in task.bash_command
+    # baseline은 항상 nowcaster 추정치라 모드 선택 인자가 없다.
+    assert "--baseline-date-mode" not in task.bash_command
 
 
 def test_station_master_enrichment_task_contract(dag):
     task = build_station_master_enrichment_task(dag)
     assert task.cwd == NORMALIZER_DIR
     assert "python station_master.py" in task.bash_command
-    assert "--baseline-date-mode latest" in task.bash_command
+    assert "--baseline-date-mode" not in task.bash_command
     assert "astimezone" in task.bash_command
 
 
@@ -98,7 +101,7 @@ def test_all_pipeline_tasks_floor_manual_run_to_same_five_minute_window(dag):
     """수동 trigger의 19:33도 모든 모듈에서 동일하게 19:30으로 내림한다."""
     tasks = [
         build_collector_task(dag, "bike_station_realtime"),
-        build_normalizer_task(dag, "normalize", "strict"),
+        build_normalizer_task(dag, "normalize"),
         build_inference_task(dag),
         build_db_loader_task(dag, "station_stock"),
         build_urgency_task(dag),

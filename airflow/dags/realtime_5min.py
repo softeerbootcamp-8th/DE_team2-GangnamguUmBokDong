@@ -8,13 +8,7 @@
         |                                                    |       |
         -> load_stations -> load_station_stock --------------|-------+-> load_forecast_points
                                                              |
-    collect_population_realtime -> run_normalizer_strict ----|
-                                      |                      |
-                                      -(실패)-> run_normalizer_fallback
-                                                   |         |
-                         [strict 또는 fallback 성공]          |
-                                                   v         |
-                                      population_normalized -┘
+    collect_population_realtime -> run_normalizer -> population_normalized -┘
 
     weather_10min / weather_3h가 쓴 최신 Silver ------------┘ (추론기가 시점 기준 조회)
 
@@ -23,8 +17,9 @@
                                                             └-> load_rebalance_route_stops
 
 population_realtime Silver는 inference 전에 반드시 normalizer를 거쳐 보정된 상태여야 한다.
-strict가 성공하면 fallback은 skipped되고, strict가 실패하면 fallback(latest)이 실행된다.
-``population_normalized``는 둘 중 하나가 성공한 경우에만 통과하는 합류 지점이다.
+normalizer는 한 번 실행으로 현재 시각과 향후 12시간(실시간 도시데이터의 `FCST_PPLTN`)
+예측 시각을 각각 보정해 그 시각의 tick 키에 쓴다. baseline이 항상 nowcaster 추정치라
+예전의 strict/fallback 두 갈래는 없앴다(`orchestration/normalizer_task.py` 참고).
 
 ## 의존성 원칙
 
@@ -50,18 +45,11 @@ DAG 안에서 API 호출, 페이지네이션, S3 저장, 데이터 검증, 모�
 """
 
 import pendulum
-from airflow import DAG
 from airflow.providers.standard.operators.empty import EmptyOperator
 from airflow.task.trigger_rule import TriggerRule
 from airflow.timetables.trigger import CronTriggerTimetable
-
 from config.schedules import CATCHUP, MAX_ACTIVE_RUNS, REALTIME_5MIN_CRON, TIMEZONE
-from config.sources import (
-    NORMALIZER_BASELINE_MODE_FALLBACK,
-    NORMALIZER_BASELINE_MODE_PRIMARY,
-    REALTIME_5MIN_SOURCES,
-    RENTAL_HISTORY_LOOKBACK_HOURS,
-)
+from config.sources import REALTIME_5MIN_SOURCES, RENTAL_HISTORY_LOOKBACK_HOURS
 from orchestration.collector_task import (
     build_collector_replay_task,
     build_collector_task,
@@ -71,6 +59,8 @@ from orchestration.inference_task import build_inference_task
 from orchestration.normalizer_task import build_normalizer_task
 from orchestration.routes_task import build_routes_task
 from orchestration.urgency_task import build_urgency_task
+
+from airflow import DAG
 
 with DAG(
     dag_id="realtime_5min",
@@ -85,20 +75,12 @@ with DAG(
     load_station_stock = build_db_loader_task(dag, "station_stock")
     collector_tasks["bike_station_realtime"] >> load_stations >> load_station_stock
 
-    run_normalizer_strict = build_normalizer_task(dag, "run_normalizer_strict", NORMALIZER_BASELINE_MODE_PRIMARY)
-    run_normalizer_fallback = build_normalizer_task(
-        dag,
-        "run_normalizer_fallback",
-        NORMALIZER_BASELINE_MODE_FALLBACK,
-        trigger_rule="all_failed",
-    )
+    run_normalizer = build_normalizer_task(dag)
     population_normalized = EmptyOperator(
         task_id="population_normalized",
         trigger_rule=TriggerRule.ONE_SUCCESS,
     )
-
-    collector_tasks["population_realtime"] >> run_normalizer_strict >> run_normalizer_fallback
-    [run_normalizer_strict, run_normalizer_fallback] >> population_normalized
+    collector_tasks["population_realtime"] >> run_normalizer >> population_normalized
 
     run_inference = build_inference_task(dag)
     inference_inputs = [

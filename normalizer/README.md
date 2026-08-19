@@ -1,12 +1,14 @@
 # normalizer
 
-서울시 250m 격자 생활인구 베이스라인(`living_population_grid`)과 서울 주요 121개 핫스팟 실시간 인구(`population_realtime`)를 공간 교차(Spatial Merge)하여, 5분 주기의 실시간 250m 격자 인구(`living_population_normalized`)를 산출하는 정규화 모듈입니다.
+서울시 250m 격자 생활인구 베이스라인(`nowcaster`가 만든 `nowcast.parquet`)과 서울 주요 121개 핫스팟 실시간 인구(`population_realtime`)를 공간 교차(Spatial Merge)하여, 5분 주기의 실시간 250m 격자 인구(`living_population_normalized`)를 산출하는 정규화 모듈입니다.
+
+한 번 실행하면 **현재 시각과 향후 12시간 예측 시각(최대 13개)** 을 각각 보정해 그 시각의 tick 키에 씁니다. 미래 인구는 실시간 도시데이터가 함께 주는 `FCST_PPLTN`(1시간 간격 12개)을 씁니다.
 
 ---
 
 ## 1. 배경 및 도입 목적
 
-- **격자 데이터의 한계**: 250m 격자 인구는 서울 전역을 촘촘히 커버하지만, 공표 지연으로 인해 실시간 인파 변화를 즉각 반영하지 못합니다.
+- **격자 데이터의 한계**: 250m 격자 인구는 서울 전역을 촘촘히 커버하지만, 관측일이 수집일보다 4~5일 늦어(`docs/collector/source-config-audit.md` 5-20) 실측만으로는 "오늘"의 베이스라인을 만들 수 없습니다. 그래서 베이스라인은 `nowcaster`의 추정치(D-3~D+3)를 씁니다 — 미래 시각도 같은 방식으로 커버됩니다.
 - **실시간 POI 데이터의 한계**: 5분 단위로 수집되어 매우 신선하지만, 서울 시내 주요 121개 핫스팟 영역에만 국한되어 있습니다.
 - **해결 방안 (공간 합성)**:
   1. 250m 격자의 전역 공간 커버리지와 121개 POI의 5분 주기 실시간성을 결합합니다.
@@ -18,10 +20,10 @@
 
 | 파일 | 역할 |
 |---|---|
-| `main.py` | CLI 진입점, 베이스라인 날짜 결정(`strict`/`latest`), 시간대(`TT`) 필터링 및 파이프라인 실행 |
+| `main.py` | CLI 진입점, 보정 대상 시각 결정(현재 + `FCST_n_TIME`), 시간대(`TT`) 필터링 및 파이프라인 실행 |
 | `grid.py` | 국가지점번호 `CELL_ID`를 EPSG:5179 좌표로 변환하고 250m 정사각 격자 폴리곤 생성 |
 | `poi.py` | 121개 POI Shapefile 로딩, 위상 오류(`make_valid`) 복구, EPSG:5179 좌표계 변환 및 메모리 캐싱 |
-| `merge.py` | `STRtree` 공간 조인, 면적 가중 밀도 합성, 연령·성별 재분배, 면적 내림차순 순차 갱신 |
+| `merge.py` | `STRtree` 공간 조인(지오메트리 기준 1회, 전 시각 재사용), 면적 가중 밀도 합성, 연령·성별 재분배(현재) / 총량 스케일(미래), 면적 내림차순 순차 갱신 |
 | `station_master.py` | 대여소 master에 생활인구 250m `CELL_ID`(`grid_id`, STRtree 공간 조인)와 기상청 5km 격자(`weather_nx`/`weather_ny`, `core.weather_grid`)를 보강 |
 | `storage.py` | S3 실버 읽기/쓰기 및 실행 메타데이터 Manifest JSON 저장 |
 
@@ -50,6 +52,13 @@ $$\text{SPOP}_{new} = D_{new} \times 62,500m^2$$
 2. **좁은 면적 POI 인구 후반영(희석 방지)**: 좁고 집중도가 높은 국소 POI의 실시간 밀도를 마지막에 덮어씀(Overwrite)으로써, 핵심 상권의 뾰족한 인파 특성이 넓은 권역의 평균값에 묻혀 희석되는 현상을 방지합니다.
 3. **최종 성비 확정**: 해당 격자에 가장 밀접하고 구체적인 특성을 가진 **가장 작은 POI의 실시간 남녀 성비**를 격자의 최종 성비로 채택하여 연령대를 재분배합니다.
 
+### ⑤ 미래 시각 보정 (`merge_cell_total_only`)
+`FCST_PPLTN`은 인구 수만 주고 성비를 주지 않습니다. 그래서 미래 시각은 **총량만** 밀도 합성으로 갱신하고, 성·연령 28개 컬럼은 베이스라인 비율을 유지한 채 비례 스케일합니다. 그 시각의 성·연령 구조는 `nowcaster`의 추정치(1~4주 전 같은 요일 가중평균)가 이미 담고 있으므로, 관측 시점의 성비를 12시간 뒤에 덮어씌우지 않습니다.
+
+- 대상 시각은 슬롯 번호가 아니라 `FCST_n_TIME` 값으로 결정합니다. 실측(20:55 관측)에서 첫 슬롯이 22:00이었습니다.
+- `FCST_YN='N'` 지점이나 해당 시각 예측이 없는 지점은 그 시각 보정에서 제외되고, 겹친 격자는 베이스라인 값이 남습니다.
+- 교차 면적은 지오메트리만 보므로 시각과 무관합니다 — 13개 시각이 1회 계산 결과를 공유합니다.
+
 ---
 
 ## 4. S3 입출력 경로 구조
@@ -57,11 +66,12 @@ $$\text{SPOP}_{new} = D_{new} \times 62,500m^2$$
 ```text
 s3://<bucket>/
 ├── silver/
-│   ├── living_population_grid/dt=YYYY-MM-DD/                   # [입력 1] 베이스라인 격자 인구
+│   ├── living_population_grid/dt=YYYY-MM-DD/hh=00/nowcast.parquet  # [입력 1] nowcaster 추정 베이스라인
+│   │                                                           #          (미래 날짜도 존재: D+3까지)
 │   ├── population_realtime/dt=YYYY-MM-DD/hh=HH/HHMM.parquet    # [입력 2] 5분 실시간 POI 인구
-│   ├── living_population_normalized/dt=YYYY-MM-DD/hh=HH/       # [출력] 5분 정규화 격자 인구
-│   │   └── HHMM.parquet
-│   │
+│   ├── living_population_normalized/dt=YYYY-MM-DD/hh=HH/       # [출력] 정규화 격자 인구
+│       ├── HHMM.parquet                                        #   현재 시각(5분 tick)
+│       └── HH00.parquet                                        #   미래 시각(정시, 예측 보정)
 │   ├── bike_station_master/dt=YYYY-MM-DD/hh=HH/HHMM.parquet    # [입력 3] 일 1회 대여소 master
 │   ├── bike_station_realtime/dt=YYYY-MM-DD/hh=HH/HHMM.parquet  # [입력 4] 좌표·이름·거치대 수 보완용
 │   └── station_master_enriched/dt=YYYY-MM-DD/hh=HH/            # [출력] 격자 보강 대여소 master
@@ -116,14 +126,11 @@ int16 범위(1~32767)를 벗어나면 잘못된 범주 키로 학습·서빙하�
 # 1. 의존성 설치
 uv sync
 
-# 2. 정규화 파이프라인 1회 실행 (기본 strict 모드: 당일 베이스라인 필수)
+# 2. 정규화 파이프라인 1회 실행 (현재 + 향후 12시간, 최대 13개 시각을 한 번에 쓴다)
 uv run python main.py --window-start 2026-08-15T14:05:00+09:00
 
-# 최신 가용 파티션 폴백 모드 실행 (Airflow 재시도용)
-uv run python main.py --window-start 2026-08-15T14:05:00+09:00 --baseline-date-mode latest
-
 # 3. 대여소 마스터 격자 보강 1회 실행
-uv run python station_master.py --window-start 2026-08-15T03:00:00+09:00 --baseline-date-mode latest
+uv run python station_master.py --window-start 2026-08-15T03:00:00+09:00
 
 # 4. 단위 테스트 실행
 uv run pytest

@@ -157,6 +157,35 @@ class TestAllSourcesLoad:
         assert config.adapter_params["poi_end"] == 121
         assert config.adapter_params["concurrency"] == 4
 
+    def test_population_realtime_declares_all_twelve_forecast_slots(self):
+        """어댑터가 평탄화한 `FCST_n_*` 컬럼이 전부 선언돼 있어야 silver까지 살아 남는다."""
+        config = config_loader.load("population_realtime", base_dir=SOURCES_DIR)
+
+        for slot in range(1, 13):
+            assert f"FCST_{slot}_TIME" in config.columns
+            assert f"FCST_{slot}_CONGEST_LVL" in config.columns
+            assert f"FCST_{slot}_PPLTN_MIN" in config.columns
+            assert f"FCST_{slot}_PPLTN_MAX" in config.columns
+        assert "FCST_YN" in config.columns
+
+    def test_forecast_columns_are_optional_so_non_forecast_pois_survive(self):
+        """`FCST_YN='N'` 지점이 required_missing(drop_row)에 걸려 사라지면 현재 인구 보정까지 잃는다."""
+        config = config_loader.load("population_realtime", base_dir=SOURCES_DIR)
+
+        forecast_columns = {k: v for k, v in config.columns.items() if k.startswith("FCST_")}
+        assert forecast_columns
+        assert not [k for k, spec in forecast_columns.items() if spec.required]
+
+    def test_forecast_population_bounds_match_the_observed_columns(self):
+        """예측 인구도 관측 인구와 같은 범위를 쓴다 — 둘이 갈리면 같은 값에 다른 판정이 난다."""
+        config = config_loader.load("population_realtime", base_dir=SOURCES_DIR)
+        observed = config.columns["AREA_PPLTN_MIN"].range
+
+        for slot in range(1, 13):
+            assert config.columns[f"FCST_{slot}_PPLTN_MIN"].range == observed
+            assert config.columns[f"FCST_{slot}_PPLTN_MAX"].range == observed
+            assert config.columns[f"FCST_{slot}_CONGEST_LVL"].enum == config.columns["AREA_CONGEST_LVL"].enum
+
     @pytest.mark.parametrize(
         "adapter_params",
         [
