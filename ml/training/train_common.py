@@ -10,15 +10,20 @@ tree(x)의 objective 역변환(Poisson이면 exp(tree(x)))일 뿐 init_score를 
 않는다. 따라서 실제 예측값은 항상 `exposure * booster.predict(X)`로 복원해야 한다.
 """
 
+import contextlib
 import json
+import resource
+import sys
+import time
 import zlib
-from datetime import date
+from datetime import UTC, date, datetime
 
 import lightgbm as lgb
+import mlflow
 import numpy as np
 import pandas as pd
 from core import s3 as s3_io
-from ml_core import common_config, model_io
+from ml_core import common_config, mlflow_tracking, model_io
 from ml_core.day_index import DAY_INDEX_EPOCH, day_index
 from ml_core.metrics import pinball_loss as _pinball_loss
 from ml_core.metrics import poisson_deviance as _poisson_deviance
@@ -72,9 +77,92 @@ def run_and_notify_on_failure(label: str, main_fn):
         raise
 
 
+def _validate_valid_test_days_dont_overlap_train() -> None:
+    """VALID_DAYS_OF_MONTH/TEST_DAYS_OF_MONTH에 TRAIN_DAY_DIVISOR의 배수가 섞여 있으면 바로 에러를 낸다.
+
+    train이 "TRAIN_DAY_DIVISOR의 배수인 날 전부"라(`_split()` 참고), 여기 그 배수가
+    하나라도 섞이면 그 날짜가 train과 valid/test 양쪽에 동시에 들어가는 누출이
+    생긴다. `load_training_table()`(읽기 단계에서 날짜를 미리 거름)과 `_split()`
+    (읽은 뒤 다시 확인) 둘 다 같은 검증을 쓴다.
+    """
+    conflicting = {
+        d for d in (*config.VALID_DAYS_OF_MONTH, *config.TEST_DAYS_OF_MONTH) if d % config.TRAIN_DAY_DIVISOR == 0
+    }
+    if conflicting:
+        raise ValueError(
+            f"VALID_DAYS_OF_MONTH/TEST_DAYS_OF_MONTH에 TRAIN_DAY_DIVISOR({config.TRAIN_DAY_DIVISOR})의 "
+            f"배수가 섞여 있음(train과 겹쳐 누출): {sorted(conflicting)}"
+        )
+
+
+def _wanted_dates(start: date, end: date) -> list[str]:
+    """TRAIN_DAY_DIVISOR의 배수인 날 전부 + VALID/TEST_DAYS_OF_MONTH에 해당하는 날짜만 "YYYY-MM-DD"로 나열한다.
+
+    `_split()`이 어차피 이 날짜들만 남기고 나머지(valid/test로도 안 뽑힌 날)는
+    버리므로, 그 필터링을 읽기 전에 미리 해서 애초에 안 쓸 파티션을 S3에서
+    받아오지도 않게 한다 — multi-horizon 테이블이 2025년 전체 기준 8억 행이라
+    (2026-08 실측) 다 읽은 뒤에 걸러서는 이미 늦다(그 시점에 이미 OOM).
+    """
+    wanted_days_of_month = config.VALID_DAYS_OF_MONTH | config.TEST_DAYS_OF_MONTH
+    return [
+        d.strftime("%Y-%m-%d")
+        for d in pd.date_range(start, end, freq="D")
+        if d.day % config.TRAIN_DAY_DIVISOR == 0 or d.day in wanted_days_of_month
+    ]
+
+
+def _peak_rss_mb() -> float:
+    """이 프로세스가 시작한 이후 지금까지의 최고 RSS(MB).
+
+    `resource.getrusage(RUSAGE_SELF).ru_maxrss`는 매 호출 시점의 순간 RSS가 아니라
+    그때까지 관측된 최댓값을 계속 누적해서 돌려주므로, 그냥 주기적으로 이 값만
+    읽어도 "지금까지 RAM을 최대 얼마나 썼는지"를 알 수 있다 — 별도로 폴링
+    스레드를 띄워 직접 최댓값을 추적할 필요가 없다. 단위가 플랫폼마다 달라서
+    (Linux는 KB, macOS는 바이트) 나눠주는 값도 다르게 맞춘다.
+    """
+    max_rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return max_rss / (1024 * 1024 if sys.platform == "darwin" else 1024)
+
+
+def _append_progress_log(message: str) -> None:
+    """`config.TRAIN_PROGRESS_LOG_PATH`에 타임스탬프를 붙여 한 줄 이어쓴다.
+
+    표준출력(`print(..., flush=True)`)과는 별도 채널이다 — 표준출력이 파이프/
+    리다이렉트로 버퍼링되거나 다른 로그와 섞여도, 이 파일만 tail하면 오래 걸리는
+    로드가 실제로 진행 중인지 바로 확인할 수 있다(2026-08, 8시간 넘게 걸린 로드를
+    `ps`의 경과시간을 수동으로 다시 확인하고서야 스와핑 중이었음을 알아챈 사건 이후
+    도입 — training/config.py의 TRAIN_PROGRESS_LOG_PATH 참고). 매 호출마다 열고
+    닫아 즉시 디스크에 반영한다 — 프로세스가 이후 강제 종료돼도 이미 쓰인 줄은 남는다.
+    """
+    timestamp = datetime.now(UTC).isoformat(timespec="seconds")
+    with open(config.TRAIN_PROGRESS_LOG_PATH, "a") as f:
+        f.write(f"{timestamp} {message}\n")
+
+
+def _progress_on_complete(label: str):
+    """`core.s3.read_parquet(..., on_complete=...)`에 넘길, 시간 기준으로 스로틀된 콜백을 만든다.
+
+    파일이 수백~수천 개인 대량 로드에서 완료될 때마다 그대로 로깅하면 로그
+    자체가 병목/노이즈가 되므로, 마지막 로깅 이후 `config.
+    TRAIN_PROGRESS_LOG_INTERVAL_SECONDS`가 지났을 때만(단, 마지막 파일은 무조건)
+    진행 개수와 그 시점의 peak RSS를 남긴다.
+    """
+    last_logged_at = 0.0
+
+    def _on_complete(done: int, total: int) -> None:
+        nonlocal last_logged_at
+        now = time.monotonic()
+        if done < total and now - last_logged_at < config.TRAIN_PROGRESS_LOG_INTERVAL_SECONDS:
+            return
+        last_logged_at = now
+        _append_progress_log(f"[{label}] {done}/{total}개 파일 완료, peak_rss={_peak_rss_mb():.0f}MB")
+
+    return _on_complete
+
+
 def load_training_table(model_name: str) -> pd.DataFrame:
     """model_name(대여/반납)에 맞는 multi-horizon feature 테이블에서 학습에 필요한
-    컬럼·기간만 읽는다.
+    컬럼·날짜만 읽는다.
 
     대여/반납은 완전히 분리된 데이터셋이라(서로 상대방의 lag를 안 봄) 읽는 테이블
     경로와 feature 컬럼 목록이 model_name에 따라 다르다.
@@ -85,16 +173,15 @@ def load_training_table(model_name: str) -> pd.DataFrame:
     multi-horizon 테이블은 원본 feature 테이블의 최대 HORIZON_COUNT배 행 수라 이 절약이
     특히 중요하다.
 
-    `date_range=(TRAIN_YEAR-01-01, 안전 상한)`도 같이 넘긴다 — 테이블이 `date` 파티션으로
-    쌓여있으므로(`feature_engineering/spark/build_multi_horizon_features.py`) 이
-    학습 구간에 해당하는 파티션만 나열/다운로드한다. 안 그러면 그동안 쌓인 전체
-    히스토리를 매번 다 받은 뒤 `_split()`에서 대부분 버리게 된다 — 쌓인 기간이
-    늘어날수록 이 낭비가 계속 커진다. 이 `date_range`는 S3 키 경로(`date=YYYY-MM-DD/`)
-    기준 파티션 선택일 뿐이고, `date`는 Spark가 파일 내용엔 안 넣는 파티션 컬럼이라
-    (`core.s3._read_parquet_by_date_range()` docstring 참고) `columns=`에 넣으면
-    읽을 때마다 그 문자열을 행 수만큼 새로 복제해 만들어야 한다 — `_split()`이 이제
-    `day`(이미 BASE_FEATURE_COLUMNS에 있어 어차피 읽음)만으로 경계를 가르므로
-    `date`는 아예 요청하지 않는다.
+    `dates=_wanted_dates(...)`도 같이 넘긴다 — 테이블이 `date` 파티션으로 쌓여있으므로
+    (`feature_engineering/spark/build_multi_horizon_features.py`) `_split()`이 결국
+    남길 날짜(TRAIN_DAY_DIVISOR의 배수 전부 + VALID/TEST_DAYS_OF_MONTH)만 미리 골라서
+    나열/다운로드한다
+    (2026-08부터 — 8억 행짜리 2025년 전체를 date_range로 통째로 받으면 `_split()`에서
+    거르기도 전에 로드 자체가 OOM으로 죽는다, `training/config.py` 참고). `date`
+    컬럼 자체는 Spark가 파일 내용엔 안 넣는 파티션 컬럼이라(`core.s3._read_parquet_by_dates()`
+    docstring 참고) `columns=`에 넣지 않는다 — `_split()`이 `day`(이미
+    BASE_FEATURE_COLUMNS에 있어 어차피 읽음)만으로 경계를 가른다.
 
     args:
         model_name: "rental" 또는 "return"
@@ -103,6 +190,7 @@ def load_training_table(model_name: str) -> pd.DataFrame:
             (rental이면) rental_exposure — `day`가 feature_columns에 이미 있어
             `_split()`의 경계 판정에 그대로 쓰인다
     """
+    _validate_valid_test_days_dont_overlap_train()
     feature_columns = _FEATURE_COLUMNS_BY_MODEL[model_name]
     extra = {_TARGET_COL_BY_MODEL[model_name]}
     if model_name == "rental":
@@ -110,29 +198,42 @@ def load_training_table(model_name: str) -> pd.DataFrame:
     needed = sorted(set(feature_columns) | extra)
 
     table_path = _TRAINING_TABLE_BY_MODEL[model_name]
-    train_year_end = f"{config.TRAIN_YEAR}-12-31"
-    safe_end = min(train_year_end, config.safety_cutoff_date().isoformat())
-    df = s3_io.read_parquet(table_path, columns=needed, date_range=(f"{config.TRAIN_YEAR}-01-01", safe_end))
+    safe_end = min(date(config.TRAIN_YEAR, 12, 31), config.safety_cutoff_date())
+    wanted = _wanted_dates(date(config.TRAIN_YEAR, 1, 1), safe_end)
+    _append_progress_log(f"[{model_name}] 로드 시작 — 날짜 {len(wanted)}개, max_horizon={config.MAX_TRAIN_HORIZON}")
+    # horizon도 같은 날짜 파티션 안에 1..HORIZON_COUNT가 전부 섞여 있어 날짜
+    # 필터만으론 못 줄인다 — config.MAX_TRAIN_HORIZON(기본값 = 제한 없음)로 읽는
+    # 시점에 한 번 더 걸러서 그 배율 자체를 줄인다(training/config.py 참고).
+    df = s3_io.read_parquet(
+        table_path,
+        columns=needed,
+        dates=wanted,
+        filters=[("horizon", "<=", config.MAX_TRAIN_HORIZON)],
+        on_complete=_progress_on_complete(model_name),
+    )
     if df is None:
         raise FileNotFoundError(f"S3에 없음: {table_path}")
+    _append_progress_log(f"[{model_name}] 로드 완료 — {len(df):,}행, peak_rss={_peak_rss_mb():.0f}MB")
     return df
 
 
 def _split(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """config.TRAIN_YEAR 1년치를 day-of-month 기준으로 train/valid/test로 나눈다
+    """config.TRAIN_YEAR 1년치를 day-of-month 배수 기준으로 train/valid/test로 나눈다
     (랜덤 split 금지 — lag feature 누출 방지).
 
-    매달 `config.VALID_DAYS_OF_MONTH`(기본 3, 20일)는 valid, `config.TEST_DAYS_OF_MONTH`
-    (기본 7, 24일)는 test, 나머지는 train — 12개월 전체를 계절성 편중 없이 학습에
-    쓰면서도, 같은 날짜가 반복되므로 연중 패턴을 고르게 검증/평가할 수 있다.
+    **train은 `config.TRAIN_DAY_DIVISOR`의 배수인 날 전부**(기본 2=짝수날), valid/test는
+    `config.VALID_DAYS_OF_MONTH`(기본 11, 13일)/`config.TEST_DAYS_OF_MONTH`(기본 17,
+    19일) — TRAIN_DAY_DIVISOR의 배수가 아닌 날짜만 지정해야 한다(training/config.py
+    참고, 겹치면 train과 겹쳐 누출이 생긴다). valid/test로도 안 뽑힌 나머지 날짜
+    (대부분)는 셋 어디에도 안 들어가고 버려진다 — multi-horizon 테이블이 2025년
+    전체로는 8억 행이라(2026-08 실측, `TRAIN_SAMPLE_FRAC` 같은 행 단위 표본
+    추출과 별개로) 애초에 읽어들이는 총 행 수 자체를 줄이는 용도다.
     `config.safety_cutoff_date()`를 넘는(아직 라벨이 확정 안 됐을 수 있는) 날짜는
     셋 다에서 제외한다.
 
     구간을 먼저 확정한 뒤에만 `config.{TRAIN,VALID,TEST}_SAMPLE_FRAC`으로 행을
-    표본 추출한다(기본 1.0=표본 없음) — multi-horizon 테이블은 원본의 최대
-    HORIZON_COUNT배라 학습 머신 RAM에 안 맞을 수 있다(history.md 18번 항목이 실제로
-    겪은 OOM과 같은 종류). 날짜로 먼저 나누고 그 안에서만 무작위 표본을 뽑으므로
-    표본 추출 자체가 누출을 만들지는 않는다.
+    한 번 더 표본 추출한다(기본 1.0=표본 없음). 날짜로 먼저 나누고 그 안에서만
+    무작위 표본을 뽑으므로 표본 추출 자체가 누출을 만들지는 않는다.
 
     args:
         df: `day`(2000-01-01 기준 경과일수, ml_core.day_index) 컬럼을 포함한 feature 테이블
@@ -145,6 +246,8 @@ def _split(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
             바로 알 수 있게 한다(monitor_performance.evaluate_recent_performance()의
             같은 패턴 참고).
     """
+    _validate_valid_test_days_dont_overlap_train()
+
     start_day = day_index(date(config.TRAIN_YEAR, 1, 1))
     safe_end = min(date(config.TRAIN_YEAR, 12, 31), config.safety_cutoff_date())
     safe_end_day = day_index(safe_end)
@@ -157,8 +260,9 @@ def _split(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     day_of_month = real_dates.dt.day
     valid_mask = day_of_month.isin(config.VALID_DAYS_OF_MONTH)
     test_mask = day_of_month.isin(config.TEST_DAYS_OF_MONTH)
+    train_mask = day_of_month % config.TRAIN_DAY_DIVISOR == 0
 
-    train = df[~(valid_mask | test_mask)]
+    train = df[train_mask]
     valid = df[valid_mask]
     test = df[test_mask]
 
@@ -286,6 +390,7 @@ def train_target(
     """
     is_primary = config.LGB_MACHINE_RANK == 0  # 분산 학습 시 최종 평가/아티팩트 저장은 이 머신만 담당
     feature_columns = _FEATURE_COLUMNS_BY_MODEL[model_name]
+    _append_progress_log(f"[{model_name}] split/학습 시작 — {len(df):,}행, peak_rss={_peak_rss_mb():.0f}MB")
     train_df, valid_df, test_df = _split(df)
 
     # station_categories는 샤딩 전 전체 df 기준이어야 한다 — 그래야 카테고리 코드가
@@ -303,147 +408,195 @@ def train_target(
         f"train={len(train_df):,} valid={len(valid_df):,} test={len(test_df):,}"
     )
 
-    X_train, y_train = _prepare_xy(train_df, target_col, station_dtype, feature_columns)
-    X_valid, y_valid = _prepare_xy(valid_df, target_col, station_dtype, feature_columns)
-    X_test, y_test = _prepare_xy(test_df, target_col, station_dtype, feature_columns)
-
-    # exposure 컬럼은 원본 DataFrame에서 뽑아쓰는 마지막 용도다 — 뽑자마자 바로
-    # del해서 X_*/y_*로 이미 변환된 train_df/valid_df/test_df를 이중으로 메모리에
-    # 붙들고 있지 않게 한다(아래로는 어디서도 이 세 DataFrame을 참조하지 않음).
-    if exposure_col is not None:
-        exposure_train = train_df[exposure_col].to_numpy()
-        exposure_valid = valid_df[exposure_col].to_numpy()
-        exposure_test = test_df[exposure_col].to_numpy()
-        init_train, init_valid = np.log(exposure_train), np.log(exposure_valid)
-    else:
-        exposure_train = np.ones(len(train_df))
-        exposure_valid = np.ones(len(valid_df))
-        exposure_test = np.ones(len(test_df))
-        init_train = init_valid = None
-    del train_df, valid_df, test_df
-
+    # 분산 학습 워커(rank>0)는 run을 안 연다 — 대표 머신(rank 0) 하나만 기록해야
+    # 실험 하나당 run 하나가 되고, 다른 서버(EMR 등)에서 도는 워커가 tracking
+    # server에 접근 못 해도 학습 자체엔 영향이 없다. run_name은 archive_prefix(날짜+
+    # 프로필)가 아니라 실제로 실험마다 바뀌는 divisor/horizon을 담는다 — 같은 날
+    # 같은 프로필로 여러 조합을 재시도한 이력(2026-08 OOM 대응 폴백 체인)이 전부
+    # archive_prefix는 같아서(S3 모델 파일이 서로 덮어써짐) 그것만으로는 MLflow UI
+    # 목록에서 어느 시도가 어느 조합이었는지 구분이 안 됐다.
+    #
+    # `with mlflow.start_run(...)`로 여는 이유: 예전엔 성공 경로 끝에서만
+    # mlflow.end_run()을 불렀다 — lgb.train()/S3 업로드/평가 도중 예외가 나면 run이
+    # RUNNING 상태로 영구 방치되고, 같은 프로세스가 다음 모델(반납 등)을 학습할 때
+    # 활성 run과 충돌할 수 있었다. `with` 블록은 예외가 나도 자동으로 FAILED 처리하고
+    # 종료한다. 분산 학습 워커(rank>0)는 run 자체를 안 열므로(위 이유) 진짜
+    # context manager 대신 `contextlib.nullcontext()`를 써서 이 블록 구조를 공유한다.
     if is_primary:
-        s3_io.write_json(station_categories_path(model_name, models_prefix), station_categories)
+        mlflow_tracking.configure(config.MLFLOW_EXPERIMENT_NAME)
+    run_name = f"{model_name}_{common_config.PROFILE_NAME}_d{config.TRAIN_DAY_DIVISOR}_h{config.MAX_TRAIN_HORIZON}"
+    mlflow_run = mlflow.start_run(run_name=run_name) if is_primary else contextlib.nullcontext()
 
-    metrics: dict = {"model_name": model_name}
+    with mlflow_run:
+        if is_primary:
+            mlflow.log_params({
+                "model_name": model_name,
+                "train_year": config.TRAIN_YEAR,
+                "train_day_divisor": config.TRAIN_DAY_DIVISOR,
+                "max_train_horizon": config.MAX_TRAIN_HORIZON,
+                "valid_days_of_month": sorted(config.VALID_DAYS_OF_MONTH),
+                "test_days_of_month": sorted(config.TEST_DAYS_OF_MONTH),
+                "train_sample_frac": config.TRAIN_SAMPLE_FRAC,
+                "valid_sample_frac": config.VALID_SAMPLE_FRAC,
+                "test_sample_frac": config.TEST_SAMPLE_FRAC,
+                "profile_name": common_config.PROFILE_NAME,
+                "models_prefix": models_prefix,
+                "train_rows": len(train_df),
+                "valid_rows": len(valid_df),
+                "test_rows": len(test_df),
+                "feature_columns": ",".join(feature_columns),
+                "lgb_num_boost_round": config.LGB_NUM_BOOST_ROUND,
+                "lgb_early_stopping_rounds": config.LGB_EARLY_STOPPING_ROUNDS,
+                **config.LGB_PARAMS_COMMON,
+            })
 
-    # 1) Poisson (+ exposure offset)
-    train_set = lgb.Dataset(
-        X_train, label=y_train, init_score=init_train, categorical_feature=config.CATEGORICAL_FEATURES
-    )
-    valid_set = lgb.Dataset(
-        X_valid, label=y_valid, init_score=init_valid, reference=train_set,
-        categorical_feature=config.CATEGORICAL_FEATURES,
-    )
-    poisson_params = {
-        **config.LGB_PARAMS_COMMON, **_distributed_params(), "objective": "poisson", "metric": "poisson",
-    }
-    booster = lgb.train(
-        poisson_params,
-        train_set,
-        num_boost_round=config.LGB_NUM_BOOST_ROUND,
-        valid_sets=[valid_set],
-        callbacks=[lgb.early_stopping(config.LGB_EARLY_STOPPING_ROUNDS, verbose=False), lgb.log_evaluation(0)],
-    )
-    # 분산 학습 시 lgb.train()은 모든 머신이 동시에(같은 파라미터·같은 횟수) 호출해야
-    # 소켓 핸드셰이크가 맞아떨어진다 — 그래서 여기서 리턴하지 않고 quantile 학습까지
-    # 전 머신이 그대로 진행한다. 다만 boosting이 끝나면 모든 머신의 booster가 동일하므로
-    # (매 라운드 gradient를 네트워크로 동기화) 파일 저장은 대표 머신(rank 0)만 하면 되고,
-    # 나머지 머신이 같은 경로에 동시에 쓰면 경합이 생길 수 있어 그 부분만 막는다.
-    if is_primary:
-        model_io.stage_and_upload_booster(booster, model_key(model_name, "poisson", models_prefix))
+        X_train, y_train = _prepare_xy(train_df, target_col, station_dtype, feature_columns)
+        X_valid, y_valid = _prepare_xy(valid_df, target_col, station_dtype, feature_columns)
+        X_test, y_test = _prepare_xy(test_df, target_col, station_dtype, feature_columns)
 
-    mu_test = exposure_test * booster.predict(X_test, num_iteration=booster.best_iteration)
-    metrics["poisson_deviance_test"] = _poisson_deviance(y_test.to_numpy(), mu_test)
-    metrics["rmse_test"] = float(np.sqrt(np.mean((y_test.to_numpy() - mu_test) ** 2)))
-    metrics["best_iteration"] = booster.best_iteration
-    print(
-        f"  [poisson] best_iter={booster.best_iteration} "
-        f"test_deviance={metrics['poisson_deviance_test']:.4f} test_rmse={metrics['rmse_test']:.4f}"
-    )
+        # exposure 컬럼은 원본 DataFrame에서 뽑아쓰는 마지막 용도다 — 뽑자마자 바로
+        # del해서 X_*/y_*로 이미 변환된 train_df/valid_df/test_df를 이중으로 메모리에
+        # 붙들고 있지 않게 한다(아래로는 어디서도 이 세 DataFrame을 참조하지 않음).
+        if exposure_col is not None:
+            exposure_train = train_df[exposure_col].to_numpy()
+            exposure_valid = valid_df[exposure_col].to_numpy()
+            exposure_test = test_df[exposure_col].to_numpy()
+            init_train, init_valid = np.log(exposure_train), np.log(exposure_valid)
+        else:
+            exposure_train = np.ones(len(train_df))
+            exposure_valid = np.ones(len(valid_df))
+            exposure_test = np.ones(len(test_df))
+            init_train = init_valid = None
+        del train_df, valid_df, test_df
 
-    # 2) Quantile P10/P50/P90 (exposure offset 미적용 — quantile loss는 offset 해석이 표준적이지 않음)
-    train_set_q = lgb.Dataset(X_train, label=y_train, categorical_feature=config.CATEGORICAL_FEATURES)
-    valid_set_q = lgb.Dataset(
-        X_valid, label=y_valid, reference=train_set_q, categorical_feature=config.CATEGORICAL_FEATURES
-    )
+        if is_primary:
+            s3_io.write_json(station_categories_path(model_name, models_prefix), station_categories)
+            mlflow.log_dict(station_categories, "station_categories.json")
 
-    # train_set/train_set_q는 X_train/y_train을 쓰는 마지막 Dataset이다 — 지금
-    # construct()로 bin 압축을 강제로 끝내두면(각 Dataset이 압축된 자체 사본을
-    # 가짐) 그 뒤로는 원본 X_train/y_train이 필요 없으므로 del로 참조를 끊는다.
-    # X_valid/X_test는 뒤에서 predict()에 그대로 쓰이므로 지우지 않는다.
-    train_set.construct()
-    train_set_q.construct()
-    del X_train, y_train
+        metrics: dict = {"model_name": model_name}
 
-    quantile_preds_test = {}
-    quantile_preds_valid = {}
-    for alpha in config.QUANTILE_ALPHAS:
-        q_params = {**config.LGB_PARAMS_COMMON, **_distributed_params(), "objective": "quantile", "alpha": alpha}
-        q_booster = lgb.train(
-            q_params,
-            train_set_q,
+        # 1) Poisson (+ exposure offset)
+        train_set = lgb.Dataset(
+            X_train, label=y_train, init_score=init_train, categorical_feature=config.CATEGORICAL_FEATURES
+        )
+        valid_set = lgb.Dataset(
+            X_valid, label=y_valid, init_score=init_valid, reference=train_set,
+            categorical_feature=config.CATEGORICAL_FEATURES,
+        )
+        poisson_params = {
+            **config.LGB_PARAMS_COMMON, **_distributed_params(), "objective": "poisson", "metric": "poisson",
+        }
+        booster = lgb.train(
+            poisson_params,
+            train_set,
             num_boost_round=config.LGB_NUM_BOOST_ROUND,
-            valid_sets=[valid_set_q],
-            callbacks=[
-                lgb.early_stopping(config.LGB_EARLY_STOPPING_ROUNDS, verbose=False),
-                lgb.log_evaluation(0),
-            ],
+            valid_sets=[valid_set],
+            callbacks=[lgb.early_stopping(config.LGB_EARLY_STOPPING_ROUNDS, verbose=False), lgb.log_evaluation(0)],
+        )
+        # 분산 학습 시 lgb.train()은 모든 머신이 동시에(같은 파라미터·같은 횟수) 호출해야
+        # 소켓 핸드셰이크가 맞아떨어진다 — 그래서 여기서 리턴하지 않고 quantile 학습까지
+        # 전 머신이 그대로 진행한다. 다만 boosting이 끝나면 모든 머신의 booster가 동일하므로
+        # (매 라운드 gradient를 네트워크로 동기화) 파일 저장은 대표 머신(rank 0)만 하면 되고,
+        # 나머지 머신이 같은 경로에 동시에 쓰면 경합이 생길 수 있어 그 부분만 막는다.
+        if is_primary:
+            model_io.stage_and_upload_booster(
+                booster, model_key(model_name, "poisson", models_prefix), log_to_mlflow=True
+            )
+
+        mu_test = exposure_test * booster.predict(X_test, num_iteration=booster.best_iteration)
+        metrics["poisson_deviance_test"] = _poisson_deviance(y_test.to_numpy(), mu_test)
+        metrics["rmse_test"] = float(np.sqrt(np.mean((y_test.to_numpy() - mu_test) ** 2)))
+        metrics["best_iteration"] = booster.best_iteration
+        print(
+            f"  [poisson] best_iter={booster.best_iteration} "
+            f"test_deviance={metrics['poisson_deviance_test']:.4f} test_rmse={metrics['rmse_test']:.4f}"
+        )
+
+        # 2) Quantile P10/P50/P90 (exposure offset 미적용 — quantile loss는 offset 해석이 표준적이지 않음)
+        train_set_q = lgb.Dataset(X_train, label=y_train, categorical_feature=config.CATEGORICAL_FEATURES)
+        valid_set_q = lgb.Dataset(
+            X_valid, label=y_valid, reference=train_set_q, categorical_feature=config.CATEGORICAL_FEATURES
+        )
+
+        # train_set/train_set_q는 X_train/y_train을 쓰는 마지막 Dataset이다 — 지금
+        # construct()로 bin 압축을 강제로 끝내두면(각 Dataset이 압축된 자체 사본을
+        # 가짐) 그 뒤로는 원본 X_train/y_train이 필요 없으므로 del로 참조를 끊는다.
+        # X_valid/X_test는 뒤에서 predict()에 그대로 쓰이므로 지우지 않는다.
+        train_set.construct()
+        train_set_q.construct()
+        del X_train, y_train
+
+        quantile_preds_test = {}
+        quantile_preds_valid = {}
+        for alpha in config.QUANTILE_ALPHAS:
+            q_params = {**config.LGB_PARAMS_COMMON, **_distributed_params(), "objective": "quantile", "alpha": alpha}
+            q_booster = lgb.train(
+                q_params,
+                train_set_q,
+                num_boost_round=config.LGB_NUM_BOOST_ROUND,
+                valid_sets=[valid_set_q],
+                callbacks=[
+                    lgb.early_stopping(config.LGB_EARLY_STOPPING_ROUNDS, verbose=False),
+                    lgb.log_evaluation(0),
+                ],
+            )
+            if is_primary:
+                model_io.stage_and_upload_booster(
+                    q_booster, model_key(model_name, f"q{int(alpha * 100)}", models_prefix), log_to_mlflow=True
+                )
+            pred_test = q_booster.predict(X_test, num_iteration=q_booster.best_iteration)
+            pred_valid = q_booster.predict(X_valid, num_iteration=q_booster.best_iteration)
+            quantile_preds_test[alpha] = pred_test
+            quantile_preds_valid[alpha] = pred_valid
+            metrics[f"pinball_test_q{int(alpha * 100)}"] = _pinball_loss(y_test.to_numpy(), pred_test, alpha)
+            print(f"  [q{int(alpha * 100)}] best_iter={q_booster.best_iteration} pinball={metrics[f'pinball_test_q{int(alpha * 100)}']:.4f}")
+
+        p10_test, p90_test = quantile_preds_test[0.1], quantile_preds_test[0.9]
+        raw_coverage = float(np.mean((y_test.to_numpy() >= p10_test) & (y_test.to_numpy() <= p90_test)))
+        metrics["p10_p90_coverage_raw_test"] = raw_coverage
+        print(f"  [calibration] 보정 전 P10~P90 커버리지 = {raw_coverage:.3f} (이론값 {config.CONFORMAL_TARGET_COVERAGE})")
+
+        # split-conformal 보정: 검증셋에서 목표 커버리지에 맞는 correction을 구해 저장, 테스트셋에 적용해 재평가
+        # 주의(분산 학습 시 알려진 근사): y_valid/quantile_preds_valid는 이 머신의 station 샤드
+        # 뿐이라, correction이 전체 검증셋이 아니라 rank 0 머신 몫만으로 계산된다 — station을
+        # 머신에 무작위로(crc32) 배정하므로 심하게 편향되진 않지만 정확히 전체 검증셋과 같지는
+        # 않다. 여러 머신의 conformity score를 모아 합치는 건 LightGBM 소켓 프로토콜 밖의
+        # 별도 집계 단계가 필요해 지금은 범위 밖으로 남겨둔다.
+        correction = _conformal_correction(
+            y_valid.to_numpy(), quantile_preds_valid[0.1], quantile_preds_valid[0.9], config.CONFORMAL_TARGET_COVERAGE
         )
         if is_primary:
-            model_io.stage_and_upload_booster(q_booster, model_key(model_name, f"q{int(alpha * 100)}", models_prefix))
-        pred_test = q_booster.predict(X_test, num_iteration=q_booster.best_iteration)
-        pred_valid = q_booster.predict(X_valid, num_iteration=q_booster.best_iteration)
-        quantile_preds_test[alpha] = pred_test
-        quantile_preds_valid[alpha] = pred_valid
-        metrics[f"pinball_test_q{int(alpha * 100)}"] = _pinball_loss(y_test.to_numpy(), pred_test, alpha)
-        print(f"  [q{int(alpha * 100)}] best_iter={q_booster.best_iteration} pinball={metrics[f'pinball_test_q{int(alpha * 100)}']:.4f}")
+            correction_payload = {"correction": correction, "target_coverage": config.CONFORMAL_TARGET_COVERAGE}
+            s3_io.write_json(model_json_key(model_name, "conformal_correction", models_prefix), correction_payload)
+            mlflow.log_dict(correction_payload, "conformal_correction.json")
 
-    p10_test, p90_test = quantile_preds_test[0.1], quantile_preds_test[0.9]
-    raw_coverage = float(np.mean((y_test.to_numpy() >= p10_test) & (y_test.to_numpy() <= p90_test)))
-    metrics["p10_p90_coverage_raw_test"] = raw_coverage
-    print(f"  [calibration] 보정 전 P10~P90 커버리지 = {raw_coverage:.3f} (이론값 {config.CONFORMAL_TARGET_COVERAGE})")
-
-    # split-conformal 보정: 검증셋에서 목표 커버리지에 맞는 correction을 구해 저장, 테스트셋에 적용해 재평가
-    # 주의(분산 학습 시 알려진 근사): y_valid/quantile_preds_valid는 이 머신의 station 샤드
-    # 뿐이라, correction이 전체 검증셋이 아니라 rank 0 머신 몫만으로 계산된다 — station을
-    # 머신에 무작위로(crc32) 배정하므로 심하게 편향되진 않지만 정확히 전체 검증셋과 같지는
-    # 않다. 여러 머신의 conformity score를 모아 합치는 건 LightGBM 소켓 프로토콜 밖의
-    # 별도 집계 단계가 필요해 지금은 범위 밖으로 남겨둔다.
-    correction = _conformal_correction(
-        y_valid.to_numpy(), quantile_preds_valid[0.1], quantile_preds_valid[0.9], config.CONFORMAL_TARGET_COVERAGE
-    )
-    if is_primary:
-        s3_io.write_json(
-            model_json_key(model_name, "conformal_correction", models_prefix),
-            {"correction": correction, "target_coverage": config.CONFORMAL_TARGET_COVERAGE},
+        p10_calibrated = np.clip(p10_test - correction, 0, None)  # count는 음수가 될 수 없음
+        p90_calibrated = p90_test + correction
+        calibrated_coverage = float(
+            np.mean((y_test.to_numpy() >= p10_calibrated) & (y_test.to_numpy() <= p90_calibrated))
+        )
+        metrics["conformal_correction"] = correction
+        metrics["p10_p90_coverage_calibrated_test"] = calibrated_coverage
+        print(
+            f"  [calibration] correction={correction:.4f} 적용 후 커버리지 = {calibrated_coverage:.3f}"
         )
 
-    p10_calibrated = np.clip(p10_test - correction, 0, None)  # count는 음수가 될 수 없음
-    p90_calibrated = p90_test + correction
-    calibrated_coverage = float(
-        np.mean((y_test.to_numpy() >= p10_calibrated) & (y_test.to_numpy() <= p90_calibrated))
-    )
-    metrics["conformal_correction"] = correction
-    metrics["p10_p90_coverage_calibrated_test"] = calibrated_coverage
-    print(
-        f"  [calibration] correction={correction:.4f} 적용 후 커버리지 = {calibrated_coverage:.3f}"
-    )
+        # monitor_performance.py가 "이 모델이 학습/검수 시점에 어느 정도였는지"를 알아야
+        # 매달 실측 성능과 비교할 baseline을 잡을 수 있다 — 그 baseline을 여기서 남긴다.
+        if is_primary:
+            s3_io.write_json(model_json_key(model_name, "metrics", models_prefix), metrics)
+            # 임베고 등 프로필 값이 바뀌면 이 모델을 서빙할 feature_engine/inference도
+            # 같은 프로필을 써야 한다 — 어떤 프로필로 학습됐는지를 모델 파일 옆에 그대로
+            # 남겨서, 나중에 이 모델을 찾았을 때 재현/서빙 조건을 바로 알 수 있게 한다
+            # (챔피언으로 승격되면 training/promotion.py가 이 archive_prefix를 포인터로
+            # 가리키므로, 이 파일도 그 포인터를 통해 그대로 조회된다 — 별도 복사 없음).
+            profile_payload = {"profile_name": common_config.PROFILE_NAME, **common_config.PROFILE}
+            s3_io.write_json(model_json_key(model_name, "profile", models_prefix), profile_payload)
+            mlflow.log_dict(profile_payload, "profile.json")
+            # metrics의 "model_name"은 문자열이라 mlflow.log_metrics(숫자만 허용)에서 뺀다.
+            mlflow.log_metrics({k: v for k, v in metrics.items() if isinstance(v, int | float)})
 
-    # monitor_performance.py가 "이 모델이 학습/검수 시점에 어느 정도였는지"를 알아야
-    # 매달 실측 성능과 비교할 baseline을 잡을 수 있다 — 그 baseline을 여기서 남긴다.
-    if is_primary:
-        s3_io.write_json(model_json_key(model_name, "metrics", models_prefix), metrics)
-        # 임베고 등 프로필 값이 바뀌면 이 모델을 서빙할 feature_engine/inference도
-        # 같은 프로필을 써야 한다 — 어떤 프로필로 학습됐는지를 모델 파일 옆에 그대로
-        # 남겨서, 나중에 이 모델을 찾았을 때 재현/서빙 조건을 바로 알 수 있게 한다
-        # (챔피언으로 승격되면 training/promotion.py가 이 archive_prefix를 포인터로
-        # 가리키므로, 이 파일도 그 포인터를 통해 그대로 조회된다 — 별도 복사 없음).
-        s3_io.write_json(
-            model_json_key(model_name, "profile", models_prefix),
-            {"profile_name": common_config.PROFILE_NAME, **common_config.PROFILE},
-        )
-
+    _append_progress_log(f"[{model_name}] 학습 완료, peak_rss={_peak_rss_mb():.0f}MB")
     return metrics
 
 

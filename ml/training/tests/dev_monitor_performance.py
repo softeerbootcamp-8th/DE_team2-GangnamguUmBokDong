@@ -3,11 +3,16 @@
 그대로 적용하는지, 경계값에서 정확히 판정이 갈리는지가 핵심이다.
 """
 
+import mlflow
 import pandas as pd
 import pytest
 
-from training import config
-from training.monitor_performance import _recent_month_range, decide_retrain
+from training import config, monitor_performance
+from training.monitor_performance import (
+    _log_to_mlflow,
+    _recent_month_range,
+    decide_retrain,
+)
 
 
 def _evaluation(deviance_relative_change: float, coverage_drift: float) -> dict:
@@ -104,3 +109,51 @@ def test_recent_month_range_boundary_exactly_at_cutoff_is_safe(monkeypatch):
     assert _recent_month_range(1, as_of="2026-02-11") == ("2026-01-01", "2026-01-31")
     # 반대로 하루 이르면(경계 밖) 1월도 아직 불안전 — 한 달 더 밀려 12월로.
     assert _recent_month_range(1, as_of="2026-02-09") == ("2025-12-01", "2025-12-31")
+
+
+def _result(**overrides) -> dict:
+    base = {
+        "model_name": "rental",
+        "period": {"start": "2026-01-01", "end": "2026-01-31"},
+        "n_rows": 100,
+        "baseline_deviance": 1.0,
+        "current_deviance": 1.05,
+        "deviance_relative_change": 0.05,
+        "baseline_rmse": 2.0,
+        "current_rmse": 2.1,
+        "baseline_coverage": 0.8,
+        "current_coverage": 0.82,
+        "coverage_drift": 0.02,
+        "needs_retrain": False,
+        "reasons": [],
+    }
+    base.update(overrides)
+    return base
+
+
+def test_log_to_mlflow_writes_params_and_metrics(tmp_path, monkeypatch):
+    """월별 점검 결과가 MLflow에 그대로 기록되는지 확인한다(로컬 파일 backend 사용)."""
+    monkeypatch.setenv("MLFLOW_ALLOW_FILE_STORE", "true")
+    monkeypatch.setattr(monitor_performance.mlflow_tracking, "MLFLOW_TRACKING_URI", str(tmp_path / "mlruns"))
+
+    _log_to_mlflow(_result(), horizon=1)
+
+    client = mlflow.tracking.MlflowClient()
+    exp = client.get_experiment_by_name(config.MLFLOW_MONITORING_EXPERIMENT_NAME)
+    run = client.search_runs([exp.experiment_id], max_results=1)[0]
+    assert run.info.status == "FINISHED"
+    assert run.data.metrics["deviance_relative_change"] == 0.05
+    assert run.data.metrics["needs_retrain"] == 0.0
+    assert run.data.params["model_name"] == "rental"
+    assert run.data.params["horizon"] == "1"
+
+
+def test_log_to_mlflow_swallows_errors_so_check_keeps_going(monkeypatch, capsys):
+    """MLflow 서버가 없어도(로컬 개발 등) 월별 점검 자체(재학습 판단)는 죽으면 안 된다."""
+    monkeypatch.setattr(
+        monitor_performance.mlflow_tracking, "configure", lambda *_: (_ for _ in ()).throw(RuntimeError("no server"))
+    )
+
+    _log_to_mlflow(_result(), horizon=1)  # 예외를 던지지 않아야 한다
+
+    assert "MLflow 로깅 실패" in capsys.readouterr().out

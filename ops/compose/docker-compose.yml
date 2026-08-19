@@ -51,6 +51,32 @@ services:
       exit 0;
       "
 
+  mlflow:
+    build:
+      context: ../..
+      dockerfile: ops/compose/Dockerfile.mlflow
+    environment:
+      MLFLOW_S3_ENDPOINT_URL: http://minio:9000
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    # --serve-artifacts로 이 서버가 S3 업로드/다운로드를 대신 중계한다 — 그래서
+    # feature_engine(EMR)/training(로컬)/inference(어디든) 클라이언트는 S3 자격증명
+    # 없이 MLFLOW_TRACKING_URI 하나만으로 파라미터/지표/아티팩트를 전부 기록할 수 있다.
+    command: >
+      mlflow server
+      --host 0.0.0.0
+      --port 5000
+      --backend-store-uri postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_MLFLOW_DB:-mlflow}
+      --artifacts-destination s3://${S3_BUCKET:-local-dev}/mlflow-artifacts
+      --serve-artifacts
+    ports:
+      - "${MLFLOW_PORT:-5000}:5000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_started
+
   airflow-init:
     build:
       context: ../..

@@ -18,9 +18,11 @@
 import json
 from datetime import date
 
+import mlflow
 import numpy as np
 import pandas as pd
 from core import s3 as s3_io
+from ml_core import mlflow_tracking
 from ml_core.metrics import poisson_deviance as _poisson_deviance
 from ml_core.model_contract import RENTAL_FEATURE_COLUMNS, RETURN_FEATURE_COLUMNS
 from ml_core.paths import model_json_key, read_champion_prefix
@@ -128,7 +130,7 @@ def evaluate_recent_performance(
     feature_columns = _FEATURE_COLUMNS_BY_MODEL[model_name]
     # "date"는 안 넣는다 — Spark 파티션 컬럼이라 파일엔 없고, columns=에 넣으면
     # 읽을 때마다 그 문자열을 행 수만큼 복제해 만들어야 하는데(core.s3
-    # ._read_parquet_by_date_range() 참고) 이 함수는 그 값을 실제로 쓰지 않는다
+    # ._read_parquet_by_dates() 참고) 이 함수는 그 값을 실제로 쓰지 않는다
     # (date_range로 이미 파티션 자체를 걸렀고, horizon 필터는 별도 컬럼으로 함).
     needed = sorted(set(feature_columns) | {target_col, "horizon"} | ({exposure_col} if exposure_col else set()))
     df = s3_io.read_parquet(table_path, columns=needed, date_range=(start, end))
@@ -190,6 +192,44 @@ def decide_retrain(evaluation: dict) -> dict:
     return {**evaluation, "needs_retrain": len(reasons) > 0, "reasons": reasons}
 
 
+def _log_to_mlflow(result: dict, horizon: int) -> None:
+    """월별 성능 점검 결과를 MLflow에도 남긴다.
+
+    학습(`train_common.train_target()`)과 같은 서버, 다른 experiment
+    (`config.MLFLOW_MONITORING_EXPERIMENT_NAME`)에 점검마다 run 하나씩 쌓는다 —
+    "언제부터 드리프트가 시작됐는지"를 매달 콘솔 로그를 뒤져서 찾는 대신 MLflow UI의
+    지표 추이(deviance_relative_change/coverage_drift)로 바로 볼 수 있게 하려는
+    용도다. 이 로깅 자체는 재학습 필요 여부 판단(`decide_retrain()`)의 정확성과
+    무관한 부가 기능이라, MLflow 서버가 마침 안 떠 있어도(로컬 개발 등) 실제 점검
+    결과 출력/재학습 판단을 막지 않도록 실패를 삼키고 경고만 남긴다.
+    """
+    try:
+        mlflow_tracking.configure(config.MLFLOW_MONITORING_EXPERIMENT_NAME)
+        with mlflow.start_run(run_name=f"{result['model_name']}_h{horizon}_{result['period']['end']}"):
+            mlflow.log_params({
+                "model_name": result["model_name"],
+                "horizon": horizon,
+                "period_start": result["period"]["start"],
+                "period_end": result["period"]["end"],
+            })
+            mlflow.log_metrics({
+                "n_rows": result["n_rows"],
+                "baseline_deviance": result["baseline_deviance"],
+                "current_deviance": result["current_deviance"],
+                "deviance_relative_change": result["deviance_relative_change"],
+                "baseline_rmse": result["baseline_rmse"],
+                "current_rmse": result["current_rmse"],
+                "baseline_coverage": result["baseline_coverage"],
+                "current_coverage": result["current_coverage"],
+                "coverage_drift": result["coverage_drift"],
+                "needs_retrain": int(result["needs_retrain"]),
+            })
+            if result["reasons"]:
+                mlflow.log_dict({"reasons": result["reasons"]}, "reasons.json")
+    except Exception as exc:  # noqa: BLE001 — 부가 로깅이라 어떤 이유로 실패하든 점검 자체를 막으면 안 됨
+        print(f"[monitor_performance] MLflow 로깅 실패(무시하고 진행): {exc}")
+
+
 def check_all_models(as_of: date | None = None, horizon: int = 1) -> list[dict]:
     """대여/반납 챔피언 모델을 모두 확인한다.
 
@@ -202,7 +242,9 @@ def check_all_models(as_of: date | None = None, horizon: int = 1) -> list[dict]:
     results = []
     for model_name, target_col, exposure_col in MODEL_SPECS:
         evaluation = evaluate_recent_performance(model_name, target_col, exposure_col, as_of=as_of, horizon=horizon)
-        results.append(decide_retrain(evaluation))
+        result = decide_retrain(evaluation)
+        _log_to_mlflow(result, horizon)
+        results.append(result)
     return results
 
 

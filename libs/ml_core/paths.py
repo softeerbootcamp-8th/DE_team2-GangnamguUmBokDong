@@ -142,8 +142,17 @@ def read_champion_prefix(model_name: str) -> str:
     고정되어, 그 프로세스 안에서 booster/correction/station_categories가
     항상 같은 archive_prefix에서 나온다. 다른 프로세스(다음 5분 주기 inference 등)가
     승격 이후 새 값을 보는 것은 정상이고 문제없다 — 막아야 하는 건 프로세스
-    "하나"가 자기 안에서 신/구 버전을 섞어 쓰는 경우뿐이다. 테스트에서 승격을
-    흉내내려면 `read_champion_prefix.cache_clear()`로 캐시를 비울 것.
+    "하나"가 자기 안에서 신/구 버전을 섞어 쓰는 경우뿐이다.
+
+    **"학습해봤더니 구려서 같은 프로세스 안에서 재학습→재승격을 반복"하는
+    코드는 어떻게 되나(2026-08)**: `training.promotion.promote_challenger()`가
+    승격할 때 이 캐시와 `ml_core.scoring`의 `load_boosters()`/
+    `load_conformal_correction()` 캐시까지 셋을 한꺼번에 비운다 — 그래야 재승격
+    직후 다음 채점부터는 새 archive를 보면서도, 셋 중 일부만 새 값을 보고
+    나머지는 옛 값에 머무는 불일치가 안 생긴다(`promote_challenger()` docstring
+    참고). 이 함수를 `write_champion_pointer()`로 직접 부르기만 하고
+    `promote_challenger()`를 안 거치면(테스트 외) 이 캐시가 안 비워진다 —
+    `read_champion_prefix.cache_clear()`를 직접 불러야 한다.
 
     args:
         model_name: "rental" 또는 "return"
@@ -161,9 +170,19 @@ def read_champion_prefix(model_name: str) -> str:
 def write_champion_pointer(model_name: str, archive_prefix: str) -> dict:
     """model_name의 챔피언이 archive_prefix를 가리키도록 원자적으로 전환한다.
 
-    `training.promotion.promote_challenger()`가 승격 시 이 함수 하나만 부른다 —
     더 이상 archive 파일을 챔피언 자리로 복사하지 않는다(`read_champion_prefix()`
-    docstring 참고).
+    docstring 참고) — 포인터 하나만 바꾸면 승격이 끝난다.
+
+    **이 함수 자신은 캐시를 안 비운다 — 일부러다.** `read_champion_prefix()`뿐
+    아니라 `ml_core.scoring.load_boosters()`/`load_conformal_correction()`도
+    같은 archive_prefix를 각자 따로 캐시하는데, 이 함수는 `paths.py`에 있어서
+    `scoring.py`(순환 import 방지로 이 모듈을 모름)의 캐시까지는 못 비운다. 여기서
+    `read_champion_prefix`만 비우면 셋 중 하나만 새 값을 보고 나머지 둘은 옛
+    값을 유지하는 **불일치**가 생긴다(실측 확인됨, 2026-08) — 그게 바로 이
+    캐시 설계가 막으려던 문제 그 자체다. 그래서 세 캐시를 전부 아는 유일한
+    지점인 `training.promotion.promote_challenger()`(이 함수의 유일한 실제
+    호출부)가 셋을 한꺼번에 비운다 — 이 함수를 단독으로(테스트 외에) 호출하는
+    코드는 없어야 한다.
 
     args:
         model_name: "rental" 또는 "return"

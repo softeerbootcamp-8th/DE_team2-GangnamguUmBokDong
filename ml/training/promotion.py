@@ -29,7 +29,8 @@ station_categories는 옛 버전인 식으로 섞인 모델을 읽을 수 있었
 from __future__ import annotations
 
 from ml_core import common_config
-from ml_core.paths import write_champion_pointer
+from ml_core.paths import read_champion_prefix, write_champion_pointer
+from ml_core.scoring import load_boosters, load_conformal_correction
 
 
 def should_promote(challenger_metrics: dict, champion_metrics: dict | None) -> tuple[bool, list[str]]:
@@ -72,6 +73,15 @@ def promote_challenger(model_name: str, archive_prefix: str) -> dict:
     더 이상 archive 밑의 파일을 챔피언 자리로 복사하지 않는다(모듈 docstring
     참고) — 포인터 하나만 바꾸면 승격이 끝난다.
 
+    **2026-08**: `write_champion_pointer()` 자신은 캐시를 안 비운다(그 함수
+    docstring 참고 — `read_champion_prefix()`만 비우면 `load_boosters()`/
+    `load_conformal_correction()`은 옛 값에 머물러 셋이 서로 다른 archive를
+    가리키는 불일치가 생긴다, 실측 확인됨). 셋 다 아는 유일한 지점이 여기라서,
+    포인터를 쓴 직후 세 캐시를 한꺼번에 비운다 — "학습해봤더니 구려서 같은
+    프로세스 안에서 재학습→재승격"을 반복하는 코드가 있다면, 재승격 직후
+    다음 채점부터 booster/correction/station_categories가 전부 새 archive
+    하나로 일관되게 나온다.
+
     args:
         model_name: "rental" 또는 "return"
         archive_prefix: 이번에 승격할 학습 결과가 있는 아카이브 prefix
@@ -79,4 +89,8 @@ def promote_challenger(model_name: str, archive_prefix: str) -> dict:
     returns:
         dict: `write_champion_pointer()`가 실제로 기록한 포인터 내용(로그/알림용)
     """
-    return write_champion_pointer(model_name, archive_prefix)
+    record = write_champion_pointer(model_name, archive_prefix)
+    read_champion_prefix.cache_clear()
+    load_boosters.cache_clear()
+    load_conformal_correction.cache_clear()
+    return record

@@ -40,26 +40,26 @@ EMR 대상이다(로컬 검증은 짧은 기간의 합성 데이터로만).
 
 from __future__ import annotations
 
+from ml_core import common_config
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 
 from . import config
 
+# station_no/capacity/lat/lon/temp/precip/pop_total/minute/dow/is_holiday/day는
+# common_config.BASE_FEATURE_COLUMNS와 정확히 겹친다(horizon만 예외 — 그건
+# _shift_for_horizon()이 self-join 뒤에 직접 붙이는 값이라 원본 tick 테이블엔
+# 아직 없는 컬럼이고, 여기서 select하면 실패한다). 하드코딩으로 다시 나열하면
+# BASE_FEATURE_COLUMNS에 피처를 추가/삭제할 때 여기를 깜빡하고 안 고쳐서 학습
+# 테이블에서 그 컬럼만 조용히 빠지는 사고가 날 수 있어(2026-08 리뷰 지적),
+# BASE_FEATURE_COLUMNS에서 그대로 파생시켜 이 두 목록이 어긋날 가능성 자체를
+# 없앤다. hour_ts/hour/date는 모델 feature가 아니라 이 파일 자체의 self-join
+# 키/식별용/split 경계 판정용이라 별도로 붙인다.
 _COMMON_TARGET_COLUMNS = [
-    "station_no",
-    "hour_ts",
-    "capacity",
-    "lat",
-    "lon",
-    "temp",
-    "precip",
-    "pop_total",
+    *(c for c in common_config.BASE_FEATURE_COLUMNS if c != "horizon"),
+    "hour_ts",  # self-join 키(target_ts) — _shift_for_horizon()이 소모하고 버림
     "hour",  # 더 이상 모델 feature 아님(minute이 대체) — scoring.predict() 출력/CLI 식별용
-    "minute",  # 자정 기준 경과분 — 실제 모델 feature(common_config.BASE_FEATURE_COLUMNS)
-    "dow",
-    "is_holiday",
-    "day",
-    "date",
+    "date",  # train_common._split()의 train/valid/test 경계 판정용 — 모델 feature 아님
 ]
 
 # station_id(텍스트)는 이 테이블에 아예 안 담는다 — horizon self-join으로 원본의

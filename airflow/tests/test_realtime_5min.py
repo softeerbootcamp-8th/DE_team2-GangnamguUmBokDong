@@ -55,9 +55,11 @@ def test_normalizer_strict_then_fallback():
     assert "--baseline-date-mode strict" in strict.bash_command
 
 
-def test_inference_depends_on_all_three_collectors_but_not_normalizer():
-    """ml/inference/predict_single.py는 normalizer 출력을 소비하지 않는다 — 설계 판단을
-    회귀 테스트로 고정한다."""
+def test_inference_depends_on_all_three_collectors_and_normalizer_fallback():
+    """ml/inference/predict_single.py의 _get_recent_population()은 실제로 normalizer의
+    출력(living_population_normalized)을 읽는다(2026-08 정정 — 예전엔 안 읽는다고
+    잘못 판단했었다) — normalizer가 그 tick을 다 쓰기 전에 run_inference가 먼저
+    실행되는 race condition을 막으려면 normalizer 브랜치 뒤에 붙어야 한다."""
     run_inference = dag.get_task("run_inference")
     upstream_ids = {t.task_id for t in run_inference.upstream_list}
 
@@ -65,9 +67,19 @@ def test_inference_depends_on_all_three_collectors_but_not_normalizer():
         "collect_bike_rental_history",
         "collect_bike_station_realtime",
         "collect_population_realtime",
+        "run_normalizer_fallback",
     }
+    # strict는 fallback을 거쳐 간접적으로만 upstream이다(직접 엣지는 없음).
     assert "run_normalizer_strict" not in upstream_ids
-    assert "run_normalizer_fallback" not in upstream_ids
+
+
+def test_inference_trigger_rule_does_not_skip_when_normalizer_fallback_is_skipped():
+    """run_normalizer_fallback은 strict가 성공하면(정상 경로) trigger_rule=all_failed 때문에
+    SKIPPED로 끝난다 — run_inference가 기본 규칙(ALL_SUCCESS)이면 SKIPPED가 전파돼
+    정상 경로에서도 추론이 거의 항상 안 도는 사고가 난다. NONE_FAILED_MIN_ONE_SUCCESS로
+    fallback이 SKIPPED든 SUCCESS든 다른 collector가 성공하면 진행되게 했는지 확인한다."""
+    run_inference = dag.get_task("run_inference")
+    assert run_inference.trigger_rule == "none_failed_min_one_success"
 
 
 def test_inference_then_load_forecast_points():

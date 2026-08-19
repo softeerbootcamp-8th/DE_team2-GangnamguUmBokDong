@@ -260,11 +260,13 @@ def forecast_points_from_predictions(df: pd.DataFrame, batch_run_at: datetime) -
     (predict_demand_multi_hour_all_stations()가 target_ts = anchor_ts + (horizon-1)h로
     계산해서 채워 넣는다) — horizon을 여기서 다시 더하지 않는다.
 
-    station_id("ST-101" 등)와 stations.sta_id("101" 등, bike_station_realtime의
-    raw stationId를 그대로 씀)가 같은 값 공간인지는 실제 데이터로 아직 확정되지
-    않았다 — libs/ml_core/silver_schema.py의 컬럼 매핑이 둘 다 raw stationId를
-    그대로 통과시키는 것처럼 보이지만, 실제 Seoul OpenAPI 응답으로 검증 전까지는
-    가정으로만 남겨둔다.
+    **2026-08 확정**: station_id("ST-101" 등, predict_single.py가 station_master
+    기준으로 채움)와 stations.sta_id(`stations_from_silver()`가 bike_station_realtime의
+    raw stationId를 그대로 씀)가 같은 값 공간인지 실제 샘플 데이터로 대조 완료 —
+    `ml/data/silver/bike_station_realtime/`의 실제 stationId는 이미 "ST-4"처럼
+    접두사가 붙어 있고(raw 자체가 이 형식), `ml/data/processed_v2/station_master.parquet`의
+    station_id와 전수 대조한 결과 realtime 샘플의 1,000개 stationId가 전부(100%)
+    station_master에 존재했다(불일치 0건) — 두 값 공간은 같다, FK/JOIN 누락 위험 없음.
     """
     records = []
     for row in df.to_dict("records"):

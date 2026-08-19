@@ -251,6 +251,67 @@ def test_single_station_cli_saves_to_s3(monkeypatch):
     assert "return_pred_mean" in df.columns
 
 
+def _fake_all_stations_outcome(expected: int, actual: int) -> dict:
+    results = [
+        {
+            "station_id": f"S{i}", "date": "2025-06-01", "hour": 10, "minute": 0, "horizon": 1,
+            "rental": {"pred_mean": 1.0, "pred_p10": 0.5, "pred_p50": 1.0, "pred_p90": 1.5, "lag_data_freshness": 1.0},
+            "return": {"pred_mean": 1.0, "pred_p10": 0.5, "pred_p50": 1.0, "pred_p90": 1.5},
+            "population_source": "provided", "stockout_source": "provided",
+        }
+        for i in range(actual)
+    ]
+    failed = [{"station_id": f"F{i}", "error": "boom"} for i in range(expected - actual)]
+    return {"results": results, "failed": failed, "expected_count": expected, "actual_count": actual}
+
+
+def _run_all_stations_cli(monkeypatch, outcome: dict) -> tuple[int, list, list]:
+    from core import s3 as s3_io
+
+    monkeypatch.setattr(ps, "predict_demand_multi_hour_all_stations", lambda **kwargs: outcome)
+    parquet_calls, json_calls = [], []
+    monkeypatch.setattr(s3_io, "write_parquet", lambda df, key: parquet_calls.append((df, key)))
+    monkeypatch.setattr(s3_io, "write_json", lambda key, data: json_calls.append((key, data)))
+
+    argv = ["--all-stations", "--date", "2025-06-01", "--hour", "10", "--temp", "20.0", "--precip", "0.0"]
+    try:
+        ps.main(argv)
+        code = 0
+    except SystemExit as e:
+        code = e.code
+    return code, parquet_calls, json_calls
+
+
+def test_all_stations_cli_exits_zero_on_full_success(monkeypatch):
+    code, parquet_calls, json_calls = _run_all_stations_cli(monkeypatch, _fake_all_stations_outcome(3, 3))
+
+    assert code == 0
+    assert len(parquet_calls) == 1  # 성공 결과는 항상 저장
+    assert json_calls == []  # 실패가 없으니 failed 목록 파일도 없음
+
+
+def test_all_stations_cli_exits_zero_on_partial_failure_but_writes_failed_list(monkeypatch):
+    """**2026-08 정정**: 부분 실패(2,582개 중 1개 등)로 전체 배치 태스크를 실패
+    처리해서 이미 저장된 나머지 성공 결과의 DB 적재까지 막던 문제를 고쳤다 —
+    이제는 하나라도 성공하면 exit 0으로 통과시키되, 실패 목록은 별도 파일로
+    계속 남겨서 추적 가능하게 한다."""
+    code, parquet_calls, json_calls = _run_all_stations_cli(monkeypatch, _fake_all_stations_outcome(3, 2))
+
+    assert code == 0
+    assert len(parquet_calls) == 1
+    assert len(json_calls) == 1  # 실패 1건은 별도 파일로 남음
+    _failed_key, failed_data = json_calls[0]
+    assert len(failed_data) == 1
+
+
+def test_all_stations_cli_exits_one_on_total_failure(monkeypatch):
+    """성공한 게 하나도 없으면(시스템 자체가 잘못됐다는 신호) 여전히 exit 1로 막는다."""
+    code, _parquet_calls, json_calls = _run_all_stations_cli(monkeypatch, _fake_all_stations_outcome(3, 0))
+
+    assert code == 1
+    assert len(json_calls) == 1
+
+
 def test_single_station_multi_hour_cli_saves_to_s3(monkeypatch):
     """단일 정류소 다중 시간대(n_hours>1) CLI 실행 시 S3 저장 검증."""
     from core import s3 as s3_io

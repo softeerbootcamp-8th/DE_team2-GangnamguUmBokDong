@@ -86,6 +86,49 @@ POPULATION_COLUMN_MAP = {
     "SPOP": "pop_total",
 }
 
+# **2026-08 확정**: `loader/transform.py`의 `weather_forecast_from_silver()`가
+# 이 소스를 이미 실제로 소비하고 있어(collector 예보 수집 자체는 이 브랜치엔
+# 아직 없지만, loader 쪽에서 실제 raw 응답 기준으로 이미 구현/검증됨) 그 코드를
+# 그대로 근거로 쓴다 — 앞서(ml-integration-requests.md #6) "PCP는 숫자로 정규화돼
+# 내려온다"고 가정했던 건 틀렸다: PCP는 여전히 raw 텍스트("강수없음"/"1.0mm 미만"/
+# "30.0~50.0mm"/순수 숫자)로 온다(`parse_kma_precip_text()`가 loader의
+# `_parse_precip_str()`과 동일한 정책으로 파싱). 타겟 시각도 단일 컬럼이 아니라
+# `fcstDate`(YYYYMMDD)+`fcstTime`(HHMM, KST) 두 컬럼을 합쳐야 한다(발표 시각은
+# `baseDate`/`baseTime`). nx/ny(격자)는 무시한다 — `weather_ultra_short_live`
+# 관측 소스도 지금 격자 구분 없이 "서울 전체 공유" 1개 값으로 취급하므로
+# (`WEATHER_SOURCE_ID` 관련 함수들 참고) 예보만 격자를 따로 가리는 건 일관성이
+# 없다(추후 격자별로 세분화하려면 관측 쪽도 같이 손봐야 함).
+WEATHER_FORECAST_SOURCE_ID = "weather_short_term_forecast"
+WEATHER_FORECAST_COLUMN_MAP = {"TMP": "temp"}  # PCP는 parse_kma_precip_text()로 별도 처리(단순 rename 불가)
+WEATHER_FORECAST_DATE_COLUMN = "fcstDate"
+WEATHER_FORECAST_TIME_COLUMN = "fcstTime"
+# 실제 발표 주기/스케줄은 아직 확정되지 않았다(자동 수집 DAG 자체가 아직 없음,
+# ml-integration-requests.md #11) — 다른 소스와 같은 3시간 격자를 잠정 가정한다.
+WEATHER_FORECAST_ISSUE_TICK_MINUTES = 180
+
+
+def parse_kma_precip_text(value) -> float | None:
+    """기상청 강수량 raw 값("강수없음"/"1.0mm 미만"/"30.0~50.0mm"/순수 숫자)을 float(mm)로 변환한다.
+
+    `loader/transform.py`의 `_parse_precip_str()`과 정확히 같은 정책이다 — 두
+    인스턴스가 서로 import하지 않는다는 원칙(이 파일 모듈 docstring 참고)이라
+    독립적으로 복제한다. 범위 표현("30.0~50.0mm")은 하한값을 쓴다(둘 다 동일).
+    """
+    if value is None or value == "":
+        return None
+    text = str(value).strip()
+    if text in ("강수없음", "적설없음"):
+        return 0.0
+    if "미만" in text:
+        return 0.5
+    text = text.replace("mm", "").strip()
+    if "~" in text:
+        text = text.split("~")[0]
+    try:
+        return float(text)
+    except (TypeError, ValueError):
+        return None
+
 BIKE_REALTIME_SOURCE_ID = "bike_station_realtime"
 RENTAL_SOURCE_ID = "bike_rental_history"
 WEATHER_SOURCE_ID = "weather_ultra_short_live"
@@ -140,6 +183,21 @@ def rental_tick_keys(anchor_ts: pd.Timestamp, lookback_hours: float) -> list[str
 def weather_tick_keys(anchor_ts: pd.Timestamp, lookback_hours: float = 3.0) -> list[str]:
     """`weather_ultra_short_live`의 10분 tick 키 목록(오래된 것부터 최신 순)."""
     return _tick_keys(WEATHER_SOURCE_ID, anchor_ts, lookback_hours, WEATHER_TICK_MINUTES)
+
+
+def weather_forecast_issue_keys(anchor_ts: pd.Timestamp, lookback_hours: float = 24.0) -> list[str]:
+    """`weather_short_term_forecast`의 발표(issue) 파일 키 목록(오래된 것부터 최신 순).
+
+    다른 소스와 달리 이 파일 하나엔 미래 여러 시각의 예보가 여러 행으로 들어있다
+    (관측 소스처럼 "그 tick의 값 1개"가 아님) — 그래서 이 키들은 "그 시각의
+    예보값"이 아니라 "그 시각에 발표된 예보 파일 전체"를 가리킨다. 호출부가 가장
+    최근 발표 파일부터 훑으며 그 안에서 원하는 미래 시각(target_ts)에 가장 가까운
+    행을 골라 쓴다. lookback을 기본 24시간으로 넉넉히 잡은 이유는 실제 발표 주기가
+    3시간 격자에 정확히 맞아떨어지는지 아직 확정되지 않았기 때문(자동 수집 스케줄
+    자체가 아직 없음, `WEATHER_FORECAST_ISSUE_TICK_MINUTES` 주석 참고) — 최소 한
+    번은 걸리게 넉넉히 본다.
+    """
+    return _tick_keys(WEATHER_FORECAST_SOURCE_ID, anchor_ts, lookback_hours, WEATHER_FORECAST_ISSUE_TICK_MINUTES)
 
 
 def population_normalized_tick_keys(anchor_ts: pd.Timestamp, lookback_hours: float = 1.0) -> list[str]:

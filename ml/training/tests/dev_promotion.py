@@ -2,7 +2,7 @@
 (promote_challenger)을 검증한다."""
 
 import pytest
-from ml_core import common_config
+from ml_core import common_config, scoring
 from ml_core.paths import read_champion_prefix
 
 from training.promotion import promote_challenger, should_promote
@@ -13,8 +13,12 @@ _CHAMPION = {"poisson_deviance_test": 1.0, "p10_p90_coverage_calibrated_test": 0
 @pytest.fixture(autouse=True)
 def _clear_champion_prefix_cache():
     read_champion_prefix.cache_clear()
+    scoring.load_boosters.cache_clear()
+    scoring.load_conformal_correction.cache_clear()
     yield
     read_champion_prefix.cache_clear()
+    scoring.load_boosters.cache_clear()
+    scoring.load_conformal_correction.cache_clear()
 
 
 def test_should_promote_when_no_champion_exists_yet():
@@ -68,6 +72,29 @@ def test_promote_challenger_does_not_touch_other_model_names_pointer():
     promote_challenger("rental", "models/archive/dt=2026-08-17/default")
 
     assert read_champion_prefix("return") == return_prefix
+
+
+def test_promote_challenger_invalidates_scoring_caches_so_repromotion_is_consistent():
+    """**사용자 질문 재현**: "학습해봤더니 구려서 같은 프로세스 안에서 계속
+    재학습→재승격"을 반복하면, 재승격 직후 다음 채점부터는 read_champion_prefix()/
+    load_conformal_correction()이 전부 새 archive 하나로 일관되게 나와야 한다.
+    write_champion_pointer() 혼자 read_champion_prefix만 비우면 scoring.py 쪽
+    캐시가 옛 archive에 머물러 오히려 더 나쁜 불일치가 생긴다(dev_champion_pointer.py/
+    dev_scoring.py의 회귀 테스트가 그 실패 모드를 고정해둠) — promote_challenger()가
+    셋을 한꺼번에 비워서 막는다."""
+    from core import s3 as s3_io
+
+    old_prefix = "models/archive/dt=2026-08-17/default"
+    promote_challenger("rental", old_prefix)
+    s3_io.write_json(f"{old_prefix}/rental_conformal_correction.json", {"correction": 1.5, "target_coverage": 0.8})
+    assert scoring.load_conformal_correction("rental") == 1.5  # 캐시를 채워둔다
+
+    new_prefix = "models/archive/dt=2026-08-18/default"
+    s3_io.write_json(f"{new_prefix}/rental_conformal_correction.json", {"correction": 9.9, "target_coverage": 0.8})
+    promote_challenger("rental", new_prefix)
+
+    assert read_champion_prefix("rental") == new_prefix
+    assert scoring.load_conformal_correction("rental") == 9.9
 
 
 def test_promote_challenger_does_not_copy_any_archive_files():

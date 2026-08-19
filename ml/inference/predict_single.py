@@ -18,6 +18,20 @@ P10/P50/P90)를 반환한다. 생활인구(`population`)는 있으면 넣고, �
 집계)과 달리 "지금 이 순간"만 필요하므로 조회 범위가 훨씬 좁다. 값을 직접 주면
 (테스트 등) 그 조회를 건너뛰고 준 값을 그대로 쓴다(하위 호환).
 
+**학습과 날씨를 다루는 방식이 다르다**: 학습은 target_ts(예측 대상 시점)에 실제로
+관측된 날씨(ground truth)로 배운다 — 그 시점이 이미 지난 과거라 실측이 있기
+때문(`feature_engine/spark/build_multi_horizon_features.py`). 반면 추론 시점엔
+target_ts가 미래일 수 있어(horizon>1) 실측이 없다 — `_resolve_live_weather()`가
+target_ts와 anchor_ts(T0, "지금")를 비교해, 미래면 예보(`_get_forecast_weather()`,
+`weather_short_term_forecast`)를 먼저 쓰고 그렇지 않으면(또는 예보가 없으면)
+관측(`_get_recent_weather()`, `weather_ultra_short_live`)을 쓴다. **주의(2026-08)**:
+collector 자체의 예보 자동 수집 스케줄은 이 저장소에 아직 없다(수동 트리거만
+가능, `docs/collector/ml-integration-requests.md` #11) — 그래서 예보 소스가
+실제로 채워져 있지 않으면 이 경로는 조용히 관측 fallback으로 넘어간다. 다만
+raw 스키마 자체(`fcstDate`/`fcstTime`/`TMP`/`PCP`)는 `loader/transform.py`의
+`weather_forecast_from_silver()`가 이미 같은 소스를 실제로 소비하고 있어 그
+코드를 근거로 확인된 값이다(가정이 아님).
+
 모델이 쓰는 lag feature는 대여/반납 각 1개(`rental_lag_1h`/`return_lag_1h`)뿐이고,
 그걸 계산하려면 "최근 실적 히스토리"가 필요하다. 히스토리 소스는 두 개로 나뉜다:
 (1) `_get_history_by_station()` — Silver `rental`을 시간 단위로 집계한 것,
@@ -542,18 +556,18 @@ def _population_fallback(grid_id: str, ts: pd.Timestamp) -> float:
 
 
 def _get_recent_weather(target_ts: pd.Timestamp, lookback_hours: float = 3) -> dict[str, float]:
-    """target_ts 시각(또는 그 근처)의 Silver 기상 관측값을 읽는다(서울 전체 공유).
+    """target_ts 시각(또는 그 근처)의 Silver 기상 **관측값**을 읽는다(서울 전체 공유).
 
-    `weather_ultra_short_live`(기상청 초단기실황, 10분 간격)을 쓴다 — 실제로는
-    `weather_short_term_forecast`(예보, 3시간 간격)도 있지만 그쪽은 강수량(mm)이
-    아니라 강수확률(%)만 제공해 `precip`과 단위가 안 맞고, 이 함수가 원래
-    "그 시점 근처 가장 최근 관측값"을 찾는 용도라 관측 소스가 의미상으로도 더
-    맞는다(자세한 내용은 `docs/collector/ml-integration-requests.md`). target_ts
-    키가 정확히 있으면 그걸, 없으면(수집 지연 또는 아직 도착 안 한 미래 시각)
-    거슬러 올라가 가장 최근 값을 대신 쓴다.
+    `weather_ultra_short_live`(기상청 초단기실황, 10분 간격)만 쓴다 — 관측이라
+    target_ts가 미래면 애초에 존재하지 않는다(이 함수는 "막 지난 시각"을 다루는
+    용도). target_ts가 미래(horizon>1)면 `_resolve_live_weather()`가 이 함수 대신
+    `_get_forecast_weather()`를 먼저 시도한다 — 이 함수는 target_ts가 anchor_ts와
+    같거나 과거일 때, 또는 예보를 못 찾았을 때의 fallback으로만 호출된다.
+    target_ts 키가 정확히 있으면 그걸, 없으면(수집 지연) 거슬러 올라가 가장 최근
+    값을 대신 쓴다.
 
     args:
-        target_ts: 조회하려는 시각(horizon에 따라 미래일 수 있음)
+        target_ts: 조회하려는 시각
         lookback_hours: target_ts 키가 없을 때 몇 시간 전까지 대신 찾아볼지
     returns:
         dict[str, float]: temp, precip (wind/humidity는 더 이상 모델 피처가 아니라 안 읽음)
@@ -566,6 +580,47 @@ def _get_recent_weather(target_ts: pd.Timestamp, lookback_hours: float = 3) -> d
             row = df.rename(columns=silver_schema.WEATHER_COLUMN_MAP).iloc[-1]
             return {"temp": float(row["temp"]), "precip": float(row["precip"])}
     raise ValueError(f"최근 {lookback_hours}시간 안에 날씨 데이터가 없습니다(target_ts={target_ts})")
+
+
+def _get_forecast_weather(target_ts: pd.Timestamp, issue_lookback_hours: float = 24.0) -> dict[str, float] | None:
+    """target_ts(미래) 시각의 예보(`weather_short_term_forecast`)를 찾는다.
+
+    관측 소스와 달리 파일 하나에 미래 여러 시각의 예보가 여러 행으로 들어있다 —
+    그래서 "그 시각의 파일"을 바로 읽는 게 아니라, 가장 최근에 발표된 예보
+    파일부터 훑으면서 그 안에서 target_ts와 가장 가까운 행을 골라 쓴다. 타겟
+    시각은 `fcstDate`(YYYYMMDD)+`fcstTime`(HHMM, KST) 두 컬럼을 합쳐서 구한다
+    (단일 컬럼이 아님 — 기상청 raw 응답 자체가 이 형태, `loader/transform.py`의
+    `weather_forecast_from_silver()`가 같은 소스를 이미 이렇게 읽고 있어 그
+    스키마를 그대로 근거로 쓴다). 강수량(`PCP`)은 순수 숫자가 아니라
+    "강수없음"/"1.0mm 미만"/"30.0~50.0mm" 같은 텍스트가 섞여 있어
+    `silver_schema.parse_kma_precip_text()`로 파싱한다 — 단순 컬럼 rename으로는
+    안 된다.
+
+    args:
+        target_ts: 예보를 찾으려는 미래 시각
+        issue_lookback_hours: 예보 발표 파일을 몇 시간 전까지 거슬러 찾아볼지
+            (발표 주기가 정확히 알려지지 않아 넉넉히 잡음, `weather_forecast_issue_keys()` 참고)
+    returns:
+        dict[str, float] | None: temp, precip — 예보 파일을 하나도 못 찾거나
+            타겟 시각 컬럼이 없거나 강수량 파싱에 전부 실패하면 None(호출부가
+            관측치 fallback으로 넘어감)
+    """
+    keys = silver_schema.weather_forecast_issue_keys(target_ts, issue_lookback_hours)
+    date_col, time_col = silver_schema.WEATHER_FORECAST_DATE_COLUMN, silver_schema.WEATHER_FORECAST_TIME_COLUMN
+    for df in reversed(s3_io.read_parquet_many(keys)):  # 가장 최근 발표 파일부터
+        if df is None or df.empty or date_col not in df.columns or time_col not in df.columns:
+            continue
+        fcst_ts = pd.to_datetime(
+            df[date_col].astype(str) + df[time_col].astype(str).str.zfill(4), format="%Y%m%d%H%M"
+        )
+        # 위치 기반으로 가장 가까운 행을 찾는다 — 라벨(.loc[idxmin()]) 기반은 여러
+        # 발표 조각을 pd.concat()해 인덱스가 겹치면 행 여러 개를 한꺼번에 돌려준다.
+        row = df.iloc[(fcst_ts - target_ts).abs().to_numpy().argmin()].rename(silver_schema.WEATHER_FORECAST_COLUMN_MAP)
+        precip = silver_schema.parse_kma_precip_text(row.get("PCP"))
+        if precip is None or "temp" not in row.index:
+            continue
+        return {"temp": float(row["temp"]), "precip": precip}
+    return None
 
 
 def _get_recent_bike_status(anchor_ts: pd.Timestamp, lookback_hours: float = 1.0) -> pd.DataFrame:
@@ -1090,7 +1145,7 @@ def predict_demand_multi_hour(
         target_ts = anchor_ts + pd.Timedelta(hours=h - 1)
         h_temp = None if temp is None else _resolve_weather_for_horizon(temp, h, n_hours, "temp")
         h_precip = None if precip is None else _resolve_weather_for_horizon(precip, h, n_hours, "precip")
-        h_temp, h_precip = _resolve_live_weather(target_ts, h_temp, h_precip)
+        h_temp, h_precip = _resolve_live_weather(target_ts, anchor_ts, h_temp, h_precip)
         target_fields, population_fallback = _build_target_time_fields(
             station_id, station_row, target_ts, h_temp, h_precip, population, stockout, h,
         )
@@ -1267,7 +1322,7 @@ def predict_demand_multi_hour_all_stations(
         target_ts = anchor_ts + pd.Timedelta(hours=h - 1)
         t_temp = None if temp is None else _resolve_weather_for_horizon(temp, h, n_hours, "temp")
         t_precip = None if precip is None else _resolve_weather_for_horizon(precip, h, n_hours, "precip")
-        t_temp, t_precip = _resolve_live_weather(target_ts, t_temp, t_precip)
+        t_temp, t_precip = _resolve_live_weather(target_ts, anchor_ts, t_temp, t_precip)
         for sid in alive_station_ids:
             sid_stockout, sid_stockout_fallback = _stockout_from_status(sid, bike_status, stockout)
             target_fields, population_fallback = _build_target_time_fields(
@@ -1322,16 +1377,29 @@ def predict_demand_multi_hour_all_stations(
 
 
 def _resolve_live_weather(
-    target_ts: pd.Timestamp, temp: float | None, precip: float | None
+    target_ts: pd.Timestamp, anchor_ts: pd.Timestamp, temp: float | None, precip: float | None
 ) -> tuple[float, float]:
     """둘 중 하나라도 None이면 target_ts 기준 Silver 실시간 날씨로 나머지도 같이 채운다.
 
     (둘을 한 번에 같이 조회하는 이유: 실제로 둘 다 안 주고 전부 실시간으로 받는 게
     정상적인 호출 방식이고, 일부만 주는 건 테스트/디버깅용 — 그런 섞어 쓰기에서도
     같은 관측 하나에서 나온 값끼리 일관되게 채워지도록 조회는 항상 한 번만 한다.)
+
+    **관측 vs 예보 분기(2026-08)**: target_ts가 anchor_ts(호출부의 "지금", T0)보다
+    미래면(horizon>1) 그 시각의 날씨는 아직 관측되지 않았으므로 예보
+    (`_get_forecast_weather()`)를 먼저 시도하고, 예보를 못 찾을 때만 관측치
+    (`_get_recent_weather()`, 사실상 "지금 날씨" 재사용)로 대체한다. target_ts가
+    anchor_ts와 같거나 과거면(horizon=1 또는 수집 지연 재현) 처음부터 관측치만
+    쓴다 — 실제 wall-clock(`pd.Timestamp.now()`)을 안 쓰고 항상 호출부가 넘긴
+    anchor_ts와 비교하는 이유는, 이 모듈의 다른 함수들처럼 "지금"을 인자로만
+    받아 테스트 가능하게 유지하기 위함이다(과거 날짜로도 결정적으로 재현 가능).
     """
     if temp is None or precip is None:
-        weather = _get_recent_weather(target_ts)
+        weather = None
+        if target_ts > anchor_ts:
+            weather = _get_forecast_weather(target_ts)
+        if weather is None:
+            weather = _get_recent_weather(target_ts)
         temp = weather["temp"] if temp is None else temp
         precip = weather["precip"] if precip is None else precip
     return temp, precip
@@ -1422,7 +1490,7 @@ def predict_rental_demand(
     """
     anchor_ts = _target_timestamp(date, hour, minute)
     target_ts = anchor_ts + pd.Timedelta(hours=horizon - 1)
-    temp, precip = _resolve_live_weather(target_ts, temp, precip)
+    temp, precip = _resolve_live_weather(target_ts, anchor_ts, temp, precip)
     stockout, stockout_fallback = _resolve_live_stockout(station_id, anchor_ts, stockout)
     result = _predict_at(
         "rental",
@@ -1473,8 +1541,9 @@ def predict_return_demand(
         ValueError: station_id가 station_master에 없거나 hour/minute/horizon이
             범위를 벗어날 때(`_build_feature_record()` 참고)
     """
-    target_ts = _target_timestamp(date, hour, minute) + pd.Timedelta(hours=horizon - 1)
-    temp, precip = _resolve_live_weather(target_ts, temp, precip)
+    anchor_ts = _target_timestamp(date, hour, minute)
+    target_ts = anchor_ts + pd.Timedelta(hours=horizon - 1)
+    temp, precip = _resolve_live_weather(target_ts, anchor_ts, temp, precip)
     return _predict_at(
         "return",
         None,
@@ -1527,7 +1596,8 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--temp", type=_parse_weather_arg, default=None,
         help="기온(°C) — 스칼라(전체 horizon 재사용) 또는 --n-hours와 길이가 같은 콤마구분 배열(예: 20,21,21.5). "
-        "생략하면 Silver `weather_forecast`에서 실시간 조회(운영 시 실제 호출 방식)",
+        "생략하면 미래 시각은 Silver `weather_short_term_forecast`(예보), 그 외엔 "
+        "`weather_ultra_short_live`(관측)에서 실시간 조회(운영 시 실제 호출 방식)",
     )
     parser.add_argument("--precip", type=_parse_weather_arg, default=None, help="강수량(mm) — --temp와 동일 형식·기본값")
     parser.add_argument(
@@ -1594,9 +1664,9 @@ def main(argv: list[str] | None = None) -> None:
 
         if failed:
             # Gold 적재 등 downstream이 stderr 로그를 안 봐도 partial 여부를 알 수 있게
-            # 실패 목록을 결과 옆에 별도 파일로 남기고, 종료 코드로도 partial임을 알린다
-            # (run_full_pipeline.py/monthly_retrain_check.py처럼 subprocess.run(check=True)로
-            # 호출하는 쪽이 이 실패를 놓치지 않도록).
+            # 실패 목록을 결과 옆에 별도 파일로 남긴다(run_full_pipeline.py/
+            # monthly_retrain_check.py처럼 subprocess.run(check=True)로 호출하는
+            # 쪽도 이 파일로 partial 여부를 확인할 수 있음).
             failed_path = (
                 silver_schema.predictions_failed_key(window_start)
                 if not args.out
@@ -1604,7 +1674,15 @@ def main(argv: list[str] | None = None) -> None:
             )
             s3_io.write_json(failed_path, failed)
             print(f"실패 {len(failed):,}건 목록 저장: {failed_path}", file=sys.stderr)
-            raise SystemExit(1)
+            # **2026-08 정정**: 전에는 실패가 하나라도 있으면(2,582개 중 1개여도) exit
+            # 1로 종료했다 — Airflow의 run_inference 태스크가 그대로 FAILED 처리돼서,
+            # 이미 위에서 S3에 저장한 2,581개의 정상 예측 결과가 load_forecast_points로
+            # 이어지지 못하고 통째로 버려지는 운영 취약점이 있었다(리뷰 지적). 완전히
+            # 아무것도 성공 못 했을 때만(시스템 자체가 잘못됐다는 신호) exit 1로 막고,
+            # 부분 실패는 exit 0으로 통과시켜 성공한 결과라도 적재되게 한다 — 실패
+            # 건수 자체는 위 failed_path 파일과 종료 메시지로 계속 확인 가능하다.
+            if outcome["actual_count"] == 0:
+                raise SystemExit(1)
         raise SystemExit(0)
 
     common = {
