@@ -507,8 +507,10 @@ if __name__ == "__main__":
     # 운영 엔트리포인트는 train_rental_model.py/train_return_model.py(모델 아카이브
     # 경로/프로필까지 처리)이고, 이 블록은 로컬 ad-hoc 실행용이다. models_prefix에
     # 기본값이 없으므로(챔피언 자리에 직접 못 씀) 여기서도 실제 엔트리포인트와
-    # 똑같이 아카이브 경로를 명시적으로 계산해서 넘긴다.
-    _archive_prefix = archive_models_prefix(config.today_kst().isoformat(), common_config.PROFILE_NAME)
+    # 똑같이 아카이브 경로를 명시적으로 계산해서 넘긴다 — 같은 날 두 번 돌려도
+    # archive_prefix가 겹치면 안 되므로 config.unique_archive_date() 사용
+    # (config.today_kst()만 쓰면 안 됨, unique_archive_date() 참고).
+    _archive_prefix = archive_models_prefix(config.unique_archive_date(), common_config.PROFILE_NAME)
 
     rental_metrics = train_target(
         "rental_count", "rental", _archive_prefix, exposure_col="rental_exposure"

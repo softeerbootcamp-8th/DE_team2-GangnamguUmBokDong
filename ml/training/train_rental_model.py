@@ -7,8 +7,10 @@ horizon=1..HORIZON_COUNT 전체를 학습한다(history.md 18번 항목 — "hor
 이 결과를 챔피언과 비교해 조건을 만족할 때만 챔피언 포인터가 이 아카이브
 prefix를 가리키도록 원자적으로 전환한다(`training/scripts/monthly_retrain_check.py`
 참고). 날짜/프로필은
-`MODEL_ARCHIVE_DATE`/`ML_PROFILE` 환경변수로 정해진다(둘 다 미지정 시 오늘 날짜 /
-"default" 프로필 — 수동 실행 시 그대로 씀).
+`MODEL_ARCHIVE_DATE`/`ML_PROFILE` 환경변수로 정해진다(둘 다 미지정 시 실행마다
+유일한 날짜 / "default" 프로필 — 수동 실행 시 그대로 씀. `MODEL_ARCHIVE_DATE`
+미지정 기본값이 실행마다 달라야 하는 이유는 `config.unique_archive_date()` 참고
+— 같은 날 두 번 실행해도 archive_prefix가 겹치면 안 됨).
 """
 
 import json
@@ -17,7 +19,7 @@ import os
 from ml_core import common_config
 from ml_core.paths import archive_models_prefix
 
-from .config import today_kst
+from .config import unique_archive_date
 from .train_common import run_and_notify_on_failure, train_target
 
 
@@ -27,7 +29,7 @@ def main() -> dict:
     returns:
         dict: train_target()의 평가 지표
     """
-    archive_date = os.environ.get("MODEL_ARCHIVE_DATE", today_kst().isoformat())
+    archive_date = os.environ.get("MODEL_ARCHIVE_DATE", unique_archive_date())
     models_prefix = archive_models_prefix(archive_date, common_config.PROFILE_NAME)
 
     metrics = train_target(

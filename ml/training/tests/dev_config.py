@@ -10,6 +10,7 @@ from training.config import (
     VALID_DAYS_OF_MONTH,
     safety_cutoff_date,
     today_kst,
+    unique_archive_date,
 )
 
 
@@ -35,3 +36,18 @@ def test_train_window_is_rolling_and_ends_at_safety_cutoff():
     assert TRAIN_WINDOW_END == safety_cutoff_date()
     assert TRAIN_WINDOW_START < TRAIN_WINDOW_END
     assert date(2000, 1, 1) <= TRAIN_WINDOW_START
+
+
+def test_unique_archive_date_embeds_given_date_but_differs_across_calls():
+    """회귀 재현 — archive_models_prefix()는 date+profile_name만으로 경로를 만들어서,
+    같은 날 같은 프로필로 학습을 두 번 돌리면(수동 재실행 등) archive_prefix가
+    겹쳐 이미 챔피언이 가리키는 아티팩트를 비원자적으로 덮어쓸 수 있었다(리뷰
+    지적). unique_archive_date()가 매 호출마다 다른 값을 내야 이 문제가 해결된다."""
+    as_of = date(2026, 8, 19)
+
+    a = unique_archive_date(as_of)
+    b = unique_archive_date(as_of)
+
+    assert a != b
+    assert a.startswith("2026-08-19-")
+    assert b.startswith("2026-08-19-")

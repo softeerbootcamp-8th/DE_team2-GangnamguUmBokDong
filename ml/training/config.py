@@ -8,6 +8,7 @@
 """
 
 import os
+import uuid
 from datetime import date, timedelta
 
 from ml_core import common_config
@@ -24,11 +25,36 @@ __all__ = [
     "RENTAL_MULTI_HORIZON_FEATURES_TABLE_PARQUET",
     "RETURN_MULTI_HORIZON_FEATURES_TABLE_PARQUET",
     "today_kst",
+    "unique_archive_date",
 ]
 
 # KST 기준 "오늘"은 이제 common_config.py 소유다(feature_engine도 학습기간 롤링
 # 윈도우 계산에 필요해져서 공유 위치로 옮김) — 여기는 하위 호환을 위해 그대로 재수출.
 today_kst = common_config.today_kst
+
+
+def unique_archive_date(as_of: date | None = None) -> str:
+    """실행마다 유일한 아카이브 날짜 문자열("{오늘}-{실행 유일 접미사}")을 만든다.
+
+    `ml_core.paths.archive_models_prefix()`는 date+profile_name만으로 경로를
+    만들기 때문에, 같은 날 같은 프로필로 학습을 두 번 실행하면(수동 재실행, 다른
+    오케스트레이터의 재시도 등) archive_prefix가 겹쳐 이미 챔피언이 가리키는
+    아티팩트를 비원자적으로 덮어쓸 수 있다(리뷰 지적 — archive는 immutable이어야
+    한다는 설계가 무력화됨). 이 유일성은 "학습 한 번의 시도" 단위로 호출부가
+    한 번만 계산해서 archive_models_prefix()에 넘겨야 한다 — 그 함수 자체 안에서
+    매번 새 값을 생성하면, 같은 시도 안에서 이 함수를 여러 번 호출하는 곳
+    (`monthly_retrain_check.py`가 학습 시작 시/승격 판단 시 두 번 호출)이 서로
+    다른 prefix를 보게 돼 깨진다. `MODEL_ARCHIVE_DATE`가 명시되지 않은 모든 학습
+    진입점(train_rental_model.py/train_return_model.py/train_common.py의 ad-hoc
+    블록/monthly_retrain_check.py)이 이 함수를 기본값으로 써서, 어느 경로로
+    실행되든 매 실행이 항상 새 archive_prefix를 가리키게 한다.
+
+    args:
+        as_of: 기준 날짜(기본 오늘) — 테스트에서 날짜를 고정하기 위한 override
+    returns:
+        str: "YYYY-MM-DD-{8자리 hex}"
+    """
+    return f"{(as_of or today_kst()).isoformat()}-{uuid.uuid4().hex[:8]}"
 
 # --- 학습/검증/평가 split (day-of-month 기준) ---
 # 예전엔 TRAIN/VALID/TEST를 시간 순(walk-forward)으로 연속 구간(20/5/5일)만 뽑아

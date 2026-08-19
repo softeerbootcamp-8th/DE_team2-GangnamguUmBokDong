@@ -49,7 +49,6 @@ import argparse
 import os
 import subprocess
 import sys
-import uuid
 
 from core import s3 as s3_io
 from ml_core import common_config
@@ -60,7 +59,7 @@ from ml_core.paths import (
     read_champion_prefix,
 )
 
-from ..config import today_kst
+from ..config import unique_archive_date
 from ..monitor_performance import _load_baseline_metrics, check_all_models
 from ..promotion import promote_challenger, should_promote
 
@@ -230,9 +229,11 @@ def _attempt_promotion(model_name: str, champion_metrics: dict | None) -> bool:
     # — 이미 그 prefix가 챔피언 포인터가 가리키는 곳이라면, 학습 subprocess가
     # 파일을 그 자리에 다시 쓰는 순간 원자적 포인터 설계가 무력화된다(should_promote()
     # 가 이 챌린저를 반려해도 이미 챔피언 아티팩트는 비원자적으로 교체된 뒤 —
-    # 리뷰 지적). 실행마다 고유한 접미사를 붙여 archive_prefix 자체가 항상 새
-    # 위치를 가리키게 한다(archive가 immutable이라는 가정을 실제로 보장).
-    archive_date = f"{today_kst().isoformat()}-{uuid.uuid4().hex[:8]}"
+    # 리뷰 지적). unique_archive_date()가 실행마다 고유한 접미사를 붙여
+    # archive_prefix 자체가 항상 새 위치를 가리키게 한다(archive가 immutable이라는
+    # 가정을 실제로 보장 — train_rental_model.py/train_return_model.py의
+    # MODEL_ARCHIVE_DATE 미지정 기본값도 동일한 이유로 같은 함수를 쓴다).
+    archive_date = unique_archive_date()
     for profile_name, env_overrides in _candidate_profiles(model_name):
         try:
             _trigger_feature_pipeline(profile_name, env_overrides)
