@@ -17,7 +17,11 @@
 `station_id`만 채워지고 나머지는 빈 값이 된다 — 지어내지 않는다.
 
 매핑 신뢰도는 교차 검증으로 확인했다. 1단계와 3단계가 모두 맞은 2,636건에서
-`stationId`가 **100% 일치**했다.
+`stationId`가 **100% 일치**했다. 단 이 교차검증은 *API와 대여이력 사이*의 일치를 본
+것이고, *대여이력 파일들 사이*의 번호 재사용은 검증 대상이 아니었다 — 대여소번호는
+폐기 후 재사용될 수 있어 station_id와 1:1이 아니다. 3단계는 파일명순(=시간순)으로
+읽어 최신 기간의 id를 채택하고, 덮어쓴 사실은 `history_id_conflicts` 통계와 경고
+로그로 남긴다(`_read_history_ids` 참고).
 
 `bikeStationMaster`는 쓸 수 없다. `ADDR2`가 대여소 번호가 아니라 상세주소
 (`"더샵스타시티 C동 앞"`)라서 번호로 조인할 방법이 없다.
@@ -63,6 +67,9 @@ _HISTORY_PATTERN = "서울특별시 공공자전거 대여이력 정보_*.csv"
 _HISTORY_ENCODING = "cp949"
 # (대여소번호 컬럼, 대여소ID 컬럼) 쌍. 한 행이 대여·반납 두 대여소를 담는다.
 _HISTORY_COLUMN_PAIRS = (("대여 대여소번호", "대여대여소ID"), ("반납대여소번호", "반납대여소ID"))
+# 충돌 로그/stats에 남기는 샘플 개수. manifest를 비대하게 만들지 않으면서 "어느 번호가
+# 충돌했나"를 바로 짚을 수 있는 최소한.
+_MAX_CONFLICT_SAMPLE = 5
 
 
 @dataclass(frozen=True)
@@ -149,20 +156,50 @@ def _info_from_api(row: dict) -> StationInfo:
     )
 
 
-def _read_history_ids(csv_dir: Path) -> dict[str, str]:
-    """대여이력 CSV들에서 `대여소번호 -> 대여소ID` 매핑을 모은다.
+def _read_history_ids(csv_dir: Path) -> tuple[dict[str, str], list[str]]:
+    """대여이력 CSV들에서 `대여소번호 -> 대여소ID` 매핑을 모으고 충돌을 함께 기록한다.
 
     대여·반납 두 컬럼 쌍을 모두 읽는다 — 한쪽에만 나오는 대여소가 있다.
+
+    ⚠️ 대여소번호는 station_id와 1:1이 **아니다**. 폐기된 대여소의 번호가 나중에 다른
+    대여소에 재사용될 수 있어서, 같은 `00102`가 2024년 파일에서는 `ST-4`, 2025년
+    파일에서는 `ST-999`로 나올 수 있다. 파일을 파일명순(=사실상 시간순)으로 읽으므로
+    나중 파일이 이긴다 — 최신 id가 지금 살아있는 대여소를 가리킬 가능성이 높아 이 동작
+    자체는 유지하되, 덮어쓴 사실을 조용히 삼키지 않고 어느 기간에서 어느 기간으로
+    바뀌었는지 남긴다. 이 매핑은 `bikeList`에 없는 대여소(폐쇄분)에만 쓰이므로 충돌이
+    그대로 적재 결과가 되는 경로다.
+
+    returns:
+        (매핑, 충돌 설명 목록). 충돌 설명은 `"00102: ST-4(2412) -> ST-999(2501)"`
+        형식이고 대여소번호순으로 정렬된다(결정적).
     """
     mapping: dict[str, str] = {}
+    # 현재 매핑값이 어느 파일(기간)에서 왔는지 — 충돌 로그에 시점을 남기기 위한 것.
+    origin: dict[str, str] = {}
+    trail: dict[str, list[str]] = {}
     for path in sorted(csv_dir.glob(_HISTORY_PATTERN)):
+        # "...대여이력 정보_2501.csv" -> "2501"
+        period = path.stem.rsplit("_", 1)[-1]
         with path.open(encoding=_HISTORY_ENCODING, errors="replace", newline="") as handle:
             for row in csv.DictReader(handle):
                 for number_column, id_column in _HISTORY_COLUMN_PAIRS:
                     number, station_id = row.get(number_column), row.get(id_column)
-                    if number and station_id:
-                        mapping[_pad(number)] = station_id
-    return mapping
+                    if not (number and station_id):
+                        continue
+                    padded = _pad(number)
+                    previous = mapping.get(padded)
+                    if previous == station_id:
+                        continue
+                    if previous is not None:
+                        trail.setdefault(padded, [f"{previous}({origin[padded]})"]).append(
+                            f"{station_id}({period})"
+                        )
+                    mapping[padded] = station_id
+                    origin[padded] = period
+    conflicts = [
+        f"{number}: {' -> '.join(steps)}" for number, steps in sorted(trail.items())
+    ]
+    return mapping, conflicts
 
 
 def build(csv_dir: Path | None, *, client: httpx.Client | None = None) -> StationMap:
@@ -194,7 +231,7 @@ def build(csv_dir: Path | None, *, client: httpx.Client | None = None) -> Statio
         if prefix:
             by_number[_pad(prefix.group(1))] = info
 
-    history = _read_history_ids(csv_dir) if csv_dir is not None else {}
+    history, conflicts = _read_history_ids(csv_dir) if csv_dir is not None else ({}, [])
     for number, station_id in history.items():
         # API가 이긴다 — 그쪽만 5개 컬럼을 모두 채운다.
         by_number.setdefault(number, StationInfo(station_id=station_id))
@@ -203,10 +240,20 @@ def build(csv_dir: Path | None, *, client: httpx.Client | None = None) -> Statio
         "built_at": datetime.now(tz=_KST).isoformat(),
         "api_stations": len(api_rows),
         "history_stations": len(history),
+        # 대여소번호 하나가 기간에 따라 서로 다른 station_id로 나타난 건수. manifest에
+        # 실려 남으므로 나중에 "그때 번호가 재사용됐었나"를 되짚을 수 있다.
+        "history_id_conflicts": len(conflicts),
+        "history_id_conflict_sample": conflicts[:_MAX_CONFLICT_SAMPLE],
     }
     logger.info(
         f"stage=bootstrap_station_join api_stations={stats['api_stations']} "
         f"history_stations={stats['history_stations']} by_name={len(by_name)} "
-        f"by_number={len(by_number)}"
+        f"by_number={len(by_number)} history_id_conflicts={stats['history_id_conflicts']}"
     )
+    if conflicts:
+        logger.warning(
+            f"stage=bootstrap_station_join 대여소번호가 기간에 따라 다른 station_id를 가리킴 "
+            f"count={len(conflicts)} sample={stats['history_id_conflict_sample']} "
+            "— 최신 기간의 id를 채택했다"
+        )
     return StationMap(by_name=by_name, by_number=by_number, stats=stats)

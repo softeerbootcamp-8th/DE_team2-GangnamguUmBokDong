@@ -6,6 +6,7 @@ required로 요구한다. 세 소스를 겹쳐 매핑표를 만든다 — 실측
 """
 
 import json
+import logging
 
 import httpx
 import pytest
@@ -178,6 +179,70 @@ class TestHistoryFallback:
         table = build(tmp_path, client=client)
 
         assert table.lookup("00211", "211. 여의도역") is None
+
+
+class TestHistoryIdConflict:
+    """대여소번호는 폐기 후 재사용될 수 있어 station_id와 1:1이 아니다."""
+
+    def _two_periods(self, tmp_path):
+        """같은 `00102`가 2412에는 ST-4, 2501에는 ST-999로 나오는 두 파일."""
+        _write_history(tmp_path,
+            "SPB-1,2024-12-01 00:00:00,00102,102. 망원역,02191,대학동,ST-4,ST-2375\n",
+            name="서울특별시 공공자전거 대여이력 정보_2412.csv")
+        _write_history(tmp_path,
+            "SPB-2,2025-01-01 00:00:00,00102,102. 망원역,02191,대학동,ST-999,ST-2375\n",
+            name="서울특별시 공공자전거 대여이력 정보_2501.csv")
+        return tmp_path
+
+    def test_records_conflict_with_period_trail(self, tmp_path):
+        """조용히 덮어쓰지 않고 어느 기간에서 어느 기간으로 바뀌었는지 남긴다."""
+        d = self._two_periods(tmp_path)
+        client = _client([[]])
+
+        table = build(d, client=client)
+
+        assert table.stats["history_id_conflicts"] == 1
+        assert table.stats["history_id_conflict_sample"] == ["00102: ST-4(2412) -> ST-999(2501)"]
+
+    def test_latest_period_wins(self, tmp_path):
+        """최신 id가 지금 살아있는 대여소를 가리킬 가능성이 높다 — 동작은 유지한다."""
+        d = self._two_periods(tmp_path)
+        client = _client([[]])
+
+        info = build(d, client=client).lookup("00102", "102. 망원역")
+
+        assert info.station_id == "ST-999"
+
+    def test_warns_when_conflict_found(self, tmp_path, caplog):
+        d = self._two_periods(tmp_path)
+        client = _client([[]])
+
+        with caplog.at_level(logging.WARNING, logger="bootstrap.station_join"):
+            build(d, client=client)
+
+        assert "00102: ST-4(2412) -> ST-999(2501)" in caplog.text
+
+    def test_reports_no_conflict_when_ids_are_stable(self, tmp_path):
+        """같은 번호가 같은 id로만 나오면 충돌이 아니다 — 정상 로그를 오염시키지 않는다."""
+        _write_history(tmp_path,
+            "SPB-1,2024-12-01 00:00:00,00102,102. 망원역,02191,대학동,ST-4,ST-2375\n",
+            name="서울특별시 공공자전거 대여이력 정보_2412.csv")
+        _write_history(tmp_path,
+            "SPB-2,2025-01-01 00:00:00,00102,102. 망원역,02191,대학동,ST-4,ST-2375\n",
+            name="서울특별시 공공자전거 대여이력 정보_2501.csv")
+        client = _client([[]])
+
+        table = build(tmp_path, client=client)
+
+        assert table.stats["history_id_conflicts"] == 0
+        assert table.stats["history_id_conflict_sample"] == []
+
+    def test_reports_no_conflict_when_history_is_skipped(self):
+        client = _client([[_station("ST-4", "102. 망원역 1번출구 앞")]])
+
+        table = build(None, client=client)
+
+        assert table.stats["history_id_conflicts"] == 0
 
 
 class TestUnknownStation:
