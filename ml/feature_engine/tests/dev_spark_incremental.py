@@ -42,6 +42,7 @@ from feature_engine.spark.build_rolling_rental_features import (
     build_rolling_rental_features,
 )
 from feature_engine.spark.run_pipeline import (
+    _incremental_since,
     _refresh_primary_tables,
     _reject_if_legacy_flat_layout,
     _run_incremental,
@@ -208,6 +209,61 @@ def test_incremental_append_matches_full_rebuild(spark, synthetic_environment, t
     )
 
     pd.testing.assert_frame_equal(got_new, expected_new, check_dtype=False, check_exact=False, rtol=1e-9)
+
+
+def test_incremental_does_not_corrupt_lag_at_the_recompute_boundary(spark, synthetic_environment, tmp_path):
+    """회귀 재현 — 증분 재계산이 실제로 덮어쓰는 날짜 파티션 중 **가장 이른 tick**
+    (재계산 구간의 자정 경계, `since_dt`)이 이미 정상값으로 발행돼 있던 걸 NULL/
+    과소값으로 덮어쓰면 안 된다.
+
+    `build_features()`의 lag는 "hour_ts - 1시간" self-join이라, 재계산에 쓰는
+    DataFrame이 `since_dt`부터만 있으면 그 첫 tick은 이전 시간대 데이터를 못 봐서
+    lag가 NULL이 된다(`rental_lag_1h`은 rolling 창(window+embargo)이 짧게 잘려
+    과소집계). 이 tick은 "새로 생기는 데이터"가 아니라 **이전 실행에서 이미 정상
+    값으로 발행됐던** 파티션이라, 매 증분 실행마다 이 결함으로 덮어써지면 회귀가
+    영구 반복된다 — `test_incremental_append_matches_full_rebuild`는 워터마크
+    "이후"(새 데이터)만 비교해서 이 경계는 잡지 못한다.
+    """
+    watermark_cutoff = synthetic_environment["watermark_cutoff"]
+    since_dt = _incremental_since(watermark_cutoff.to_pydatetime())
+
+    # (A) 기준값 — 전체 재계산 기준으로 since_dt 당일의 lag.
+    full_rolling_path = str(tmp_path / "full_rolling_boundary.parquet")
+    build_rolling_rental_features(spark, output_path=full_rolling_path)
+    full_merged = build_merged_table(spark)
+    full_features = build_features(spark, full_merged, rolling_parquet_path=full_rolling_path)
+    since_dt_ts = pd.Timestamp(since_dt)
+    expected_boundary = (
+        full_features.filter(F.col("hour_ts") == F.lit(since_dt_ts))
+        .select(*COMPARE_COLS)
+        .toPandas()
+    )
+    assert len(expected_boundary) > 0  # 이 테스트 데이터 범위 안에 실제로 존재하는 tick이어야 의미가 있음
+    assert expected_boundary["rental_lag_1h"].notna().all()
+    assert expected_boundary["return_lag_1h"].notna().all()
+
+    # 기존 피처마트(챔피언 산출물) — since_dt 당일도 이미 "정상값으로" 써져 있던 상태.
+    existing = full_features.filter(F.col("hour_ts") <= F.lit(watermark_cutoff))
+    existing.write.mode("overwrite").partitionBy("date").parquet(fe_config.FEATURES_TABLE_PARQUET)
+    write_watermark(fe_config.WATERMARK_PATH, watermark_cutoff.isoformat(), {})
+
+    # (B) 증분 실행 — since_dt 날짜 파티션이 덮어써진다.
+    _run_incremental(spark, {"max_hour_ts": watermark_cutoff.isoformat()})
+
+    got_boundary = (
+        spark.read.parquet(fe_config.FEATURES_TABLE_PARQUET)
+        .filter(F.col("hour_ts") == F.lit(since_dt_ts))
+        .select(*COMPARE_COLS)
+        .toPandas()
+    )
+
+    assert got_boundary["rental_lag_1h"].notna().all(), "증분 재계산이 경계 tick의 rental_lag_1h를 NULL로 덮어씀"
+    assert got_boundary["return_lag_1h"].notna().all(), "증분 재계산이 경계 tick의 return_lag_1h를 NULL로 덮어씀"
+    pd.testing.assert_frame_equal(
+        got_boundary.sort_values("hour_ts").reset_index(drop=True),
+        expected_boundary.sort_values("hour_ts").reset_index(drop=True),
+        check_dtype=False, check_exact=False, rtol=1e-9,
+    )
 
 
 def test_incremental_corrects_rental_count_for_late_arriving_trip(spark, synthetic_environment, tmp_path):

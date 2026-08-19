@@ -32,6 +32,17 @@ append 방식(이전 구현)은 워터마크 이하 행을 전부 버렸기 때�
 그 날의 앞부분(이번에 다시 안 만든 시간대)까지 통째로 지워지므로, 반드시 자정
 경계로 내림한 뒤 그 날짜 전체를 다시 계산해야 한다.
 
+**"읽는" 시작점과 "덮어쓰는" 시작점은 다르다(2026-08 수정)**: `build_features()`의
+lag(`hour_ts - 1시간` self-join)/rolling(과거 최대 window+embargo분 트립 집계)은
+재계산 구간의 **경계 바로 이전** 데이터를 필요로 한다. 덮어쓰는 시작점(`since_dt`)
+그대로 읽기 시작점으로도 쓰면, `since_dt` 자정 근처 tick들이 그 이전 컨텍스트를
+전혀 못 보고 lag가 NULL이 되거나 rolling 카운트가 과소집계된다 — 이 문제는 매
+증분 실행마다 반복되므로, 그때마다 **이미 이전 실행에서 정상값으로 써져 있던**
+`since_dt` 날짜 파티션이 이 결함 있는 값으로 덮어써진다(신규 데이터가 아니라
+기존 정상 데이터가 손상되는 회귀). 그래서 실제로는 `since_dt`보다 하루 더 이전부터
+읽어서(`_run_incremental()`의 `read_since_dt`) self-join/rolling에 필요한 컨텍스트를
+확보하고, 계산이 끝난 뒤 `since_dt` 이후 행만 남겨서 그 부분만 덮어쓴다.
+
 **학습 시 주의 — "아직 확정 안 된 최근 구간"**: 워터마크 파일(`watermark.py`)의
 `updated_at`(이 파이프라인이 실제로 실행된 시각) 기준으로 `updated_at -
 INCREMENTAL_LOOKBACK_HOURS`보다 최신인 날짜는 아직 위 사후 보정 대상이다 — 다음
@@ -203,6 +214,23 @@ def _run_incremental(spark, watermark: dict) -> None:
     print(f"[{config.PARAM_COMBO_ID}] 워터마크={watermark_dt} -> {since_str}부터 재계산(증분, "
           f"lookback={config.INCREMENTAL_LOOKBACK_HOURS}시간, 날짜 경계로 내림)")
 
+    # **읽는 시작점(read_since_dt)과 실제로 덮어쓰는 시작점(since_dt)을 분리한다**
+    # (리뷰 지적, 2026-08 수정). build_features()의 rental_lag_1h/return_lag_1h는
+    # "hour_ts - 1시간" 행을 찾는 self-join이고, rental_lag_1h는 그 안에서
+    # censored_rolling_counts()가 최대 (ROLLING_WINDOW_MINUTES+ROLLING_EMBARGO_MINUTES)
+    # 분 이전 트립까지 봐야 한다 — 그런데 since_dt를 그대로 읽기 시작점으로 쓰면,
+    # merged_increment/rolling 계산에 since_dt 이전 데이터가 아예 없어서 since_dt
+    # 자정 근처 tick들의 lag가 NULL이 되거나(self-join 짝을 못 찾음) 과소집계된다
+    # (rolling 창이 실제보다 짧게 잘림). 문제는 이게 "새로 생기는 구간"이 아니라
+    # **이미 이전 실행에서 정상값으로 써져 있던 since_dt 날짜 파티션을 매 증분
+    # 실행마다 이 결함 있는 값으로 덮어쓴다**는 것 — 하루 여유를 두고 더 일찍부터
+    # 읽어서(day 경계 정렬을 유지하는 가장 단순한 마진 — 기본 프로필의 window+embargo
+    # 100분보다 넉넉함) self-join/rolling이 실제 과거 데이터를 보게 하고, 실제
+    # 파티션 덮어쓰기 대상(및 워터마크 갱신 기준)은 여전히 since_dt 이후로만
+    # 아래에서 다시 필터링해 제한한다.
+    read_since_dt = since_dt - timedelta(days=1)
+    read_since_str = read_since_dt.strftime("%Y-%m-%d %H:%M:%S")
+
     # _refresh_primary_tables()는 위 since_str(증분 워터마크 기준, 보통 최근 며칠~몇 주)이
     # 아니라 학습기간 롤링 윈도우 시작점(config.WINDOW_START)을 쓴다 — station_status/
     # weather/population/targets는 그 자체가 학습에 쓰이는 전체 구간을 커버해야 하고,
@@ -215,10 +243,13 @@ def _run_incremental(spark, watermark: dict) -> None:
     # 90분), 매 증분마다 저장소를 늘리기보다 build_features가 읽을 임시 parquet으로만
     # 써둔다.
     rolling_tmp_path = f"{config.OUTPUT_ROOT}/_rolling_incremental_tmp.parquet"
-    build_rolling_rental_features(spark, output_path=rolling_tmp_path, since=since_str)
+    build_rolling_rental_features(spark, output_path=rolling_tmp_path, since=read_since_str)
 
-    merged_increment = build_merged_table(spark, since=since_str)
+    merged_increment = build_merged_table(spark, since=read_since_str)
     features_increment = build_features(spark, merged_increment, rolling_parquet_path=rolling_tmp_path)
+    # lag/rolling 계산용으로만 더 읽은 read_since_dt~since_dt 구간은 실제 overwrite
+    # 대상이 아니다(위 주석 참고) — since_dt 이후만 남긴다.
+    features_increment = features_increment.filter(F.col("hour_ts") >= F.lit(since_str))
 
     if features_increment.limit(1).count() == 0:
         print(f"[{config.PARAM_COMBO_ID}] 재계산 구간({since_str}~)에 데이터 없음 — 건너뜀")
