@@ -138,7 +138,7 @@ def synthetic_environment(spark, tmp_path, monkeypatch):
             "_source_kind": "bootstrap",
         } for h in day_hours]
         pop_rows = [{
-            "YMD": f"{h:%Y%m%d}", "TT": f"{h:%H}", "H_DNG_CD": "",
+            "YMD": f"{h:%Y%m%d}", "TT": f"{h:%H}", "H_DNG_CD": "11110515",
             "CELL_ID": "다사00000000", "SPOP": 102.0,
             "is_estimated": False, "estimation_method": "actual",
         } for h in day_hours]
@@ -204,7 +204,10 @@ def synthetic_environment(spark, tmp_path, monkeypatch):
     )
     _write_parquet(
         archive_root / "living_population_grid" / "dt=2025-01-26.parquet",
-        pd.DataFrame([{"YMD": "20250127", "TT": "00", "CELL_ID": "다사00000000", "SPOP": 102.0}]),
+        pd.DataFrame([{
+            "YMD": "20250127", "TT": "00", "H_DNG_CD": "11110515",
+            "CELL_ID": "다사00000000", "SPOP": 102.0,
+        }]),
     )
     # build_targets는 경계 전 출발/경계 뒤 수집을 보존하려고 rental partition만
     # INCREMENTAL_LOOKBACK_HOURS 앞과 TRAINING_SAFETY_MARGIN_DAYS 뒤까지 읽는다.

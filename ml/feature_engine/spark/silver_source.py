@@ -54,6 +54,7 @@ _ARCHIVE_REQUIRED_COLUMNS: dict[str, tuple[tuple[str, ...], ...]] = {
     silver_schema.POPULATION_SOURCE_ID: (
         ("YMD",),
         ("TT",),
+        ("H_DNG_CD",),
         ("CELL_ID",),
         ("SPOP",),
     ),
@@ -170,6 +171,52 @@ def _optional_column(df: DataFrame, name: str, dtype: str) -> Column:
 def _archive_window_start(df: DataFrame) -> Column:
     """Archive 표준 `_window_start`를 timestamp_ntz로 파싱한다."""
     return F.to_timestamp(_optional_column(df, "_window_start", "string")).cast("timestamp_ntz")
+
+
+def _population_hour_ts() -> Column:
+    """숫자형/숫자 문자열 `YMD`·`TT`를 엄격한 정시각으로 변환한다.
+
+    과거 CSV에서 생성된 Parquet의 `TT` 문자열은 `"0 "`처럼 한 자리이거나
+    뒤 공백이 붙을 수 있다. parser에 넘기기 전에 trim하고 시각을 2자리로
+    zero-padding하되, 날짜는 정확히 8자리 정수이고 시각은 0~23의
+    1~2자리 정수인 경우만 받는다. 잘못된 행은 학습 범위 필터에서
+    조용히 사라지지 않고 Spark job을 실패시킨다.
+    """
+    ymd_text = F.trim(F.col("YMD").cast("string"))
+    hour_text = F.trim(F.col("TT").cast("string"))
+    ymd_is_integer = ymd_text.rlike(r"^[0-9]{8}$")
+    hour_is_integer = hour_text.rlike(r"^[0-9]{1,2}$")
+    hour_number = hour_text.cast("int")
+    normalized = F.concat_ws(" ", ymd_text, F.lpad(hour_number.cast("string"), 2, "0"))
+    parsed = F.try_to_timestamp(normalized, F.lit("yyyyMMdd HH")).cast("timestamp_ntz")
+    valid = ymd_is_integer & hour_is_integer & hour_number.between(0, 23) & parsed.isNotNull()
+    error_message = F.concat(
+        F.lit("Archive living_population_grid YMD/TT가 잘못됐습니다: YMD="),
+        F.coalesce(ymd_text, F.lit("<null>")),
+        F.lit(", TT="),
+        F.coalesce(hour_text, F.lit("<null>")),
+        F.lit(" (YMD=yyyyMMdd, TT=0..23 정수 필수)"),
+    )
+    return F.when(valid, parsed).otherwise(F.raise_error(error_message)).cast("timestamp_ntz")
+
+
+def _population_h_dng_cd() -> Column:
+    """행정동 코드를 trim하고 필수 숫자 문자열 계약을 엄격히 검증한다.
+
+    서울 API의 `H_DNG_CD`는 뒤 공백을 붙여 내려보내므로 논리 키로 사용하기
+    전에 반드시 trim해야 한다. 이 컬럼은 source 설정상 required이고 행정동
+    코드이므로 null·빈 문자열·숫자가 아닌 값은 서로 같은 빈 키로 합치지 않고
+    Spark job을 실패시킨다. 코드 길이는 과거 적재물 간 차이를 허용한다.
+    """
+    raw_text = F.col("H_DNG_CD").cast("string")
+    normalized = F.trim(raw_text)
+    valid = normalized.isNotNull() & (F.length(normalized) > 0) & normalized.rlike(r"^[0-9]+$")
+    error_message = F.concat(
+        F.lit("Archive living_population_grid H_DNG_CD가 잘못됐습니다: H_DNG_CD="),
+        F.coalesce(raw_text, F.lit("<null>")),
+        F.lit(" (공백이 아닌 숫자 문자열 필수)"),
+    )
+    return F.when(valid, normalized).otherwise(F.raise_error(error_message)).cast("string")
 
 
 def read_station_master(spark: SparkSession) -> DataFrame:
@@ -417,10 +464,12 @@ def read_population(
     pop_short_foreign 구분이 없다 — `SPOP`(총 인구)만 `pop_total`로 쓰고, `pop_resd`는
     `pop_total`과 같다고 근사(전부 내국인으로 간주)한 뒤 나머지 둘은 0으로 둔다.
     (2) nowcaster는 `is_estimated`/`estimation_method`를 붙이고 실측 도착 시 실제
-    `YMD` 날짜 archive를 갱신한다. 같은 `(grid_id, hour_ts)`가 중복되면 명시적 actual,
-    메타 없는 호환 실측, estimated 순으로 고르고, 같은 등급에서는 최신
-    `_window_start`/archive 날짜를 우선한다. 메타 컬럼 자체가 없어도 필수 물리 컬럼이
-    있으면 호환 실측으로 처리한다.
+    `YMD` 날짜 archive를 갱신한다. `H_DNG_CD` 뒤 공백을 제거한 뒤 같은
+    `(H_DNG_CD, grid_id, hour_ts)` 안에서 명시적 actual, 메타 없는 호환 실측,
+    estimated 순으로 한 revision만 고르고, 같은 등급에서는 최신
+    `_window_start`/archive 날짜를 우선한다. 그 다음 서로 다른 행정동 component의
+    `SPOP`을 격자·시간별로 합산한다. 전부 null인 합계는 0으로 바꾸지 않고 null로
+    유지한다. 메타 컬럼 자체가 없어도 필수 물리 컬럼이 있으면 호환 실측으로 처리한다.
 
     args:
         spark: SparkSession
@@ -437,10 +486,8 @@ def read_population(
     )
     df = df.withColumn("_collected_ts", _archive_window_start(df))
     df = _rename(df, silver_schema.POPULATION_COLUMN_MAP)
-    df = df.withColumn(
-        "hour_ts",
-        F.to_timestamp(F.concat_ws(" ", F.col("YMD"), F.col("TT")), "yyyyMMdd HH").cast("timestamp_ntz"),
-    )
+    df = df.withColumn("hour_ts", _population_hour_ts())
+    df = df.withColumn("_h_dng_cd", _population_h_dng_cd())
     df = df.filter(
         (F.col("hour_ts") >= F.lit(since_bound))
         & (F.col("hour_ts") < F.lit(until_bound))
@@ -455,6 +502,7 @@ def read_population(
         .otherwise(F.lit(1))
     )
     df = df.select(
+        "_h_dng_cd",
         "grid_id",
         "hour_ts",
         F.col("pop_total").cast("double").alias("pop_total"),
@@ -463,16 +511,22 @@ def read_population(
         actual_priority.alias("_actual_priority"),
     )
 
-    window = Window.partitionBy("grid_id", "hour_ts").orderBy(
+    # 동일 우선순위·수집시각·archive 날짜까지 겹친 비정상 중복은 non-null/큰
+    # SPOP을 안정적인 최종 tie-breaker로 써 Spark 실행 순서에 좌우되지 않게 한다.
+    window = Window.partitionBy("_h_dng_cd", "grid_id", "hour_ts").orderBy(
         F.col("_actual_priority").desc(),
         F.col("_collected_ts").desc_nulls_last(),
         F.col("_archive_dt").desc_nulls_last(),
+        F.col("pop_total").desc_nulls_last(),
     )
     df = (
         df.withColumn("_rn", F.row_number().over(window))
         .filter(F.col("_rn") == 1)
         .drop("_rn", "_actual_priority", "_collected_ts", "_archive_dt")
     )
+    # Spark sum은 non-null component만 더하고 모든 component가 null일 때 null을
+    # 반환한다. 따라서 masking된 전체 그룹을 인구 0으로 오해하지 않는다.
+    df = df.groupBy("grid_id", "hour_ts").agg(F.sum("pop_total").alias("pop_total"))
     df = df.withColumn("pop_resd", F.col("pop_total"))
     df = df.withColumn("pop_long_foreign", F.lit(0.0))
     df = df.withColumn("pop_short_foreign", F.lit(0.0))

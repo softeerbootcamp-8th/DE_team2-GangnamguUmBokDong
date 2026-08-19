@@ -134,12 +134,12 @@ def test_read_population_prefers_actual_then_latest_snapshot(spark, _data_roots)
         archive_root / "living_population_grid" / "dt=2025-06-01.parquet",
         pd.DataFrame([
             {
-                "YMD": "20250601", "TT": "08", "H_DNG_CD": "", "CELL_ID": "G1",
+                "YMD": "20250601", "TT": "08", "H_DNG_CD": "11110515", "CELL_ID": "G1",
                 "SPOP": 100.0, "is_estimated": False, "estimation_method": "actual",
                 "_window_start": "2025-06-01T09:00:00+09:00",
             },
             {
-                "YMD": "20250601", "TT": "08", "H_DNG_CD": "", "CELL_ID": "G1",
+                "YMD": "20250601", "TT": "08", "H_DNG_CD": "11110515", "CELL_ID": "G1",
                 "SPOP": 999.0, "is_estimated": True, "estimation_method": "weighted_avg",
                 "_window_start": "2025-06-01T23:00:00+09:00",
             },
@@ -148,7 +148,7 @@ def test_read_population_prefers_actual_then_latest_snapshot(spark, _data_roots)
     _write_parquet(
         archive_root / "living_population_grid" / "dt=2025-06-02.parquet",
         pd.DataFrame([{
-            "YMD": "20250601", "TT": "08", "H_DNG_CD": "", "CELL_ID": "G1",
+            "YMD": "20250601", "TT": "08", "H_DNG_CD": "11110515", "CELL_ID": "G1",
             "SPOP": 200.0, "is_estimated": False, "estimation_method": "actual",
             "_window_start": "2025-06-02T09:00:00+09:00",
         }]),
@@ -163,6 +163,162 @@ def test_read_population_prefers_actual_then_latest_snapshot(spark, _data_roots)
     assert df.iloc[0]["pop_resd"] == pytest.approx(200.0)
     assert df.iloc[0]["pop_long_foreign"] == 0.0
     assert df.iloc[0]["pop_short_foreign"] == 0.0
+
+
+def test_read_population_sums_distinct_h_dng_components_after_revision_dedupe(
+    spark,
+    _data_roots,
+):
+    """행정동별 최신 revision만 고른 뒤 같은 격자의 서로 다른 component를 합산한다."""
+    archive_root = _data_roots["archive"]
+    _write_parquet(
+        archive_root / "living_population_grid" / "dt=2025-06-01.parquet",
+        pd.DataFrame([
+            {
+                "YMD": "20250601", "TT": "08", "H_DNG_CD": "11110515     ",
+                "CELL_ID": "G1", "SPOP": 10.0, "is_estimated": True,
+                "estimation_method": "weighted_avg", "_window_start": "2025-06-01T08:05:00+09:00",
+            },
+            {
+                "YMD": "20250601", "TT": "08", "H_DNG_CD": "11110515",
+                "CELL_ID": "G1", "SPOP": 20.0, "is_estimated": False,
+                "estimation_method": "actual", "_window_start": "2025-06-01T09:05:00+09:00",
+            },
+            {
+                "YMD": "20250601", "TT": "08", "H_DNG_CD": "11110530",
+                "CELL_ID": "G1", "SPOP": 7.0, "is_estimated": False,
+                "estimation_method": "actual", "_window_start": "2025-06-01T09:05:00+09:00",
+            },
+        ]),
+    )
+
+    population = read_population(
+        spark,
+        since="2025-06-01 00:00:00",
+        until="2025-06-02 00:00:00",
+    ).toPandas()
+
+    assert len(population) == 1
+    assert population.iloc[0]["pop_total"] == pytest.approx(27.0)
+
+
+def test_read_population_preserves_all_null_component_sum(spark, _data_roots):
+    """격자·시각의 모든 행정동 SPOP가 마스킹되면 합계를 0이 아닌 null로 둔다."""
+    archive_root = _data_roots["archive"]
+    rows = pd.DataFrame([
+        {"YMD": "20250601", "TT": "08", "H_DNG_CD": "11110515", "CELL_ID": "G1", "SPOP": None},
+        {"YMD": "20250601", "TT": "08", "H_DNG_CD": "11110530", "CELL_ID": "G1", "SPOP": None},
+    ])
+    rows["SPOP"] = rows["SPOP"].astype("float64")
+    _write_parquet(
+        archive_root / "living_population_grid" / "dt=2025-06-01.parquet",
+        rows,
+    )
+
+    population = read_population(
+        spark,
+        since="2025-06-01 00:00:00",
+        until="2025-06-02 00:00:00",
+    ).toPandas()
+
+    assert len(population) == 1
+    assert pd.isna(population.iloc[0]["pop_total"])
+    assert pd.isna(population.iloc[0]["pop_resd"])
+
+
+@pytest.mark.parametrize(
+    ("ymd", "tt", "expected"),
+    [
+        (20250216, 0, pd.Timestamp("2025-02-16 00:00:00")),
+        ("20250216", "0 ", pd.Timestamp("2025-02-16 00:00:00")),
+        ("20250216", "9", pd.Timestamp("2025-02-16 09:00:00")),
+    ],
+)
+def test_read_population_normalizes_integer_and_numeric_string_hours(
+    spark,
+    _data_roots,
+    ymd,
+    tt,
+    expected,
+):
+    """실제 Archive의 `TT=0 ` 및 정수형 시각을 2자리로 정규화한다."""
+    archive_root = _data_roots["archive"]
+    _write_parquet(
+        archive_root / "living_population_grid" / "dt=2025-02-16.parquet",
+        pd.DataFrame([{
+            "YMD": ymd,
+            "TT": tt,
+            "H_DNG_CD": "11110515",
+            "CELL_ID": "G1",
+            "SPOP": 123.0,
+        }]),
+    )
+
+    population = read_population(
+        spark,
+        since="2025-02-16 00:00:00",
+        until="2025-02-17 00:00:00",
+    ).toPandas()
+
+    assert len(population) == 1
+    assert population.iloc[0]["hour_ts"] == expected
+
+
+@pytest.mark.parametrize(
+    ("ymd", "tt"),
+    [
+        ("20250216", "24"),
+        ("20250216", "3.5"),
+        ("20250230", "0"),
+        ("2025-02-16", "0"),
+    ],
+)
+def test_read_population_fails_closed_for_invalid_ymd_or_hour(spark, _data_roots, ymd, tt):
+    """시각 계약 위반 행을 조용히 누락하지 않고 Spark job을 실패시킨다."""
+    archive_root = _data_roots["archive"]
+    _write_parquet(
+        archive_root / "living_population_grid" / "dt=2025-02-16.parquet",
+        pd.DataFrame([{
+            "YMD": ymd,
+            "TT": tt,
+            "H_DNG_CD": "11110515",
+            "CELL_ID": "G1",
+            "SPOP": 123.0,
+        }]),
+    )
+
+    population = read_population(
+        spark,
+        since="2025-02-16 00:00:00",
+        until="2025-02-17 00:00:00",
+    )
+    with pytest.raises(Exception, match="Archive living_population_grid YMD/TT"):
+        population.collect()
+
+
+@pytest.mark.parametrize("h_dng_cd", ["", "   ", "not-a-code"])
+def test_read_population_fails_closed_for_invalid_h_dng_cd(
+    spark,
+    _data_roots,
+    h_dng_cd,
+):
+    """required 행정동 코드가 비었거나 숫자 코드가 아니면 조용히 합치지 않는다."""
+    archive_root = _data_roots["archive"]
+    _write_parquet(
+        archive_root / "living_population_grid" / "dt=2025-06-01.parquet",
+        pd.DataFrame([{
+            "YMD": "20250601", "TT": "08", "H_DNG_CD": h_dng_cd,
+            "CELL_ID": "G1", "SPOP": 123.0,
+        }]),
+    )
+
+    population = read_population(
+        spark,
+        since="2025-06-01 00:00:00",
+        until="2025-06-02 00:00:00",
+    )
+    with pytest.raises(Exception, match="Archive living_population_grid H_DNG_CD"):
+        population.collect()
 
 
 def test_archive_readers_use_status_and_weather_availability_time(spark, _data_roots):
@@ -490,13 +646,31 @@ def test_incompatible_daily_archive_schema_fails_closed(spark, _data_roots):
         )
 
 
+def test_population_archive_missing_required_h_dng_cd_fails_closed(spark, _data_roots):
+    """생활인구 Archive에 required 행정동 코드 컬럼이 없으면 schema 단계에서 실패한다."""
+    archive_root = _data_roots["archive"]
+    _write_parquet(
+        archive_root / "living_population_grid" / "dt=2025-06-01.parquet",
+        pd.DataFrame([{
+            "YMD": "20250601", "TT": "08", "CELL_ID": "G1", "SPOP": 123.0,
+        }]),
+    )
+
+    with pytest.raises(ValueError, match="H_DNG_CD"):
+        read_population(
+            spark,
+            since="2025-06-01 00:00:00",
+            until="2025-06-02 00:00:00",
+        )
+
+
 def test_metadata_free_population_and_status_physical_time_are_supported(spark, _data_roots):
     """메타 없는 실측 인구와 물리 stationDt가 있는 과거 재고는 그대로 처리한다."""
     archive_root = _data_roots["archive"]
     _write_parquet(
         archive_root / "living_population_grid" / "dt=2025-06-01.parquet",
         pd.DataFrame([{
-            "YMD": "20250601", "TT": "08", "H_DNG_CD": "", "CELL_ID": "G1", "SPOP": 123.0,
+            "YMD": "20250601", "TT": "08", "H_DNG_CD": "11110515", "CELL_ID": "G1", "SPOP": 123.0,
         }]),
     )
     _write_parquet(
@@ -572,8 +746,8 @@ def test_refresh_keeps_current_silver_master_and_refilters_archive_upper_bound(
     _write_parquet(
         archive_root / "living_population_grid" / "dt=2025-12-31.parquet",
         pd.DataFrame([
-            {"YMD": "20251231", "TT": "23", "H_DNG_CD": "", "CELL_ID": "G1", "SPOP": 100.0},
-            {"YMD": "20260101", "TT": "00", "H_DNG_CD": "", "CELL_ID": "G1", "SPOP": 200.0},
+            {"YMD": "20251231", "TT": "23", "H_DNG_CD": "11110515", "CELL_ID": "G1", "SPOP": 100.0},
+            {"YMD": "20260101", "TT": "00", "H_DNG_CD": "11110515", "CELL_ID": "G1", "SPOP": 200.0},
         ]),
     )
 
