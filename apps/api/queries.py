@@ -1,261 +1,629 @@
-import math
-from collections import defaultdict
-from datetime import UTC, date, datetime, timedelta
+"""Gold PostGIS serving schema를 조회하고 route 상태를 전이한다."""
 
-from core.db import fetch_all, fetch_one
+from __future__ import annotations
 
-# station_urgency는 sta_id당 최신 1건만 upsert되므로(#124), 배치가 몇 회 연속으로
-# 멈춰도 마지막 값이 그대로 남는다. "낡은 값을 최신인 것처럼 보여주지 않는다"는
-# 원칙(#107)을 유지하려면 조회 시점에 신선도를 직접 걸러야 한다 — 5분 배치가
-# 한 번 밀리는 것까지는 허용하고, 그보다 오래되면 알림에서 제외한다.
-ALERTS_FRESHNESS_WINDOW_MIN = 10
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from enum import StrEnum
+from typing import Any
+from uuid import UUID
 
-# 대여소 주변 몇 km 이내 행사를 "주변 행사"로 볼지. 지도의 주변 회수필요 후보
-# 반경(StationMap.tsx의 NEARBY_RADIUS_KM=1, 도보 이동 기준)보다 넉넉하게 잡았다
-# — 행사는 도보 범위를 넘어 대중교통으로도 사람을 끌어모으기 때문이다. 실측
-# 검증은 아직 없는 첫 추정값이라, 실제 행사-수요 상관관계 데이터가 쌓이면
-# 조정해야 한다(#102 완료 기준 참고).
+from core.db import fetch_all, fetch_one, get_connection
+from psycopg import Cursor
+from psycopg.errors import CheckViolation
+from psycopg.rows import dict_row
+
+STOCK_FRESHNESS = timedelta(minutes=10)
+DEMAND_FRESHNESS = timedelta(minutes=10)
+WEATHER_FRESHNESS = timedelta(minutes=45)
+EVENT_FRESHNESS = timedelta(hours=36)
+FUTURE_TOLERANCE = timedelta(minutes=5)
+FORECAST_HOUR_COUNT = 12
 NEARBY_EVENT_RADIUS_KM = 1.5
-_EARTH_RADIUS_KM = 6371.0
 
 
-def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    """두 위경도 지점 사이의 대권거리(직선거리)를 km로 반환한다."""
-    p1, p2 = math.radians(lat1), math.radians(lat2)
-    dphi = math.radians(lat2 - lat1)
-    dlambda = math.radians(lon2 - lon1)
-    h = math.sin(dphi / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dlambda / 2) ** 2
-    return 2 * _EARTH_RADIUS_KM * math.asin(math.sqrt(h))
+class ForecastState(StrEnum):
+    """수요예측 API가 응답할 수 있는 상태를 나타낸다."""
+
+    READY = "ready"
+    STATION_NOT_FOUND = "station_not_found"
+    FORECAST_NOT_AVAILABLE = "forecast_not_available"
+    FORECAST_NOT_READY = "forecast_not_ready"
+    STOCK_NOT_ALIGNED = "stock_forecast_not_aligned"
 
 
-def _floor_to_5min(dt: datetime) -> datetime:
-    """주어진 시각을 5분 단위로 내림한다."""
-    return dt - timedelta(minutes=dt.minute % 5, seconds=dt.second, microseconds=dt.microsecond)
+@dataclass(frozen=True)
+class ForecastResult:
+    """수요예측 조회 결과와 실패 원인을 함께 보관한다."""
+
+    state: ForecastState
+    station: dict[str, Any] | None = None
+    base_dttm: datetime | None = None
+    points: tuple[dict[str, Any], ...] = ()
 
 
-def fetch_stations() -> list[dict]:
-    """대여소 마스터와 각 대여소의 최신 재고를 반환한다."""
-    query = """
-        SELECT s.sta_id, s.sta_nm, s.gu, s.sta_addr, s.lat, s.lon, s.hold_cnt,
-               stock.parking_bike_tot_cnt, stock.observed_at AS base_dttm
-        FROM stations s
-        JOIN station_stock stock ON stock.sta_id = s.sta_id
-        ORDER BY s.sta_id
-    """
-    return fetch_all(query)
+class WeatherState(StrEnum):
+    """시간별 날씨 API가 응답할 수 있는 상태를 나타낸다."""
+
+    READY = "ready"
+    STATION_NOT_FOUND = "station_not_found"
+    WEATHER_NOT_READY = "weather_not_ready"
 
 
-def fetch_station(sta_id: str) -> dict | None:
-    """대여소 하나의 마스터 + 최신 재고를 반환한다. 없으면 None."""
-    query = """
-        SELECT s.sta_id, s.sta_nm, s.gu, s.sta_addr, s.lat, s.lon, s.hold_cnt,
-               stock.parking_bike_tot_cnt, stock.observed_at AS base_dttm
-        FROM stations s
-        JOIN station_stock stock ON stock.sta_id = s.sta_id
-        WHERE s.sta_id = %(sta_id)s
-    """
-    return fetch_one(query, {"sta_id": sta_id})
+@dataclass(frozen=True)
+class WeatherResult:
+    """시간별 날씨 조회 결과와 실패 원인을 함께 보관한다."""
+
+    state: WeatherState
+    points: tuple[dict[str, Any], ...] = ()
 
 
-def fetch_forecast_points(sta_id: str, now: datetime) -> list[dict]:
-    """미래 구간을 가진 최신 배치 한 건의 예측만 시간순으로 반환한다."""
-    query = """
-        WITH latest_batch AS (
-            SELECT max(batch_run_at) AS batch_run_at
-            FROM forecast_points
-            WHERE predicted_dttm > %(now)s
-        )
-        SELECT predicted_dttm, predicted_rent_cnt, predicted_return_cnt
-        FROM forecast_points
-        WHERE sta_id = %(sta_id)s
-          AND predicted_dttm > %(now)s
-          AND batch_run_at = (SELECT batch_run_at FROM latest_batch)
-        ORDER BY predicted_dttm
-    """
-    return fetch_all(query, {"sta_id": sta_id, "now": now})
+class RouteTransitionResult(StrEnum):
+    """route 상태 전이 결과를 API와 독립적인 값으로 나타낸다."""
 
-
-def fetch_alerts(now: datetime) -> list[dict]:
-    """전체 대여소의 재배치 우선순위 알림을 station_urgency(배치가 미리 계산한
-    결과)에서 urgency_score 내림차순으로 조회한다. ALERTS_FRESHNESS_WINDOW_MIN보다
-    오래된 값(배치가 멈췄거나 지연된 대여소)은 낡은 값을 최신인 것처럼 보여주지
-    않기 위해 제외한다. region은 위경도가 있어야 계산되므로 stations와 조인해서
-    같이 가져온다."""
-    query = """
-        SELECT s.sta_id, s.sta_nm, s.lat, s.lon,
-               u.action_type, u.urgency_score, u.minutes_until_critical
-        FROM station_urgency u
-        JOIN stations s ON s.sta_id = u.sta_id
-        WHERE u.batch_run_at >= %(cutoff)s
-        ORDER BY u.urgency_score DESC
-    """
-    cutoff = now - timedelta(minutes=ALERTS_FRESHNESS_WINDOW_MIN)
-    return fetch_all(query, {"cutoff": cutoff})
-
-
-def fetch_batch_run_at(now: datetime) -> datetime:
-    """미래 예측이 있는 최신 배치 시각. 결과가 없으면 전체 최신값 또는 현재 시각."""
-    row = fetch_one(
-        """
-        SELECT COALESCE(
-            max(batch_run_at) FILTER (WHERE predicted_dttm > %(now)s),
-            max(batch_run_at)
-        ) AS latest
-        FROM forecast_points
-        """,
-        {"now": now},
-    )
-    latest = row["latest"] if row else None
-    return latest if latest is not None else _floor_to_5min(now)
+    NOT_FOUND = "not_found"
+    WRONG_STATUS = "wrong_status"
+    CONSTRAINT_CONFLICT = "constraint_conflict"
 
 
 def now_utc() -> datetime:
-    """UTC 현재 시각(timezone-aware)을 반환한다."""
+    """UTC 현재 시각을 timezone-aware 값으로 반환한다."""
     return datetime.now(UTC)
 
 
-def _fetch_stops_for_routes(route_ids: list[str]) -> dict[str, list[dict]]:
-    """여러 라우트의 스톱을 쿼리 1번으로 가져와 route_id별로 묶어서 반환한다
-    (N+1 쿼리를 피하기 위함). stations와 조인해 지도 렌더링에 필요한
-    sta_nm/lat/lon도 같이 준다."""
-    if not route_ids:
-        return {}
-    query = """
-        SELECT s.route_id, s.visit_order, s.sta_id, st.sta_nm, st.lat, st.lon, s.action, s.bike_cnt
-        FROM rebalance_route_stops s
-        JOIN stations st ON st.sta_id = s.sta_id
-        WHERE s.route_id = ANY(%(route_ids)s)
-        ORDER BY s.route_id, s.visit_order
+def _is_fresh(value: datetime | None, now: datetime, max_age: timedelta) -> bool:
+    """시각이 과거 freshness와 5분 미래 허용 범위 안인지 확인한다."""
+    return value is not None and now - max_age <= value <= now + FUTURE_TOLERANCE
+
+
+def _start_read_snapshot(cursor: Cursor[dict[str, Any]]) -> None:
+    """여러 SELECT가 하나의 읽기 snapshot을 사용하도록 transaction을 설정한다."""
+    cursor.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+
+
+def fetch_stations(now: datetime) -> list[dict[str, Any]]:
+    """활성 대여소와 같은 anchor의 신선한 최신 재고를 반환한다."""
+    return fetch_all(
+        """
+        SELECT s.sta_id,
+               s.sta_nm,
+               ST_Y(s.sta_point) AS lat,
+               ST_X(s.sta_point) AS lon,
+               s.hold_cnt,
+               stock.parking_bike_tot_cnt,
+               stock.base_dttm,
+               center.dispatch_center_nm AS region
+          FROM station AS s
+          JOIN station_stock AS stock
+            ON stock.sta_id = s.sta_id
+           AND stock.base_dttm = s.last_seen_dttm
+          JOIN dispatch_center AS center
+            ON center.dispatch_center_id = s.dispatch_center_id
+           AND center.is_active
+         WHERE s.is_active
+           AND stock.base_dttm BETWEEN %(now)s - INTERVAL '10 minutes'
+                                   AND %(now)s + INTERVAL '5 minutes'
+         ORDER BY s.sta_id
+        """,
+        {"now": now},
+    )
+
+
+def fetch_station(sta_id: str, now: datetime) -> dict[str, Any] | None:
+    """활성 대여소 하나와 같은 anchor의 신선한 최신 재고를 반환한다."""
+    return fetch_one(
+        """
+        SELECT s.sta_id,
+               s.sta_nm,
+               s.sta_addr,
+               ST_Y(s.sta_point) AS lat,
+               ST_X(s.sta_point) AS lon,
+               s.hold_cnt,
+               stock.parking_bike_tot_cnt,
+               stock.base_dttm,
+               center.dispatch_center_nm AS region
+          FROM station AS s
+          JOIN station_stock AS stock
+            ON stock.sta_id = s.sta_id
+           AND stock.base_dttm = s.last_seen_dttm
+          JOIN dispatch_center AS center
+            ON center.dispatch_center_id = s.dispatch_center_id
+           AND center.is_active
+         WHERE s.sta_id = %(sta_id)s
+           AND s.is_active
+           AND stock.base_dttm BETWEEN %(now)s - INTERVAL '10 minutes'
+                                   AND %(now)s + INTERVAL '5 minutes'
+        """,
+        {"sta_id": sta_id, "now": now},
+    )
+
+
+def _read_forecast_snapshot(
+    sta_id: str,
+) -> tuple[
+    dict[str, Any] | None,
+    dict[str, Any],
+    list[dict[str, Any]],
+    dict[str, Any] | None,
+]:
+    """대여소·수요 projection·재고를 하나의 DB snapshot에서 읽는다."""
+    with (
+        get_connection() as connection,
+        connection.cursor(row_factory=dict_row) as cursor,
+    ):
+        _start_read_snapshot(cursor)
+        cursor.execute(
+            """
+            SELECT sta_id, hold_cnt, last_seen_dttm
+              FROM station
+             WHERE sta_id = %(sta_id)s
+               AND is_active
+            """,
+            {"sta_id": sta_id},
+        )
+        station = cursor.fetchone()
+        cursor.execute(
+            """
+            SELECT count(*) AS row_cnt,
+                   min(base_dttm) AS min_base_dttm,
+                   max(base_dttm) AS max_base_dttm
+              FROM station_demand_forecast
+            """
+        )
+        demand_summary = cursor.fetchone()
+        assert demand_summary is not None
+        cursor.execute(
+            """
+            SELECT base_dttm,
+                   predicted_dttm,
+                   predicted_rent_cnt,
+                   predicted_rtn_cnt AS predicted_return_cnt
+              FROM station_demand_forecast
+             WHERE sta_id = %(sta_id)s
+             ORDER BY predicted_dttm
+            """,
+            {"sta_id": sta_id},
+        )
+        points = cursor.fetchall()
+        cursor.execute(
+            """
+            SELECT sta_id, base_dttm, parking_bike_tot_cnt
+              FROM station_stock
+             WHERE sta_id = %(sta_id)s
+            """,
+            {"sta_id": sta_id},
+        )
+        stock = cursor.fetchone()
+    return station, demand_summary, points, stock
+
+
+def fetch_forecast(sta_id: str, now: datetime) -> ForecastResult:
+    """대여소의 정렬된 미래 12시간 수요예측과 같은 anchor 재고를 판정한다."""
+    station, summary, points, stock = _read_forecast_snapshot(sta_id)
+    if station is None:
+        return ForecastResult(ForecastState.STATION_NOT_FOUND)
+
+    common_base = summary["min_base_dttm"]
+    if (
+        summary["row_cnt"] == 0
+        or common_base != summary["max_base_dttm"]
+        or not _is_fresh(common_base, now, DEMAND_FRESHNESS)
+    ):
+        return ForecastResult(ForecastState.FORECAST_NOT_READY)
+
+    if not points:
+        return ForecastResult(ForecastState.FORECAST_NOT_AVAILABLE)
+
+    expected_targets = [
+        common_base + timedelta(hours=hour)
+        for hour in range(1, FORECAST_HOUR_COUNT + 1)
+    ]
+    actual_targets = [point["predicted_dttm"] for point in points]
+    if (
+        len(points) != FORECAST_HOUR_COUNT
+        or any(point["base_dttm"] != common_base for point in points)
+        or actual_targets != expected_targets
+        or any(target <= now for target in actual_targets)
+    ):
+        return ForecastResult(ForecastState.FORECAST_NOT_READY)
+
+    if (
+        stock is None
+        or stock["base_dttm"] != common_base
+        or station["last_seen_dttm"] != stock["base_dttm"]
+        or not _is_fresh(stock["base_dttm"], now, STOCK_FRESHNESS)
+    ):
+        return ForecastResult(ForecastState.STOCK_NOT_ALIGNED)
+
+    response_station = {
+        **station,
+        "parking_bike_tot_cnt": stock["parking_bike_tot_cnt"],
+    }
+    response_points = tuple(
+        {
+            "predicted_dttm": point["predicted_dttm"],
+            "predicted_rent_cnt": point["predicted_rent_cnt"],
+            "predicted_return_cnt": point["predicted_return_cnt"],
+        }
+        for point in points
+    )
+    return ForecastResult(
+        ForecastState.READY,
+        response_station,
+        common_base,
+        response_points,
+    )
+
+
+def fetch_status_base_dttm(now: datetime) -> datetime | None:
+    """fresh하고 전체 행에 공통인 실제 demand base를 반환한다."""
+    summary = fetch_one(
+        """
+        SELECT count(*) AS row_cnt,
+               min(base_dttm) AS min_base_dttm,
+               max(base_dttm) AS max_base_dttm
+          FROM station_demand_forecast
+        """
+    )
+    if summary is None or summary["row_cnt"] == 0:
+        return None
+    base_dttm = summary["min_base_dttm"]
+    if base_dttm != summary["max_base_dttm"] or not _is_fresh(
+        base_dttm,
+        now,
+        DEMAND_FRESHNESS,
+    ):
+        return None
+    return base_dttm
+
+
+def fetch_nearby_events(
+    sta_id: str,
+    now: datetime,
+    radius_km: float = NEARBY_EVENT_RADIUS_KM,
+) -> list[dict[str, Any]] | None:
+    """활성 station 주변의 신선한 현재·예정 행사를 PostGIS 거리순으로 반환한다.
+
+    활성 station이 없으면 None을 반환하고, station은 있지만 행사가 없으면 빈 목록을
+    반환해 API가 404와 정상 EMPTY를 구분할 수 있게 한다.
     """
-    rows = fetch_all(query, {"route_ids": route_ids})
-    grouped: dict[str, list[dict]] = defaultdict(list)
-    for row in rows:
-        grouped[row.pop("route_id")].append(row)
-    return dict(grouped)
+    with (
+        get_connection() as connection,
+        connection.cursor(row_factory=dict_row) as cursor,
+    ):
+        _start_read_snapshot(cursor)
+        cursor.execute(
+            """
+            SELECT 1
+              FROM station
+             WHERE sta_id = %(sta_id)s
+               AND is_active
+            """,
+            {"sta_id": sta_id},
+        )
+        if cursor.fetchone() is None:
+            return None
+        cursor.execute(
+            """
+            SELECT e.event_id,
+                   e.event_name AS title,
+                   e.event_spot_nm AS place,
+                   e.event_start_dt AS start_date,
+                   e.event_end_dt AS end_date,
+                   ST_Y(e.event_point) AS lat,
+                   ST_X(e.event_point) AS lon,
+                   ST_Distance(
+                       e.event_point::geography,
+                       s.sta_point::geography
+                   ) / 1000.0 AS distance_km
+              FROM station AS s
+              JOIN event AS e
+                ON ST_DWithin(
+                       e.event_point::geography,
+                       s.sta_point::geography,
+                       %(radius_m)s
+                   )
+             WHERE s.sta_id = %(sta_id)s
+               AND s.is_active
+               AND e.event_end_dt >= (%(now)s AT TIME ZONE 'Asia/Seoul')::date
+               AND e.last_seen_dttm BETWEEN %(now)s - INTERVAL '36 hours'
+                                            AND %(now)s + INTERVAL '5 minutes'
+             ORDER BY distance_km, e.event_id
+            """,
+            {"sta_id": sta_id, "now": now, "radius_m": radius_km * 1000.0},
+        )
+        events = cursor.fetchall()
+    return [
+        {**event, "distance_km": round(event["distance_km"], 2)} for event in events
+    ]
+
+
+def _read_weather_snapshot(
+    sta_id: str,
+    now: datetime,
+    hours: int,
+) -> tuple[bool, list[dict[str, Any]]]:
+    """대여소 존재와 날씨 horizon을 하나의 DB snapshot에서 읽는다."""
+    with (
+        get_connection() as connection,
+        connection.cursor(row_factory=dict_row) as cursor,
+    ):
+        _start_read_snapshot(cursor)
+        cursor.execute(
+            """
+            SELECT 1
+              FROM station
+             WHERE sta_id = %(sta_id)s
+               AND is_active
+            """,
+            {"sta_id": sta_id},
+        )
+        if cursor.fetchone() is None:
+            return False, []
+        cursor.execute(
+            """
+            WITH horizon AS (
+                SELECT date_trunc('hour', %(now)s::TIMESTAMPTZ) + INTERVAL '1 hour'
+                           AS first_forecast_dttm
+            )
+            SELECT wf.forecast_dttm,
+                   wf.temperature,
+                   wf.sky_condition_cd,
+                   wf.precipitation_type_cd,
+                   wf.precipitation_prob,
+                   wf.precipitation_amount,
+                   wf.humidity,
+                   wf.wind_speed,
+                   wf.updated_dttm
+              FROM station AS s
+              JOIN weather_forecast AS wf USING (weather_grid_id)
+             CROSS JOIN horizon AS h
+             WHERE s.sta_id = %(sta_id)s
+               AND s.is_active
+               AND wf.forecast_dttm >= h.first_forecast_dttm
+               AND wf.forecast_dttm < h.first_forecast_dttm
+                                          + %(hours)s * INTERVAL '1 hour'
+             ORDER BY wf.forecast_dttm
+            """,
+            {"sta_id": sta_id, "now": now, "hours": hours},
+        )
+        return True, cursor.fetchall()
+
+
+def fetch_weather(
+    sta_id: str,
+    now: datetime,
+    hours: int = FORECAST_HOUR_COUNT,
+) -> WeatherResult:
+    """활성 대여소의 fresh하고 완전한 미래 정시 날씨를 반환한다."""
+    station_exists, rows = _read_weather_snapshot(sta_id, now, hours)
+    if not station_exists:
+        return WeatherResult(WeatherState.STATION_NOT_FOUND)
+
+    first_target = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+    expected_targets = [
+        first_target + timedelta(hours=offset) for offset in range(hours)
+    ]
+    if (
+        len(rows) != hours
+        or [row["forecast_dttm"] for row in rows] != expected_targets
+        or any(
+            not _is_fresh(row["updated_dttm"], now, WEATHER_FRESHNESS) for row in rows
+        )
+    ):
+        return WeatherResult(WeatherState.WEATHER_NOT_READY)
+
+    points = tuple(
+        {key: value for key, value in row.items() if key != "updated_dttm"}
+        for row in rows
+    )
+    return WeatherResult(WeatherState.READY, points)
+
+
+def fetch_regions() -> list[dict[str, Any]]:
+    """활성 배차 센터의 이름과 Point 파생 좌표를 반환한다."""
+    return fetch_all(
+        """
+        SELECT dispatch_center_nm AS region,
+               ST_Y(dispatch_center_point) AS lat,
+               ST_X(dispatch_center_point) AS lon
+          FROM dispatch_center
+         WHERE is_active
+         ORDER BY dispatch_center_id
+        """
+    )
+
+
+def fetch_alerts(now: datetime) -> list[dict[str, Any]]:
+    """같은 fresh anchor와 최신 correction을 만족하는 긴급도만 반환한다."""
+    return fetch_all(
+        """
+        SELECT s.sta_id,
+               s.sta_nm,
+               urgency.rebalance_need_type_cd AS action_type,
+               urgency.urgency_score,
+               urgency.critical_remaining_min AS minutes_until_critical,
+               center.dispatch_center_nm AS region
+          FROM station_urgency AS urgency
+          JOIN station_stock AS stock
+            ON stock.sta_id = urgency.sta_id
+           AND stock.base_dttm = urgency.base_dttm
+          JOIN station AS s
+            ON s.sta_id = urgency.sta_id
+           AND s.is_active
+           AND s.last_seen_dttm = stock.base_dttm
+          JOIN dispatch_center AS center
+            ON center.dispatch_center_id = s.dispatch_center_id
+           AND center.is_active
+         WHERE urgency.base_dttm BETWEEN %(now)s - INTERVAL '10 minutes'
+                                       AND %(now)s + INTERVAL '5 minutes'
+           AND stock.base_dttm BETWEEN %(now)s - INTERVAL '10 minutes'
+                                     AND %(now)s + INTERVAL '5 minutes'
+           AND urgency.updated_dttm >= stock.updated_dttm
+           AND urgency.updated_dttm >= s.updated_dttm
+         ORDER BY urgency.urgency_score DESC, s.sta_id ASC
+        """,
+        {"now": now},
+    )
+
+
+def _route_aggregate_query(where_clause: str, page_clause: str = "") -> str:
+    """route header와 stop을 한 statement에서 읽는 SQL을 만든다."""
+    return f"""
+        WITH route_page AS MATERIALIZED (
+            SELECT route.route_id,
+                   center.dispatch_center_nm AS region,
+                   route.route_status_cd AS status,
+                   route.proposed_dttm AS proposed_at,
+                   route.dispatched_dttm AS dispatched_at,
+                   route.completed_dttm AS completed_at
+              FROM rebalance_route AS route
+              JOIN dispatch_center AS center USING (dispatch_center_id)
+             {where_clause}
+             ORDER BY route.proposed_dttm DESC, route.route_id ASC
+             {page_clause}
+        )
+        SELECT page.route_id::text AS route_id,
+               page.region,
+               page.status,
+               page.proposed_at,
+               page.dispatched_at,
+               page.completed_at,
+               COALESCE(stops.items, '[]'::jsonb) AS stops
+          FROM route_page AS page
+          LEFT JOIN LATERAL (
+              SELECT jsonb_agg(
+                         jsonb_build_object(
+                             'visit_order', stop.visit_no,
+                             'sta_id', stop.sta_id,
+                             'sta_nm', station.sta_nm,
+                             'lat', ST_Y(station.sta_point),
+                             'lon', ST_X(station.sta_point),
+                             'action', stop.route_action_type_cd,
+                             'bike_cnt', stop.bike_cnt
+                         )
+                         ORDER BY stop.visit_no
+                     ) AS items
+                FROM rebalance_route_stop AS stop
+                JOIN station USING (sta_id)
+               WHERE stop.route_id = page.route_id
+          ) AS stops ON true
+         ORDER BY page.proposed_at DESC, page.route_id ASC
+    """
 
 
 def fetch_routes(
-    region: str | None = None, status: str | None = None, limit: int = 100, offset: int = 0
-) -> list[dict]:
-    """재배치 라우트 목록을 스톱과 함께 조회한다. region/status로 선택적으로 필터링한다.
-
-    compute_routes는 5분마다 여러 권역에 걸쳐 라우트를 새로 만들기 때문에(#114),
-    limit/offset 없이 전부 반환하면 응답이 무한정 커질 수 있다 — proposed_at
-    내림차순으로 최신 것부터 limit개만 반환한다."""
+    region: str | None = None,
+    status: str | None = None,
+    limit: int = 100,
+    offset: int = 0,
+) -> list[dict[str, Any]]:
+    """bounded filter와 결정적 순서로 route aggregate 목록을 반환한다."""
     conditions: list[str] = []
-    params: dict = {"limit": limit, "offset": offset}
+    params: dict[str, Any] = {"limit": limit, "offset": offset}
     if region is not None:
-        conditions.append("region = %(region)s")
+        conditions.append("center.dispatch_center_nm = %(region)s")
         params["region"] = region
     if status is not None:
-        conditions.append("status = %(status)s")
+        conditions.append("route.route_status_cd = %(status)s")
         params["status"] = status
-    where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
-
-    query = f"""
-        SELECT route_id, region, status, proposed_at, dispatched_at, completed_at
-        FROM rebalance_routes
-        {where}
-        ORDER BY proposed_at DESC
-        LIMIT %(limit)s OFFSET %(offset)s
-    """
-    routes = fetch_all(query, params)
-    stops_by_route = _fetch_stops_for_routes([route["route_id"] for route in routes])
-    for route in routes:
-        route["stops"] = stops_by_route.get(route["route_id"], [])
-    return routes
-
-
-def fetch_route(route_id: str) -> dict | None:
-    """라우트 하나를 스톱과 함께 조회한다. 없으면 None."""
-    query = """
-        SELECT route_id, region, status, proposed_at, dispatched_at, completed_at
-        FROM rebalance_routes
-        WHERE route_id = %(route_id)s
-    """
-    route = fetch_one(query, {"route_id": route_id})
-    if route is None:
-        return None
-    route["stops"] = _fetch_stops_for_routes([route_id]).get(route_id, [])
-    return route
-
-
-def dispatch_route(route_id: str, now: datetime) -> dict | str:
-    """proposed 상태인 라우트를 dispatched로 전이한다. 상태 체크를 UPDATE의 WHERE절에
-    넣고 RETURNING으로 전이된 행을 그 자리에서 바로 받는다 — UPDATE 따로,
-    조회 따로 하면 그 사이에 다른 요청이 상태를 또 바꿔서(예: 곧바로 complete)
-    응답이 실제로 일어난 일과 다른 상태를 보여줄 수 있다.
-
-    returns: 성공 시 stops 포함 라우트(dict) | "not_found"(라우트 없음) | "wrong_status"(proposed가 아님)
-    """
-    row = fetch_one(
-        """
-        UPDATE rebalance_routes
-        SET status = 'dispatched', dispatched_at = %(now)s
-        WHERE route_id = %(route_id)s AND status = 'proposed'
-        RETURNING route_id, region, status, proposed_at, dispatched_at, completed_at
-        """,
-        {"route_id": route_id, "now": now},
+    where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+    query = _route_aggregate_query(
+        where_clause,
+        "LIMIT %(limit)s OFFSET %(offset)s",
     )
-    if row is None:
-        return "not_found" if fetch_route(route_id) is None else "wrong_status"
-    row["stops"] = _fetch_stops_for_routes([route_id]).get(route_id, [])
-    return row
+    return fetch_all(query, params)
 
 
-def complete_route(route_id: str, now: datetime) -> dict | str:
-    """dispatched 상태인 라우트를 completed로 전이한다. dispatch_route와 동일한 패턴
-    (RETURNING으로 원자적 응답).
-
-    returns: 성공 시 stops 포함 라우트(dict) | "not_found"(라우트 없음) | "wrong_status"(dispatched가 아님)
-    """
-    row = fetch_one(
-        """
-        UPDATE rebalance_routes
-        SET status = 'completed', completed_at = %(now)s
-        WHERE route_id = %(route_id)s AND status = 'dispatched'
-        RETURNING route_id, region, status, proposed_at, dispatched_at, completed_at
-        """,
-        {"route_id": route_id, "now": now},
+def _fetch_route_with_cursor(
+    cursor: Cursor[dict[str, Any]],
+    route_id: UUID,
+) -> dict[str, Any] | None:
+    """현재 transaction에서 route aggregate 하나를 조회한다."""
+    cursor.execute(
+        _route_aggregate_query("WHERE route.route_id = %(route_id)s"),
+        {"route_id": route_id},
     )
-    if row is None:
-        return "not_found" if fetch_route(route_id) is None else "wrong_status"
-    row["stops"] = _fetch_stops_for_routes([route_id]).get(route_id, [])
-    return row
+    return cursor.fetchone()
 
 
-def fetch_nearby_events(lat: float, lon: float, today: date) -> list[dict]:
-    """(lat, lon) 기준 NEARBY_EVENT_RADIUS_KM 이내에서 아직 끝나지 않은 문화행사를
-    가까운 순으로 반환한다.
-
-    cultural_events에 위경도 없는 색인이 없어서, SQL에서는 위경도 사각형으로
-    싸게 후보만 추리고(위도 1도 ≈ 111km 근사), 정확한 거리·반경 판정과 정렬은
-    Python에서 haversine으로 한다 — StationMap.tsx가 주변 회수필요 후보를
-    고를 때 쓰는 것과 같은 방식이다.
-    """
-    lat_delta = NEARBY_EVENT_RADIUS_KM / 111.0
-    lon_delta = NEARBY_EVENT_RADIUS_KM / (111.0 * math.cos(math.radians(lat)))
-    query = """
-        SELECT event_id, title, category, place, start_date, end_date, is_free, lat, lon
-        FROM cultural_events
-        WHERE lat BETWEEN %(min_lat)s AND %(max_lat)s
-          AND lon BETWEEN %(min_lon)s AND %(max_lon)s
-          AND (end_date IS NULL OR end_date >= %(today)s)
-    """
-    rows = fetch_all(
-        query,
-        {
-            "min_lat": lat - lat_delta,
-            "max_lat": lat + lat_delta,
-            "min_lon": lon - lon_delta,
-            "max_lon": lon + lon_delta,
-            "today": today,
-        },
+def fetch_route(route_id: UUID) -> dict[str, Any] | None:
+    """route header와 모든 stop을 한 SQL snapshot으로 반환한다."""
+    return fetch_one(
+        _route_aggregate_query("WHERE route.route_id = %(route_id)s"),
+        {"route_id": route_id},
     )
 
-    events = []
-    for row in rows:
-        distance_km = _haversine_km(lat, lon, row["lat"], row["lon"])
-        if distance_km <= NEARBY_EVENT_RADIUS_KM:
-            events.append({**row, "distance_km": round(distance_km, 2)})
-    return sorted(events, key=lambda e: e["distance_km"])
+
+def _transition_route(
+    route_id: UUID,
+    now: datetime,
+    *,
+    expected_status: str,
+    next_status: str,
+    timestamp_column: str,
+) -> dict[str, Any] | RouteTransitionResult:
+    """guarded update와 aggregate 재조회를 같은 transaction에서 수행한다."""
+    try:
+        with (
+            get_connection() as connection,
+            connection.cursor(row_factory=dict_row) as cursor,
+        ):
+            cursor.execute(
+                f"""
+                UPDATE rebalance_route
+                   SET route_status_cd = %(next_status)s,
+                       {timestamp_column} = %(now)s
+                 WHERE route_id = %(route_id)s
+                   AND route_status_cd = %(expected_status)s
+                RETURNING route_id
+                """,
+                {
+                    "route_id": route_id,
+                    "now": now,
+                    "expected_status": expected_status,
+                    "next_status": next_status,
+                },
+            )
+            if cursor.fetchone() is None:
+                cursor.execute(
+                    "SELECT route_status_cd FROM rebalance_route WHERE route_id = %(route_id)s",
+                    {"route_id": route_id},
+                )
+                if cursor.fetchone() is None:
+                    return RouteTransitionResult.NOT_FOUND
+                return RouteTransitionResult.WRONG_STATUS
+            route = _fetch_route_with_cursor(cursor, route_id)
+            if route is None:
+                raise RuntimeError("상태 전이 직후 route aggregate를 찾을 수 없습니다.")
+            return route
+    except CheckViolation:
+        return RouteTransitionResult.CONSTRAINT_CONFLICT
+
+
+def dispatch_route(
+    route_id: UUID,
+    now: datetime,
+) -> dict[str, Any] | RouteTransitionResult:
+    """route를 proposed에서 dispatched로 원자 전이한다."""
+    return _transition_route(
+        route_id,
+        now,
+        expected_status="proposed",
+        next_status="dispatched",
+        timestamp_column="dispatched_dttm",
+    )
+
+
+def complete_route(
+    route_id: UUID,
+    now: datetime,
+) -> dict[str, Any] | RouteTransitionResult:
+    """route를 dispatched에서 completed로 원자 전이한다."""
+    return _transition_route(
+        route_id,
+        now,
+        expected_status="dispatched",
+        next_status="completed",
+        timestamp_column="completed_dttm",
+    )
