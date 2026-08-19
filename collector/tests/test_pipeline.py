@@ -7,10 +7,9 @@ from typing import ClassVar
 from zoneinfo import ZoneInfo
 
 import httpx
-import pytest
-
 import manifest as manifest_module
 import pipeline
+import pytest
 import storage
 from adapters.base import FetchErrorKind, FetchResult, adapter
 from config.schema import Backfill, Policies, Quality, Schedule, SourceConfig
@@ -108,6 +107,33 @@ class TestFreshFetchSuccess:
         saved = manifest_module.load(config.source_id, WINDOW_START)
         assert saved.status == RunStatus.SUCCEEDED
         assert storage.read_bronze(config.source_id, WINDOW_START, ["a", "b"]) == [_chunk("a"), _chunk("b")]
+
+    def test_successful_empty_part_is_not_counted_as_missing(self, scripted_adapter, client, monkeypatch):
+        """INFO-200 같은 정상 빈 조각은 row 부족이 아니라 성공한 POI 조각이다."""
+        scripted_adapter.results = [
+            [
+                FetchResult(key="poi-POI001", payload=_chunk("row"), error=None, expected_total=None),
+                FetchResult(key="poi-POI002", payload=_chunk("empty"), error=None, expected_total=None),
+            ]
+        ]
+        scripted_adapter.rows_by_key = {"row": {"k": "row"}, "empty": None}
+
+        original_normalize = scripted_adapter.normalize
+
+        def normalize_without_empty(chunks, config):
+            return [row for row in original_normalize(chunks, config) if row is not None]
+
+        monkeypatch.setattr(scripted_adapter, "normalize", staticmethod(normalize_without_empty))
+        config = _config(quality=Quality(max_drop_ratio=1.0, max_missing_ratio=0.0, allow_empty=False))
+
+        result = pipeline.execute_window(config, WINDOW_START, client=client)
+
+        assert result.status == RunStatus.SUCCEEDED
+        assert result.counts.expected is None
+        assert result.counts.fetched == 1
+        assert result.missing.parts == ()
+        assert result.missing.basis == "parts"
+        assert result.completeness == 1.0
 
 
 class TestSkipBranch:

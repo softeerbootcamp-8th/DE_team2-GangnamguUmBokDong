@@ -102,7 +102,9 @@ class SeoulOpenApiAdapter:
             if poi_start < 1 or poi_end < poi_start:
                 raise ValueError("citydata_ppltn의 poi_start/poi_end 범위가 올바르지 않습니다")
 
-            expected = poi_end - poi_start + 1
+            # expected_total은 pipeline에서 기대 row 수를 뜻한다. POI 범위 크기는
+            # 요청 조각 수이고 INFO-200 조각은 정상적으로 0행일 수 있으므로, 여기서는
+            # None을 유지해 실제 요청 실패만 조각 기준 missing_ratio로 계산한다.
             for i in range(poi_start, poi_end + 1):
                 poi_id = f"POI{i:03d}"
                 key = f"poi-{poi_id}"
@@ -121,7 +123,7 @@ class SeoulOpenApiAdapter:
                         key=key,
                         payload=None,
                         error=FetchErrorKind.TRANSIENT,
-                        expected_total=expected if i == poi_start else None,
+                        expected_total=None,
                     )
                     continue
 
@@ -133,14 +135,14 @@ class SeoulOpenApiAdapter:
                         key=key,
                         payload=response.content,
                         error=None,
-                        expected_total=expected if i == poi_start else None,
+                        expected_total=None,
                     )
                 elif category is FetchErrorKind.FATAL:
                     yield FetchResult(
                         key=key,
                         payload=None,
                         error=category,
-                        expected_total=expected if i == poi_start else None,
+                        expected_total=None,
                     )
                     return
                 else:
@@ -148,7 +150,7 @@ class SeoulOpenApiAdapter:
                         key=key,
                         payload=None,
                         error=category,
-                        expected_total=expected if i == poi_start else None,
+                        expected_total=None,
                     )
             return
 

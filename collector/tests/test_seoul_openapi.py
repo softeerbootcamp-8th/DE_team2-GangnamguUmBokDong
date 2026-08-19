@@ -6,7 +6,6 @@ import json
 
 import httpx
 import pytest
-
 from adapters.base import FetchErrorKind
 from adapters.seoul_openapi import SeoulOpenApiAdapter
 
@@ -176,7 +175,9 @@ def test_population_fetch_uses_configured_poi_range_and_does_not_stop_at_gap():
         "poi-POI120",
         "poi-POI121",
     ]
-    assert results[0].expected_total == 5
+    # POI 범위는 기대 row 수가 아니다. INFO-200도 정상 성공 조각이므로 pipeline이
+    # 조각 기준 completeness를 쓰도록 expected_total은 전달하지 않는다.
+    assert all(result.expected_total is None for result in results)
     assert all(result.error is None for result in results)
     assert any("/POI121/" in url for url in calls)
 
