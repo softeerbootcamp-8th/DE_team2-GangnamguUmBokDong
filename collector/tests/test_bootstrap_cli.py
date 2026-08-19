@@ -83,13 +83,13 @@ class TestMain:
         monkeypatch.setattr(cli.config_loader, "load", lambda source_id: stub_scfg)
 
     def test_csv_kind_reads_file_once_and_loads_each_date(self, monkeypatch, stub_scfg, tmp_path):
-        bcfg = SimpleNamespace(kind="csv")
+        bcfg = SimpleNamespace(kind="csv", join=None)
         monkeypatch.setattr(cli.bootstrap_config, "load", lambda source_id: bcfg)
         (tmp_path / "data.csv").write_text("x")
 
         read_calls = []
 
-        def fake_read_by_date(cfg, csv_dir, days):
+        def fake_read_by_date(cfg, csv_dir, days, station_map=None):
             read_calls.append((cfg, csv_dir, frozenset(days)))
             return {
                 date(2026, 6, 1): pa.Table.from_pylist([{"row": "d1"}]),
@@ -98,7 +98,7 @@ class TestMain:
 
         load_calls = []
 
-        def fake_load_date(scfg, bcfg_arg, day, rows, *, force):
+        def fake_load_date(scfg, bcfg_arg, day, rows, *, force, station_map_stats=None):
             load_calls.append((scfg, bcfg_arg, day, rows, force))
             return DateResult(day=day, status="loaded", rows=len(rows))
 
@@ -120,7 +120,7 @@ class TestMain:
         assert load_calls[1][3] == [{"row": "d2"}]
 
     def test_csv_kind_without_csv_dir_exits(self, monkeypatch):
-        bcfg = SimpleNamespace(kind="csv")
+        bcfg = SimpleNamespace(kind="csv", join=None)
         monkeypatch.setattr(cli.bootstrap_config, "load", lambda source_id: bcfg)
         monkeypatch.setattr(cli.csv_source, "read_by_date", lambda *a, **k: {})
         monkeypatch.setattr(cli.runner, "load_date", lambda *a, **k: None)
@@ -134,7 +134,7 @@ class TestMain:
     def test_csv_dir_nonexistent_path_exits(self, monkeypatch, tmp_path):
         """오타·잘못된 경로를 주면 glob이 조용히 빈 결과를 내고 전부 skipped가 되어
         종료 코드 0으로 끝난다 — 하나도 못 읽은 것과 정상 재개를 구별할 수 없다."""
-        bcfg = SimpleNamespace(kind="csv")
+        bcfg = SimpleNamespace(kind="csv", join=None)
         monkeypatch.setattr(cli.bootstrap_config, "load", lambda source_id: bcfg)
         monkeypatch.setattr(cli.runner, "load_date", lambda *a, **k: None)
 
@@ -147,7 +147,7 @@ class TestMain:
             ])
 
     def test_csv_dir_is_a_file_not_a_directory_exits(self, monkeypatch, tmp_path):
-        bcfg = SimpleNamespace(kind="csv")
+        bcfg = SimpleNamespace(kind="csv", join=None)
         monkeypatch.setattr(cli.bootstrap_config, "load", lambda source_id: bcfg)
         monkeypatch.setattr(cli.runner, "load_date", lambda *a, **k: None)
 
@@ -163,9 +163,9 @@ class TestMain:
     def test_csv_dir_with_no_csv_files_warns(self, monkeypatch, tmp_path, capsys):
         """로그는 `configure_batch_logging`이 root 핸들러를 stdout으로 바꿔치므로
         caplog가 아니라 capsys로 확인한다."""
-        bcfg = SimpleNamespace(kind="csv")
+        bcfg = SimpleNamespace(kind="csv", join=None)
         monkeypatch.setattr(cli.bootstrap_config, "load", lambda source_id: bcfg)
-        monkeypatch.setattr(cli.csv_source, "read_by_date", lambda cfg, csv_dir, days: {})
+        monkeypatch.setattr(cli.csv_source, "read_by_date", lambda cfg, csv_dir, days, station_map=None: {})
         monkeypatch.setattr(cli.runner, "load_date", lambda *a, **k: DateResult(day=date(2026, 6, 1), status="empty"))
 
         cli.main([
@@ -190,7 +190,7 @@ class TestMain:
 
         load_calls = []
 
-        def fake_load_date(scfg, bcfg_arg, day, rows, *, force):
+        def fake_load_date(scfg, bcfg_arg, day, rows, *, force, station_map_stats=None):
             load_calls.append((day, rows))
             return DateResult(day=day, status="loaded", rows=len(rows))
 
@@ -221,7 +221,7 @@ class TestMain:
 
         load_calls = []
 
-        def fake_load_date(scfg, bcfg_arg, day, rows, *, force):
+        def fake_load_date(scfg, bcfg_arg, day, rows, *, force, station_map_stats=None):
             load_calls.append(day)
             return DateResult(day=day, status="loaded", rows=len(rows))
 
@@ -278,7 +278,7 @@ class TestMain:
         monkeypatch.setattr(cli.api_source, "fetch_by_date", fake_fetch_by_date)
         monkeypatch.setattr(
             cli.runner, "load_date",
-            lambda scfg, bcfg_arg, day, rows, *, force: DateResult(day=day, status="loaded", rows=len(rows)),
+            lambda scfg, bcfg_arg, day, rows, *, force, station_map_stats=None: DateResult(day=day, status="loaded", rows=len(rows)),
         )
 
         days = [date(2026, 1, 1) + __import__("datetime").timedelta(days=n) for n in range(9)]
@@ -291,16 +291,16 @@ class TestMain:
         assert code != 0  # 실패한 날짜는 여전히 있으므로 non-zero
 
     def test_prints_summary_with_source_status_and_overlap(self, monkeypatch, capsys, tmp_path):
-        bcfg = SimpleNamespace(kind="csv")
+        bcfg = SimpleNamespace(kind="csv", join=None)
         monkeypatch.setattr(cli.bootstrap_config, "load", lambda source_id: bcfg)
         (tmp_path / "data.csv").write_text("x")
         monkeypatch.setattr(
             cli.csv_source, "read_by_date",
-            lambda cfg, csv_dir, days: {date(2026, 6, 1): pa.Table.from_pylist([{"row": "d1"}])},
+            lambda cfg, csv_dir, days, station_map=None: {date(2026, 6, 1): pa.Table.from_pylist([{"row": "d1"}])},
         )
         monkeypatch.setattr(
             cli.runner, "load_date",
-            lambda scfg, bcfg_arg, day, rows, *, force: DateResult(
+            lambda scfg, bcfg_arg, day, rows, *, force, station_map_stats=None: DateResult(
                 day=day, status="loaded", rows=len(rows), silver_present=True,
             ),
         )
@@ -317,16 +317,16 @@ class TestMain:
         assert "silver_overlap=1" in out
 
     def test_summary_reports_dropped_total(self, monkeypatch, capsys, tmp_path):
-        bcfg = SimpleNamespace(kind="csv")
+        bcfg = SimpleNamespace(kind="csv", join=None)
         monkeypatch.setattr(cli.bootstrap_config, "load", lambda source_id: bcfg)
         (tmp_path / "data.csv").write_text("x")
         monkeypatch.setattr(
             cli.csv_source, "read_by_date",
-            lambda cfg, csv_dir, days: {date(2026, 6, 1): pa.Table.from_pylist([{"row": "d1"}])},
+            lambda cfg, csv_dir, days, station_map=None: {date(2026, 6, 1): pa.Table.from_pylist([{"row": "d1"}])},
         )
         monkeypatch.setattr(
             cli.runner, "load_date",
-            lambda scfg, bcfg_arg, day, rows, *, force: DateResult(
+            lambda scfg, bcfg_arg, day, rows, *, force, station_map_stats=None: DateResult(
                 day=day, status="loaded", rows=len(rows), dropped=3,
             ),
         )
@@ -356,3 +356,94 @@ class TestMain:
 
         out = capsys.readouterr().out
         assert "aborted=true" in out
+
+
+class TestStationJoinWiring:
+    """`join`이 선언된 CSV 소스는 매핑표를 만들어 read_by_date와 manifest에 넘긴다."""
+
+    @pytest.fixture(autouse=True)
+    def _stub_config_loader(self, monkeypatch):
+        monkeypatch.setattr(cli.config_loader, "load",
+                            lambda source_id: SimpleNamespace(source_id="bike_station_realtime"))
+
+    @pytest.fixture
+    def joined_bcfg(self, monkeypatch):
+        bcfg = SimpleNamespace(kind="csv", join=SimpleNamespace(provider="bike_station"))
+        monkeypatch.setattr(cli.bootstrap_config, "load", lambda source_id: bcfg)
+        return bcfg
+
+    def _stub_table(self, monkeypatch, stats=None):
+        table = SimpleNamespace(stats=stats or {"built_at": "2026-08-19T18:40:00+09:00",
+                                                "api_stations": 2737, "history_stations": 2831})
+        monkeypatch.setattr(cli.station_join, "build", lambda csv_dir, **kwargs: table)
+        return table
+
+    def test_passes_station_map_to_reader(self, monkeypatch, joined_bcfg, tmp_path):
+        (tmp_path / "stock.csv").write_text("x")
+        table = self._stub_table(monkeypatch)
+        seen = {}
+
+        def fake_read_by_date(cfg, csv_dir, days, station_map=None):
+            seen["station_map"] = station_map
+            return {}
+
+        monkeypatch.setattr(cli.csv_source, "read_by_date", fake_read_by_date)
+        monkeypatch.setattr(cli.runner, "load_date",
+                            lambda *a, **k: DateResult(day=date(2025, 12, 1), status="empty"))
+
+        cli.main(["--source", "bike_station_realtime", "--from", "2025-12-01",
+                  "--to", "2025-12-01", "--csv-dir", str(tmp_path)])
+
+        assert seen["station_map"] is table
+
+    def test_passes_stats_to_loader(self, monkeypatch, joined_bcfg, tmp_path):
+        (tmp_path / "stock.csv").write_text("x")
+        table = self._stub_table(monkeypatch)
+        seen = {}
+
+        monkeypatch.setattr(cli.csv_source, "read_by_date",
+                            lambda cfg, csv_dir, days, station_map=None: {
+                                date(2025, 12, 1): pa.Table.from_pylist([{"row": "d1"}])})
+
+        def fake_load_date(scfg, bcfg_arg, day, rows, *, force, station_map_stats=None):
+            seen["stats"] = station_map_stats
+            return DateResult(day=day, status="loaded", rows=len(rows))
+
+        monkeypatch.setattr(cli.runner, "load_date", fake_load_date)
+
+        cli.main(["--source", "bike_station_realtime", "--from", "2025-12-01",
+                  "--to", "2025-12-01", "--csv-dir", str(tmp_path)])
+
+        assert seen["stats"] == table.stats
+
+    def test_builds_map_once_for_the_whole_range(self, monkeypatch, joined_bcfg, tmp_path):
+        """매핑표는 API 4회 호출이라 날짜마다 다시 만들면 안 된다."""
+        (tmp_path / "stock.csv").write_text("x")
+        calls = []
+        monkeypatch.setattr(cli.station_join, "build",
+                            lambda csv_dir, **kwargs: calls.append(csv_dir) or SimpleNamespace(stats={}))
+        monkeypatch.setattr(cli.csv_source, "read_by_date",
+                            lambda cfg, csv_dir, days, station_map=None: {})
+        monkeypatch.setattr(cli.runner, "load_date",
+                            lambda *a, **k: DateResult(day=date(2025, 12, 1), status="empty"))
+
+        cli.main(["--source", "bike_station_realtime", "--from", "2025-12-01",
+                  "--to", "2025-12-31", "--csv-dir", str(tmp_path)])
+
+        assert len(calls) == 1
+
+    def test_does_not_build_map_when_join_is_absent(self, monkeypatch, tmp_path):
+        (tmp_path / "data.csv").write_text("x")
+        monkeypatch.setattr(cli.bootstrap_config, "load",
+                            lambda source_id: SimpleNamespace(kind="csv", join=None))
+        calls = []
+        monkeypatch.setattr(cli.station_join, "build", lambda csv_dir, **kwargs: calls.append(1))
+        monkeypatch.setattr(cli.csv_source, "read_by_date",
+                            lambda cfg, csv_dir, days, station_map=None: {})
+        monkeypatch.setattr(cli.runner, "load_date",
+                            lambda *a, **k: DateResult(day=date(2025, 12, 1), status="empty"))
+
+        cli.main(["--source", "bike_rental_history", "--from", "2025-12-01",
+                  "--to", "2025-12-01", "--csv-dir", str(tmp_path)])
+
+        assert calls == []
