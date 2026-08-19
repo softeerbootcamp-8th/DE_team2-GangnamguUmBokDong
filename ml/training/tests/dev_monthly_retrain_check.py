@@ -84,3 +84,30 @@ def test_candidate_profiles_puts_champion_profile_first_with_period_override_the
     # 챔피언 프로필(b-profile)은 1차 시도에서 이미 다뤘으니 "나머지" 목록에서는 빠지고,
     # 나머지는 학습기간 override 없이(빈 dict) 이름순으로 온다.
     assert candidates[1:] == [("a-profile", {}), ("c-profile", {})]
+
+
+def test_attempt_promotion_uses_a_unique_archive_prefix_each_call(monkeypatch):
+    """회귀 재현 — 예전엔 archive_date가 순수 날짜(`today_kst().isoformat()`)라
+    같은 날 두 번 --execute하면(수동 재실행, 부분 실패 후 재시도 등) 두 시도가
+    정확히 같은 archive_prefix를 다시 써서, 이미 승격된 라이브 챔피언 아티팩트를
+    비원자적으로 덮어쓸 수 있었다(리뷰 지적). 두 번의 `_attempt_promotion()` 호출이
+    서로 다른 archive_date(그래서 다른 archive_prefix)를 쓰는지 확인한다."""
+    from training.scripts import monthly_retrain_check as mrc
+
+    monkeypatch.setattr(mrc, "_candidate_profiles", lambda model_name: [("default", {})])
+    monkeypatch.setattr(mrc, "_trigger_feature_pipeline", lambda profile_name, env_overrides: None)
+    monkeypatch.setattr(mrc, "should_promote", lambda challenger, champion: (False, ["기준 미달"]))
+
+    used_archive_dates = []
+
+    def _fake_run_training_subprocess(model_name, profile_name, archive_date, env_overrides):
+        used_archive_dates.append(archive_date)
+        return {"poisson_deviance_test": 0.5, "p10_p90_coverage_calibrated_test": 0.8}
+
+    monkeypatch.setattr(mrc, "_run_training_subprocess", _fake_run_training_subprocess)
+
+    mrc._attempt_promotion("rental", None)
+    mrc._attempt_promotion("rental", None)
+
+    assert len(used_archive_dates) == 2
+    assert used_archive_dates[0] != used_archive_dates[1]

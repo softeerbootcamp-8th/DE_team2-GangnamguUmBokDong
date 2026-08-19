@@ -49,6 +49,7 @@ import argparse
 import os
 import subprocess
 import sys
+import uuid
 
 from core import s3 as s3_io
 from ml_core import common_config
@@ -189,9 +190,12 @@ def _run_training_subprocess(
     args:
         model_name: "rental" 또는 "return"
         profile_name: 이 시도에 쓸 프로필 이름(ML_PROFILE로 subprocess에 전달)
-        archive_date: "YYYY-MM-DD" — 이 시도 전체(feature 파이프라인 포함)가 공유하는
-            날짜. 자정을 넘겨 실행되더라도 아카이브 경로가 어긋나지 않게 오케스트레이터가
-            한 번만 계산해서 넘긴다.
+        archive_date: "YYYY-MM-DD-{실행 유니크 접미사}" — 이 시도 전체(feature
+            파이프라인 포함)가 공유하는 값. 자정을 넘겨 실행되더라도 아카이브
+            경로가 어긋나지 않게, 그리고 같은 날 다시 실행해도 이전 시도의
+            archive_prefix와 절대 안 겹치게(`_attempt_promotion()` 참고) 오케스트레이터가
+            한 번만 계산해서 넘긴다. `archive_models_prefix()`는 이 문자열의 형식을
+            검사하지 않으므로 순수 날짜가 아니어도 문제없다.
         env_overrides: `_trigger_feature_pipeline()` 참고 — 같은 시도 안에서 feature
             파이프라인과 반드시 같은 값을 써야 학습기간이 어긋나지 않는다.
     returns:
@@ -221,7 +225,14 @@ def _attempt_promotion(model_name: str, champion_metrics: dict | None) -> bool:
     returns:
         bool: 승격이 일어났는지
     """
-    archive_date = today_kst().isoformat()
+    # 날짜만 쓰면(예: "2026-08-19") 같은 날 이 스크립트를 다시 --execute로 실행할
+    # 때(수동 재실행, 부분 실패 후 재시도 등) archive_prefix가 이전 시도와 겹친다
+    # — 이미 그 prefix가 챔피언 포인터가 가리키는 곳이라면, 학습 subprocess가
+    # 파일을 그 자리에 다시 쓰는 순간 원자적 포인터 설계가 무력화된다(should_promote()
+    # 가 이 챌린저를 반려해도 이미 챔피언 아티팩트는 비원자적으로 교체된 뒤 —
+    # 리뷰 지적). 실행마다 고유한 접미사를 붙여 archive_prefix 자체가 항상 새
+    # 위치를 가리키게 한다(archive가 immutable이라는 가정을 실제로 보장).
+    archive_date = f"{today_kst().isoformat()}-{uuid.uuid4().hex[:8]}"
     for profile_name, env_overrides in _candidate_profiles(model_name):
         try:
             _trigger_feature_pipeline(profile_name, env_overrides)
