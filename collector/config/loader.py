@@ -48,10 +48,28 @@ def load(source_id: str, base_dir: Path = Path("sources")) -> SourceConfig:
         )
     errors += _check_policy_names(config)
     errors += _check_row_params(config)
+    errors += _check_adapter_params(config)
     if errors:
         raise ConfigError("\n".join(errors))
 
     return config.model_copy(update={"config_version": config_version})
+
+
+def _check_adapter_params(config: SourceConfig) -> list[str]:
+    """네트워크나 기존 bronze를 건드리기 전에 adapter별 계획 설정을 검증한다."""
+    params = config.adapter_params
+    if config.adapter != "seoul_openapi" or params.get("service") != "citydata_ppltn":
+        return []
+
+    poi_start = params.get("poi_start", 1)
+    poi_end = params.get("poi_end")
+    if not isinstance(poi_start, int) or isinstance(poi_start, bool):
+        return ["adapter_params.poi_start: 1 이상의 정수여야 합니다."]
+    if not isinstance(poi_end, int) or isinstance(poi_end, bool):
+        return ["adapter_params.poi_end: 필수이며 정수여야 합니다."]
+    if poi_start < 1 or poi_end < poi_start:
+        return ["adapter_params.poi_start/poi_end: 1 <= poi_start <= poi_end여야 합니다."]
+    return []
 
 
 def _check_policy_names(config: SourceConfig) -> list[str]:

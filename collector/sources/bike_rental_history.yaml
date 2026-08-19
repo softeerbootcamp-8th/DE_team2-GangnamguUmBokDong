@@ -6,7 +6,10 @@ adapter_params:
   service: tbCycleRentData
   page_size: 1000
   root_key: rentData.row
-  path_suffix: "/{window_start:%Y-%m-%d}/{window_start:%Y-%m-%d}"
+  # API가 시간까지만 받으므로 5분 실행은 현재 시간대의 누적 snapshot을 다시 읽는다.
+  # 시간 중 신규 대여를 5분 단위로 반영하기 위한 선택이며, 소비자는
+  # (BIKE_ID, RENT_DT)로 중복 제거한다.
+  path_suffix: "/{window_start:%Y-%m-%d}/{window_start:%H}"
 
 schedule:
   interval: 5m
