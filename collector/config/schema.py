@@ -1,5 +1,4 @@
-"""데이터 수집 설정 파일의 명세를 정의하고, 
-Pydantic을 활용해 사용자의 잘못된 입력을 차단하는 안전장치."""
+"""데이터 수집 설정 파일의 명세를 정의하고, Pydantic을 활용해 사용자의 잘못된 입력을 차단하는 안전장치."""
 
 
 
@@ -61,7 +60,15 @@ class ColumnSpec(BaseModel):
     # Pydantic 모델 configuration
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    types: tuple[Literal["str", "int", "float", "bool"], ...] = Field(min_length=1)
+    # "precip"은 기상청 강수량 범주 표기("강수없음", "30.0~50.0mm" 등)를 mm 실수로
+    # 바꾸는 전용 캐스터다. 규칙은 `core.precip`에 있고 loader와 공유한다.
+    # "snow"는 적설 표기("적설없음", "1.0~4.9cm" 등)를 cm 실수로 바꾼다 — 형태는
+    # 같지만 단위가 달라 서로의 표기를 받지 않는다(`core._amount` 참고).
+    # "masked_float"는 생활인구의 비식별 마스킹(`*`)을 결측으로 판정시킨다
+    # (`core.masked` 참고).
+    types: tuple[
+        Literal["str", "int", "float", "bool", "precip", "snow", "masked_float"], ...
+    ] = Field(min_length=1)
     required: bool = False
     range: Range | None = None
     enum: tuple[Any, ...] | None = None
@@ -94,6 +101,19 @@ class Storage(BaseModel):
     bronze_format: str
     silver_format: str
     partition: tuple[str, ...] = Field(min_length=1)
+
+
+class Compaction(BaseModel):
+    """하루치 silver를 archive로 묶을 때의 소스별 옵션."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    # 윈도우마다 같은 구간을 다시 받는 소스에서 켠다. path_suffix가 날짜 단위인데
+    # 주기가 그보다 짧으면 윈도우끼리 같은 기록을 중복 수집한다(bike_rental_history).
+    #
+    # 스냅샷 소스에는 켜면 안 된다 — 재고가 안 변하면 연속 윈도우가 같은 값을 내는
+    # 것이 정상인데, 그걸 지우면 시계열이 무너진다.
+    dedup: bool = False
 
 
 class Quality(BaseModel):
@@ -167,6 +187,7 @@ class SourceConfig(BaseModel):
     quality: 품질 기준
     fetch: API 호출에 사용할 수 있는 최대 시간
     backfill: 백필
+    compaction: 하루치 압축 옵션
     policies: 컬럼 정책과 행 정책
     columns: 데이터 스키마(key=컬럼명, value=컬럼 스펙)
     config_version: 설정 버전
@@ -184,6 +205,7 @@ class SourceConfig(BaseModel):
     quality: Quality
     fetch: Fetch | None = None
     backfill: Backfill | None = None
+    compaction: Compaction | None = None
     policies: Policies
     columns: dict[str, ColumnSpec]
     config_version: str = ""

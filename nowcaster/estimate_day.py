@@ -1,9 +1,8 @@
-"""후보 주차의 archive 테이블들을 (H_DNG_CD, CELL_ID, TT) 키로 조인해
-`estimator.estimate`를 격자·시간대별로 적용한 추정 테이블을 만든다.
-"""
+"""과거 아카이브 데이터를 바탕으로 일자별 생활인구 격자 추정 테이블을 생성한다."""
 
 from __future__ import annotations
 
+# pyrefly: ignore [missing-import]
 import numpy as np
 import pandas as pd
 
@@ -18,7 +17,13 @@ _WEIGHTS = {1: 0.4, 2: 0.3, 3: 0.2, 4: 0.1}
 
 
 def historical_average(frames: list[pd.DataFrame | None]) -> pd.DataFrame | None:
-    """전체 결측 폴백 최후 단계용: 여러 날짜의 archive를 (H_DNG_CD, CELL_ID, TT) 기준으로 평균낸다."""
+    """여러 아카이브 데이터프레임의 격자·시간대별 인구 평균을 계산한다.
+
+    args:
+        frames: 과거 아카이브 DataFrame 목록
+    returns:
+        격자·시간대별 평균 DataFrame (데이터가 없으면 None)
+    """
     present = [f for f in frames if f is not None and not f.empty]
     if not present:
         return None
@@ -28,10 +33,7 @@ def historical_average(frames: list[pd.DataFrame | None]) -> pd.DataFrame | None
 
 
 def _prep(frames: list[pd.DataFrame | None], suffix_prefix: str) -> list[pd.DataFrame]:
-    """각 프레임을 KEY_COLS로 인덱싱하고, 컬럼명에 `__{suffix_prefix}{순번}`을 붙인다.
-
-    순번은 1부터 시작하며 "가까운 주차/우선순위"를 뜻한다(가중치 매핑, 폴백 우선순위에 사용).
-    """
+    """데이터프레임의 키를 인덱스로 설정하고 컬럼명에 순번 접미사를 부여한다."""
     prepped = []
     for i, frame in enumerate(frames, start=1):
         if frame is None or frame.empty:
@@ -48,52 +50,64 @@ def build_nowcast_table(
     extended_frames: list[pd.DataFrame | None] = (),
     historical_avg_frame: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
-    """`candidate_frames`는 [1주전, 2주전, 3주전, 4주전] (해당 주차 archive 전체, 결측/불일치는 None).
+    """후보 주차 및 폴백 데이터들을 결합하여 일자별 생활인구 추정 테이블을 생성한다.
 
-    격자 수 × 시간대만큼 키가 많아질 수 있어(서울 전체 기준 수십만 행), 키별 파이썬 루프
-    대신 pandas 벡터화 연산으로 처리한다.
+    args:
+        candidate_frames: 1~4주 전 후보 DataFrame 목록 (결측은 None)
+        extended_frames: 5~8주 전 확장 후보 DataFrame 목록
+        historical_avg_frame: 과거 전체 평균 DataFrame
+    returns:
+        추정치 및 추정 방식 메타데이터가 포함된 DataFrame
     """
     n_candidates = len(candidate_frames)
+
+    # 1. 주차별 데이터프레임의 키를 인덱스로 설정하고 컬럼명 접미사 부여 (__c: 후보, __e: 확장, __h: 과거평균)
     candidate_prepped = _prep(candidate_frames, "c")
     extended_prepped = _prep(extended_frames, "e")
     historical_prepped = _prep([historical_avg_frame] if historical_avg_frame is not None else [], "h")
 
+    # 모든 주차 데이터를 합쳤을 때 아무 데이터도 없다면 빈 결과 테이블을 즉시 반환
     all_prepped = candidate_prepped + extended_prepped + historical_prepped
     if not all_prepped:
         return pd.DataFrame(columns=[*KEY_COLS, *VALUE_COLS, "is_estimated", "estimation_method"])
 
+    # 2. KEY_COLS 인덱스를 기준으로 모든 주차의 컬럼을 가로로 결합 (Wide format 테이블 생성)
     wide = pd.concat(all_prepped, axis=1, join="outer")
 
-    # SPOP이 대표 컬럼이다 - 어떤 주차가 유효한지는 SPOP 기준으로 한 번만 판정하고,
-    # 그 판정(estimation_method)을 행 전체에 적용한다.
+    # 3. SPOP(생활인구합계)을 대표 컬럼으로 삼아 행별 유효 주차 수를 계산하고 estimation_method를 결정
     spop_cand_cols = [f"SPOP__c{i}" for i in range(1, n_candidates + 1) if f"SPOP__c{i}" in wide.columns]
     if spop_cand_cols:
         count_valid = wide[spop_cand_cols].notna().sum(axis=1)
     else:
         count_valid = pd.Series(0, index=wide.index)
 
+    # 기본값은 "no_data"로 설정하고 유효 주차 수에 따라 라벨 부여
     method = pd.Series("no_data", index=wide.index, dtype=object)
-    method[count_valid == n_candidates] = "weighted_avg"
-    method[count_valid == 1] = "single_week_fallback"
-    method[(count_valid > 1) & (count_valid < n_candidates)] = "reweighted_avg"
-    need_fallback = count_valid == 0
+    method[count_valid == n_candidates] = "weighted_avg"                          # 4개 주차 모두 존재
+    method[count_valid == 1] = "single_week_fallback"                              # 1개 주차만 존재
+    method[(count_valid > 1) & (count_valid < n_candidates)] = "reweighted_avg"   # 2~3개 주차 존재 (가중치 재조정)
+    need_fallback = count_valid == 0                                              # 최근 4주가 모두 결측된 행들
 
+    # 3-1. 1차 폴백: 5~8주 전 확장 데이터(__e)가 하나라도 존재하는 행에 라벨 부여
     ext_prefix_cols = [c for c in wide.columns if "__e" in c]
     if need_fallback.any() and ext_prefix_cols:
         spop_ext_cols = [c for c in ext_prefix_cols if c.startswith("SPOP__e")]
         if spop_ext_cols:
             has_ext = wide.loc[need_fallback, spop_ext_cols].notna().any(axis=1)
             method.loc[has_ext[has_ext].index] = "extended_lookback_fallback"
-            need_fallback.loc[has_ext[has_ext].index] = False
+            need_fallback.loc[has_ext[has_ext].index] = False                     # 확장 데이터로 해결된 행은 폴백 대상에서 제외
 
+    # 3-2. 2차 폴백: 여전히 결측인 행 중 격자의 과거 전체 평균(__h1)이 존재하는 행에 라벨 부여
     if need_fallback.any() and "SPOP__h1" in wide.columns:
         has_hist = wide.loc[need_fallback, "SPOP__h1"].notna()
         method.loc[has_hist[has_hist].index] = "grid_historical_avg"
 
+    # 4. 29개 VALUE_COLS에 대해 가중평균 및 단계별 폴백 수치 연산 수행
     result = pd.DataFrame(index=wide.index)
     for col in VALUE_COLS:
         cand_cols = [f"{col}__c{i}" for i in range(1, n_candidates + 1) if f"{col}__c{i}" in wide.columns]
         if cand_cols:
+            # 주차별 가중치(0.4, 0.3, 0.2, 0.1) 매핑 및 결측치를 제외한 가중치 합으로 정규화하여 가중평균 계산
             week_weights = np.array([_WEIGHTS[int(c.rsplit("__c", 1)[1])] for c in cand_cols])
             cand_values = wide[cand_cols]
             valid = cand_values.notna()
@@ -103,18 +117,21 @@ def build_nowcast_table(
         else:
             value = pd.Series(np.nan, index=wide.index)
 
+        # 4-1. 최근 4주가 모두 NaN인 경우: 5~8주 전 확장 데이터 중 가장 가까운 유효 주차 값(bfill)으로 대체
         ext_cols = [f"{col}__e{i}" for i in range(1, len(extended_frames) + 1) if f"{col}__e{i}" in wide.columns]
         if ext_cols:
-            # bfill(axis=1) 후 첫 컬럼 = 이 행에서 컬럼 순서상 가장 먼저 나오는 값 없지 않은 값
             ext_value = wide[ext_cols].bfill(axis=1).iloc[:, 0]
             value = value.where(value.notna(), ext_value)
 
+        # 4-2. 확장 데이터도 NaN인 경우: 과거 전체 평균 수치(__h1)로 대체
         hist_col = f"{col}__h1"
         if hist_col in wide.columns:
             value = value.where(value.notna(), wide[hist_col])
 
+        # 4-3. 과거 평균조차 없는 경우: 최종 0.0으로 결측치 채움
         result[col] = value.fillna(0.0)
 
+    # 5. 메타데이터(추정 여부 플래그, 추정 방식) 부여 및 KEY_COLS를 일반 컬럼으로 리셋하여 반환
     result["is_estimated"] = True
     result["estimation_method"] = method
     return result.reset_index()

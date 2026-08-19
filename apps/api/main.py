@@ -1,17 +1,19 @@
-from fastapi import FastAPI, HTTPException
+from core.forecast import enrich_forecast_points
+from core.regions import DISPATCH_CENTERS, nearest_region
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
 import queries
-from regions import DISPATCH_CENTERS, nearest_region
 from schemas import (
     Alert,
     DispatchCenter,
+    EventsResponse,
     ForecastResponse,
+    Route,
     StationDetail,
     StationSummary,
     StatusResponse,
 )
-from scoring import enrich_forecast_points, urgency_score
 
 app = FastAPI(title="GangnamguUmBokDong API")
 
@@ -19,7 +21,7 @@ app = FastAPI(title="GangnamguUmBokDong API")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_methods=["GET"],
+    allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
 
@@ -67,11 +69,23 @@ def get_forecast(sta_id: str) -> dict:
     }
 
 
+@app.get("/stations/{sta_id}/events", response_model=EventsResponse)
+def get_station_events(sta_id: str) -> dict:
+    """대여소 주변(queries.NEARBY_EVENT_RADIUS_KM 이내)에서 진행 중이거나 예정된
+    문화행사를 가까운 순으로 반환한다. 대여소가 없으면 404."""
+    station = queries.fetch_station(sta_id)
+    if station is None:
+        raise HTTPException(status_code=404, detail=f"station {sta_id} not found")
+    today = queries.now_utc().date()
+    events = queries.fetch_nearby_events(station["lat"], station["lon"], today)
+    return {"radius_km": queries.NEARBY_EVENT_RADIUS_KM, "events": events}
+
+
 @app.get("/regions", response_model=list[DispatchCenter])
 def list_regions() -> list[dict]:
     """지역센터(권역) 목록과 좌표를 반환한다. 프론트가 권역 경계(보로노이)를
-    그리려면 대여소 배정에 쓰인 것과 같은 좌표를 알아야 하므로, 여기 하나(regions.py)만
-    출처로 둔다."""
+    그리려면 대여소 배정에 쓰인 것과 같은 좌표를 알아야 하므로, 여기 하나
+    (core.regions)만 출처로 둔다."""
     return [{"region": name, "lat": lat, "lon": lon} for name, lat, lon in DISPATCH_CENTERS]
 
 
@@ -85,32 +99,70 @@ def get_status() -> dict:
 def list_alerts() -> list[dict]:
     """전체 대여소의 재배치 우선순위 알림을 urgency_score 내림차순으로 반환한다.
 
-    대여소마다 재고 이력·예측치를 따로 조회하면 대여소 수만큼 쿼리가 늘어나므로
-    (N+1), 두 데이터 다 전체 대여소를 대상으로 한 번씩만 조회해 sta_id별로 나눠 쓴다.
+    urgency_score는 더 이상 요청마다 계산하지 않는다 — 5분 배치(rebalance/urgency.py)가
+    미리 계산해 station_urgency 테이블에 적재해두고, 여기서는 그 결과만 조회한다.
     """
-    now = queries.now_utc()
-    stations = queries.fetch_stations()
-    sta_ids = [station["sta_id"] for station in stations]
-    stock_history_by_station = queries.fetch_all_stock_history(sta_ids, now)
-    raw_points_by_station = queries.fetch_all_forecast_points(sta_ids, now)
+    alerts = queries.fetch_alerts(queries.now_utc())
+    return [
+        {
+            "sta_id": row["sta_id"],
+            "sta_nm": row["sta_nm"],
+            "action_type": row["action_type"],
+            "urgency_score": row["urgency_score"],
+            "minutes_until_critical": row["minutes_until_critical"],
+            "region": nearest_region(row["lat"], row["lon"]),
+        }
+        for row in alerts
+    ]
 
-    alerts = []
-    for station in stations:
-        current = station["parking_bike_tot_cnt"]
-        hold_cnt = station["hold_cnt"]
-        stock_history = stock_history_by_station[station["sta_id"]]
-        raw_points = raw_points_by_station[station["sta_id"]]
-        points = enrich_forecast_points(current, hold_cnt, raw_points)
 
-        score, minutes, action_type = urgency_score(current, hold_cnt, stock_history, points, now)
-        alerts.append(
-            {
-                "sta_id": station["sta_id"],
-                "sta_nm": station["sta_nm"],
-                "action_type": action_type,
-                "urgency_score": score,
-                "minutes_until_critical": minutes,
-                "region": nearest_region(station["lat"], station["lon"]),
-            }
-        )
-    return sorted(alerts, key=lambda a: a["urgency_score"], reverse=True)
+@app.get("/routes", response_model=list[Route])
+def list_routes(
+    region: str | None = None,
+    status: str | None = None,
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+) -> list[dict]:
+    """재배치 라우트 목록을 스톱과 함께 반환한다. region/status로 필터링 가능.
+
+    compute_routes가 5분마다 여러 권역에 걸쳐 라우트를 새로 만들기 때문에(#114),
+    필터 없이 전부 반환하면 응답이 무한정 커질 수 있어 최신순으로 limit/offset을
+    적용한다."""
+    return queries.fetch_routes(region, status, limit, offset)
+
+
+@app.get("/routes/{route_id}", response_model=Route)
+def get_route(route_id: str) -> dict:
+    """라우트 하나를 스톱과 함께 반환한다. 없으면 404."""
+    route = queries.fetch_route(route_id)
+    if route is None:
+        raise HTTPException(status_code=404, detail=f"route {route_id} not found")
+    return route
+
+
+@app.post("/routes/{route_id}/dispatch", response_model=Route)
+def dispatch_route(route_id: str) -> dict:
+    """운영자가 라우트 실행을 선택했을 때 proposed -> dispatched로 전이한다.
+    없으면 404, proposed 상태가 아니면 409. queries.dispatch_route가 UPDATE의
+    RETURNING으로 전이된 행을 그 자리에서 반환하므로, 여기서 별도로 다시
+    조회하지 않는다 — 그 사이 다른 요청이 상태를 또 바꾸면 응답이 실제로
+    일어난 일과 달라질 수 있기 때문이다."""
+    result = queries.dispatch_route(route_id, queries.now_utc())
+    if result == "not_found":
+        raise HTTPException(status_code=404, detail=f"route {route_id} not found")
+    if result == "wrong_status":
+        raise HTTPException(status_code=409, detail=f"route {route_id} is not in proposed status")
+    return result
+
+
+@app.post("/routes/{route_id}/complete", response_model=Route)
+def complete_route(route_id: str) -> dict:
+    """운영자가 실행 완료를 표시했을 때 dispatched -> completed로 전이한다.
+    없으면 404, dispatched 상태가 아니면 409. dispatch_route와 동일하게
+    RETURNING으로 받은 행을 그대로 반환한다."""
+    result = queries.complete_route(route_id, queries.now_utc())
+    if result == "not_found":
+        raise HTTPException(status_code=404, detail=f"route {route_id} not found")
+    if result == "wrong_status":
+        raise HTTPException(status_code=409, detail=f"route {route_id} is not in dispatched status")
+    return result

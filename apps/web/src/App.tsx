@@ -3,6 +3,7 @@ import { api } from "./api";
 import type { Alert, DispatchCenter, ForecastResponse, StationSummary } from "./api";
 import { AlertList } from "./components/AlertList";
 import { DetailPanel } from "./components/DetailPanel";
+import type { FocusedEvent } from "./components/DetailPanel";
 import { ForecastPanel } from "./components/ForecastPanel";
 import { Header } from "./components/Header";
 import { StationMap } from "./components/StationMap";
@@ -35,6 +36,15 @@ export default function App() {
   // 공개 자료가 없어 최근접 근사로 배정한 값이다(apps/api/regions.py 참고).
   const [selectedRegion, setSelectedRegion] = useState<string>(ALL_REGIONS);
   const [regionCenters, setRegionCenters] = useState<DispatchCenter[]>([]);
+  // 대여소 상세의 "주변 행사" 탭에서 행사를 고르면 지도를 그 위치로 옮기고
+  // 초록 점 + 검색 반경 원을 띄운다. DetailPanel과 StationMap이 형제 컴포넌트라
+  // 공통 부모인 여기서 들고 내려보낸다.
+  const [focusedEvent, setFocusedEvent] = useState<FocusedEvent | null>(null);
+  // 상단(지도:리스트)은 드래그로 폭을 바꿀 수 있는데 하단(예측/재고:상세)이 항상
+  // 고정 1/3씩이면 두 줄의 세로 구획선이 안 맞는다(#97). 상단 그룹의 실제 레이아웃을
+  // 여기로 받아와서 하단 그리드 폭 계산에 그대로 쓴다 — 핸들을 드래그하면 하단도
+  // 같이 움직인다.
+  const [mapColumnPercent, setMapColumnPercent] = useState(66.666);
 
   useEffect(() => {
     let cancelled = false;
@@ -61,6 +71,14 @@ export default function App() {
   useEffect(() => {
     api.regions().then(setRegionCenters);
   }, []);
+
+  // 첫 화면부터 세 하단 패널이 비어 있지 않도록, 데이터가 도착하면 가장
+  // 긴급한 대여소(서버가 urgency 내림차순으로 반환)를 기본 선택한다.
+  useEffect(() => {
+    if (selectedStationId === null && alerts.length > 0) {
+      setSelectedStationId(alerts[0].sta_id);
+    }
+  }, [alerts, selectedStationId]);
 
   useEffect(() => {
     if (selectedStationId === null) {
@@ -96,16 +114,22 @@ export default function App() {
         <ResizablePanelGroup orientation="vertical" className="rounded-lg border">
           {/* Top Row: Map and Alert List */}
           <ResizablePanel defaultSize={67} minSize={30}>
-            <ResizablePanelGroup orientation="horizontal">
+            <ResizablePanelGroup
+              orientation="horizontal"
+              onLayoutChange={(layout) => {
+                const mapPercent = layout["map-col"];
+                if (mapPercent !== undefined) setMapColumnPercent(mapPercent);
+              }}
+            >
               {/* Map */}
-              <ResizablePanel defaultSize={66.666} minSize={30}>
+              <ResizablePanel id="map-col" defaultSize={66.666} minSize={30}>
                 <div className="flex h-full flex-col px-4 py-2 bg-background">
                   <section className="flex flex-col h-full gap-2 min-w-0 min-h-0">
                     <div className="flex items-center justify-between">
                       <span className="flex items-center gap-2">
                         <h2 className="text-base font-semibold tracking-tight">대여소 지도</h2>
                         <select
-                          className="region-select rounded border px-2 py-1 text-sm bg-background"
+                          className="region-select"
                           value={selectedRegion}
                           onChange={(e) => setSelectedRegion(e.target.value)}
                           aria-label="지역센터 필터"
@@ -118,6 +142,20 @@ export default function App() {
                             </option>
                           ))}
                         </select>
+                        <div className="alert-tabs alert-tabs--inline" role="tablist" aria-label="지도 표시 범위">
+                          {MAP_FILTER_TABS.map((t) => (
+                            <button
+                              key={t.key}
+                              type="button"
+                              role="tab"
+                              aria-selected={mapFilterMode === t.key}
+                              className={`alert-tab${mapFilterMode === t.key ? " active" : ""}`}
+                              onClick={() => setMapFilterMode(t.key)}
+                            >
+                              {t.label}
+                            </button>
+                          ))}
+                        </div>
                       </span>
                       <span className="text-xs text-muted-foreground">기준 시각 {stationsUpdatedAt ? formatClock(stationsUpdatedAt) : "-"}</span>
                     </div>
@@ -128,8 +166,10 @@ export default function App() {
                           alerts={filteredAlerts}
                           selectedStationId={selectedStationId}
                           onSelect={setSelectedStationId}
+                          mapFilterMode={mapFilterMode}
                           regionCenters={regionCenters}
                           selectedRegion={selectedRegion}
+                          focusedEvent={focusedEvent}
                         />
                       </div>
                     </div>
@@ -138,7 +178,7 @@ export default function App() {
               </ResizablePanel>
               <ResizableHandle withHandle />
               {/* Alert List */}
-              <ResizablePanel defaultSize={33.334} minSize={20}>
+              <ResizablePanel id="list-col" defaultSize={33.334} minSize={20}>
                 <div className="flex h-full flex-col overflow-auto bg-card px-4 py-2 min-w-0 min-h-0">
                   <section className="flex flex-col h-full gap-2 min-w-0 min-h-0">
                     <h2 className="text-base font-semibold tracking-tight">작업 우선순위</h2>
@@ -155,7 +195,12 @@ export default function App() {
 
           {/* Bottom Row: Forecast, Stock, Details */}
           <ResizablePanel defaultSize={33} minSize={20}>
-            <div className="grid h-full grid-cols-3 divide-x">
+            <div
+              className="grid h-full divide-x"
+              style={{
+                gridTemplateColumns: `${mapColumnPercent / 2}% ${mapColumnPercent / 2}% ${100 - mapColumnPercent}%`,
+              }}
+            >
               <div className="flex h-full flex-col overflow-auto bg-card px-4 py-2 min-w-0 min-h-0">
                 <section className="flex flex-col h-full gap-2 min-w-0 min-h-0">
                   <h2 className="text-base font-semibold tracking-tight">대여·반납 예측</h2>
@@ -176,7 +221,11 @@ export default function App() {
                 <section className="flex flex-col h-full gap-2 min-w-0 min-h-0">
                   <h2 className="text-base font-semibold tracking-tight">대여소 상세</h2>
                   <div className="flex-1 min-w-0 min-h-0">
-                    <DetailPanel stationId={selectedStationId} reasons={forecast?.reasons ?? []} />
+                    <DetailPanel
+                      stationId={selectedStationId}
+                      reasons={forecast?.reasons ?? []}
+                      onFocusEvent={setFocusedEvent}
+                    />
                   </div>
                 </section>
               </div>

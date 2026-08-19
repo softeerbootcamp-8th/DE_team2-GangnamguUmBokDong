@@ -143,7 +143,10 @@ POPULATION_NORMALIZED_SOURCE_ID = "living_population_normalized"
 
 BIKE_REALTIME_TICK_MINUTES = 5
 RENTAL_TICK_MINUTES = 5
-WEATHER_TICK_MINUTES = 10
+
+# #89 E2E에서는 realtime_5min DAG에서도 weather Silver가 5분 window_start로 생길 수
+# 있으므로(airflow/dags/realtime_5min.py) :05/:15 파일까지 조회 대상에 포함해야 한다.
+WEATHER_TICK_MINUTES = 5
 POPULATION_NORMALIZED_TICK_MINUTES = 5
 
 

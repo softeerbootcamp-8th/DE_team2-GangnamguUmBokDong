@@ -1,7 +1,14 @@
 source_id: population_realtime
 description: "\uC11C\uC6B8 \uC2E4\uC2DC\uAC04 \uC778\uAD6C \uB370\uC774\uD130"
 adapter: seoul_openapi
-adapter_params: {service: citydata_ppltn, page_size: 1000, root_key: SeoulRtd.citydata_ppltn}
+adapter_params:
+  service: citydata_ppltn
+  page_size: 1000
+  root_key: SeoulRtd.citydata_ppltn
+  poi_start: 1
+  poi_end: 121
+  # 5분마다 POI 121개를 각각 호출하므로 4개씩 병렬 조회한다.
+  concurrency: 4
 schedule: {interval: 5m}
 storage:
   bronze_format: json

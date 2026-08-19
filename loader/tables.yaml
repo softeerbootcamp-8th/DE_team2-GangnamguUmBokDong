@@ -1,0 +1,163 @@
+stations:
+  source_id: bike_station_realtime
+  transform: stations_from_silver
+  conflict_cols:
+    - sta_id
+  update_cols:
+    - sta_nm
+    - gu
+    - sta_addr
+    - lat
+    - lon
+    - hold_cnt
+    - grid_nx
+    - grid_ny
+
+station_stock:
+  source_id: bike_station_realtime
+  transform: station_stock_from_silver
+  conflict_cols:
+    - sta_id
+    - observed_at
+  update_cols:
+    - parking_bike_tot_cnt
+
+# weather_current/weather_forecast는 gu(자치구) 대신 격자(nx, ny)를 조인 키로 쓴다.
+# gu는 표시용 파생 컬럼으로만 남는다(넓은 구에 여러 격자가 걸치는 문제를 gu 단위
+# 조인으로는 해소할 수 없어서, docs/superpowers/specs/2026-08-19-weather-grid-matching-design.md
+# 참고).
+weather_current:
+  source_id: weather_ultra_short_live
+  transform: weather_current_from_silver
+  conflict_cols:
+    - nx
+    - ny
+  update_cols:
+    - gu
+    - observed_at
+    - temperature
+    - humidity
+    - wind_speed
+    - rainfall
+    - pty_type
+
+# weather_forecast와 weather_forecast_ultra는 loader/main.py의 _TABLE_ALIASES에 의해
+# 같은 물리 테이블(weather_forecast)을 공유한다. 두 소스는 서로 다른 Airflow DAG(3h/30분)로
+# 실행 순서 보장 없이 이 테이블에 upsert하므로, guard_col(base_dttm)로 더 오래된 발표가
+# 더 최신 발표를 덮어쓰지 못하게 막는다.
+weather_forecast:
+  source_id: weather_short_term_forecast
+  transform: weather_forecast_from_silver
+  conflict_cols:
+    - nx
+    - ny
+    - forecast_dttm
+  update_cols:
+    - gu
+    - sky_cond
+    - pty_type
+    - temperature
+    - precip_prob
+    - precip_amount
+    - humidity
+    - wind_speed
+    - base_dttm
+  expire_col: forecast_dttm
+  guard_col: base_dttm
+
+weather_forecast_ultra:
+  source_id: weather_ultra_short_forecast
+  transform: weather_forecast_ultra_from_silver
+  conflict_cols:
+    - nx
+    - ny
+    - forecast_dttm
+  update_cols:
+    - gu
+    - sky_cond
+    - pty_type
+    - temperature
+    - precip_prob
+    - precip_amount
+    - humidity
+    - wind_speed
+    - base_dttm
+  expire_col: forecast_dttm
+  guard_col: base_dttm
+
+cultural_events:
+  source_id: cultural_event
+  transform: cultural_events_from_silver
+  conflict_cols:
+    - event_id
+  update_cols:
+    - title
+    - category
+    - gu
+    - place
+    - start_date
+    - end_date
+    - is_free
+    - lat
+    - lon
+  expire_col: end_date
+
+cultural_events_performance:
+  source_id: performance_event
+  transform: performance_events_from_silver
+  conflict_cols:
+    - event_id
+  update_cols:
+    - title
+    - category
+    - gu
+    - place
+    - start_date
+    - end_date
+    - is_free
+    - lat
+    - lon
+  expire_col: end_date
+
+forecast_points:
+  source_id: ml_predictions
+  transform: forecast_points_from_predictions
+  conflict_cols:
+    - sta_id
+    - predicted_dttm
+  update_cols:
+    - predicted_rent_cnt
+    - predicted_return_cnt
+    - batch_run_at
+  reader: read_predictions
+  expire_col: predicted_dttm
+
+station_urgency:
+  source_id: rebalance_urgency
+  transform: station_urgency_from_urgency_batch
+  conflict_cols:
+    - sta_id
+  update_cols:
+    - urgency_score
+    - minutes_until_critical
+    - action_type
+    - bike_qty
+    - batch_run_at
+  reader: read_urgency
+
+rebalance_routes:
+  source_id: rebalance_routes
+  transform: rebalance_routes_from_routes_batch
+  conflict_cols:
+    - route_id
+  update_cols: []
+  reader: read_routes
+
+rebalance_route_stops:
+  source_id: rebalance_route_stops
+  transform: rebalance_route_stops_from_route_stops_batch
+  conflict_cols:
+    - route_id
+    - visit_order
+  update_cols: []
+  reader: read_route_stops

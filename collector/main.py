@@ -1,44 +1,33 @@
-"""CLI 진입점으로 인자 파싱 후 pipeline을 호출한다.
-
-## 실행 방법
+"""CLI 진입점 — 인자 파싱 후 pipeline을 호출한다.
 
     cd collector
     uv run python main.py --source bike_station_realtime \
         --window-start 2026-08-12T23:10:00+09:00 [--force] [--backfill]
 
-- Airflow는 소스별 태스크에서 `data_interval_start`를 KST로 변환해 `--window-start`로 넘긴다. 
-- 백필 DAG는 `_retry_queue/`에서 얻은 대상에 `--backfill`을 붙여 호출한다. 
-- 인자 — `--source`(필수) · `--window-start`(필수, ISO8601, KST 오프셋(`+09:00`) 포함)
-  · `--force` · `--backfill`
-- `window_end`는 config의 `schedule.interval`로 계산한다. collector 자체는 스케줄을
-  모른다.
-- 인자 파싱 → 로깅 초기화 → config 로드 → pipeline 실행 → 종료 코드 반환.
-  로깅 초기화가 pipeline보다 먼저여야 고정 필드가 모든 로그에 붙는다.
+Airflow는 소스별 태스크에서 `data_interval_start`를 KST로 변환해 `--window-start`로
+넘기고, 백필 DAG는 `_retry_queue/`에서 얻은 대상에 `--backfill`을 붙여 호출한다.
+`window_end`는 config의 `schedule.interval`로 계산하며, collector 자체는 스케줄을
+모른다. 처리 순서는 인자 파싱 → 로깅 초기화 → config 로드 → pipeline 실행 →
+종료 코드 반환이다. 로깅 초기화가 pipeline보다 먼저여야 고정 필드가 모든 로그에
+붙는다.
 
-## --force와 --backfill
-
-목적이 반대다.
+`--force`와 `--backfill`은 목적이 반대라 함께 줄 수 없다(오류로 막는다).
 
 | 플래그 | 의미 | bronze |
 | --- | --- | --- |
 | `--force` | 재개 분기를 무시하고 처음부터 다시 | `clear_bronze` 후 전체 재수집 |
-| `--backfill` | 완결된 window의 **누락 조각만** 채움 | 기존 조각 유지, 빠진 것만 호출 |
+| `--backfill` | 완결된 window의 누락 조각만 채움 | 기존 조각 유지, 빠진 것만 호출 |
 
-둘을 함께 주면 오류로 막는다.
+종료 코드는 `SUCCEEDED`·`PARTIAL`·`EMPTY`·`SKIPPED`가 0, `FAILED`가 non-zero다.
+누락이 있어도 게이트를 통과했으면 `PARTIAL`(0)이다 — 부분 성공은 재실행해도
+재개 분기가 `SKIPPED`로 빠지므로 Airflow retry가 할 일이 없고, 채워 넣는 일은
+백필 잡이 맡는다.
 
-## 종료 코드
-
-`SUCCEEDED` · `PARTIAL` · `EMPTY` · `SKIPPED`는 0, 
-`FAILED`는 non-zero. Airflow 태스크 실패로 이어져야 한다.
-
-**누락이 있어도 게이트를 통과했으면 `PARTIAL`이므로 0이다.** 부분 성공은
-`stage=completed`로 끝나 재실행하면 재개 분기가 `SKIPPED`로 빠지므로 Airflow retry가 할 일이 없다 
-채워 넣는 일은 백필 잡이 맡고, 가시성은 WARN 로그 · manifest · `_retry_queue` 마커로 확보한다.
-
-## 주의
-
-- 스택 트레이스를 그대로 뱉지 않는다. 실패는 manifest에 남기고 정리된 메시지와 종료 코드로 전달한다.
-- 인증키를 인자로 받지 않는다. 키는 환경변수(`SEOUL_OPENAPI_KEY`, `KMA_APIHUB_KEY`)에서만 읽는다.
+주의:
+- 스택 트레이스를 그대로 뱉지 않는다. 실패는 manifest에 남기고 정리된 메시지와
+  종료 코드로 전달한다.
+- 인증키를 인자로 받지 않는다. 키는 환경변수(`SEOUL_OPENAPI_KEY`, `KMA_APIHUB_KEY`)
+  에서만 읽는다.
 """
 
 from __future__ import annotations
@@ -56,6 +45,15 @@ from logging_setup import configure_logging
 from manifest import RunStatus
 
 _OK_STATUSES = frozenset({RunStatus.SUCCEEDED, RunStatus.PARTIAL, RunStatus.EMPTY, RunStatus.SKIPPED})
+
+# httpx 기본값은 모든 단계에 5초다. 서울 열린데이터광장의 1000행 페이지 응답 시간을
+# 실측하면 시점에 따라 0.6~7.2초로 흔들려서, 기본값이면 느린 시점에 페이지마다
+# ReadTimeout으로 5초를 버리고 라운드 재시도(15s·30s 대기)로 넘어간다. 데이터를
+# 잃지는 않지만 fetch 예산(`effective_fetch_budget`)을 헛되게 태운다.
+#
+# read를 30초로 두는 근거는 실측 최댓값(7.2초)의 4배 여유다. connect는 짧게 둔다 —
+# 연결이 안 되는 상황은 기다려서 나아지지 않고, TRANSIENT로 라운드가 재시도한다.
+_HTTP_TIMEOUT = httpx.Timeout(connect=10.0, read=30.0, write=30.0, pool=30.0)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -131,7 +129,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # httpx.Client를 여기서 만들어 실행 하나에 재사용한다
     # 어댑터는 연결을 모르고 `client` 인자로 주입받기만 한다
-    with httpx.Client() as client:
+    with httpx.Client(timeout=_HTTP_TIMEOUT) as client:
         result = pipeline.execute_window(
             config, window_start, client=client, force=args.force, backfill=args.backfill,
         )

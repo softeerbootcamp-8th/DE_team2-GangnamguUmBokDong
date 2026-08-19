@@ -1,65 +1,125 @@
-"""loader CLI 진입점.
-
-Airflow가 `uv run python main.py --table <table> --window-start <window_start>` 형태로
-호출하는 것을 전제로 한다. Silver(또는 ml/inference 추론 결과)를 읽어 변환한 뒤
-Gold DB에 upsert하고, 성공하면 0, 실패하면 0이 아닌 코드로 종료한다.
-
-`window_start`는 Airflow DAG의 KST(+09:00) 오프셋 문자열을 그대로 받는다 — collector와
-동일한 오프셋이어야 한다(offset이 다르면 `%H`/`%HHMM`로 찍는 S3 파티션 키가 서로
-어긋난다).
-
-    uv run python main.py --table stations --window-start 2026-08-16T14:05:00+09:00
-"""
+"""Silver 계층 데이터를 읽어 Gold DB에 Upsert하는 CLI 진입점 모듈."""
 
 from __future__ import annotations
 
 import argparse
 import sys
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from core.db import get_connection
-
-from config import TABLE_SPECS
 from core.upsert import upsert
+
+from config import TABLE_SPECS, target_table_for
+from retention_config import DATE_TYPED_EXPIRE_TABLES, grace_for
+
+KST = ZoneInfo("Asia/Seoul")
+
+
+def _expire_cutoff(target_table: str, window_start: datetime):
+    """target_table의 만료 기준 시각(또는 날짜)을 계산한다. window_start에서
+    유예기간(retention_config.RETENTION_GRACE)만큼 뺀 시점보다 오래된 행이 삭제 대상이다."""
+    cutoff = window_start - grace_for(target_table)
+    return cutoff.date() if target_table in DATE_TYPED_EXPIRE_TABLES else cutoff
+
+
+def _delete_expired(conn, target_table: str, expire_col: str, cutoff) -> int:
+    """target_table에서 expire_col < cutoff인 행을 지우고 지운 행 수를 반환한다."""
+    with conn.cursor() as cur:
+        cur.execute(f"DELETE FROM {target_table} WHERE {expire_col} < %(cutoff)s", {"cutoff": cutoff})
+        return cur.rowcount
+
+
+def _only_known_stations(rows: list[dict], known_station_ids: set[str]) -> list[dict]:
+    """stations FK가 존재하는 urgency row만 반환한다."""
+    return [row for row in rows if row["sta_id"] in known_station_ids]
+
+
+def _retire_stale_proposed_routes(conn) -> None:
+    """이번 배치가 새 proposed 라우트를 넣기 전에, 아직 proposed인(=아무도 안
+    건드린) 예전 라우트를 지운다. compute_routes는 매 사이클 전체 권역의 수요를
+    다시 계산하므로, 지난 사이클의 proposed는 이번 사이클 결과로 완전히
+    대체되는 게 맞다 — 그대로 두면 아무도 안 건드린 예전 제안이 사이클마다
+    계속 쌓인다. dispatched/completed로 이미 넘어간 라우트는 운영자가 실제로
+    처리한 기록이라 안 건드린다. S3(routes_main.py가 매 사이클 써두는 parquet)에
+    "그때 뭘 제안했었는지"는 이미 영구히 남으므로, 아무도 안 건드린 proposed를
+    RDS에서 지워도 잃는 정보가 없다."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "DELETE FROM rebalance_route_stops "
+            "WHERE route_id IN (SELECT route_id FROM rebalance_routes WHERE status = 'proposed')"
+        )
+        cur.execute("DELETE FROM rebalance_routes WHERE status = 'proposed'")
 
 
 def run(table: str, window_start: datetime) -> None:
+    """지정된 테이블 스펙에 따라 S3 데이터를 읽고 변환하여 Gold DB에 Upsert한다.
+
+    args:
+        table: 대상 테이블 스펙 식별자
+        window_start: 수집 기준 시각 (KST)
+    """
     spec = TABLE_SPECS[table]
     silver = spec.read(window_start)
 
     if table == "station_stock":
         rows = spec.transform(silver, observed_at=window_start)
-    elif table == "forecast_points":
+    elif table in ("forecast_points", "station_urgency"):
         rows = spec.transform(silver, batch_run_at=window_start)
     else:
         rows = spec.transform(silver)
 
-    # 논리 spec 이름 → 물리 테이블 이름 매핑
-    # 여러 소스가 같은 골드 테이블로 병합되는 경우를 처리한다.
-    _TABLE_ALIASES = {
-        "cultural_events_performance": "cultural_events",
-        "weather_forecast_ultra": "weather_forecast",
-    }
-    target_table = _TABLE_ALIASES.get(table, table)
+    target_table = target_table_for(table)
 
     with get_connection() as conn:
-        upsert(conn, target_table, rows, spec.conflict_cols, spec.update_cols)
+        if table == "station_urgency" and rows:
+            station_ids = [row["sta_id"] for row in rows]
+            with conn.cursor() as cur:
+                cur.execute("SELECT sta_id FROM stations WHERE sta_id = ANY(%s)", (station_ids,))
+                known_station_ids = {row[0] for row in cur.fetchall()}
+            filtered_rows = _only_known_stations(rows, known_station_ids)
+            excluded_count = len(rows) - len(filtered_rows)
+            if excluded_count:
+                print(f"excluded {excluded_count} urgency rows absent from stations")
+            rows = filtered_rows
+        if table == "rebalance_routes":
+            _retire_stale_proposed_routes(conn)
+        upsert(conn, target_table, rows, spec.conflict_cols, spec.update_cols, guard_col=spec.guard_col)
+        if spec.expire_col:
+            cutoff = _expire_cutoff(target_table, window_start)
+            deleted = _delete_expired(conn, target_table, spec.expire_col, cutoff)
+            print(f"deleted {deleted} expired rows from {target_table} (expire_col={spec.expire_col}, cutoff={cutoff})")
         conn.commit()
 
     print(f"upserted {len(rows)} rows into {target_table}")
 
 
+def _parse_window_start(raw: str) -> datetime:
+    """--window-start를 파싱한다. 오프셋이 없으면 KST로 간주해 채운다.
+
+    naive datetime을 그대로 쓰면 DELETE 문의 cutoff가 psycopg를 거쳐 세션
+    TimeZone(컨테이너 기본 UTC)으로 해석돼, KST로 의도한 시각보다 9시간 미래가
+    기준이 된다. 그러면 아직 만료되지 않은 예보/예측 행까지 지워지므로
+    (대시보드가 읽는 바로 그 행들) 여기서 오프셋을 반드시 확정한다."""
+    parsed = datetime.fromisoformat(raw)
+    if parsed.tzinfo is None:
+        print(f"warning: --window-start에 오프셋이 없어 KST로 간주한다: {raw}", file=sys.stderr)
+        return parsed.replace(tzinfo=KST)
+    return parsed
+
+
 def main() -> int:
+    """CLI 인자를 파싱하고 테이블 적재 파이프라인을 실행한다 (성공 0, 실패 1)."""
     parser = argparse.ArgumentParser(description="Silver parquet을 읽어 Gold DB에 upsert한다.")
     parser.add_argument("--table", required=True, choices=sorted(TABLE_SPECS))
     parser.add_argument("--window-start", required=True, help="ISO8601 시각(KST), 예: 2026-08-16T14:05:00+09:00")
     args = parser.parse_args()
 
-    window_start = datetime.fromisoformat(args.window_start)
+    window_start = _parse_window_start(args.window_start)
 
     try:
         run(args.table, window_start)
-    except Exception as exc:  # noqa: BLE001 - CLI 최상위: 실패를 종료 코드로 변환하기 위해 넓게 잡는다
+    except Exception as exc:  # noqa: BLE001 - CLI 최상위: 실패를 종료 코드로 변환하기 위해 포괄 처리
         print(f"loader failed: {exc}", file=sys.stderr)
         return 1
     return 0

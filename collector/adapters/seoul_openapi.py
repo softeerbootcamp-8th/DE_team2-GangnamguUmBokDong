@@ -1,37 +1,30 @@
 """서울 열린데이터광장 공용 페이지네이션 규약 어댑터.
 
-## 데이터 소스 
-따릉이 실시간 대여정보 · 따릉이 대여이력 정보 · 서울 실시간 인구 데이터 ·
-서울시 문화행사·공연행사 · 서울 생활인구(250m).
-
-## RESULT.CODE → 실패 범주
+RESULT.CODE → 실패 범주:
 
 | 코드 | 범주 | 근거 |
 | --- | --- | --- |
 | `INFO-000` | 성공 | |
-| `INFO-200` (해당 데이터 없음) | **성공(빈 결과)** | 정상 상황을 누락으로 세면 완결도가 왜곡된다 |
+| `INFO-200` (해당 데이터 없음) | 성공(빈 결과) | 정상 상황을 누락으로 세면 완결도가 왜곡된다 |
 | `INFO-100` (인증키 오류) | `FATAL` | 모든 조각이 같은 키를 쓰므로 재시도·백필이 무의미 |
 | `ERROR-500` 계열 (서버 오류) | `TRANSIENT` | 라운드로 회복 가능 |
 | 그 외 요청 오류 | `PERMANENT` | 그 조각만 누락 확정 |
 
-`yield`하는 값은 **가공되지 않은 응답 원본**이다. 여기서 행을 꺼내거나 페이지를 합치지
-않는다. 조각을 S3에 저장하는 것은 pipeline이다.
-
-라운드 재시도 · 안전장치 · HTTP 클라이언트는 base의 공통 유틸을 쓴다.
-
-## 주의
-
-- 인증키는 `SEOUL_OPENAPI_KEY`에서 읽는다. **키가 URL 경로에 들어가므로** 로그 ·
-  예외 메시지 · bronze · **조각 키**에 남지 않게 마스킹한다.
-- 전 필드가 문자열로 내려온다. 캐스팅은 검증 엔진의 `types`가 담당하고 어댑터는
+주의:
+- 인증키(`SEOUL_OPENAPI_KEY`)는 URL 경로에 그대로 실리므로 로그·예외 메시지·bronze·
+  조각 키 어디에도 남지 않게 마스킹한다.
+- 응답 필드는 전부 문자열로 내려온다. 캐스팅은 검증 엔진의 `types`가 맡고 어댑터는
   값에 손대지 않는다.
 """
-
 
 from __future__ import annotations
 
 import json
 import os
+from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
+from datetime import timedelta
 from typing import TYPE_CHECKING
 
 import httpx
@@ -45,6 +38,11 @@ _BASE_URL = "http://openapi.seoul.go.kr:8088"
 
 _FATAL_CODES = {"INFO-100"}
 _SUCCESS_CODES = {"INFO-000", "INFO-200"}
+
+# adapter_params에 `concurrency`를 선언하지 않은 소스는 순차로 돈다. 병렬은 소스별
+# opt-in이다 — 페이지가 몇 개뿐인 소스는 이득이 없고, 한 API에 동시 요청을 늘리는
+# 것이라 필요한 곳에만 켠다.
+_DEFAULT_CONCURRENCY = 1
 
 
 def _api_key() -> str:
@@ -77,9 +75,136 @@ def _extract(body: dict, wrapper_key: str) -> dict:
     return body.get(wrapper_key, {})
 
 
+def _result_code(body: dict, wrapper_key: str) -> str | None:
+    """본문에서 RESULT.CODE를 꺼낸다. 서울 API는 두 형태를 쓴다.
+
+    보통은 서비스명 래퍼 안에 `RESULT.CODE`가 있다. 그런데 **시작 인덱스가
+    `list_total_count`를 넘으면 래퍼 없이 최상단에 `CODE`만 온다**
+    (실측: `{"CODE": "INFO-200", "MESSAGE": "해당하는 데이터가 없습니다."}`).
+    래퍼만 보면 `None`이 되어 `_classify`가 PERMANENT로 오판한다.
+    """
+    wrapper = _extract(body, wrapper_key)
+    if isinstance(wrapper, dict):
+        code = wrapper.get("RESULT", {}).get("CODE")
+        if isinstance(code, str):
+            return code
+    top_level = body.get("CODE")
+    return top_level if isinstance(top_level, str) else None
+
+
+@dataclass(frozen=True, slots=True)
+class _PageOutcome:
+    """페이지 하나의 조회 결과. 스레드풀 워커가 돌려주는 값이라 순수 데이터로 둔다."""
+
+    payload: bytes | None
+    total: int | None
+    error: FetchErrorKind | None
+
+
+def _request_json(client: httpx.Client, url: str) -> tuple[bytes, dict] | FetchErrorKind:
+    """URL을 요청해 JSON 객체로 파싱한다. 예외를 밖으로 던지지 않는다.
+
+    스레드풀에서 병렬 호출되므로 공유 상태를 두지 않는다. `httpx.Client`는 스레드
+    안전하고, 하나를 공유하면 커넥션 풀도 재사용된다.
+    """
+    try:
+        response = client.get(url)
+        response.raise_for_status()
+        body = json.loads(response.content)
+        if not isinstance(body, dict):
+            raise json.JSONDecodeError("응답이 JSON 객체가 아님", "", 0)
+    except (httpx.RequestError, httpx.HTTPStatusError, json.JSONDecodeError):
+        # 타임아웃·커넥션 에러, 또는 서버가 5xx와 함께 HTML을 내려보내 파싱에 실패한 경우
+        return FetchErrorKind.TRANSIENT
+    return response.content, body
+
+
+def _fetch_page(client: httpx.Client, url: str, wrapper_key: str) -> _PageOutcome:
+    """페이지 하나를 받아 실패 범주까지 판정한다."""
+    result = _request_json(client, url)
+    if isinstance(result, FetchErrorKind):
+        return _PageOutcome(payload=None, total=None, error=result)
+    content, body = result
+
+    # 서울 API는 보통 HTTP 200으로 응답하고, 논리적 성공/실패는 본문 코드에 담아 보낸다
+    category = _classify(_result_code(body, wrapper_key))
+    if category is not None:
+        return _PageOutcome(payload=None, total=None, error=category)
+
+    wrapper = _extract(body, wrapper_key)
+    raw_total = wrapper.get("list_total_count", 0) if isinstance(wrapper, dict) else 0
+    return _PageOutcome(payload=content, total=int(raw_total), error=None)
+
+
+def _fetch_poi(client: httpx.Client, url: str, wrapper_key: str) -> _PageOutcome:
+    """실시간 인구 POI 하나를 받아 실패 범주까지 판정한다."""
+    result = _request_json(client, url)
+    if isinstance(result, FetchErrorKind):
+        return _PageOutcome(payload=None, total=None, error=result)
+    content, body = result
+
+    # citydata_ppltn은 일반 페이지 응답과 달리 RESULT.CODE가 최상단 RESULT 객체의
+    # `RESULT.CODE` 키로 내려온다. 빈 POI(INFO-200)도 성공 조각으로 보존한다.
+    code = body.get("RESULT.CODE") or body.get("RESULT", {}).get("RESULT.CODE")
+    category = _classify(code)
+    if category is not None:
+        return _PageOutcome(payload=None, total=None, error=category)
+    return _PageOutcome(payload=content, total=None, error=None)
+
+
+def _run_concurrent(items, concurrency: int, fetch_one, thread_name_prefix: str):
+    """items 순서를 유지하며 fetch_one(item)을 동시 실행해 (item, outcome) 순서대로 yield한다.
+
+    완료 순서대로 내보내면(as_completed) 조각 키 순서가 흔들리므로, 앞 항목을 기다리는
+    동안에도 뒤 요청은 이미 나가 있게 해 전체 소요를 완료순과 같게 만든다. 미리 요청하는
+    개수를 concurrency의 2배로 묶는 이유는 메모리다 — 전부 던져두면 완료됐지만 아직
+    내보내지 않은 응답이 쌓인다.
+    """
+    pool = ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix=thread_name_prefix)
+    try:
+        queued = iter(items)
+        inflight: deque[tuple[object, Future[_PageOutcome]]] = deque()
+
+        def submit_next() -> bool:
+            item = next(queued, None)
+            if item is None:
+                return False
+            inflight.append((item, pool.submit(fetch_one, item)))
+            return True
+
+        for _ in range(concurrency * 2):
+            if not submit_next():
+                break
+
+        while inflight:
+            item, future = inflight.popleft()
+            outcome = future.result()
+            submit_next()
+            yield item, outcome
+            if outcome.error is FetchErrorKind.FATAL:
+                # 모든 조각이 같은 인증키를 쓰므로 나머지도 같은 이유로 실패한다.
+                return
+    finally:
+        # `with ThreadPoolExecutor(...)`를 쓰면 __exit__이 shutdown(wait=True)라
+        # 큐에 남은 항목이 끝날 때까지 블록한다. fetch_with_rounds가 마감 시한을
+        # 넘겨 순회를 중단하고 이 제너레이터를 버릴 때 그 대기가 마감 시한 방어를
+        # 무력화한다. 실행 중인 요청은 끊을 수 없지만 대기 큐는 즉시 비운다.
+        pool.shutdown(wait=False, cancel_futures=True)
+
+
 @adapter("seoul_openapi")
 class SeoulOpenApiAdapter:
     """서울 열린데이터광장 공용 페이지네이션 규약 어댑터."""
+
+    @staticmethod
+    def planned_parts(config: SourceConfig, window) -> frozenset[str] | None:
+        """요청 전에 전체 키를 아는 POI 소스의 조각 계획을 반환한다."""
+        params = config.adapter_params
+        if params["service"] != "citydata_ppltn":
+            return None
+        poi_start = int(params.get("poi_start", 1))
+        poi_end = int(params["poi_end"])
+        return frozenset(f"poi-POI{i:03d}" for i in range(poi_start, poi_end + 1))
 
     @staticmethod
     def fetch(
@@ -104,104 +229,134 @@ class SeoulOpenApiAdapter:
         path_suffix_template = params.get("path_suffix", "")
         suffix = ""
         if path_suffix_template:
-            suffix = path_suffix_template.format(window_start=window.window_start)
-        # citydata_ppltn은 페이지네이션 대신 POI001~POI116 순회
+            # `window_last`는 이 윈도우가 시작하기 직전 순간이다. 시간 단위 파라미터를
+            # 받는 API에서 매시 끝자락이 누락되는 것을 막는다 — 19:00 윈도우가
+            # window_start의 시를 쓰면 19시대를 요청해 18:55~19:00 데이터를 아무도
+            # 가져가지 않는다. window_last를 쓰면 그 윈도우가 18시대를 한 번 더
+            # 완결시키고 19:05부터 19시대로 넘어간다.
+            suffix = path_suffix_template.format(
+                window_start=window.window_start,
+                window_end=window.window_end,
+                window_last=window.window_start - timedelta(seconds=1),
+            )
+        # citydata_ppltn은 페이지네이션 대신 YAML에 선언된 POI 범위를 순회한다.
+        # 장소가 늘어날 때 공통 코드를 고치지 않고 poi_end만 갱신할 수 있게 한다.
         if service == "citydata_ppltn":
-            expected = 116
-            for i in range(1, expected + 1):
+            poi_start = int(params.get("poi_start", 1))
+            poi_end = int(params["poi_end"])
+            if poi_start < 1 or poi_end < poi_start:
+                raise ValueError("citydata_ppltn의 poi_start/poi_end 범위가 올바르지 않습니다")
+
+            pois = []
+            for i in range(poi_start, poi_end + 1):
                 poi_id = f"POI{i:03d}"
                 key = f"poi-{poi_id}"
-                
-                if key in skip:
-                    continue
-                
-                url = f"{_BASE_URL}/{_api_key()}/json/{service}/1/5/{poi_id}/"
-                try:
-                    response = client.get(url)
-                    response.raise_for_status()
-                    body = json.loads(response.content)
-                    wrapper = _extract(body, wrapper_key)
-                except (httpx.RequestError, httpx.HTTPStatusError, json.JSONDecodeError):
-                    yield FetchResult(key=key, payload=None, error=FetchErrorKind.TRANSIENT, expected_total=expected if i == 1 else None)
-                    continue
+                if key not in skip:
+                    url = f"{_BASE_URL}/{_api_key()}/json/{service}/1/5/{poi_id}/"
+                    pois.append((key, url))
 
-                code = body.get("RESULT.CODE") or body.get("RESULT", {}).get("RESULT.CODE")
-                category = _classify(code)
+            # expected_total은 pipeline에서 기대 row 수를 뜻한다. POI 범위 크기는
+            # 요청 조각 수이고 INFO-200 조각은 정상적으로 0행일 수 있으므로, 여기서는
+            # None을 유지해 실제 요청 실패만 조각 기준 missing_ratio로 계산한다.
+            concurrency = max(1, int(params.get("concurrency", _DEFAULT_CONCURRENCY)))
+            if concurrency == 1:
+                for key, url in pois:
+                    outcome = _fetch_poi(client, url, wrapper_key)
+                    yield FetchResult(
+                        key=key, payload=outcome.payload, error=outcome.error,
+                        expected_total=None,
+                    )
+                    if outcome.error is FetchErrorKind.FATAL:
+                        return
+                return
 
-                if category is None:
-                    yield FetchResult(key=key, payload=response.content, error=None, expected_total=expected if i == 1 else None)
-                elif category is FetchErrorKind.FATAL:
-                    yield FetchResult(key=key, payload=None, error=category, expected_total=expected if i == 1 else None)
-                    return
-                else:
-                    yield FetchResult(key=key, payload=None, error=category, expected_total=expected if i == 1 else None)
+            # 조각 순서는 유지하되 네트워크 요청은 미리 병렬로 시작한다.
+            def fetch_one_poi(item: tuple[str, str]) -> _PageOutcome:
+                _, url = item
+                return _fetch_poi(client, url, wrapper_key)
+
+            for (key, _url), outcome in _run_concurrent(pois, concurrency, fetch_one_poi, "seoul-poi"):
+                yield FetchResult(
+                    key=key, payload=outcome.payload, error=outcome.error,
+                    expected_total=None,
+                )
             return
+
+        def page_url(start: int, end: int) -> str:
+            return f"{_BASE_URL}/{_api_key()}/json/{service}/{start}/{end}{suffix}/"
 
         # total을 모르면 몇 페이지를 더 돌아야 하는지 알 수 없다.
         # expected_total로 이미 받았으면(라운드 재시도·백필) 그 값을 그대로 쓴다.
         total = expected_total
         page_start = 1
 
-        # total을 아직 모르는 동안은 무조건 계속 돈다(첫 페이지를 반드시 부른다).
-        # 알고 나면 그 값을 넘어서는 순간 멈춘다.
+        # (1) total 발견 — 모르는 동안은 병렬화할 수 없다. 페이지 목록 자체를 만들 수
+        #     없기 때문이고, 범위를 넘겨 요청하면 서울 API가 래퍼 없이 INFO-200을
+        #     내려보내기 때문이다(`_result_code` 참고). 그래서 한 페이지만 순차로 받는다.
+        if total is None:
+            # skip에 있는 키는 네트워크 호출 없이 건너뛴다. total을 모르는 구간에서는
+            # 마지막 페이지를 clamp할 수 없으므로 page_end를 그대로 쓴다.
+            while f"page-{page_start:05d}-{page_start + page_size - 1:05d}" in skip:
+                page_start += page_size
 
-        # (1) 동적 페이지네이션
-        while total is None or page_start <= total:
-            page_end = page_start + page_size - 1
-            if total is not None:
-                page_end = min(page_end, total)
-            key = f"page-{page_start:05d}-{page_end:05d}"
+            key = f"page-{page_start:05d}-{page_start + page_size - 1:05d}"
+            outcome = _fetch_page(client, page_url(page_start, page_start + page_size - 1), wrapper_key)
 
-            # (2) skip 목록에 있는 키는 네트워크 호출을 건너뛴다.
-            if key in skip:
-                page_start = page_end + 1
-                continue
-
-            url = f"{_BASE_URL}/{_api_key()}/json/{service}/{page_start}/{page_end}{suffix}/"
-            try:
-                response = client.get(url)
-                response.raise_for_status()
-                wrapper = _extract(json.loads(response.content), wrapper_key)
-            except (httpx.RequestError, httpx.HTTPStatusError, json.JSONDecodeError):
-                
-                # 타임아웃, 커넥션 에러, 또는 서버가 5xx 에러와 함께 HTML 등을 내려보내 JSON 파싱에 실패한 경우
-                yield FetchResult(key=key, payload=None, error=FetchErrorKind.TRANSIENT, expected_total=None)
-                if total is None:
-                    # 첫 페이지에서 네트워크 에러가 나면 전체 건수를 알 길이 없으므로 그대로 중단
-                    return
-                page_start = page_end + 1
-                continue
-
-            # 서울 API는 보통 HTTP 200으로 응답하고, 논리적 성공/실패는 본문의 RESULT.CODE에 담아 보낸다
-            code = wrapper.get("RESULT", {}).get("CODE")
-            category = _classify(code)
-
-            if category is None:  # 성공 (INFO-000 또는 INFO-200)
-                if total is None:
-                    # list_total_count는 첫 응답에만 실려 오기 때문에 
-                    # 여기서 이 값을 한 번 잡아야 남은 페이지 수를 계산할 수 있다.
-                    total = int(wrapper.get("list_total_count", 0))
-                yield FetchResult(
-                    key=key, payload=response.content, error=None,
-                    # expected_total은 pipeline이 기억해뒀다가 다음 라운드·백필에 되돌려주는 값이므로, 
-                    # 처음 알아낸 순간에만 실어 보내고, 그 뒤로는 pipeline이 이미 갖고 있다.
-                    expected_total=total if page_start == 1 else None,
-                )
-                page_start = page_end + 1
-                if total is None:
-                    # 첫 페이지가 성공했는데도 list_total_count를 못 읽었다면 몇 페이지가 더 있는지 알 방법이 없으므로 멈춘다.
-                    return
-            elif category is FetchErrorKind.FATAL:
-                # 인증키 오류 등 확정적 원인이면 즉시 중단한다(라운드 재시도도 무의미).
-                yield FetchResult(key=key, payload=None, error=category, expected_total=None)
+            if outcome.error is not None:
+                yield FetchResult(key=key, payload=None, error=outcome.error, expected_total=None)
+                # total을 못 구했으면 남은 페이지 수를 알 방법이 없으므로 여기서 멈춘다.
                 return
-            else:  # TRANSIENT 또는 PERMANENT 조각만 실패로 보고하고 계속 진행
-                yield FetchResult(key=key, payload=None, error=category, expected_total=None)
-                if total is None:
-                    # 첫 페이지가 실패해 total을 못 구했다 
-                    # 남은 페이지 수를 알 수 없으므로 여기서 멈춘다. 
+
+            total = outcome.total or 0
+            yield FetchResult(
+                key=key, payload=outcome.payload, error=None,
+                # expected_total은 pipeline이 기억해뒀다가 다음 라운드·백필에 되돌려주는
+                # 값이라 처음 알아낸 순간에만 싣는다. 그 뒤로는 pipeline이 이미 갖고 있다.
+                expected_total=total if page_start == 1 else None,
+            )
+            page_start += page_size
+
+        # (2) 남은 페이지 목록. total을 알므로 마지막 페이지를 clamp한다 — 조각 키가
+        #     이 clamp에 의존하므로 total이 라운드 사이에 흔들리면 skip이 어긋난다.
+        #     그래서 pipeline이 expected_total을 persist해 되돌려준다.
+        pages: list[tuple[str, int, int]] = []
+        start = page_start
+        while start <= total:
+            end = min(start + page_size - 1, total)
+            key = f"page-{start:05d}-{end:05d}"
+            if key not in skip:
+                pages.append((key, start, end))
+            start = end + 1
+
+        if not pages:
+            return
+
+        # (3) 조회. concurrency를 선언하지 않은 소스는 순차 그대로다(동작 무변화).
+        concurrency = max(1, int(params.get("concurrency", _DEFAULT_CONCURRENCY)))
+
+        if concurrency == 1:
+            for key, start, end in pages:
+                outcome = _fetch_page(client, page_url(start, end), wrapper_key)
+                yield FetchResult(
+                    key=key, payload=outcome.payload, error=outcome.error,
+                    expected_total=total if start == 1 else None,
+                )
+                if outcome.error is FetchErrorKind.FATAL:
+                    # 모든 조각이 같은 인증키를 쓰므로 나머지도 같은 이유로 실패한다.
                     return
-                page_start = page_end + 1
+            return
+
+        # living_population_grid는 254페이지라 페이지당 1.4MB면 수백 MB가 된다 —
+        # 그래서 _run_concurrent가 미리 요청하는 개수를 concurrency의 2배로 묶는다.
+        def fetch_one_page(item: tuple[str, int, int]) -> _PageOutcome:
+            _, start, end = item
+            return _fetch_page(client, page_url(start, end), wrapper_key)
+
+        for (key, start, _end), outcome in _run_concurrent(pages, concurrency, fetch_one_page, "seoul-page"):
+            yield FetchResult(
+                key=key, payload=outcome.payload, error=outcome.error,
+                expected_total=total if start == 1 else None,
+            )
 
     @staticmethod
     def normalize(chunks: list[bytes], config: SourceConfig) -> list[dict]:

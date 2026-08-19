@@ -561,6 +561,7 @@ name = "inference"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
+    { name = "holidays" },
     { name = "ml-core" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "numpy", version = "2.5.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
@@ -575,6 +576,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "holidays", specifier = ">=0.65" },
     { name = "ml-core", editable = "../../libs/ml_core" },
     { name = "numpy" },
     { name = "pandas" },

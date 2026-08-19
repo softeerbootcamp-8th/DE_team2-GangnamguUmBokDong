@@ -1,4 +1,4 @@
-"""#10 소스 YAML 7종 테스트.
+"""Collector 소스 YAML 10종 테스트.
 
 `sources/*.yaml` 전부가 config loader를 통과하는지, 이번에 늘어난 3개 키
 (`max_missing_ratio` · `fetch` · `backfill`)가 생략 가능한지, 그리고 실제
@@ -15,6 +15,8 @@ from zoneinfo import ZoneInfo
 
 import httpx
 import pytest
+
+pytestmark = pytest.mark.usefixtures("_bucket")
 
 import config.loader as config_loader
 import pipeline
@@ -36,8 +38,8 @@ def _api_keys(monkeypatch):
 
 
 class TestAllSourcesLoad:
-    def test_nine_sources_exist(self):
-        assert len(SOURCE_IDS) == 9
+    def test_ten_sources_exist(self):
+        assert len(SOURCE_IDS) == 10
 
     @pytest.mark.parametrize("source_id", SOURCE_IDS)
     def test_loads_without_error(self, source_id):
@@ -46,6 +48,78 @@ class TestAllSourcesLoad:
         assert config.source_id == source_id
         assert config.adapter in ("seoul_openapi", "kma_apihub")
         assert config.config_version.startswith("sha256:")
+
+    def test_no_source_declares_response_pagination_meta(self):
+        """`RNUM`·`START_INDEX`·`END_INDEX`는 데이터가 아니라 요청/응답 메타다.
+
+        실측에서 `START_INDEX`/`END_INDEX`는 전 행이 `(0, 0)`이고 `RNUM`은 그 응답
+        안에서의 행 번호다. 선언하면 두 가지가 나빠진다.
+
+        1. archive에 의미 없는 컬럼이 쌓인다(`docs/collector/bootstrap-design.md`도
+           "archive에도 의미가 없다"고 적어뒀다 — CSV bootstrap은 채울 수조차 없다).
+        2. `compaction.dedup`이 `_window_start`를 뺀 **전체 데이터 컬럼**으로 묶으므로
+           `RNUM`이 dedup 키에 들어간다. 같은 시간대를 여러 윈도우가 반복 수집할 때
+           목록에 지연 등록이 끼어들어 `RNUM`이 한 칸 밀리면, 같은 대여가 서로 다른
+           행으로 남아 중복이 걷히지 않는다.
+        """
+        forbidden = {"RNUM", "START_INDEX", "END_INDEX"}
+        for source_id in SOURCE_IDS:
+            config = config_loader.load(source_id, base_dir=SOURCES_DIR)
+            declared = forbidden & set(config.columns)
+            assert not declared, f"{source_id}에 응답 메타 컬럼이 선언돼 있다: {sorted(declared)}"
+
+    def test_bike_rental_history_preserves_string_compatible_types(self):
+        config = config_loader.load("bike_rental_history", base_dir=SOURCES_DIR)
+
+        # 윈도우 직전 순간(window_last)의 시를 요청한다 — 매시 끝자락 누락 방지.
+        # `RNUM`은 의도적으로 선언하지 않는다(위 응답 메타 테스트 참고).
+        assert config.adapter_params["path_suffix"] == (
+            "/{window_last:%Y-%m-%d}/{window_last:%H}"
+        )
+        assert config.columns["USE_MIN"].types == ("str", "int")
+        assert config.columns["USE_DST"].types == ("str", "float")
+        assert config.columns["BIRTH_YEAR"].types == ("str", "int")
+
+    def test_population_realtime_covers_current_121_pois(self):
+        config = config_loader.load("population_realtime", base_dir=SOURCES_DIR)
+
+        assert config.adapter_params["poi_start"] == 1
+        assert config.adapter_params["poi_end"] == 121
+        assert config.adapter_params["concurrency"] == 4
+
+    @pytest.mark.parametrize(
+        "adapter_params",
+        [
+            {"service": "citydata_ppltn", "page_size": 1000, "root_key": "SeoulRtd.citydata_ppltn"},
+            {
+                "service": "citydata_ppltn",
+                "page_size": 1000,
+                "root_key": "SeoulRtd.citydata_ppltn",
+                "poi_start": 10,
+                "poi_end": 9,
+            },
+        ],
+    )
+    def test_population_poi_range_is_validated_at_config_load(self, tmp_path, adapter_params):
+        source = tmp_path / "invalid_population.yaml"
+        source.write_text(
+            "\n".join(
+                [
+                    "source_id: invalid_population",
+                    "description: invalid population config",
+                    "adapter: seoul_openapi",
+                    f"adapter_params: {json.dumps(adapter_params)}",
+                    "schedule: {interval: 5m}",
+                    "storage: {bronze_format: json, silver_format: parquet, partition: [dt, hh]}",
+                    "quality: {max_drop_ratio: 0.05}",
+                    "policies: {required_missing: drop_row, required_outlier: drop_row, optional_missing: keep_null, optional_outlier: set_null}",
+                    "columns: {}",
+                ]
+            )
+        )
+
+        with pytest.raises(config_loader.ConfigError, match="adapter_params.poi"):
+            config_loader.load("invalid_population", base_dir=tmp_path)
 
 
 class TestOptionalKeysOmittable:
@@ -165,6 +239,34 @@ class TestSeoulSourcesEndToEnd:
 
         assert result.status == RunStatus.EMPTY
 
+    def test_performance_event_end_to_end(self):
+        config = config_loader.load("performance_event", base_dir=SOURCES_DIR)
+        rows = [
+            {
+                "SCH_SEQ": "1234", "TITLE": "잠실 야구 경기", "SDATE": "2026-08-20",
+                "EDATE": "2026-08-20", "USE_TIME": "18:30", "USE_AGE": "전체 관람가",
+                "USE_TARGET": "시민", "USE_PAY": "유료", "LINK_URL": "https://example.com/event",
+                "REG_DATE": "2026-08-01", "UPD_DATE": "2026-08-10", "SCH_CODE_A": "1",
+                "SCH_CODE_B": "8", "CODE_TITLE_A": "스포츠경기", "CODE_TITLE_B": "잠실야구장",
+            }
+        ]
+
+        def handler(request):
+            return httpx.Response(200, content=_seoul_response("stadiumScheduleInfo", rows, total=len(rows)))
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        window_start = datetime(2026, 8, 18, tzinfo=KST)
+
+        result = pipeline.execute_window(config, window_start, client=client, sleep_fn=lambda s: None)
+
+        assert result.status == RunStatus.SUCCEEDED
+        # allow_empty: true라서 status만 보면 스키마가 어긋나 전 행이 폐기돼도
+        # 통과한다. 행이 실제로 살아남았는지까지 고정한다.
+        assert result.counts.kept == 1
+        assert result.drop_ratio == 0.0
+        assert result.artifacts.silver is not None
+
+
 
 class TestKmaSourceEndToEnd:
     def test_weather_ultra_short_live_end_to_end(self):
@@ -199,13 +301,12 @@ class TestKmaSourceEndToEnd:
     @pytest.mark.parametrize(
         "source_id", ["weather_ultra_short_live", "weather_short_term_forecast"]
     )
-    def test_weather_grids_cover_25_seoul_gu_one_to_one(self, source_id):
-        """loader/gu_mapping.py의 `_GRID_TO_GU_TABLE`은 여기 grids 목록과 1:1로
-        맞춰 25개 구 전부를 대표하도록 만들어졌다. 격자를 늘리거나 줄일 때 loader
-        쪽 테이블과 어긋나면 일부 구의 weather_current/weather_forecast가 조용히
-        비게 되므로, 최소한 "정확히 25개, 중복 없음"은 여기서 회귀로 잡는다."""
+    def test_weather_grids_cover_all_real_stations_without_duplicates(self, source_id):
+        """grids 목록은 `loader/scripts/generate_weather_grids.py`가 실제 대여소
+        좌표(`apps/api/seed_data/stations_seoul.json`) 전부를 `latlon_to_grid`로
+        변환해 만든 고유 격자 집합이다(현재 34개). 더는 "구당 격자 1개" 하드코딩
+        테이블에 맞출 필요가 없으므로, 여기서는 "중복 없음"만 회귀로 잡는다."""
         config = config_loader.load(source_id, base_dir=SOURCES_DIR)
         grids = config.adapter_params["grids"]
 
-        assert len(grids) == 25
-        assert len({tuple(g) for g in grids}) == 25
+        assert len(grids) == len({tuple(g) for g in grids})

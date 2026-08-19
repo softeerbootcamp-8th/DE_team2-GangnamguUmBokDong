@@ -1,8 +1,8 @@
-"""데이터 수집 설정 파일(YAML)의 구조와 논리적 오류를 검증하여 로드한다.
+"""sources/{source_id}.yaml을 읽어 검증까지 마친 SourceConfig로 만드는 곳.
 
-이 모듈은 sources/{source_id}.yaml 파일을 읽어 Pydantic 스키마 검증 및 정책 레지스트리 조회를 거친 뒤, 
-유효성이 입증된 SourceConfig 객체로 변환하는 단일 관문입니다. 
-네트워크 호출 전에 모든 설정 오류를 사전에 차단하며, 통과된 설정에는 버전 추적을 위한 SHA-256 해시가 기록됩니다.
+파일을 읽고, Pydantic으로 타입을 검사하고, 정책 이름이 실제 등록된 것인지 확인한 뒤 문제가 없으면 SourceConfig를 반환한다. 
+여기서 오류를 다 걸러내야 네트워크를 타기 전에 잘못된 설정을 잡을 수 있다. 
+통과한 설정에는 원본 YAML의 SHA-256 해시를 `config_version`으로 붙여, 나중에 어떤 설정으로 수집했는지 추적할 수 있게 한다.
 """
 
 from __future__ import annotations
@@ -48,10 +48,28 @@ def load(source_id: str, base_dir: Path = Path("sources")) -> SourceConfig:
         )
     errors += _check_policy_names(config)
     errors += _check_row_params(config)
+    errors += _check_adapter_params(config)
     if errors:
         raise ConfigError("\n".join(errors))
 
     return config.model_copy(update={"config_version": config_version})
+
+
+def _check_adapter_params(config: SourceConfig) -> list[str]:
+    """네트워크나 기존 bronze를 건드리기 전에 adapter별 계획 설정을 검증한다."""
+    params = config.adapter_params
+    if config.adapter != "seoul_openapi" or params.get("service") != "citydata_ppltn":
+        return []
+
+    poi_start = params.get("poi_start", 1)
+    poi_end = params.get("poi_end")
+    if not isinstance(poi_start, int) or isinstance(poi_start, bool):
+        return ["adapter_params.poi_start: 1 이상의 정수여야 합니다."]
+    if not isinstance(poi_end, int) or isinstance(poi_end, bool):
+        return ["adapter_params.poi_end: 필수이며 정수여야 합니다."]
+    if poi_start < 1 or poi_end < poi_start:
+        return ["adapter_params.poi_start/poi_end: 1 <= poi_start <= poi_end여야 합니다."]
+    return []
 
 
 def _check_policy_names(config: SourceConfig) -> list[str]:

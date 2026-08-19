@@ -17,6 +17,7 @@ from __future__ import annotations
 from airflow.task.trigger_rule import TriggerRule
 
 from config.schedules import INFERENCE_EXECUTION_TIMEOUT
+
 from orchestration.task_builder import REPO_ROOT, build_module_task
 from orchestration.templates import KST_DATE, KST_HOUR, KST_MINUTE
 
@@ -32,7 +33,8 @@ def build_inference_task(dag, *, trigger_rule: str = TriggerRule.ALL_SUCCESS):
     """
     cmd = (
         "uv --project inference run python -m inference.predict_single "
-        f"--all-stations --date {KST_DATE} --hour {KST_HOUR} --minute {KST_MINUTE}"
+        f"--all-stations --date {KST_DATE} --hour {KST_HOUR} --minute {KST_MINUTE} "
+        "--n-hours 12"
     )
     return build_module_task(
         dag,

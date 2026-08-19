@@ -26,6 +26,7 @@ data/
 *.csv
 *.parquet
 *.db
+data/
 
 # log
 *.log

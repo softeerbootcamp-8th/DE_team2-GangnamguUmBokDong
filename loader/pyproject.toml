@@ -9,6 +9,7 @@ dependencies = [
     "pyarrow>=25.0.1",
     "shapely>=2.1.2",
     "psycopg[binary]>=3.1.0",
+    "pyyaml>=6.0.3",
 ]
 
 [tool.uv]
@@ -23,7 +24,7 @@ dev = [
     "moto[s3]>=5.2.2",
     "pytest>=9.1.1",
     # forecast_points 키 컨벤션이 ml_core.silver_schema.predictions_key()와 갈라지지
-    # 않는지 확인하는 계약 테스트 전용 — 런타임(main.py/s3_reader.py)은 이 의존성을
+    # 않는지 확인하는 계약 테스트 전용 — 런타임(main.py/reader.py)은 이 의존성을
     # 쓰지 않는다(무거운 lightgbm 등을 배포 환경에 끌고 오지 않기 위해).
     "ml_core",
 ]

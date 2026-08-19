@@ -9,15 +9,19 @@ from __future__ import annotations
 import gzip
 import json
 from collections.abc import Sequence
-from datetime import datetime
+from datetime import date, datetime
 
 import pyarrow.parquet as pq
 
+from core.layout import archive_key
 from core.s3 import (
+    S3Object,
     delete_object,
     delete_objects,
     get_object_bytes,
     list_keys,
+    list_objects,
+    object_exists,
     put_object_bytes,
     read_json,
     write_json,
@@ -88,6 +92,56 @@ def write_quarantine(source_id: str, window_start: datetime, rows: list[dict]) -
     body = "\n".join(json.dumps(row, ensure_ascii=False) for row in rows) + "\n"
     put_object_bytes(key, body.encode("utf-8"))
     return key
+
+
+def _silver_date_prefix(source_id: str, day: date) -> str:
+    """해당 날짜의 silver 조각들이 모이는 prefix를 만든다."""
+    return f"silver/{source_id}/dt={day:%Y-%m-%d}/"
+
+
+def list_silver_objects(source_id: str, day: date) -> list[S3Object]:
+    """해당 날짜의 silver parquet을 메타(size·last_modified)와 함께 나열한다.
+
+    compaction이 "이 날짜가 지난번 압축 이후 바뀌었는가"를 본문 없이 판정하는 근거다.
+    parquet이 아닌 객체는 거른다 — nowcaster가 같은 prefix 아래에 자기 산출물을
+    두는 경우가 있어(`silver/{src}/dt=.../hh=00/nowcast.parquet`) 확장자만으로는
+    부족할 수 있으나, 그 소스는 compaction 대상이 아니다.
+    """
+    return [o for o in list_objects(_silver_date_prefix(source_id, day)) if o.key.endswith(".parquet")]
+
+
+def write_archive(source_id: str, day: date, table: pq.Table) -> str:
+    """하루치를 묶은 테이블을 archive parquet으로 저장하고 저장된 키를 반환한다.
+
+    경로 규칙은 `core.layout`이 갖는다 — nowcaster도 같은 계층을 읽고 쓰므로
+    한쪽만 바뀌면 조용히 어긋난다.
+    """
+    key = archive_key(source_id, day)
+    write_parquet(table, key)
+    return key
+
+
+def archive_exists(source_id: str, day: date) -> bool:
+    """해당 날짜의 archive가 이미 있는지 확인한다.
+
+    bootstrap이 재개 판단에 쓴다 — 상태 파일을 따로 두지 않고 결과물의 존재로 판정한다.
+    """
+    return object_exists(archive_key(source_id, day))
+
+
+def _archive_manifest_key(source_id: str, day: date) -> str:
+    """해당 날짜의 archive manifest 객체 키를 만든다."""
+    return f"_archive_manifest/{source_id}/dt={day:%Y-%m-%d}.json"
+
+
+def write_archive_manifest(source_id: str, day: date, data: dict) -> None:
+    """해당 날짜의 압축 결과 요약을 저장한다."""
+    write_json(_archive_manifest_key(source_id, day), data)
+
+
+def read_archive_manifest(source_id: str, day: date) -> dict | None:
+    """해당 날짜의 압축 결과 요약을 읽는다. 없으면 None(= 아직 압축한 적 없음)."""
+    return read_json(_archive_manifest_key(source_id, day))
 
 
 def _manifest_key(source_id: str, window_start: datetime) -> str:
