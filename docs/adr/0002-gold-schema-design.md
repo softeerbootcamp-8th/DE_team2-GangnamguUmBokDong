@@ -137,9 +137,3 @@ station_urgency로 "어디가 급한지"는 알아도 "트럭이 몇 대를 옮�
 RDS의 `station_stock` 행 수는 대여소 수만큼으로 고정된다. 최근 재고 추세가 필요한
 새 소비자는 RDS 이력이 아니라 S3 Silver를 사용해야 한다. 기존 DB 마이그레이션에서
 제거되는 과거 행도 S3에 남아 있으므로 원본 데이터는 보존된다.
-
-운영 RDS에는 로컬 Compose의 `postgres-schema-init` 실행 경로가 없으므로
-`ops/postgres/migrations/20260819_station_stock_latest.sql`을 별도로 적용한다. 기존
-loader를 먼저 중지하고, DB 마이그레이션 후 `sta_id`를 충돌 키로 사용하는 새 loader를
-배포한 다음 적재를 재개한다. 다른 Gold 테이블 초기화 구문이 포함된
-`002_gold_schema.sh` 전체를 운영 마이그레이션으로 사용하지 않는다.
