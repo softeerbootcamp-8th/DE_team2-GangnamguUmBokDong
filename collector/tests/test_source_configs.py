@@ -164,6 +164,34 @@ class TestSeoulSourcesEndToEnd:
 
         assert result.status == RunStatus.EMPTY
 
+    def test_performance_event_end_to_end(self):
+        config = config_loader.load("performance_event", base_dir=SOURCES_DIR)
+        rows = [
+            {
+                "SCH_SEQ": "1234", "TITLE": "잠실 야구 경기", "SDATE": "2026-08-20",
+                "EDATE": "2026-08-20", "USE_TIME": "18:30", "USE_AGE": "전체 관람가",
+                "USE_TARGET": "시민", "USE_PAY": "유료", "LINK_URL": "https://example.com/event",
+                "REG_DATE": "2026-08-01", "UPD_DATE": "2026-08-10", "SCH_CODE_A": "1",
+                "SCH_CODE_B": "8", "CODE_TITLE_A": "스포츠경기", "CODE_TITLE_B": "잠실야구장",
+            }
+        ]
+
+        def handler(request):
+            return httpx.Response(200, content=_seoul_response("stadiumScheduleInfo", rows, total=len(rows)))
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        window_start = datetime(2026, 8, 18, tzinfo=KST)
+
+        result = pipeline.execute_window(config, window_start, client=client, sleep_fn=lambda s: None)
+
+        assert result.status == RunStatus.SUCCEEDED
+        # allow_empty: true라서 status만 보면 스키마가 어긋나 전 행이 폐기돼도
+        # 통과한다. 행이 실제로 살아남았는지까지 고정한다.
+        assert result.counts.kept == 1
+        assert result.drop_ratio == 0.0
+        assert result.artifacts.silver is not None
+
+
 
 class TestKmaSourceEndToEnd:
     def test_weather_ultra_short_live_end_to_end(self):
