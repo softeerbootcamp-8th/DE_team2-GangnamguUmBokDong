@@ -11,6 +11,8 @@ import os
 import threading
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from datetime import datetime
 
 import boto3
 import pandas as pd
@@ -359,6 +361,39 @@ def list_common_prefixes(prefix: str, delimiter: str = "/") -> list[str]:
         for common_prefix in page.get("CommonPrefixes", [])
     ]
 
+
+@dataclass(frozen=True)
+class S3Object:
+    """LIST 응답이 주는 객체 메타.
+
+    `size`·`last_modified`는 본문을 읽지 않고 변경을 감지할 때 쓴다. 같은 키를
+    덮어쓴 경우 키 목록은 그대로지만 이 둘이 바뀐다.
+    """
+
+    key: str
+    size: int
+    last_modified: datetime
+
+
+def list_objects(prefix: str, delimiter: str = "") -> list[S3Object]:
+    """주어진 prefix 아래 객체를 메타와 함께 나열한다.
+
+    `list_keys`는 키만 주므로 "내용이 바뀌었는지"를 알 수 없다. 이 함수는 LIST 응답에
+    이미 들어 있는 `Size`·`LastModified`를 버리지 않고 그대로 넘긴다.
+
+    args:
+        prefix: 나열할 키 prefix
+        delimiter: S3 폴더 구분자 (예: "/")
+    returns:
+        prefix로 시작하는 객체 메타 목록
+    """
+    client = _client()
+    paginator = client.get_paginator("list_objects_v2")
+    return [
+        S3Object(key=obj["Key"], size=obj["Size"], last_modified=obj["LastModified"])
+        for page in paginator.paginate(Bucket=_bucket(), Prefix=prefix, Delimiter=delimiter)
+        for obj in page.get("Contents", [])
+    ]
 
 
 def object_exists(key: str) -> bool:
