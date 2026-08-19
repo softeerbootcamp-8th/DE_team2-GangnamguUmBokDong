@@ -362,8 +362,9 @@ def station_urgency_from_urgency_batch(df: pd.DataFrame, batch_run_at: datetime)
     레코드 목록으로 변환한다.
 
     args:
-        df: rebalance가 S3에 쓴 urgency 결과 DataFrame(sta_id, urgency_score,
-            minutes_until_critical, action_type)
+        df: rebalance가 S3에 쓴 urgency 결과 DataFrame(sta_id, lat, lon, urgency_score,
+            minutes_until_critical, action_type, bike_qty — lat/lon은 routes.py의
+            권역 배정 전용이라 station_urgency 테이블에는 싣지 않는다)
         batch_run_at: 배치 실행 시각 (KST)
     returns:
         station_urgency 테이블 적재용 레코드 목록
@@ -376,7 +377,62 @@ def station_urgency_from_urgency_batch(df: pd.DataFrame, batch_run_at: datetime)
                 "urgency_score": float(row["urgency_score"]),
                 "minutes_until_critical": int(row["minutes_until_critical"]),
                 "action_type": row["action_type"],
+                "bike_qty": int(row["bike_qty"]),
                 "batch_run_at": batch_run_at,
+            }
+        )
+    return records
+
+
+def _kst_timestamp_to_utc(value) -> datetime:
+    """KST 벽시계 시각(naive pd.Timestamp/datetime)을 UTC datetime으로 변환한다
+    (_kst_to_utc/_kst_date_hm_to_utc와 같은 규칙)."""
+    naive_kst = pd.Timestamp(value).to_pydatetime().replace(tzinfo=UTC)
+    return naive_kst - _KST
+
+
+def rebalance_routes_from_routes_batch(df: pd.DataFrame) -> list[dict]:
+    """rebalance 배치(routes.compute_all)가 S3에 쓴 라우트 헤더 결과를
+    rebalance_routes 테이블 레코드 목록으로 변환한다. proposed_at이 데이터
+    자체에 실려 있어(forecast_points/station_urgency와 달리) batch_run_at을
+    별도 인자로 받지 않는다.
+
+    args:
+        df: rebalance가 S3에 쓴 라우트 결과 DataFrame(route_id, region, status, proposed_at)
+    returns:
+        rebalance_routes 테이블 적재용 레코드 목록
+    """
+    records = []
+    for row in df.to_dict("records"):
+        records.append(
+            {
+                "route_id": str(row["route_id"]),
+                "region": row["region"],
+                "status": row["status"],
+                "proposed_at": _kst_timestamp_to_utc(row["proposed_at"]),
+            }
+        )
+    return records
+
+
+def rebalance_route_stops_from_route_stops_batch(df: pd.DataFrame) -> list[dict]:
+    """rebalance 배치(routes.compute_all)가 S3에 쓴 라우트 스톱 결과를
+    rebalance_route_stops 테이블 레코드 목록으로 변환한다.
+
+    args:
+        df: rebalance가 S3에 쓴 스톱 결과 DataFrame(route_id, visit_order, sta_id, action, bike_cnt)
+    returns:
+        rebalance_route_stops 테이블 적재용 레코드 목록
+    """
+    records = []
+    for row in df.to_dict("records"):
+        records.append(
+            {
+                "route_id": str(row["route_id"]),
+                "visit_order": int(row["visit_order"]),
+                "sta_id": str(row["sta_id"]),
+                "action": row["action"],
+                "bike_cnt": int(row["bike_cnt"]),
             }
         )
     return records
