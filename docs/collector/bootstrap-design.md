@@ -19,7 +19,7 @@ collector는 배포 시점부터 수집을 시작한다. 그 이전 기간은 ar
 | 소스 | 입력 | 이번 범위 |
 |---|---|---|
 | `bike_rental_history` | 과거 CSV (`서울특별시 공공자전거 대여이력 정보_YYMM.csv`) | **포함** |
-| `bike_station_realtime` | `bikeListHist` 과거 조회 API | **포함** |
+| `bike_station_realtime` | `bikeListHist` 과거 조회 API | **포함** — 이후 CSV로 교체됨, 아래 결정 3 참고 |
 | `weather_ultra_short_live` | 기상청 격자 텍스트 | **제외** — 입력 방식 플러그 지점만 열어둔다 |
 | `living_population_grid` | 과거 CSV | **제외** — nowcaster가 이미 수행 중 |
 
@@ -71,7 +71,7 @@ collector가 API 응답에 없는 컬럼을 기대하게 된다.
 |---|---|---|
 | 1 | 대여이력 입력 | CSV |
 | 2 | 적재 계층 | `archive/`에 직접 |
-| 3 | 재고 입력 | `bikeListHist` API |
+| 3 | 재고 입력 | ~~`bikeListHist` API~~ → **대여가능 수량 CSV** (2026-08-19 변경) |
 | 4 | 출처 구분 | `_source_kind` 메타 컬럼 추가 |
 | 5 | 검증 | collector `validate_batch()` 재사용, quarantine 없이 집계만 |
 | 6 | 값 체계 | CSV 값을 API 코드 체계로 변환 |
@@ -93,7 +93,16 @@ silver에 쓰면 기존 소비자가 과거를 읽을 수 있다는 이점이 �
 ml은 lookback이 168시간이라 과거 3년을 silver로 읽을 일이 없고, loader에는 대여이력
 테이블이 아예 없다(`loader/config.py`의 `TABLE_SPECS`).
 
-### 결정 3 — 재고를 API로 하는 이유
+### 결정 3 — 재고를 API로 하는 이유 (2026-08-19 뒤집힘)
+
+> **이 결정은 유지되지 않는다.** 재고 입력은 대여가능 수량 CSV로 바뀌었다. 아래 표가
+> 지적한 "마스터 API 조인 필수"와 "현재 시점 값이라 틀린 정보"는 여전히 맞는 진단이고,
+> 그 대가를 알고 받아들인 것이다 — 3년 범위에 26,000회 호출이 필요한 쪽을 피했다.
+> 조인은 마스터 API가 아니라 `bikeList` + 대여이력 CSV로 하고(마스터의 `ADDR2`가
+> 대여소 번호가 아니라 상세주소라 조인 키가 없다), 미매칭은 실측 0.68%다.
+> 자세한 내용은 `docs/superpowers/specs/2026-08-19-station-stock-csv-bootstrap-design.md`.
+
+아래는 당시의 판단이다.
 
 재고 CSV(`data_2512.csv`)는 컬럼이 `일시·대여소번호·대여소명·시간대·거치대수량`
 5개뿐이라 collector의 7개 컬럼을 못 채운다.
