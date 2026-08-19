@@ -123,6 +123,7 @@ def test_replay_template_renders_to_a_whole_hour_earlier():
 
     import jinja2
     from airflow.sdk.execution_time import macros
+
     from orchestration.templates import KST_WINDOW_START, kst_window_start_shifted
 
     kst = timezone(timedelta(hours=9))
@@ -157,6 +158,7 @@ def test_replay_template_rejects_non_positive_hours():
 
 def test_replay_collector_task_contract(dag):
     from airflow.task.trigger_rule import TriggerRule
+
     from orchestration.collector_task import build_collector_replay_task
 
     task = build_collector_replay_task(dag, "bike_rental_history", 1)

@@ -16,8 +16,10 @@ strict가 성공하면 fallback은 skipped되고, strict가 실패하면 fallbac
 """
 
 import pendulum
+from airflow import DAG
 from airflow.providers.standard.operators.empty import EmptyOperator
 from airflow.task.trigger_rule import TriggerRule
+
 from config.schedules import TIMEZONE
 from config.sources import (
     NORMALIZER_BASELINE_MODE_FALLBACK,
@@ -35,8 +37,6 @@ from orchestration.normalizer_task import (
 )
 from orchestration.routes_task import build_routes_task
 from orchestration.urgency_task import build_urgency_task
-
-from airflow import DAG
 
 with DAG(
     dag_id="e2e_realtime",

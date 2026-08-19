@@ -49,9 +49,11 @@ DAG 안에서 API 호출, 페이지네이션, S3 저장, 데이터 검증, 모�
 """
 
 import pendulum
+from airflow import DAG
 from airflow.providers.standard.operators.empty import EmptyOperator
 from airflow.task.trigger_rule import TriggerRule
 from airflow.timetables.trigger import CronTriggerTimetable
+
 from config.schedules import CATCHUP, MAX_ACTIVE_RUNS, REALTIME_5MIN_CRON, TIMEZONE
 from config.sources import (
     NORMALIZER_BASELINE_MODE_FALLBACK,
@@ -59,14 +61,15 @@ from config.sources import (
     REALTIME_5MIN_SOURCES,
     RENTAL_HISTORY_LOOKBACK_HOURS,
 )
-from orchestration.collector_task import build_collector_replay_task, build_collector_task
+from orchestration.collector_task import (
+    build_collector_replay_task,
+    build_collector_task,
+)
 from orchestration.db_loader_task import build_db_loader_task
 from orchestration.inference_task import build_inference_task
 from orchestration.normalizer_task import build_normalizer_task
 from orchestration.routes_task import build_routes_task
 from orchestration.urgency_task import build_urgency_task
-
-from airflow import DAG
 
 with DAG(
     dag_id="realtime_5min",

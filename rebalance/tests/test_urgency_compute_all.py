@@ -12,10 +12,10 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
-import urgency
-from urgency import compute_all
 
+import urgency
 from tests.conftest import TEST_BUCKET
+from urgency import compute_all
 
 # ml/inference의 _target_timestamp와 같은 이유로 pd.Timestamp를 쓴다(naive
 # datetime을 datetime.strptime/datetime()으로 직접 만들면 tzinfo 누락으로
