@@ -132,6 +132,16 @@ class SeoulOpenApiAdapter:
     """서울 열린데이터광장 공용 페이지네이션 규약 어댑터."""
 
     @staticmethod
+    def planned_parts(config: SourceConfig, window) -> frozenset[str] | None:
+        """요청 전에 전체 키를 아는 POI 소스의 조각 계획을 반환한다."""
+        params = config.adapter_params
+        if params["service"] != "citydata_ppltn":
+            return None
+        poi_start = int(params.get("poi_start", 1))
+        poi_end = int(params["poi_end"])
+        return frozenset(f"poi-POI{i:03d}" for i in range(poi_start, poi_end + 1))
+
+    @staticmethod
     def fetch(
         config: SourceConfig,
         window,
@@ -164,10 +174,18 @@ class SeoulOpenApiAdapter:
                 window_end=window.window_end,
                 window_last=window.window_start - timedelta(seconds=1),
             )
-        # citydata_ppltn은 페이지네이션 대신 POI001~POI116 순회
+        # citydata_ppltn은 페이지네이션 대신 YAML에 선언된 POI 범위를 순회한다.
+        # 장소가 늘어날 때 공통 코드를 고치지 않고 poi_end만 갱신할 수 있게 한다.
         if service == "citydata_ppltn":
-            expected = 116
-            for i in range(1, expected + 1):
+            poi_start = int(params.get("poi_start", 1))
+            poi_end = int(params["poi_end"])
+            if poi_start < 1 or poi_end < poi_start:
+                raise ValueError("citydata_ppltn의 poi_start/poi_end 범위가 올바르지 않습니다")
+
+            # expected_total은 pipeline에서 기대 row 수를 뜻한다. POI 범위 크기는
+            # 요청 조각 수이고 INFO-200 조각은 정상적으로 0행일 수 있으므로, 여기서는
+            # None을 유지해 실제 요청 실패만 조각 기준 missing_ratio로 계산한다.
+            for i in range(poi_start, poi_end + 1):
                 poi_id = f"POI{i:03d}"
                 key = f"poi-{poi_id}"
                 
@@ -181,19 +199,39 @@ class SeoulOpenApiAdapter:
                     body = json.loads(response.content)
                     wrapper = _extract(body, wrapper_key)
                 except (httpx.RequestError, httpx.HTTPStatusError, json.JSONDecodeError):
-                    yield FetchResult(key=key, payload=None, error=FetchErrorKind.TRANSIENT, expected_total=expected if i == 1 else None)
+                    yield FetchResult(
+                        key=key,
+                        payload=None,
+                        error=FetchErrorKind.TRANSIENT,
+                        expected_total=None,
+                    )
                     continue
 
                 code = body.get("RESULT.CODE") or body.get("RESULT", {}).get("RESULT.CODE")
                 category = _classify(code)
 
                 if category is None:
-                    yield FetchResult(key=key, payload=response.content, error=None, expected_total=expected if i == 1 else None)
+                    yield FetchResult(
+                        key=key,
+                        payload=response.content,
+                        error=None,
+                        expected_total=None,
+                    )
                 elif category is FetchErrorKind.FATAL:
-                    yield FetchResult(key=key, payload=None, error=category, expected_total=expected if i == 1 else None)
+                    yield FetchResult(
+                        key=key,
+                        payload=None,
+                        error=category,
+                        expected_total=None,
+                    )
                     return
                 else:
-                    yield FetchResult(key=key, payload=None, error=category, expected_total=expected if i == 1 else None)
+                    yield FetchResult(
+                        key=key,
+                        payload=None,
+                        error=category,
+                        expected_total=None,
+                    )
             return
 
         def page_url(start: int, end: int) -> str:

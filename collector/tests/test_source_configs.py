@@ -13,10 +13,11 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-import config.loader as config_loader
 import httpx
-import pipeline
 import pytest
+
+import config.loader as config_loader
+import pipeline
 from adapters import (  # noqa: F401 — @adapter 등록을 위한 import
     kma_apihub,
     seoul_openapi,
@@ -64,6 +65,58 @@ class TestAllSourcesLoad:
             config = config_loader.load(source_id, base_dir=SOURCES_DIR)
             declared = forbidden & set(config.columns)
             assert not declared, f"{source_id}에 응답 메타 컬럼이 선언돼 있다: {sorted(declared)}"
+
+    def test_bike_rental_history_preserves_string_compatible_types(self):
+        config = config_loader.load("bike_rental_history", base_dir=SOURCES_DIR)
+
+        # 윈도우 직전 순간(window_last)의 시를 요청한다 — 매시 끝자락 누락 방지.
+        # `RNUM`은 의도적으로 선언하지 않는다(위 응답 메타 테스트 참고).
+        assert config.adapter_params["path_suffix"] == (
+            "/{window_last:%Y-%m-%d}/{window_last:%H}"
+        )
+        assert config.columns["USE_MIN"].types == ("str", "int")
+        assert config.columns["USE_DST"].types == ("str", "float")
+        assert config.columns["BIRTH_YEAR"].types == ("str", "int")
+
+    def test_population_realtime_covers_current_121_pois(self):
+        config = config_loader.load("population_realtime", base_dir=SOURCES_DIR)
+
+        assert config.adapter_params["poi_start"] == 1
+        assert config.adapter_params["poi_end"] == 121
+
+    @pytest.mark.parametrize(
+        "adapter_params",
+        [
+            {"service": "citydata_ppltn", "page_size": 1000, "root_key": "SeoulRtd.citydata_ppltn"},
+            {
+                "service": "citydata_ppltn",
+                "page_size": 1000,
+                "root_key": "SeoulRtd.citydata_ppltn",
+                "poi_start": 10,
+                "poi_end": 9,
+            },
+        ],
+    )
+    def test_population_poi_range_is_validated_at_config_load(self, tmp_path, adapter_params):
+        source = tmp_path / "invalid_population.yaml"
+        source.write_text(
+            "\n".join(
+                [
+                    "source_id: invalid_population",
+                    "description: invalid population config",
+                    "adapter: seoul_openapi",
+                    f"adapter_params: {json.dumps(adapter_params)}",
+                    "schedule: {interval: 5m}",
+                    "storage: {bronze_format: json, silver_format: parquet, partition: [dt, hh]}",
+                    "quality: {max_drop_ratio: 0.05}",
+                    "policies: {required_missing: drop_row, required_outlier: drop_row, optional_missing: keep_null, optional_outlier: set_null}",
+                    "columns: {}",
+                ]
+            )
+        )
+
+        with pytest.raises(config_loader.ConfigError, match="adapter_params.poi"):
+            config_loader.load("invalid_population", base_dir=tmp_path)
 
 
 class TestOptionalKeysOmittable:
@@ -182,6 +235,34 @@ class TestSeoulSourcesEndToEnd:
         result = pipeline.execute_window(config, window_start, client=client, sleep_fn=lambda s: None)
 
         assert result.status == RunStatus.EMPTY
+
+    def test_performance_event_end_to_end(self):
+        config = config_loader.load("performance_event", base_dir=SOURCES_DIR)
+        rows = [
+            {
+                "SCH_SEQ": "1234", "TITLE": "잠실 야구 경기", "SDATE": "2026-08-20",
+                "EDATE": "2026-08-20", "USE_TIME": "18:30", "USE_AGE": "전체 관람가",
+                "USE_TARGET": "시민", "USE_PAY": "유료", "LINK_URL": "https://example.com/event",
+                "REG_DATE": "2026-08-01", "UPD_DATE": "2026-08-10", "SCH_CODE_A": "1",
+                "SCH_CODE_B": "8", "CODE_TITLE_A": "스포츠경기", "CODE_TITLE_B": "잠실야구장",
+            }
+        ]
+
+        def handler(request):
+            return httpx.Response(200, content=_seoul_response("stadiumScheduleInfo", rows, total=len(rows)))
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        window_start = datetime(2026, 8, 18, tzinfo=KST)
+
+        result = pipeline.execute_window(config, window_start, client=client, sleep_fn=lambda s: None)
+
+        assert result.status == RunStatus.SUCCEEDED
+        # allow_empty: true라서 status만 보면 스키마가 어긋나 전 행이 폐기돼도
+        # 통과한다. 행이 실제로 살아남았는지까지 고정한다.
+        assert result.counts.kept == 1
+        assert result.drop_ratio == 0.0
+        assert result.artifacts.silver is not None
+
 
 
 class TestKmaSourceEndToEnd:

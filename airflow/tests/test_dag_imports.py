@@ -45,6 +45,17 @@ def test_e2e_gold_waits_for_inference_and_station_stock():
     assert upstream == {"run_inference", "load_station_stock"}
 
 
+def test_urgency_loaders_wait_for_stations_fk():
+    assert realtime_5min_dag.dag.get_task("load_station_urgency").upstream_task_ids == {
+        "compute_urgency",
+        "load_stations",
+    }
+    assert e2e_realtime_dag.dag.get_task("load_station_urgency").upstream_task_ids == {
+        "compute_urgency",
+        "load_stations",
+    }
+
+
 def test_weather_10min_dag_id():
     assert weather_10min_dag.dag.dag_id == "weather_10min"
 

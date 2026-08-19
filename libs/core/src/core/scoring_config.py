@@ -1,5 +1,7 @@
-"""urgency_score 계산에 쓰이는 정책/튜닝값. 실측 데이터로 분포를 보면서 계속
-조정될 값이라, 계산 로직(scoring.py)과 분리해서 값만 바꿀 수 있게 둔다."""
+"""urgency_score/enrich_forecast_points 계산에 쓰이는 정책/튜닝값. 실측 데이터로
+분포를 보면서 계속 조정될 값이라, 계산 로직(rebalance/urgency.py, core/forecast.py)과
+분리해서 값만 바꿀 수 있게 둔다. urgency_score는 배치(rebalance/), enrich_forecast_points는
+실시간(apps/api)과 배치 양쪽에서 쓰여 이 상수들을 공유해야 하므로 libs/core에 둔다."""
 
 RESPONSE_LAG_MIN = 30  # 트럭 출동~도착 소요시간
 HALF_LIFE_MIN = 60  # 대응 여유시간이 이만큼 늘어날 때마다 시급성 점수가 절반이 됨

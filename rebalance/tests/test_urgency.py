@@ -1,12 +1,14 @@
-"""scoring.py: _severity, _max_overshoot, _max_deficit, urgency_score 테스트.
+"""urgency.py: _severity, _max_overshoot, _max_deficit, urgency_score 테스트.
 
-PR #40 리뷰에서 지적된 대로(#55) 예측 구간 전체를 스캔하는 로직과 점근 곡선에
-대한 안전망. hold_cnt=0, 정원 초과, 예측 없음 등 경계값을 우선 다룬다.
+apps/api/tests/test_scoring.py에서 그대로 이관했다(urgency_score가 배치로
+이식되면서 함께 옮김, 이슈 #107). PR #40 리뷰에서 지적된 대로(#55) 예측 구간
+전체를 스캔하는 로직과 점근 곡선에 대한 안전망. hold_cnt=0, 정원 초과, 예측
+없음 등 경계값을 우선 다룬다.
 """
 
 from datetime import UTC, datetime, timedelta
 
-from scoring import (
+from urgency import (
     _max_deficit,
     _max_overshoot,
     _max_unmet_demand,

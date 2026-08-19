@@ -257,6 +257,25 @@ def test_fetch_with_rounds_stops_new_calls_when_budget_exceeded(window):
     assert result.missing == {"b": FetchErrorKind.TRANSIENT}
 
 
+def test_fetch_with_rounds_marks_unvisited_planned_parts_missing(window):
+    def fetch_fn(config, win, *, client, skip, expected_total):
+        yield FetchResult(key="a", payload=b"1", error=None, expected_total=None)
+
+    result = fetch_with_rounds(
+        fetch_fn,
+        _FakeBudgetConfig(),
+        window,
+        client=object(),
+        planned_parts=frozenset({"a", "b", "c"}),
+    )
+
+    assert result.chunks == {"a": b"1"}
+    assert result.missing == {
+        "b": FetchErrorKind.TRANSIENT,
+        "c": FetchErrorKind.TRANSIENT,
+    }
+
+
 def test_fetch_with_rounds_calls_on_chunk_immediately_for_each_success(window):
     def fetch_fn(config, win, *, client, skip, expected_total):
         yield FetchResult(key="a", payload=b"1", error=None, expected_total=None)

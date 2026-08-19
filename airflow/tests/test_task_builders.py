@@ -10,6 +10,7 @@ from orchestration.normalizer_task import (
 )
 from orchestration.nowcasting_task import NOWCASTING_DIR, build_nowcasting_task
 from orchestration.task_builder import REPO_ROOT
+from orchestration.urgency_task import REBALANCE_DIR, build_urgency_task
 
 
 def test_repo_root_resolves_to_repository_root():
@@ -60,6 +61,18 @@ def test_inference_task_cwd_is_ml_not_ml_inference(dag):
     assert ".replace(" in task.bash_command
 
 
+def test_urgency_task_cwd_and_flags(dag):
+    """rebalance는 loader/nowcaster처럼 flat 레이아웃이라 -m 실행이 필요 없다 —
+    ml/inference와 달리 uv --project가 아니라 uv run --frozen을 쓴다."""
+    task = build_urgency_task(dag)
+    assert task.cwd == REBALANCE_DIR
+    assert task.cwd.endswith("/rebalance")
+    assert "uv run --frozen python main.py" in task.bash_command
+    assert "--date" in task.bash_command
+    assert "--hour" in task.bash_command
+    assert "--minute" in task.bash_command
+
+
 def test_all_pipeline_tasks_floor_manual_run_to_same_five_minute_window(dag):
     """수동 trigger의 19:33도 모든 모듈에서 동일하게 19:30으로 내림한다."""
     tasks = [
@@ -67,6 +80,7 @@ def test_all_pipeline_tasks_floor_manual_run_to_same_five_minute_window(dag):
         build_normalizer_task(dag, "normalize", "strict"),
         build_inference_task(dag),
         build_db_loader_task(dag, "station_stock"),
+        build_urgency_task(dag),
     ]
 
     for task in tasks:

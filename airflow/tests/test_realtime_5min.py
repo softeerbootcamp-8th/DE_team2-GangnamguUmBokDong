@@ -26,6 +26,8 @@ def test_expected_tasks_exist():
         "population_normalized",
         "run_inference",
         "load_forecast_points",
+        "compute_urgency",
+        "load_station_urgency",
     } | {
         # 대여이력 과거 시간대 재조회. 상수를 올리면 태스크가 따라 늘어난다.
         f"collect_bike_rental_history_replay_{h}h"
@@ -77,6 +79,20 @@ def test_inference_then_load_forecast_points():
     run_inference = dag.get_task("run_inference")
     load_forecast_points = dag.get_task("load_forecast_points")
     assert load_forecast_points.task_id in {t.task_id for t in run_inference.downstream_list}
+
+
+def test_inference_then_compute_urgency_then_load_station_urgency():
+    """urgency_score 계산(rebalance)은 S3(재고 이력·예측 결과)만 읽어서 RDS 적재
+    (load_station_stock/load_forecast_points)를 기다릴 필요가 없다. 단, urgency loader는
+    stations FK가 준비된 뒤 실행돼야 한다."""
+    run_inference = dag.get_task("run_inference")
+    compute_urgency = dag.get_task("compute_urgency")
+    load_station_urgency = dag.get_task("load_station_urgency")
+
+    assert compute_urgency.task_id in {t.task_id for t in run_inference.downstream_list}
+    assert {t.task_id for t in compute_urgency.upstream_list} == {"run_inference"}
+    assert load_station_urgency.task_id in {t.task_id for t in compute_urgency.downstream_list}
+    assert {t.task_id for t in load_station_urgency.upstream_list} == {"compute_urgency", "load_stations"}
 
 
 def test_collector_task_execution_contract():
