@@ -7,7 +7,7 @@
 **무손실 재배치이며 원본 silver는 지우지 않는다** — loader·ml_core·nowcaster가 읽고
 있다.
 
-## 설계상 중요한 세 가지
+## 설계상 중요한 네 가지
 
 **시각 보존.** `bike_station_realtime`은 행에 시각 컬럼이 없어서 파일 경로가 유일한
 시각 정보다. 그대로 이어붙이면 288개 스냅샷이 구분 불가능해진다. 모든 소스에 예외
@@ -19,9 +19,15 @@
 `concat_tables(promote_options=...)` 계열은 이걸 줄 수 없다. 캐스팅이 실패하면 yaml과
 현실이 어긋났다는 뜻이므로 조용히 넓히지 않고 그대로 터뜨린다.
 
+**Authority 선택.** 전환된 윈도우에는 correction마다 immutable Silver가 남지만, 최신
+source snapshot manifest가 가리키는 SUCCEEDED object 하나만 유효하다. 최신 상태가
+EMPTY이면 이전 object를 다시 읽지 않는다. Source manifest가 없는 historical legacy
+window만 기존 key를 호환 입력으로 사용한다.
+
 **변경 감지.** 매일 검사 범위 전체를 다시 압축하면 대부분이 무의미한 재작업이고,
 archive의 LastModified가 내용과 무관하게 갱신되어 하류의 변경 감지를 오염시킨다.
-LIST가 주는 size·last_modified로 서명을 만들어 바뀐 날짜만 다시 쓴다.
+선택된 object의 size·last_modified와 최신 authority manifest SHA로 서명을 만들어
+바뀐 날짜만 다시 쓴다.
 """
 
 from __future__ import annotations
@@ -35,11 +41,13 @@ from datetime import date, datetime, timedelta
 from math import ceil
 from zoneinfo import ZoneInfo
 
+import manifest as manifest_module
 import pyarrow as pa
-
 import storage
 from config.schema import SourceConfig
 from core.s3 import S3Object, read_parquet
+from core.source_snapshot import SourceSnapshotManifest, SourceSnapshotStatus
+from manifest import RunStatus, Stage
 
 logger = logging.getLogger(__name__)
 
@@ -79,7 +87,43 @@ _META_FIELDS = [
     ("_source_kind", pa.string()),
 ]
 
-_SILVER_KEY = re.compile(r"/dt=(\d{4}-\d{2}-\d{2})/hh=\d{2}/(\d{4})\.parquet$")
+_SILVER_KEY = re.compile(
+    r"\Asilver/(?P<source_id>[a-z][a-z0-9_]*)/"
+    r"dt=(?P<day>\d{4}-\d{2}-\d{2})/hh=(?P<partition_hour>\d{2})/"
+    r"(?P<hhmm>\d{4})(?:/sha256=(?P<checksum>[0-9a-f]{64}))?\.parquet\Z"
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _ParsedSilverKey:
+    """Legacy와 immutable Silver key에서 읽은 exact window identity다."""
+
+    source_id: str
+    window_start: datetime
+    checksum: str | None
+
+
+def _parse_silver_key(key: str) -> _ParsedSilverKey:
+    """Silver key를 파싱하고 partition과 파일 시각이 일치하는지 검증한다."""
+    matched = _SILVER_KEY.fullmatch(key)
+    if matched is None:
+        raise ValueError(f"silver 키 규칙에 맞지 않아 윈도우 시각을 알 수 없다: {key}")
+
+    day = matched.group("day")
+    hhmm = matched.group("hhmm")
+    if matched.group("partition_hour") != hhmm[:2]:
+        raise ValueError(f"silver 키의 hh partition과 파일 시각이 다르다: {key}")
+    try:
+        window_start = datetime.strptime(f"{day} {hhmm}", "%Y-%m-%d %H%M").replace(
+            tzinfo=_KST
+        )
+    except ValueError as exc:
+        raise ValueError(f"silver 키의 윈도우 시각이 유효하지 않다: {key}") from exc
+    return _ParsedSilverKey(
+        source_id=matched.group("source_id"),
+        window_start=window_start,
+        checksum=matched.group("checksum"),
+    )
 
 
 def window_start_from_key(key: str) -> str:
@@ -88,18 +132,15 @@ def window_start_from_key(key: str) -> str:
     `hh=` 파티션은 시 단위라 분을 잃는다. 파일명의 `HHMM`이 진짜 시각이다.
 
     args:
-        key: `silver/{src}/dt=2026-08-12/hh=14/1410.parquet` 형식의 전체 키
+        key: legacy `.../1410.parquet` 또는 immutable
+            `.../1410/sha256={64hex}.parquet` 형식의 전체 키
     returns:
         `"2026-08-12T14:10:00+09:00"` 형식의 KST ISO8601 문자열
     raises:
         ValueError: 규칙에 맞지 않는 키일 때. 시각을 모르는 행을 archive에 넣는 것보다
             멈추는 편이 낫다.
     """
-    matched = _SILVER_KEY.search(key)
-    if matched is None:
-        raise ValueError(f"silver 키 규칙에 맞지 않아 윈도우 시각을 알 수 없다: {key}")
-    day, hhmm = matched.groups()
-    return datetime.strptime(f"{day} {hhmm}", "%Y-%m-%d %H%M").replace(tzinfo=_KST).isoformat()
+    return _parse_silver_key(key).window_start.isoformat()
 
 
 def archive_schema(config: SourceConfig) -> pa.Schema:
@@ -113,7 +154,9 @@ def archive_schema(config: SourceConfig) -> pa.Schema:
     returns:
         yaml 컬럼 + 메타 컬럼 2개로 구성된 pyarrow 스키마
     """
-    fields = [(name, _ARROW_TYPES[spec.types[0]]) for name, spec in config.columns.items()]
+    fields = [
+        (name, _ARROW_TYPES[spec.types[0]]) for name, spec in config.columns.items()
+    ]
     return pa.schema(fields + _META_FIELDS)
 
 
@@ -174,9 +217,15 @@ def dedup(table: pa.Table, schema: pa.Schema) -> pa.Table:
     """
     data_columns = [f.name for f in schema if f.name != "_window_start"]
     grouped = table.group_by(data_columns).aggregate([("_window_start", "min")])
-    return conform(grouped.rename_columns(
-        [("_window_start" if n == "_window_start_min" else n) for n in grouped.schema.names]
-    ), schema)
+    return conform(
+        grouped.rename_columns(
+            [
+                ("_window_start" if n == "_window_start_min" else n)
+                for n in grouped.schema.names
+            ]
+        ),
+        schema,
+    )
 
 
 def silver_signature(objects: list[S3Object]) -> str:
@@ -245,6 +294,231 @@ class DateResult:
     error: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class _SelectedSilver:
+    """한 window에서 compaction 입력 권한을 얻은 exact Silver object다."""
+
+    object: S3Object
+    expected_rows: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class _DateAuthority:
+    """날짜 하나에서 확정된 compaction 입력과 변경 감지 근거다."""
+
+    selected: tuple[_SelectedSilver, ...]
+    markers: tuple[tuple[str, ...], ...]
+    completed_windows: int
+
+
+def _mutable_manifest_sha256(value: manifest_module.Manifest | None) -> str:
+    """Mutable 진단 manifest의 현재 상태를 변경 감지용 SHA-256으로 만든다."""
+    if value is None:
+        return "missing"
+    payload = json.dumps(
+        value.model_dump(mode="json"),
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _snapshot_silver_key(
+    snapshot: SourceSnapshotManifest,
+    *,
+    source_id: str,
+    window_start: datetime,
+) -> str:
+    """SUCCEEDED source snapshot이 가리켜야 할 canonical Silver key를 검증한다."""
+    if snapshot.status is not SourceSnapshotStatus.SUCCEEDED:
+        raise ValueError("SUCCEEDED source snapshot만 Silver key를 가질 수 있다.")
+    if snapshot.source_id != source_id or snapshot.logical_dttm != window_start:
+        raise ValueError("source snapshot과 Silver window identity가 다르다.")
+    if snapshot.silver_uri is None or snapshot.silver_byte_sha256 is None:
+        raise ValueError("SUCCEEDED source snapshot에 Silver identity가 없다.")
+
+    kst_window = snapshot.logical_dttm.astimezone(_KST)
+    if kst_window.second or kst_window.microsecond:
+        raise ValueError("Silver minute key로 표현할 수 없는 source logical_dttm이다.")
+    key = (
+        f"silver/{source_id}/dt={kst_window:%Y-%m-%d}/hh={kst_window:%H}/"
+        f"{kst_window:%H%M}/sha256={snapshot.silver_byte_sha256}.parquet"
+    )
+    if snapshot.silver_uri != storage.object_uri(key):
+        raise ValueError("source snapshot의 Silver URI가 canonical key와 다르다.")
+    return key
+
+
+def _group_silver_objects(
+    source_id: str, objects: list[S3Object]
+) -> dict[datetime, tuple[S3Object, ...]]:
+    """Silver objects를 window별로 묶고 source/key 중복을 검증한다."""
+    grouped: dict[datetime, list[S3Object]] = {}
+    seen_keys: set[str] = set()
+    for silver_object in objects:
+        parsed = _parse_silver_key(silver_object.key)
+        if parsed.source_id != source_id:
+            raise ValueError(
+                f"다른 source의 Silver가 compaction 목록에 섞였다: {silver_object.key}"
+            )
+        if silver_object.key in seen_keys:
+            raise ValueError(f"같은 Silver object가 중복 나열됐다: {silver_object.key}")
+        seen_keys.add(silver_object.key)
+        grouped.setdefault(parsed.window_start, []).append(silver_object)
+    return {window: tuple(values) for window, values in grouped.items()}
+
+
+def _select_date_authority(
+    config: SourceConfig,
+    objects: list[S3Object],
+    source_snapshot_windows: list[datetime],
+) -> _DateAuthority:
+    """최신 immutable authority 또는 historical legacy 하나만 window 입력으로 고른다.
+
+    Source snapshot revision chain이 하나라도 있으면 mutable manifest와 legacy key는
+    더 이상 authority가 아니다. 최신 revision이 SUCCEEDED일 때 그 manifest가 가리키는
+    exact content-addressed object만 고르고, EMPTY이면 이전 Silver를 모두 제외한다.
+    Immutable object만 있고 source manifest가 없는 manifest-last 중간 상태도 열지 않는다.
+    """
+    selected: list[_SelectedSilver] = []
+    markers: list[tuple[str, ...]] = []
+    completed_windows = 0
+    grouped_objects = _group_silver_objects(config.source_id, objects)
+    authority_windows = set(source_snapshot_windows)
+
+    for window_start in sorted(set(grouped_objects) | authority_windows):
+        window_objects = grouped_objects.get(window_start, ())
+        by_key = {silver_object.key: silver_object for silver_object in window_objects}
+        if window_start in authority_windows:
+            snapshots = manifest_module.load_source_snapshots(
+                config.source_id, window_start
+            )
+            if not snapshots:
+                raise ValueError(
+                    "나열된 source snapshot window의 revision chain이 비어 있다: "
+                    f"{window_start.isoformat()}"
+                )
+            latest = snapshots[-1].manifest
+            markers.append(
+                (
+                    "source_snapshot",
+                    window_start.isoformat(),
+                    str(latest.revision_no),
+                    latest.sha256,
+                )
+            )
+            completed_windows += 1
+            if latest.status is SourceSnapshotStatus.EMPTY:
+                continue
+
+            exact_key = _snapshot_silver_key(
+                latest,
+                source_id=config.source_id,
+                window_start=window_start,
+            )
+            silver_object = by_key.get(exact_key)
+            if silver_object is None:
+                raise ValueError(
+                    "source snapshot이 가리키는 exact Silver object가 목록에 없다: "
+                    f"{exact_key}"
+                )
+            selected.append(
+                _SelectedSilver(
+                    object=silver_object,
+                    expected_rows=latest.counts.kept,
+                )
+            )
+            continue
+
+        diagnostic = manifest_module.load(config.source_id, window_start)
+        diagnostic_sha = _mutable_manifest_sha256(diagnostic)
+        if diagnostic is not None and (
+            diagnostic.source_id != config.source_id
+            or diagnostic.window_start != window_start
+        ):
+            raise ValueError("mutable manifest와 Silver window identity가 다르다.")
+
+        immutable_objects = [
+            silver_object
+            for silver_object in window_objects
+            if _parse_silver_key(silver_object.key).checksum is not None
+        ]
+        if immutable_objects:
+            markers.append(
+                (
+                    "unpublished_immutable",
+                    window_start.isoformat(),
+                    diagnostic_sha,
+                )
+            )
+            continue
+
+        legacy_objects = list(window_objects)
+        if len(legacy_objects) != 1:
+            raise ValueError(
+                f"window에 legacy Silver key가 하나보다 많다: {window_start}"
+            )
+        legacy_object = legacy_objects[0]
+
+        if diagnostic is None:
+            markers.append(("legacy_without_manifest", window_start.isoformat()))
+        elif (
+            diagnostic.status is RunStatus.SUCCEEDED
+            and diagnostic.stage is Stage.COMPLETED
+            and diagnostic.artifacts.silver == legacy_object.key
+        ):
+            markers.append(
+                (
+                    "legacy_succeeded",
+                    window_start.isoformat(),
+                    diagnostic_sha,
+                )
+            )
+        else:
+            markers.append(
+                (
+                    "legacy_not_authoritative",
+                    window_start.isoformat(),
+                    diagnostic_sha,
+                )
+            )
+            continue
+
+        selected.append(
+            _SelectedSilver(
+                object=legacy_object,
+                expected_rows=None,
+            )
+        )
+        completed_windows += 1
+
+    return _DateAuthority(
+        selected=tuple(selected),
+        markers=tuple(markers),
+        completed_windows=completed_windows,
+    )
+
+
+def _authority_signature(authority: _DateAuthority) -> str:
+    """선택된 exact object와 최신 authority 상태의 변경 감지 서명을 만든다."""
+    payload = {
+        "objects": [
+            (
+                item.object.key,
+                item.object.size,
+                item.object.last_modified.isoformat(),
+                item.expected_rows,
+            )
+            for item in authority.selected
+        ],
+        "authority": authority.markers,
+    }
+    return hashlib.sha256(
+        json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+
 def _backfill_window_closed(config: SourceConfig, day: date, today: date) -> bool:
     """이 날짜의 silver가 더 채워질 가능성이 없는지 판정한다.
 
@@ -264,12 +538,14 @@ def _expected_windows(config: SourceConfig) -> int:
     return max(1, int(timedelta(days=1) / config.schedule.interval))
 
 
-def compact_date(config: SourceConfig, day: date, *, today: date, force: bool = False) -> DateResult:
+def compact_date(
+    config: SourceConfig, day: date, *, today: date, force: bool = False
+) -> DateResult:
     """해당 날짜의 silver를 묶어 archive에 쓴다.
 
-    변경이 없으면 parquet을 아예 읽지 않고 LIST 한 번으로 끝낸다. 실패하면 archive도
-    manifest도 쓰지 않는다 — 서명이 기록되지 않으므로 다음 실행이 자동으로 재시도하고,
-    부분 결과가 남지 않는다.
+    변경이 없으면 parquet 본문을 읽지 않고 object metadata와 authority manifest만
+    확인한다. 실패하면 archive도 manifest도 쓰지 않는다 — 서명이 기록되지 않으므로
+    다음 실행이 자동으로 재시도하고, 부분 결과가 남지 않는다.
 
     args:
         config: 대상 소스 설정
@@ -279,19 +555,33 @@ def compact_date(config: SourceConfig, day: date, *, today: date, force: bool = 
     returns:
         이 날짜의 처리 결과. 예외를 던지지 않는다.
     """
-    objects = storage.list_silver_objects(config.source_id, day)
-    if not objects:
-        return DateResult(day=day, status="empty")
-
-    signature = silver_signature(objects)
-    previous = storage.read_archive_manifest(config.source_id, day)
-    if not force and previous and previous.get("silver_signature") == signature:
-        return DateResult(day=day, status="skipped", archive_key=previous.get("archive_key"))
-
-    schema = archive_schema(config)
     try:
-        tables = [_read_conformed(o.key, schema) for o in objects]
-        table = pa.concat_tables(tables)
+        objects = storage.list_silver_objects(config.source_id, day)
+        source_snapshot_windows = storage.list_source_snapshot_windows(
+            config.source_id, day
+        )
+        if not objects and not source_snapshot_windows:
+            return DateResult(day=day, status="empty")
+
+        authority = _select_date_authority(config, objects, source_snapshot_windows)
+        signature = _authority_signature(authority)
+        previous = storage.read_archive_manifest(config.source_id, day)
+        if (
+            not authority.selected
+            and authority.completed_windows == 0
+            and previous is None
+        ):
+            return DateResult(day=day, status="empty")
+        if not force and previous and previous.get("silver_signature") == signature:
+            return DateResult(
+                day=day,
+                status="skipped",
+                archive_key=previous.get("archive_key"),
+            )
+
+        schema = archive_schema(config)
+        tables = [_read_selected(item, schema) for item in authority.selected]
+        table = pa.concat_tables(tables) if tables else _empty_table(schema)
         if config.compaction and config.compaction.dedup:
             table = dedup(table, schema)
     except Exception as exc:  # noqa: BLE001 — 어느 예외든 이 날짜만 실패로 격리한다
@@ -302,23 +592,51 @@ def compact_date(config: SourceConfig, day: date, *, today: date, force: bool = 
 
     archive_key = storage.write_archive(config.source_id, day, table)
     expected = _expected_windows(config)
-    storage.write_archive_manifest(config.source_id, day, {
-        "source_id": config.source_id,
-        "date": f"{day:%Y-%m-%d}",
-        "archive_key": archive_key,
-        "silver_signature": signature,
-        "expected_windows": expected,
-        "found_windows": len(objects),
-        "completeness": len(objects) / expected,
-        "backfill_window_closed": _backfill_window_closed(config, day, today),
-        "rows": table.num_rows,
-        "compacted_at": datetime.now(tz=_KST).isoformat(),
-    })
+    storage.write_archive_manifest(
+        config.source_id,
+        day,
+        {
+            "source_id": config.source_id,
+            "date": f"{day:%Y-%m-%d}",
+            "archive_key": archive_key,
+            "silver_signature": signature,
+            "expected_windows": expected,
+            "found_windows": authority.completed_windows,
+            "completeness": authority.completed_windows / expected,
+            "backfill_window_closed": _backfill_window_closed(config, day, today),
+            "rows": table.num_rows,
+            "compacted_at": datetime.now(tz=_KST).isoformat(),
+        },
+    )
     logger.info(
         f"stage=compaction status=compacted source={config.source_id} date={day} "
-        f"parts={len(objects)}/{expected} rows={table.num_rows} key={archive_key}"
+        f"parts={authority.completed_windows}/{expected} rows={table.num_rows} key={archive_key}"
     )
-    return DateResult(day=day, status="compacted", rows=table.num_rows, archive_key=archive_key)
+    return DateResult(
+        day=day, status="compacted", rows=table.num_rows, archive_key=archive_key
+    )
+
+
+def _empty_table(schema: pa.Schema) -> pa.Table:
+    """Archive schema를 유지하는 0행 테이블을 만든다."""
+    return pa.Table.from_arrays(
+        [pa.array([], type=field.type) for field in schema], schema=schema
+    )
+
+
+def _read_selected(item: _SelectedSilver, schema: pa.Schema) -> pa.Table:
+    """선택된 immutable bytes와 row count를 검증한 뒤 archive schema로 읽는다."""
+    if item.expected_rows is not None:
+        storage.read_immutable_silver_artifact(
+            item.object.key, row_count=item.expected_rows
+        )
+    table = _read_conformed(item.object.key, schema)
+    if item.expected_rows is not None and table.num_rows != item.expected_rows:
+        raise ValueError(
+            "source snapshot counts.kept와 Silver parquet row 수가 다르다: "
+            f"expected={item.expected_rows} actual={table.num_rows} key={item.object.key}"
+        )
+    return table
 
 
 def _read_conformed(key: str, schema: pa.Schema) -> pa.Table:
@@ -327,9 +645,12 @@ def _read_conformed(key: str, schema: pa.Schema) -> pa.Table:
     if table is None:
         raise ValueError(f"silver를 읽지 못했다: {key}")
     started = window_start_from_key(key)
-    table = table.append_column("_window_start", pa.array([started] * table.num_rows, type=pa.string()))
     table = table.append_column(
-        "_source_kind", pa.array([SOURCE_KIND_COLLECTOR] * table.num_rows, type=pa.string())
+        "_window_start", pa.array([started] * table.num_rows, type=pa.string())
+    )
+    table = table.append_column(
+        "_source_kind",
+        pa.array([SOURCE_KIND_COLLECTOR] * table.num_rows, type=pa.string()),
     )
     return conform(table, schema)
 

@@ -8,20 +8,42 @@ from zoneinfo import ZoneInfo
 
 import httpx
 import pytest
-
 from adapters.base import FetchErrorKind, Window
-from adapters.seoul_openapi import SeoulOpenApiAdapter
+from adapters.seoul_openapi import NaturalKeyCardinalityError, SeoulOpenApiAdapter
 
 KST = ZoneInfo("Asia/Seoul")
 
 
 class _StubConfig:
-    def __init__(self, adapter_params):
+    """어댑터가 읽는 최소 소스 설정을 제공한다."""
+
+    def __init__(self, adapter_params, natural_key=None):
+        """adapter params와 선택적 자연키를 보관한다."""
         self.adapter_params = adapter_params
+        self.natural_key = natural_key
 
 
 def _config(page_size=2):
-    return _StubConfig({"service": "bikeList", "page_size": page_size, "root_key": "rentBikeStatus.row"})
+    return _StubConfig(
+        {
+            "service": "bikeList",
+            "page_size": page_size,
+            "root_key": "rentBikeStatus.row",
+        }
+    )
+
+
+def _probe_config(page_size=2, natural_key=("stationId",)):
+    """빈 페이지까지 탐색하는 bikeList 설정을 만든다."""
+    return _StubConfig(
+        {
+            "service": "bikeList",
+            "page_size": page_size,
+            "root_key": "rentBikeStatus.row",
+            "pagination": "probe_until_empty",
+        },
+        natural_key=natural_key,
+    )
 
 
 def _body(code="INFO-000", total=3, rows=None):
@@ -47,13 +69,17 @@ def test_fetch_paginates_until_total_is_covered():
     def handler(request):
         calls.append(str(request.url))
         if "/1/2/" in str(request.url):
-            return httpx.Response(200, content=_body(total=3, rows=[{"a": "1"}, {"a": "2"}]))
+            return httpx.Response(
+                200, content=_body(total=3, rows=[{"a": "1"}, {"a": "2"}])
+            )
         if "/3/3/" in str(request.url):
             return httpx.Response(200, content=_body(total=3, rows=[{"a": "3"}]))
         raise AssertionError(f"unexpected url: {request.url}")
 
     client = httpx.Client(transport=httpx.MockTransport(handler))
-    results = list(SeoulOpenApiAdapter.fetch(_config(page_size=2), window=None, client=client))
+    results = list(
+        SeoulOpenApiAdapter.fetch(_config(page_size=2), window=None, client=client)
+    )
 
     assert [r.key for r in results] == ["page-00001-00002", "page-00003-00003"]
     assert results[0].expected_total == 3
@@ -67,7 +93,9 @@ def test_fetch_masks_api_key_from_chunk_keys():
         return httpx.Response(200, content=_body(total=1, rows=[{"a": "1"}]))
 
     client = httpx.Client(transport=httpx.MockTransport(handler))
-    results = list(SeoulOpenApiAdapter.fetch(_config(page_size=2), window=None, client=client))
+    results = list(
+        SeoulOpenApiAdapter.fetch(_config(page_size=2), window=None, client=client)
+    )
 
     for r in results:
         assert "secret-key-123" not in r.key
@@ -83,8 +111,11 @@ def test_fetch_skips_keys_already_collected(monkeypatch):
     client = httpx.Client(transport=httpx.MockTransport(handler))
     results = list(
         SeoulOpenApiAdapter.fetch(
-            _config(page_size=2), window=None, client=client,
-            skip=frozenset({"page-00001-00002"}), expected_total=3,
+            _config(page_size=2),
+            window=None,
+            client=client,
+            skip=frozenset({"page-00001-00002"}),
+            expected_total=3,
         )
     )
 
@@ -144,6 +175,150 @@ def test_fetch_yields_raw_response_unmodified():
     results = list(SeoulOpenApiAdapter.fetch(_config(), window=None, client=client))
 
     assert results[0].payload == raw
+
+
+class TestProbeUntilEmptyPagination:
+    """페이지별 count가 전체가 아닌 bikeList의 탐색 계약을 검증한다."""
+
+    def test_ignores_page_totals_and_continues_after_short_page(self):
+        """짧은 페이지 뒤에도 명시적 빈 row를 확인할 때까지 계속 조회한다."""
+        responses = {
+            "/1/2/": _body(
+                total=2, rows=[{"stationId": "ST-1"}, {"stationId": "ST-2"}]
+            ),
+            "/3/4/": _body(total=1, rows=[{"stationId": "ST-3"}]),
+            "/5/6/": _body(total=1, rows=[{"stationId": "ST-4"}]),
+            "/7/8/": _body(total=0, rows=[]),
+        }
+        calls = []
+
+        def handler(request):
+            url = str(request.url)
+            calls.append(url)
+            return httpx.Response(
+                200,
+                content=next(
+                    payload for marker, payload in responses.items() if marker in url
+                ),
+            )
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        results = list(
+            SeoulOpenApiAdapter.fetch(_probe_config(), window=None, client=client)
+        )
+
+        assert [result.key for result in results] == [
+            "page-00001-00002",
+            "page-00003-00004",
+            "page-00005-00006",
+            "page-00007-00008",
+        ]
+        assert [result.expected_total for result in results] == [None, None, None, 4]
+        assert len(calls) == 4
+
+    def test_missing_total_does_not_stop_probe(self):
+        """list_total_count가 없는 비어 있지 않은 페이지도 정상 raw로 보존한다."""
+        first = json.dumps(
+            {
+                "rentBikeStatus": {
+                    "RESULT": {"CODE": "INFO-000", "MESSAGE": "ok"},
+                    "row": [{"stationId": "ST-1"}],
+                }
+            }
+        ).encode()
+        empty = _body(total=0, rows=[])
+        calls = []
+
+        def handler(request):
+            calls.append(str(request.url))
+            return httpx.Response(200, content=first if len(calls) == 1 else empty)
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        results = list(
+            SeoulOpenApiAdapter.fetch(_probe_config(), window=None, client=client)
+        )
+
+        assert results[0].payload == first
+        assert results[-1].expected_total == 1
+        assert len(calls) == 2
+
+    def test_exact_multiple_requires_info_200_sentinel(self):
+        """마지막 데이터 페이지가 꽉 차도 다음 INFO-200까지 확인한다."""
+        sentinel = json.dumps(
+            {"CODE": "INFO-200", "MESSAGE": "해당하는 데이터가 없습니다."}
+        ).encode()
+        calls = []
+
+        def handler(request):
+            url = str(request.url)
+            calls.append(url)
+            if "/1/2/" in url:
+                return httpx.Response(
+                    200,
+                    content=_body(
+                        total=2,
+                        rows=[{"stationId": "ST-1"}, {"stationId": "ST-2"}],
+                    ),
+                )
+            if "/3/4/" in url:
+                return httpx.Response(
+                    200,
+                    content=_body(
+                        total=2,
+                        rows=[{"stationId": "ST-3"}, {"stationId": "ST-4"}],
+                    ),
+                )
+            return httpx.Response(200, content=sentinel)
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        results = list(
+            SeoulOpenApiAdapter.fetch(_probe_config(), window=None, client=client)
+        )
+
+        assert [result.key for result in results] == [
+            "page-00001-00002",
+            "page-00003-00004",
+            "page-00005-00006",
+        ]
+        assert results[-1].payload == sentinel
+        assert results[-1].expected_total == 4
+        assert len(calls) == 3
+
+    def test_duplicate_natural_key_fails_cardinality_validation(self):
+        """raw 행 수보다 고유 stationId 수가 작으면 serving 입력 생성을 거부한다."""
+        chunk = _body(
+            total=2,
+            rows=[{"stationId": "ST-1"}, {"stationId": "ST-1"}],
+        )
+
+        with pytest.raises(NaturalKeyCardinalityError, match=r"rows=2, unique=1"):
+            SeoulOpenApiAdapter.normalize([chunk], _probe_config())
+
+    @pytest.mark.parametrize("station_id", [None, "", "   "])
+    def test_missing_natural_key_fails_before_silver(self, station_id):
+        """identity 결손 행은 nullable 비식별 필드와 달리 snapshot을 거부한다."""
+        chunk = _body(total=1, rows=[{"stationId": station_id, "stationName": "이름"}])
+
+        with pytest.raises(NaturalKeyCardinalityError, match=r"natural_key.*비어"):
+            SeoulOpenApiAdapter.normalize([chunk], _probe_config())
+
+    def test_nullable_fields_and_large_counts_remain_raw(self):
+        """identity 외 nullable 값과 큰 비음수 count를 어댑터가 바꾸지 않는다."""
+        row = {
+            "stationId": "ST-1",
+            "stationName": None,
+            "rackTotCnt": "0",
+            "parkingBikeTotCnt": "500000",
+            "shared": "500000",
+            "stationLatitude": "37.0",
+            "stationLongitude": "127.5",
+        }
+        raw = _body(total=1, rows=[row])
+
+        normalized = SeoulOpenApiAdapter.normalize([raw], _probe_config())
+
+        assert normalized == [row]
+        assert json.loads(raw)["rentBikeStatus"]["row"][0] == row
 
 
 def test_population_fetch_uses_configured_poi_range_and_does_not_stop_at_gap():
@@ -227,7 +402,9 @@ def test_population_fetch_requests_pois_concurrently_and_preserves_order():
     results = list(SeoulOpenApiAdapter.fetch(config, window=None, client=client))
 
     assert live["max"] > 1
-    assert [result.key for result in results] == [f"poi-POI{i:03d}" for i in range(1, 9)]
+    assert [result.key for result in results] == [
+        f"poi-POI{i:03d}" for i in range(1, 9)
+    ]
     assert all(result.error is None for result in results)
 
 
@@ -254,10 +431,14 @@ def test_population_fetch_honors_skip_under_concurrency():
         return httpx.Response(200, content=json.dumps(body).encode())
 
     client = httpx.Client(transport=httpx.MockTransport(handler))
-    results = list(SeoulOpenApiAdapter.fetch(
-        config, window=None, client=client,
-        skip=frozenset({"poi-POI002", "poi-POI003"}),
-    ))
+    results = list(
+        SeoulOpenApiAdapter.fetch(
+            config,
+            window=None,
+            client=client,
+            skip=frozenset({"poi-POI002", "poi-POI003"}),
+        )
+    )
 
     assert [result.key for result in results] == ["poi-POI001", "poi-POI004"]
     assert set(calls) == {"POI001", "POI004"}
@@ -273,10 +454,14 @@ def test_normalize_concatenates_rows_across_chunks():
 
 
 def test_normalize_tolerates_missing_row_key():
-    chunk_without_rows = json.dumps({"rentBikeStatus": {"RESULT": {"CODE": "INFO-200"}}}).encode()
+    chunk_without_rows = json.dumps(
+        {"rentBikeStatus": {"RESULT": {"CODE": "INFO-200"}}}
+    ).encode()
     chunk_with_rows = _body(total=1, rows=[{"a": "1"}])
 
-    rows = SeoulOpenApiAdapter.normalize([chunk_without_rows, chunk_with_rows], _config())
+    rows = SeoulOpenApiAdapter.normalize(
+        [chunk_without_rows, chunk_with_rows], _config()
+    )
 
     assert rows == [{"a": "1"}]
 
@@ -298,12 +483,18 @@ class TestPathSuffixTemplate:
             return httpx.Response(200, content=_body(total=1, rows=[{"a": "1"}]))
 
         client = httpx.Client(transport=httpx.MockTransport(handler))
-        list(SeoulOpenApiAdapter.fetch(_StubConfig(params), window=window, client=client))
+        list(
+            SeoulOpenApiAdapter.fetch(_StubConfig(params), window=window, client=client)
+        )
         return calls
 
     def _params(self, suffix):
-        return {"service": "tbCycleRentData", "page_size": 1000,
-                "root_key": "rentBikeStatus.row", "path_suffix": suffix}
+        return {
+            "service": "tbCycleRentData",
+            "page_size": 1000,
+            "root_key": "rentBikeStatus.row",
+            "path_suffix": suffix,
+        }
 
     def test_window_start_is_available(self):
         window = Window(
@@ -311,7 +502,9 @@ class TestPathSuffixTemplate:
             window_end=datetime(2026, 8, 18, 19, 0, tzinfo=KST),
         )
 
-        calls = self._capture(self._params("/{window_start:%Y-%m-%d}/{window_start:%H}"), window)
+        calls = self._capture(
+            self._params("/{window_start:%Y-%m-%d}/{window_start:%H}"), window
+        )
 
         assert calls[0].endswith("/2026-08-18/18/")
 
@@ -331,7 +524,9 @@ class TestPathSuffixTemplate:
             window_end=datetime(2026, 8, 18, 19, 5, tzinfo=KST),
         )
 
-        calls = self._capture(self._params("/{window_last:%Y-%m-%d}/{window_last:%H}"), window)
+        calls = self._capture(
+            self._params("/{window_last:%Y-%m-%d}/{window_last:%H}"), window
+        )
 
         assert calls[0].endswith("/2026-08-18/18/")
 
@@ -351,7 +546,9 @@ class TestPathSuffixTemplate:
             window_end=datetime(2026, 8, 19, 0, 5, tzinfo=KST),
         )
 
-        calls = self._capture(self._params("/{window_last:%Y-%m-%d}/{window_last:%H}"), window)
+        calls = self._capture(
+            self._params("/{window_last:%Y-%m-%d}/{window_last:%H}"), window
+        )
 
         assert calls[0].endswith("/2026-08-18/23/")
 
@@ -381,13 +578,19 @@ class TestPathSuffixTemplate:
 
 
 def _concurrent_config(page_size=2, concurrency=4):
-    return _StubConfig({
-        "service": "bikeList", "page_size": page_size,
-        "root_key": "rentBikeStatus.row", "concurrency": concurrency,
-    })
+    return _StubConfig(
+        {
+            "service": "bikeList",
+            "page_size": page_size,
+            "root_key": "rentBikeStatus.row",
+            "concurrency": concurrency,
+        }
+    )
 
 
-def _paged_handler(total, page_size, *, delay=0.0, overrides=None, calls=None, live=None):
+def _paged_handler(
+    total, page_size, *, delay=0.0, overrides=None, calls=None, live=None
+):
     """total건을 page_size로 나눠 응답하는 핸들러. delay로 지연을 흉내낸다.
 
     `live`를 주면 동시 진행 중인 요청 수의 최댓값을 `live["max"]`에 기록한다.
@@ -414,6 +617,7 @@ def _paged_handler(total, page_size, *, delay=0.0, overrides=None, calls=None, l
                 if marker in url:
                     return response
             import re
+
             start, end = (int(x) for x in re.search(r"/(\d+)/(\d+)/", url).groups())
             rows = [{"a": str(i)} for i in range(start, min(end, total) + 1)]
             return httpx.Response(200, content=_body(total=total, rows=rows))
@@ -436,8 +640,11 @@ class TestConcurrentPagination:
         )
         started = time.monotonic()
         results = list(
-            SeoulOpenApiAdapter.fetch(_concurrent_config(page_size=1, concurrency=4),
-                                      window=None, client=client)
+            SeoulOpenApiAdapter.fetch(
+                _concurrent_config(page_size=1, concurrency=4),
+                window=None,
+                client=client,
+            )
         )
         elapsed = time.monotonic() - started
 
@@ -447,13 +654,20 @@ class TestConcurrentPagination:
         assert elapsed < 1.2, f"순차(1.6s)보다 빨라야 한다: {elapsed:.2f}s"
 
     def test_page_order_is_preserved(self):
-        client = httpx.Client(transport=httpx.MockTransport(_paged_handler(8, 1, delay=0.05)))
+        client = httpx.Client(
+            transport=httpx.MockTransport(_paged_handler(8, 1, delay=0.05))
+        )
         results = list(
-            SeoulOpenApiAdapter.fetch(_concurrent_config(page_size=1, concurrency=4),
-                                      window=None, client=client)
+            SeoulOpenApiAdapter.fetch(
+                _concurrent_config(page_size=1, concurrency=4),
+                window=None,
+                client=client,
+            )
         )
 
-        assert [r.key for r in results] == [f"page-{i:05d}-{i:05d}" for i in range(1, 9)]
+        assert [r.key for r in results] == [
+            f"page-{i:05d}-{i:05d}" for i in range(1, 9)
+        ]
         assert results[0].expected_total == 8
         assert all(r.expected_total is None for r in results[1:])
 
@@ -463,7 +677,9 @@ class TestConcurrentPagination:
         client = httpx.Client(
             transport=httpx.MockTransport(_paged_handler(6, 1, delay=0.02, live=live))
         )
-        results = list(SeoulOpenApiAdapter.fetch(_config(page_size=1), window=None, client=client))
+        results = list(
+            SeoulOpenApiAdapter.fetch(_config(page_size=1), window=None, client=client)
+        )
 
         assert len(results) == 6
         assert live["max"] == 1, "concurrency 미선언 소스는 순차여야 한다"
@@ -473,20 +689,36 @@ class TestConcurrentPagination:
         client = httpx.Client(
             transport=httpx.MockTransport(_paged_handler(4, 1, calls=calls))
         )
-        results = list(SeoulOpenApiAdapter.fetch(
-            _concurrent_config(page_size=1, concurrency=4), window=None, client=client,
-            skip=frozenset({"page-00002-00002", "page-00003-00003"}), expected_total=4,
-        ))
+        results = list(
+            SeoulOpenApiAdapter.fetch(
+                _concurrent_config(page_size=1, concurrency=4),
+                window=None,
+                client=client,
+                skip=frozenset({"page-00002-00002", "page-00003-00003"}),
+                expected_total=4,
+            )
+        )
 
         assert [r.key for r in results] == ["page-00001-00001", "page-00004-00004"]
         assert not any("/2/2/" in c or "/3/3/" in c for c in calls)
 
     def test_transient_on_one_page_reports_only_that_page(self):
-        client = httpx.Client(transport=httpx.MockTransport(_paged_handler(
-            4, 1, overrides={"/3/3/": httpx.Response(500, content=b"boom")},
-        )))
-        results = list(SeoulOpenApiAdapter.fetch(
-            _concurrent_config(page_size=1, concurrency=4), window=None, client=client))
+        client = httpx.Client(
+            transport=httpx.MockTransport(
+                _paged_handler(
+                    4,
+                    1,
+                    overrides={"/3/3/": httpx.Response(500, content=b"boom")},
+                )
+            )
+        )
+        results = list(
+            SeoulOpenApiAdapter.fetch(
+                _concurrent_config(page_size=1, concurrency=4),
+                window=None,
+                client=client,
+            )
+        )
 
         by_key = {r.key: r for r in results}
         assert by_key["page-00003-00003"].error is FetchErrorKind.TRANSIENT
@@ -494,11 +726,26 @@ class TestConcurrentPagination:
         assert by_key["page-00004-00004"].error is None
 
     def test_fatal_stops_the_whole_fetch(self):
-        client = httpx.Client(transport=httpx.MockTransport(_paged_handler(
-            6, 1, overrides={"/3/3/": httpx.Response(200, content=_body(code="INFO-100", total=6))},
-        )))
-        results = list(SeoulOpenApiAdapter.fetch(
-            _concurrent_config(page_size=1, concurrency=4), window=None, client=client))
+        client = httpx.Client(
+            transport=httpx.MockTransport(
+                _paged_handler(
+                    6,
+                    1,
+                    overrides={
+                        "/3/3/": httpx.Response(
+                            200, content=_body(code="INFO-100", total=6)
+                        )
+                    },
+                )
+            )
+        )
+        results = list(
+            SeoulOpenApiAdapter.fetch(
+                _concurrent_config(page_size=1, concurrency=4),
+                window=None,
+                client=client,
+            )
+        )
 
         assert results[-1].error is FetchErrorKind.FATAL
         assert results[-1].key == "page-00003-00003"
@@ -515,7 +762,8 @@ class TestConcurrentPagination:
             transport=httpx.MockTransport(_paged_handler(40, 1, delay=0.3))
         )
         iterator = SeoulOpenApiAdapter.fetch(
-            _concurrent_config(page_size=1, concurrency=4), window=None, client=client)
+            _concurrent_config(page_size=1, concurrency=4), window=None, client=client
+        )
         next(iterator)  # 1페이지만 받고 버린다
 
         started = time.monotonic()
@@ -531,19 +779,31 @@ class TestTopLevelResultCode:
     래퍼 안의 RESULT.CODE만 보면 None이 되어 PERMANENT로 오판한다."""
 
     def test_top_level_info_200_is_success_not_permanent(self):
-        body = json.dumps({"CODE": "INFO-200", "MESSAGE": "해당하는 데이터가 없습니다."}).encode()
-        client = httpx.Client(transport=httpx.MockTransport(
-            lambda request: httpx.Response(200, content=body)))
+        body = json.dumps(
+            {"CODE": "INFO-200", "MESSAGE": "해당하는 데이터가 없습니다."}
+        ).encode()
+        client = httpx.Client(
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(200, content=body)
+            )
+        )
 
-        results = list(SeoulOpenApiAdapter.fetch(_config(page_size=2), window=None, client=client))
+        results = list(
+            SeoulOpenApiAdapter.fetch(_config(page_size=2), window=None, client=client)
+        )
 
         assert [r.error for r in results] == [None]
 
     def test_top_level_error_code_is_still_classified(self):
         body = json.dumps({"CODE": "INFO-100", "MESSAGE": "인증키 오류"}).encode()
-        client = httpx.Client(transport=httpx.MockTransport(
-            lambda request: httpx.Response(200, content=body)))
+        client = httpx.Client(
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(200, content=body)
+            )
+        )
 
-        results = list(SeoulOpenApiAdapter.fetch(_config(page_size=2), window=None, client=client))
+        results = list(
+            SeoulOpenApiAdapter.fetch(_config(page_size=2), window=None, client=client)
+        )
 
         assert results[0].error is FetchErrorKind.FATAL

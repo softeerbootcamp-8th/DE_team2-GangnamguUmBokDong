@@ -2,24 +2,31 @@
 
 import gzip
 import json
-from datetime import datetime
+import re
+from datetime import date, datetime
 
 import boto3
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
-
+from core.gold_publication.errors import (
+    ObjectChecksumMismatchError,
+    ObjectCollisionError,
+)
 from storage import (
     clear_bronze,
     delete_retry_marker,
     list_retry_markers,
+    list_source_snapshot_windows,
     read_bronze,
+    read_immutable_silver_artifact,
     read_manifest,
     write_bronze_part,
+    write_immutable_silver,
     write_manifest,
     write_quarantine,
     write_retry_marker,
-    write_silver,
+    write_source_snapshot_manifest,
 )
 from tests.conftest import KST, TEST_BUCKET
 
@@ -97,27 +104,68 @@ class TestClearBronze:
         clear_bronze("nonexistent_source", WINDOW_START)
 
 
-class TestWriteSilver:
+class TestWriteImmutableSilver:
+    """Content-addressed Silver의 put-once와 readback을 검증한다."""
+
     def test_writes_parquet_and_returns_key(self):
+        """Parquet bytes를 hash segment가 있는 object에 기록한다."""
         table = pa.table({"stationId": ["ST-1", "ST-2"], "rackTotCnt": [10, 20]})
 
-        key = write_silver("test_source", WINDOW_START, table)
+        key = write_immutable_silver("test_source", WINDOW_START, table).key
 
-        assert key == "silver/test_source/dt=2026-08-12/hh=14/1410.parquet"
+        assert re.fullmatch(
+            r"silver/test_source/dt=2026-08-12/hh=14/1410/"
+            r"sha256=[0-9a-f]{64}\.parquet",
+            key,
+        )
         body = _s3().get_object(Bucket=TEST_BUCKET, Key=key)["Body"].read()
         roundtrip = pq.read_table(pa.BufferReader(body))
         assert roundtrip.to_pydict() == table.to_pydict()
 
-    def test_overwrites_same_key_on_second_call(self):
+    def test_changed_bytes_use_a_new_key_without_overwrite(self):
+        """Correction parquet은 기존 URI를 덮어쓰지 않고 새 content key를 쓴다."""
         table1 = pa.table({"x": [1]})
         table2 = pa.table({"x": [1, 2]})
 
-        key1 = write_silver("test_source", WINDOW_START, table1)
-        key2 = write_silver("test_source", WINDOW_START, table2)
+        key1 = write_immutable_silver("test_source", WINDOW_START, table1).key
+        key2 = write_immutable_silver("test_source", WINDOW_START, table2).key
 
-        assert key1 == key2
-        body = _s3().get_object(Bucket=TEST_BUCKET, Key=key1)["Body"].read()
-        assert pq.read_table(pa.BufferReader(body)).num_rows == 2
+        assert key1 != key2
+        first = _s3().get_object(Bucket=TEST_BUCKET, Key=key1)["Body"].read()
+        second = _s3().get_object(Bucket=TEST_BUCKET, Key=key2)["Body"].read()
+        assert pq.read_table(pa.BufferReader(first)).num_rows == 1
+        assert pq.read_table(pa.BufferReader(second)).num_rows == 2
+
+    def test_same_bytes_replay_the_same_immutable_key(self):
+        """동일 table 재실행은 같은 object의 안전한 replay다."""
+        table = pa.table({"x": [1]})
+
+        first = write_immutable_silver("test_source", WINDOW_START, table).key
+        second = write_immutable_silver("test_source", WINDOW_START, table).key
+
+        assert second == first
+
+    def test_collision_does_not_overwrite_existing_key(self):
+        """Content key에 다른 bytes가 있으면 put-once가 hard fail한다."""
+        table = pa.table({"x": [1]})
+        key = write_immutable_silver("test_source", WINDOW_START, table).key
+        _s3().put_object(Bucket=TEST_BUCKET, Key=key, Body=b"corrupt")
+
+        with pytest.raises(ObjectCollisionError):
+            write_immutable_silver("test_source", WINDOW_START, table)
+
+        assert (
+            _s3().get_object(Bucket=TEST_BUCKET, Key=key)["Body"].read() == b"corrupt"
+        )
+
+    def test_readback_rejects_checksum_mismatch(self):
+        """URI hash와 실제 Silver bytes가 다르면 authority 복원이 실패한다."""
+        table = pa.table({"x": [1]})
+        key = write_immutable_silver("test_source", WINDOW_START, table).key
+        _s3().put_object(Bucket=TEST_BUCKET, Key=key, Body=b"corrupt")
+
+        with pytest.raises(ObjectChecksumMismatchError):
+            read_immutable_silver_artifact(key, row_count=1)
 
 
 class TestWriteQuarantine:
@@ -131,7 +179,10 @@ class TestWriteQuarantine:
         assert listed.get("KeyCount", 0) == 0
 
     def test_nonempty_rows_writes_jsonl(self):
-        rows = [{"stationId": "ST-1", "_issues": ["missing:rackTotCnt"]}, {"stationId": "ST-2"}]
+        rows = [
+            {"stationId": "ST-1", "_issues": ["missing:rackTotCnt"]},
+            {"stationId": "ST-2"},
+        ]
 
         key = write_quarantine("test_source", WINDOW_START, rows)
 
@@ -152,6 +203,50 @@ class TestManifestRawIO:
 
     def test_read_missing_returns_none(self):
         assert read_manifest("never_written", WINDOW_START) is None
+
+
+class TestSourceSnapshotWindowListing:
+    """UTC manifest layout을 KST compaction 날짜의 logical window로 발견한다."""
+
+    def test_lists_both_utc_partitions_and_deduplicates_revisions(self) -> None:
+        """KST 하루 양끝 window와 여러 revision을 오름차순 한 번씩 반환한다."""
+        midnight = datetime(2026, 8, 12, 0, 0, tzinfo=KST)
+        late = datetime(2026, 8, 12, 23, 55, tzinfo=KST)
+        before = datetime(2026, 8, 11, 23, 55, tzinfo=KST)
+        after = datetime(2026, 8, 13, 0, 0, tzinfo=KST)
+        write_source_snapshot_manifest("test_source", midnight, 0, b"{}")
+        write_source_snapshot_manifest("test_source", midnight, 1, b'{"v":1}')
+        write_source_snapshot_manifest("test_source", late, 0, b"{}")
+        write_source_snapshot_manifest("test_source", before, 0, b"{}")
+        write_source_snapshot_manifest("test_source", after, 0, b"{}")
+
+        result = list_source_snapshot_windows("test_source", date(2026, 8, 12))
+
+        assert result == [midnight, late]
+
+    def test_does_not_mix_sources(self) -> None:
+        """같은 logical time의 다른 source manifest를 포함하지 않는다."""
+        write_source_snapshot_manifest("source_a", WINDOW_START, 0, b"{}")
+        write_source_snapshot_manifest("source_b", WINDOW_START, 0, b"{}")
+
+        result = list_source_snapshot_windows("source_a", date(2026, 8, 12))
+
+        assert result == [WINDOW_START]
+
+    def test_returns_empty_when_date_has_no_manifests(self) -> None:
+        """해당 KST 날짜에 manifest가 없으면 빈 목록을 반환한다."""
+        assert list_source_snapshot_windows("test_source", date(2026, 8, 12)) == []
+
+    def test_rejects_partition_mismatched_manifest_key(self) -> None:
+        """UTC partition이 logical time과 다른 key를 authority로 발견하지 않는다."""
+        key = (
+            "source_snapshot_manifest/test_source/dt=2026-08-12/hh=13/"
+            "logical=20260812T140000000000Z/revision=0000000000.json"
+        )
+        _s3().put_object(Bucket=TEST_BUCKET, Key=key, Body=b"{}")
+
+        with pytest.raises(ValueError, match="partition"):
+            list_source_snapshot_windows("test_source", date(2026, 8, 12))
 
 
 class TestRetryMarkerRawIO:

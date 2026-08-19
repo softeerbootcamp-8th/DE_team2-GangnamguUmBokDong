@@ -1,15 +1,25 @@
 """compaction 실행 경로를 moto S3로 검증한다 — 압축·건너뛰기·격리·manifest."""
 
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
+import manifest as manifest_module
 import pyarrow as pa
 import pytest
-
+import storage
 from compaction import RECOVERY_DAYS, compact_date, compact_range, target_dates
-from config.schema import Backfill, ColumnSpec, Policies, Quality, Schedule, SourceConfig
+from config.schema import (
+    Backfill,
+    ColumnSpec,
+    Policies,
+    Quality,
+    Schedule,
+    SourceConfig,
+)
 from config.schema import Compaction as CompactionConfig
 from config.schema import Storage as StorageConfig
-from core.s3 import read_parquet
+from core.s3 import put_object_bytes, read_parquet
+from core.source_snapshot import SourceSnapshotStatus
+from manifest import Artifacts, Counts, Manifest, RunStatus, Stage
 from storage import read_archive_manifest, write_silver
 from tests.conftest import KST
 
@@ -25,13 +35,22 @@ def _config(**overrides):
         "description": "테스트 소스",
         "adapter": "t_adapter",
         "schedule": Schedule(interval="5m"),
-        "storage": StorageConfig(bronze_format="json", silver_format="parquet", partition=("dt", "hh")),
-        "quality": Quality(max_drop_ratio=0.5, max_missing_ratio=0.0, allow_empty=False),
-        "policies": Policies(
-            required_missing="drop_row", required_outlier="drop_row",
-            optional_missing="keep_null", optional_outlier="set_null",
+        "storage": StorageConfig(
+            bronze_format="json", silver_format="parquet", partition=("dt", "hh")
         ),
-        "columns": {"sta": ColumnSpec(types=("str",)), "cnt": ColumnSpec(types=("int",))},
+        "quality": Quality(
+            max_drop_ratio=0.5, max_missing_ratio=0.0, allow_empty=False
+        ),
+        "policies": Policies(
+            required_missing="drop_row",
+            required_outlier="drop_row",
+            optional_missing="keep_null",
+            optional_outlier="set_null",
+        ),
+        "columns": {
+            "sta": ColumnSpec(types=("str",)),
+            "cnt": ColumnSpec(types=("int",)),
+        },
         "config_version": "v1",
     }
     fields.update(overrides)
@@ -40,12 +59,91 @@ def _config(**overrides):
 
 def _put_silver(source_id, minute, rows=2, day=DAY):
     """해당 날짜 hh=09의 HH:MM 윈도우에 silver 하나를 쓴다."""
-    table = pa.table({
-        "sta": [f"ST-{i}" for i in range(rows)],
-        "cnt": list(range(rows)),
-        "_row_status": ["ok"] * rows,
-    })
-    write_silver(source_id, datetime(day.year, day.month, day.day, 9, minute, tzinfo=KST), table)
+    table = pa.table(
+        {
+            "sta": [f"ST-{i}" for i in range(rows)],
+            "cnt": list(range(rows)),
+            "_row_status": ["ok"] * rows,
+        }
+    )
+    write_silver(
+        source_id, datetime(day.year, day.month, day.day, 9, minute, tzinfo=KST), table
+    )
+
+
+def _table(values: list[int]) -> pa.Table:
+    """구분 가능한 cnt 값을 가진 테스트 Silver table을 만든다."""
+    return pa.table(
+        {
+            "sta": [f"ST-{value}" for value in values],
+            "cnt": values,
+            "_row_status": ["ok"] * len(values),
+        }
+    )
+
+
+def _window(minute: int) -> datetime:
+    """테스트 날짜의 KST 09시 source logical window를 만든다."""
+    return datetime(DAY.year, DAY.month, DAY.day, 9, minute, tzinfo=KST)
+
+
+def _publish_succeeded(
+    minute: int, values: list[int]
+) -> storage.ImmutableSilverArtifact:
+    """Immutable Silver와 그 SUCCEEDED source snapshot manifest를 게시한다."""
+    logical = _window(minute)
+    artifact = storage.write_immutable_silver("t_source", logical, _table(values))
+    row_count = len(values)
+    manifest_module.publish_source_snapshot(
+        source_id="t_source",
+        logical_dttm=logical,
+        status=SourceSnapshotStatus.SUCCEEDED,
+        config_version="v1",
+        silver=artifact,
+        counts=Counts(
+            expected=row_count,
+            fetched=row_count,
+            kept=row_count,
+            repaired=0,
+            dropped=0,
+        ),
+        planned_parts=("part",),
+        completed_parts=("part",),
+    )
+    return artifact
+
+
+def _publish_empty(minute: int) -> None:
+    """같은 logical window의 최신 correction을 confirmed EMPTY로 게시한다."""
+    manifest_module.publish_source_snapshot(
+        source_id="t_source",
+        logical_dttm=_window(minute),
+        status=SourceSnapshotStatus.EMPTY,
+        config_version="v1",
+        silver=None,
+        counts=Counts(expected=0, fetched=0, kept=0, repaired=0, dropped=0),
+        planned_parts=("sentinel",),
+        completed_parts=("sentinel",),
+    )
+
+
+def _save_mutable_diagnostic(minute: int, status: RunStatus, silver_key: str) -> None:
+    """Silver key 옆에 mutable 진단 manifest를 기록한다."""
+    logical = _window(minute)
+    manifest_module.save(
+        Manifest(
+            source_id="t_source",
+            window_start=logical,
+            window_end=logical + timedelta(minutes=5),
+            status=status,
+            stage=Stage.COMPLETED,
+            started_at=logical,
+            ended_at=logical + timedelta(seconds=1),
+            artifacts=Artifacts(silver=silver_key),
+            counts=Counts(expected=1, fetched=1, kept=1),
+            config_version="v1",
+        )
+    )
 
 
 class TestCompactDate:
@@ -66,7 +164,13 @@ class TestCompactDate:
         compact_date(config, DAY, today=TODAY)
 
         table = read_parquet("archive/t_source/dt=2026-08-12.parquet", as_pandas=False)
-        assert table.schema.names == ["sta", "cnt", "_row_status", "_window_start", "_source_kind"]
+        assert table.schema.names == [
+            "sta",
+            "cnt",
+            "_row_status",
+            "_window_start",
+            "_source_kind",
+        ]
         assert table.schema.field("cnt").type == pa.int64()
 
     def test_marks_rows_as_collector_sourced(self):
@@ -99,7 +203,10 @@ class TestCompactDate:
 
         assert result.status == "empty"
         assert result.archive_key is None
-        assert read_parquet("archive/t_source/dt=2026-08-12.parquet", as_pandas=False) is None
+        assert (
+            read_parquet("archive/t_source/dt=2026-08-12.parquet", as_pandas=False)
+            is None
+        )
 
     def test_dates_with_different_null_patterns_share_one_schema(self):
         """전량 결측 컬럼이 있는 날과 없는 날의 archive 스키마가 같아야 한다."""
@@ -108,7 +215,13 @@ class TestCompactDate:
         write_silver(
             "t_source",
             datetime(2026, 8, 11, 9, 5, tzinfo=KST),
-            pa.table({"sta": ["ST-0"], "cnt": pa.array([None], type=pa.null()), "_row_status": ["ok"]}),
+            pa.table(
+                {
+                    "sta": ["ST-0"],
+                    "cnt": pa.array([None], type=pa.null()),
+                    "_row_status": ["ok"],
+                }
+            ),
         )
 
         compact_date(config, DAY, today=TODAY)
@@ -117,6 +230,220 @@ class TestCompactDate:
         a = read_parquet("archive/t_source/dt=2026-08-12.parquet", as_pandas=False)
         b = read_parquet("archive/t_source/dt=2026-08-11.parquet", as_pandas=False)
         assert a.schema == b.schema
+
+
+class TestSourceSnapshotAuthority:
+    """Immutable source snapshot의 최신 correction만 archive 입력을 열어야 한다."""
+
+    def test_compacts_manifest_referenced_immutable_silver(self) -> None:
+        """SUCCEEDED manifest가 가리킨 immutable Silver만 압축한다."""
+        config = _config()
+        _publish_succeeded(5, [7, 8])
+
+        result = compact_date(config, DAY, today=TODAY)
+
+        archive = read_parquet(
+            "archive/t_source/dt=2026-08-12.parquet", as_pandas=False
+        )
+        assert result.status == "compacted"
+        assert result.rows == 2
+        assert archive.column("cnt").to_pylist() == [7, 8]
+        assert archive.column("_window_start").to_pylist() == [
+            "2026-08-12T09:05:00+09:00",
+            "2026-08-12T09:05:00+09:00",
+        ]
+
+    def test_same_window_legacy_is_not_merged_with_immutable_authority(self) -> None:
+        """같은 window의 legacy와 immutable을 동시에 합치지 않는다."""
+        config = _config()
+        write_silver("t_source", _window(5), _table([999]))
+        _publish_succeeded(5, [1, 2])
+
+        result = compact_date(config, DAY, today=TODAY)
+
+        archive = read_parquet(
+            "archive/t_source/dt=2026-08-12.parquet", as_pandas=False
+        )
+        assert result.rows == 2
+        assert archive.column("cnt").to_pylist() == [1, 2]
+
+    def test_latest_succeeded_correction_replaces_older_immutable_object(self) -> None:
+        """여러 immutable revision 중 latest SUCCEEDED만 선택한다."""
+        config = _config()
+        _publish_succeeded(5, [1])
+        _publish_succeeded(5, [20, 30])
+
+        result = compact_date(config, DAY, today=TODAY)
+
+        archive = read_parquet(
+            "archive/t_source/dt=2026-08-12.parquet", as_pandas=False
+        )
+        assert result.rows == 2
+        assert archive.column("cnt").to_pylist() == [20, 30]
+
+    def test_unpublished_partial_attempt_keeps_last_published_success(self) -> None:
+        """새 PARTIAL object는 직전 published SUCCEEDED authority를 대체하지 않는다."""
+        config = _config()
+        _publish_succeeded(5, [1])
+        compact_date(config, DAY, today=TODAY)
+        partial = storage.write_immutable_silver("t_source", _window(5), _table([999]))
+        _save_mutable_diagnostic(5, RunStatus.PARTIAL, partial.key)
+
+        result = compact_date(config, DAY, today=TODAY)
+
+        archive = read_parquet(
+            "archive/t_source/dt=2026-08-12.parquet", as_pandas=False
+        )
+        assert result.status == "skipped"
+        assert archive.column("cnt").to_pylist() == [1]
+
+    def test_initial_empty_manifest_is_counted_without_silver(self) -> None:
+        """Silver가 한 번도 없는 최초 EMPTY도 completed window로 압축 기록한다."""
+        config = _config()
+        _publish_empty(5)
+
+        result = compact_date(config, DAY, today=TODAY)
+
+        archive = read_parquet(
+            "archive/t_source/dt=2026-08-12.parquet", as_pandas=False
+        )
+        archive_manifest = read_archive_manifest("t_source", DAY)
+        assert result.status == "compacted"
+        assert result.rows == 0
+        assert archive.num_rows == 0
+        assert archive_manifest["found_windows"] == 1
+        assert archive_manifest["completeness"] == pytest.approx(1 / 288)
+
+    def test_empty_correction_clears_previously_compacted_rows(self) -> None:
+        """Latest EMPTY correction은 과거 archive row를 빈 table로 교정한다."""
+        config = _config()
+        _publish_succeeded(5, [1])
+        first = compact_date(config, DAY, today=TODAY)
+        _publish_empty(5)
+
+        corrected = compact_date(config, DAY, today=TODAY)
+
+        archive = read_parquet(
+            "archive/t_source/dt=2026-08-12.parquet", as_pandas=False
+        )
+        archive_manifest = read_archive_manifest("t_source", DAY)
+        assert first.rows == 1
+        assert corrected.status == "compacted"
+        assert corrected.rows == 0
+        assert archive.num_rows == 0
+        assert archive_manifest["found_windows"] == 1
+
+    @pytest.mark.parametrize(
+        "status", [RunStatus.PARTIAL, RunStatus.FAILED, RunStatus.EMPTY]
+    )
+    def test_non_succeeded_mutable_legacy_manifest_does_not_open_authority(
+        self, status: RunStatus
+    ) -> None:
+        """Mutable legacy의 비성공 최종 상태는 archive 입력을 열지 않는다."""
+        config = _config()
+        legacy_key = write_silver("t_source", _window(5), _table([1]))
+        _save_mutable_diagnostic(5, status, legacy_key)
+
+        result = compact_date(config, DAY, today=TODAY)
+
+        assert result.status == "empty"
+        assert (
+            read_parquet("archive/t_source/dt=2026-08-12.parquet", as_pandas=False)
+            is None
+        )
+
+    def test_succeeded_historical_legacy_manifest_remains_compatible(self) -> None:
+        """전환 전 SUCCEEDED legacy window는 계속 압축할 수 있다."""
+        config = _config()
+        legacy_key = write_silver("t_source", _window(5), _table([4]))
+        _save_mutable_diagnostic(5, RunStatus.SUCCEEDED, legacy_key)
+
+        result = compact_date(config, DAY, today=TODAY)
+
+        assert result.status == "compacted"
+        assert result.rows == 1
+
+    def test_unpublished_immutable_object_does_not_fall_back_to_legacy(self) -> None:
+        """Manifest-last 중간 상태에서는 같은 window legacy도 열지 않는다."""
+        config = _config()
+        write_silver("t_source", _window(5), _table([999]))
+        storage.write_immutable_silver("t_source", _window(5), _table([1]))
+
+        result = compact_date(config, DAY, today=TODAY)
+
+        assert result.status == "empty"
+        assert (
+            read_parquet("archive/t_source/dt=2026-08-12.parquet", as_pandas=False)
+            is None
+        )
+
+    def test_manifest_row_count_mismatch_fails_closed(self) -> None:
+        """Manifest count와 parquet row가 다르면 archive를 기록하지 않는다."""
+        config = _config()
+        logical = _window(5)
+        artifact = storage.write_immutable_silver("t_source", logical, _table([1]))
+        manifest_module.publish_source_snapshot(
+            source_id="t_source",
+            logical_dttm=logical,
+            status=SourceSnapshotStatus.SUCCEEDED,
+            config_version="v1",
+            silver=artifact,
+            counts=Counts(expected=2, fetched=2, kept=2),
+            planned_parts=("part",),
+            completed_parts=("part",),
+        )
+
+        result = compact_date(config, DAY, today=TODAY)
+
+        assert result.status == "failed"
+        assert "counts.kept" in result.error
+        assert read_archive_manifest("t_source", DAY) is None
+
+    def test_manifest_referenced_missing_silver_fails_closed(self) -> None:
+        """Manifest만 있고 exact SUCCEEDED Silver가 없으면 날짜를 실패시킨다."""
+        config = _config()
+        logical = _window(5)
+        checksum = "a" * 64
+        missing_key = (
+            f"silver/t_source/dt=2026-08-12/hh=09/0905/sha256={checksum}.parquet"
+        )
+        missing = storage.ImmutableSilverArtifact(
+            key=missing_key,
+            uri=storage.object_uri(missing_key),
+            byte_sha256=checksum,
+            row_count=1,
+        )
+        manifest_module.publish_source_snapshot(
+            source_id="t_source",
+            logical_dttm=logical,
+            status=SourceSnapshotStatus.SUCCEEDED,
+            config_version="v1",
+            silver=missing,
+            counts=Counts(expected=1, fetched=1, kept=1),
+            planned_parts=("part",),
+            completed_parts=("part",),
+        )
+
+        result = compact_date(config, DAY, today=TODAY)
+
+        assert result.status == "failed"
+        assert "exact Silver object" in result.error
+        assert read_archive_manifest("t_source", DAY) is None
+
+    def test_manifest_referenced_checksum_mismatch_fails_closed(self) -> None:
+        """Content-addressed key의 bytes가 변조되면 archive를 기록하지 않는다."""
+        config = _config()
+        artifact = _publish_succeeded(5, [1])
+        put_object_bytes(artifact.key, b"corrupted parquet bytes")
+
+        result = compact_date(config, DAY, today=TODAY)
+
+        assert result.status == "failed"
+        assert read_archive_manifest("t_source", DAY) is None
+        assert (
+            read_parquet("archive/t_source/dt=2026-08-12.parquet", as_pandas=False)
+            is None
+        )
 
 
 class TestChangeDetection:
@@ -224,7 +551,10 @@ class TestFailureIsolation:
 
         assert result.status == "failed"
         assert read_archive_manifest("t_source", DAY) is None
-        assert read_parquet("archive/t_source/dt=2026-08-12.parquet", as_pandas=False) is None
+        assert (
+            read_parquet("archive/t_source/dt=2026-08-12.parquet", as_pandas=False)
+            is None
+        )
 
     def test_one_bad_date_does_not_block_others(self):
         config = _config(columns={"cnt": ColumnSpec(types=("int",))})
@@ -292,11 +622,13 @@ class TestDedup:
         write_silver(
             "t_source",
             datetime(2026, 8, 12, 9, minute, tzinfo=KST),
-            pa.table({
-                "sta": [r[0] for r in rows],
-                "cnt": [r[1] for r in rows],
-                "_row_status": ["ok"] * len(rows),
-            }),
+            pa.table(
+                {
+                    "sta": [r[0] for r in rows],
+                    "cnt": [r[1] for r in rows],
+                    "_row_status": ["ok"] * len(rows),
+                }
+            ),
         )
 
     def test_off_by_default_keeps_window_duplicates(self):
@@ -327,7 +659,9 @@ class TestDedup:
         compact_date(config, DAY, today=TODAY)
 
         table = read_parquet("archive/t_source/dt=2026-08-12.parquet", as_pandas=False)
-        assert table.column("_window_start").to_pylist() == ["2026-08-12T09:05:00+09:00"]
+        assert table.column("_window_start").to_pylist() == [
+            "2026-08-12T09:05:00+09:00"
+        ]
 
     def test_preserves_rows_differing_in_any_data_column(self):
         """원본의 진짜 중복(값이 다름)은 compaction이 판단해 지울 것이 아니다."""
@@ -346,7 +680,13 @@ class TestDedup:
         compact_date(config, DAY, today=TODAY)
 
         table = read_parquet("archive/t_source/dt=2026-08-12.parquet", as_pandas=False)
-        assert table.schema.names == ["sta", "cnt", "_row_status", "_window_start", "_source_kind"]
+        assert table.schema.names == [
+            "sta",
+            "cnt",
+            "_row_status",
+            "_window_start",
+            "_source_kind",
+        ]
         assert table.schema.field("cnt").type == pa.int64()
 
     def test_distinct_rows_are_untouched(self):

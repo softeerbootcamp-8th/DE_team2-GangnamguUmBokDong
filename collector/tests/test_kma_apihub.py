@@ -3,13 +3,12 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import httpx
 import pytest
-
-from adapters.base import FetchErrorKind, Window
+from adapters.base import FetchErrorKind, Window, fetch_with_rounds
 from adapters.kma_apihub import (
     KmaApiHubAdapter,
     _adjust_base_time,
@@ -22,6 +21,10 @@ KST = ZoneInfo("Asia/Seoul")
 class _StubConfig:
     def __init__(self, adapter_params):
         self.adapter_params = adapter_params
+
+    def effective_fetch_budget(self):
+        """공통 round loop 테스트용 fetch budget을 반환한다."""
+        return timedelta(seconds=1)
 
 
 def _config(grids=None):
@@ -42,9 +45,19 @@ def _window():
     )
 
 
+def _thirty_four_grids() -> list[list[int]]:
+    """KMA production plan과 같은 cardinality의 중복 없는 테스트 grid를 만든다."""
+    return [[57 + index // 10, 120 + index % 10] for index in range(34)]
+
+
 def _body(items=None):
     return json.dumps(
-        {"response": {"header": {"resultCode": "00"}, "body": {"items": {"item": items or []}}}}
+        {
+            "response": {
+                "header": {"resultCode": "00"},
+                "body": {"items": {"item": items or []}},
+            }
+        }
     ).encode()
 
 
@@ -67,6 +80,56 @@ def test_fetch_calls_once_per_grid_in_order():
     assert len(calls) == 2
 
 
+def test_planned_parts_fixes_all_34_grids_before_fetch():
+    """Deadline으로 iterator가 끊기기 전부터 미방문 grid key를 모두 안다."""
+    planned = KmaApiHubAdapter.planned_parts(
+        _config(grids=_thirty_four_grids()), _window()
+    )
+
+    assert len(planned) == 34
+    assert "grid-057x120" in planned
+    assert "grid-060x123" in planned
+
+
+@pytest.mark.parametrize(
+    "grids",
+    [
+        pytest.param(_thirty_four_grids()[:-1], id="33-grids"),
+        pytest.param(_thirty_four_grids()[:-1] + [[57, 120]], id="duplicate"),
+    ],
+)
+def test_planned_parts_rejects_non_exact_grid_plan(grids):
+    """33개나 중복 포함 34개 plan은 완전 snapshot 근거가 될 수 없다."""
+    with pytest.raises(ValueError):
+        KmaApiHubAdapter.planned_parts(_config(grids=grids), _window())
+
+
+def test_deadline_marks_all_33_unvisited_kma_grids_missing():
+    """첫 grid 뒤 deadline이면 yield하지 못한 나머지 plan도 missing에 남는다."""
+    config = _config(grids=_thirty_four_grids())
+    planned = KmaApiHubAdapter.planned_parts(config, _window())
+    client = httpx.Client(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, content=_body())
+        )
+    )
+    clock = iter((0.0, 0.0, 0.0, 2.0))
+
+    result = fetch_with_rounds(
+        KmaApiHubAdapter.fetch,
+        config,
+        _window(),
+        client=client,
+        now_fn=lambda: next(clock),
+        sleep_fn=lambda seconds: None,
+        planned_parts=planned,
+    )
+
+    assert tuple(result.chunks) == ("grid-057x120",)
+    assert len(result.missing) == 33
+    assert set(result.chunks) | set(result.missing) == set(planned)
+
+
 def test_fetch_uses_window_start_as_base_date_and_time_without_offset():
     captured = []
 
@@ -86,7 +149,9 @@ def test_fetch_expected_total_is_always_none():
         return httpx.Response(200, content=_body())
 
     client = httpx.Client(transport=httpx.MockTransport(handler))
-    results = list(KmaApiHubAdapter.fetch(_config(grids=[[60, 127]]), _window(), client=client))
+    results = list(
+        KmaApiHubAdapter.fetch(_config(grids=[[60, 127]]), _window(), client=client)
+    )
 
     assert results[0].expected_total is None
 
@@ -96,7 +161,9 @@ def test_fetch_masks_api_key_from_chunk_keys():
         return httpx.Response(200, content=_body())
 
     client = httpx.Client(transport=httpx.MockTransport(handler))
-    results = list(KmaApiHubAdapter.fetch(_config(grids=[[60, 127]]), _window(), client=client))
+    results = list(
+        KmaApiHubAdapter.fetch(_config(grids=[[60, 127]]), _window(), client=client)
+    )
 
     for r in results:
         assert "secret-key-456" not in r.key
@@ -112,7 +179,10 @@ def test_fetch_skips_grids_already_collected():
     client = httpx.Client(transport=httpx.MockTransport(handler))
     results = list(
         KmaApiHubAdapter.fetch(
-            _config(), _window(), client=client, skip=frozenset({"grid-060x127"}),
+            _config(),
+            _window(),
+            client=client,
+            skip=frozenset({"grid-060x127"}),
         )
     )
 
@@ -142,7 +212,10 @@ def test_fetch_classifies_5xx_as_transient_and_continues():
     client = httpx.Client(transport=httpx.MockTransport(handler))
     results = list(KmaApiHubAdapter.fetch(_config(), _window(), client=client))
 
-    assert [r.error for r in results] == [FetchErrorKind.TRANSIENT, FetchErrorKind.TRANSIENT]
+    assert [r.error for r in results] == [
+        FetchErrorKind.TRANSIENT,
+        FetchErrorKind.TRANSIENT,
+    ]
 
 
 def test_fetch_classifies_404_as_permanent_and_continues():
@@ -152,7 +225,10 @@ def test_fetch_classifies_404_as_permanent_and_continues():
     client = httpx.Client(transport=httpx.MockTransport(handler))
     results = list(KmaApiHubAdapter.fetch(_config(), _window(), client=client))
 
-    assert [r.error for r in results] == [FetchErrorKind.PERMANENT, FetchErrorKind.PERMANENT]
+    assert [r.error for r in results] == [
+        FetchErrorKind.PERMANENT,
+        FetchErrorKind.PERMANENT,
+    ]
 
 
 def test_fetch_yields_raw_response_unmodified():
@@ -162,7 +238,9 @@ def test_fetch_yields_raw_response_unmodified():
         return httpx.Response(200, content=raw)
 
     client = httpx.Client(transport=httpx.MockTransport(handler))
-    results = list(KmaApiHubAdapter.fetch(_config(grids=[[60, 127]]), _window(), client=client))
+    results = list(
+        KmaApiHubAdapter.fetch(_config(grids=[[60, 127]]), _window(), client=client)
+    )
 
     assert results[0].payload == raw
 
@@ -200,7 +278,9 @@ def test_fetch_fetches_second_page_when_total_count_exceeds_num_of_rows():
         return httpx.Response(200, content=_page_body(1052, 2, page2_items))
 
     client = httpx.Client(transport=httpx.MockTransport(handler))
-    results = list(KmaApiHubAdapter.fetch(_config(grids=[[60, 127]]), _window(), client=client))
+    results = list(
+        KmaApiHubAdapter.fetch(_config(grids=[[60, 127]]), _window(), client=client)
+    )
 
     assert calls == [1, 2]
     assert len(results) == 1
@@ -223,7 +303,9 @@ def test_fetch_single_page_when_total_count_missing_stays_unmodified():
         return httpx.Response(200, content=raw)
 
     client = httpx.Client(transport=httpx.MockTransport(handler))
-    results = list(KmaApiHubAdapter.fetch(_config(grids=[[60, 127]]), _window(), client=client))
+    results = list(
+        KmaApiHubAdapter.fetch(_config(grids=[[60, 127]]), _window(), client=client)
+    )
 
     assert calls == ["1"]
     assert results[0].payload == raw
@@ -241,7 +323,9 @@ def test_fetch_single_page_when_total_count_fits_num_of_rows():
         return httpx.Response(200, content=raw)
 
     client = httpx.Client(transport=httpx.MockTransport(handler))
-    results = list(KmaApiHubAdapter.fetch(_config(grids=[[60, 127]]), _window(), client=client))
+    results = list(
+        KmaApiHubAdapter.fetch(_config(grids=[[60, 127]]), _window(), client=client)
+    )
 
     assert calls == ["1"]
     assert results[0].payload == raw
@@ -259,7 +343,9 @@ def test_fetch_transient_on_second_page_fails_whole_grid_not_just_that_page():
         return httpx.Response(503, content=b"")
 
     client = httpx.Client(transport=httpx.MockTransport(handler))
-    results = list(KmaApiHubAdapter.fetch(_config(grids=[[60, 127]]), _window(), client=client))
+    results = list(
+        KmaApiHubAdapter.fetch(_config(grids=[[60, 127]]), _window(), client=client)
+    )
 
     assert len(results) == 1
     assert results[0].key == "grid-060x127"
@@ -278,7 +364,9 @@ def test_fetch_fatal_on_second_page_stops_entire_fetch():
 
     client = httpx.Client(transport=httpx.MockTransport(handler))
     results = list(
-        KmaApiHubAdapter.fetch(_config(grids=[[60, 127], [61, 127]]), _window(), client=client)
+        KmaApiHubAdapter.fetch(
+            _config(grids=[[60, 127], [61, 127]]), _window(), client=client
+        )
     )
 
     assert len(results) == 1
@@ -288,31 +376,82 @@ def test_fetch_fatal_on_second_page_stops_entire_fetch():
 def test_normalize_pivots_long_rows_into_wide_records_grouped_by_remaining_fields():
     chunk = _body(
         items=[
-            {"baseDate": "20260812", "baseTime": "1400", "nx": 60, "ny": 127, "category": "T1H", "obsrValue": "31.6"},
-            {"baseDate": "20260812", "baseTime": "1400", "nx": 60, "ny": 127, "category": "REH", "obsrValue": "42"},
+            {
+                "baseDate": "20260812",
+                "baseTime": "1400",
+                "nx": 60,
+                "ny": 127,
+                "category": "T1H",
+                "obsrValue": "31.6",
+            },
+            {
+                "baseDate": "20260812",
+                "baseTime": "1400",
+                "nx": 60,
+                "ny": 127,
+                "category": "REH",
+                "obsrValue": "42",
+            },
         ]
     )
 
     rows = KmaApiHubAdapter.normalize([chunk], _config())
 
     assert rows == [
-        {"baseDate": "20260812", "baseTime": "1400", "nx": 60, "ny": 127, "T1H": "31.6", "REH": "42"}
+        {
+            "baseDate": "20260812",
+            "baseTime": "1400",
+            "nx": 60,
+            "ny": 127,
+            "T1H": "31.6",
+            "REH": "42",
+        }
     ]
 
 
 def test_normalize_groups_separately_across_chunks_by_grid():
     chunk1 = _body(
-        items=[{"baseDate": "20260812", "baseTime": "1400", "nx": 60, "ny": 127, "category": "T1H", "obsrValue": "31.6"}]
+        items=[
+            {
+                "baseDate": "20260812",
+                "baseTime": "1400",
+                "nx": 60,
+                "ny": 127,
+                "category": "T1H",
+                "obsrValue": "31.6",
+            }
+        ]
     )
     chunk2 = _body(
-        items=[{"baseDate": "20260812", "baseTime": "1400", "nx": 61, "ny": 127, "category": "T1H", "obsrValue": "30.9"}]
+        items=[
+            {
+                "baseDate": "20260812",
+                "baseTime": "1400",
+                "nx": 61,
+                "ny": 127,
+                "category": "T1H",
+                "obsrValue": "30.9",
+            }
+        ]
     )
 
     rows = KmaApiHubAdapter.normalize([chunk1, chunk2], _config())
 
     assert rows == [
-        {"baseDate": "20260812", "baseTime": "1400", "nx": 60, "ny": 127, "T1H": "31.6"},
-        {"baseDate": "20260812", "baseTime": "1400", "nx": 61, "ny": 127, "T1H": "30.9"},
+        {
+            "baseDate": "20260812",
+            "baseTime": "1400",
+            "nx": 60,
+            "ny": 127,
+            "T1H": "31.6",
+        },
+        {
+            "baseDate": "20260812",
+            "baseTime": "1400",
+            "nx": 61,
+            "ny": 127,
+            "T1H": "30.9",
+        },
     ]
 
 
@@ -330,12 +469,24 @@ def test_normalize_absorbs_forecast_endpoint_field_names_via_pivot_config_only()
     chunk = _body(
         items=[
             {
-                "baseDate": "20260812", "baseTime": "1400", "fcstDate": "20260812", "fcstTime": "1500",
-                "nx": 60, "ny": 127, "category": "T1H", "fcstValue": "30.1",
+                "baseDate": "20260812",
+                "baseTime": "1400",
+                "fcstDate": "20260812",
+                "fcstTime": "1500",
+                "nx": 60,
+                "ny": 127,
+                "category": "T1H",
+                "fcstValue": "30.1",
             },
             {
-                "baseDate": "20260812", "baseTime": "1400", "fcstDate": "20260812", "fcstTime": "1500",
-                "nx": 60, "ny": 127, "category": "REH", "fcstValue": "40",
+                "baseDate": "20260812",
+                "baseTime": "1400",
+                "fcstDate": "20260812",
+                "fcstTime": "1500",
+                "nx": 60,
+                "ny": 127,
+                "category": "REH",
+                "fcstValue": "40",
             },
         ]
     )
@@ -344,8 +495,14 @@ def test_normalize_absorbs_forecast_endpoint_field_names_via_pivot_config_only()
 
     assert rows == [
         {
-            "baseDate": "20260812", "baseTime": "1400", "fcstDate": "20260812", "fcstTime": "1500",
-            "nx": 60, "ny": 127, "T1H": "30.1", "REH": "40",
+            "baseDate": "20260812",
+            "baseTime": "1400",
+            "fcstDate": "20260812",
+            "fcstTime": "1500",
+            "nx": 60,
+            "ny": 127,
+            "T1H": "30.1",
+            "REH": "40",
         }
     ]
 
@@ -353,13 +510,25 @@ def test_normalize_absorbs_forecast_endpoint_field_names_via_pivot_config_only()
 def test_normalize_tolerates_grid_missing_from_chunk_list():
     chunk_without_items = _body(items=[])
     chunk_with_items = _body(
-        items=[{"baseDate": "20260812", "baseTime": "1400", "nx": 60, "ny": 127, "category": "T1H", "obsrValue": "31.6"}]
+        items=[
+            {
+                "baseDate": "20260812",
+                "baseTime": "1400",
+                "nx": 60,
+                "ny": 127,
+                "category": "T1H",
+                "obsrValue": "31.6",
+            }
+        ]
     )
 
-    rows = KmaApiHubAdapter.normalize([chunk_without_items, chunk_with_items], _config())
+    rows = KmaApiHubAdapter.normalize(
+        [chunk_without_items, chunk_with_items], _config()
+    )
 
-    assert rows == [{"baseDate": "20260812", "baseTime": "1400", "nx": 60, "ny": 127, "T1H": "31.6"}]
-
+    assert rows == [
+        {"baseDate": "20260812", "baseTime": "1400", "nx": 60, "ny": 127, "T1H": "31.6"}
+    ]
 
 
 def test_classify_result_code():
@@ -385,23 +554,33 @@ def test_adjust_base_time_hourly():
 def test_adjust_base_time_half_hourly():
     # 30분 전에는 이전 시각 30분 (14:29 -> 13:30)
     dt = datetime(2026, 8, 12, 14, 29, tzinfo=KST)
-    assert _adjust_base_time(dt, "half_hourly") == datetime(2026, 8, 12, 13, 30, tzinfo=KST)
+    assert _adjust_base_time(dt, "half_hourly") == datetime(
+        2026, 8, 12, 13, 30, tzinfo=KST
+    )
 
     # 30분 이후는 현재 시각 30분 (14:30 -> 14:30)
     dt = datetime(2026, 8, 12, 14, 30, tzinfo=KST)
-    assert _adjust_base_time(dt, "half_hourly") == datetime(2026, 8, 12, 14, 30, tzinfo=KST)
+    assert _adjust_base_time(dt, "half_hourly") == datetime(
+        2026, 8, 12, 14, 30, tzinfo=KST
+    )
 
 
 def test_adjust_base_time_vilage_fcst():
     # 02, 05, 08, 11, 14, 17, 20, 23시 + 10분 발표
     # 05:09 -> 02:00
     dt = datetime(2026, 8, 12, 5, 9, tzinfo=KST)
-    assert _adjust_base_time(dt, "vilage_fcst") == datetime(2026, 8, 12, 2, 0, tzinfo=KST)
+    assert _adjust_base_time(dt, "vilage_fcst") == datetime(
+        2026, 8, 12, 2, 0, tzinfo=KST
+    )
 
     # 05:10 -> 05:00
     dt = datetime(2026, 8, 12, 5, 10, tzinfo=KST)
-    assert _adjust_base_time(dt, "vilage_fcst") == datetime(2026, 8, 12, 5, 0, tzinfo=KST)
+    assert _adjust_base_time(dt, "vilage_fcst") == datetime(
+        2026, 8, 12, 5, 0, tzinfo=KST
+    )
 
     # 01:00 -> 전날 23:00
     dt = datetime(2026, 8, 12, 1, 0, tzinfo=KST)
-    assert _adjust_base_time(dt, "vilage_fcst") == datetime(2026, 8, 11, 23, 0, tzinfo=KST)
+    assert _adjust_base_time(dt, "vilage_fcst") == datetime(
+        2026, 8, 11, 23, 0, tzinfo=KST
+    )

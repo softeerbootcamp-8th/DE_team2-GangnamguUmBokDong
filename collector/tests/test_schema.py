@@ -3,8 +3,6 @@
 from datetime import timedelta
 
 import pytest
-from pydantic import ValidationError
-
 from config.schema import (
     Backfill,
     ColumnSpec,
@@ -17,6 +15,7 @@ from config.schema import (
     Storage,
     _parse_duration,
 )
+from pydantic import ValidationError
 
 
 class TestParseDuration:
@@ -46,13 +45,21 @@ class TestParseDuration:
 
 
 class TestRange:
-    def test_requires_both_min_and_max(self):
-        with pytest.raises(ValidationError):
-            Range(min=0)
+    def test_allows_min_only(self):
+        bounds = Range(min=0)
 
-    def test_requires_both_min_and_max_max_only(self):
+        assert bounds.min == 0
+        assert bounds.max == float("inf")
+
+    def test_allows_max_only(self):
+        bounds = Range(max=200)
+
+        assert bounds.min == float("-inf")
+        assert bounds.max == 200
+
+    def test_requires_at_least_one_boundary(self):
         with pytest.raises(ValidationError):
-            Range(max=200)
+            Range()
 
     def test_valid(self):
         r = Range(min=0, max=200)
@@ -108,7 +115,9 @@ class TestSchedule:
 
 class TestStorage:
     def test_valid(self):
-        s = Storage(bronze_format="json", silver_format="parquet", partition=["dt", "hh"])
+        s = Storage(
+            bronze_format="json", silver_format="parquet", partition=["dt", "hh"]
+        )
         assert s.partition == ("dt", "hh")
 
     def test_requires_nonempty_partition(self):
@@ -160,7 +169,11 @@ def _minimal_source_config(**overrides):
         "description": "test",
         "adapter": "seoul_openapi",
         "schedule": {"interval": "5m"},
-        "storage": {"bronze_format": "json", "silver_format": "parquet", "partition": ["dt", "hh"]},
+        "storage": {
+            "bronze_format": "json",
+            "silver_format": "parquet",
+            "partition": ["dt", "hh"],
+        },
         "quality": {"max_drop_ratio": 0.05},
         "policies": {
             "required_missing": "drop_row",

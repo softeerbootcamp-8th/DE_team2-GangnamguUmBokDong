@@ -1,9 +1,8 @@
 """데이터 수집 설정 파일의 명세를 정의하고, Pydantic을 활용해 사용자의 잘못된 입력을 차단하는 안전장치."""
 
-
-
 from __future__ import annotations
 
+import math
 import re
 from datetime import timedelta
 from typing import Annotated, Any, Literal
@@ -16,7 +15,7 @@ _DURATION_RE = re.compile(r"(?:(\d+)d)?(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?")
 
 def _parse_duration(value: object) -> timedelta:
     """YAML 파일에서 문자열로 입력한 값을 파이썬이 이해할 수 있는 시간 간격 객체로 변환한다."""
-    
+
     if isinstance(value, timedelta):
         return value
     if not isinstance(value, str) or not value:
@@ -25,11 +24,10 @@ def _parse_duration(value: object) -> timedelta:
     match = _DURATION_RE.fullmatch(value)
     # 정규식의 모든 단위가 ?로 생략 가능하기 때문에 단위 값이 하나도 없는 경우를 확인한다.
     if match is None or not any(match.groups()):
-        raise ValueError(
-            f"duration 형식이 틀렸습니다.: {value!r}"
-        )
+        raise ValueError(f"duration 형식이 틀렸습니다.: {value!r}")
     days, hours, minutes, seconds = (int(g) if g else 0 for g in match.groups())
     return timedelta(days=days, hours=hours, minutes=minutes, seconds=seconds)
+
 
 # Annotated는 기본 타입에 추가적인 메타데이터나 동작을 붙일 때 사용한다.
 # BeforeValidator는 Pydantic이 값을 검증하기 전에 _parse_duration 함수를 실행하여 값을 변환한다.
@@ -37,20 +35,24 @@ Duration = Annotated[timedelta, BeforeValidator(_parse_duration)]
 
 
 class Range(BaseModel):
-    """컬럼의 정상 범위이다. min, max 둘 다 필수이다."""
+    """컬럼의 정상 범위이다. 한쪽 경계만 선언한 열린 범위도 허용한다."""
 
     # Pydantic 모델 configuration
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    min: float
-    max: float
+    min: float = -math.inf
+    max: float = math.inf
 
     @model_validator(mode="after")
     def _min_le_max(self) -> Range:
-        """min이 max보다 큰 range를 막는다."""
+        """경계가 하나도 없거나 min이 max보다 큰 range를 막는다."""
 
+        if not self.model_fields_set.intersection({"min", "max"}):
+            raise ValueError("range는 min 또는 max 중 하나 이상을 선언해야 합니다.")
         if self.min > self.max:
-            raise ValueError(f"range.min({self.min})이 range.max({self.max})보다 클 수 없습니다.")
+            raise ValueError(
+                f"range.min({self.min})이 range.max({self.max})보다 클 수 없습니다."
+            )
         return self
 
 
@@ -152,7 +154,7 @@ class Backfill(BaseModel):
     @model_validator(mode="after")
     def _max_age_required_when_enabled(self) -> Backfill:
         """enabled=true인데 max_age가 없는 조합을 막는다."""
-        
+
         # 무한정 과거로 거슬러 올라가며 재수집을 시도하여 과부하를 일으킬 가능성을 막기 위함
         if self.enabled and self.max_age is None:
             raise ValueError("backfill.enabled=true면 max_age가 필수다")
@@ -190,6 +192,7 @@ class SourceConfig(BaseModel):
     compaction: 하루치 압축 옵션
     policies: 컬럼 정책과 행 정책
     columns: 데이터 스키마(key=컬럼명, value=컬럼 스펙)
+    natural_key: 원천 snapshot에서 행별 identity를 이루는 컬럼
     config_version: 설정 버전
     """
 
@@ -208,6 +211,7 @@ class SourceConfig(BaseModel):
     compaction: Compaction | None = None
     policies: Policies
     columns: dict[str, ColumnSpec]
+    natural_key: tuple[str, ...] | None = Field(default=None, min_length=1)
     config_version: str = ""
 
     def effective_fetch_budget(self) -> timedelta:

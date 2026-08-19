@@ -6,6 +6,9 @@ adapter_params:
   service: bikeList
   page_size: 1000
   root_key: rentBikeStatus.row
+  pagination: probe_until_empty
+
+natural_key: [stationId]
 
 schedule:
   interval: 5m
@@ -32,20 +35,18 @@ columns:
     required: true
   stationName:
     types: [str]
-    required: true
   rackTotCnt:
     types: [int]
-    range: { min: 0, max: 200 }
+    range: { min: 0 }
   parkingBikeTotCnt:
     types: [int]
-    range: { min: 0, max: 200 }
-    on_outlier: clip_to_range
+    range: { min: 0 }
   shared:
     types: [int]
-    range: { min: 0, max: 1000 }
+    range: { min: 0 }
   stationLatitude:
     types: [float]
-    range: { min: 37.4, max: 37.7 }
+    range: { min: 37.0, max: 38.0 }
   stationLongitude:
     types: [float]
-    range: { min: 126.7, max: 127.2 }
+    range: { min: 126.5, max: 127.5 }
