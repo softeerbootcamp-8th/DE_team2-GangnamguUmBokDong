@@ -105,3 +105,15 @@ def test_grid_matching_error_shrinks_after_switching_to_nearest_grid():
     assert max(new_distances) <= 3.6
     assert sum(new_distances) < sum(old_distances)
     assert all(new <= old + 1e-9 for new, old in zip(new_distances, old_distances))
+
+
+def test_grid_conversion_is_the_shared_core_implementation():
+    """격자 변환 공식은 `core.weather_grid` 한 곳에만 존재해야 한다.
+
+    loader가 자체 구현을 되살리거나 재수출이 끊기면, 같은 대여소의
+    `stations.grid_nx`(loader)와 `weather_nx`(normalizer)가 조용히 어긋날 수 있다.
+    """
+    from core import weather_grid
+
+    assert latlon_to_grid is weather_grid.latlon_to_grid
+    assert grid_to_latlon is weather_grid.grid_to_latlon
