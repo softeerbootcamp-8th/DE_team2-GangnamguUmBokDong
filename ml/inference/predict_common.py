@@ -89,10 +89,14 @@ def run_predict_cli(model_name: str, target_col: str, exposure_col: str | None, 
     master = _load_station_master()
 
     table_path = _TRAINING_TABLE_BY_MODEL[model_name]
-    df = s3_io.read_parquet(table_path)
+    # date_range 없이 부르면 "prefix 전체 나열" 경로를 타서 (1) date 파티션 컬럼이
+    # 파일 내용에 없어 아예 복원이 안 되고(바로 아래 필터에서 KeyError, 리뷰 지적)
+    # (2) 조회 범위 밖 파티션까지 전부 받아온다 — date_range로 필요한 날짜만 미리
+    # 좁혀서 읽는다(core.s3._read_parquet_by_dates()가 date를 복원해줌).
+    df = s3_io.read_parquet(table_path, date_range=(args.start_date, args.end_date))
     if df is None:
-        raise FileNotFoundError(f"S3에 없음: {table_path}")
-    df = df[(df["date"] >= args.start_date) & (df["date"] <= args.end_date) & (df["horizon"] == args.horizon)]
+        raise FileNotFoundError(f"S3에 없음: {table_path} ({args.start_date}~{args.end_date})")
+    df = df[df["horizon"] == args.horizon]
     if args.station_id:
         match = master[master["station_id"] == args.station_id]
         if match.empty:
