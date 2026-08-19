@@ -112,3 +112,28 @@ station_urgency로 "어디가 급한지"는 알아도 "트럭이 몇 대를 옮�
 
 ## 결과
 `proposed` 상태 row는 항상 권역 수(11개) 이하로 유지된다. `dispatched`/`completed`는 여전히 계속 쌓이지만, 실제 트럭 운행 건수만큼만 늘어나 사이클마다 늘어나는 것보다 훨씬 느리다 — 오래된 `completed`/`cancelled`(향후 운영자가 명시적으로 취소하는 경우)를 언제까지 남길지는 위에서 이미 미뤄둔 질문 그대로 남아있다.
+
+---
+
+# station_stock은 sta_id당 최신 1건만 upsert한다 (기존 이력 테이블 결정 번복)
+
+## 배경
+위의 "station_stock은 현재 한 줄이 아니라 이력 테이블로 둔다" 결정은 API가 최근
+20~25분의 재고 추세를 직접 계산하던 구조를 전제로 했다. #107에서 긴급도와 추세
+계산을 `rebalance` 배치로 옮긴 뒤 RDS 재고 이력을 읽던 유일한 소비자
+`fetch_all_stock_history()`가 사용되지 않게 됐고, 웹도 재고 이력 그래프를 제공하지
+않는다. 반면 `(sta_id, observed_at)` 복합 PK는 5분마다 대여소 수만큼 행을 계속
+누적한다. 원본 관측 이력은 S3 Silver에 보존되므로 RDS에서 줄여도 유실되지 않는다.
+
+## 결정
+`station_stock`의 PK를 `sta_id` 단일키로 바꾸고, loader가 충돌 시 `observed_at`과
+`parking_bike_tot_cnt`를 함께 갱신한다. 기존 복합 PK 볼륨은 대여소별 가장 최신
+`observed_at` 행만 남긴 뒤 단일 PK로 전환한다. API의 `/stations`와
+`/stations/{sta_id}`는 더 이상 최신 행을 고르는 lateral join을 하지 않고
+`station_stock`을 일반 조인한다. API 응답의 `base_dttm` 이름은 호환성을 위해 이번
+변경에서 유지하고, 컬럼 네이밍 정리는 #129에서 별도로 결정한다.
+
+## 결과
+RDS의 `station_stock` 행 수는 대여소 수만큼으로 고정된다. 최근 재고 추세가 필요한
+새 소비자는 RDS 이력이 아니라 S3 Silver를 사용해야 한다. 기존 DB 마이그레이션에서
+제거되는 과거 행도 S3에 남아 있으므로 원본 데이터는 보존된다.
