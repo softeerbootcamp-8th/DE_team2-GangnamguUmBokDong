@@ -1,8 +1,8 @@
 PROJECTS := collector apps/api airflow ml/inference ml/training ml/feature_engine libs/core libs/ml_core normalizer nowcaster loader rebalance
 LOCAL_TEST_PROJECTS := collector apps/api ml/inference ml/training ml/feature_engine libs/core libs/ml_core normalizer nowcaster loader rebalance
 CI_TEST_PROJECTS := collector apps/api libs/core libs/ml_core normalizer nowcaster loader rebalance
-CI_UNIT_PROJECTS := collector libs/core libs/ml_core normalizer nowcaster loader rebalance
-CI_INTEGRATION_PROJECTS := apps/api
+CI_UNIT_PROJECTS := collector apps/api libs/core libs/ml_core normalizer nowcaster rebalance
+CI_INTEGRATION_PROJECTS := loader
 
 COMPOSE = docker compose $(if $(wildcard .env),--env-file .env,) -f ops/compose/docker-compose.yml
 
