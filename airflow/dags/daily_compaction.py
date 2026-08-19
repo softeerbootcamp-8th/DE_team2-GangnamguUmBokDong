@@ -1,19 +1,23 @@
-"""1일 주기: 소스별로 하루치 silver를 archive parquet 하나로 묶는다.
+"""1일 주기: D-6 대여이력을 재수집한 뒤 하루치 Silver를 Archive로 묶는다.
 
-소스 간 의존이 없어 태스크를 병렬로 둔다 — 한 소스의 압축 실패가 다른 소스를 막지
-않는다. collector 내부에서도 날짜 단위로 격리되어 있어, 한 날짜가 실패해도 나머지
-날짜는 압축된다.
+대여이력 API는 반납 완료 건만 보여 최초 수집 때 장기 대여가 빠질 수 있다. D-6의
+24개 시간대를 `--force`로 순차 재조회하고, 모든 시간대의 시도가 끝난 뒤 대여이력
+compaction을 실행한다. 한 시간대 실패가 다음 시간대를 막지 않으며, 대여소 상태와
+초단기 실황 compaction은 replay와 독립적으로 실행한다.
 
-일 단위 수집(`daily_population_and_events`, 03:00)이 끝난 뒤에 돌도록 04:30에 둔다.
+모든 compaction은 명시적 날짜 대신 Collector의 recovery sweep을 사용해 과거 DAG
+중단이나 압축 실패로 누락된 Archive도 다음 실행에서 복구한다.
 """
 
 import pendulum
-from airflow import DAG
+from airflow.task.trigger_rule import TriggerRule
 from airflow.timetables.trigger import CronTriggerTimetable
-
 from config.schedules import CATCHUP, COMPACTION_CRON, MAX_ACTIVE_RUNS, TIMEZONE
-from config.sources import COMPACTION_SOURCES
+from config.sources import COMPACTION_SOURCES, DAILY_ARCHIVE_DELAY_DAYS
+from orchestration.collector_task import build_daily_history_replay_task
 from orchestration.compaction_task import build_compaction_task
+
+from airflow import DAG
 
 with DAG(
     dag_id="daily_compaction",
@@ -23,5 +27,20 @@ with DAG(
     max_active_runs=MAX_ACTIVE_RUNS,
     tags=["daily", "archive"],
 ) as dag:
+    replay_chain = None
+    for hour in range(24):
+        replay = build_daily_history_replay_task(
+            dag, hour, DAILY_ARCHIVE_DELAY_DAYS
+        )
+        if replay_chain is not None:
+            replay_chain >> replay
+        replay_chain = replay
+
     for source_id in COMPACTION_SOURCES:
-        build_compaction_task(dag, source_id)
+        if source_id == "bike_rental_history":
+            compact = build_compaction_task(
+                dag, source_id, trigger_rule=TriggerRule.ALL_DONE
+            )
+            replay_chain >> compact
+        else:
+            build_compaction_task(dag, source_id)

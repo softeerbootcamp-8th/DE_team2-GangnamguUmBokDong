@@ -9,8 +9,13 @@ from __future__ import annotations
 
 from airflow.task.trigger_rule import TriggerRule
 from config.schedules import DEFAULT_EXECUTION_TIMEOUT, EXECUTION_TIMEOUT_OVERRIDES
+
 from orchestration.task_builder import REPO_ROOT, build_module_task
-from orchestration.templates import KST_WINDOW_START, kst_window_start_shifted
+from orchestration.templates import (
+    KST_WINDOW_START,
+    kst_day_hour_replay_days_ago,
+    kst_window_start_shifted,
+)
 
 COLLECTOR_DIR = str(REPO_ROOT / "collector")
 
@@ -55,5 +60,29 @@ def build_collector_replay_task(dag, source_id: str, hours_back: int):
         COLLECTOR_DIR,
         cmd,
         execution_timeout=timeout,
+        trigger_rule=TriggerRule.ALL_DONE,
+    )
+
+
+def build_daily_history_replay_task(dag, hour: int, days_back: int):
+    """과거 날짜의 대여이력 한 시간대를 실패 전파 없이 전체 재수집한다.
+
+    시간별 태스크는 API 동시 요청을 제한하려고 순차 연결하지만, 한 시간대의 최종
+    실패가 나머지 23개 시간대까지 막아서는 안 되므로 ``ALL_DONE``으로 실행한다.
+    """
+    source_id = "bike_rental_history"
+    window_start = kst_day_hour_replay_days_ago(days_back, hour)
+    cmd = (
+        f"uv run --frozen python main.py --source {source_id} "
+        f"--window-start {window_start} --force"
+    )
+    return build_module_task(
+        dag,
+        f"replay_{source_id}_{hour:02d}h",
+        COLLECTOR_DIR,
+        cmd,
+        execution_timeout=EXECUTION_TIMEOUT_OVERRIDES.get(
+            source_id, DEFAULT_EXECUTION_TIMEOUT
+        ),
         trigger_rule=TriggerRule.ALL_DONE,
     )
