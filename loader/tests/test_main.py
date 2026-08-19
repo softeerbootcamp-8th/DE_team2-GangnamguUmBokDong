@@ -3,7 +3,9 @@
 
 from datetime import UTC, date, datetime
 
-from main import _delete_expired, _expire_cutoff
+import pytest
+
+from main import KST, _delete_expired, _expire_cutoff, _parse_window_start
 
 
 class _FakeCursor:
@@ -77,3 +79,44 @@ class TestDeleteExpired:
         [(query, _params)] = conn.cursor_obj.executed
         assert "DELETE FROM cultural_events" in query
         assert "weather_forecast_ultra" not in query
+
+
+class TestParseWindowStart:
+    def test_keeps_explicit_offset(self):
+        parsed = _parse_window_start("2026-08-16T14:05:00+09:00")
+
+        assert parsed == datetime(2026, 8, 16, 5, 5, tzinfo=UTC)
+
+    def test_assumes_kst_when_offset_is_missing(self):
+        """naive 값을 그대로 넘기면 DB 세션 TimeZone(UTC)으로 해석돼 cutoff가 9시간
+        미래가 되고, 아직 만료되지 않은 예보/예측 행까지 지워진다."""
+        parsed = _parse_window_start("2026-08-16T14:05:00")
+
+        assert parsed.tzinfo is not None
+        assert parsed == datetime(2026, 8, 16, 14, 5, tzinfo=KST)
+        assert parsed.utcoffset().total_seconds() == 9 * 3600
+
+    def test_naive_input_does_not_shift_the_cutoff(self):
+        naive = _parse_window_start("2026-08-16T14:05:00")
+        aware = _parse_window_start("2026-08-16T14:05:00+09:00")
+
+        assert _expire_cutoff("forecast_points", naive) == _expire_cutoff("forecast_points", aware)
+
+
+class TestRetentionConfigValidation:
+    def test_expire_col_without_grace_fails_at_import_time(self):
+        """tables.yaml에 expire_col만 추가하고 유예기간을 빠뜨리면, 적재 도중이
+        아니라 설정 로드 시점에 잡혀야 한다(적재 후 롤백 방지)."""
+        import config
+        from config import TableSpec
+
+        specs = {"brand_new_table": TableSpec(
+            source_id="x",
+            transform=lambda df: [],
+            conflict_cols=["id"],
+            update_cols=[],
+            expire_col="expired_at",
+        )}
+
+        with pytest.raises(ValueError, match="brand_new_table"):
+            config._validate_retention_config(specs)

@@ -207,14 +207,16 @@ def cultural_events_from_silver(df: pd.DataFrame, today: date | None = None) -> 
         df: cultural_event Silver DataFrame
         today: 행사 유효성 검사용 기준 일자 (KST, 기본값: 오늘)
     returns:
-        cultural_events 테이블 적재용 레코드 목록 (종료된 행사 제외)
+        cultural_events 테이블 적재용 레코드 목록 (종료됐거나 종료일을 알 수 없는 행사 제외)
     """
     today = today or datetime.now(ZoneInfo("Asia/Seoul")).date()
     records = []
     for row in df.to_dict("records"):
         end_date = _parse_date(row["END_DATE"])
-        # 이미 종료된 행사는 제외
-        if end_date is not None and end_date < today:
+        # 이미 종료된 행사는 제외한다. 종료일을 파싱하지 못한 행(end_date=None)도 제외하는데,
+        # 적재하면 만료 정리(main._delete_expired)의 `end_date < cutoff` 조건에 NULL이
+        # 절대 걸리지 않아 영구히 쌓이기 때문이다(#117).
+        if end_date is None or end_date < today:
             continue
         title = row["TITLE"]
         place = row["PLACE"]
@@ -244,14 +246,15 @@ def performance_events_from_silver(df: pd.DataFrame, today: date | None = None) 
         df: performance_event Silver DataFrame
         today: 행사 유효성 검사용 기준 일자 (KST, 기본값: 오늘)
     returns:
-        cultural_events 테이블 적재용 레코드 목록 (종료된 행사 제외)
+        cultural_events 테이블 적재용 레코드 목록 (종료됐거나 종료일을 알 수 없는 행사 제외)
     """
     today = today or datetime.now(ZoneInfo("Asia/Seoul")).date()
     records = []
     for row in df.to_dict("records"):
         end_date = _parse_date(row.get("SVCOPNENDDT"))
-        # 1. 이미 종료된 행사는 제외
-        if end_date is not None and end_date < today:
+        # 1. 이미 종료된 행사는 제외한다. 종료일 파싱 실패(end_date=None)도 같이 제외한다 —
+        #    NULL은 만료 정리의 `end_date < cutoff`에 안 걸려 영구히 남는다(#117).
+        if end_date is None or end_date < today:
             continue
         title = row.get("SVCNM", "")
         place = row.get("PLACENM", "")

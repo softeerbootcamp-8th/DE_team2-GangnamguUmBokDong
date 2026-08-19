@@ -5,18 +5,21 @@ from __future__ import annotations
 import argparse
 import sys
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from core.db import get_connection
 from core.upsert import upsert
 
-from config import TABLE_SPECS
-from retention_config import DATE_TYPED_EXPIRE_TABLES, RETENTION_GRACE
+from config import TABLE_SPECS, target_table_for
+from retention_config import DATE_TYPED_EXPIRE_TABLES, grace_for
+
+KST = ZoneInfo("Asia/Seoul")
 
 
 def _expire_cutoff(target_table: str, window_start: datetime):
     """target_table의 만료 기준 시각(또는 날짜)을 계산한다. window_start에서
     유예기간(retention_config.RETENTION_GRACE)만큼 뺀 시점보다 오래된 행이 삭제 대상이다."""
-    cutoff = window_start - RETENTION_GRACE[target_table]
+    cutoff = window_start - grace_for(target_table)
     return cutoff.date() if target_table in DATE_TYPED_EXPIRE_TABLES else cutoff
 
 
@@ -44,15 +47,7 @@ def run(table: str, window_start: datetime) -> None:
     else:
         rows = spec.transform(silver)
 
-    # 논리 spec 이름 → 물리 DB 테이블 이름 매핑
-    # 서로 다른 여러 데이터 소스가 단일 Gold 테이블로 통합 적재되는 경우를 처리한다:
-    # 1) 문화/공연 행사: cultural_event(문화행사)와 performance_event(공연행사) → cultural_events 테이블로 병합
-    # 2) 날씨 예보: weather_short_term_forecast(단기)와 weather_ultra_short_forecast(초단기) → weather_forecast 테이블로 병합
-    _TABLE_ALIASES = {
-        "cultural_events_performance": "cultural_events",
-        "weather_forecast_ultra": "weather_forecast",
-    }
-    target_table = _TABLE_ALIASES.get(table, table)
+    target_table = target_table_for(table)
 
     with get_connection() as conn:
         upsert(conn, target_table, rows, spec.conflict_cols, spec.update_cols)
@@ -65,6 +60,20 @@ def run(table: str, window_start: datetime) -> None:
     print(f"upserted {len(rows)} rows into {target_table}")
 
 
+def _parse_window_start(raw: str) -> datetime:
+    """--window-start를 파싱한다. 오프셋이 없으면 KST로 간주해 채운다.
+
+    naive datetime을 그대로 쓰면 DELETE 문의 cutoff가 psycopg를 거쳐 세션
+    TimeZone(컨테이너 기본 UTC)으로 해석돼, KST로 의도한 시각보다 9시간 미래가
+    기준이 된다. 그러면 아직 만료되지 않은 예보/예측 행까지 지워지므로
+    (대시보드가 읽는 바로 그 행들) 여기서 오프셋을 반드시 확정한다."""
+    parsed = datetime.fromisoformat(raw)
+    if parsed.tzinfo is None:
+        print(f"warning: --window-start에 오프셋이 없어 KST로 간주한다: {raw}", file=sys.stderr)
+        return parsed.replace(tzinfo=KST)
+    return parsed
+
+
 def main() -> int:
     """CLI 인자를 파싱하고 테이블 적재 파이프라인을 실행한다 (성공 0, 실패 1)."""
     parser = argparse.ArgumentParser(description="Silver parquet을 읽어 Gold DB에 upsert한다.")
@@ -72,7 +81,7 @@ def main() -> int:
     parser.add_argument("--window-start", required=True, help="ISO8601 시각(KST), 예: 2026-08-16T14:05:00+09:00")
     args = parser.parse_args()
 
-    window_start = datetime.fromisoformat(args.window_start)
+    window_start = _parse_window_start(args.window_start)
 
     try:
         run(args.table, window_start)
