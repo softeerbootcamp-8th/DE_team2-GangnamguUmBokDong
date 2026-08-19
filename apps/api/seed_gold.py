@@ -1,4 +1,4 @@
-"""로컬 개발용 대여소 2,746곳 + 재고 이력 + 예측치를 골드 테이블에 채운다.
+"""로컬 개발용 대여소 2,746곳 + 재고·예측·urgency를 골드 테이블에 채운다.
 
 collector→gold를 채우는 실제 ETL이 아직 없어서, apps/api를 로컬에서 켜보려면
 이 스크립트로 더미 데이터를 직접 넣어야 한다. 실행: `uv run python seed_gold.py`
@@ -25,10 +25,28 @@ from datetime import timedelta
 from pathlib import Path
 
 from core.db import get_connection
-
 from queries import now_utc
 
 STATIONS = json.loads((Path(__file__).parent / "seed_data" / "stations_seoul.json").read_text(encoding="utf-8"))
+
+# cultural_events는 stations_seoul.json과 달리 실제 수집 파이프라인이 아직 없어서
+# (collector/loader 쪽 작업, #99 참고) 실측 데이터가 없다. /stations/{id}/events를
+# 로컬에서 눈으로 확인해볼 수 있도록 실제 대여소 좌표 근처에 지어낸 이벤트 몇 개만
+# 넣는다 — sta_id 102(망원역)/301(경복궁역)/2301(강남 현대고 인근) 좌표를 기준으로,
+# 반경(NEARBY_EVENT_RADIUS_KM=1.5km) 안/밖 경계와 "이미 끝난 행사 제외" 필터를 같이
+# 확인할 수 있게 구성했다.
+SEED_EVENTS = [
+    # 망원역(102) 반경 안, 진행 중
+    ("seed-event-1", "망원 한강 벚꽃 야시장", "축제", "마포구", "망원한강공원", -2, 5, "무료", 37.5540, 126.9020),
+    # 망원역(102) 반경 안이지만 이미 종료 — end_date 필터 확인용
+    ("seed-event-2", "지난달 마포 프리마켓", "행사", "마포구", "망원동 주민센터", -40, -30, "무료", 37.5560, 126.9110),
+    # 경복궁역(301) 반경 안, 진행 중
+    ("seed-event-3", "경복궁 야간 특별관람", "전시/관람", "종로구", "경복궁", -1, 10, "유료", 37.5780, 126.9700),
+    # 강남 현대고(2301) 반경 안, 진행 중
+    ("seed-event-4", "강남역 버스킹 페스티벌", "공연", "강남구", "강남역 8번출구", 0, 3, "무료", 37.5220, 127.0230),
+    # 강남 현대고(2301) 기준으로는 반경 밖(약 5km) — distance 필터 확인용
+    ("seed-event-5", "잠실 한강 불꽃축제", "축제", "송파구", "잠실한강공원", 2, 2, "무료", 37.5205, 127.0730),
+]
 
 
 def seed() -> None:
@@ -39,6 +57,7 @@ def seed() -> None:
 
     stock_rows = []
     forecast_rows = []
+    urgency_rows = []
     for station in STATIONS:
         sta_id = str(station["sta_id"])
         for minutes_ago, parking_bike_tot_cnt in station["stock_history"]:
@@ -48,11 +67,13 @@ def seed() -> None:
             forecast_rows.append(
                 (sta_id, now + timedelta(hours=hour), predicted_rent_cnt, predicted_return_cnt, now)
             )
+        urgency_rows.append((now, sta_id, 0.0, 720, "normal"))
 
     with get_connection() as conn, conn.cursor() as cur:
         # 이전에 다른 STATIONS 구성으로 시드를 돌린 적이 있으면, 지금 목록에 없는
         # sta_id가 stations 테이블에 잔여물로 남아있을 수 있다(예: 예전 33곳짜리
         # 시드의 흔적). 그런 것도 같이 지운다.
+        cur.execute("DELETE FROM station_urgency")
         cur.execute("DELETE FROM forecast_points WHERE sta_id != ALL(%s)", (sta_ids,))
         cur.execute("DELETE FROM station_stock WHERE sta_id != ALL(%s)", (sta_ids,))
         cur.execute("DELETE FROM stations WHERE sta_id != ALL(%s)", (sta_ids,))
@@ -96,7 +117,55 @@ def seed() -> None:
             forecast_rows,
         )
 
-    print(f"seeded {len(STATIONS)} stations")
+        cur.executemany(
+            """
+            INSERT INTO station_urgency
+                (batch_run_at, sta_id, urgency_score, minutes_until_critical, action_type)
+            VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT (sta_id) DO UPDATE SET
+                urgency_score = EXCLUDED.urgency_score,
+                minutes_until_critical = EXCLUDED.minutes_until_critical,
+                action_type = EXCLUDED.action_type,
+                batch_run_at = EXCLUDED.batch_run_at
+            """,
+            urgency_rows,
+        )
+
+        today = now_utc().date()
+        cur.executemany(
+            """
+            INSERT INTO cultural_events
+                (event_id, title, category, gu, place, start_date, end_date, is_free, lat, lon)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (event_id) DO UPDATE SET
+                title = EXCLUDED.title,
+                category = EXCLUDED.category,
+                gu = EXCLUDED.gu,
+                place = EXCLUDED.place,
+                start_date = EXCLUDED.start_date,
+                end_date = EXCLUDED.end_date,
+                is_free = EXCLUDED.is_free,
+                lat = EXCLUDED.lat,
+                lon = EXCLUDED.lon
+            """,
+            [
+                (
+                    event_id,
+                    title,
+                    category,
+                    gu,
+                    place,
+                    today + timedelta(days=start_offset),
+                    today + timedelta(days=end_offset),
+                    is_free,
+                    lat,
+                    lon,
+                )
+                for event_id, title, category, gu, place, start_offset, end_offset, is_free, lat, lon in SEED_EVENTS
+            ],
+        )
+
+    print(f"seeded {len(STATIONS)} stations with urgency, {len(SEED_EVENTS)} cultural events")
 
 
 if __name__ == "__main__":

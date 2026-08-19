@@ -50,6 +50,7 @@ class TableSpec:
     테이블은 적재 직후 유예기간이 지난 행을 정리한다(loader/retention_config.py,
     main.py의 _delete_expired 참고). None이면 정리 대상이 아니다(마스터 데이터나
     최신 1건만 유지하는 테이블 등)."""
+    guard_col: str | None = None
 
     def read(self, window_start: datetime) -> pd.DataFrame:
         """지정된 윈도우 시각의 S3 데이터를 읽어 Pandas DataFrame으로 반환한다."""
@@ -67,8 +68,14 @@ def _load_table_specs() -> dict[str, TableSpec]:
         transform_fn = getattr(transform, raw["transform"])
 
         reader_fn = None
-        if raw.get("reader") == "read_predictions":
-            reader_fn = lambda ws: reader.read_predictions(ws).to_pandas()
+        if raw.get("reader"):
+            reader_name = raw["reader"]
+            # getattr을 람다 밖에서 한 번만 실행해 캡처하면 안 된다 — 테스트가
+            # `monkeypatch.setattr("config.reader.read_predictions", ...)`처럼
+            # 모듈 속성을 나중에 바꿔치기하므로, 호출 시점마다 다시 조회해야
+            # 그 패치가 반영된다(기존 하드코딩 버전의 lambda ws: reader.read_predictions(ws)와
+            # 동일한 지연 조회 방식을 유지).
+            reader_fn = lambda ws, reader_name=reader_name: getattr(reader, reader_name)(ws).to_pandas()
 
         specs[table_name] = TableSpec(
             source_id=raw["source_id"],
@@ -77,6 +84,7 @@ def _load_table_specs() -> dict[str, TableSpec]:
             update_cols=raw["update_cols"],
             reader=reader_fn,
             expire_col=raw.get("expire_col"),
+            guard_col=raw.get("guard_col"),
         )
     return specs
 

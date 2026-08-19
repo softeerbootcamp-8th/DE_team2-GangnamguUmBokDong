@@ -30,6 +30,28 @@ def _delete_expired(conn, target_table: str, expire_col: str, cutoff) -> int:
         return cur.rowcount
 
 
+def _only_known_stations(rows: list[dict], known_station_ids: set[str]) -> list[dict]:
+    """stations FK가 존재하는 urgency row만 반환한다."""
+    return [row for row in rows if row["sta_id"] in known_station_ids]
+
+
+def _retire_stale_proposed_routes(conn) -> None:
+    """이번 배치가 새 proposed 라우트를 넣기 전에, 아직 proposed인(=아무도 안
+    건드린) 예전 라우트를 지운다. compute_routes는 매 사이클 전체 권역의 수요를
+    다시 계산하므로, 지난 사이클의 proposed는 이번 사이클 결과로 완전히
+    대체되는 게 맞다 — 그대로 두면 아무도 안 건드린 예전 제안이 사이클마다
+    계속 쌓인다. dispatched/completed로 이미 넘어간 라우트는 운영자가 실제로
+    처리한 기록이라 안 건드린다. S3(routes_main.py가 매 사이클 써두는 parquet)에
+    "그때 뭘 제안했었는지"는 이미 영구히 남으므로, 아무도 안 건드린 proposed를
+    RDS에서 지워도 잃는 정보가 없다."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "DELETE FROM rebalance_route_stops "
+            "WHERE route_id IN (SELECT route_id FROM rebalance_routes WHERE status = 'proposed')"
+        )
+        cur.execute("DELETE FROM rebalance_routes WHERE status = 'proposed'")
+
+
 def run(table: str, window_start: datetime) -> None:
     """지정된 테이블 스펙에 따라 S3 데이터를 읽고 변환하여 Gold DB에 Upsert한다.
 
@@ -42,7 +64,7 @@ def run(table: str, window_start: datetime) -> None:
 
     if table == "station_stock":
         rows = spec.transform(silver, observed_at=window_start)
-    elif table == "forecast_points":
+    elif table in ("forecast_points", "station_urgency"):
         rows = spec.transform(silver, batch_run_at=window_start)
     else:
         rows = spec.transform(silver)
@@ -50,7 +72,19 @@ def run(table: str, window_start: datetime) -> None:
     target_table = target_table_for(table)
 
     with get_connection() as conn:
-        upsert(conn, target_table, rows, spec.conflict_cols, spec.update_cols)
+        if table == "station_urgency" and rows:
+            station_ids = [row["sta_id"] for row in rows]
+            with conn.cursor() as cur:
+                cur.execute("SELECT sta_id FROM stations WHERE sta_id = ANY(%s)", (station_ids,))
+                known_station_ids = {row[0] for row in cur.fetchall()}
+            filtered_rows = _only_known_stations(rows, known_station_ids)
+            excluded_count = len(rows) - len(filtered_rows)
+            if excluded_count:
+                print(f"excluded {excluded_count} urgency rows absent from stations")
+            rows = filtered_rows
+        if table == "rebalance_routes":
+            _retire_stale_proposed_routes(conn)
+        upsert(conn, target_table, rows, spec.conflict_cols, spec.update_cols, guard_col=spec.guard_col)
         if spec.expire_col:
             cutoff = _expire_cutoff(target_table, window_start)
             deleted = _delete_expired(conn, target_table, spec.expire_col, cutoff)

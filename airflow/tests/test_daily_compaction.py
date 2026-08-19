@@ -1,0 +1,61 @@
+"""일 배치 compaction DAG와 태스크 빌더를 검증한다."""
+
+from airflow.timetables.trigger import CronTriggerTimetable
+
+from config.schedules import COMPACTION_CRON
+from config.sources import COMPACTION_SOURCES
+from dags.daily_compaction import dag
+from orchestration.compaction_task import COLLECTOR_DIR, build_compaction_task
+
+
+class TestCompactionTask:
+    def test_runs_collector_compact_cli(self, dag):
+        task = build_compaction_task(dag, "bike_station_realtime")
+
+        assert task.cwd == COLLECTOR_DIR
+        assert "uv run --frozen python compact.py --source bike_station_realtime" in task.bash_command
+
+    def test_passes_no_date_so_collector_derives_its_own_range(self, dag):
+        """검사 범위는 소스 설정에서 유도한다 — Airflow가 백필 창을 알 필요가 없다."""
+        task = build_compaction_task(dag, "bike_rental_history")
+
+        assert "--date" not in task.bash_command
+        assert "--from" not in task.bash_command
+
+    def test_no_virtual_env_leak(self, dag):
+        task = build_compaction_task(dag, "bike_station_realtime")
+
+        assert task.bash_command.startswith("env -u VIRTUAL_ENV ")
+
+
+class TestCompactionSources:
+    def test_forecast_sources_are_excluded(self):
+        """예보는 사후 재현이 불가해 archive 가치가 낮다."""
+        assert "weather_ultra_short_forecast" not in COMPACTION_SOURCES
+        assert "weather_short_term_forecast" not in COMPACTION_SOURCES
+
+    def test_covers_the_three_target_sources(self):
+        assert set(COMPACTION_SOURCES) == {
+            "bike_rental_history",
+            "bike_station_realtime",
+            "weather_ultra_short_live",
+        }
+
+
+class TestDag:
+    def test_schedule(self):
+        assert isinstance(dag.timetable, CronTriggerTimetable)
+        assert dag.catchup is False
+        assert dag.max_active_runs == 1
+
+    def test_runs_after_the_daily_collectors(self):
+        """수집이 도는 03:00보다 뒤여야 전날치가 온전히 모인다."""
+        assert COMPACTION_CRON == "30 4 * * *"
+
+    def test_one_task_per_source(self):
+        assert set(dag.task_ids) == {f"compact_{source}" for source in COMPACTION_SOURCES}
+
+    def test_tasks_are_independent(self):
+        """한 소스의 압축 실패가 다른 소스를 막지 않아야 한다."""
+        for task_id in dag.task_ids:
+            assert dag.get_task(task_id).upstream_list == []

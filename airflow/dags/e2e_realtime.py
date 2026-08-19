@@ -16,8 +16,10 @@ strict가 성공하면 fallback은 skipped되고, strict가 실패하면 fallbac
 """
 
 import pendulum
+from airflow import DAG
 from airflow.providers.standard.operators.empty import EmptyOperator
 from airflow.task.trigger_rule import TriggerRule
+
 from config.schedules import TIMEZONE
 from config.sources import (
     NORMALIZER_BASELINE_MODE_FALLBACK,
@@ -33,8 +35,8 @@ from orchestration.normalizer_task import (
     build_normalizer_task,
     build_station_master_enrichment_task,
 )
-
-from airflow import DAG
+from orchestration.routes_task import build_routes_task
+from orchestration.urgency_task import build_urgency_task
 
 with DAG(
     dag_id="e2e_realtime",
@@ -79,3 +81,14 @@ with DAG(
 
     load_forecast_points = build_db_loader_task(dag, "forecast_points")
     [run_inference, load_station_stock] >> load_forecast_points
+
+    compute_urgency = build_urgency_task(dag)
+    load_station_urgency = build_db_loader_task(dag, "station_urgency")
+    run_inference >> compute_urgency
+    [compute_urgency, load_stations] >> load_station_urgency
+
+    compute_routes = build_routes_task(dag)
+    load_rebalance_routes = build_db_loader_task(dag, "rebalance_routes")
+    load_rebalance_route_stops = build_db_loader_task(dag, "rebalance_route_stops")
+    compute_urgency >> compute_routes >> load_rebalance_routes >> load_rebalance_route_stops
+    load_stations >> load_rebalance_route_stops

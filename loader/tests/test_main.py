@@ -1,20 +1,37 @@
-"""main.py의 만료 행 정리(retention) 로직 — _expire_cutoff/_delete_expired를
-검증한다. run() 전체를 목킹하는 대신 이 두 함수로 테스트 표면을 좁혔다(#116/#117)."""
+"""loader CLI의 테이블별 적재 전 계약을 검증한다. main.py의 만료 행 정리(retention)
+로직 — _expire_cutoff/_delete_expired를 검증한다. run() 전체를 목킹하는 대신 이
+두 함수로 테스트 표면을 좁혔다(#116/#117)."""
 
 from datetime import UTC, date, datetime
 
 import pytest
 
-from main import KST, _delete_expired, _expire_cutoff, _parse_window_start
+from main import (
+    KST,
+    _delete_expired,
+    _expire_cutoff,
+    _only_known_stations,
+    _parse_window_start,
+    _retire_stale_proposed_routes,
+)
+
+
+def test_station_urgency_filters_rows_without_station_fk():
+    rows = [
+        {"sta_id": "A", "urgency_score": 10.0},
+        {"sta_id": "OUTSIDE", "urgency_score": 20.0},
+    ]
+
+    assert _only_known_stations(rows, {"A"}) == [{"sta_id": "A", "urgency_score": 10.0}]
 
 
 class _FakeCursor:
-    def __init__(self, rowcount: int):
+    def __init__(self, rowcount: int = 0):
         self.rowcount = rowcount
-        self.executed: list[tuple[str, dict]] = []
+        self.executed: list[tuple[str, dict | None]] = []
 
     def execute(self, query, params=None):
-        self.executed.append((query, params))
+        self.executed.append((" ".join(query.split()), params))
 
     def __enter__(self):
         return self
@@ -29,6 +46,19 @@ class _FakeConnection:
 
     def cursor(self):
         return self.cursor_obj
+
+
+def test_retire_stale_proposed_routes_deletes_stops_before_routes():
+    """rebalance_route_stops.route_id가 rebalance_routes.route_id를 FK 참조하므로,
+    자식(stops)을 먼저 지우지 않으면 부모(routes) 삭제가 FK 위반으로 실패한다."""
+    conn = _FakeConnection()
+
+    _retire_stale_proposed_routes(conn)
+
+    [(stops_delete, _), (routes_delete, _)] = conn.cursor_obj.executed
+    assert "DELETE FROM rebalance_route_stops" in stops_delete
+    assert "status = 'proposed'" in stops_delete
+    assert "DELETE FROM rebalance_routes WHERE status = 'proposed'" in routes_delete
 
 
 class TestExpireCutoff:

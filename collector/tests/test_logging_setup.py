@@ -10,6 +10,7 @@ import logging
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+import logging_setup
 from logging_setup import configure_logging
 
 KST = ZoneInfo("Asia/Seoul")
@@ -131,3 +132,37 @@ class TestIsolation:
 
         assert stream1.getvalue() == ""
         assert stream2.getvalue().count("only once") == 1
+
+
+class TestBatchLogging:
+    """compaction 같은 날짜 단위 배치는 window·attempt가 없다.
+
+    없는 개념을 억지로 채우면(now()를 window로 넣는 등) 로그를 읽는 사람이 그 값을
+    실제 수집 윈도우로 오해한다. 배치는 source_id만 고정 필드로 갖는다.
+    """
+
+    def test_injects_source_id(self):
+        stream = io.StringIO()
+        root = logging_setup.configure_batch_logging("bike_rental_history", stream=stream)
+
+        root.info("stage=compaction status=compacted")
+
+        assert "source_id=bike_rental_history" in stream.getvalue()
+
+    def test_omits_window_and_attempt(self):
+        stream = io.StringIO()
+        root = logging_setup.configure_batch_logging("bike_rental_history", stream=stream)
+
+        root.info("stage=compaction status=compacted")
+
+        line = stream.getvalue()
+        assert "window=" not in line
+        assert "attempt=" not in line
+
+    def test_extra_fields_still_render_as_key_value(self):
+        stream = io.StringIO()
+        root = logging_setup.configure_batch_logging("t_source", stream=stream)
+
+        root.info("stage=compaction", extra={"rows": 42})
+
+        assert "rows=42" in stream.getvalue()

@@ -1,5 +1,6 @@
 """Airflow DAG 모듈이 문법/의존성 에러 없이 로드되고 핵심 E2E 의존성을 유지하는지 확인한다."""
 
+import dags.daily_compaction as daily_compaction_dag
 import dags.daily_population_and_events as daily_dag
 import dags.e2e_realtime as e2e_realtime_dag
 import dags.realtime_5min as realtime_5min_dag
@@ -44,6 +45,17 @@ def test_e2e_gold_waits_for_inference_and_station_stock():
     assert upstream == {"run_inference", "load_station_stock"}
 
 
+def test_urgency_loaders_wait_for_stations_fk():
+    assert realtime_5min_dag.dag.get_task("load_station_urgency").upstream_task_ids == {
+        "compute_urgency",
+        "load_stations",
+    }
+    assert e2e_realtime_dag.dag.get_task("load_station_urgency").upstream_task_ids == {
+        "compute_urgency",
+        "load_stations",
+    }
+
+
 def test_weather_10min_dag_id():
     assert weather_10min_dag.dag.dag_id == "weather_10min"
 
@@ -54,6 +66,10 @@ def test_weather_3h_dag_id():
 
 def test_daily_population_and_events_dag_id():
     assert daily_dag.dag.dag_id == "daily_population_and_events"
+
+
+def test_daily_compaction_dag_id():
+    assert daily_compaction_dag.dag.dag_id == "daily_compaction"
 
 
 def test_station_master_daily_collector_contract():

@@ -3,12 +3,22 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import logging
+import math
 from datetime import UTC, date, datetime, timedelta
+from functools import lru_cache
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pandas as pd
 
-from gu_mapping import grid_to_gu, latlon_to_gu
+from core.precip import parse_precip
+from gu_mapping import grid_to_gu, latlon_to_grid, latlon_to_gu
+
+logger = logging.getLogger(__name__)
+
+_STADIUM_COORDS_PATH = Path(__file__).parent / "assets" / "stadium_coords.json"
 
 _KST = timedelta(hours=9)
 
@@ -40,6 +50,7 @@ def stations_from_silver(df: pd.DataFrame) -> list[dict]:
         gu = latlon_to_gu(lat, lon)
         if gu is None:
             continue  # 서울 자치구 경계 밖(인접 도시 접경) 정거장은 제외
+        grid_nx, grid_ny = latlon_to_grid(lat, lon)
         records.append(
             {
                 "sta_id": str(row["stationId"]),
@@ -49,6 +60,8 @@ def stations_from_silver(df: pd.DataFrame) -> list[dict]:
                 "lat": lat,
                 "lon": lon,
                 "hold_cnt": int(row["rackTotCnt"]),
+                "grid_nx": grid_nx,
+                "grid_ny": grid_ny,
             }
         )
     return records
@@ -86,18 +99,22 @@ def weather_current_from_silver(df: pd.DataFrame) -> list[dict]:
     returns:
         weather_current 테이블 적재용 자치구별 최신 실황 레코드 목록
     """
-    by_gu: dict[str, dict] = {}
+    by_grid: dict[tuple[int, int], dict] = {}
     for row in df.to_dict("records"):
-        gu = grid_to_gu(row["nx"], row["ny"])
+        nx, ny = int(row["nx"]), int(row["ny"])
+        gu = grid_to_gu(nx, ny)
         if gu is None:
             continue
         observed_at = _kst_to_utc(str(row["baseDate"]), str(row["baseTime"]))
 
-        # 최신 데이터 보장: 이미 담긴 구의 데이터보다 과거 시간이면 무시한다
-        existing = by_gu.get(gu)
+        # 최신 데이터 보장: 이미 담긴 격자의 데이터보다 과거 시간이면 무시한다
+        key = (nx, ny)
+        existing = by_grid.get(key)
         if existing is not None and existing["observed_at"] >= observed_at:
             continue
-        by_gu[gu] = {
+        by_grid[key] = {
+            "nx": nx,
+            "ny": ny,
             "gu": gu,
             "observed_at": observed_at,
             "temperature": _to_float(row.get("T1H")),  # T1H: 기온(°C)
@@ -106,7 +123,7 @@ def weather_current_from_silver(df: pd.DataFrame) -> list[dict]:
             "rainfall": _to_float(row.get("RN1")),     # RN1: 1시간 강수량(mm)
             "pty_type": _to_int(row.get("PTY")),       # PTY: 강수형태 코드
         }
-    return list(by_gu.values())
+    return list(by_grid.values())
 
 
 def weather_forecast_from_silver(df: pd.DataFrame) -> list[dict]:
@@ -117,18 +134,21 @@ def weather_forecast_from_silver(df: pd.DataFrame) -> list[dict]:
     returns:
         weather_forecast 테이블 적재용 예보 레코드 목록
     """
-    by_key: dict[tuple[str, datetime], dict] = {}
+    by_key: dict[tuple[int, int, datetime], dict] = {}
     for row in df.to_dict("records"):
-        gu = grid_to_gu(row["nx"], row["ny"])
+        nx, ny = int(row["nx"]), int(row["ny"])
+        gu = grid_to_gu(nx, ny)
         if gu is None:
             continue
         forecast_dttm = _kst_to_utc(str(row["fcstDate"]), str(row["fcstTime"]))
         base_dttm = _kst_to_utc(str(row["baseDate"]), str(row["baseTime"]))
-        key = (gu, forecast_dttm)
+        key = (nx, ny, forecast_dttm)
         existing = by_key.get(key)
         if existing is not None and existing["base_dttm"] >= base_dttm:
             continue
         by_key[key] = {
+            "nx": nx,
+            "ny": ny,
             "gu": gu,
             "forecast_dttm": forecast_dttm,
             "sky_cond": _to_int(row.get("SKY")),       # SKY: 하늘상태 코드(1:맑음, 3:구름많음, 4:흐림)
@@ -144,24 +164,24 @@ def weather_forecast_from_silver(df: pd.DataFrame) -> list[dict]:
 
 
 def _parse_precip_str(value) -> float | None:
-    """기상청 강수량 문자열(예: '강수없음', '1.0mm 미만', '30.0~50.0mm')을 실수값(float)으로 변환한다."""
-    # 1. 빈 값이면 None 반환
+    """기상청 강수량 표기를 float으로 변환한다. 해석할 수 없으면 None.
+
+    변환 규칙은 `core.precip.parse_precip`이 갖는다 — collector가 silver에 쓸 때
+    쓰는 것과 같은 함수다. 여기서 하는 일은 결측·해석 실패를 예외 대신 None으로
+    바꾸는 것뿐이다(upsert에서 그 컬럼이 NULL이 된다).
+
+    collector가 `types: [precip]`으로 저장하기 시작한 뒤로 silver의 PCP·RN1은
+    이미 실수다. 그래도 문자열 경로를 남겨 둔다 — 전환 이전에 쌓인 silver를
+    다시 읽을 때 필요하다.
+    """
     if value is None or value == "":
         return None
-    text = str(value).strip()
-    # 2. 비/눈이 안 오는 경우 0.0으로 변환
-    if text in ("강수없음", "적설없음"):
-        return 0.0
-    # 3. "1.0mm 미만" 형태는 소량의 강수를 의미하는 0.5로 변환
-    if "미만" in text:
-        return 0.5
-    # 4. "mm" 단위를 제거하고, "30.0~50.0" 같은 범위는 앞의 하한값(30.0)만 추출
-    text = text.replace("mm", "").strip()
-    if "~" in text:
-        text = text.split("~")[0]
-    # 5. 최종 숫자로 변환 (예외 발생 시 None 반환)
+    if isinstance(value, float) and math.isnan(value):
+        # 숫자 컬럼의 결측은 pandas에서 NaN으로 온다. float()를 그냥 통과하므로
+        # 여기서 막지 않으면 NaN이 그대로 RDB에 들어간다.
+        return None
     try:
-        return float(text)
+        return parse_precip(value)
     except (TypeError, ValueError):
         return None
 
@@ -174,24 +194,27 @@ def weather_forecast_ultra_from_silver(df: pd.DataFrame) -> list[dict]:
     returns:
         weather_forecast 테이블 적재용 초단기예보 레코드 목록
     """
-    by_key: dict[tuple[str, datetime], dict] = {}
+    by_key: dict[tuple[int, int, datetime], dict] = {}
     for row in df.to_dict("records"):
-        gu = grid_to_gu(row["nx"], row["ny"])
+        nx, ny = int(row["nx"]), int(row["ny"])
+        gu = grid_to_gu(nx, ny)
         if gu is None:
             continue
         forecast_dttm = _kst_to_utc(str(row["fcstDate"]), str(row["fcstTime"]))
         base_dttm = _kst_to_utc(str(row["baseDate"]), str(row["baseTime"]))
-        key = (gu, forecast_dttm)
+        key = (nx, ny, forecast_dttm)
         existing = by_key.get(key)
         if existing is not None and existing["base_dttm"] >= base_dttm:
             continue
         by_key[key] = {
+            "nx": nx,
+            "ny": ny,
             "gu": gu,
             "forecast_dttm": forecast_dttm,
             "sky_cond": _to_int(row.get("SKY")),       # SKY: 하늘상태 코드(1:맑음, 3:구름많음, 4:흐림)
             "pty_type": _to_int(row.get("PTY")),       # PTY: 강수형태 코드
             "temperature": _to_float(row.get("T1H")),  # T1H: 기온(°C)
-            "precip_prob": None,                       # 초단기예보에는 강수확률(POP)이 없음
+            "precip_prob": _to_float(row.get("POP")),  # POP: 강수확률(%)
             "precip_amount": _parse_precip_str(row.get("RN1")),  # RN1: 1시간 강수량(mm)
             "humidity": _to_float(row.get("REH")),     # REH: 습도(%)
             "wind_speed": _to_float(row.get("WSD")),   # WSD: 풍속(m/s)
@@ -240,7 +263,7 @@ def cultural_events_from_silver(df: pd.DataFrame, today: date | None = None) -> 
 
 
 def performance_events_from_silver(df: pd.DataFrame, today: date | None = None) -> list[dict]:
-    """서울시 공공서비스예약(공연) Silver 데이터를 cultural_events 테이블 레코드 목록으로 변환한다.
+    """서울시 체육시설 공연행사 Silver 데이터를 cultural_events 테이블 레코드 목록으로 변환한다.
 
     args:
         df: performance_event Silver DataFrame
@@ -250,37 +273,64 @@ def performance_events_from_silver(df: pd.DataFrame, today: date | None = None) 
     """
     today = today or datetime.now(ZoneInfo("Asia/Seoul")).date()
     records = []
+    unmapped_codes: set[str] = set()
     for row in df.to_dict("records"):
-        end_date = _parse_date(row.get("SVCOPNENDDT"))
+        end_date = _parse_date(row.get("EDATE"))
         # 1. 이미 종료된 행사는 제외한다. 종료일 파싱 실패(end_date=None)도 같이 제외한다 —
         #    NULL은 만료 정리의 `end_date < cutoff`에 안 걸려 영구히 남는다(#117).
         if end_date is None or end_date < today:
             continue
-        title = row.get("SVCNM", "")
-        place = row.get("PLACENM", "")
-        svcid = row.get("SVCID")
+        # 2. 제목이 없는 행은 건너뛴다 — 스키마 변경 이전 Silver 파티션을 백필로
+        #    다시 읽으면 컬럼명이 전부 달라 title이 비고, event_id가 sha256("")로
+        #    모든 행에서 같아져 한 행으로 뭉개진다.
+        title = row.get("TITLE") or ""
+        if not str(title).strip():
+            continue
+        # SCH_CODE_A/B는 숫자 코드라 화면에 그대로 쓸 수 없다. 사람이 읽는 이름은
+        # CODE_TITLE_A/B로 따로 오므로 표시용 필드에는 그쪽을 쓴다.
+        place = row.get("CODE_TITLE_B", "")
+        schedule_id = row.get("SCH_SEQ")
 
-        # 2. 서울시 서비스ID(SVCID)가 있으면 사용하고, 없으면 제목+장소+시작일 해시로 event_id 생성
-        event_id = str(svcid) if svcid else hashlib.sha256(f"{title}{place}{row.get('SVCOPNBGNDT', '')}".encode()).hexdigest()
+        # 3. 일정 순번이 있으면 사용하고, 없으면 제목+시설+시작일 해시로 event_id를 생성한다.
+        event_id = (
+            str(schedule_id)
+            if schedule_id
+            else hashlib.sha256(f"{title}{place}{row.get('SDATE', '')}".encode()).hexdigest()
+        )
 
-        # 3. 유/무료 여부 정규화
-        is_free_val = row.get("PAYATNM")
-        is_free = "무료" if is_free_val == "무료" else "유료"
+        # 4. USE_PAY는 자유 텍스트(가격표·안내 URL·"없음" 등)라 유/무료로 정규화하지
+        #    않고 원문을 그대로 싣는다.
+        is_free = row.get("USE_PAY")
 
-        # 4. cultural_events 공통 스키마에 맞게 매핑 (Y: 위도, X: 경도)
+        # 5. 원본 API가 좌표를 주지 않으므로 시설 코드로 좌표 마스터를 조회해 채운다.
+        #    마스터에 없는 코드(시설 신설 등)는 좌표 없이 적재하고 경고만 남긴다 —
+        #    행을 버리는 것보다 낫지만, 좌표가 없으면 반경 조회에는 잡히지 않는다.
+        stadium_code = str(row.get("SCH_CODE_B") or "")
+        coords = _stadium_coords().get(stadium_code)
+        if coords is None:
+            unmapped_codes.add(stadium_code)
+        lat, lon, gu = coords if coords else (None, None, None)
+
         records.append(
             {
                 "event_id": event_id,
                 "title": title,
-                "category": row.get("MINCLASSNM"),
-                "gu": row.get("AREANM"),
+                "category": row.get("CODE_TITLE_A"),
+                "gu": gu,
                 "place": place,
-                "start_date": _parse_date(row.get("SVCOPNBGNDT")),
+                "start_date": _parse_date(row.get("SDATE")),
                 "end_date": end_date,
                 "is_free": is_free,
-                "lat": _to_float(row.get("Y")),
-                "lon": _to_float(row.get("X")),
+                "lat": lat,
+                "lon": lon,
             }
+        )
+
+    if unmapped_codes:
+        logger.warning(
+            "stadium_coords에 없는 시설 코드 %s — 해당 행사는 좌표 없이 적재되어 "
+            "주변 행사 조회에 잡히지 않는다. assets/stadium_coords.json에 추가가 필요하다.",
+            sorted(unmapped_codes),
         )
     return records
 
@@ -310,6 +360,87 @@ def forecast_points_from_predictions(df: pd.DataFrame, batch_run_at: datetime) -
     return records
 
 
+def station_urgency_from_urgency_batch(df: pd.DataFrame, batch_run_at: datetime) -> list[dict]:
+    """rebalance 배치(urgency.compute_all)의 결과 DataFrame을 station_urgency 테이블
+    레코드 목록으로 변환한다.
+
+    args:
+        df: rebalance가 S3에 쓴 urgency 결과 DataFrame(sta_id, lat, lon, urgency_score,
+            minutes_until_critical, action_type, bike_qty — lat/lon은 routes.py의
+            권역 배정 전용이라 station_urgency 테이블에는 싣지 않는다)
+        batch_run_at: 배치 실행 시각 (KST)
+    returns:
+        station_urgency 테이블 적재용 레코드 목록
+    """
+    records = []
+    for row in df.to_dict("records"):
+        records.append(
+            {
+                "sta_id": str(row["sta_id"]),
+                "urgency_score": float(row["urgency_score"]),
+                "minutes_until_critical": int(row["minutes_until_critical"]),
+                "action_type": row["action_type"],
+                "bike_qty": int(row["bike_qty"]),
+                "batch_run_at": batch_run_at,
+            }
+        )
+    return records
+
+
+def _kst_timestamp_to_utc(value) -> datetime:
+    """KST 벽시계 시각(naive pd.Timestamp/datetime)을 UTC datetime으로 변환한다
+    (_kst_to_utc/_kst_date_hm_to_utc와 같은 규칙)."""
+    naive_kst = pd.Timestamp(value).to_pydatetime().replace(tzinfo=UTC)
+    return naive_kst - _KST
+
+
+def rebalance_routes_from_routes_batch(df: pd.DataFrame) -> list[dict]:
+    """rebalance 배치(routes.compute_all)가 S3에 쓴 라우트 헤더 결과를
+    rebalance_routes 테이블 레코드 목록으로 변환한다. proposed_at이 데이터
+    자체에 실려 있어(forecast_points/station_urgency와 달리) batch_run_at을
+    별도 인자로 받지 않는다.
+
+    args:
+        df: rebalance가 S3에 쓴 라우트 결과 DataFrame(route_id, region, status, proposed_at)
+    returns:
+        rebalance_routes 테이블 적재용 레코드 목록
+    """
+    records = []
+    for row in df.to_dict("records"):
+        records.append(
+            {
+                "route_id": str(row["route_id"]),
+                "region": row["region"],
+                "status": row["status"],
+                "proposed_at": _kst_timestamp_to_utc(row["proposed_at"]),
+            }
+        )
+    return records
+
+
+def rebalance_route_stops_from_route_stops_batch(df: pd.DataFrame) -> list[dict]:
+    """rebalance 배치(routes.compute_all)가 S3에 쓴 라우트 스톱 결과를
+    rebalance_route_stops 테이블 레코드 목록으로 변환한다.
+
+    args:
+        df: rebalance가 S3에 쓴 스톱 결과 DataFrame(route_id, visit_order, sta_id, action, bike_cnt)
+    returns:
+        rebalance_route_stops 테이블 적재용 레코드 목록
+    """
+    records = []
+    for row in df.to_dict("records"):
+        records.append(
+            {
+                "route_id": str(row["route_id"]),
+                "visit_order": int(row["visit_order"]),
+                "sta_id": str(row["sta_id"]),
+                "action": row["action"],
+                "bike_cnt": int(row["bike_cnt"]),
+            }
+        )
+    return records
+
+
 def _to_float(value) -> float | None:
     """문자열 또는 숫자 값을 float으로 변환한다 (변환 불가 시 None)."""
     if value is None or value == "":
@@ -328,6 +459,21 @@ def _to_int(value) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+@lru_cache(maxsize=1)
+def _stadium_coords() -> dict[str, tuple[float, float, str | None]]:
+    """시설 코드(SCH_CODE_B) → (위도, 경도, 자치구) 조회 테이블을 반환한다.
+
+    자치구는 좌표에서 도출하므로(gu_mapping) 마스터 파일에는 좌표만 둔다 —
+    자치구 경계와 좌표가 따로 갱신되며 어긋나는 일을 막는다.
+    """
+    raw = json.loads(_STADIUM_COORDS_PATH.read_text(encoding="utf-8"))
+    return {
+        code: (entry["lat"], entry["lon"], latlon_to_gu(entry["lat"], entry["lon"]))
+        for code, entry in raw.items()
+        if not code.startswith("_")
+    }
 
 
 def _parse_date(value) -> date | None:

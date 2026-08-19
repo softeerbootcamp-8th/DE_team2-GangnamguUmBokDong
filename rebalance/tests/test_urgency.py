@@ -1,17 +1,20 @@
-"""scoring.py: _severity, _max_overshoot, _max_deficit, urgency_score 테스트.
+"""urgency.py: _severity, _max_overshoot, _max_deficit, urgency_score 테스트.
 
-PR #40 리뷰에서 지적된 대로(#55) 예측 구간 전체를 스캔하는 로직과 점근 곡선에
-대한 안전망. hold_cnt=0, 정원 초과, 예측 없음 등 경계값을 우선 다룬다.
+apps/api/tests/test_scoring.py에서 그대로 이관했다(urgency_score가 배치로
+이식되면서 함께 옮김, 이슈 #107). PR #40 리뷰에서 지적된 대로(#55) 예측 구간
+전체를 스캔하는 로직과 점근 곡선에 대한 안전망. hold_cnt=0, 정원 초과, 예측
+없음 등 경계값을 우선 다룬다.
 """
 
 from datetime import UTC, datetime, timedelta
 
-from scoring import (
+from urgency import (
     _max_deficit,
     _max_overshoot,
     _max_unmet_demand,
     _severity,
     _trend_time_to_critical,
+    bike_qty,
     urgency_score,
 )
 
@@ -109,6 +112,33 @@ class TestMaxUnmetDemand:
             _point(rent=9, ret=9, predicted_bikes=2, action_type="normal"),
         ]
         assert _max_unmet_demand(current=2, hold_cnt=10, points=points) == 9
+
+
+class TestBikeQty:
+    def test_retrieval_needed_uses_max_overshoot(self):
+        points = [_point(rent=0, ret=0, predicted_bikes=14, action_type="retrieval_needed")]
+        assert bike_qty(current=5, hold_cnt=10, action_type="retrieval_needed", points=points) == 4
+
+    def test_supply_needed_uses_larger_of_deficit_and_unmet_demand(self):
+        # _max_deficit=5(8건 대여로 -5), _max_unmet_demand=0(시작 재고 3이 threshold(2) 위) -> 5.
+        points = [_point(rent=8, ret=0, predicted_bikes=0, action_type="supply_needed")]
+        assert bike_qty(current=3, hold_cnt=10, action_type="supply_needed", points=points) == 5
+
+    def test_supply_needed_clamps_to_available_docks(self):
+        # unmet_demand=10인데 지금 빈 거치대(hold_cnt-current)는 8뿐이라, 물리적
+        # 한계인 8로 클램프돼야 한다(urgency_score의 severity 랭킹은 클램프 없는
+        # 원본값 10을 그대로 쓴다 — _severity_qty 참고).
+        points = [_point(rent=10, ret=10, predicted_bikes=2, action_type="normal")]
+        assert bike_qty(current=2, hold_cnt=10, action_type="supply_needed", points=points) == 8
+
+    def test_retrieval_needed_clamps_to_current_stock(self):
+        # overshoot=9인데 지금 실제로 있는 재고(current)는 5뿐이라, 5로 클램프된다.
+        points = [_point(rent=0, ret=0, predicted_bikes=19, action_type="retrieval_needed")]
+        assert bike_qty(current=5, hold_cnt=10, action_type="retrieval_needed", points=points) == 5
+
+    def test_normal_is_always_zero(self):
+        points = [_point(rent=10, ret=0, predicted_bikes=0, action_type="normal")]
+        assert bike_qty(current=5, hold_cnt=10, action_type="normal", points=points) == 0
 
 
 class TestTrendTimeToCritical:
