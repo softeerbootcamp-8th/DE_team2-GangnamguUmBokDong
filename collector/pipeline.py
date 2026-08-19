@@ -99,9 +99,8 @@ import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-import pyarrow as pa
-
 import manifest as manifest_module
+import pyarrow as pa
 import storage
 from adapters.base import FetchErrorKind, Window, fetch_with_rounds, get_adapter
 from config.schema import SourceConfig
@@ -397,6 +396,22 @@ def execute_window(
     missing = _build_missing(missing_keys, expected_total, fetched_rows)
 
     parts_summary = f"{len(chunks)}/{len(chunks) + len(missing_keys)}"
+
+    if expected_total is not None and fetched_rows > expected_total:
+        # 1 - fetched/expected를 0으로 clamp하면 probe 재시도 사이 snapshot이
+        # 축소·재정렬돼 옛 Bronze payload와 새 total이 섞인 상태를 완결로 오인한다.
+        # 초과분을 임의로 자를 근거도 없으므로 Silver를 쓰지 않고 force 재수집이
+        # 필요한 명시적 fetch 실패로 남긴다.
+        logger.error(
+            "stage=bronze_written status=failed failure_reason=fetch_error "
+            f"reason=fetched_exceeds_expected parts={parts_summary} "
+            f"rows={fetched_rows} expected={expected_total}"
+        )
+        return _finish(
+            failure_reason=FailureReason.FETCH_ERROR,
+            missing=missing,
+            counts=Counts(expected=expected_total, fetched=fetched_rows),
+        )
 
     if ratio > config.quality.max_missing_ratio:
         # 완결도 게이트 초과 — silver를 쓰지 않고 fetch_error로 끝낸다. stage는

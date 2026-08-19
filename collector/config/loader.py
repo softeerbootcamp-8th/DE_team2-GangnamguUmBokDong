@@ -12,8 +12,6 @@ from pathlib import Path
 
 import yaml
 from pydantic import ValidationError
-
-from config.schema import SourceConfig
 from validation.registry import (
     get_row_policy_params_model,
     is_policy_registered,
@@ -21,6 +19,8 @@ from validation.registry import (
     policy_names,
     row_policy_names,
 )
+
+from config.schema import SourceConfig
 
 
 class ConfigError(ValueError):
@@ -58,18 +58,53 @@ def load(source_id: str, base_dir: Path = Path("sources")) -> SourceConfig:
 def _check_adapter_params(config: SourceConfig) -> list[str]:
     """네트워크나 기존 bronze를 건드리기 전에 adapter별 계획 설정을 검증한다."""
     params = config.adapter_params
-    if config.adapter != "seoul_openapi" or params.get("service") != "citydata_ppltn":
+    if config.adapter != "seoul_openapi":
         return []
 
-    poi_start = params.get("poi_start", 1)
-    poi_end = params.get("poi_end")
-    if not isinstance(poi_start, int) or isinstance(poi_start, bool):
-        return ["adapter_params.poi_start: 1 이상의 정수여야 합니다."]
-    if not isinstance(poi_end, int) or isinstance(poi_end, bool):
-        return ["adapter_params.poi_end: 필수이며 정수여야 합니다."]
-    if poi_start < 1 or poi_end < poi_start:
-        return ["adapter_params.poi_start/poi_end: 1 <= poi_start <= poi_end여야 합니다."]
-    return []
+    errors: list[str] = []
+    page_size = params.get("page_size")
+    if params and (
+        not isinstance(page_size, int) or isinstance(page_size, bool) or page_size < 1
+    ):
+        errors.append("adapter_params.page_size: 1 이상의 정수여야 합니다.")
+
+    pagination = params.get("pagination", "total")
+    if pagination not in {"total", "probe"}:
+        errors.append("adapter_params.pagination: 'total' 또는 'probe'여야 합니다.")
+
+    if params.get("service") == "citydata_ppltn":
+        if pagination != "total":
+            errors.append("adapter_params.pagination: citydata_ppltn에는 probe를 사용할 수 없습니다.")
+
+        poi_start = params.get("poi_start", 1)
+        poi_end = params.get("poi_end")
+        if not isinstance(poi_start, int) or isinstance(poi_start, bool):
+            errors.append("adapter_params.poi_start: 1 이상의 정수여야 합니다.")
+        if not isinstance(poi_end, int) or isinstance(poi_end, bool):
+            errors.append("adapter_params.poi_end: 필수이며 정수여야 합니다.")
+        if (
+            isinstance(poi_start, int)
+            and not isinstance(poi_start, bool)
+            and isinstance(poi_end, int)
+            and not isinstance(poi_end, bool)
+            and (poi_start < 1 or poi_end < poi_start)
+        ):
+            errors.append("adapter_params.poi_start/poi_end: 1 <= poi_start <= poi_end여야 합니다.")
+        return errors
+
+    if pagination == "probe":
+        max_probe_pages = params.get("max_probe_pages")
+        if (
+            not isinstance(max_probe_pages, int)
+            or isinstance(max_probe_pages, bool)
+            or max_probe_pages < 1
+        ):
+            errors.append(
+                "adapter_params.max_probe_pages: pagination=probe이면 1 이상의 정수가 필수입니다."
+            )
+    elif "max_probe_pages" in params:
+        errors.append("adapter_params.max_probe_pages: pagination=probe에서만 사용할 수 있습니다.")
+    return errors
 
 
 def _check_policy_names(config: SourceConfig) -> list[str]:

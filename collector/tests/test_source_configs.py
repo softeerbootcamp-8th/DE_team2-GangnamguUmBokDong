@@ -80,6 +80,76 @@ class TestAllSourcesLoad:
         assert config.columns["USE_DST"].types == ("str", "float")
         assert config.columns["BIRTH_YEAR"].types == ("str", "int")
 
+    def test_bike_station_realtime_uses_bounded_probe_pagination(self):
+        """bikeList의 페이지 크기 total을 전체 건수로 오인하지 않는 설정을 고정한다."""
+        config = config_loader.load("bike_station_realtime", base_dir=SOURCES_DIR)
+
+        assert config.adapter_params["pagination"] == "probe"
+        assert config.adapter_params["page_size"] == 1000
+        assert config.adapter_params["max_probe_pages"] == 10
+
+    @pytest.mark.parametrize(
+        ("adapter_params", "message"),
+        [
+            (
+                {
+                    "service": "bikeList",
+                    "page_size": 1000,
+                    "root_key": "rentBikeStatus.row",
+                    "pagination": "unknown",
+                },
+                "adapter_params.pagination",
+            ),
+            (
+                {
+                    "service": "bikeList",
+                    "page_size": 1000,
+                    "root_key": "rentBikeStatus.row",
+                    "pagination": "probe",
+                },
+                "adapter_params.max_probe_pages",
+            ),
+            (
+                {
+                    "service": "bikeList",
+                    "page_size": 1000,
+                    "root_key": "rentBikeStatus.row",
+                    "pagination": "probe",
+                    "max_probe_pages": 0,
+                },
+                "adapter_params.max_probe_pages",
+            ),
+            (
+                {
+                    "service": "bikeList",
+                    "page_size": 0,
+                    "root_key": "rentBikeStatus.row",
+                },
+                "adapter_params.page_size",
+            ),
+        ],
+    )
+    def test_seoul_pagination_config_is_validated(self, tmp_path, adapter_params, message):
+        source = tmp_path / "invalid_pagination.yaml"
+        source.write_text(
+            "\n".join(
+                [
+                    "source_id: invalid_pagination",
+                    "description: invalid pagination config",
+                    "adapter: seoul_openapi",
+                    f"adapter_params: {json.dumps(adapter_params)}",
+                    "schedule: {interval: 5m}",
+                    "storage: {bronze_format: json, silver_format: parquet, partition: [dt, hh]}",
+                    "quality: {max_drop_ratio: 0.05}",
+                    "policies: {required_missing: drop_row, required_outlier: drop_row, optional_missing: keep_null, optional_outlier: set_null}",
+                    "columns: {}",
+                ]
+            )
+        )
+
+        with pytest.raises(config_loader.ConfigError, match=message):
+            config_loader.load("invalid_pagination", base_dir=tmp_path)
+
     def test_population_realtime_covers_current_121_pois(self):
         config = config_loader.load("population_realtime", base_dir=SOURCES_DIR)
 
@@ -195,6 +265,13 @@ class TestSeoulSourcesEndToEnd:
         ]
 
         def handler(request):
+            if "/1001/2000/" in str(request.url):
+                return httpx.Response(
+                    200,
+                    content=json.dumps(
+                        {"CODE": "INFO-200", "MESSAGE": "해당하는 데이터가 없습니다."}
+                    ).encode(),
+                )
             return httpx.Response(200, content=_seoul_response("rentBikeStatus", rows, total=len(rows)))
 
         client = httpx.Client(transport=httpx.MockTransport(handler))

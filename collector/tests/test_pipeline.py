@@ -7,10 +7,9 @@ from typing import ClassVar
 from zoneinfo import ZoneInfo
 
 import httpx
-import pytest
-
 import manifest as manifest_module
 import pipeline
+import pytest
 import storage
 from adapters.base import FetchErrorKind, FetchResult, adapter
 from config.schema import Backfill, Policies, Quality, Schedule, SourceConfig
@@ -231,6 +230,35 @@ class TestMissingRatioGate:
         assert result.status == RunStatus.PARTIAL
         assert result.artifacts.silver is not None
         assert result.missing.parts == ("b",)
+
+    def test_fetched_rows_above_expected_fail_closed_on_snapshot_drift(
+        self,
+        scripted_adapter,
+        client,
+        monkeypatch,
+    ):
+        """축소·재정렬 전 4행 Bronze와 새 expected=3을 정상 완료로 clamp하지 않는다."""
+        scripted_adapter.results = [[
+            FetchResult(key="old-pages", payload=_chunk("old-pages"), error=None, expected_total=3)
+        ]]
+        monkeypatch.setattr(
+            scripted_adapter,
+            "normalize",
+            staticmethod(lambda chunks, config: [{"stationId": str(i)} for i in range(4)]),
+        )
+        # 누락 허용치를 100%로 둬도 overfetch는 비율 문제가 아니라 snapshot 계약
+        # 위반이므로 반드시 실패해야 한다.
+        config = _config(
+            quality=Quality(max_drop_ratio=1.0, max_missing_ratio=1.0, allow_empty=True)
+        )
+
+        result = pipeline.execute_window(config, WINDOW_START, client=client)
+
+        assert result.status == RunStatus.FAILED
+        assert result.failure_reason == FailureReason.FETCH_ERROR
+        assert result.counts.expected == 3
+        assert result.counts.fetched == 4
+        assert result.artifacts.silver is None
 
 
 class TestFatalAbortsImmediately:

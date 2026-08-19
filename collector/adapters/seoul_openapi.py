@@ -15,6 +15,8 @@ RESULT.CODE → 실패 범주:
   조각 키 어디에도 남지 않게 마스킹한다.
 - 응답 필드는 전부 문자열로 내려온다. 캐스팅은 검증 엔진의 `types`가 맡고 어댑터는
   값에 손대지 않는다.
+- 기본 `pagination: total`은 전체 건수인 `list_total_count`를 사용한다. 현재 페이지
+  행 수를 돌려주는 `bikeList`는 `pagination: probe`로 빈 페이지까지 순차 탐색한다.
 """
 
 from __future__ import annotations
@@ -99,6 +101,8 @@ class _PageOutcome:
     payload: bytes | None
     total: int | None
     error: FetchErrorKind | None
+    row_count: int | None = None
+    terminal: bool = False
 
 
 def _request_json(client: httpx.Client, url: str) -> tuple[bytes, dict] | FetchErrorKind:
@@ -134,6 +138,45 @@ def _fetch_page(client: httpx.Client, url: str, wrapper_key: str) -> _PageOutcom
     wrapper = _extract(body, wrapper_key)
     raw_total = wrapper.get("list_total_count", 0) if isinstance(wrapper, dict) else 0
     return _PageOutcome(payload=content, total=int(raw_total), error=None)
+
+
+def _fetch_probe_page(client: httpx.Client, url: str, wrapper_key: str) -> _PageOutcome:
+    """전체 건수를 신뢰하지 않는 페이지를 받아 행 수와 종료 여부를 판정한다.
+
+    `bikeList`의 `list_total_count`는 전체가 아니라 현재 응답의 행 수다. probe
+    모드에서는 이 값을 완전히 무시하고, 정상 응답의 `row` 길이와 INFO-200만
+    사용한다. INFO-000인데 row가 없거나 list가 아니면 빈 끝으로 오인해 수집을
+    조용히 자를 수 있으므로 영구 조각 오류로 돌린다.
+    """
+    result = _request_json(client, url)
+    if isinstance(result, FetchErrorKind):
+        return _PageOutcome(payload=None, total=None, error=result)
+    content, body = result
+
+    code = _result_code(body, wrapper_key)
+    category = _classify(code)
+    if category is not None:
+        return _PageOutcome(payload=None, total=None, error=category)
+    if code == "INFO-200":
+        return _PageOutcome(
+            payload=content,
+            total=None,
+            error=None,
+            row_count=0,
+            terminal=True,
+        )
+
+    wrapper = _extract(body, wrapper_key)
+    rows = wrapper.get("row") if isinstance(wrapper, dict) else None
+    if not isinstance(rows, list):
+        return _PageOutcome(payload=None, total=None, error=FetchErrorKind.PERMANENT)
+    return _PageOutcome(
+        payload=content,
+        total=None,
+        error=None,
+        row_count=len(rows),
+        terminal=not rows,
+    )
 
 
 def _fetch_poi(client: httpx.Client, url: str, wrapper_key: str) -> _PageOutcome:
@@ -190,6 +233,219 @@ def _run_concurrent(items, concurrency: int, fetch_one, thread_name_prefix: str)
         # 넘겨 순회를 중단하고 이 제너레이터를 버릴 때 그 대기가 마감 시한 방어를
         # 무력화한다. 실행 중인 요청은 끊을 수 없지만 대기 큐는 즉시 비운다.
         pool.shutdown(wait=False, cancel_futures=True)
+
+
+def _probe_page_key(start: int, page_size: int) -> str:
+    """probe 모드의 고정 폭 페이지 키를 만든다."""
+    return f"page-{start:05d}-{start + page_size - 1:05d}"
+
+
+def _minimum_total_covered_by_probe_parts(parts: frozenset[str]) -> int:
+    """이미 저장된 probe data part들이 보장하는 최소 row 위치를 반환한다.
+
+    ``page-N-M``이 성공 저장됐다는 것은 적어도 N번째 row가 그 snapshot에 있었다는
+    뜻이다. 종료 probe 재시도 중 더 작은 total이 관측되면 서로 다른 snapshot의
+    payload와 metadata를 섞는 것이므로 성공으로 확정할 수 없다.
+    """
+    starts: list[int] = []
+    for key in parts:
+        if not key.startswith("page-"):
+            continue
+        try:
+            starts.append(int(key.split("-", 2)[1]))
+        except (IndexError, ValueError):
+            continue
+    return max(starts, default=0)
+
+
+def _recover_probe_total(
+    *,
+    page_start: int,
+    page_size: int,
+    skip: frozenset[str],
+    client: httpx.Client,
+    page_url,
+    wrapper_key: str,
+) -> int | None:
+    """종료 페이지만 재시도한 경우 직전 성공 페이지에서 실제 행 수를 복구한다.
+
+    probe의 종료 응답은 bronze로 저장하지 않으므로 보통 매 라운드 다시 확인된다.
+    다만 직전 라운드에서 종료 요청만 일시 실패했다면 이번 라운드의 데이터 페이지는
+    전부 skip에 들어 있다. 이때 직전 페이지 하나만 다시 읽어 마지막 페이지의 실제
+    행 수를 알아낸다. 데이터 payload를 다시 yield하지 않으므로 bronze는 중복 저장되지
+    않는다.
+    """
+    previous_start = page_start - page_size
+    if previous_start < 1:
+        return 0
+    previous_key = _probe_page_key(previous_start, page_size)
+    if previous_key not in skip:
+        return None
+
+    outcome = _fetch_probe_page(
+        client,
+        page_url(previous_start, previous_start + page_size - 1),
+        wrapper_key,
+    )
+    if outcome.error is not None or outcome.terminal or outcome.row_count is None:
+        return None
+    return previous_start - 1 + outcome.row_count
+
+
+def _fetch_probe_pages(
+    *,
+    params: dict,
+    client: httpx.Client,
+    page_url,
+    wrapper_key: str,
+    skip: frozenset[str],
+    expected_total: int | None,
+):
+    """응답 total 대신 빈 페이지까지 순차 탐색하는 페이지 결과를 생성한다.
+
+    처음에는 끝을 모르므로 순차 탐색한다. 빈 row 또는 INFO-200 종료 응답은 원본
+    데이터가 아니어서 bronze에 저장하지 않고 `persist=False` 메타데이터 결과로
+    실제 expected_total만 전달한다. 이후 라운드에는 그 expected_total로 안정적인
+    고정 폭 페이지 목록을 복원해 성공 조각은 skip하고 실패 조각만 다시 요청한다.
+    """
+    page_size = int(params["page_size"])
+    max_probe_pages = int(params["max_probe_pages"])
+
+    if expected_total is not None:
+        page_count = (expected_total + page_size - 1) // page_size
+        if page_count > max_probe_pages:
+            start = max_probe_pages * page_size + 1
+            yield FetchResult(
+                key=_probe_page_key(start, page_size),
+                payload=None,
+                error=FetchErrorKind.PERMANENT,
+                expected_total=None,
+            )
+            return
+
+        pages = [
+            (start, _probe_page_key(start, page_size))
+            for start in range(1, page_count * page_size + 1, page_size)
+        ]
+        for index, (start, key) in enumerate(pages):
+            if key in skip:
+                continue
+            outcome = _fetch_probe_page(
+                client,
+                page_url(start, start + page_size - 1),
+                wrapper_key,
+            )
+            if outcome.terminal:
+                # 이전 라운드에서 확정한 행 수가 있는데 데이터 페이지가 사라지면
+                # 스냅샷이 호출 사이에 바뀐 것이다. 남은 범위를 모두 transient로
+                # 남겨 부분 snapshot을 완결로 오인하지 않는다.
+                for missing_start, missing_key in pages[index:]:
+                    if missing_key not in skip:
+                        yield FetchResult(
+                            key=missing_key,
+                            payload=None,
+                            error=FetchErrorKind.TRANSIENT,
+                            expected_total=None,
+                        )
+                return
+            yield FetchResult(
+                key=key,
+                payload=outcome.payload,
+                error=outcome.error,
+                expected_total=None,
+            )
+            if outcome.error is FetchErrorKind.FATAL:
+                return
+        return
+
+    page_start = 1
+    last_data_start: int | None = None
+    last_data_rows: int | None = None
+    while True:
+        page_number = ((page_start - 1) // page_size) + 1
+        key = _probe_page_key(page_start, page_size)
+
+        # max_probe_pages개의 데이터 페이지 뒤 딱 한 번 더 호출해 빈 끝을 확인한다.
+        # 그 호출에도 데이터가 있으면 설정 상한이 낮은 것이므로 조용히 자르지 않고
+        # 명시적인 누락으로 실패시킨다.
+        is_boundary_probe = page_number == max_probe_pages + 1
+        if page_number > max_probe_pages + 1:
+            raise AssertionError("probe 페이지 상한 검사가 누락됨")
+        if key in skip and not is_boundary_probe:
+            page_start += page_size
+            continue
+
+        outcome = _fetch_probe_page(
+            client,
+            page_url(page_start, page_start + page_size - 1),
+            wrapper_key,
+        )
+        if outcome.error is not None:
+            yield FetchResult(
+                key=key,
+                payload=None,
+                error=outcome.error,
+                expected_total=None,
+            )
+            if outcome.error is FetchErrorKind.FATAL or is_boundary_probe:
+                return
+            page_start += page_size
+            continue
+
+        if outcome.terminal:
+            if page_start == 1:
+                total = 0
+            elif last_data_start == page_start - page_size and last_data_rows is not None:
+                total = last_data_start - 1 + last_data_rows
+            else:
+                total = _recover_probe_total(
+                    page_start=page_start,
+                    page_size=page_size,
+                    skip=skip,
+                    client=client,
+                    page_url=page_url,
+                    wrapper_key=wrapper_key,
+                )
+            minimum_covered_total = _minimum_total_covered_by_probe_parts(skip)
+            if total is None or total < minimum_covered_total:
+                # 직전 라운드의 성공 payload는 그대로 두고 더 작아진 snapshot의
+                # terminal/row_count만 metadata로 확정하면 fetched>expected인 혼합
+                # Bronze가 정상 완료될 수 있다. 복구 불가능한 이번 라운드는 transient로
+                # 남겨 상위 라운드/quality gate가 fail-closed하게 처리한다.
+                yield FetchResult(
+                    key=f"probe-end-{page_start:05d}",
+                    payload=None,
+                    error=FetchErrorKind.TRANSIENT,
+                    expected_total=None,
+                )
+                return
+            yield FetchResult(
+                key=f"probe-end-{page_start:05d}",
+                payload=None,
+                error=None,
+                expected_total=total,
+                persist=False,
+            )
+            return
+
+        if is_boundary_probe:
+            yield FetchResult(
+                key=key,
+                payload=None,
+                error=FetchErrorKind.PERMANENT,
+                expected_total=None,
+            )
+            return
+
+        yield FetchResult(
+            key=key,
+            payload=outcome.payload,
+            error=None,
+            expected_total=None,
+        )
+        last_data_start = page_start
+        last_data_rows = outcome.row_count
+        page_start += page_size
 
 
 @adapter("seoul_openapi")
@@ -284,6 +540,17 @@ class SeoulOpenApiAdapter:
 
         def page_url(start: int, end: int) -> str:
             return f"{_BASE_URL}/{_api_key()}/json/{service}/{start}/{end}{suffix}/"
+
+        if params.get("pagination", "total") == "probe":
+            yield from _fetch_probe_pages(
+                params=params,
+                client=client,
+                page_url=page_url,
+                wrapper_key=wrapper_key,
+                skip=skip,
+                expected_total=expected_total,
+            )
+            return
 
         # total을 모르면 몇 페이지를 더 돌아야 하는지 알 수 없다.
         # expected_total로 이미 받았으면(라운드 재시도·백필) 그 값을 그대로 쓴다.
