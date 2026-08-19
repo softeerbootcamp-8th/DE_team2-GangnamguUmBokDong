@@ -1,7 +1,6 @@
 """10분 날씨 DAG의 구성을 검증한다."""
 
 from airflow.timetables.trigger import CronTriggerTimetable
-
 from config.schedules import WEATHER_10MIN_CRON
 from dags.weather_10min import dag
 
@@ -15,11 +14,16 @@ def test_schedule():
 
 def test_tasks_and_dependency():
     expected_tasks = {
-        "collect_weather_ultra_short_live", "load_weather_current",
-        "collect_weather_ultra_short_forecast", "load_weather_forecast_ultra",
+        "collect_weather_ultra_short_live",
+        "collect_weather_ultra_short_forecast",
+        "publish_weather_forecast",
     }
     assert set(dag.task_ids) == expected_tasks
-    collect = dag.get_task("collect_weather_ultra_short_live")
-    load = dag.get_task("load_weather_current")
-    assert load.task_id in {t.task_id for t in collect.downstream_list}
-    assert "--table weather_current" in load.bash_command
+    collect_live = dag.get_task("collect_weather_ultra_short_live")
+    collect_forecast = dag.get_task("collect_weather_ultra_short_forecast")
+    publish = dag.get_task("publish_weather_forecast")
+
+    assert collect_live.downstream_task_ids == set()
+    assert publish.upstream_task_ids == {collect_forecast.task_id}
+    assert "--publication weather-forecast" in publish.bash_command
+    assert "--table weather_current" not in publish.bash_command

@@ -2,6 +2,10 @@
 
 from orchestration.collector_task import COLLECTOR_DIR, build_collector_task
 from orchestration.db_loader_task import DB_LOADER_DIR, build_db_loader_task
+from orchestration.gold_publisher_task import (
+    GOLD_PUBLISHER_DIR,
+    build_gold_publisher_task,
+)
 from orchestration.inference_task import ML_DIR, build_inference_task
 from orchestration.normalizer_task import (
     NORMALIZER_DIR,
@@ -23,7 +27,10 @@ def test_repo_root_resolves_to_repository_root():
 def test_collector_task_uses_kst_window_start_and_own_project_environment(dag):
     task = build_collector_task(dag, "bike_station_realtime")
     assert task.bash_command.startswith("env -u VIRTUAL_ENV -u UV_PROJECT_ENVIRONMENT ")
-    assert "uv run --frozen python main.py --source bike_station_realtime" in task.bash_command
+    assert (
+        "uv run --frozen python main.py --source bike_station_realtime"
+        in task.bash_command
+    )
     assert "astimezone" in task.bash_command
     assert task.cwd == COLLECTOR_DIR
 
@@ -55,7 +62,10 @@ def test_inference_task_cwd_is_ml_not_ml_inference(dag):
     task = build_inference_task(dag)
     assert task.cwd == ML_DIR
     assert task.cwd.endswith("/ml")
-    assert "uv --project inference run python -m inference.predict_single" in task.bash_command
+    assert (
+        "uv --project inference run python -m inference.predict_single"
+        in task.bash_command
+    )
     assert "--all-stations" in task.bash_command
     assert "--n-hours 12" in task.bash_command
     assert "// 5" in task.bash_command
@@ -91,7 +101,8 @@ def test_all_pipeline_tasks_floor_manual_run_to_same_five_minute_window(dag):
         build_collector_task(dag, "bike_station_realtime"),
         build_normalizer_task(dag, "normalize", "strict"),
         build_inference_task(dag),
-        build_db_loader_task(dag, "station_stock"),
+        build_gold_publisher_task(dag, "station-release"),
+        build_db_loader_task(dag, "forecast_points"),
         build_urgency_task(dag),
         build_routes_task(dag),
     ]
@@ -106,6 +117,25 @@ def test_db_loader_task_table_flag(dag):
     assert task.cwd == DB_LOADER_DIR
     assert "--table forecast_points" in task.bash_command
     assert "--window-start" in task.bash_command
+
+
+def test_gold_publisher_task_uses_allowlisted_cli_contract(dag):
+    task = build_gold_publisher_task(dag, "event:cultural_event")
+
+    assert task.task_id == "publish_event_cultural_event"
+    assert task.cwd == GOLD_PUBLISHER_DIR == DB_LOADER_DIR
+    assert "uv run --frozen python gold_cli.py" in task.bash_command
+    assert "--publication event:cultural_event" in task.bash_command
+    assert "--window-start" in task.bash_command
+    assert "astimezone" in task.bash_command
+    assert task.trigger_rule == "all_success"
+
+
+def test_gold_publisher_task_rejects_unregistered_publication(dag):
+    import pytest
+
+    with pytest.raises(ValueError, match="지원하지 않는"):
+        build_gold_publisher_task(dag, "station; unsafe")
 
 
 def test_all_module_wrappers_attach_success_and_failure_callbacks(dag):
@@ -123,16 +153,19 @@ def test_replay_template_renders_to_a_whole_hour_earlier():
 
     import jinja2
     from airflow.sdk.execution_time import macros
-
     from orchestration.templates import KST_WINDOW_START, kst_window_start_shifted
 
     kst = timezone(timedelta(hours=9))
     context = {
         # 5분 경계가 아닌 수동 trigger 시각. 19:33 -> 19:30으로 내림된 뒤 이동해야 한다.
-        "dag_run": type("R", (), {
-            "logical_date": datetime(2026, 8, 18, 19, 33, 12, tzinfo=kst),
-            "start_date": None,
-        })(),
+        "dag_run": type(
+            "R",
+            (),
+            {
+                "logical_date": datetime(2026, 8, 18, 19, 33, 12, tzinfo=kst),
+                "start_date": None,
+            },
+        )(),
         "macros": macros,
     }
     env = jinja2.Environment()
@@ -168,10 +201,14 @@ def test_daily_replay_templates_render_d_minus_six_boundaries():
 
     kst = timezone(timedelta(hours=9))
     context = {
-        "dag_run": type("R", (), {
-            "logical_date": datetime(2026, 8, 19, 4, 30, tzinfo=kst),
-            "start_date": None,
-        })(),
+        "dag_run": type(
+            "R",
+            (),
+            {
+                "logical_date": datetime(2026, 8, 19, 4, 30, tzinfo=kst),
+                "start_date": None,
+            },
+        )(),
         "macros": macros,
     }
     env = jinja2.Environment()
@@ -187,7 +224,6 @@ def test_daily_replay_templates_render_d_minus_six_boundaries():
 
 def test_replay_collector_task_contract(dag):
     from airflow.task.trigger_rule import TriggerRule
-
     from orchestration.collector_task import build_collector_replay_task
 
     task = build_collector_replay_task(dag, "bike_rental_history", 1)
