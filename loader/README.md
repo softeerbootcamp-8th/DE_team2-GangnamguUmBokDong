@@ -27,7 +27,7 @@ S3 실버 계층(Silver Parquet) 및 머신러닝 추론 결과(ML Predictions)�
 | `weather_forecast` | `weather_forecast` | `weather_short_term_forecast` | `[gu, forecast_dttm]` | 하늘상태(SKY), 강수형태(PTY), 기온(TMP), 강수확률(POP), 강수량(PCP), 습도, 풍속 |
 | `weather_forecast_ultra` | `weather_forecast` | `weather_ultra_short_forecast` | `[gu, forecast_dttm]` | 하늘상태(SKY), 강수형태(PTY), 기온(T1H), 강수량(RN1), 습도, 풍속 |
 | `cultural_events` | `cultural_events` | `cultural_event` | `[event_id]` | 행사명, 카테고리, 자치구, 장소, 시작일, 종료일, 유/무료, 위도, 경도 |
-| `cultural_events_performance` | `cultural_events` | `performance_event` | `[event_id]` | 공연명, 카테고리, 자치구, 장소, 시작일, 종료일, 유/무료, 위도, 경도 |
+| `cultural_events_performance` | `cultural_events` | `performance_event` | `[event_id]` | 공연명, 카테고리, 자치구, 장소, 시작일, 종료일, 이용료 원문, 위도, 경도 |
 | `forecast_points` | `forecast_points` | `ml_predictions` | `[sta_id, predicted_dttm]` | 예측 대여량, 예측 반납량, 배치 실행 시각 |
 
 ---
@@ -41,7 +41,10 @@ S3 실버 계층(Silver Parquet) 및 머신러닝 추론 결과(ML Predictions)�
 
 ### ② 다중 소스의 단일 Gold 테이블 병합 (`_TABLE_ALIASES`)
 S3의 서로 다른 데이터 소스가 Gold DB의 동일한 단일 테이블로 통합 적재되는 구조를 지원합니다:
-1. **문화/공연 행사 병합**: 서울시 문화행사(`cultural_events`)와 공공서비스예약 공연(`cultural_events_performance`)이 단일 **`cultural_events`** 테이블로 적재됩니다. 고유 ID는 서울시 서비스ID(`SVCID`) 또는 제목+장소+시작일 기반 SHA256 해시를 사용합니다.
+1. **문화/공연 행사 병합**: 서울시 문화행사(`cultural_events`)와 체육시설 공연행사(`cultural_events_performance`)가 단일 **`cultural_events`** 테이블로 적재됩니다. 고유 ID는 문화행사의 경우 제목+장소+시작일 기반 SHA256 해시, 체육시설 공연행사의 경우 일정 순번(`SCH_SEQ`)을 사용합니다.
+   - 체육시설 공연행사 API는 좌표를 제공하지 않으므로, 시설 코드(`SCH_CODE_B`) → 좌표 마스터(`assets/stadium_coords.json`, 11개 시설)를 조회해 `lat`/`lon`을 채우고 `gu`는 좌표에서 도출합니다. 좌표가 없으면 `apps/api`의 위경도 반경 조회에서 전 행이 걸러지기 때문입니다. 마스터에 없는 시설 코드는 좌표 없이 적재되고 경고 로그가 남습니다.
+   - 카테고리·장소는 숫자 코드(`SCH_CODE_A`/`SCH_CODE_B`)가 아니라 이름 필드(`CODE_TITLE_A`/`CODE_TITLE_B`)를 씁니다.
+   - `is_free`에는 원본 `USE_PAY` 문자열을 그대로 싣습니다 — 가격표·안내 URL·`"없음"` 등이 섞인 자유 텍스트라 유/무료로 정규화하지 않습니다.
 2. **날씨 예보 병합**: 기상청 단기예보(`weather_forecast`)와 초단기예보(`weather_forecast_ultra`)가 단일 **`weather_forecast`** 테이블로 적재됩니다. 동일한 `(자치구, 예보 시점)`에 대해 최신 발표 일시(`base_dttm`) 데이터가 유지됩니다.
 
 ### ③ 기상청 비정형 강수량 파싱 (`_parse_precip_str`)
