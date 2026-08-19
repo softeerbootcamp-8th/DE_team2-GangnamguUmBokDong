@@ -2,8 +2,10 @@
 
 import pyarrow as pa
 import pytest
+from core.weather_grid import latlon_to_grid
 from pyproj import Transformer
-from station_master import enrich_station_master
+
+from station_master import _OUTPUT_SCHEMA, enrich_station_master
 
 
 def _cell_center_wgs84(cell_id: str) -> tuple[float, float]:
@@ -58,3 +60,42 @@ def test_enrich_station_master_rejects_low_grid_coverage():
 
     with pytest.raises(ValueError, match="매핑률이 기준 미달"):
         enrich_station_master(master, baseline)
+
+
+def test_enrich_station_master_adds_weather_grid_for_valid_coordinates():
+    """유효 좌표 대여소에는 기상청 5km 격자(nx, ny)가 함께 실린다."""
+    cell_id = "다사53815262"
+    lat, lon = _cell_center_wgs84(cell_id)
+    master = pa.Table.from_pylist(
+        [{"RNTLS_ID": "ST-1", "ADDR1": "주소", "ADDR2": "1", "LAT": lat, "LOT": lon}]
+    )
+    baseline = pa.Table.from_pylist([{"CELL_ID": cell_id}])
+
+    result, _ = enrich_station_master(master, baseline)
+    [row] = result.to_pylist()
+
+    assert (row["weather_nx"], row["weather_ny"]) == latlon_to_grid(lat, lon)
+
+
+def test_enrich_station_master_weather_grid_is_none_when_coordinates_missing():
+    """좌표가 유효하지 않은 대여소의 weather_nx/weather_ny는 None이다."""
+    cell_id = "다사53815262"
+    lat, lon = _cell_center_wgs84(cell_id)
+    master = pa.Table.from_pylist(
+        [{"RNTLS_ID": f"ST-{i}", "ADDR1": "주소", "ADDR2": str(i), "LAT": lat, "LOT": lon} for i in range(19)]
+        + [{"RNTLS_ID": "ST-BAD", "ADDR1": "주소", "ADDR2": "bad", "LAT": 0.0, "LOT": 0.0}]
+    )
+    baseline = pa.Table.from_pylist([{"CELL_ID": cell_id}])
+
+    result, metrics = enrich_station_master(master, baseline)
+    rows = {row["station_id"]: row for row in result.to_pylist()}
+
+    assert metrics["grid_coverage"] == 0.95
+    assert rows["ST-BAD"]["weather_nx"] is None
+    assert rows["ST-BAD"]["weather_ny"] is None
+
+
+def test_output_schema_declares_weather_grid_columns():
+    """스키마 계약: 소비 측이 컬럼 존재를 가정할 수 있어야 한다."""
+    assert _OUTPUT_SCHEMA.field("weather_nx").type == pa.int64()
+    assert _OUTPUT_SCHEMA.field("weather_ny").type == pa.int64()

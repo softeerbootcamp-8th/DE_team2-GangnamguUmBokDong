@@ -9,6 +9,7 @@ from orchestration.normalizer_task import (
     build_station_master_enrichment_task,
 )
 from orchestration.nowcasting_task import NOWCASTING_DIR, build_nowcasting_task
+from orchestration.routes_task import build_routes_task
 from orchestration.task_builder import REPO_ROOT
 from orchestration.urgency_task import REBALANCE_DIR, build_urgency_task
 
@@ -73,6 +74,17 @@ def test_urgency_task_cwd_and_flags(dag):
     assert "--minute" in task.bash_command
 
 
+def test_routes_task_cwd_and_flags(dag):
+    """urgency_task와 같은 이유로 flat 레이아웃 호출 규칙(uv run --frozen)을 쓴다."""
+    task = build_routes_task(dag)
+    assert task.cwd == REBALANCE_DIR
+    assert task.cwd.endswith("/rebalance")
+    assert "uv run --frozen python routes_main.py" in task.bash_command
+    assert "--date" in task.bash_command
+    assert "--hour" in task.bash_command
+    assert "--minute" in task.bash_command
+
+
 def test_all_pipeline_tasks_floor_manual_run_to_same_five_minute_window(dag):
     """수동 trigger의 19:33도 모든 모듈에서 동일하게 19:30으로 내림한다."""
     tasks = [
@@ -81,6 +93,7 @@ def test_all_pipeline_tasks_floor_manual_run_to_same_five_minute_window(dag):
         build_inference_task(dag),
         build_db_loader_task(dag, "station_stock"),
         build_urgency_task(dag),
+        build_routes_task(dag),
     ]
 
     for task in tasks:
@@ -110,6 +123,7 @@ def test_replay_template_renders_to_a_whole_hour_earlier():
 
     import jinja2
     from airflow.sdk.execution_time import macros
+
     from orchestration.templates import KST_WINDOW_START, kst_window_start_shifted
 
     kst = timezone(timedelta(hours=9))
@@ -173,6 +187,7 @@ def test_daily_replay_templates_render_d_minus_six_boundaries():
 
 def test_replay_collector_task_contract(dag):
     from airflow.task.trigger_rule import TriggerRule
+
     from orchestration.collector_task import build_collector_replay_task
 
     task = build_collector_replay_task(dag, "bike_rental_history", 1)

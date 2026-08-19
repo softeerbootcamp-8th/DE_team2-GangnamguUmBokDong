@@ -101,8 +101,8 @@ class _PageOutcome:
     error: FetchErrorKind | None
 
 
-def _fetch_page(client: httpx.Client, url: str, wrapper_key: str) -> _PageOutcome:
-    """페이지 하나를 받아 실패 범주까지 판정한다. 예외를 밖으로 던지지 않는다.
+def _request_json(client: httpx.Client, url: str) -> tuple[bytes, dict] | FetchErrorKind:
+    """URL을 요청해 JSON 객체로 파싱한다. 예외를 밖으로 던지지 않는다.
 
     스레드풀에서 병렬 호출되므로 공유 상태를 두지 않는다. `httpx.Client`는 스레드
     안전하고, 하나를 공유하면 커넥션 풀도 재사용된다.
@@ -115,7 +115,16 @@ def _fetch_page(client: httpx.Client, url: str, wrapper_key: str) -> _PageOutcom
             raise json.JSONDecodeError("응답이 JSON 객체가 아님", "", 0)
     except (httpx.RequestError, httpx.HTTPStatusError, json.JSONDecodeError):
         # 타임아웃·커넥션 에러, 또는 서버가 5xx와 함께 HTML을 내려보내 파싱에 실패한 경우
-        return _PageOutcome(payload=None, total=None, error=FetchErrorKind.TRANSIENT)
+        return FetchErrorKind.TRANSIENT
+    return response.content, body
+
+
+def _fetch_page(client: httpx.Client, url: str, wrapper_key: str) -> _PageOutcome:
+    """페이지 하나를 받아 실패 범주까지 판정한다."""
+    result = _request_json(client, url)
+    if isinstance(result, FetchErrorKind):
+        return _PageOutcome(payload=None, total=None, error=result)
+    content, body = result
 
     # 서울 API는 보통 HTTP 200으로 응답하고, 논리적 성공/실패는 본문 코드에 담아 보낸다
     category = _classify(_result_code(body, wrapper_key))
@@ -124,7 +133,63 @@ def _fetch_page(client: httpx.Client, url: str, wrapper_key: str) -> _PageOutcom
 
     wrapper = _extract(body, wrapper_key)
     raw_total = wrapper.get("list_total_count", 0) if isinstance(wrapper, dict) else 0
-    return _PageOutcome(payload=response.content, total=int(raw_total), error=None)
+    return _PageOutcome(payload=content, total=int(raw_total), error=None)
+
+
+def _fetch_poi(client: httpx.Client, url: str, wrapper_key: str) -> _PageOutcome:
+    """실시간 인구 POI 하나를 받아 실패 범주까지 판정한다."""
+    result = _request_json(client, url)
+    if isinstance(result, FetchErrorKind):
+        return _PageOutcome(payload=None, total=None, error=result)
+    content, body = result
+
+    # citydata_ppltn은 일반 페이지 응답과 달리 RESULT.CODE가 최상단 RESULT 객체의
+    # `RESULT.CODE` 키로 내려온다. 빈 POI(INFO-200)도 성공 조각으로 보존한다.
+    code = body.get("RESULT.CODE") or body.get("RESULT", {}).get("RESULT.CODE")
+    category = _classify(code)
+    if category is not None:
+        return _PageOutcome(payload=None, total=None, error=category)
+    return _PageOutcome(payload=content, total=None, error=None)
+
+
+def _run_concurrent(items, concurrency: int, fetch_one, thread_name_prefix: str):
+    """items 순서를 유지하며 fetch_one(item)을 동시 실행해 (item, outcome) 순서대로 yield한다.
+
+    완료 순서대로 내보내면(as_completed) 조각 키 순서가 흔들리므로, 앞 항목을 기다리는
+    동안에도 뒤 요청은 이미 나가 있게 해 전체 소요를 완료순과 같게 만든다. 미리 요청하는
+    개수를 concurrency의 2배로 묶는 이유는 메모리다 — 전부 던져두면 완료됐지만 아직
+    내보내지 않은 응답이 쌓인다.
+    """
+    pool = ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix=thread_name_prefix)
+    try:
+        queued = iter(items)
+        inflight: deque[tuple[object, Future[_PageOutcome]]] = deque()
+
+        def submit_next() -> bool:
+            item = next(queued, None)
+            if item is None:
+                return False
+            inflight.append((item, pool.submit(fetch_one, item)))
+            return True
+
+        for _ in range(concurrency * 2):
+            if not submit_next():
+                break
+
+        while inflight:
+            item, future = inflight.popleft()
+            outcome = future.result()
+            submit_next()
+            yield item, outcome
+            if outcome.error is FetchErrorKind.FATAL:
+                # 모든 조각이 같은 인증키를 쓰므로 나머지도 같은 이유로 실패한다.
+                return
+    finally:
+        # `with ThreadPoolExecutor(...)`를 쓰면 __exit__이 shutdown(wait=True)라
+        # 큐에 남은 항목이 끝날 때까지 블록한다. fetch_with_rounds가 마감 시한을
+        # 넘겨 순회를 중단하고 이 제너레이터를 버릴 때 그 대기가 마감 시한 방어를
+        # 무력화한다. 실행 중인 요청은 끊을 수 없지만 대기 큐는 즉시 비운다.
+        pool.shutdown(wait=False, cancel_futures=True)
 
 
 @adapter("seoul_openapi")
@@ -182,56 +247,39 @@ class SeoulOpenApiAdapter:
             if poi_start < 1 or poi_end < poi_start:
                 raise ValueError("citydata_ppltn의 poi_start/poi_end 범위가 올바르지 않습니다")
 
-            # expected_total은 pipeline에서 기대 row 수를 뜻한다. POI 범위 크기는
-            # 요청 조각 수이고 INFO-200 조각은 정상적으로 0행일 수 있으므로, 여기서는
-            # None을 유지해 실제 요청 실패만 조각 기준 missing_ratio로 계산한다.
+            pois = []
             for i in range(poi_start, poi_end + 1):
                 poi_id = f"POI{i:03d}"
                 key = f"poi-{poi_id}"
-                
-                if key in skip:
-                    continue
-                
-                url = f"{_BASE_URL}/{_api_key()}/json/{service}/1/5/{poi_id}/"
-                try:
-                    response = client.get(url)
-                    response.raise_for_status()
-                    body = json.loads(response.content)
-                    wrapper = _extract(body, wrapper_key)
-                except (httpx.RequestError, httpx.HTTPStatusError, json.JSONDecodeError):
-                    yield FetchResult(
-                        key=key,
-                        payload=None,
-                        error=FetchErrorKind.TRANSIENT,
-                        expected_total=None,
-                    )
-                    continue
+                if key not in skip:
+                    url = f"{_BASE_URL}/{_api_key()}/json/{service}/1/5/{poi_id}/"
+                    pois.append((key, url))
 
-                code = body.get("RESULT.CODE") or body.get("RESULT", {}).get("RESULT.CODE")
-                category = _classify(code)
+            # expected_total은 pipeline에서 기대 row 수를 뜻한다. POI 범위 크기는
+            # 요청 조각 수이고 INFO-200 조각은 정상적으로 0행일 수 있으므로, 여기서는
+            # None을 유지해 실제 요청 실패만 조각 기준 missing_ratio로 계산한다.
+            concurrency = max(1, int(params.get("concurrency", _DEFAULT_CONCURRENCY)))
+            if concurrency == 1:
+                for key, url in pois:
+                    outcome = _fetch_poi(client, url, wrapper_key)
+                    yield FetchResult(
+                        key=key, payload=outcome.payload, error=outcome.error,
+                        expected_total=None,
+                    )
+                    if outcome.error is FetchErrorKind.FATAL:
+                        return
+                return
 
-                if category is None:
-                    yield FetchResult(
-                        key=key,
-                        payload=response.content,
-                        error=None,
-                        expected_total=None,
-                    )
-                elif category is FetchErrorKind.FATAL:
-                    yield FetchResult(
-                        key=key,
-                        payload=None,
-                        error=category,
-                        expected_total=None,
-                    )
-                    return
-                else:
-                    yield FetchResult(
-                        key=key,
-                        payload=None,
-                        error=category,
-                        expected_total=None,
-                    )
+            # 조각 순서는 유지하되 네트워크 요청은 미리 병렬로 시작한다.
+            def fetch_one_poi(item: tuple[str, str]) -> _PageOutcome:
+                _, url = item
+                return _fetch_poi(client, url, wrapper_key)
+
+            for (key, _url), outcome in _run_concurrent(pois, concurrency, fetch_one_poi, "seoul-poi"):
+                yield FetchResult(
+                    key=key, payload=outcome.payload, error=outcome.error,
+                    expected_total=None,
+                )
             return
 
         def page_url(start: int, end: int) -> str:
@@ -298,46 +346,17 @@ class SeoulOpenApiAdapter:
                     return
             return
 
-        # 순서를 유지하면서 앞으로 몇 페이지를 미리 요청해 둔다. 완료 순서대로
-        # 내보내면(as_completed) 조각 키 순서가 흔들리는데, 앞 페이지를 기다리는
-        # 동안에도 뒤 요청은 이미 나가 있으므로 전체 소요는 완료순과 같다.
-        #
-        # 미리 요청하는 개수를 concurrency의 2배로 묶는 이유는 메모리다. 전부
-        # 던져두면 완료됐지만 아직 내보내지 않은 응답이 쌓인다 —
-        # living_population_grid는 254페이지라 페이지당 1.4MB면 수백 MB가 된다.
-        pool = ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="seoul-page")
-        try:
-            queued = iter(pages)
-            inflight: deque[tuple[str, int, Future[_PageOutcome]]] = deque()
+        # living_population_grid는 254페이지라 페이지당 1.4MB면 수백 MB가 된다 —
+        # 그래서 _run_concurrent가 미리 요청하는 개수를 concurrency의 2배로 묶는다.
+        def fetch_one_page(item: tuple[str, int, int]) -> _PageOutcome:
+            _, start, end = item
+            return _fetch_page(client, page_url(start, end), wrapper_key)
 
-            def submit_next() -> bool:
-                item = next(queued, None)
-                if item is None:
-                    return False
-                key, start, end = item
-                inflight.append((key, start, pool.submit(_fetch_page, client, page_url(start, end), wrapper_key)))
-                return True
-
-            for _ in range(concurrency * 2):
-                if not submit_next():
-                    break
-
-            while inflight:
-                key, start, future = inflight.popleft()
-                outcome = future.result()
-                submit_next()
-                yield FetchResult(
-                    key=key, payload=outcome.payload, error=outcome.error,
-                    expected_total=total if start == 1 else None,
-                )
-                if outcome.error is FetchErrorKind.FATAL:
-                    return
-        finally:
-            # `with ThreadPoolExecutor(...)`를 쓰면 __exit__이 shutdown(wait=True)라
-            # 큐에 남은 페이지가 끝날 때까지 블록한다. fetch_with_rounds가 마감 시한을
-            # 넘겨 순회를 중단하고 이 제너레이터를 버릴 때 그 대기가 마감 시한 방어를
-            # 무력화한다. 실행 중인 요청은 끊을 수 없지만 대기 큐는 즉시 비운다.
-            pool.shutdown(wait=False, cancel_futures=True)
+        for (key, start, _end), outcome in _run_concurrent(pages, concurrency, fetch_one_page, "seoul-page"):
+            yield FetchResult(
+                key=key, payload=outcome.payload, error=outcome.error,
+                expected_total=total if start == 1 else None,
+            )
 
     @staticmethod
     def normalize(chunks: list[bytes], config: SourceConfig) -> list[dict]:

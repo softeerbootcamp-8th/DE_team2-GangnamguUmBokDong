@@ -14,7 +14,7 @@ import math
 from datetime import datetime
 
 import pandas as pd
-import reader
+from core.db import fetch_all
 from core.forecast import enrich_forecast_points
 from core.scoring_config import (
     FIRST_FORECAST_MIN,
@@ -23,6 +23,8 @@ from core.scoring_config import (
     SEVERITY_SCALE,
     SUPPLY_LOW_STOCK_RATIO,
 )
+
+import reader
 
 logger = logging.getLogger(__name__)
 
@@ -113,6 +115,31 @@ def _severity(ratio: float) -> float:
     return 1 - math.exp(-ratio / SEVERITY_SCALE)
 
 
+def _severity_qty(current: int, hold_cnt: int, action_type: str, points: list[dict]) -> int:
+    """urgency_score의 심각도 계산에 쓰는 초과/부족량(회수필요는 정원 초과분,
+    공급필요는 부족분과 미충족수요 중 더 큰 값) — 예측 구간 전체에서 가장
+    심해지는 시점 기준이라 물리적 한계로 클램프하지 않은 원본값이다. 이 값은
+    "얼마나 위험한가"를 비교하는 랭킹 지표라, 지금 당장 트럭에 실을 수 있는
+    양과는 별개다(bike_qty 참고)."""
+    if action_type == "retrieval_needed":
+        return _max_overshoot(current, hold_cnt, points)
+    return max(_max_deficit(current, points), _max_unmet_demand(current, hold_cnt, points))
+
+
+def bike_qty(current: int, hold_cnt: int, action_type: str, points: list[dict]) -> int:
+    """실제로 트럭이 싣고 내릴 수 있는 자전거 대수. _severity_qty는 예측 구간
+    전체에서 가장 심해지는 시점 기준값이라, 그 값을 그대로 실물 이동량으로 쓰면
+    지금 당장의 물리적 한계를 넘어설 수 있다 — 회수필요는 지금 있는 것보다 많이
+    실으라고 할 수 있고, 공급필요는 목적지 빈 거치대보다 많이 내리라고 할 수
+    있다. 그래서 각각 지금 실을 수 있는 한도(현재 재고)와 내릴 수 있는 한도
+    (빈 거치대 수)로 클램프한다. action_type이 normal이면 옮길 필요가 없다."""
+    if action_type == "retrieval_needed":
+        return min(current, _severity_qty(current, hold_cnt, action_type, points))
+    if action_type == "supply_needed":
+        return min(_severity_qty(current, hold_cnt, action_type, points), max(0, hold_cnt - current))
+    return 0
+
+
 def urgency_score(
     current: int,
     hold_cnt: int,
@@ -159,10 +186,7 @@ def urgency_score(
     # hold_cnt=0(신규/이상 등록 등)인 대여소가 들어오면 division by zero로 배치가
     # 죽으므로, 최소 1로 방어한다.
     safe_hold_cnt = max(hold_cnt, 1)
-    if action_type == "retrieval_needed":
-        ratio = _max_overshoot(current, hold_cnt, points) / safe_hold_cnt
-    else:
-        ratio = max(_max_deficit(current, points), _max_unmet_demand(current, hold_cnt, points)) / safe_hold_cnt
+    ratio = _severity_qty(current, hold_cnt, action_type, points) / safe_hold_cnt
     impact_factor = _severity(ratio)
 
     score = round(100 * time_factor * impact_factor, 1)
@@ -187,11 +211,23 @@ def _predicted_points_by_station(predictions: pd.DataFrame) -> dict[str, list[di
     return by_station
 
 
+def _known_station_ids() -> set[str]:
+    """stations 테이블에 실제로 존재하는 sta_id 집합. compute_all()의 계산은 전부
+    S3에서만 읽지만, 서울 자치구 경계 밖 좌표(loader/transform.py:stations_from_silver가
+    적재 시 거르는 대상)의 대여소가 결과에 남으면 station_urgency와
+    rebalance_route_stops 양쪽 다 sta_id FK 위반으로 loader 적재가 실패하므로,
+    이 필터 하나만 예외적으로 RDS를 읽는다(routes.py의 dispatched 넷팅 조회와
+    같은 성격)."""
+    rows = fetch_all("SELECT sta_id FROM stations")
+    return {row["sta_id"] for row in rows}
+
+
 def compute_all(anchor: datetime) -> pd.DataFrame:
     """anchor 시점 기준 전체 대여소의 urgency_score를 계산한다.
 
-    입력은 전부 S3(재고 이력·예측 결과)에서만 읽는다 — RDS는 이 배치가 만든 결과를
-    loader가 station_urgency에 적재할 때만 쓰인다(배치 자신은 RDS를 건드리지 않음).
+    입력은 대부분 S3(재고 이력·예측 결과)에서 읽는다 — RDS는 이 배치가 만든 결과를
+    loader가 station_urgency에 적재할 때 쓰이는 것 외에, sta_id FK 안전성 확인
+    (_known_station_ids)을 위해서만 좁게 읽는다.
     """
     if anchor.minute % 5 or anchor.second or anchor.microsecond:
         raise ValueError(f"anchor must align to a 5-minute tick: {anchor}")
@@ -219,6 +255,15 @@ def compute_all(anchor: datetime) -> pd.DataFrame:
         )
     computable_station_ids = set(current_histories) & set(points_by_station)
 
+    known_station_ids = _known_station_ids()
+    unknown_stations = computable_station_ids - known_station_ids
+    if unknown_stations:
+        logger.warning(
+            "excluding %d stations not present in stations table (outside Seoul gu boundary)",
+            len(unknown_stations),
+        )
+    computable_station_ids &= known_station_ids
+
     rows = []
     for sta_id in sorted(computable_station_ids):
         history = current_histories[sta_id]
@@ -231,9 +276,15 @@ def compute_all(anchor: datetime) -> pd.DataFrame:
         rows.append(
             {
                 "sta_id": sta_id,
+                "lat": history[-1]["lat"],
+                "lon": history[-1]["lon"],
                 "urgency_score": score,
                 "minutes_until_critical": minutes,
                 "action_type": action_type,
+                "bike_qty": bike_qty(current, hold_cnt, action_type, points),
             }
         )
-    return pd.DataFrame(rows, columns=["sta_id", "urgency_score", "minutes_until_critical", "action_type"])
+    return pd.DataFrame(
+        rows,
+        columns=["sta_id", "lat", "lon", "urgency_score", "minutes_until_critical", "action_type", "bike_qty"],
+    )

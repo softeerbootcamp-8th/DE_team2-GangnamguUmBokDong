@@ -8,6 +8,8 @@ from transform import (
     cultural_events_from_silver,
     forecast_points_from_predictions,
     performance_events_from_silver,
+    rebalance_route_stops_from_route_stops_batch,
+    rebalance_routes_from_routes_batch,
     station_stock_from_silver,
     station_urgency_from_urgency_batch,
     stations_from_silver,
@@ -426,9 +428,12 @@ def test_station_urgency_from_urgency_batch_maps_columns():
         [
             {
                 "sta_id": "101",
+                "lat": 37.5172,
+                "lon": 127.0473,
                 "urgency_score": 48.7,
                 "minutes_until_critical": 0,
                 "action_type": "supply_needed",
+                "bike_qty": 10,
             }
         ]
     )
@@ -441,5 +446,44 @@ def test_station_urgency_from_urgency_batch_maps_columns():
         "urgency_score": 48.7,
         "minutes_until_critical": 0,
         "action_type": "supply_needed",
+        "bike_qty": 10,
         "batch_run_at": batch_run_at,
     }
+
+
+def test_rebalance_routes_from_routes_batch_converts_kst_proposed_at_to_utc():
+    df = pd.DataFrame(
+        [
+            {
+                "route_id": "r1",
+                "region": "세종로",
+                "status": "proposed",
+                "proposed_at": pd.Timestamp(2026, 8, 16, 14, 5),  # KST 벽시계
+            }
+        ]
+    )
+
+    [record] = rebalance_routes_from_routes_batch(df)
+
+    assert record == {
+        "route_id": "r1",
+        "region": "세종로",
+        "status": "proposed",
+        "proposed_at": datetime(2026, 8, 16, 5, 5, tzinfo=UTC),  # KST 14:05 -> UTC 05:05
+    }
+
+
+def test_rebalance_route_stops_from_route_stops_batch_maps_columns():
+    df = pd.DataFrame(
+        [
+            {"route_id": "r1", "visit_order": 1, "sta_id": "101", "action": "pickup", "bike_cnt": 8},
+            {"route_id": "r1", "visit_order": 2, "sta_id": "102", "action": "dropoff", "bike_cnt": 8},
+        ]
+    )
+
+    records = rebalance_route_stops_from_route_stops_batch(df)
+
+    assert records == [
+        {"route_id": "r1", "visit_order": 1, "sta_id": "101", "action": "pickup", "bike_cnt": 8},
+        {"route_id": "r1", "visit_order": 2, "sta_id": "102", "action": "dropoff", "bike_cnt": 8},
+    ]

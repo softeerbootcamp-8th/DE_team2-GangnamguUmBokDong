@@ -9,23 +9,11 @@ from __future__ import annotations
 
 import argparse
 import sys
-from datetime import datetime
 
-import pandas as pd
-import urgency
 from core.s3 import write_parquet
 
-
-def _anchor_timestamp(date: str, hour: int, minute: int) -> pd.Timestamp:
-    """date+hour+minute(KST 벽시계 시각)을 합쳐 anchor 시각을 만든다. S3 dt=/hh=/HHMM
-    파티션 키(추론기·loader와 동일 규칙)를 그대로 여기서도 쓴다. ml/inference의
-    _target_timestamp와 같은 이유로 pd.Timestamp를 쓴다(naive datetime을
-    datetime.strptime으로 직접 만들면 tzinfo 누락으로 오해되기 쉬움)."""
-    return pd.Timestamp(date) + pd.Timedelta(hours=hour, minutes=minute)
-
-
-def _urgency_key(window_start: datetime) -> str:
-    return f"urgency/dt={window_start:%Y-%m-%d}/hh={window_start:%H}/urgency_{window_start:%H%M}.parquet"
+import urgency
+from reader import _urgency_key, anchor_timestamp
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -38,7 +26,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.minute % 5:
         parser.error("--minute must be aligned to a 5-minute tick")
 
-    anchor = _anchor_timestamp(args.date, args.hour, args.minute)
+    anchor = anchor_timestamp(args.date, args.hour, args.minute)
     result = urgency.compute_all(anchor)
 
     out_path = _urgency_key(anchor)
