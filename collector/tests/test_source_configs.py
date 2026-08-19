@@ -83,6 +83,7 @@ class TestAllSourcesLoad:
 
         assert config.adapter_params["poi_start"] == 1
         assert config.adapter_params["poi_end"] == 121
+        assert config.adapter_params["concurrency"] == 4
 
     @pytest.mark.parametrize(
         "adapter_params",
