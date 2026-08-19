@@ -38,8 +38,8 @@ def test_forecast_points_reader_delegates_to_read_predictions(monkeypatch):
 def test_station_urgency_table_spec_registered():
     spec = TABLE_SPECS["station_urgency"]
 
-    assert spec.conflict_cols == ["batch_run_at", "sta_id"]
-    assert spec.update_cols == ["urgency_score", "minutes_until_critical", "action_type"]
+    assert spec.conflict_cols == ["sta_id"]
+    assert spec.update_cols == ["urgency_score", "minutes_until_critical", "action_type", "batch_run_at"]
     assert spec.reader is not None
 
 
