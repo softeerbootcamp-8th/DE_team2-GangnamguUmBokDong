@@ -16,6 +16,8 @@ from zoneinfo import ZoneInfo
 import httpx
 import pytest
 
+pytestmark = pytest.mark.usefixtures("_bucket")
+
 import config.loader as config_loader
 import pipeline
 from adapters import (  # noqa: F401 — @adapter 등록을 위한 import

@@ -9,6 +9,7 @@ from datetime import date, datetime
 
 import boto3
 import pyarrow as pa
+import pytest
 
 import storage as storage_module
 from storage import (
@@ -19,6 +20,8 @@ from storage import (
     write_silver,
 )
 from tests.conftest import KST, TEST_BUCKET
+
+pytestmark = pytest.mark.usefixtures("_bucket")
 
 DAY = date(2026, 8, 12)
 
