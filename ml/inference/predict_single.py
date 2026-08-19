@@ -814,24 +814,29 @@ def _censored_rental_recent(
 def _target_timestamp(date: str, hour: int, minute: int = 0) -> pd.Timestamp:
     """date+hour+minute을 target_ts로 조합한다.
 
-    `minute`은 반드시 `config.GRID_TICK_MINUTES`의 배수여야 한다 — 그보다 더 잘게
-    쪼갠 시각을 요청해도 학습 데이터(feature_engine의 같은 tick 그리드)에 대응하는
-    tick이 없어서 lag 앵커가 의미를 잃는다.
+    `minute`이 `config.GRID_TICK_MINUTES`(학습 anchor 그리드, 기본 20분)의 배수일
+    필요는 없다 — lag/날씨/재고/인구는 전부 `_lag_rolling_features()`/
+    `_get_recent_weather()` 등이 실시간 Silver를 그 시각 기준으로 직접 point-in-time
+    계산하므로 사전에 만들어둔 tick 그리드를 찾아 조회하지 않는다(학습 anchor
+    그리드는 8억 행 규모 multi-horizon 테이블의 행 수를 줄이려고 넓힌 것일 뿐,
+    실시간 서빙 경로와는 무관 — `_profile_stat()`처럼 오프라인 프로필로 fallback할
+    때만 grid-tick 조회라 off-grid 분은 거기서만 NaN이 된다, LightGBM이 결측을
+    네이티브로 처리). Airflow가 5분 주기로 서빙을 돌리므로(`realtime_5min.py`) 이
+    tick보다 촘촘한 실제 시각을 그대로 받아야 한다 — 0~59 범위만 확인한다.
 
     args:
         date: "YYYY-MM-DD"
         hour: 0~23
-        minute: 0~59 중 GRID_TICK_MINUTES의 배수 (기본값 0 — 정시)
+        minute: 0~59
     returns:
         pd.Timestamp: date+hour+minute을 합친 시각
     raises:
-        ValueError: hour가 0~23 밖이거나 minute이 0~59 밖이거나 GRID_TICK_MINUTES의
-            배수가 아닐 때
+        ValueError: hour가 0~23 밖이거나 minute이 0~59 밖일 때
     """
     if not (0 <= hour <= 23):
         raise ValueError(f"hour는 0~23 사이여야 함: {hour}")
-    if not (0 <= minute < 60) or minute % config.GRID_TICK_MINUTES != 0:
-        raise ValueError(f"minute은 0~59 사이의 {config.GRID_TICK_MINUTES}분 배수여야 함: {minute}")
+    if not (0 <= minute < 60):
+        raise ValueError(f"minute은 0~59 사이여야 함: {minute}")
     return pd.Timestamp(date) + pd.Timedelta(hours=hour, minutes=minute)
 
 
@@ -988,10 +993,11 @@ def _build_feature_row(
         stockout: 그 시각 대여 가능한 자전거가 없었는지 여부
         skip_rental_recent: `_lag_rolling_features()` 참고 — True면 rental_lag_1h를
             비싼 실시간 조회 없이 NaN으로 두고, 호출부가 바로 덮어쓸 걸 전제한다
-        minute: 0~59 중 `config.GRID_TICK_MINUTES`의 배수 (기본값 0 — 정시).
-            학습 그리드가 이 tick 간격이라 이 값에 따라 lag 앵커가 실제로
+        minute: 0~59 (기본값 0 — 정시). 이 값에 따라 lag 앵커가 실제로
             달라진다(`_target_timestamp()` 참고) — 정시로만 고정하면 tick 단위
-            요청을 전부 정시 기준으로 뭉개서 계산하게 된다.
+            요청을 전부 정시 기준으로 뭉개서 계산하게 된다. GRID_TICK_MINUTES의
+            배수일 필요는 없다(`_target_timestamp()` docstring 참고 — lag/날씨/재고/
+            인구는 실시간 point-in-time 계산이라 학습 anchor 그리드와 무관).
         horizon: 몇 시간 뒤를 예측할지(1~HORIZON_COUNT, 기본값 1). lag는
             date+hour+minute("지금") 기준으로 고정하고, 날씨/캘린더/타겟만
             horizon만큼 미래로 이동한다(`_build_feature_record()` 참고).
@@ -1153,8 +1159,8 @@ def predict_demand_multi_hour(
             Silver `weather_forecast`에서 매 horizon의 target_ts 기준으로 실시간 조회
         population: 생활인구 합계(pop_total). None이면 매 horizon target_ts 기준
             격자 평소 인구(hour, dow 기준이라 horizon마다 달라짐)로 자동 대체
-        minute: `predict_rental_demand()` 참고 — 0~59 중 `config.GRID_TICK_MINUTES`의
-            배수 (기본값 0), T0의 tick 앵커
+        minute: `predict_rental_demand()` 참고 — 0~59 (기본값 0), T0의 tick 앵커
+            (GRID_TICK_MINUTES 배수일 필요 없음 — `_target_timestamp()` 참고)
         stockout: 전체 horizon 공통 재고 없음으로 가정할지 (대여 exposure 보정). None이면
             Silver `bike_station_realtime`에서 anchor_ts(T0) 기준 실시간 조회
         n_hours: 몇 개 horizon(1~HORIZON_COUNT)을 예측할지 (1이면 predict_rental/return_demand와 동일)
@@ -1266,8 +1272,8 @@ def predict_demand_multi_hour_all_stations(
             길이 n_hours 시퀀스(horizon별, 전체 정류소 공통). None이면 Silver
             `weather_forecast`에서 매 horizon의 target_ts 기준으로 실시간 조회(서울
             전체가 공유하는 값이라 station마다 다시 조회하지 않고 horizon당 한 번만 조회)
-        minute: `predict_rental_demand()` 참고 — 0~59 중 `config.GRID_TICK_MINUTES`의
-            배수 (기본값 0), T0의 tick 앵커
+        minute: `predict_rental_demand()` 참고 — 0~59 (기본값 0), T0의 tick 앵커
+            (GRID_TICK_MINUTES 배수일 필요 없음 — `_target_timestamp()` 참고)
         station_ids: None이면 학습된 모델이 실제로 아는 정류소 전체(아래 참고)
         stockout: 전체 n_hours·전체 정류소에 공통 적용할 값을 직접 줄 때만 사용.
             None(기본값)이면 Silver `bike_station_realtime`에서 anchor_ts(T0) 기준으로
@@ -1511,10 +1517,9 @@ def predict_rental_demand(
         population: 그 정류소가 속한 250m 격자의 생활인구 합계(pop_total). None이면
             Silver `living_population_normalized`에서 실시간 조회를 먼저 시도하고,
             그마저 없으면 그 격자의 평소 인구(hour, dow 기준)로 자동 대체된다
-        minute: 0~59 중 `config.GRID_TICK_MINUTES`의 배수 (기본값 0) —
-            feature_engine의 학습 그리드가 이 tick 간격이라, 이 값을 안 주면 그
-            tick 사이 시점 요청이 전부 정시 기준으로 계산돼 lag가 실제 시각과
-            어긋난다.
+        minute: 0~59 (기본값 0) — 이 값을 안 주면 정시 기준으로 계산돼 lag가
+            실제 시각과 어긋난다. GRID_TICK_MINUTES 배수일 필요는 없다
+            (`_target_timestamp()` 참고).
         horizon: 몇 시간 뒤를 예측할지(1~HORIZON_COUNT, 기본값 1). 여러 horizon을
             한 번에 물어보려면(재귀 없이, predict()도 한 번만 호출) 이 함수를 반복
             호출하는 대신 `predict_demand_multi_hour()`를 쓸 것.
@@ -1572,8 +1577,7 @@ def predict_return_demand(
         population: 그 정류소가 속한 250m 격자의 생활인구 합계(pop_total). None이면
             Silver `living_population_normalized`에서 실시간 조회를 먼저 시도하고,
             그마저 없으면 그 격자의 평소 인구(hour, dow 기준)로 자동 대체된다
-        minute: `predict_rental_demand()` 참고 — 0~59 중 `config.GRID_TICK_MINUTES`의
-            배수 (기본값 0)
+        minute: `predict_rental_demand()` 참고 — 0~59 (기본값 0)
         horizon: `predict_rental_demand()` 참고 — 1~HORIZON_COUNT (기본값 1)
     returns:
         dict: station_id, date, hour, minute, horizon, pred_mean, pred_p10, pred_p50,
@@ -1627,8 +1631,9 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--hour", type=int, required=True)
     parser.add_argument(
         "--minute", type=int, default=0,
-        help="0~59 중 GRID_TICK_MINUTES의 배수 (기본값 0 — 정시). 학습 그리드가 이 "
-        "tick 간격이라 정시로만 고정하면 그 사이 시점을 요청할 수 없다.",
+        help="0~59 (기본값 0 — 정시). GRID_TICK_MINUTES 배수일 필요는 없다 — "
+        "lag/날씨/재고/인구는 실시간 point-in-time 조회라 5분 단위 등 더 촘촘한 "
+        "주기로 반복 호출해도(예: realtime_5min.py) 정상 동작한다.",
     )
     parser.add_argument(
         "--horizon", type=int, default=1,

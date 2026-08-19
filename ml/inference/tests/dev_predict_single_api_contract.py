@@ -1,10 +1,12 @@
 """predict_single.py의 두 가지 API 계약을 검증한다 (PR 리뷰에서 지적된 문제 재발 방지).
 
-1. **tick 단위 시각 지정** — 공개 API가 `date`+`hour`만 받으면 그 시간 안의 세부
-   tick(예: GRID_TICK_MINUTES=20이면 17:00/17:20/17:40) 요청을 전부 정시 기준으로
-   뭉개 계산하게 된다(feature_engine의 학습 그리드가 그 tick 단위인데 서빙
-   인터페이스가 그 정밀도를 못 받는 문제). `minute` 인자가 실제로 target_ts/lag
-   앵커에 반영되는지 확인한다.
+1. **분 단위 시각 지정** — 공개 API가 `date`+`hour`만 받으면 그 시간 안의 세부
+   시점(예: 17:07/17:35) 요청을 전부 정시 기준으로 뭉개 계산하게 된다. `minute`
+   인자가 실제로 target_ts/lag 앵커에 반영되는지 확인한다 — GRID_TICK_MINUTES(학습
+   anchor 그리드, 기본 20분)의 배수가 아니어도 된다는 게 핵심이다: lag/날씨/재고/
+   인구는 전부 실시간 Silver를 그 시각 기준으로 직접 point-in-time 계산하므로
+   (`_target_timestamp()` docstring 참고) 학습 그리드보다 촘촘한 5분 주기
+   (`airflow/dags/realtime_5min.py`)로 반복 호출해도 정상 동작해야 한다.
 2. **배치 실패의 완결성 계약** — `predict_demand_multi_hour_all_stations()`가 일부
    station 실패를 조용히 skip하면 downstream(Gold 적재 등)이 "전체 성공"과
    "일부 누락"을 구분할 수 없다. 반환값에 실패 station 목록/기대·실제 건수가
@@ -110,11 +112,21 @@ def test_target_timestamp_combines_date_hour_minute():
     assert ps._target_timestamp("2025-06-01", 17) == pd.Timestamp("2025-06-01 17:00:00")  # minute 기본값 0
 
 
-@pytest.mark.parametrize("hour,minute", [(24, 0), (-1, 0), (17, 7), (17, 60), (17, -5)])
+@pytest.mark.parametrize("hour,minute", [(24, 0), (-1, 0), (17, 60), (17, -5)])
 def test_target_timestamp_rejects_out_of_range(hour, minute):
-    """hour는 0~23, minute은 GRID_TICK_MINUTES의 배수(0~59)여야 한다."""
+    """hour는 0~23, minute은 0~59여야 한다 — GRID_TICK_MINUTES의 배수일 필요는 없다
+    (아래 test_target_timestamp_accepts_off_grid_minute 참고)."""
     with pytest.raises(ValueError):
         ps._target_timestamp("2025-06-01", hour, minute)
+
+
+def test_target_timestamp_accepts_off_grid_minute():
+    """minute=7처럼 GRID_TICK_MINUTES(기본 20분)의 배수가 아니어도 받아들여야 한다 —
+    lag/날씨/재고/인구가 전부 실시간 point-in-time 조회라 학습 anchor 그리드와
+    무관하다(`_target_timestamp()` docstring 참고). Airflow가 5분 주기로 서빙을
+    돌리므로(`realtime_5min.py`) 이 tick보다 촘촘한 시각이 항상 들어온다 — 여기서
+    거부하면 시간당 5분 실행의 대부분이 크래시한다(리뷰 지적)."""
+    assert ps._target_timestamp("2025-06-01", 17, 7) == pd.Timestamp("2025-06-01 17:07:00")
 
 
 def test_lag_rolling_features_differ_by_minute_within_same_hour():
@@ -163,13 +175,27 @@ def test_build_feature_record_honors_minute():
     assert population_fallback is False  # population을 명시적으로 줬으므로
 
 
-def test_build_feature_record_rejects_invalid_minute():
+def test_build_feature_record_honors_off_grid_minute():
+    """minute=7(GRID_TICK_MINUTES 배수 아님)도 그대로 anchor_ts=17:07에 반영돼야
+    한다 — test_target_timestamp_accepts_off_grid_minute과 같은 이유."""
+    trips = pd.DataFrame([_trip("A", "2025-06-01 16:37:00", "2025-06-01 16:47:00")])
+    _set_rental_events(trips)
+    _set_return_history("A", "2025-06-01 16:07:00")
+    ps._station_profile_station_index = {}
+    ps._station_profile_values = np.empty((0, 0, 0, 0, 0), dtype="float32")
     _set_station_master(["A"])
-    with pytest.raises(ValueError):
-        ps._build_feature_record(
-            station_id="A", date="2025-06-01", hour=17, minute=7,  # GRID_TICK_MINUTES 배수 아님
-            temp=20.0, precip=0.0, population=3000.0, stockout=False,
-        )
+
+    record, fallback, _population_fallback = ps._build_feature_record(
+        station_id="A", date="2025-06-01", hour=17, minute=7,
+        temp=20.0, precip=0.0, population=3000.0, stockout=False,
+    )
+
+    target_ts = pd.Timestamp("2025-06-01 17:07:00")
+    expected, expected_fallback = ps._lag_rolling_features("A", 1, target_ts)
+
+    assert record["minute"] == ps.minute_of_day(target_ts)
+    assert record["rental_lag_1h"] == pytest.approx(expected["rental_lag_1h"])
+    assert set(fallback) == set(expected_fallback)
 
 
 # --- 2. 배치 실패의 완결성 계약 -----------------------------------------------------
