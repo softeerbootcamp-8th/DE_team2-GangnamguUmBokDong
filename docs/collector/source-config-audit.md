@@ -3,7 +3,11 @@
 collector의 10개 소스 YAML을 **실제 API 응답**과 대조해, 선언이 원본과 맞는지 · 각 컬럼이
 어떻게 처리되는지 · 전용 파싱이나 값 매핑이 필요한지를 정리한다.
 
-- 점검 일자: 2026-08-19 (KST)
+- 점검 일자: 2026-08-19 (KST) — 같은 날 **2차 재점검**을 수행해 결과를 반영했다.
+  1차 지적 사항의 수정 반영 여부를 실데이터로 재확인하고, 컬럼 선언이 아니라
+  **수집 범위(페이지네이션·순회 상한)** 를 새로 들여다봤다. 그 결과 1차에서 놓친
+  🔴 2건(5-18 · 5-19)이 나왔다. 1차는 "raw 키 ↔ 선언 차집합"만 봤기 때문에,
+  **차집합이 없어도 행 자체가 안 들어오는** 경우를 볼 수 없었다.
 - 점검 대상: `collector/sources/*.yaml` 10개 전부
 - 대조 방법: `SEOUL_OPENAPI_KEY` · `KMA_APIHUB_KEY`로 각 엔드포인트를 직접 호출해 raw 응답을
   받고, `yaml`의 `columns` 선언 집합과 raw 키 집합을 차집합으로 비교한 뒤, `validation/engine.py`의
@@ -75,6 +79,10 @@ raw 7개 컬럼 = 선언 7개 컬럼. **차집합 없음(완전 일치).**
 - **교차 컬럼 불변식 미검증**: 표본 1,000건 중 363건이 `parkingBikeTotCnt > rackTotCnt`다.
   따릉이는 거치대 밖 주차가 가능해 정상 상황이지만, 현재 엔진에 교차 컬럼 규칙이 없어
   "10배 튀는 값"과 "정상 초과"를 구분할 방법이 없다.
+- 🔴 **컬럼은 완전 일치하지만 행의 63.4%가 안 들어온다.** 이 소스는 1페이지(1,000행)에서
+  멈추고, 실제 운영 대여소는 2,736곳이다. 원인은 `list_total_count`의 의미가 이 API만
+  다르다는 것 — 자세한 것은 **5-18**을 보라. 표본을 "1,000건"으로 적은 위 서술은
+  페이지 하나가 곧 전체였기 때문이 아니라, **수집이 거기서 끊겨서**였다.
 
 ### 1-2. `bike_station_master` (`bikeStationMaster`, 1일)
 
@@ -86,11 +94,14 @@ raw 5개 = 선언 5개. **차집합 없음.** 단, 이 소스만 `LAT`/`LOT`가 
 | `RNTLS_ID` | `'ST-10'` | `str`, required | 그대로 | `bike_station_realtime.stationId`와 같은 체계 |
 | `ADDR1` | `'서울특별시 마포구 양화로 93'` | `str` | 그대로 | 빈값 0건. **진짜 도로명주소** |
 | `ADDR2` | `'427'` / `'더샵스타시티 C동 앞'` | `str` | 그대로 | 상세주소와 거치대번호가 섞여 있다 |
-| `LAT` | `37.552746` (float) | `float`, **range 없음** | 그대로 | **표본 1,000건 중 62건(6.2%)이 `0.0`** |
-| `LOT` | `126.918617` (float) | `float`, **range 없음** | 그대로 | 같은 62건이 `0.0` |
+| `LAT` | `37.552746` (float) | `float`, **range 없음** | 그대로 | **전량 3,428건 중 77건(2.2%)이 `0.0`** (2차 재점검에서 전 페이지로 재측정) |
+| `LOT` | `126.918617` (float) | `float`, **range 없음** | 그대로 | 같은 77건이 `0.0`. `RNTLS_ID` 중복은 0건 |
 
 - **버그**: `LAT`/`LOT`에 `range`가 없어 `0.0`(기니만 해상)이 정상값으로 silver에 들어간다.
   `bike_station_realtime`은 같은 의미의 컬럼에 `range`가 선언돼 있다 — 선언 불일치.
+  단, 2차 재점검에서 확인한 바로는 `normalizer/station_master.py:98`이 `_valid_wgs84`로
+  좌표를 검사해 실패하면 실시간 좌표로 폴백하므로 **downstream 실피해는 없다**.
+  다만 그 폴백 소스가 5-18 때문에 36.6%밖에 없어, 77건 중 상당수는 폴백도 못 받는다.
 - **미활용**: 이 소스는 수집만 되고 Gold에 적재되지 않는다(`loader/tables.yaml`에 항목 없음).
   그런데 loader는 `sta_addr`에 넣을 실주소가 없어서 `stationName`을 복제하고 있다. 여기 있는
   `ADDR1`이 바로 그 값이다.
@@ -255,9 +266,9 @@ raw 33개 = 선언 33개. **차집합 없음.** `list_total_count = 253,699`
 - `CELL_ID`(`'다사52255350'`)는 격자 좌표를 인코딩한 문자열이다. 대여소·기상 격자와 조인하려면
   **전용 디코더가 필요**하고, 현재 어디에도 없다.
 
-### 3-2. `population_realtime` (`citydata_ppltn`, 5분, POI001~116 순회)
+### 3-2. `population_realtime` (`citydata_ppltn`, 5분, POI001~116 순회 — 실제 유효는 131)
 
-raw **22개** 중 **7개만 선언**.
+raw **22개** 중 **7개만 선언**. 그리고 🔴 **순회 상한이 실제보다 15개 모자란다(5-19)**.
 
 **선언되지 않은 raw 컬럼 15개**:
 `AREA_CONGEST_MSG`, `PPLTN_RATE_0`~`PPLTN_RATE_70`(8개), `RESNT_PPLTN_RATE`,
@@ -284,6 +295,9 @@ raw **22개** 중 **7개만 선언**.
   성별 비율만 있고 연령 구성은 silver에 없다.
 - `AREA_CD`는 POI 코드이고 **좌표가 응답에 없다.** 대여소나 자치구와 공간 조인할 수 없다.
   POI ↔ 좌표/자치구 매핑 테이블이 별도로 필요하다.
+- 🔴 **어댑터의 `expected = 116`이 실제 유효 범위보다 작다.** 2차 재점검에서 POI117~POI131을
+  하나씩 호출해 전부 정상 응답(200 + 행 1건)을 확인했다. POI132부터는 래퍼 없이
+  `RESULT.CODE`만 온다. 상세는 **5-19**.
 
 ---
 
@@ -348,8 +362,22 @@ raw는 long format(`category`/`fcstValue` 쌍)으로 오고, 어댑터의 `pivot
 대략 심각도 순. 각 항목의 근거는 위 본문에 있다.
 
 - 5-2는 재조사 후 🔴에서 🟠로 내렸다(마스킹 → null은 의도된 동작이었다).
-- **수정 완료: 5-1 · 5-2 · 5-3 · 5-10, 그리고 아래 5-15.** 나머지는 미착수다.
+- **수정 완료: 5-1 · 5-2 · 5-3 · 5-10 · 5-15 · 5-16 · 5-17.** 나머지는 미착수다.
   번호는 상호 참조 때문에 그대로 뒀다.
+- **2차 재점검(2026-08-19)에서 추가된 항목: 5-18 🔴 · 5-19 🔴 · 5-20 🟠.**
+  이 셋은 컬럼 선언이 아니라 **수집 범위**의 문제라 1차의 차집합 비교로는 보이지 않았다.
+  현재 최우선은 5-18이다 — 다른 모든 대여소 지표의 분모를 바꾸기 때문이다.
+
+### 2차 재점검에서 확인한 수정 반영 상태
+
+| 항목 | 실데이터 재확인 결과 |
+| --- | --- |
+| 5-3 `SNO` snow 캐스터 | 단기예보 207행 전부 캐스팅 성공, `TYPE_ERROR` 0 |
+| 5-2 `masked_float` | `'*'`이 `MISSING`으로 판정됨(SPOP 9.8%, 연령·성별 40~85%) |
+| 5-10 무의미 컬럼 | `RNUM`/`START_INDEX`/`END_INDEX`가 raw에는 여전히 오지만 선언에서 빠짐 |
+| UUU/VVV 분해 | 기상 3개 소스 모두 선언·범위 정상, 실측값이 range 안에 들어옴 |
+| 5-1 lookback | 아래 "잔여 누락" 참고 — 회수는 확인됐고 꼬리가 남는다 |
+| 5-4 · 5-5 · 5-6 · 5-7 · 5-8 · 5-9 · 5-11 · 5-12 | **미착수 상태 그대로** 재확인됨 |
 
 ### 수정 순서와 그 이유
 
@@ -421,6 +449,23 @@ raw는 long format(`category`/`fcstValue` 쌍)으로 오고, 어댑터의 `pivot
 
 누락의 **87.2%**를 회수했다. 정상 tick(19:00 윈도우)과 재조회(20:00 tick − 1h)가 같은
 `/2026-08-18/18`을 조회하고 조각 키도 `page-00001-01000`으로 동일함을 확인했다.
+
+**2차 재점검 — 잔여 누락 🟡.** `RENTAL_HISTORY_LOOKBACK_HOURS = 1`이므로 회수 범위는
+`+1h`까지다. 반납 지연의 꼬리를 시간대별로 다시 재어 보면:
+
+| 대여 시각대 | 전체 | `>=+1h` (현행이 놓치던 양) | `>=+2h` (**lookback=1로도 못 잡는 잔여**) |
+| --- | --- | --- | --- |
+| 2026-08-18 18시 | 16,900 | 4,454 (26.4%) | **564 (3.3%)** |
+| 2026-08-18 22시 | 6,948 | 1,547 (22.3%) | 0 (0.0%) |
+| 2026-08-19 08시 | 13,233 | 1,680 (12.7%) | 201 (1.5%) |
+
+`+2h`까지 늘리면 위 표의 잔여가 사실상 0이 된다(1차 표의 "+2h 재조회 시 회수" 98~100%와
+일치한다). 비용은 tick당 이 소스 호출이 2개 → 3개로 느는 것이고, 실측 14.4초/호출이라
+5분 tick 안에 그대로 들어간다. `RENTAL_HISTORY_LOOKBACK_HOURS = 2` 한 줄이 전부다.
+
+한편 반납 시각이 대여 시각보다 **앞선 것처럼 보이는 행**(offset `-22`, `-17` 등)이
+18시대에 7건, 22시대에 140건 있는데, 전부 자정을 넘겨 반납된 정상 기록이다
+(`RTN_DT`의 날짜가 다음 날). 시(hour)만 비교하면 음수로 보일 뿐이다.
 
 **`_window_start` 의미 변화(감수한 대가)**: 재조회가 같은 silver 파일을 덮어쓰므로
 `compaction.dedup`의 `min` 집계 결과가 그 시간대의 첫 윈도우 값으로 균일해진다.
@@ -515,6 +560,29 @@ loader는 `SNO`를 쓰지 않아 영향이 없다.
 
 선택지는 (a) `performance_event`를 별 테이블로 분리, (b) Gold에 `date_semantics` 구분 컬럼
 추가, (c) `performance_event`를 행사 목록에서 제외 — 어느 쪽이든 의사결정이 필요하다.
+
+**2차 재점검 — 규모를 실측했다. 1차 판단보다 심각하다.** 전량 606건 기준:
+
+- **606건 전부(100%)가 `loader/transform.py:268`의 종료 필터(`end_date < today`)를 통과한다.**
+  API가 이미 운영 중인 서비스만 돌려주기 때문이다. 즉 필터가 아무것도 걸러내지 못한다.
+- 그 606건의 **기간 길이는 중앙값 230일 · 평균 450일 · 최대 3,925일**이고, 80.4%가 30일을
+  넘는다. 종료일 최빈값은 `2026-12-31`(234건) · `2026-08-31`(228건)이라, 234건은 연말까지
+  매일 "진행 중인 행사"로 남는다.
+- **같은 테이블의 `cultural_event`는 기간 중앙값이 0일(당일 행사) · 90퍼센타일 49일이다.**
+  한 테이블에 중앙값 0일짜리와 230일짜리가 섞인다 — 행사 밀도를 세면 후자가 상수처럼 깔린다.
+- 운영 상태로 보면 606건 중 **`예약마감` 152건 · `접수종료` 72건**이다. 예약이 이미 끝난
+  224건도 "진행 중인 행사"로 적재된다.
+- 한 행 예시: `SVCNM='테니스장1(평일)-2026년 응봉공원(대현산배수지)'`,
+  `SVCOPNBGNDT='2025-12-01'`, `SVCOPNENDDT='2026-12-31'`.
+- 실제 이용 시각은 **미선언 컬럼** `V_MIN`/`V_MAX`(`'07:00'`/`'19:00'`)에 있고,
+  운영 상태는 `SVCSTATNM`(접수중 333 · 예약마감 152 · 접수종료 72 · 안내중 40 ·
+  예약일시중지 9)에 있다. 접수 기간은 또 `RCPTBGNDT`/`RCPTENDDT`로 따로 온다.
+- 소스 `description`("서울시 체육시설 공연행사 정보")도 실제 내용(체육시설 **예약 서비스
+  목록**)과 맞지 않는다. `MINCLASSNM` 분포가 테니스장 285 · 풋살장 82 · 축구장 55다.
+
+따릉이 수요에 영향을 주는 것은 "예약 서비스가 열려 있다"가 아니라 "그 시간에 사람이
+모인다"이므로, 현재 매핑은 피처로서 의미가 거의 없고 노이즈만 더한다. 위 (c)를 기본값으로
+두고, 남긴다면 `V_MIN`/`V_MAX`/`SVCSTATNM`을 선언해 시간대 단위로 좁혀야 한다.
 
 ### 5-5. `weather_short_term_forecast`에 `TMN`/`TMX` 선언 누락 🟠
 
@@ -674,6 +742,103 @@ GET /tbCycleRentData/1001/2000/2026-08-18/03/   (total=734)
 현재 코드는 `page_start <= total`로 범위를 넘지 않아 도달하지 않는 경로였지만, 병렬화가
 페이지 경계를 더 자주 건드리므로 함께 고쳤다 — `_result_code()`가 래퍼와 최상단을 모두 본다.
 
+**5-18의 전제**: 이 수정 덕분에 "범위를 넘겨 요청하면 `INFO-200`이 온다"는 것이 이미
+정상 종료 신호로 처리된다. 5-18의 수정은 이 위에 얹으면 된다.
+
+### 5-18. `bike_station_realtime` — 대여소의 63.4%를 매 tick 놓친다 🔴 (2차 재점검 신규)
+
+**증상.** 실시간 대여소 정보가 매 5분마다 **1,000행에서 멈춘다.** 실제 운영 대여소는
+**2,736곳**이다. 어댑터를 그대로 돌려 확인했다:
+
+```
+어댑터가 실제로 가져온 조각: [('page-00001-01000', expected_total=1000, rows=1000)]
+총 행: 1000
+```
+
+**원인.** `bikeList`만 `list_total_count`의 의미가 다르다. 다른 서울 API는 전체 건수를
+주는데(마스터 3,428 · 문화행사 19,495 · 생활인구 253,699 · 체육행사 606), 이 API는
+**그 응답에 담긴 행 수**를 준다:
+
+```
+GET /bikeList/1/1000/     → list_total_count=1000, rows=1000
+GET /bikeList/1001/2000/  → list_total_count=1000, rows=1000
+GET /bikeList/2001/3000/  → list_total_count= 736, rows= 736   ← 여기가 끝
+GET /bikeList/3001/4000/  → 래퍼 없음(INFO-200)
+```
+
+`seoul_openapi.py:227`이 `total = outcome.total or 0`으로 **1000**을 잡고, 이어지는
+`while start <= total`이 `page_start = 1001 > 1000`이라 곧장 끝난다. 페이지 목록이 비어
+`if not pages: return`으로 나간다.
+
+**왜 지금까지 안 걸렸나.** 품질 게이트가 잡을 수 없는 형태다. `expected_total`도 1000,
+수집한 행도 1000이라 `_missing_ratio`가 0이고, `max_missing_ratio: 0.0`을 정확히 통과한다.
+**manifest에 "완결"로 기록되고 경고 한 줄 남지 않는다.** 1차 점검이 raw 키 ↔ 선언
+차집합만 봐서 놓친 것도 같은 이유다 — 컬럼은 완전히 일치했다.
+
+**영향.** 이 소스는 프로젝트에서 가장 아래에 깔린 데이터다.
+
+- `loader/transform.py:31` `stations_from_silver` → `stations` 테이블(대여소 마스터 좌표·
+  자치구·격자 매핑)이 36.6%만 채워진다.
+- 같은 파일 `station_stock_from_silver` → `station_stock`(재고 시계열)도 같은 비율.
+- `normalizer/station_master.py:98` → API 마스터의 좌표 `0.0` 77건을 실시간 좌표로
+  폴백하는 경로가 대부분 빈손이 된다(5-7 참고).
+- 추론 입력과 예측 대상 대여소 집합 전체.
+
+**수정 방향.** `list_total_count`를 신뢰할 수 없는 소스를 위한 페이지네이션 모드가 필요하다.
+`adapter_params`에 플래그(예: `pagination: probe`)를 두고, 그 소스는 total을 쓰지 않고
+**빈 페이지(또는 `INFO-200`)가 나올 때까지** 진행한다. 5-17 덕분에 `INFO-200`은 이미
+정상 종료로 분류되므로, 그 신호를 "더 없음"으로 해석하는 분기만 추가하면 된다.
+`expected_total`을 모르는 동안은 병렬화할 수 없다는 기존 제약(주석 (1))이 그대로 적용돼
+순차가 되는데, 3페이지짜리라 문제되지 않는다.
+
+### 5-19. `population_realtime` — POI 순회 상한이 실제보다 15개 작다 🔴 (2차 재점검 신규)
+
+**증상.** `seoul_openapi.py:168`의 `expected = 116`이 하드코딩이다. POI117~POI131을
+하나씩 호출해 보니 **전부 정상 응답**한다:
+
+> 신정네거리역 · 잠실새내역 · 잠실역 · 잠실롯데타워·석촌호수 · 송리단길·호수단길 ·
+> 신촌 스타광장 · 보라매공원 · 서대문독립공원 · 안양천 · 여의서로 · 올림픽공원 ·
+> 홍제폭포 · 송현녹지광장 · 시의회 앞 · 숭례문
+
+POI132부터는 래퍼 없이 `RESULT.CODE`/`RESULT.MESSAGE`만 온다(= 유효 범위의 끝).
+즉 **131개 중 15개(11.4%)가 영구 누락**이다.
+
+**영향.** 누락 목록에 여의서로 · 안양천 · 올림픽공원 · 보라매공원처럼 따릉이 수요가
+집중되는 하천·공원 지점이 들어 있다. 혼잡도 피처가 이 지역들에서만 통째로 비어 있다.
+
+**게이트도 못 잡는다.** `expected_total=116`을 어댑터가 스스로 선언하므로, 116개를 다 받으면
+완결로 기록된다. 5-18과 같은 구조의 결함이다 — **어댑터가 자기가 정한 분모로 자기를
+채점한다.**
+
+**수정 방향.** `expected`를 하드코딩에서 빼서 YAML `adapter_params`로 올린다
+(예: `poi_range: [1, 131]`). 상한이 또 늘 수 있으므로, 상한 자체를 넘겨 보고 래퍼가
+없으면 멈추는 탐색 방식이 더 낫지만, 매 tick 헛호출이 붙으므로 설정값 + 정기 확인
+테스트 쪽이 비용이 싸다.
+
+### 5-20. `living_population_grid` — 관측일이 수집일보다 5일 늦다 🟠 (2차 재점검 신규)
+
+2026-08-19에 호출한 응답 253,699건이 **전량 `YMD=20260814`** 다(1페이지 `TT=00`,
+중간 `TT=12`, 마지막 `TT=23` — 하루치 24시간이 통째로 온다). 즉:
+
+- `dt` 파티션(수집일)과 `YMD`(관측일)가 **5일 어긋난다.** 파티션만 보고 시점을 판단하면
+  5일 밀린 값을 쓰게 된다.
+- API에 날짜 파라미터가 없어 `backfill: {enabled: true, max_age: 7d}`도 실질적으로
+  **같은 최신 1일치를 다시 받는 것**뿐이다. 과거를 지정해 받을 수단이 없다.
+- 지연 폭이 고정이라는 보장도 없다(휴일 등으로 늘어날 수 있다).
+
+**현재 실피해는 없다.** `normalizer/station_master.py:79`가 이 소스에서 `CELL_ID`만 뽑아
+격자 폴리곤을 만들고 인구 수치는 쓰지 않는다. 격자 경계는 날짜와 무관하다.
+**단, 인구 수치를 피처로 쓰는 순간 5일 밀린 값이 된다.** `YMD`가 이미 선언돼 있으므로
+downstream이 `dt`가 아니라 `YMD`를 기준으로 삼기만 하면 된다 — 지금 명시해 두는 편이 낫다.
+
+### 5-21. `cultural_event` — 매일 받는 19,495건의 91.9%가 이미 끝난 행사다 🔵 (2차 재점검 신규)
+
+표본 5,000건 중 `END_DATE`가 오늘 이전인 행이 4,597건(91.9%)이고, `STRTDATE` 연도는
+2025년 2,617 · 2026년 2,383이다. `loader/transform.py:232`가 종료된 행사를 버리므로
+**결과는 정상**이고, 이건 결함이 아니라 비용 항목이다. API에 기간 필터가 없어 전량을
+받을 수밖에 없다. 20페이지 순차 조회라 1일 주기에서는 부담이 아니므로 **조치 불필요**로
+남긴다 — 나중에 "왜 이렇게 많이 받나"를 다시 묻지 않도록 기록만 해 둔다.
+
 ---
 
 ## 부록: 점검 재현 방법
@@ -727,4 +892,82 @@ missed = [r for r in rows if r["RTN_DT"] > f"{d} 19:00:00"]
 print(f"{len(missed)}/{len(rows)} = {len(missed)/len(rows):.1%} 가 현행 윈도우 밖에서 반납된다")
 print("RTN_DT 시간대 분포:", collections.Counter(r["RTN_DT"][11:13] for r in rows))
 PY
+```
+
+### 2차 재점검(수집 범위) 재현 방법
+
+컬럼 차집합이 아니라 **행이 다 들어오는지**를 보는 검사다. 5-18·5-19가 여기서 나왔다.
+
+`bikeList`의 `list_total_count`가 전체가 아님을 보이는 검사:
+
+```bash
+set -a && source .env && set +a
+collector/.venv/bin/python - <<'PY'
+import os, json, httpx
+K = os.environ["SEOUL_OPENAPI_KEY"]; B = "http://openapi.seoul.go.kr:8088"
+for a, b in [(1, 1000), (1001, 2000), (2001, 3000), (3001, 4000)]:
+    w = json.loads(httpx.get(f"{B}/{K}/json/bikeList/{a}/{b}/", timeout=90).content).get("rentBikeStatus", {})
+    print(a, b, "list_total_count=", w.get("list_total_count"), "rows=", len(w.get("row", [])))
+PY
+```
+
+어댑터가 실제로 몇 조각을 가져오는지(= 위 결함이 수집에 그대로 반영되는지):
+
+```bash
+cd collector && ../collector/.venv/bin/python - <<'PY'
+import json, httpx
+from datetime import datetime, timedelta
+from pathlib import Path
+from types import SimpleNamespace
+import config.loader as cl
+from adapters.seoul_openapi import SeoulOpenApiAdapter
+cfg = cl.load("bike_station_realtime", base_dir=Path("sources"))
+w = SimpleNamespace(window_start=datetime.now(), window_end=datetime.now() + timedelta(minutes=5))
+with httpx.Client(timeout=60) as c:
+    parts = [(r.key, r.expected_total, len(json.loads(r.payload)["rentBikeStatus"]["row"]))
+             for r in SeoulOpenApiAdapter.fetch(cfg, w, client=c)]
+print(parts, "총 행:", sum(p[2] for p in parts))
+PY
+```
+
+`citydata_ppltn`의 유효 POI 상한:
+
+```bash
+collector/.venv/bin/python - <<'PY'
+import os, json, httpx
+K = os.environ["SEOUL_OPENAPI_KEY"]; B = "http://openapi.seoul.go.kr:8088"
+ok = []
+for i in range(1, 146):
+    r = json.loads(httpx.get(f"{B}/{K}/json/citydata_ppltn/1/5/POI{i:03d}/", timeout=60).content)
+    rows = r.get("SeoulRtd.citydata_ppltn")
+    if rows: ok.append((i, rows[0]["AREA_NM"]))
+print("유효 POI 개수:", len(ok), "상한:", ok[-1])
+PY
+```
+
+반납 지연 꼬리(5-1 잔여 누락) 측정:
+
+```bash
+collector/.venv/bin/python - <<'PY'
+import os, json, httpx, collections
+K = os.environ["SEOUL_OPENAPI_KEY"]; B = "http://openapi.seoul.go.kr:8088"
+d = "2026-08-18"
+def page(h, a, b):
+    return json.loads(httpx.get(f"{B}/{K}/json/tbCycleRentData/{a}/{b}/{d}/{h}/", timeout=180).content)["rentData"]
+for h in ["18", "22"]:
+    p1 = page(h, 1, 1000); tot = int(p1["list_total_count"]); rows = p1["row"]
+    for s in range(1001, tot + 1, 1000): rows += page(h, s, min(s + 999, tot))["row"]
+    off = collections.Counter((int(r["RTN_DT"][11:13]) - int(h)) if r.get("RTN_DT") else "none" for r in rows)
+    over2 = sum(v for k, v in off.items() if isinstance(k, int) and k >= 2)
+    print(f"[{d} {h}시] total={tot} >=+2h(lookback=1로도 못 잡음)={over2} ({over2/tot:.1%})")
+PY
+```
+
+모든 소스에 대해 raw ↔ 선언을 한 번에 대조하고 컬럼별 판정을 집계하는 스크립트는
+`_judge_column`을 직접 불러 쓴다(엔진과 판정이 어긋나지 않게):
+
+```python
+from validation.engine import _judge_column
+value, issue = _judge_column(raw_row.get(col), col, config.columns[col])
+# issue.kind ∈ {MISSING, TYPE_ERROR, OUTLIER} 를 소스·컬럼별로 집계한다
 ```
