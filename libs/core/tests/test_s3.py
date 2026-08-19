@@ -2,7 +2,6 @@
 
 import pandas as pd
 import pytest
-
 from core import s3
 
 
@@ -85,6 +84,35 @@ def test_read_parquet_date_range_with_columns_keeps_date_and_requested_order():
 
     assert list(result.columns) == ["date", "a"]
     assert result["date"].tolist() == ["2025-11-01"]
+
+
+def test_read_parquet_date_range_without_date_in_columns_omits_it_and_skips_building_it(monkeypatch):
+    """columns에 "date"를 안 넣으면 결과에도 없어야 하고(기존부터 참), 애초에
+    그 문자열 배열을 만드는 작업 자체를 건너뛰어야 한다(2026-08 수정 — 예전엔
+    combined.select(columns)에서 나중에 버리기 전까지 전체 구간 크기로 만들어져
+    있었다, 리뷰 지적: station_categories_for_dates()처럼 "date" 없이 컬럼 1개만
+    1년 전체를 읽는 호출에서 그 버려지는 배열만 수 GB 규모).
+
+    `pa.array`를 통째로 스파이하면 pandas/pyarrow 내부(`to_pandas()`의 컬럼 인덱스
+    역직렬화 등)에서도 호출돼 오탐이 난다 — "date" 파티션 문자열이 그대로 반복된
+    호출(예: `pa.array(["2025-11-01"])`)만 걸러서 우리 코드가 만든 것인지 구분한다.
+    """
+    s3.write_parquet(pd.DataFrame({"a": [1], "b": [10]}), "mh2b/date=2025-11-01/part-00000.parquet")
+
+    date_array_calls = []
+    real_pa_array = s3.pa.array
+
+    def _spy(*args, **kwargs):
+        if args and list(args[0]) == ["2025-11-01"]:
+            date_array_calls.append(args[0])
+        return real_pa_array(*args, **kwargs)
+
+    monkeypatch.setattr(s3.pa, "array", _spy)
+
+    result = s3.read_parquet("mh2b", columns=["a"], date_range=("2025-11-01", "2025-11-01"))
+
+    assert list(result.columns) == ["a"]
+    assert date_array_calls == []  # "date" 배열을 만들려고 호출된 적이 없어야 함
 
 
 def test_read_parquet_date_range_missing_partitions_returns_none():

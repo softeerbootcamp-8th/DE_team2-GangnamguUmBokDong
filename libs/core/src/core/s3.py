@@ -193,8 +193,9 @@ def _read_parquet_by_dates(
     args:
         key: Spark `partitionBy("date")` 출력의 prefix(파티션 폴더들의 부모)
         date_strs: 읽을 날짜("YYYY-MM-DD") 목록 — 연속/불연속 상관없음
-        columns: 읽을 컬럼(None이면 전체) — "date"가 포함돼도/안 돼도 결과에는
-            항상 복원된 "date"가 있고, 지정 시 그 컬럼 순서를 그대로 맞춰 반환한다
+        columns: 읽을 컬럼(None이면 전체) — `None`이거나 명시적으로 `"date"`를
+            포함해야 결과에 복원된 "date"가 있다(포함 안 하면 애초에 안 만듦,
+            아래 참고). 지정 시 그 컬럼 순서를 그대로 맞춰 반환한다
         as_pandas: True면 DataFrame, False면 pyarrow Table 반환("date" 복원은
             내부적으로 항상 pandas로 하고 필요할 때만 마지막에 변환)
         filters: `read_parquet()` docstring 참고 — 각 날짜 파티션 파일에 그대로 적용된다
@@ -235,6 +236,15 @@ def _read_parquet_by_dates(
     # pandas .copy()+할당 대신 Arrow 레벨에서 상수 컬럼으로 붙여서, 조각마다 pandas
     # DataFrame을 따로 만들지 않는다(다중 파티션 읽기라 이 함수가 가장 큰 데이터를
     # 다룰 가능성이 높음 — training의 multi-horizon 테이블 읽기).
+    #
+    # **"date"는 호출부가 실제로 요청했을 때만 붙인다(2026-08 수정)** — 예전엔
+    # `columns`에 "date"가 없어도 일단 전체 구간에 대해 행 수만큼 문자열 배열을
+    # 만들고 나중에(아래 `combined.select(columns)`에서) 버렸다. `lazy_train_dataset.
+    # station_categories_for_dates()`처럼 `columns=["station_no"]`로 1년 전체(약
+    # 8억 행)를 읽는 호출에서, 그 순간만 쓰고 버리는 date 문자열 배열이 수 GB
+    # 규모로 일시에 잡혀 있었다(리뷰 지적) — 스트리밍 경로를 만든 취지와 정반대라
+    # 애초에 요청 안 했으면 만들지 않는다.
+    want_date = columns is None or "date" in columns
     tables = []
     for date_str, table in zip(
         key_dates,
@@ -242,8 +252,10 @@ def _read_parquet_by_dates(
     ):
         if table is None or table.num_rows == 0:
             continue
-        date_column = pa.array([date_str] * table.num_rows)
-        tables.append(table.append_column("date", date_column))
+        if want_date:
+            date_column = pa.array([date_str] * table.num_rows)
+            table = table.append_column("date", date_column)
+        tables.append(table)
 
     if not tables:
         return None
