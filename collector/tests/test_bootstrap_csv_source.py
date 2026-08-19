@@ -7,6 +7,7 @@ import pytest
 
 from bootstrap.config import BootstrapConfig
 from bootstrap.csv_source import _format_component, read_by_date
+from bootstrap.station_join import StationInfo, StationMap
 
 HEADER = "자전거번호,대여일시,이용자종류,성별\n"
 
@@ -486,3 +487,138 @@ class TestDerivedWind:
 
         assert rows[0]["WSD"] == "3.0"
         assert rows[0]["UUU"] == "3.0"
+
+
+STOCK_HEADER = "일시,대여소번호,대여소명,시간대,거치대수량\n"
+
+
+def _stock_cfg(**overrides):
+    """재고 CSV(대여소별 공공자전거 대여가능 수량) 설정."""
+    fields = {
+        "kind": "csv",
+        "encoding": "cp949",
+        "column_map": {
+            "대여소번호": "_station_no",
+            "대여소명": "stationName",
+            "거치대수량": "parkingBikeTotCnt",
+        },
+        "composed_time": {
+            "stationDt": {
+                "from": ["일시", "시간대"],
+                "parse": "%Y-%m-%d %H",
+                "format": "%Y%m%d%H",
+            }
+        },
+        "window": {"from_column": "stationDt", "format": "%Y%m%d%H"},
+    }
+    fields.update(overrides)
+    return BootstrapConfig.model_validate(fields)
+
+
+def _write_stock(tmp_path, body, name="stock.csv"):
+    (tmp_path / name).write_text(STOCK_HEADER + body, encoding="cp949")
+    return tmp_path
+
+
+class TestComposedTime:
+    def test_joins_two_columns_into_one_time_column(self, tmp_path):
+        d = _write_stock(tmp_path, "2025-12-01,00102,102. 망원역,7,8\n")
+
+        row = read_by_date(_stock_cfg(), d, {date(2025, 12, 1)})[date(2025, 12, 1)].to_pylist()[0]
+
+        assert row["stationDt"] == "2025120107"
+
+    def test_accepts_hour_without_zero_padding(self, tmp_path):
+        """CSV의 `시간대`는 `0`~`23`이라 한 자리 시각이 그대로 온다(실측)."""
+        d = _write_stock(tmp_path, "2025-12-01,00102,102. 망원역,0,8\n")
+
+        row = read_by_date(_stock_cfg(), d, {date(2025, 12, 1)})[date(2025, 12, 1)].to_pylist()[0]
+
+        assert row["stationDt"] == "2025120100"
+
+    def test_buckets_by_composed_date(self, tmp_path):
+        d = _write_stock(tmp_path,
+            "2025-12-01,00102,102. 망원역,23,8\n"
+            "2025-12-02,00102,102. 망원역,0,9\n")
+
+        result = read_by_date(_stock_cfg(), d, {date(2025, 12, 1)})
+
+        assert result[date(2025, 12, 1)].num_rows == 1
+        assert date(2025, 12, 2) not in result
+
+    def test_raises_when_time_cannot_be_parsed(self, tmp_path):
+        """조용히 빈 값으로 넘기면 날짜 버킷팅이 죽거나 행 전체가 사라진다."""
+        d = _write_stock(tmp_path, "2025/12/01,00102,102. 망원역,7,8\n")
+
+        with pytest.raises(ValueError, match="stationDt"):
+            read_by_date(_stock_cfg(), d, {date(2025, 12, 1)})
+
+
+class TestJoin:
+    """CSV에 없는 대여소 컬럼을 매핑표에서 채운다."""
+
+    def _cfg(self):
+        return _stock_cfg(join={
+            "provider": "bike_station",
+            "by": {"number": "_station_no", "name": "stationName"},
+            "fills": ["stationId", "rackTotCnt", "shared",
+                      "stationLatitude", "stationLongitude"],
+        })
+
+    def _map(self, **entries):
+        table = StationMap()
+        for name, info in entries.items():
+            table.by_name[name] = info
+        return table
+
+    def test_fills_columns_from_station_map(self, tmp_path):
+        d = _write_stock(tmp_path, "2025-12-01,00102,102. 망원역,7,8\n")
+        table = self._map(**{"102. 망원역": StationInfo(
+            station_id="ST-4", rack_tot_cnt="15", shared="13",
+            latitude="37.55", longitude="126.91")})
+
+        row = read_by_date(self._cfg(), d, {date(2025, 12, 1)}, station_map=table)[
+            date(2025, 12, 1)].to_pylist()[0]
+
+        assert row["stationId"] == "ST-4"
+        assert row["rackTotCnt"] == "15"
+        assert row["shared"] == "13"
+        assert (row["stationLatitude"], row["stationLongitude"]) == ("37.55", "126.91")
+
+    def test_leaves_fills_empty_when_station_is_unknown(self, tmp_path):
+        """빈 stationId는 required 결측이라 검증 엔진의 drop_row 정책이 행을 폐기한다."""
+        d = _write_stock(tmp_path, "2025-12-01,09999,없는 대여소,7,8\n")
+
+        row = read_by_date(self._cfg(), d, {date(2025, 12, 1)}, station_map=self._map())[
+            date(2025, 12, 1)].to_pylist()[0]
+
+        assert row["stationId"] == ""
+        assert row["rackTotCnt"] == ""
+
+    def test_keeps_partial_info_from_history_only_stations(self, tmp_path):
+        """폐쇄 대여소는 stationId만 안다 — 나머지를 지어내지 않는다."""
+        d = _write_stock(tmp_path, "2025-12-01,00211,211. 여의도역,7,8\n")
+        table = self._map(**{"211. 여의도역": StationInfo(station_id="ST-99")})
+
+        row = read_by_date(self._cfg(), d, {date(2025, 12, 1)}, station_map=table)[
+            date(2025, 12, 1)].to_pylist()[0]
+
+        assert row["stationId"] == "ST-99"
+        assert row["shared"] == ""
+
+    def test_join_key_column_is_dropped_from_output(self, tmp_path):
+        """`_station_no`는 조인용 임시 컬럼이라 archive 스키마에 남지 않는다."""
+        d = _write_stock(tmp_path, "2025-12-01,00102,102. 망원역,7,8\n")
+        table = self._map(**{"102. 망원역": StationInfo(station_id="ST-4")})
+
+        columns = read_by_date(self._cfg(), d, {date(2025, 12, 1)}, station_map=table)[
+            date(2025, 12, 1)].column_names
+
+        assert "_station_no" not in columns
+
+    def test_raises_when_join_declared_but_map_missing(self, tmp_path):
+        """매핑표 없이 돌면 stationId가 전부 비어 그 날짜가 통째로 폐기된다."""
+        d = _write_stock(tmp_path, "2025-12-01,00102,102. 망원역,7,8\n")
+
+        with pytest.raises(ValueError, match="station_map"):
+            read_by_date(self._cfg(), d, {date(2025, 12, 1)})
