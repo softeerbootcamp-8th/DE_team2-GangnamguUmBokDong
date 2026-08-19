@@ -8,6 +8,7 @@ fixture 패턴 재사용). 각 테스트 후 전역을 리셋해 테스트 간 �
 lag_24h/168h, roll_mean/std_3h/24h 테스트는 해당 컬럼 자체가 없어져 제거했다.
 """
 
+import numpy as np
 import pandas as pd
 import pytest
 from ml_core.rolling_window_features import count_visible_in_window
@@ -41,7 +42,8 @@ def _reset_module_caches():
         "_history_by_station",
         "_rental_events_by_station",
         "_rental_events_coverage",
-        "_station_profile",
+        "_station_profile_station_index",
+        "_station_profile_values",
     ]
     saved = {n: getattr(ps, n) for n in names}
     ps._rental_events_sorted_by_station = {}
@@ -69,8 +71,23 @@ def _set_return_history(station_id: str, point, return_count: float) -> None:
 
 
 def _set_profile(entries: dict) -> None:
-    """entries: {(station_no, minute, dow, month): {"rental_mean":..., "rental_std":..., ...}}"""
-    ps._station_profile = entries
+    """entries: {(station_no, minute, dow, month): {"rental_mean":..., "rental_std":..., ...}}
+
+    predict_single.py 내부 캐시는 이제 dict-of-dict가 아니라 dense numpy 배열이라
+    (`_get_station_profile()`/`_build_station_profile_arrays()` 참고, 리뷰 지적으로
+    프로세스당 수 GB 먹던 문제 수정), 여기선 예전과 같은 호출부 형식(`entries` dict
+    literal)을 유지한 채 내부적으로만 DataFrame으로 바꿔 실제 압축 함수를 그대로 태운다."""
+    if not entries:
+        ps._station_profile_station_index = {}
+        ps._station_profile_values = np.empty((0, 0, 0, 0, 0), dtype="float32")
+        return
+    df = pd.DataFrame(
+        [
+            {"station_no": station_no, "minute": minute, "dow": dow, "month": month, **stats}
+            for (station_no, minute, dow, month), stats in entries.items()
+        ]
+    )
+    ps._station_profile_station_index, ps._station_profile_values = ps._build_station_profile_arrays(df)
 
 
 def test_rental_lag_1h_matches_count_visible_in_window():

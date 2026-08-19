@@ -11,6 +11,7 @@
    제대로 채워지는지 확인한다.
 """
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -43,7 +44,8 @@ def _reset_module_caches(monkeypatch):
         "_rental_events_by_station",
         "_rental_events_coverage",
         "_all_rental_events_sorted",
-        "_station_profile",
+        "_station_profile_station_index",
+        "_station_profile_values",
         "_population_profile",
         "_station_master",
         "_holidays_by_year",
@@ -126,7 +128,8 @@ def test_lag_rolling_features_differ_by_minute_within_same_hour():
     trips = pd.DataFrame([_trip("A", "2025-06-01 16:30:00", "2025-06-01 16:40:00")])
     _set_rental_events(trips)
     _set_return_history("A", "2025-06-01 16:00:00")
-    ps._station_profile = {}
+    ps._station_profile_station_index = {}
+    ps._station_profile_values = np.empty((0, 0, 0, 0, 0), dtype="float32")
 
     out_1700, fb_1700 = ps._lag_rolling_features("A", 1, pd.Timestamp("2025-06-01 17:00:00"))
     out_1720, fb_1720 = ps._lag_rolling_features("A", 1, pd.Timestamp("2025-06-01 17:20:00"))
@@ -143,7 +146,8 @@ def test_build_feature_record_honors_minute():
     trips = pd.DataFrame([_trip("A", "2025-06-01 17:10:00", "2025-06-01 17:20:00")])
     _set_rental_events(trips)
     _set_return_history("A", "2025-06-01 16:40:00")
-    ps._station_profile = {}
+    ps._station_profile_station_index = {}
+    ps._station_profile_values = np.empty((0, 0, 0, 0, 0), dtype="float32")
     _set_station_master(["A"])
 
     record, fallback, population_fallback = ps._build_feature_record(
@@ -178,7 +182,8 @@ def test_predict_demand_multi_hour_all_stations_reports_failed_stations(monkeypa
     trips = pd.DataFrame([_trip("A", "2025-06-01 09:00:00", "2025-06-01 09:05:00")])
     _set_rental_events(trips)
     _set_return_history("A", "2025-06-01 09:00:00")
-    ps._station_profile = {}
+    ps._station_profile_station_index = {}
+    ps._station_profile_values = np.empty((0, 0, 0, 0, 0), dtype="float32")
     ps._population_profile = {}
     _set_station_master(["A"])  # "MISSING"은 일부러 마스터에 안 넣음
     monkeypatch.setattr(ps, "predict", _fake_predict)
@@ -201,7 +206,8 @@ def test_predict_demand_multi_hour_all_stations_no_failures_when_all_known(monke
     trips = pd.DataFrame([_trip("A", "2025-06-01 09:00:00", "2025-06-01 09:05:00")])
     _set_rental_events(trips)
     _set_return_history("A", "2025-06-01 09:00:00")
-    ps._station_profile = {}
+    ps._station_profile_station_index = {}
+    ps._station_profile_values = np.empty((0, 0, 0, 0, 0), dtype="float32")
     ps._population_profile = {}
     _set_station_master(["A"])
     monkeypatch.setattr(ps, "predict", _fake_predict)
@@ -222,7 +228,8 @@ def test_single_station_cli_saves_to_s3(monkeypatch):
     trips = pd.DataFrame([_trip("ST-100", "2025-06-01 09:00:00", "2025-06-01 09:05:00")])
     _set_rental_events(trips)
     _set_return_history("ST-100", "2025-06-01 09:00:00")
-    ps._station_profile = {}
+    ps._station_profile_station_index = {}
+    ps._station_profile_values = np.empty((0, 0, 0, 0, 0), dtype="float32")
     ps._population_profile = {}
     _set_station_master(["ST-100"])
     monkeypatch.setattr(ps, "predict", _fake_predict)
@@ -319,7 +326,8 @@ def test_single_station_multi_hour_cli_saves_to_s3(monkeypatch):
     trips = pd.DataFrame([_trip("ST-100", "2025-06-01 09:00:00", "2025-06-01 09:05:00")])
     _set_rental_events(trips)
     _set_return_history("ST-100", "2025-06-01 09:00:00")
-    ps._station_profile = {}
+    ps._station_profile_station_index = {}
+    ps._station_profile_values = np.empty((0, 0, 0, 0, 0), dtype="float32")
     ps._population_profile = {}
     _set_station_master(["ST-100"])
     monkeypatch.setattr(ps, "predict", _fake_predict)

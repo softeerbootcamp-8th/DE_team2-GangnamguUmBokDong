@@ -119,7 +119,12 @@ _rental_events_by_station: dict[str, pd.DataFrame] | None = None
 _rental_events_sorted_by_station: dict[str, tuple] = {}  # station_id -> (start_dt 정렬된 numpy 배열, 그 순서로 정렬된 end_dt 배열) — _rental_visible_at() 캐시
 _all_rental_events_sorted: tuple | None = None  # (station_id 배열, start_dt로 정렬된 배열, 같은 순서의 end_dt 배열) — 전체 정류소 통합, _rental_visible_batch_all_stations() 캐시
 _rental_events_coverage: tuple[pd.Timestamp, pd.Timestamp] | None = None
-_station_profile: dict[tuple[str, int, int, int], dict[str, float]] | None = None
+_STATION_PROFILE_STAT_COLS = ("rental_mean", "rental_std", "return_mean", "return_std")
+_STATION_PROFILE_STAT_INDEX = {name: i for i, name in enumerate(_STATION_PROFILE_STAT_COLS)}
+# station_no -> station 축 인덱스, 그리고 (station, minute//tick, dow, month-1, stat) dense
+# 배열 — dict[tuple, dict[str,float]] 대신 쓰는 이유는 _get_station_profile() 참고.
+_station_profile_station_index: dict[int, int] | None = None
+_station_profile_values: np.ndarray | None = None
 _population_profile: dict[tuple[str, int, int], dict[str, float]] | None = None
 _station_master: pd.DataFrame | None = None
 _holidays_by_year: dict[int, set[str]] = {}
@@ -462,12 +467,18 @@ def _get_holidays(year: int) -> set[str]:
     return _holidays_by_year[year]
 
 
-def _get_station_profile() -> dict[tuple[int, int, int, int], dict[str, float]]:
-    """station_hourly_profile.parquet을 (station_no, minute, dow, month) 키의 dict로 캐시해 반환한다.
+def _build_station_profile_arrays(df: pd.DataFrame) -> tuple[dict[int, int], np.ndarray]:
+    """station_hourly_profile 행들을 (station_no -> 축 인덱스) dict + dense numpy 배열로 압축한다.
 
-    station_id(텍스트)가 아니라 station_no(정수)로 키를 잡는다 — build_station_profile.py가
-    이제 그 기준으로 프로필을 만든다(모델 feature 자체가 station_no로 바뀐 것과 동일한
-    이유, model_contract.BASE_FEATURE_COLUMNS 참고).
+    예전엔 (station_no, minute, dow, month) 튜플을 key로, {rental_mean, ...} dict를
+    value로 갖는 파이썬 dict를 그대로 캐시했다 — 정류소 약 수천 개 x 72tick(20분
+    간격) x 7요일 x 12개월 = 약 1,800만 개 항목이라, dict-of-dict 하나당 파이썬 객체
+    오버헤드(키 튜플 + 값 dict, 항목당 수백 바이트)만으로 프로세스당 수 GB를
+    먹었다(리뷰 지적). minute/dow/month는 전부 값의 범위가 좁고 촘촘해서(tick
+    간격으로 나누면 72개, dow 7개, month 12개) 해시 테이블이 필요 없다 — station마다
+    dense numpy 배열 한 칸을 두면 항목당 파이썬 객체 오버헤드 없이 float32 4개만
+    쓴다(수백 MB 수준으로 축소). station_no만 정수값 자체가 넓게 흩어져 있어(정류소
+    자체는 수천 개뿐) 그것만 작은 dict로 따로 0-based 인덱스로 압축한다.
 
     hour가 아니라 minute(자정 기준 경과분)으로 묶는 이유: rental_count/return_count
     자체가 60분짜리 미래 방향 롤링 합이라 한 hour 안의 tick들은 40분(2/3)이나 겹쳐서
@@ -480,25 +491,48 @@ def _get_station_profile() -> dict[tuple[int, int, int, int], dict[str, float]]:
     (실측 1월 대비 6월 약 2.44배), station x minute x dow로만 묶으면
     1월 결측과 6월 결측이 똑같은 연간 평균으로 채워지는 문제가 생긴다.
 
+    args:
+        df: station_no, minute, dow, month, rental_mean, rental_std, return_mean,
+            return_std 컬럼을 가진 프로필 행들 (build_station_profile.py 산출물과 같은 스키마).
+            minute은 GRID_TICK_MINUTES의 배수라고 가정한다(업스트림 grid 집계 결과이므로).
     returns:
-        dict[tuple[int, int, int, int], dict[str, float]]: (station_no, minute, dow, month) ->
-            {rental_mean, rental_std, return_mean, return_std}
+        (station_no -> station 축 인덱스 dict, shape (n_station, 1440//tick, 7, 12, 4) float32 배열)
     """
-    global _station_profile
-    if _station_profile is None:
+    station_nos = sorted(df["station_no"].unique().tolist())
+    station_index = {station_no: i for i, station_no in enumerate(station_nos)}
+    n_minute_buckets = 1440 // config.GRID_TICK_MINUTES
+
+    values = np.full(
+        (len(station_nos), n_minute_buckets, 7, 12, len(_STATION_PROFILE_STAT_COLS)), np.nan, dtype="float32"
+    )
+    station_idx = df["station_no"].map(station_index).to_numpy()
+    minute_idx = df["minute"].to_numpy() // config.GRID_TICK_MINUTES
+    dow_idx = df["dow"].to_numpy()
+    month_idx = df["month"].to_numpy() - 1
+    for stat_idx, col in enumerate(_STATION_PROFILE_STAT_COLS):
+        values[station_idx, minute_idx, dow_idx, month_idx, stat_idx] = df[col].to_numpy()
+
+    return station_index, values
+
+
+def _get_station_profile() -> tuple[dict[int, int], np.ndarray]:
+    """station_hourly_profile.parquet을 station_no 인덱스 dict + dense 배열로 캐시해 반환한다.
+
+    station_id(텍스트)가 아니라 station_no(정수)로 조회한다 — build_station_profile.py가
+    이제 그 기준으로 프로필을 만든다(모델 feature 자체가 station_no로 바뀐 것과 동일한
+    이유, model_contract.BASE_FEATURE_COLUMNS 참고). 실제 압축 방식은
+    `_build_station_profile_arrays()` 참고.
+
+    returns:
+        (station_no -> station 축 인덱스 dict, dense 배열) — `_profile_stat()` 참고
+    """
+    global _station_profile_station_index, _station_profile_values
+    if _station_profile_values is None:
         df = s3_io.read_parquet(config.STATION_HOURLY_PROFILE_PARQUET)
         if df is None:
             raise FileNotFoundError(f"S3에 없음: {config.STATION_HOURLY_PROFILE_PARQUET}")
-        _station_profile = {
-            (r.station_no, r.minute, r.dow, r.month): {
-                "rental_mean": r.rental_mean,
-                "rental_std": r.rental_std,
-                "return_mean": r.return_mean,
-                "return_std": r.return_std,
-            }
-            for r in df.itertuples()
-        }
-    return _station_profile
+        _station_profile_station_index, _station_profile_values = _build_station_profile_arrays(df)
+    return _station_profile_station_index, _station_profile_values
 
 
 def _profile_stat(station_no: int, ts: pd.Timestamp, stat_key: str) -> float:
@@ -509,10 +543,17 @@ def _profile_stat(station_no: int, ts: pd.Timestamp, stat_key: str) -> float:
         ts: 조회할 시각 (minute_of_day/dayofweek/month를 사용 — month으로 계절성 반영)
         stat_key: "rental_mean" / "rental_std" / "return_mean" / "return_std" 중 하나
     returns:
-        float: 프로필 값. 해당 station의 프로필이 아예 없으면 NaN
+        float: 프로필 값. 해당 station의 프로필이 아예 없거나 ts가 grid tick 경계에
+            있지 않으면(예전 dict 기반 구현도 이 경우 항상 miss였음) NaN
     """
-    entry = _get_station_profile().get((station_no, minute_of_day(ts), ts.dayofweek, ts.month))
-    return entry[stat_key] if entry is not None else np.nan
+    station_index, values = _get_station_profile()
+    row = station_index.get(station_no)
+    if row is None:
+        return np.nan
+    minute = minute_of_day(ts)
+    if minute % config.GRID_TICK_MINUTES != 0:
+        return np.nan
+    return values[row, minute // config.GRID_TICK_MINUTES, ts.dayofweek, ts.month - 1, _STATION_PROFILE_STAT_INDEX[stat_key]]
 
 
 def _get_population_profile() -> dict[tuple[str, int, int], dict[str, float]]:

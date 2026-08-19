@@ -10,6 +10,7 @@
 4. 날씨는 스칼라(전체 horizon 재사용) 또는 길이 n_hours 배열(horizon별) 둘 다 받는다.
 """
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -35,7 +36,8 @@ def _reset_module_caches(monkeypatch):
         "_rental_events_by_station",
         "_rental_events_coverage",
         "_all_rental_events_sorted",
-        "_station_profile",
+        "_station_profile_station_index",
+        "_station_profile_values",
         "_population_profile",
         "_station_master",
         "_holidays_by_year",
@@ -97,7 +99,8 @@ def _setup_common(station_id="A"):
     trips = pd.DataFrame([_trip(station_id, "2025-06-01 09:00:00", "2025-06-01 09:05:00")])
     _set_rental_events(trips)
     _set_return_history(station_id, "2025-06-01 00:00:00")
-    ps._station_profile = {}
+    ps._station_profile_station_index = {}
+    ps._station_profile_values = np.empty((0, 0, 0, 0, 0), dtype="float32")
     ps._population_profile = {}
     _set_station_master([station_id])
     ps._holidays_by_year = {2025: set()}  # is_holiday가 순수하게 주말 여부만 반영하도록 고정

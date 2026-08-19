@@ -3,6 +3,7 @@
 한다(`_stockout_from_status()` 참고, `predict_single.py` 모듈 docstring 참고).
 """
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -19,8 +20,8 @@ _BIKE_STATUS_WITH_A = pd.DataFrame(
 def _reset_module_caches(monkeypatch):
     names = [
         "_history_by_station", "_rental_events_by_station", "_rental_events_coverage",
-        "_all_rental_events_sorted", "_station_profile", "_population_profile",
-        "_station_master", "_holidays_by_year",
+        "_all_rental_events_sorted", "_station_profile_station_index", "_station_profile_values",
+        "_population_profile", "_station_master", "_holidays_by_year",
     ]
     saved = {n: getattr(ps, n) for n in names}
     ps._rental_events_sorted_by_station = {}
@@ -74,7 +75,8 @@ def _setup_single_station(station_id: str = "A") -> None:
     }])
     _set_rental_events(trips)
     _set_return_history(station_id, "2025-06-01 09:00:00")
-    ps._station_profile = {}
+    ps._station_profile_station_index = {}
+    ps._station_profile_values = np.empty((0, 0, 0, 0, 0), dtype="float32")
     ps._population_profile = {}
     _set_station_master([station_id])
     ps._holidays_by_year = {2025: set()}
@@ -150,7 +152,8 @@ def test_predict_demand_multi_hour_all_stations_reports_fallback_per_station(mon
     ps._history_by_station = {
         sid: pd.DataFrame({"return_count": [0.0]}, index=[point]) for sid in ("A", "B")
     }
-    ps._station_profile = {}
+    ps._station_profile_station_index = {}
+    ps._station_profile_values = np.empty((0, 0, 0, 0, 0), dtype="float32")
     ps._population_profile = {}
     _set_station_master(["A", "B"])
     ps._holidays_by_year = {2025: set()}

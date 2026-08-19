@@ -17,6 +17,7 @@ count_visible_in_window()을 anchor마다 반복 호출하는 방식으로 구�
 
 import os
 
+import numpy as np
 import pandas as pd
 import pytest
 from ml_core.rolling_window_features import censored_rolling_counts
@@ -65,7 +66,10 @@ def _reset_predict_single_caches():
     # _rental_events_sorted_by_station은 station_id 키로 in-place mutate되는
     # 캐시라(_rental_visible_at() 참고) save/restore로 참조만 되돌리면 이전
     # 테스트에서 채워진 항목이 새 테스트로 새어 들어간다 — 매번 새 dict로 비운다.
-    names = ["_history_by_station", "_rental_events_by_station", "_rental_events_coverage", "_station_profile"]
+    names = [
+        "_history_by_station", "_rental_events_by_station", "_rental_events_coverage",
+        "_station_profile_station_index", "_station_profile_values",
+    ]
     saved = {n: getattr(ps, n) for n in names}
     ps._rental_events_sorted_by_station = {}
     yield
@@ -124,7 +128,8 @@ def test_rental_lag_1h_matches_between_batch_and_single_point(spark, trips, tmp_
     ps._rental_events_by_station = {"A": trips.reset_index(drop=True)}
     ps._rental_events_coverage = (pd.Timestamp("2025-01-01"), pd.Timestamp("2025-12-31 23:59:59"))
     ps._history_by_station = {}  # return_lag_1h는 이 테스트 대상이 아님 — 항상 profile fallback
-    ps._station_profile = {}
+    ps._station_profile_station_index = {}
+    ps._station_profile_values = np.empty((0, 0, 0, 0, 0), dtype="float32")
 
     check_targets = pd.date_range("2025-06-01 08:00", "2025-06-01 12:00", freq="h")
     for target_ts in check_targets:
