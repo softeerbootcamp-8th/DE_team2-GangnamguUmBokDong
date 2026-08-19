@@ -5,10 +5,10 @@ feature를 결측(NaN) 대신 "그 정류소가 이 달 이 요일 이 시각에
 였는지"로 채우기 위한 fallback 테이블이다.
 
 **hour가 아니라 minute(자정 기준 경과분, ml_core.minute_of_day)으로 묶는다** —
-hour로 묶으면 표본이 늘어 보이지만(그 달의 그 요일 4~5일 x 시간당 tick 3개 =
-12~15개), rental_count/return_count 자체가 TARGET_HORIZON_MINUTES(60분)짜리
-미래 방향 롤링 합이라 한 시간 안의 tick들(예: 17:00/17:20/17:40)은 창이
-40분(2/3)이나 겹쳐 사실상 거의 같은 값을 반복해서 보는 것에 가깝다 — "추가
+hour로 묶으면 표본이 늘어 보이지만(그 달의 그 요일 4~5일 x 시간당 5분 tick 12개 =
+48~60개), rental_count/return_count 자체가 TARGET_HORIZON_MINUTES(60분)짜리
+미래 방향 롤링 합이라 인접한 tick들(예: 17:00/17:05)은 창이 55분이나 겹쳐
+사실상 거의 같은 값을 반복해서 보는 것에 가깝다 — "추가
 표본"처럼 보이지만 독립적인 정보는 거의 안 늘어난다. 반면 모델이 실제로 보는
 feature(common_config.BASE_FEATURE_COLUMNS)는 hour가 아니라 minute이라, hour로
 뭉친 fallback은 모델이 학습한 tick 단위 구분과 어긋난 값을 돌려주게 된다.
@@ -70,9 +70,10 @@ def build_station_profile() -> pd.DataFrame:
     profile["n_samples"] = profile["n_samples"].astype("int32")
 
     s3_io.write_parquet(profile, config.STATION_HOURLY_PROFILE_PARQUET)
+    ticks_per_day = 1440 // config.GRID_TICK_MINUTES
     print(
         f"station_hourly_profile: {profile.shape[0]:,}행 "
-        f"({df['station_no'].nunique()}개 정류소 x 72tick x 7요일 x 12개월), "
+        f"({df['station_no'].nunique()}개 정류소 x {ticks_per_day}tick x 7요일 x 12개월), "
         f"그룹당 표본 수 min={profile['n_samples'].min()} max={profile['n_samples'].max()} "
         f"-> {config.STATION_HOURLY_PROFILE_PARQUET}"
     )

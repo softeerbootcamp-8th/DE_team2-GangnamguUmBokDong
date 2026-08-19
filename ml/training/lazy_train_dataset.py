@@ -1,9 +1,10 @@
 """날짜 파티션 단위로 S3를 지연 조회하는 LightGBM 학습 데이터 계층.
 
-**왜 필요한가**: multi-horizon feature 테이블(20분 tick·full horizon·1년 기준 약 8억
-행, 13개 feature 컬럼)을 하나의 pandas DataFrame으로 통째로 읽으면(예전
+**왜 필요한가**: multi-horizon feature 테이블은 과거 20분 tick·full horizon·1년
+실측만으로도 약 8억 행(13개 feature 컬럼)이었다. 현재 운영 계약인 5분 tick은
+그보다 더 조밀하므로, 하나의 pandas DataFrame으로 통째로 읽으면(예전
 `train_common.load_training_table()`이 하던 방식) 원본만 수십GB라 로컬(RAM 18GB)에서
-반복적으로 OOM이 났다. 앵커 tick 밀도(20분, 향후 5분 희망)와 horizon(12 전체)은 줄이지 않기로
+반복적으로 OOM이 났다. 앵커 tick 밀도(5분)와 horizon(12 전체)은 줄이지 않기로
 확정됐으므로(`training/config.py` TRAIN_DAY_DIVISOR/MAX_TRAIN_HORIZON 주석 참고),
 유일한 근본 해결책은 그 DataFrame을 애초에 통째로 만들지 않는 것이다.
 
@@ -38,7 +39,6 @@ from collections.abc import Callable
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
-import pyarrow as pa
 from core import s3 as s3_io
 
 
@@ -56,6 +56,7 @@ class ChunkCache:
         self._data: OrderedDict[str, np.ndarray] = OrderedDict()
 
     def get_or_fetch(self, key: str, loader: Callable[[], np.ndarray]) -> np.ndarray:
+        """캐시에 있으면 재사용하고, 없으면 로드해 LRU 크기를 유지한다."""
         if key in self._data:
             self._data.move_to_end(key)
             return self._data[key]
@@ -64,6 +65,10 @@ class ChunkCache:
         if len(self._data) > self._max_size:
             self._data.popitem(last=False)
         return value
+
+    def clear(self) -> None:
+        """상주 중인 날짜 feature 배열을 모두 해제한다."""
+        self._data.clear()
 
 
 def _list_date_part_keys(table_path: str, date_str: str) -> list[str]:
@@ -112,7 +117,7 @@ def _read_date_chunk(table_path: str, date_str: str, columns: list[str], filters
     ]
     if not tables:
         raise FileNotFoundError(f"S3에 이 날짜 파티션에 데이터가 없음(filters 이후 0행): {table_path}/date={date_str}/")
-    combined = pa.concat_tables(tables)
+    combined = s3_io.concat_compatible_tables(tables, required_columns=columns)
     del tables
     df = combined.to_pandas(self_destruct=True, split_blocks=True)
     del combined
@@ -195,6 +200,7 @@ def build_lazy_dataset(
     reference: lgb.Dataset | None = None,
     on_chunk_loaded: Callable[[str, int], None] | None = None,
     on_prepass_complete: Callable[[int, int], None] | None = None,
+    dataset_params: dict | None = None,
 ) -> tuple[lgb.Dataset, np.ndarray, np.ndarray | None]:
     """train 또는 valid 하나를 Sequence 기반 `lgb.Dataset`으로 만든다.
 
@@ -208,6 +214,9 @@ def build_lazy_dataset(
         dates: `_dates_for_split()`이 계산한 이 split의 날짜 목록(캘린더 연산만, 이미 확정됨)
         reference: valid Dataset을 만들 때 train Dataset을 넘긴다(빈 스토리지 재사용 —
             LightGBM이 같은 bin 경계를 쓰게 함). train 자신은 None.
+        dataset_params: Dataset construct 시점에 고정돼야 하는 LightGBM 파라미터.
+            `max_bin`/`min_data_in_leaf` 등이 이후 `lgb.train()`에서 뒤늦게 바뀌어
+            거부되거나 다른 binning을 쓰지 않도록 학습 파라미터를 함께 넘긴다.
     returns:
         tuple[lgb.Dataset, np.ndarray, np.ndarray | None]: (construct()까지 끝난 Dataset, y, exposure)
     raises:
@@ -241,7 +250,15 @@ def build_lazy_dataset(
     ]
     init_score = np.log(exposure) if exposure_col else None
     cat_idx = [feature_columns.index("station_no")]
-    dataset = lgb.Dataset(data=sequences, label=y, init_score=init_score, reference=reference, categorical_feature=cat_idx)
+    dataset = lgb.Dataset(
+        data=sequences,
+        label=y,
+        init_score=init_score,
+        reference=reference,
+        feature_name=feature_columns,
+        categorical_feature=cat_idx,
+        params=dataset_params,
+    )
     dataset.construct()
     return dataset, y, exposure
 

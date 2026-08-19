@@ -23,7 +23,7 @@ from pathlib import Path
 
 from core import s3 as s3_io
 
-from . import common_config
+from . import common_config, profile_contract
 
 # 로컬 subprocess로 형제 패키지의 venv 실행파일을 찾을 때만 쓰는 로컬 경로
 # 개념(예: training/scripts/monthly_retrain_check.py가 feature_engine/training의
@@ -116,19 +116,8 @@ def champion_pointer_key(model_name: str) -> str:
     return f"{MODELS_PREFIX}/champion/{model_name}.json"
 
 
-PROFILES_PREFIX = "profiles"
-
-
-def profile_path(name: str) -> str:
-    """하이퍼파라미터 프로필(임베고/tick/LGB 파라미터 등)의 S3 키.
-
-    feature_engine/training/inference가 각자 다른 서버에 배포되므로, 프로필을
-    저장소에 커밋된 로컬 JSON으로 두면 값 하나 바꿀 때마다 세 곳 다 코드 배포가
-    필요해진다 — 대신 공유 S3에 두고 `common_config._load_profile()`이 매 프로세스
-    시작 시 여기서 읽는다(`ML_PROFILE` 환경변수로 이름만 맞추면 세 서비스가 항상
-    같은 값을 봄). `ml_core.profile_registry.push_profile()`이 이 키에 쓴다.
-    """
-    return f"{PROFILES_PREFIX}/{name}.json"
+PROFILES_PREFIX = profile_contract.PROFILES_PREFIX
+profile_path = profile_contract.profile_path
 
 
 @cache
@@ -226,7 +215,7 @@ POPULATION_PARQUET = f"{PROCESSED_V2_PREFIX}/population_2025.parquet"
 # 같은 값이어야 한다(위 모듈 docstring 참고) ---
 MERGED_TABLE_PARQUET = f"{FEATURE_ENGINEERING_OUTPUT_DIR}/station_hour_merged_2025.parquet"
 FEATURES_TABLE_PARQUET = f"{FEATURE_ENGINEERING_OUTPUT_DIR}/station_hour_features_2025.parquet"
-# FEATURES_TABLE_PARQUET의 각 행(T0, 20분 tick)을 horizon=1..HORIZON_COUNT만큼 self-join해
+# FEATURES_TABLE_PARQUET의 각 행(T0, 5분 tick)을 horizon=1..HORIZON_COUNT만큼 self-join해
 # "T0의 lag + T0+(horizon-1)시간의 날씨/캘린더/타겟"으로 조합한 학습 테이블
 # (build_multi_horizon_features.py) — 대여/반납이 서로 다른 lag/타겟을 쓰는 완전히
 # 분리된 데이터셋이라 출력도 둘로 나뉜다. training이 이제 이 테이블들만 읽는다.

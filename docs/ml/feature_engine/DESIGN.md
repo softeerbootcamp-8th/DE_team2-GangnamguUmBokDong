@@ -17,8 +17,8 @@
 테스트로 검증된 그대로), 파일 경로는 전부 `feature_engine/spark/` 기준으로
 읽을 것 — pandas 파일명이 나오면 그 로직이 지금은 어느 Spark 모듈에
 대응하는지 [feature_engine/README.md](../../../ml/feature_engine/README.md)의
-표를 참고. 5분 tick/피처 목록 등 구체적인 수치는 이후 세션에서 20분 tick +
-피처 축소로 또 한 번 바뀌었다 — 이 문서에서 그 변경을 반영한 부분은
+표를 참고. 5분 tick/피처 목록 등 구체적인 수치는 이후 세션에서 피처 축소와
+프로필화로 또 한 번 바뀌었다 — 이 문서에서 그 변경을 반영한 부분은
 "(2026-08 갱신)"으로 표시해뒀고, 나머지(그리드 설계 이유, dtype 다운캐스트
 근거, Spark 포팅 함정 등 인과관계 설명)는 여전히 유효하다.
 
@@ -71,17 +71,16 @@ self-test 검증). 그 외 주의점: 집계는 "그 시간대에 가장 오래 
 `data/processed/utf8_*`만 예외 — 놓치면 한글 컬럼명이 깨진다.
 
 **0.5 최종 병합 테이블 및 검증**(당시 시간 단위 그리드 기준, 이후 §1에서 tick
-단위 그리드로 전환 — 지금은 20분): 2,582개 활성 정류소 × 8,760시간 = 22,618,320행. `rental_count`/
+단위 그리드로 전환 — 지금은 5분): 2,582개 활성 정류소 × 8,760시간 = 22,618,320행. `rental_count`/
 `return_count` 합계가 원본 트립 집계와 정확히 일치, 재고 스냅샷 매칭률 98.91%,
 생활인구 매칭률(pop_total>0) 99.69% — station 수(2,582)가 기존 EDA의
 전체 정류소 수(2,835)보다 적은 건 "2025년 트립 1건 이상"만 포함해서다(정상).
 
-## 1. 그리드 — station × 20분 tick (이 절이 처음 쓰였을 땐 5분이었다)
+## 1. 그리드 — station × 5분 tick
 
 `build_merged_table.py`가 만드는 그리드의 각 행은 `(station_id, hour_ts)`이고
-`hour_ts`는 `GRID_TICK_MINUTES`(기본 프로필 **20분** — 정확한 전환 시점/사유는
-이 문서에 따로 기록돼 있지 않다, 현재 값은 `ml_core/profiles/default.json`을
-신뢰할 것) 단위 tick이다(컬럼명은 하위 호환을 위해 그대로 유지 — 항상
+`hour_ts`는 `GRID_TICK_MINUTES`(운영 계약 **5분**, 단일 소스는
+`libs/ml_core/profile_contract.py`) 단위 tick이다(컬럼명은 하위 호환을 위해 그대로 유지 — 항상
 정시라고 가정하면 안 됨). 두 가지 이유가 겹쳐서 시간 단위가 아니라 tick
 그리드를 쓰게 됐다:
 
@@ -98,7 +97,7 @@ sparse 타겟/rolling 카운트를 그리드의 특정 tick에서 조회하려�
 
 ## 2. lag/rolling — 시간 기준(gap-aware), tick 밀도 무관
 
-그리드가 tick 단위(시간당 여러 행, 현재 20분=시간당 3행)가 되면서
+그리드가 tick 단위(시간당 여러 행, 현재 5분=시간당 12행)가 되면서
 "N번째 이전 행 == N시간 전"이 더 이상 성립하지 않는다(예전 시간 단위
 그리드에서는 항상 dense해서 성립했음). 그래서:
 
@@ -122,7 +121,7 @@ sparse 타겟/rolling 카운트를 그리드의 특정 tick에서 조회하려�
 1시간 대여량" 같은 피처를 raw 값으로 만들면 학습 데이터(몇 달~몇 년 뒤 전부 반납
 완료)와 서빙 시점(방금 지난 데이터의 4~8%만 로그에 보임)의 분포가 어긋난다
 (train-serving skew). `build_rolling_rental_features.py`가 `[T-embargo-window,
-T-embargo)` 윈도우(기본 프로필: window 60분, embargo 40분 — tick이 20분일 때
+T-embargo)` 윈도우(기본 프로필: window 60분, embargo 40분 —
 "100분 전~40분 전")로 그 시점에 실제로 관측 가능했던 값만 계산해서
 (`ml_core.rolling_window_features.censored_rolling_counts()`), `features.py`가
 그 값을 `rental_lag_1h`(대여 모델의 유일한 lag 피처)로 대체한다. 반납은 반납
@@ -188,6 +187,14 @@ Silver(`silver/station/`, `silver/bike_rental_history/`,
 `feature_engine/spark/silver_source.py`가 그걸 직접 읽어 §0.4의 `build_*.py`가
 하던 재집계를 매 `run_pipeline.py` 실행마다 Spark로 다시 한다("processed_v2"는
 이제 그 중간 산출물이 놓이는 S3 키 prefix 이름으로만 남음).
+
+날씨 중간 산출물은 시간별 최신값 하나가 아니라 실제 collection tick별 유효 서울
+격자 평균을 보존한다. 병합 단계는 weather만 `lead`/`sequence`로 5분 tick에 먼저
+펼쳐 다음 관측 직전 또는 최대 3시간까지 과거 방향으로 채운 뒤 station grid와
+exact join한다. 최신 tick을 같은 시간 전체에 붙이지 않으므로 미래 관측 누수가
+없고, 최대 3시간 lookback하는 inference와 freshness 경계도 같다. window 첫 tick을
+위해 weather source만 시작점 이전 3시간 context를 읽되 최종 feature window는
+`[since, until)` 그대로다.
 
 또한 최종 산출물이 테이블 1개(`station_hour_features_2025.parquet`)가
 아니라 **대여/반납 각각의 multi-horizon 테이블 2개**다 —

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import re
 import sys
 from datetime import datetime
 
@@ -16,13 +17,17 @@ from shapely import STRtree
 from shapely.geometry import Point
 
 MIN_GRID_COVERAGE = 0.95
+STATION_NO_MIN = 1
+STATION_NO_MAX = 32_767
+
+_STATION_ID_PATTERN = re.compile(r"^ST-([0-9]+)$")
 
 _TO_EPSG5179 = Transformer.from_crs("EPSG:4326", "EPSG:5179", always_xy=True)
 
 _OUTPUT_SCHEMA = pa.schema(
     [
         ("station_id", pa.string()),
-        ("station_no", pa.string()),
+        ("station_no", pa.int16()),
         ("station_name", pa.string()),
         ("capacity", pa.int64()),
         ("lat", pa.float64()),
@@ -53,6 +58,33 @@ def _valid_wgs84(lat: object, lon: object) -> bool:
         and 36.5 <= latitude <= 38.5
         and 125.5 <= longitude <= 128.5
     )
+
+
+def _station_no(station_id: str) -> int:
+    """`ST-<숫자>` station_id에서 모델용 int16 정류소 번호를 추출한다.
+
+    `bike_station_master.ADDR2`는 실제 데이터에서 정류소 번호와 한글 상세주소가
+    섞여 있으므로 모델의 범주 키로 사용할 수 없다. 정류소 식별자인 `RNTLS_ID`의
+    숫자 suffix만 허용하고, Spark `ShortType` 및 모델 스키마와 같은 양의 int16
+    범위를 벗어나면 보강 snapshot 전체를 fail-closed한다.
+
+    raises:
+        ValueError: station_id 형식이 잘못됐거나 숫자 suffix가 양의 int16 범위 밖일 때
+    """
+    match = _STATION_ID_PATTERN.fullmatch(station_id)
+    if match is None:
+        raise ValueError(
+            "bike_station_master RNTLS_ID는 'ST-<숫자>' 형식이어야 합니다: "
+            f"{station_id!r}"
+        )
+    station_no = int(match.group(1))
+    if not STATION_NO_MIN <= station_no <= STATION_NO_MAX:
+        raise ValueError(
+            "bike_station_master RNTLS_ID 숫자 suffix가 모델 int16 범위 밖입니다: "
+            f"station_id={station_id!r}, station_no={station_no}, "
+            f"allowed={STATION_NO_MIN}..{STATION_NO_MAX}"
+        )
+    return station_no
 
 
 def _realtime_by_station(table: pa.Table | None) -> dict[str, dict]:
@@ -124,7 +156,7 @@ def enrich_station_master(
         capacity_value = _number(live.get("rackTotCnt"))
         rows_by_station[station_id] = {
             "station_id": station_id,
-            "station_no": str(raw["ADDR2"]) if raw.get("ADDR2") is not None else None,
+            "station_no": _station_no(station_id),
             "station_name": live.get("stationName") or raw.get("ADDR1") or raw.get("ADDR2"),
             "capacity": int(capacity_value) if capacity_value is not None else None,
             "lat": latitude,

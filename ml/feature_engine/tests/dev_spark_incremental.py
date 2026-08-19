@@ -36,16 +36,19 @@ pyspark = pytest.importorskip("pyspark")
 from pyspark.sql import functions as F
 
 from feature_engine.spark import config as fe_config
+from feature_engine.spark import run_pipeline
 from feature_engine.spark.build_features import build_features
 from feature_engine.spark.build_merged_table import build_merged_table
 from feature_engine.spark.build_rolling_rental_features import (
     build_rolling_rental_features,
 )
 from feature_engine.spark.run_pipeline import (
+    _explicit_window_requested,
     _incremental_since,
     _refresh_primary_tables,
     _reject_if_legacy_flat_layout,
     _run_incremental,
+    _window_timestamp_bounds,
 )
 from feature_engine.spark.watermark import read_watermark, write_watermark
 
@@ -60,6 +63,50 @@ def _write_parquet(path, df: pd.DataFrame) -> None:
     df.to_parquet(path, index=False)
 
 
+def test_window_timestamp_bounds_make_end_date_inclusive(monkeypatch):
+    """2025-12-31 전체를 포함하되 2026-01-01 00:00은 제외하는 경계를 만든다."""
+    monkeypatch.setattr(fe_config, "WINDOW_START", date(2025, 1, 1))
+    monkeypatch.setattr(fe_config, "WINDOW_END", date(2025, 12, 31))
+
+    assert _window_timestamp_bounds() == (
+        "2025-01-01 00:00:00",
+        "2026-01-01 00:00:00",
+    )
+
+
+def test_explicit_window_is_detected_only_for_complete_pair(monkeypatch):
+    """명시적 pair만 watermark를 무시하는 full overwrite 모드로 인식한다."""
+    monkeypatch.delenv("TRAIN_WINDOW_START", raising=False)
+    monkeypatch.delenv("TRAIN_WINDOW_END", raising=False)
+    assert not _explicit_window_requested()
+
+    monkeypatch.setenv("TRAIN_WINDOW_START", "2025-01-01")
+    assert not _explicit_window_requested()
+
+    monkeypatch.setenv("TRAIN_WINDOW_END", "2025-12-31")
+    assert _explicit_window_requested()
+
+
+def test_explicit_window_forces_full_overwrite_even_with_watermark(monkeypatch):
+    """고정 2025 실행은 stale 미래 partition을 남길 incremental 경로를 타지 않는다."""
+    fake_spark = object()
+    calls: list[tuple[str, object]] = []
+    monkeypatch.setenv("TRAIN_WINDOW_START", "2025-01-01")
+    monkeypatch.setenv("TRAIN_WINDOW_END", "2025-12-31")
+    monkeypatch.setattr(run_pipeline, "get_spark", lambda: fake_spark)
+    monkeypatch.setattr(run_pipeline, "read_watermark", lambda _path: {"max_hour_ts": "2026-08-01T00:00:00"})
+    monkeypatch.setattr(run_pipeline, "_run_full_build", lambda spark: calls.append(("full", spark)))
+    monkeypatch.setattr(
+        run_pipeline,
+        "_run_incremental",
+        lambda spark, watermark: calls.append(("incremental", (spark, watermark))),
+    )
+
+    run_pipeline.main()
+
+    assert calls == [("full", fake_spark)]
+
+
 @pytest.fixture
 def synthetic_environment(spark, tmp_path, monkeypatch):
     """station 1개, 25일(600시간)치 Silver 조각 파일을 로컬 tmp_path에 만들고 config를 그쪽으로 돌린다."""
@@ -68,12 +115,15 @@ def synthetic_environment(spark, tmp_path, monkeypatch):
 
     silver_root = tmp_path / "silver"
 
-    # station master — Silver 실제 컬럼명(sta_id 등, STATION_COLUMN_MAP 참고).
+    # station master — normalizer의 실제 보강 Silver 출력 컬럼/partition 계약.
     master_pdf = pd.DataFrame([{
-        "sta_id": "A", "sta_no": "00001", "sta_nm": "test",
-        "hold_cnt": 10, "lat": 37.5, "lon": 127.0, "grid_id": "다사00000000",
+        "station_id": "A", "station_no": 1, "station_name": "test",
+        "capacity": 10, "lat": 37.5, "lon": 127.0, "grid_id": "다사00000000",
     }])
-    _write_parquet(silver_root / "station" / "station_master.parquet", master_pdf)
+    _write_parquet(
+        silver_root / "station_master_enriched" / "dt=2025-01-01" / "hh=00" / "0000.parquet",
+        master_pdf,
+    )
 
     # bike_station_realtime — 시각은 파일 내용이 아니라 경로(dt=/hh=/HHMM)에만 있다.
     # station_status는 시간 단위 대표값 하나면 충분하므로(_pick_first_per_hour), 시간마다

@@ -10,6 +10,8 @@ lag(anchor 쪽)은 그대로, 날씨/캘린더/타겟(target 쪽)만 (k-1)시간
 lag 컬럼명만 다르다는 것만 짧게 확인한다.
 """
 
+from datetime import date
+
 import pandas as pd
 import pytest
 
@@ -21,6 +23,7 @@ from feature_engine.spark.build_multi_horizon_features import (
     RENTAL_TARGET_COLUMNS,
     RETURN_ANCHOR_COLUMNS,
     RETURN_TARGET_COLUMNS,
+    _features_in_training_window,
     build_multi_horizon_features,
 )
 
@@ -126,3 +129,23 @@ def test_total_row_count_matches_horizon_sum(spark):
 
     expected_total = sum(max(0, n_hours - (h - 1)) for h in range(1, fe_config.HORIZON_COUNT + 1))
     assert len(out) == expected_total
+
+
+def test_training_window_filter_excludes_newer_partitions(spark, monkeypatch):
+    """stale input partition이 있어도 exact window 밖 tick은 최종 build 입력에서 빠진다."""
+    monkeypatch.setattr(fe_config, "WINDOW_START", date(2025, 1, 1))
+    monkeypatch.setattr(fe_config, "WINDOW_END", date(2025, 12, 31))
+    source = spark.createDataFrame(pd.DataFrame({
+        "hour_ts": pd.to_datetime([
+            "2024-12-31 23:55:00",
+            "2025-01-01 00:00:00",
+            "2025-12-31 23:00:00",
+            "2025-12-31 23:55:00",
+            "2026-01-01 00:00:00",
+        ]),
+        "value": [0, 1, 2, 3, 4],
+    }))
+
+    got = _features_in_training_window(source).orderBy("hour_ts").toPandas()
+
+    assert got["value"].tolist() == [1, 2]

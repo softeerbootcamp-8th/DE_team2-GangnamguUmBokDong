@@ -80,12 +80,14 @@ raw 스키마 자체(`fcstDate`/`fcstTime`/`TMP`/`PCP`)는 `loader/transform.py`
 `_stockout_from_status()` 참고.
 """
 
+import gc
 import sys
 from collections.abc import Sequence
 
 import numpy as np
 import pandas as pd
 from core import s3 as s3_io
+from ml_core import scoring as scoring_io
 from ml_core import silver_schema
 from ml_core.day_index import day_index
 from ml_core.holidays_kr import korean_holidays
@@ -108,6 +110,7 @@ from . import config
 # merge 시 충돌 없음).
 _ALL_FEATURE_COLUMNS = sorted(set(RENTAL_FEATURE_COLUMNS) | set(RETURN_FEATURE_COLUMNS))
 _COMBINED_FEATURE_COLUMN_DTYPES = {**RENTAL_FEATURE_COLUMN_DTYPES, **RETURN_FEATURE_COLUMN_DTYPES}
+_MAX_FORECAST_DISTANCE = pd.Timedelta(minutes=35)
 
 # return_lag_1h(정확히 1시간 전 1개 값)와 rental_lag_1h의 censored window
 # ([T-100분, T-40분))를 둘 다 커버하는 여유 — Silver rental을 raw로 fetch할 때
@@ -426,28 +429,105 @@ def _rental_visible_batch_all_stations(
 
 
 def _get_station_master() -> pd.DataFrame:
-    """Silver `station` 정류소 마스터를 station_id 인덱스로 캐시해 반환한다.
+    """최신 Silver 보강 정류소 마스터를 station_id 인덱스로 캐시해 반환한다.
 
-    (feature_engine이 쓰는 1차정제 산출물 `config.STATION_MASTER_PARQUET`와는
-    별개 — 이건 collector Silver의 station_master를 실시간 조회용으로 직접 읽는다.
-    두 소스가 정류소 신설/폐쇄 시점에 따라 잠깐 어긋날 수 있으나, 서빙은 항상
-    "지금 실제로 존재하는 정류소" 기준이어야 하므로 Silver를 우선한다.)
+    feature_engine도 같은 보강 Silver의 최신 snapshot을 1차정제 산출물로 만들지만,
+    inference는 그 중간 산출물 대신 Silver를 직접 읽어 정류소 신설/폐쇄를 즉시
+    반영한다.
 
     returns:
         pd.DataFrame: station_id로 인덱싱된 정류소 마스터 (station_no, capacity, lat, lon, grid_id)
     """
     global _station_master
     if _station_master is None:
-        raw = s3_io.read_parquet(silver_schema.STATION_MASTER_KEY)
+        keys = [
+            key
+            for key in s3_io.list_keys(silver_schema.STATION_MASTER_ENRICHED_PREFIX)
+            if key.endswith(".parquet")
+        ]
+        if not keys:
+            raise FileNotFoundError(
+                f"S3에 없음: {silver_schema.STATION_MASTER_ENRICHED_PREFIX} 아래 parquet"
+            )
+        latest_key = max(keys)
+        raw = s3_io.read_parquet(latest_key)
         if raw is None:
-            raise FileNotFoundError(f"S3에 없음: {silver_schema.STATION_MASTER_KEY}")
-        master = raw.rename(columns=silver_schema.STATION_COLUMN_MAP).set_index("station_id")
-        # station_no가 Silver 원본에서 "0027"처럼 앞자리 0이 있는 문자열일 수 있다 —
-        # 학습 쪽(model_contract의 station_no 카테고리, 전부 int)과 비교/매칭 가능하도록
-        # 여기서 int로 통일해둔다(int()는 앞자리 0이 있는 10진 문자열도 그대로 처리함).
-        master["station_no"] = master["station_no"].astype(int)
+            raise FileNotFoundError(f"S3에 없음: {latest_key}")
+        master = raw.rename(columns=silver_schema.STATION_COLUMN_MAP)
+        if "grid_id" not in master:
+            raise ValueError("보강 station master에 grid_id 컬럼이 없음")
+        valid_grid = master["grid_id"].notna() & master["grid_id"].astype(str).str.strip().ne("")
+        grid_coverage = float(valid_grid.mean())
+        if grid_coverage < 0.95:
+            raise ValueError(f"보강 station master의 grid_id 매핑률이 기준 미달: {grid_coverage:.3%}")
+        master = master.set_index("station_id")
+        # 행 전체를 한 번에 astype(int)하면 깨진 station_no 하나가 전체 배치를
+        # 중단한다. 형 변환과 유효성 검사는 `_validated_station_row()`에서 station별로
+        # 수행해 정상 정류소는 계속 서빙한다.
         _station_master = master
     return _station_master
+
+
+def _validated_station_row(station_id: str, station_row: pd.Series | pd.DataFrame) -> pd.Series:
+    """정류소 마스터 한 행을 검증하고 모델 입력용 숫자 타입으로 정규화한다.
+
+    보강 마스터는 전체 grid_id 커버리지 게이트를 이미 통과했더라도 소수의 결측
+    행을 허용한다. 그런 한 행 때문에 전체 정류소 배치가 죽지 않도록 이 검사는
+    station 단위 예외를 만들며, 호출부가 해당 station만 failed로 격리한다.
+
+    args:
+        station_id: 오류 메시지에 포함할 정류소 ID
+        station_row: station master에서 선택한 한 행
+    returns:
+        station_no/capacity는 int, lat/lon은 float, grid_id는 공백 제거 문자열로
+        정규화한 행 복사본
+    raises:
+        ValueError: 필수 값이 결측·비수치·비정수·허용 좌표 범위 밖일 때
+    """
+    if isinstance(station_row, pd.DataFrame):
+        raise TypeError(f"station master에 station_id가 중복됨: station_id={station_id!r}")
+
+    normalized = station_row.copy()
+
+    def _finite_number(column: str) -> float:
+        """한 필드를 유한 실수로 변환하고 실패하면 station 문맥을 붙여 예외를 낸다."""
+        message = f"station master의 {column} 값이 유효한 숫자가 아님: station_id={station_id!r}"
+        try:
+            raw_value = normalized[column]
+            if isinstance(raw_value, (bool, np.bool_)):
+                raise TypeError
+            value = float(raw_value)
+        except (KeyError, TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(message) from exc
+        if not np.isfinite(value):
+            raise ValueError(message)
+        return value
+
+    for column, minimum in (("station_no", 1), ("capacity", 0)):
+        value = _finite_number(column)
+        if not value.is_integer() or value < minimum:
+            raise ValueError(
+                f"station master의 {column} 값이 유효한 정수가 아님: station_id={station_id!r}"
+            )
+        normalized[column] = int(value)
+
+    latitude = _finite_number("lat")
+    longitude = _finite_number("lon")
+    if not 36.5 <= latitude <= 38.5:
+        raise ValueError(f"station master의 lat 값이 서울 좌표 범위 밖임: station_id={station_id!r}")
+    if not 125.5 <= longitude <= 128.5:
+        raise ValueError(f"station master의 lon 값이 서울 좌표 범위 밖임: station_id={station_id!r}")
+    normalized["lat"] = latitude
+    normalized["lon"] = longitude
+
+    try:
+        grid_id = normalized["grid_id"]
+    except KeyError as exc:
+        raise ValueError(f"station master의 grid_id 값이 없음: station_id={station_id!r}") from exc
+    if pd.isna(grid_id) or not str(grid_id).strip():
+        raise ValueError(f"station master의 grid_id 값이 유효하지 않음: station_id={station_id!r}")
+    normalized["grid_id"] = str(grid_id).strip()
+    return normalized
 
 
 def _get_holidays(year: int) -> set[str]:
@@ -471,17 +551,17 @@ def _build_station_profile_arrays(df: pd.DataFrame) -> tuple[dict[int, int], np.
     """station_hourly_profile 행들을 (station_no -> 축 인덱스) dict + dense numpy 배열로 압축한다.
 
     예전엔 (station_no, minute, dow, month) 튜플을 key로, {rental_mean, ...} dict를
-    value로 갖는 파이썬 dict를 그대로 캐시했다 — 정류소 약 수천 개 x 72tick(20분
-    간격) x 7요일 x 12개월 = 약 1,800만 개 항목이라, dict-of-dict 하나당 파이썬 객체
+    value로 갖는 파이썬 dict를 그대로 캐시했다 — 정류소 약 수천 개 x 288tick(5분
+    간격) x 7요일 x 12개월 = 수천만 개 항목이라, dict-of-dict 하나당 파이썬 객체
     오버헤드(키 튜플 + 값 dict, 항목당 수백 바이트)만으로 프로세스당 수 GB를
     먹었다(리뷰 지적). minute/dow/month는 전부 값의 범위가 좁고 촘촘해서(tick
-    간격으로 나누면 72개, dow 7개, month 12개) 해시 테이블이 필요 없다 — station마다
+    간격으로 나누면 288개, dow 7개, month 12개) 해시 테이블이 필요 없다 — station마다
     dense numpy 배열 한 칸을 두면 항목당 파이썬 객체 오버헤드 없이 float32 4개만
-    쓴다(수백 MB 수준으로 축소). station_no만 정수값 자체가 넓게 흩어져 있어(정류소
+    쓴다(약 1GB 수준으로 축소). station_no만 정수값 자체가 넓게 흩어져 있어(정류소
     자체는 수천 개뿐) 그것만 작은 dict로 따로 0-based 인덱스로 압축한다.
 
     hour가 아니라 minute(자정 기준 경과분)으로 묶는 이유: rental_count/return_count
-    자체가 60분짜리 미래 방향 롤링 합이라 한 hour 안의 tick들은 40분(2/3)이나 겹쳐서
+    자체가 60분짜리 미래 방향 롤링 합이라 인접한 5분 tick끼리는 55분이나 겹쳐서
     거의 같은 값을 반복해서 보는 셈이다 — hour로 묶어 표본을 늘려도 독립적인 정보는
     별로 안 늘고, 오히려 모델이 실제로 구분하는 tick 단위(minute, BASE_FEATURE_COLUMNS
     참고)와 다른 값을 fallback으로 주게 된다(build_station_profile.py 모듈 docstring
@@ -596,10 +676,44 @@ def _population_fallback(grid_id: str, ts: pd.Timestamp) -> float:
 # 근처의 최근 값 하나"만 있으면 되므로 조회 범위가 훨씬 좁다. ---
 
 
-def _get_recent_weather(target_ts: pd.Timestamp, lookback_hours: float = 3) -> dict[str, float]:
+def _weather_values(df: pd.DataFrame | None) -> dict[str, float] | None:
+    """Silver 관측 행에서 유효한 기온·강수량만 골라 서울 평균을 만든다.
+
+    Collector의 weather 스키마 범위(T1H -50~50°C, RN1 0~500mm)를 그대로
+    적용한다. 최신 tick이 비어 있거나 숫자로 바꿀 수 없는 값, NaN/무한대,
+    범위 밖 값만 담고 있으면 None을 반환해 호출부가 이전 tick을 계속 찾게 한다.
+
+    args:
+        df: weather_ultra_short_live Silver 한 tick의 원본 DataFrame
+    returns:
+        유효 행 평균의 temp/precip dict. 유효한 행이 없으면 None
+    """
+    if df is None or df.empty:
+        return None
+    values = df.rename(columns=silver_schema.WEATHER_COLUMN_MAP)
+    required = ["temp", "precip"]
+    if not set(required).issubset(values.columns):
+        return None
+    numeric = values[required].apply(pd.to_numeric, errors="coerce")
+    valid = (
+        np.isfinite(numeric["temp"])
+        & np.isfinite(numeric["precip"])
+        & numeric["temp"].between(-50.0, 50.0)
+        & numeric["precip"].between(0.0, 500.0)
+    )
+    if not valid.any():
+        return None
+    means = numeric.loc[valid, required].mean()
+    return {"temp": float(means["temp"]), "precip": float(means["precip"])}
+
+
+def _get_recent_weather(
+    target_ts: pd.Timestamp,
+    lookback_hours: float = silver_schema.WEATHER_MAX_STALENESS_HOURS,
+) -> dict[str, float]:
     """target_ts 시각(또는 그 근처)의 Silver 기상 **관측값**을 읽는다(서울 전체 공유).
 
-    `weather_ultra_short_live`(기상청 초단기실황, 10분 간격)만 쓴다 — 관측이라
+    `weather_ultra_short_live`(기상청 초단기실황, 5분 수집 tick)만 쓴다 — 관측이라
     target_ts가 미래면 애초에 존재하지 않는다(이 함수는 "막 지난 시각"을 다루는
     용도). target_ts가 미래(horizon>1)면 `_resolve_live_weather()`가 이 함수 대신
     `_get_forecast_weather()`를 먼저 시도한다 — 이 함수는 target_ts가 anchor_ts와
@@ -617,9 +731,9 @@ def _get_recent_weather(target_ts: pd.Timestamp, lookback_hours: float = 3) -> d
     """
     keys = silver_schema.weather_tick_keys(target_ts, lookback_hours)
     for df in reversed(s3_io.read_parquet_many(keys)):  # target_ts에 가장 가까운 것부터
-        if df is not None and not df.empty:
-            row = df.rename(columns=silver_schema.WEATHER_COLUMN_MAP).iloc[-1]
-            return {"temp": float(row["temp"]), "precip": float(row["precip"])}
+        weather = _weather_values(df)
+        if weather is not None:
+            return weather
     raise ValueError(f"최근 {lookback_hours}시간 안에 날씨 데이터가 없습니다(target_ts={target_ts})")
 
 
@@ -628,14 +742,16 @@ def _get_forecast_weather(target_ts: pd.Timestamp, issue_lookback_hours: float =
 
     관측 소스와 달리 파일 하나에 미래 여러 시각의 예보가 여러 행으로 들어있다 —
     그래서 "그 시각의 파일"을 바로 읽는 게 아니라, 가장 최근에 발표된 예보
-    파일부터 훑으면서 그 안에서 target_ts와 가장 가까운 행을 골라 쓴다. 타겟
-    시각은 `fcstDate`(YYYYMMDD)+`fcstTime`(HHMM, KST) 두 컬럼을 합쳐서 구한다
+    파일부터 훑으면서 그 안에서 target_ts와 가장 가까운 시각의 모든 격자 행을
+    검증하고 평균 내서 쓴다. 타겟 시각은 `fcstDate`(YYYYMMDD)+
+    `fcstTime`(HHMM, KST) 두 컬럼을 합쳐서 구한다
     (단일 컬럼이 아님 — 기상청 raw 응답 자체가 이 형태, `loader/transform.py`의
     `weather_forecast_from_silver()`가 같은 소스를 이미 이렇게 읽고 있어 그
     스키마를 그대로 근거로 쓴다). 강수량(`PCP`)은 순수 숫자가 아니라
     "강수없음"/"1.0mm 미만"/"30.0~50.0mm" 같은 텍스트가 섞여 있어
     `silver_schema.parse_kma_precip_text()`로 파싱한다 — 단순 컬럼 rename으로는
-    안 된다.
+    안 된다. 가장 가까운 행도 target_ts에서 35분을 넘게 벗어나면 해당 발표본은
+    사용할 수 없는 것으로 보고 더 오래된 발표본을 계속 찾는다.
 
     args:
         target_ts: 예보를 찾으려는 미래 시각
@@ -652,15 +768,40 @@ def _get_forecast_weather(target_ts: pd.Timestamp, issue_lookback_hours: float =
         if df is None or df.empty or date_col not in df.columns or time_col not in df.columns:
             continue
         fcst_ts = pd.to_datetime(
-            df[date_col].astype(str) + df[time_col].astype(str).str.zfill(4), format="%Y%m%d%H%M"
+            df[date_col].astype(str).str.zfill(8) + df[time_col].astype(str).str.zfill(4),
+            format="%Y%m%d%H%M",
+            errors="coerce",
         )
-        # 위치 기반으로 가장 가까운 행을 찾는다 — 라벨(.loc[idxmin()]) 기반은 여러
-        # 발표 조각을 pd.concat()해 인덱스가 겹치면 행 여러 개를 한꺼번에 돌려준다.
-        row = df.iloc[(fcst_ts - target_ts).abs().to_numpy().argmin()].rename(silver_schema.WEATHER_FORECAST_COLUMN_MAP)
-        precip = silver_schema.parse_kma_precip_text(row.get("PCP"))
-        if precip is None or "temp" not in row.index:
+        distances = (fcst_ts - target_ts).abs()
+        if distances.isna().all():
             continue
-        return {"temp": float(row["temp"]), "precip": precip}
+        minimum_distance = distances.min()
+        if minimum_distance > _MAX_FORECAST_DISTANCE:
+            continue
+        # 한 발표 파일에는 같은 예보 시각의 서울 격자 행이 여러 개 있다. 임의의
+        # 첫 행 하나를 고르면 S3/concat 순서에 따라 값이 달라지므로, 최소 시간거리인
+        # 행을 모두 모은 뒤 유효한 격자들의 서울 평균을 사용한다.
+        nearest = df.loc[distances.eq(minimum_distance)].rename(
+            columns=silver_schema.WEATHER_FORECAST_COLUMN_MAP
+        )
+        if "temp" not in nearest.columns or "PCP" not in nearest.columns:
+            continue
+        numeric = pd.DataFrame({
+            "temp": pd.to_numeric(nearest["temp"], errors="coerce"),
+            "precip": pd.to_numeric(
+                nearest["PCP"].map(silver_schema.parse_kma_precip_text), errors="coerce"
+            ),
+        })
+        valid = (
+            np.isfinite(numeric["temp"])
+            & np.isfinite(numeric["precip"])
+            & numeric["temp"].between(-50.0, 50.0)
+            & numeric["precip"].between(0.0, 500.0)
+        )
+        if not valid.any():
+            continue
+        means = numeric.loc[valid, ["temp", "precip"]].mean()
+        return {"temp": float(means["temp"]), "precip": float(means["precip"])}
     return None
 
 
@@ -940,8 +1081,8 @@ def _build_feature_record(
     """
     master = _get_station_master()
     if station_id not in master.index:
-        raise ValueError(f"알 수 없는 station_id: {station_id!r} (station_master.parquet에 없음)")
-    station_row = master.loc[station_id]
+        raise ValueError(f"알 수 없는 station_id: {station_id!r} (최신 보강 station master에 없음)")
+    station_row = _validated_station_row(station_id, master.loc[station_id])
 
     if not (1 <= horizon <= config.HORIZON_COUNT):
         raise ValueError(f"horizon은 1~{config.HORIZON_COUNT} 사이여야 함: {horizon}")
@@ -1037,7 +1178,12 @@ def _predict_at(model_name: str, exposure_col: str | None, **kwargs) -> dict:
     df = _build_feature_row(**kwargs)
     fallback_fields = df.attrs.get("fallback_fields", [])
     population_fallback = df.attrs.get("population_fallback", False)
-    pred = predict(df, model_name, exposure_col=exposure_col)
+    try:
+        pred = predict(df, model_name, exposure_col=exposure_col)
+    finally:
+        # 공개 단건 API와 기본 CLI도 장수 프로세스에서 booster 4개를 계속 들고
+        # 있지 않도록 성공/실패와 무관하게 해당 모델 채점 직후 비운다.
+        _release_booster_cache()
     row = pred.iloc[0]
     # predict()의 출력은 station_no만 담는다(ml_core.scoring.predict() docstring
     # 참고) — station_id는 이 함수 자신의 kwargs에 이미 있으므로 거기서 그대로 쓴다.
@@ -1055,6 +1201,12 @@ def _predict_at(model_name: str, exposure_col: str | None, **kwargs) -> dict:
         "lag_data_freshness": round(1 - len(fallback_fields) / N_LAG_ROLLING_FEATURES, 3),
         "population_source": "fallback" if population_fallback else "provided",
     }
+
+
+def _release_booster_cache() -> None:
+    """혼합 모델 채점 사이와 종료 뒤 booster 캐시 메모리를 즉시 회수한다."""
+    scoring_io.load_boosters.cache_clear()
+    gc.collect()
 
 
 def _resolve_weather_for_horizon(value: float | Sequence[float], h: int, n_hours: int, name: str) -> float:
@@ -1171,8 +1323,8 @@ def predict_demand_multi_hour(
     """
     master = _get_station_master()
     if station_id not in master.index:
-        raise ValueError(f"알 수 없는 station_id: {station_id!r} (station_master.parquet에 없음)")
-    station_row = master.loc[station_id]
+        raise ValueError(f"알 수 없는 station_id: {station_id!r} (최신 보강 station master에 없음)")
+    station_row = _validated_station_row(station_id, master.loc[station_id])
     if not (1 <= n_hours <= config.HORIZON_COUNT):
         raise ValueError(f"n_hours는 1~{config.HORIZON_COUNT} 사이여야 함: {n_hours}")
 
@@ -1198,8 +1350,14 @@ def predict_demand_multi_hour(
 
     batch_df = pd.DataFrame(records).astype(_COMBINED_FEATURE_COLUMN_DTYPES)
     batch_df["rental_exposure"] = batch_df["rental_exposure"].astype(RENTAL_EXPOSURE_DTYPE)
-    rental_batch = predict(batch_df, "rental", exposure_col="rental_exposure")
-    return_batch = predict(batch_df, "return", exposure_col=None)
+    try:
+        rental_batch = predict(batch_df, "rental", exposure_col="rental_exposure")
+    finally:
+        _release_booster_cache()
+    try:
+        return_batch = predict(batch_df, "return", exposure_col=None)
+    finally:
+        _release_booster_cache()
 
     results = []
     for i, record in enumerate(records):
@@ -1297,7 +1455,7 @@ def predict_demand_multi_hour_all_stations(
     """
     master = _get_station_master()
     if station_ids is None:
-        # station_master.parquet(2,977개)에는 2025년에 트립이 없어 학습 데이터/
+        # 최신 보강 station master(2,977개)에는 2025년에 트립이 없어 학습 데이터/
         # station_hourly_profile에 아예 없는 정류소가 395개 섞여 있다 — 그 395개는
         # fallback도 없어 매번 NaN + "Mean of empty slice" 경고만 내면서 시간을
         # 낭비한다. 모델이 실제로 학습한 카테고리(load_station_dtype)만 쓴다 —
@@ -1305,7 +1463,13 @@ def predict_demand_multi_hour_all_stations(
         # 카테고리는 이제 station_no(정수)라 station_master로 station_id(텍스트)로
         # 되돌려야 이 함수 나머지 부분(전부 station_id 기준)이 그대로 동작한다.
         trained_station_nos = set(load_station_dtype("rental").categories)
-        station_ids = sorted(master.index[master["station_no"].isin(trained_station_nos)])
+        station_nos = pd.to_numeric(master["station_no"], errors="coerce")
+        integral_station_nos = station_nos.notna() & np.isfinite(station_nos) & (station_nos % 1 == 0)
+        trained = integral_station_nos & station_nos.isin(trained_station_nos)
+        # 깨진 station_no는 모델 카테고리와 비교할 수 없지만, 조용히 목록에서
+        # 사라지게 두면 완결성 검사가 누락을 알 수 없다. 후보에 포함해 아래
+        # station별 검증에서 명시적인 failed로 기록한다.
+        station_ids = sorted(master.index[trained | ~integral_station_nos])
     if not (1 <= n_hours <= config.HORIZON_COUNT):
         raise ValueError(f"n_hours는 1~{config.HORIZON_COUNT} 사이여야 함: {n_hours}")
 
@@ -1317,13 +1481,15 @@ def predict_demand_multi_hour_all_stations(
     #    "failed"로 원인을 알 수 있음 — 배치 중 하나가 죽어서 전체가 죽으면 안 됨).
     base_lag_features: dict[str, dict] = {}
     base_fallback: dict[str, list[str]] = {}
+    station_rows: dict[str, pd.Series] = {}
     alive_station_ids: list[str] = []
     for sid in station_ids:
         try:
             if sid not in master.index:
-                raise ValueError(f"알 수 없는 station_id: {sid!r} (station_master.parquet에 없음)")
+                raise ValueError(f"알 수 없는 station_id: {sid!r} (최신 보강 station master에 없음)")
+            station_row = _validated_station_row(sid, master.loc[sid])
             lag_features, fb = _lag_rolling_features(
-                sid, int(master.loc[sid, "station_no"]), anchor_ts, skip_rental_recent=True
+                sid, station_row["station_no"], anchor_ts, skip_rental_recent=True
             )
         except Exception as exc:  # noqa: BLE001 — 정류소 하나 실패로 전체 배치가 죽으면 안 됨(로그로 원인 남김)
             print(f"[predict_demand_multi_hour_all_stations] SKIP station={sid} — {type(exc).__name__}: {exc}", file=sys.stderr)
@@ -1334,6 +1500,7 @@ def predict_demand_multi_hour_all_stations(
             continue
         base_lag_features[sid] = lag_features
         base_fallback[sid] = fb
+        station_rows[sid] = station_row
         alive_station_ids.append(sid)
 
     expected_count = len(station_ids) * n_hours
@@ -1343,7 +1510,7 @@ def predict_demand_multi_hour_all_stations(
     # 2) rental_lag_1h는 살아남은 정류소 전체를 anchor_ts 기준 한 번에 벡터화한다
     #    (history.md 24번 항목 — anchor 축으로 뒤집는 최적화, horizon과 무관하므로
     #    이것도 한 번만).
-    station_no_by_id = master["station_no"].to_dict()
+    station_no_by_id = {sid: row["station_no"] for sid, row in station_rows.items()}
     rental_recent_df, rental_fallback_by_station = _rental_recent_batch(alive_station_ids, station_no_by_id, anchor_ts)
     for sid in alive_station_ids:
         base_lag_features[sid] = {**base_lag_features[sid], **rental_recent_df.loc[sid].to_dict()}
@@ -1367,7 +1534,7 @@ def predict_demand_multi_hour_all_stations(
         for sid in alive_station_ids:
             sid_stockout, sid_stockout_fallback = _stockout_from_status(sid, bike_status, stockout)
             target_fields, population_fallback = _build_target_time_fields(
-                sid, master.loc[sid], target_ts, t_temp, t_precip, None, sid_stockout, h,
+                sid, station_rows[sid], target_ts, t_temp, t_precip, None, sid_stockout, h,
             )
             all_records.append({**target_fields, **base_lag_features[sid]})
             row_stations.append(sid)
@@ -1381,8 +1548,18 @@ def predict_demand_multi_hour_all_stations(
     # 정류소×horizon마다 반복하면 그 자체가 병목이었다(history.md 23번 항목).
     batch_df = pd.DataFrame(all_records).astype(_COMBINED_FEATURE_COLUMN_DTYPES)
     batch_df["rental_exposure"] = batch_df["rental_exposure"].astype(RENTAL_EXPOSURE_DTYPE)
-    rental_batch = predict(batch_df, "rental", exposure_col="rental_exposure")
-    return_batch = predict(batch_df, "return", exposure_col=None)
+    try:
+        rental_batch = predict(batch_df, "rental", exposure_col="rental_exposure")
+    finally:
+        # rental/return booster 4개씩을 동시에 캐시에 두면 전체 정류소 배치의 peak
+        # memory가 거의 두 배가 되므로 return 모델군을 읽기 전에 먼저 회수한다.
+        _release_booster_cache()
+    try:
+        return_batch = predict(batch_df, "return", exposure_col=None)
+    finally:
+        # 프로세스 재사용 시 다음 호출이 cached return booster 4개를 안고 rental
+        # booster 4개를 추가 로드하지 않도록 실패 여부와 무관하게 종료 뒤에도 비운다.
+        _release_booster_cache()
 
     results = []
     for i, record in enumerate(all_records):
@@ -1420,7 +1597,7 @@ def predict_demand_multi_hour_all_stations(
 def _resolve_live_weather(
     target_ts: pd.Timestamp, anchor_ts: pd.Timestamp, temp: float | None, precip: float | None
 ) -> tuple[float, float]:
-    """둘 중 하나라도 None이면 target_ts 기준 Silver 실시간 날씨로 나머지도 같이 채운다.
+    """둘 중 하나라도 None이면 Silver 날씨로 나머지도 같이 채운다.
 
     (둘을 한 번에 같이 조회하는 이유: 실제로 둘 다 안 주고 전부 실시간으로 받는 게
     정상적인 호출 방식이고, 일부만 주는 건 테스트/디버깅용 — 그런 섞어 쓰기에서도
@@ -1428,8 +1605,10 @@ def _resolve_live_weather(
 
     **관측 vs 예보 분기(2026-08)**: target_ts가 anchor_ts(호출부의 "지금", T0)보다
     미래면(horizon>1) 그 시각의 날씨는 아직 관측되지 않았으므로 예보
-    (`_get_forecast_weather()`)를 먼저 시도하고, 예보를 못 찾을 때만 관측치
-    (`_get_recent_weather()`, 사실상 "지금 날씨" 재사용)로 대체한다. target_ts가
+    (`_get_forecast_weather()`)를 먼저 시도하고, 예보를 못 찾을 때만 anchor_ts 기준
+    관측치(`_get_recent_weather()`, 사실상 "지금 날씨" 재사용)로 대체한다. 미래
+    target_ts로 관측을 찾으면 아직 존재하지 않는 S3 키부터 훑어 불필요한 공백이
+    생기므로 fallback 기준은 반드시 anchor_ts다. target_ts가
     anchor_ts와 같거나 과거면(horizon=1 또는 수집 지연 재현) 처음부터 관측치만
     쓴다 — 실제 wall-clock(`pd.Timestamp.now()`)을 안 쓰고 항상 호출부가 넘긴
     anchor_ts와 비교하는 이유는, 이 모듈의 다른 함수들처럼 "지금"을 인자로만
@@ -1440,7 +1619,7 @@ def _resolve_live_weather(
         if target_ts > anchor_ts:
             weather = _get_forecast_weather(target_ts)
         if weather is None:
-            weather = _get_recent_weather(target_ts)
+            weather = _get_recent_weather(anchor_ts)
         temp = weather["temp"] if temp is None else temp
         precip = weather["precip"] if precip is None else precip
     return temp, precip
@@ -1620,7 +1799,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--station-id", default=None, help="--all-stations와 동시 사용 불가")
     parser.add_argument(
         "--all-stations", action="store_true",
-        help="station_master.parquet의 전체 정류소를 한 번에 예측(인구는 정류소별 자동 대체, "
+        help="최신 보강 station master의 전체 정류소를 한 번에 예측(인구는 정류소별 자동 대체, "
         "날씨는 전체 공통) — --n-hours와 함께 쓰면 horizon=1..n_hours를 재귀 없이 한 번에 예측",
     )
     parser.add_argument("--date", required=True, help="YYYY-MM-DD")
@@ -1700,30 +1879,36 @@ def main(argv: list[str] | None = None) -> None:
         out_df = pd.DataFrame(rows)
         window_start = _target_timestamp(args.date, args.hour, args.minute)
         out_path = args.out or silver_schema.predictions_key(window_start)
-        s3_io.write_parquet(out_df, out_path)
-        print(f"결과 저장: {out_path}")
+        failed_path = (
+            silver_schema.predictions_failed_key(window_start)
+            if not args.out
+            else out_path.removesuffix(".parquet") + "_failed.json"
+        )
 
-        if failed:
-            # Gold 적재 등 downstream이 stderr 로그를 안 봐도 partial 여부를 알 수 있게
-            # 실패 목록을 결과 옆에 별도 파일로 남긴다(run_full_pipeline.py/
-            # monthly_retrain_check.py처럼 subprocess.run(check=True)로 호출하는
-            # 쪽도 이 파일로 partial 여부를 확인할 수 있음).
-            failed_path = (
-                silver_schema.predictions_failed_key(window_start)
-                if not args.out
-                else out_path.removesuffix(".parquet") + "_failed.json"
-            )
-            s3_io.write_json(failed_path, failed)
+        # 완전 실패 때 빈 DataFrame으로 같은 tick의 기존 정상 결과를 덮어쓰면 복구할
+        # 수 없다. 성공 행이 있을 때만 parquet을 갱신한다. 부분 성공 parquet은 원인
+        # 분석용으로 남기되 아래 nonzero 종료로 downstream 적재는 fail-closed한다.
+        if outcome["actual_count"] > 0:
+            s3_io.write_parquet(out_df, out_path)
+            print(f"결과 저장: {out_path}")
+        else:
+            print(f"성공 결과가 없어 기존 결과를 보존함: {out_path}", file=sys.stderr)
+
+        # 매 실행마다 sidecar를 써야 이전 partial 실행의 stale 실패 목록이 완전 성공
+        # 뒤에도 남지 않는다. 완전 성공이면 명시적으로 빈 목록으로 덮어쓴다.
+        s3_io.write_json(failed_path, failed)
+
+        incomplete = (
+            outcome["actual_count"] == 0
+            or outcome["actual_count"] != outcome["expected_count"]
+            or bool(failed)
+        )
+        if incomplete:
             print(f"실패 {len(failed):,}건 목록 저장: {failed_path}", file=sys.stderr)
-            # **2026-08 정정**: 전에는 실패가 하나라도 있으면(2,582개 중 1개여도) exit
-            # 1로 종료했다 — Airflow의 run_inference 태스크가 그대로 FAILED 처리돼서,
-            # 이미 위에서 S3에 저장한 2,581개의 정상 예측 결과가 load_forecast_points로
-            # 이어지지 못하고 통째로 버려지는 운영 취약점이 있었다(리뷰 지적). 완전히
-            # 아무것도 성공 못 했을 때만(시스템 자체가 잘못됐다는 신호) exit 1로 막고,
-            # 부분 실패는 exit 0으로 통과시켜 성공한 결과라도 적재되게 한다 — 실패
-            # 건수 자체는 위 failed_path 파일과 종료 메시지로 계속 확인 가능하다.
-            if outcome["actual_count"] == 0:
-                raise SystemExit(1)
+            # Gold 적재기는 sidecar를 읽지 않으므로 partial을 exit 0으로 통과시키면
+            # 누락 행을 정상 결과처럼 적재한다. 진단 산출물은 남기되 비정상 종료해
+            # downstream을 막는다.
+            raise SystemExit(1)
         raise SystemExit(0)
 
     common = {
@@ -1791,5 +1976,3 @@ def main(argv: list[str] | None = None) -> None:
 
 if __name__ == "__main__":
     main()
-
-

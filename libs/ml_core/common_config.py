@@ -13,8 +13,8 @@ LightGBM 하이퍼파라미터처럼 **두 쪽이 반드시 같은 값을 써야
 경로(로컬 파일시스템 vs S3)처럼 두 쪽이 원래 다를 수밖에 없는 값은 각자의
 `config.py`에 그대로 둔다 — 여기 옮기는 건 "반드시 같아야 하는 값"만이다.
 
-**프로필 시스템(2026-08 S3 이관)**: 위 상수들은 S3의 `profiles/{ML_PROFILE}.json`
-(`ml_core.paths.profile_path()`, 기본 프로필명 "default")에서 값을 읽어온다. 예전엔
+**프로필 시스템(2026-08 S3 이관)**: `ML_PROFILE`을 명시하면 S3의
+`profiles/{ML_PROFILE}.json`(`ml_core.paths.profile_path()`)에서 값을 읽어온다. 예전엔
 저장소에 커밋된 로컬 JSON 파일이었는데, feature_engine/training/inference가 각자
 다른 서버에 배포되므로 로컬 파일로는 "값 하나 바꾸면 파이프라인 전체에 반영"이
 불가능했다(서버마다 코드 재배포가 필요) — S3는 이미 세 서비스가 공유하는 유일한
@@ -23,8 +23,10 @@ LightGBM 하이퍼파라미터처럼 **두 쪽이 반드시 같은 값을 써야
 있다(`ml_core.profile_registry.push_profile()`로 생성/수정 — MLflow에도 같이 기록되어
 변경 이력을 볼 수 있지만, 실제 런타임 조회는 항상 S3 직접 조회다). 기존에 있던 개별
 환경변수 override(예: `ROLLING_EMBARGO_MINUTES=45`)는 프로필 값 위에 한 번 더 덮어쓸
-수 있게 유지한다 — 우선순위는 "개별 환경변수 > S3 프로필 > (S3 조회 실패 시에만 쓰는
-내장 기본값 `_DEFAULT_PROFILE`)". `training/config.py`/`feature_engine/spark/config.py`는
+수 있게 유지한다 — 우선순위는 "개별 환경변수 > 명시적으로 선택한 S3 프로필"이다.
+`ML_PROFILE`을 생략한 실행만 예약 이름 `builtin-default`의 내장 기본값을 사용한다.
+명시한 S3 프로필이 없거나 조회/파싱에 실패하면 다른 설정으로 조용히 진행하지 않고
+즉시 실패한다. `training/config.py`/`feature_engine/spark/config.py`는
 지금처럼 `common_config.XXX`를 그대로 참조하면 되고 인터페이스는 바뀌지 않는다.
 
 **왜 `core.s3`를 안 쓰고 boto3를 직접 쓰는가**: `core.s3`는 parquet 처리를 위해
@@ -35,7 +37,6 @@ pandas/pyarrow를 무조건 import한다 — 이 파일은 위에서 말한 "pan
 
 import json
 import os
-import sys
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -43,35 +44,14 @@ import boto3
 from botocore.config import Config as BotoConfig
 from botocore.exceptions import ClientError
 
-# S3에 아직 아무 프로필도 안 올라갔거나(첫 부트스트랩) S3가 응답하지 않을 때만 쓰는
-# 안전망 — 예전 `libs/ml_core/profiles/default.json`과 내용이 같다. 로컬 JSON 파일은
-# 이제 없다(위 docstring 참고) — 이 파이썬 리터럴이 유일한 "로컬" 기본값이다.
-_DEFAULT_PROFILE = {
-    "ROLLING_TICK_MINUTES": 20,
-    "ROLLING_WINDOW_MINUTES": 60,
-    "ROLLING_EMBARGO_MINUTES": 40,
-    "TARGET_HORIZON_MINUTES": 60,
-    "GRID_TICK_MINUTES": 20,
-    "HORIZON_COUNT": 12,
-    "LGB_PARAMS_COMMON": {
-        "num_leaves": 63,
-        "learning_rate": 0.05,
-        "feature_fraction": 0.8,
-        "bagging_fraction": 0.8,
-        "bagging_freq": 5,
-        "min_data_in_leaf": 100,
-    },
-    "LGB_NUM_BOOST_ROUND": 800,
-    "LGB_EARLY_STOPPING_ROUNDS": 50,
-    "CONFORMAL_TARGET_COVERAGE": 0.80,
-    "INCREMENTAL_LOOKBACK_HOURS": 840,
-    "PERFORMANCE_DEGRADATION_THRESHOLD": 0.10,
-    "COVERAGE_DRIFT_THRESHOLD": 0.15,
-    "MONITOR_LOOKBACK_MONTHS": 1,
-    # --- 2026-08 추가: 학습기간 롤링 윈도우 (TRAIN_YEAR 고정값 폐지) ---
-    "TRAIN_LOOKBACK_MONTHS": 12,
-    "TRAINING_SAFETY_MARGIN_DAYS": 7,
-}
+from . import profile_contract
+
+# `ML_PROFILE`을 생략한 실행이 쓰는 내장 프로필이다. S3의 `profiles/default.json`과
+# 이름을 분리해, 오래된 원격 객체가 코드에 고정된 운영 기본값을 암묵적으로 덮어쓰지
+# 못하게 한다. 원격 프로필을 쓰려면 반드시 `ML_PROFILE=<name>`을 명시해야 한다.
+BUILTIN_PROFILE_NAME = profile_contract.BUILTIN_PROFILE_NAME
+REQUIRED_GRID_TICK_MINUTES = profile_contract.REQUIRED_GRID_TICK_MINUTES
+_DEFAULT_PROFILE = profile_contract.DEFAULT_PROFILE
 
 
 def _s3_client(timeout_seconds: float):
@@ -87,12 +67,12 @@ def _s3_client(timeout_seconds: float):
 def _fetch_profile_from_s3(name: str, timeout_seconds: float = 2.0) -> dict | None:
     """`profiles/{name}.json`(`ml_core.paths.profile_path()`와 같은 키 규칙, 순환
     import를 피하려고 문자열을 직접 조립한다 — paths.py가 이미 이 모듈을 import하므로
-    반대 방향 import는 불가능)을 읽는다. 없으면 None, S3가 아예 응답하지 않으면
-    예외를 그대로 던진다(호출부 `_load_profile()`가 무조건 폴백으로 받는다).
+    반대 방향 import는 불가능)을 읽는다. 없으면 None, S3가 아예 응답하지 않거나
+    JSON이 깨졌으면 예외를 그대로 던진다(호출부도 fail-closed로 전파한다).
 
     기본 boto3 재시도 정책으로 존재하지 않는 엔드포인트를 조회하면 실측 8.5초가
-    걸린다 — 프로필 조회는 부가 기능이지 핵심 데이터 경로가 아니므로, 짧은
-    timeout+재시도 없음으로 빠르게 실패하고 내장 기본값으로 넘어가게 한다.
+    걸린다 — 프로필 조회 실패는 잘못된 설정으로 학습/추론하는 것보다 즉시 실패하는
+    편이 안전하므로, 짧은 timeout+재시도 없음으로 원인을 빠르게 드러낸다.
     """
     bucket = os.environ.get("S3_BUCKET", "gangnamgu")
     try:
@@ -104,24 +84,60 @@ def _fetch_profile_from_s3(name: str, timeout_seconds: float = 2.0) -> dict | No
     return json.loads(body)
 
 
-def _load_profile() -> dict:
-    name = os.environ.get("ML_PROFILE", "default")
-    try:
-        profile = _fetch_profile_from_s3(name)
-    except Exception as exc:  # noqa: BLE001 — S3 조회 실패 사유와 무관하게 무조건 폴백
-        print(f"[common_config] ERROR: S3에서 프로필 '{name}' 조회 실패({exc}) — 내장 기본값 사용", file=sys.stderr)
-        return _DEFAULT_PROFILE
-    if profile is None:
-        print(f"[common_config] ERROR: S3에 프로필 '{name}' 없음(profiles/{name}.json) — 내장 기본값 사용", file=sys.stderr)
-        return _DEFAULT_PROFILE
-    print(f"[common_config] 프로필 '{name}'을 S3에서 읽음")
+def _selected_profile_name() -> str:
+    """이번 프로세스가 사용할 실제 프로필 이름을 반환한다.
+
+    `ML_PROFILE`을 생략하면 S3를 조회하지 않는 예약 이름 `builtin-default`를
+    반환한다. 빈 문자열을 명시한 경우는 운영 설정 오타이므로 기본값으로 간주하지
+    않고 즉시 실패한다.
+    """
+    raw_name = os.environ.get("ML_PROFILE")
+    if raw_name is None:
+        return BUILTIN_PROFILE_NAME
+    name = raw_name.strip()
+    if not name:
+        raise ValueError("ML_PROFILE은 빈 문자열일 수 없습니다")
+    return name
+
+
+def _validate_profile(profile: dict, name: str) -> None:
+    """하위 호환을 위해 순수 프로필 계약 검증 함수를 재노출한다."""
+    profile_contract.validate_profile(profile, name)
+
+
+def _load_profile(name: str | None = None) -> dict:
+    """선택된 프로필을 결정적으로 로드한다.
+
+    `builtin-default`는 S3를 전혀 조회하지 않는다. 그 외 이름은 명시적으로 선택한
+    원격 프로필이므로, 객체가 없거나 S3/JSON 오류가 나면 예외를 그대로 드러내
+    요청하지 않은 내장 값으로 학습·추론하는 fail-open을 막는다.
+
+    args:
+        name: 직접 지정할 프로필 이름. None이면 `_selected_profile_name()` 결과 사용
+    returns:
+        dict: 내장 기본 키와 병합되고 검증된 새 프로필 사본
+    raises:
+        FileNotFoundError: 명시한 S3 프로필이 없을 때
+        TypeError: 프로필 구조가 잘못됐을 때
+        ValueError: 예약 메타데이터나 5분 grid 계약이 잘못됐을 때
+    """
+    name = name or _selected_profile_name()
+    if name == BUILTIN_PROFILE_NAME:
+        profile = profile_contract.merge_and_validate_profile({}, name)
+    else:
+        loaded = _fetch_profile_from_s3(name)
+        if loaded is None:
+            raise FileNotFoundError(f"S3에 프로필 '{name}'이 없습니다: profiles/{name}.json")
+        profile = profile_contract.merge_and_validate_profile(loaded, name)
+        print(f"[common_config] 프로필 '{name}'을 S3에서 읽음")
+
     # 내장 기본값과 병합한다(S3 값이 우선) — 이 프로필이 이번 PR 이전에 올려둔
     # 것이거나 push_profile()로 사람이 손으로 만든 것이면 신규 키(TRAIN_LOOKBACK_
     # MONTHS 등)가 없을 수 있는데, 그대로 반환하면 이 파일 끝부분의
     # `_PROFILE["TRAIN_LOOKBACK_MONTHS"]` 같은 곳에서 KeyError가 나 feature_engine/
     # training/inference가 전부 import 시점에 죽는다(리뷰 지적) — 병합하면 누락된
     # 키만 내장 기본값으로 자연히 메워진다.
-    return {**_DEFAULT_PROFILE, **profile}
+    return profile
 
 
 def list_profile_names() -> list[str]:
@@ -177,20 +193,49 @@ def _subtract_months(d: date, months: int) -> date:
 
 
 def training_window(as_of: date | None = None) -> tuple[date, date]:
-    """(start, end) — 학습에 쓸 롤링 날짜 구간.
+    """학습에 쓸 명시적 또는 롤링 날짜 구간을 반환한다.
 
-    `end = as_of(기본 오늘 KST) - TRAINING_SAFETY_MARGIN_DAYS`(최근 며칠은 라벨이
-    아직 확정 안 됐을 수 있어 제외 — 대여이력은 반납이 끝나야 Silver에 나타남),
-    `start = end - TRAIN_LOOKBACK_MONTHS개월`. `TRAIN_YEAR` 같은 고정 연도 대신
-    이 함수 하나로 feature_engine(Silver 조회 범위)과 training(train/valid/test
-    split 범위)이 항상 같은 롤링 윈도우를 보게 한다 — 프로필의 `TRAIN_LOOKBACK_MONTHS`/
-    `TRAINING_SAFETY_MARGIN_DAYS` 값만 바꾸면 재배포 없이 다음 실행부터 반영된다
-    (feature_engine/training 둘 다 매번 새로 뜨는 배치 프로세스라 "다음 실행부터"로
-    충분하다).
+    `TRAIN_WINDOW_START`와 `TRAIN_WINDOW_END`를 둘 다 지정하면 해당 inclusive
+    구간을 그대로 쓴다. 최초 챔피언처럼 과거 한 해를 정확히 재현할 때 쓰며,
+    feature_engine과 training이 이 함수를 공유하므로 두 단계가 같은 범위를 본다.
+    한쪽만 지정하거나 ISO 날짜가 잘못됐거나 시작이 종료보다 늦으면 import 시점에
+    실패해 서로 다른 범위의 산출물을 만드는 것을 막는다.
+
+    두 환경변수가 모두 없으면 기존 rolling 규칙을 유지한다. 즉 `end =
+    as_of(기본 오늘 KST) - TRAINING_SAFETY_MARGIN_DAYS`, `start = end -
+    TRAIN_LOOKBACK_MONTHS개월`이다. 월별 재학습은 명시적 구간 변수를 설정하지 않고
+    이 경로를 써서 최신 데이터가 포함된 윈도우를 매번 다시 계산한다.
 
     args:
-        as_of: 기준 날짜(기본 오늘 KST) — 테스트에서 날짜를 고정하기 위한 override
+        as_of: rolling 계산 기준 날짜(기본 오늘 KST). 명시적 구간에서는 사용하지 않음
+    raises:
+        ValueError: 명시적 구간이 쌍으로 없거나 YYYY-MM-DD 형식이 아니거나 역전됐을 때
     """
+    raw_start = os.environ.get("TRAIN_WINDOW_START")
+    raw_end = os.environ.get("TRAIN_WINDOW_END")
+    if raw_start is not None or raw_end is not None:
+        if raw_start is None or raw_end is None:
+            raise ValueError("TRAIN_WINDOW_START와 TRAIN_WINDOW_END는 반드시 함께 지정해야 합니다")
+
+        def _parse_explicit_date(name: str, value: str) -> date:
+            """명시적 학습 경계 하나를 엄격한 YYYY-MM-DD 형식으로 파싱한다."""
+            try:
+                parsed = date.fromisoformat(value)
+            except ValueError as exc:
+                raise ValueError(f"{name}은 YYYY-MM-DD 형식이어야 합니다: {value!r}") from exc
+            if parsed.isoformat() != value:
+                raise ValueError(f"{name}은 YYYY-MM-DD 형식이어야 합니다: {value!r}")
+            return parsed
+
+        start = _parse_explicit_date("TRAIN_WINDOW_START", raw_start)
+        end = _parse_explicit_date("TRAIN_WINDOW_END", raw_end)
+        if start > end:
+            raise ValueError(
+                "TRAIN_WINDOW_START는 TRAIN_WINDOW_END보다 늦을 수 없습니다: "
+                f"start={start.isoformat()}, end={end.isoformat()}"
+            )
+        return start, end
+
     as_of = as_of or today_kst()
     end = as_of - timedelta(days=TRAINING_SAFETY_MARGIN_DAYS)
     start = _subtract_months(end, TRAIN_LOOKBACK_MONTHS)
@@ -199,8 +244,10 @@ def training_window(as_of: date | None = None) -> tuple[date, date]:
 
 # 이 프로세스가 실제로 어떤 프로필을 쓰고 있는지 — 모델 아티팩트에 "어떤 프로필로
 # 학습됐는지"를 그대로 남겨야 해서(model_contract.py의 profile.json) public으로 둔다.
-PROFILE_NAME = os.environ.get("ML_PROFILE", "default")
-PROFILE = _load_profile()
+# 요청한 S3 프로필을 못 읽으면 import 자체가 실패하므로, PROFILE_NAME과 PROFILE이
+# 서로 다른 출처를 가리키는 상태는 생기지 않는다.
+PROFILE_NAME = _selected_profile_name()
+PROFILE = _load_profile(PROFILE_NAME)
 _PROFILE = PROFILE  # 기존 참조(아래) 호환용 별칭
 
 
@@ -227,6 +274,11 @@ ROLLING_EMBARGO_MINUTES = _int_env("ROLLING_EMBARGO_MINUTES", _PROFILE["ROLLING_
 # "타겟/전체 그리드 간격"이라 나중에 독립적으로 바꿀 수 있게 따로 뺀다.
 TARGET_HORIZON_MINUTES = _int_env("TARGET_HORIZON_MINUTES", _PROFILE["TARGET_HORIZON_MINUTES"])
 GRID_TICK_MINUTES = _int_env("GRID_TICK_MINUTES", _PROFILE["GRID_TICK_MINUTES"])
+if ROLLING_TICK_MINUTES != REQUIRED_GRID_TICK_MINUTES or GRID_TICK_MINUTES != REQUIRED_GRID_TICK_MINUTES:
+    raise ValueError(
+        "ROLLING_TICK_MINUTES와 GRID_TICK_MINUTES는 운영 계약에 따라 모두 "
+        f"{REQUIRED_GRID_TICK_MINUTES}여야 합니다: rolling={ROLLING_TICK_MINUTES}, grid={GRID_TICK_MINUTES}"
+    )
 
 # --- 배치예측 horizon(몇 시간 뒤까지 한 번에 예측하는지) ---
 # lag/rolling(직전 실적)은 항상 "지금(T0)" 기준으로 고정하고, horizon(1..HORIZON_COUNT)을
@@ -254,8 +306,8 @@ HORIZON_COUNT = _int_env("HORIZON_COUNT", _PROFILE["HORIZON_COUNT"])
 #   encoding이 pandas Categorical로 안 살아나 매번 object dtype 문자열 배열을
 #   통째로 만드는 비용을 원천적으로 피한다(정수 컬럼은 그 디코딩 자체가 없음).
 # - `hour`(0~23) 대신 `minute`(자정 기준 경과분 0~1439, ml_core.minute_of_day) 하나로
-#   시각을 나타낸다 — 그리드 자체가 20분 tick인데 hour만 쓰면 같은 시간 안의
-#   17:00/17:20/17:40이 모델에 전부 같은 값으로 보인다. minute은 그 tick 구분을
+#   시각을 나타낸다 — 그리드 자체가 5분 tick인데 hour만 쓰면 같은 시간 안의
+#   17:00/17:05/17:10 등이 모델에 전부 같은 값으로 보인다. minute은 그 tick 구분을
 #   그대로 담으면서 hour가 주던 정보(시간대별 패턴)도 당연히 포함한다. `hour`는
 #   출력/CLI 조회 등 식별 용도로는 계속 남아있지만 더 이상 모델 feature가 아니다.
 BASE_FEATURE_COLUMNS = [
@@ -275,16 +327,34 @@ BASE_FEATURE_COLUMNS = [
 
 # --- LightGBM 공통 하이퍼파라미터 (train_common.py, 향후 SynapseML 쪽도 이 값을 참고) ---
 _LGB_PROFILE = _PROFILE["LGB_PARAMS_COMMON"]
-LGB_PARAMS_COMMON = {
-    "num_leaves": _int_env("LGB_NUM_LEAVES", _LGB_PROFILE["num_leaves"]),
-    "learning_rate": _float_env("LGB_LEARNING_RATE", _LGB_PROFILE["learning_rate"]),
-    "feature_fraction": _float_env("LGB_FEATURE_FRACTION", _LGB_PROFILE["feature_fraction"]),
-    "bagging_fraction": _float_env("LGB_BAGGING_FRACTION", _LGB_PROFILE["bagging_fraction"]),
-    "bagging_freq": _int_env("LGB_BAGGING_FREQ", _LGB_PROFILE["bagging_freq"]),
-    "min_data_in_leaf": _int_env("LGB_MIN_DATA_IN_LEAF", _LGB_PROFILE["min_data_in_leaf"]),
-    "verbose": -1,
-    "num_threads": 0,  # 0 = LightGBM이 사용 가능한 코어 수만큼 자동 사용
-}
+
+
+def _build_lgb_params(profile_params: dict) -> dict:
+    """원격 LGB 파라미터 전체를 보존하고 알려진 환경변수 override를 적용한다.
+
+    `max_bin`처럼 아직 전용 환경변수가 없는 새 LightGBM 파라미터도 원격 프로필에
+    추가하면 Dataset construct와 `lgb.train()`까지 그대로 전달돼야 한다. 알려진
+    키만 새 dict로 재작성하면 이런 미래 키가 조용히 사라지므로, 원본을 복사한 뒤
+    현재 지원하는 override만 덮는다.
+    """
+    params = dict(profile_params)
+    params.update(
+        {
+            "num_leaves": _int_env("LGB_NUM_LEAVES", profile_params["num_leaves"]),
+            "learning_rate": _float_env("LGB_LEARNING_RATE", profile_params["learning_rate"]),
+            "feature_fraction": _float_env("LGB_FEATURE_FRACTION", profile_params["feature_fraction"]),
+            "bagging_fraction": _float_env("LGB_BAGGING_FRACTION", profile_params["bagging_fraction"]),
+            "bagging_freq": _int_env("LGB_BAGGING_FREQ", profile_params["bagging_freq"]),
+            "min_data_in_leaf": _int_env("LGB_MIN_DATA_IN_LEAF", profile_params["min_data_in_leaf"]),
+            "verbose": _int_env("LGB_VERBOSE", profile_params.get("verbose", -1)),
+            # 0 = LightGBM이 사용 가능한 코어 수만큼 자동 사용
+            "num_threads": _int_env("LGB_NUM_THREADS", profile_params.get("num_threads", 0)),
+        }
+    )
+    return params
+
+
+LGB_PARAMS_COMMON = _build_lgb_params(_LGB_PROFILE)
 LGB_NUM_BOOST_ROUND = _int_env("LGB_NUM_BOOST_ROUND", _PROFILE["LGB_NUM_BOOST_ROUND"])
 LGB_EARLY_STOPPING_ROUNDS = _int_env("LGB_EARLY_STOPPING_ROUNDS", _PROFILE["LGB_EARLY_STOPPING_ROUNDS"])
 
@@ -337,3 +407,34 @@ MONITOR_LOOKBACK_MONTHS = _int_env("MONITOR_LOOKBACK_MONTHS", _PROFILE["MONITOR_
 # 아직 라벨이 안 굳었을 수 있음).
 TRAIN_LOOKBACK_MONTHS = _int_env("TRAIN_LOOKBACK_MONTHS", _PROFILE["TRAIN_LOOKBACK_MONTHS"])
 TRAINING_SAFETY_MARGIN_DAYS = _int_env("TRAINING_SAFETY_MARGIN_DAYS", _PROFILE["TRAINING_SAFETY_MARGIN_DAYS"])
+
+
+def effective_profile() -> dict:
+    """환경변수 override까지 반영된 이번 프로세스의 프로필 snapshot을 반환한다.
+
+    원격/내장 원문 `PROFILE`을 그대로 모델 옆에 저장하면 실제 실행에 적용된 개별
+    환경변수와 아티팩트 기록이 달라질 수 있다. 알려지지 않은 미래 top-level 키는
+    보존하고, 런타임이 해석하는 키만 최종 상수로 덮어 재현 가능한 사본을 만든다.
+    반환 dict와 중첩 LGB dict는 새 객체라 호출자가 바꿔도 모듈 전역 설정은 변하지
+    않는다. `profile_name`은 값 자체가 아니라 선택 메타데이터이므로 호출부가
+    `PROFILE_NAME`을 별도 필드로 마지막에 추가한다.
+    """
+    return {
+        **PROFILE,
+        "ROLLING_TICK_MINUTES": ROLLING_TICK_MINUTES,
+        "ROLLING_WINDOW_MINUTES": ROLLING_WINDOW_MINUTES,
+        "ROLLING_EMBARGO_MINUTES": ROLLING_EMBARGO_MINUTES,
+        "TARGET_HORIZON_MINUTES": TARGET_HORIZON_MINUTES,
+        "GRID_TICK_MINUTES": GRID_TICK_MINUTES,
+        "HORIZON_COUNT": HORIZON_COUNT,
+        "LGB_PARAMS_COMMON": dict(LGB_PARAMS_COMMON),
+        "LGB_NUM_BOOST_ROUND": LGB_NUM_BOOST_ROUND,
+        "LGB_EARLY_STOPPING_ROUNDS": LGB_EARLY_STOPPING_ROUNDS,
+        "CONFORMAL_TARGET_COVERAGE": CONFORMAL_TARGET_COVERAGE,
+        "INCREMENTAL_LOOKBACK_HOURS": INCREMENTAL_LOOKBACK_HOURS,
+        "PERFORMANCE_DEGRADATION_THRESHOLD": PERFORMANCE_DEGRADATION_THRESHOLD,
+        "COVERAGE_DRIFT_THRESHOLD": COVERAGE_DRIFT_THRESHOLD,
+        "MONITOR_LOOKBACK_MONTHS": MONITOR_LOOKBACK_MONTHS,
+        "TRAIN_LOOKBACK_MONTHS": TRAIN_LOOKBACK_MONTHS,
+        "TRAINING_SAFETY_MARGIN_DAYS": TRAINING_SAFETY_MARGIN_DAYS,
+    }

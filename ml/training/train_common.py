@@ -17,6 +17,7 @@ tree(x)의 objective 역변환(Poisson이면 exp(tree(x)))일 뿐 init_score를 
 """
 
 import contextlib
+import gc
 import json
 import resource
 import sys
@@ -106,27 +107,54 @@ def _validate_valid_test_days_dont_overlap_train() -> None:
 
 
 def _dates_for_split(start: date, end: date) -> tuple[list[str], list[str], list[str]]:
-    """(train_dates, valid_dates, test_dates) — 전부 캘린더 연산만, I/O 없음.
+    """purged day-of-month 규칙으로 train/valid/test 날짜를 나눈다.
 
     예전 `_split()`은 전체 df를 로드한 뒤 `day` 컬럼을 역산해 day-of-month를 구해
     나눴다. Spark가 이미 `date=YYYY-MM-DD/` Hive 파티션으로 저장해두었으므로
     **날짜 문자열 자체에서 day-of-month를 바로 뽑을 수 있어 데이터를 읽을 필요가
     전혀 없다** — `lazy_train_dataset`이 이 함수가 정한 날짜만 골라 S3를 조회한다.
 
-    valid/test를 먼저 확정하고 그 나머지 중에서만 `TRAIN_DAY_DIVISOR` 배수 조건을
-    보므로(`elif`), divisor=1(모든 날이 "배수")이어도 valid/test 날짜가 train으로
-    새지 않는다.
+    multi-horizon 테이블은 같은 anchor의 horizon 행들이 target 시각 기준 서로
+    다른 날짜 파티션에 걸칠 수 있다. 따라서 valid/test를 먼저 확정한 뒤, 그 날짜
+    전후 `SPLIT_EMBARGO_DAYS` 안의 날짜를 train 후보에서 제거한다. valid와 test가
+    서로 embargo 거리 안에 있으면 두 평가셋도 같은 anchor를 공유할 수 있으므로
+    설정 오류로 즉시 실패한다.
+
+    returns:
+        tuple[list[str], list[str], list[str]]: 날짜순 train/valid/test 날짜 문자열
+    raises:
+        ValueError: valid와 test 날짜가 embargo 거리 안에 함께 있을 때
     """
-    train, valid, test = [], [], []
-    for d in pd.date_range(start, end, freq="D"):
-        date_str = d.strftime("%Y-%m-%d")
-        if d.day in config.VALID_DAYS_OF_MONTH:
-            valid.append(date_str)
-        elif d.day in config.TEST_DAYS_OF_MONTH:
-            test.append(date_str)
-        elif d.day % config.TRAIN_DAY_DIVISOR == 0:
-            train.append(date_str)
-    return train, valid, test
+    all_dates = [d.date() for d in pd.date_range(start, end, freq="D")]
+    valid_dates = [d for d in all_dates if d.day in config.VALID_DAYS_OF_MONTH]
+    test_dates = [d for d in all_dates if d.day in config.TEST_DAYS_OF_MONTH]
+
+    unsafe_eval_pairs = [
+        (valid_date, test_date)
+        for valid_date in valid_dates
+        for test_date in test_dates
+        if abs((valid_date - test_date).days) <= config.SPLIT_EMBARGO_DAYS
+    ]
+    if unsafe_eval_pairs:
+        sample = unsafe_eval_pairs[0]
+        raise ValueError(
+            "valid/test 날짜 사이에 필요한 split embargo가 없습니다: "
+            f"valid={sample[0]}, test={sample[1]}, SPLIT_EMBARGO_DAYS={config.SPLIT_EMBARGO_DAYS}"
+        )
+
+    evaluation_dates = {*valid_dates, *test_dates}
+    train_dates = [
+        d
+        for d in all_dates
+        if d not in evaluation_dates
+        and d.day % config.TRAIN_DAY_DIVISOR == 0
+        and all(abs((d - evaluation_date).days) > config.SPLIT_EMBARGO_DAYS for evaluation_date in evaluation_dates)
+    ]
+    return (
+        [d.isoformat() for d in train_dates],
+        [d.isoformat() for d in valid_dates],
+        [d.isoformat() for d in test_dates],
+    )
 
 
 def _peak_rss_mb() -> float:
@@ -354,10 +382,12 @@ def train_target(
         # 청크를 필요할 때만 S3에서 읽고 바이닝 후 버림, lazy_train_dataset.py 참고).
         train_set, y_train, exposure_train = lazy_train_dataset.build_lazy_dataset(
             table_path, train_dates, feature_columns, station_dtype, filters, target_col, exposure_col, cache,
+            dataset_params=config.LGB_PARAMS_COMMON,
             on_chunk_loaded=_chunk_progress(model_name, "train"),
         )
         valid_set, y_valid, exposure_valid = lazy_train_dataset.build_lazy_dataset(
             table_path, valid_dates, feature_columns, station_dtype, filters, target_col, exposure_col, cache,
+            dataset_params=config.LGB_PARAMS_COMMON,
             reference=train_set, on_chunk_loaded=_chunk_progress(model_name, "valid"),
         )
         _append_progress_log(
@@ -365,7 +395,10 @@ def train_target(
             f"valid {len(y_valid):,}행, peak_rss={_peak_rss_mb():.0f}MB"
         )
         print(f"[{model_name}] train={len(y_train):,} valid={len(y_valid):,}")
-        del exposure_train, exposure_valid  # init_score로 이미 train_set/valid_set 구성 시점에 반영됨, 더 안 씀
+        # label/init_score는 construct된 Dataset의 native buffer에 이미 복사됐다.
+        # conformal에 필요한 y_valid만 남기고 Python-side train label/exposure 배열은
+        # 즉시 내려 peak RSS를 줄인다.
+        del y_train, exposure_train, exposure_valid
 
         poisson_params = {
             **config.LGB_PARAMS_COMMON, **_distributed_params(), "objective": "poisson", "metric": "poisson",
@@ -399,6 +432,7 @@ def train_target(
             f"  [poisson] best_iter={booster.best_iteration} "
             f"test_deviance={metrics['poisson_deviance_test']:.4f} test_rmse={metrics['rmse_test']:.4f}"
         )
+        del test_poisson, exposure_test, mu_test
 
         # 2) Quantile P10/P50/P90 (exposure offset 미적용 — quantile loss는 offset 해석이 표준적이지 않음)
         #
@@ -414,12 +448,22 @@ def train_target(
         if exposure_col is None:
             train_set_q, valid_set_q = train_set, valid_set
         else:
+            # 대여 quantile Dataset은 offset 없는 새 native binned storage가 필요하다.
+            # poisson Dataset 변수를 둔 채 새 Dataset을 construct하면 두 train/valid
+            # storage가 동시에 상주해 23GB 머신에서 OOM이 난다. lgb.train() 기본값은
+            # 반환 전에 Booster와 Dataset 연결을 끊으므로 여기서 마지막 Python 참조와
+            # 날짜 chunk cache를 먼저 버리고 cyclic/native finalizer까지 즉시 수거한다.
+            del train_set, valid_set
+            cache.clear()
+            gc.collect()
             train_set_q, _, _ = lazy_train_dataset.build_lazy_dataset(
                 table_path, train_dates, feature_columns, station_dtype, filters, target_col, None, cache,
+                dataset_params=config.LGB_PARAMS_COMMON,
                 on_chunk_loaded=_chunk_progress(model_name, "train-quantile"),
             )
             valid_set_q, _, _ = lazy_train_dataset.build_lazy_dataset(
                 table_path, valid_dates, feature_columns, station_dtype, filters, target_col, None, cache,
+                dataset_params=config.LGB_PARAMS_COMMON,
                 reference=train_set_q, on_chunk_loaded=_chunk_progress(model_name, "valid-quantile"),
             )
 
@@ -442,6 +486,14 @@ def train_target(
                 )
             quantile_boosters[alpha] = q_booster
             print(f"  [q{int(alpha * 100)}] best_iter={q_booster.best_iteration}")
+
+        # 학습이 끝난 binned Dataset은 아래 streaming predict/conformal 계산에 필요
+        # 없다. 반납 모델은 poisson Dataset 별칭이므로 원래 이름도 함께 제거한다.
+        del train_set_q, valid_set_q
+        if exposure_col is None:
+            del train_set, valid_set
+        cache.clear()
+        gc.collect()
 
         # valid/test 청크를 quantile booster 3개 전부로 한 번에 predict한다(alpha별로
         # 따로 부르면 같은 날짜를 3번씩 다시 읽게 되므로 I/O가 3배 든다).
@@ -492,7 +544,11 @@ def train_target(
             # 남겨서, 나중에 이 모델을 찾았을 때 재현/서빙 조건을 바로 알 수 있게 한다
             # (챔피언으로 승격되면 training/promotion.py가 이 archive_prefix를 포인터로
             # 가리키므로, 이 파일도 그 포인터를 통해 그대로 조회된다 — 별도 복사 없음).
-            profile_payload = {"profile_name": common_config.PROFILE_NAME, **common_config.PROFILE}
+            # 원격 프로필이 임의의 `profile_name` 메타데이터로 실제 선택 이름을
+            # 덮어쓰지 못하도록 운영 코드가 마지막에 확정한다. common_config의
+            # 프로필 검증도 이 예약 키를 거부하지만, 아티팩트 경계에서 한 번 더
+            # 순서를 안전하게 둔다.
+            profile_payload = {**common_config.effective_profile(), "profile_name": common_config.PROFILE_NAME}
             s3_io.write_json(model_json_key(model_name, "profile", models_prefix), profile_payload)
             mlflow.log_dict(profile_payload, "profile.json")
             # metrics의 "model_name"은 문자열이라 mlflow.log_metrics(숫자만 허용)에서 뺀다.

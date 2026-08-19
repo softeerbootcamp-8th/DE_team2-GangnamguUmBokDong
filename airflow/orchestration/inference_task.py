@@ -15,7 +15,6 @@ resolve되려면 cwd가 `ml/`이어야 하고, 환경은 `inference` 프로젝�
 from __future__ import annotations
 
 from airflow.task.trigger_rule import TriggerRule
-
 from config.schedules import INFERENCE_EXECUTION_TIMEOUT
 
 from orchestration.task_builder import REPO_ROOT, build_module_task
@@ -24,12 +23,13 @@ from orchestration.templates import KST_DATE, KST_HOUR, KST_MINUTE
 ML_DIR = str(REPO_ROOT / "ml")
 
 
-def build_inference_task(dag, *, trigger_rule: str = TriggerRule.ALL_SUCCESS):
-    """`trigger_rule`은 realtime_5min.py가 normalizer 브랜치(strict/fallback) 뒤에
-    붙일 때 `NONE_FAILED_MIN_ONE_SUCCESS`로 덮어쓴다 — `run_normalizer_fallback`이
-    보통(strict 성공 시) SKIPPED로 끝나는데, 기본값 ALL_SUCCESS는 upstream이
-    SKIPPED면 이 태스크도 그대로 SKIPPED로 전파시켜 버려서 정상 경로에서 추론이
-    거의 항상 안 도는 사고가 난다(`realtime_5min.py` 모듈 docstring 참고).
+def build_inference_task(dag):
+    """정규화까지 끝난 실시간 입력이 모두 성공하면 실행할 추론 태스크를 만든다.
+
+    strict/fallback normalizer의 분기 상태는 두 운영 DAG의
+    ``population_normalized``(``ONE_SUCCESS``) 합류 태스크가 먼저 흡수한다. 추론의
+    직접 upstream에는 그 합류 태스크와 필수 collector만 있으므로 여기서는
+    ``ALL_SUCCESS``가 올바른 고정 계약이다.
     """
     cmd = (
         "uv --project inference run python -m inference.predict_single "
@@ -42,5 +42,5 @@ def build_inference_task(dag, *, trigger_rule: str = TriggerRule.ALL_SUCCESS):
         ML_DIR,
         cmd,
         execution_timeout=INFERENCE_EXECUTION_TIMEOUT,
-        trigger_rule=trigger_rule,
+        trigger_rule=TriggerRule.ALL_SUCCESS,
     )

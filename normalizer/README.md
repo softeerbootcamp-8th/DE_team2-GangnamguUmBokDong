@@ -85,7 +85,7 @@ s3://<bucket>/
 | 컬럼 | 타입 | 출처 | 결측 조건 |
 |---|---|---|---|
 | `station_id` | string | master `RNTLS_ID` | 없음(없는 행은 제외) |
-| `station_no` | string | master `ADDR2` | `ADDR2` 없을 때 |
+| `station_no` | int16 | master `RNTLS_ID`의 엄격한 `ST-<숫자>` suffix | 없음. 형식 오류 또는 1~32767 범위 밖이면 snapshot 전체 실패 |
 | `station_name` | string | 실시간 `stationName` → master `ADDR1` → `ADDR2` | 셋 다 없을 때 |
 | `capacity` | int64 | 실시간 `rackTotCnt` | 해당 실시간 행이 없을 때 |
 | `lat` | double | master `LAT` → (무효 시) 실시간 `stationLatitude` | 숫자 변환 실패 시. `0.0`은 그대로 실린다 |
@@ -102,6 +102,11 @@ s3://<bucket>/
 
 **좌표 유효성 판정**: `_valid_wgs84`가 위도 36.5~38.5, 경도 125.5~128.5를 요구한다. master의
 `LAT`/`LOT`가 `0`인 대여소는 이 검사에서 걸러지므로 적도상 엉뚱한 격자가 계산되지 않는다.
+
+**모델용 정류소 번호**: `ADDR2`는 실제 API에서 숫자와 한글 상세주소가 섞인 필드라
+`station_no`로 사용하지 않는다. 안정적인 식별자인 `RNTLS_ID`가 정확히 `ST-<숫자>`
+형식인지 확인해 숫자 suffix를 추출하며, downstream Spark `ShortType`과 같은 양의
+int16 범위(1~32767)를 벗어나면 잘못된 범주 키로 학습·서빙하지 않도록 즉시 실패한다.
 
 ---
 

@@ -66,18 +66,29 @@ def _tick_from_path() -> Column:
 
 
 def read_station_master(spark: SparkSession) -> DataFrame:
-    """Silver `station/station_master.parquet`(정적 파일 1개)를 우리 컬럼명으로 읽는다.
+    """Silver `station_master_enriched`의 최신 snapshot을 우리 컬럼명으로 읽는다.
+
+    normalizer가 `dt=.../hh=.../HHMM.parquet`로 새 snapshot을 계속 쌓으므로 전체
+    prefix를 읽은 뒤 파일 경로가 가장 최신인 행만 남긴다. 날짜·시각 segment가
+    zero-padding된 키 계약이라 경로의 사전순 최대값이 최신 snapshot과 같다.
 
     returns:
         DataFrame: station_id, station_no, station_name, capacity, lat, lon, grid_id
     """
-    station_master_suffix = silver_schema.STATION_MASTER_KEY.removeprefix("silver/")
-    df = spark.read.parquet(f"{config.SILVER_ROOT}/{station_master_suffix}")
+    station_master_suffix = silver_schema.STATION_MASTER_ENRICHED_PREFIX.removeprefix("silver/")
+    path = f"{config.SILVER_ROOT}/{station_master_suffix}dt=*/hh=*/*.parquet"
+    df = spark.read.parquet(path).withColumn("_source_path", F.input_file_name())
+    latest_path = df.select(F.max("_source_path").alias("path")).first()["path"]
+    df = df.filter(F.col("_source_path") == latest_path).drop("_source_path")
     df = _rename(df, silver_schema.STATION_COLUMN_MAP)
     return df.select("station_id", "station_no", "station_name", "capacity", "lat", "lon", "grid_id")
 
 
-def read_rental_trips(spark: SparkSession, since: str | None = None) -> DataFrame:
+def read_rental_trips(
+    spark: SparkSession,
+    since: str | None = None,
+    until: str | None = None,
+) -> DataFrame:
     """Silver `bike_rental_history`(5분 tick)를 station_id 매칭까지 끝낸 트립 단위로 읽는다.
 
     `RENT_STATION_ID`/`RETURN_STATION_ID`가 이미 `station_id`와 같은 형식이라
@@ -94,6 +105,7 @@ def read_rental_trips(spark: SparkSession, since: str | None = None) -> DataFram
     args:
         spark: SparkSession
         since: 지정하면 start_dt >= since인 트립만 남긴다(증분 재계산용)
+        until: 지정하면 start_dt < until인 트립만 남긴다(exclusive upper bound)
     returns:
         DataFrame: station_id(대여), end_station_id(반납, 없으면 null), start_dt, end_dt
     """
@@ -110,6 +122,8 @@ def read_rental_trips(spark: SparkSession, since: str | None = None) -> DataFram
     )
     if since is not None:
         df = df.filter(F.col("start_dt") >= F.lit(since))
+    if until is not None:
+        df = df.filter(F.col("start_dt") < F.lit(until))
     df = df.dropDuplicates(["bike_id", "start_dt"]).drop("bike_id")
 
     df = df.join(master_ids, on="station_id", how="inner")
@@ -127,11 +141,10 @@ def read_rental_trips(spark: SparkSession, since: str | None = None) -> DataFram
 def _pick_first_per_hour(df: DataFrame, tick_col: str, partition_cols: list[str]) -> DataFrame:
     """(partition_cols, hour) 그룹마다 tick_col이 가장 이른 행 하나만 남긴다.
 
-    `bike_station_realtime`/`weather_ultra_short_live`은 5~10분 tick이지만, 지금
-    다운스트림(`build_merged_table.py`)이 기대하는 station_status/weather 입력은
-    시간(hour) 단위 스냅샷 하나다 — 그 시간의 첫 tick을 대표값으로 쓴다(그 시간
-    동안 값이 유지된다고 forward-fill하는 것과 동치, `build_merged_table.py`의
-    `_expand_hourly_to_ticks()`가 그 forward-fill을 이미 담당).
+    `bike_station_realtime`은 5분 tick이지만 학습 station grid는 시간별 첫 재고
+    스냅샷을 대표값으로 쓴다. weather에는 이 helper를 쓰지 않는다. 날씨는 실제
+    수집 tick을 모두 보존한 뒤 별도의 과거 방향 as-of 확장을 해야 미래 누수를
+    막을 수 있다.
     """
     window = Window.partitionBy(*partition_cols, "hour_ts").orderBy(tick_col)
     return (
@@ -141,12 +154,17 @@ def _pick_first_per_hour(df: DataFrame, tick_col: str, partition_cols: list[str]
     )
 
 
-def read_station_status(spark: SparkSession, since: str | None = None) -> DataFrame:
+def read_station_status(
+    spark: SparkSession,
+    since: str | None = None,
+    until: str | None = None,
+) -> DataFrame:
     """Silver `bike_station_realtime`(5분 tick)에서 정류소별 시간당 재고 스냅샷을 만든다.
 
     args:
         spark: SparkSession
         since: 지정하면 hour_ts >= since인 시간대만 남긴다(증분 재계산용)
+        until: 지정하면 hour_ts < until인 시간대만 남긴다(exclusive upper bound)
     returns:
         DataFrame: station_id, hour_ts, bike_count, stockout_flag
     """
@@ -156,39 +174,74 @@ def read_station_status(spark: SparkSession, since: str | None = None) -> DataFr
     df = df.withColumn("hour_ts", F.date_trunc("hour", F.col("_tick")))
     if since is not None:
         df = df.filter(F.col("hour_ts") >= F.lit(since))
+    if until is not None:
+        df = df.filter(F.col("hour_ts") < F.lit(until))
     df = df.select("station_id", "hour_ts", "bike_count", "_tick")
     df = _pick_first_per_hour(df, "_tick", ["station_id"])
     df = df.withColumn("stockout_flag", (F.col("bike_count") <= 0).cast("byte"))
     return df.select("station_id", "hour_ts", "bike_count", "stockout_flag")
 
 
-def read_weather(spark: SparkSession, since: str | None = None) -> DataFrame:
-    """Silver `weather_ultra_short_live`(10분 tick, 서울 전체 공통)에서 시간당 관측값을 만든다.
+def read_weather(
+    spark: SparkSession,
+    since: str | None = None,
+    until: str | None = None,
+) -> DataFrame:
+    """Silver `weather_ultra_short_live`에서 수집 tick별 서울 평균 관측값을 만든다.
 
-    `weather_short_term_forecast`(예보, 3시간)는 강수량이 아니라 강수확률만 있어
-    아직 안 쓴다(`ml-integration-requests.md` 6번) — `inference/predict_single.py`의
-    `_get_recent_weather()`와 같은 소스 선택.
+    학습 입력에는 미래 예보가 아니라 사후 관측인 `weather_ultra_short_live`를 쓴다 —
+    `inference/predict_single.py`의 `_get_recent_weather()`와 같은 소스 선택이다.
+    각 실제 수집 tick을 그대로 보존하고, 그 tick에 함께 수집된 모든 유효한 서울
+    격자 행을 평균낸다. 같은 시간의 최신 tick 하나를 시간 전체에 붙이면 08:55에
+    처음 알게 된 관측이 08:00~08:50 학습 행으로 역전파되는 미래 누수가 생긴다.
+    5분 feature grid로의 과거 방향 forward-fill은 `build_merged_table.py`가 inference와
+    같은 최대 3시간 freshness 계약으로 담당한다.
 
     args:
         spark: SparkSession
-        since: 지정하면 hour_ts >= since인 시간대만 남긴다(증분 재계산용)
+        since: 지정하면 실제 수집 tick >= since인 행만 남긴다(증분 재계산용)
+        until: 지정하면 실제 수집 tick < until인 행만 남긴다(exclusive upper bound)
     returns:
         DataFrame: hour_ts, temp, precip, wind, humidity
     """
     df = spark.read.parquet(_silver_glob(silver_schema.WEATHER_SOURCE_ID))
     df = _rename(df, silver_schema.WEATHER_COLUMN_MAP)
     df = df.withColumn("_tick", _tick_from_path())
-    df = df.withColumn("hour_ts", F.date_trunc("hour", F.col("_tick")))
     if since is not None:
-        df = df.filter(F.col("hour_ts") >= F.lit(since))
-    df = df.select("hour_ts", "temp", "precip", "wind", "humidity", "_tick")
-    df = _pick_first_per_hour(df, "_tick", [])
+        df = df.filter(F.col("_tick") >= F.lit(since))
+    if until is not None:
+        df = df.filter(F.col("_tick") < F.lit(until))
+    df = df.select("_tick", "temp", "precip", "wind", "humidity")
+    for column in ("temp", "precip", "wind", "humidity"):
+        df = df.withColumn(column, F.col(column).cast("double"))
+    valid = (
+        F.col("temp").isNotNull()
+        & ~F.isnan("temp")
+        & F.col("temp").between(-50.0, 50.0)
+        & F.col("precip").isNotNull()
+        & ~F.isnan("precip")
+        & F.col("precip").between(0.0, 500.0)
+    )
+    # tick별 전체 격자 평균만 만든다. 유효 행이 하나도 없는 tick은 빠지고,
+    # build_merged_table의 과거 방향 forward-fill이 직전 유효 tick을 선택하므로
+    # inference가 깨진 최신 파일을 건너뛰는 동작과 같아진다.
+    df = df.filter(valid).groupBy("_tick").agg(
+        F.avg("temp").alias("temp"),
+        F.avg("precip").alias("precip"),
+        F.avg("wind").alias("wind"),
+        F.avg("humidity").alias("humidity"),
+    )
+    df = df.withColumnRenamed("_tick", "hour_ts")
     return df.withColumn("humidity", F.round(F.col("humidity")).cast("int")).select(
         "hour_ts", "temp", "precip", "wind", "humidity"
     )
 
 
-def read_population(spark: SparkSession, since: str | None = None) -> DataFrame:
+def read_population(
+    spark: SparkSession,
+    since: str | None = None,
+    until: str | None = None,
+) -> DataFrame:
     """Silver `living_population_grid`(하루 1개 파일, YMD+TT로 24시간 내장)에서 격자x시간 인구를 만든다.
 
     실제 예시 데이터에서 두 가지를 확인했다(`ml-integration-requests.md` 8번):
@@ -203,6 +256,7 @@ def read_population(spark: SparkSession, since: str | None = None) -> DataFrame:
     args:
         spark: SparkSession
         since: 지정하면 hour_ts >= since인 시간대만 남긴다(증분 재계산용)
+        until: 지정하면 hour_ts < until인 시간대만 남긴다(exclusive upper bound)
     returns:
         DataFrame: grid_id, hour_ts, pop_resd, pop_long_foreign, pop_short_foreign, pop_total
     """
@@ -218,6 +272,8 @@ def read_population(spark: SparkSession, since: str | None = None) -> DataFrame:
     )
     if since is not None:
         df = df.filter(F.col("hour_ts") >= F.lit(since))
+    if until is not None:
+        df = df.filter(F.col("hour_ts") < F.lit(until))
     df = df.select("grid_id", "hour_ts", "pop_total", "_collected_dt")
 
     window = Window.partitionBy("grid_id", "hour_ts").orderBy(F.col("_collected_dt").desc())

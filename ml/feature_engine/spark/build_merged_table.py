@@ -1,10 +1,10 @@
-"""모든 소스를 station x tick(20분 간격) 기준으로 병합해 최종 feature 테이블의 입력을 만든다 (PySpark 포팅).
+"""모든 소스를 station x tick(5분 간격) 기준으로 병합해 최종 feature 테이블의 입력을 만든다 (PySpark 포팅).
 
-**그리드가 시간(hour) 단위에서 20분 tick 단위로 바뀌었다** — `src/build_merged_table.py`
-(pandas)와 동일한 이유: "3시 40분 기준으로 앞으로 1시간"처럼 임의의 20분 단위 기준
+**그리드가 시간(hour) 단위에서 5분 tick 단위로 바뀌었다** — `src/build_merged_table.py`
+(pandas)와 동일한 이유: "3시 40분 기준으로 앞으로 1시간"처럼 임의의 5분 단위 기준
 시각에서 예측하려면 그리드 자체가 그 해상도여야 한다(타겟은 이미
-`build_targets.py`에서 20분 tick sparse step function으로 바뀜). `hour_ts` 컬럼명은
-그대로 두지만(다른 파일들과의 접점이 많아 이름을 바꾸지 않음) 이제 20분 단위로도
+`build_targets.py`에서 5분 tick sparse step function으로 바뀜). `hour_ts` 컬럼명은
+그대로 두지만(다른 파일들과의 접점이 많아 이름을 바꾸지 않음) 이제 5분 단위로도
 값을 가진다.
 
 `src/build_merged_table.py`(pandas, 로컬 검증용)와 **의도적으로 다른 부분이 하나
@@ -31,8 +31,10 @@ step function이라, 그리드의 각 (station, tick)에 대해 `lookup_count_at
 `since` 이전의 마지막 delta를 잃어버려, `since` 직후 tick들의 조회값이 깨진다
 (그리드/날씨/인구처럼 "그 시점 이후 데이터만 있으면 되는" 소스와 다름).
 
-날씨/인구는 원본이 시간 단위뿐이라(관측 자체가 그 해상도) tick을 정시로 내려서
-join한다 — 그 시간 동안 값이 유지된다고 forward-fill하는 것과 동치.
+날씨는 실제 수집 tick별 서울 평균을 보존한 뒤, 각 관측을 다음 관측 직전 또는
+최대 3시간까지만 5분 grid로 과거 방향 forward-fill해 exact join한다. 따라서 같은
+시간 안의 08:55 관측이 08:00~08:50 행에 역전파되지 않는다. 생활인구만 원본의
+시간 단위 값을 정시로 내려서 그 시간의 tick들과 join한다.
 
 **메모리(dtype 최적화)**: `src/build_merged_table.py`의 `NATIVE_COLUMN_DTYPES`
 (값 범위 실측 기반 다운캐스트)와 동일한 Spark 타입 매핑을 적용한다 — 값 범위는
@@ -41,9 +43,12 @@ join한다 — 그 시간 동안 값이 유지된다고 forward-fill하는 것�
 pop_short_foreign)는 원본 join 직후 즉시 버린다(뒤로 전파시키지 않음).
 """
 
+from datetime import datetime, timedelta
+
+from ml_core import silver_schema
 from ml_core.day_index import DAY_INDEX_EPOCH
 from ml_core.holidays_kr import korean_holidays
-from pyspark.sql import DataFrame, SparkSession
+from pyspark.sql import DataFrame, SparkSession, Window
 from pyspark.sql import functions as F
 from pyspark.sql.types import ByteType, FloatType, ShortType
 
@@ -135,7 +140,68 @@ def _expand_hourly_to_ticks(status: DataFrame, tick_minutes: int, spark: SparkSe
     return expanded.drop("hour_ts", "_offset_seconds", "_hour_ts_unix")
 
 
-def build_merged_table(spark: SparkSession, since: str | None = None) -> DataFrame:
+def _forward_fill_weather_to_ticks(
+    weather: DataFrame,
+    tick_minutes: int,
+    max_staleness_hours: int,
+) -> DataFrame:
+    """수집 tick별 날씨를 미래 관측을 쓰지 않고 feature grid tick으로 펼친다.
+
+    각 관측은 그 시각부터 다음 관측 직전까지만 유효하다. 다음 관측이 늦거나 없으면
+    inference의 lookback 계약과 같은 ``max_staleness_hours``까지만 유지한다.
+    station grid와 range join하면 station 수만큼 중간 행이 폭증하므로, 작은 도시
+    공통 weather 테이블만 ``lead``/``sequence``로 먼저 확장한 뒤 exact join한다.
+
+    args:
+        weather: hour_ts(실제 수집 tick), temp, precip 컬럼을 가진 DataFrame
+        tick_minutes: feature grid 간격(분)
+        max_staleness_hours: 관측을 재사용할 수 있는 최대 시간(경계 포함)
+    returns:
+        DataFrame: hour_ts가 tick_minutes 간격으로 확장된 날씨 관측
+    """
+    if tick_minutes <= 0:
+        raise ValueError("tick_minutes는 양수여야 합니다")
+    if max_staleness_hours <= 0:
+        raise ValueError("max_staleness_hours는 양수여야 합니다")
+
+    tick_interval = F.expr(f"INTERVAL {tick_minutes} MINUTES")
+    stale_interval = F.expr(f"INTERVAL {max_staleness_hours} HOURS")
+    ordered = weather.withColumn(
+        "_next_weather_ts",
+        F.lead("hour_ts").over(Window.orderBy("hour_ts")),
+    )
+    expires_at = F.col("hour_ts") + stale_interval
+    before_next = F.col("_next_weather_ts") - tick_interval
+    fill_through = F.when(
+        F.col("_next_weather_ts").isNull(),
+        expires_at,
+    ).otherwise(F.least(before_next, expires_at))
+    expanded = ordered.withColumn("_fill_through", fill_through).filter(
+        F.col("_fill_through") >= F.col("hour_ts")
+    )
+    expanded = expanded.withColumn(
+        "_weather_tick",
+        F.explode(F.sequence(F.col("hour_ts"), F.col("_fill_through"), tick_interval)),
+    )
+    return (
+        expanded.drop("hour_ts", "_next_weather_ts", "_fill_through")
+        .withColumnRenamed("_weather_tick", "hour_ts")
+    )
+
+
+def _weather_context_start(since: str) -> str:
+    """target 시작점에서 최대 freshness만큼 앞선 weather source 시작점을 반환한다."""
+    return (
+        datetime.fromisoformat(since)
+        - timedelta(hours=silver_schema.WEATHER_MAX_STALENESS_HOURS)
+    ).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def build_merged_table(
+    spark: SparkSession,
+    since: str | None = None,
+    until: str | None = None,
+) -> DataFrame:
     """station master/타겟/재고/날씨/인구를 station x tick(config.GRID_TICK_MINUTES) 기준으로 병합한다.
 
     args:
@@ -145,6 +211,8 @@ def build_merged_table(spark: SparkSession, since: str | None = None) -> DataFra
             맞물린다). None이면(기본값) 전체 히스토리. **타겟 parquet(rental/return)은
             sparse step function이라 이 필터와 무관하게 항상 전체를 읽는다** — 위
             모듈 docstring 참고.
+        until: 지정하면 시계열 입력과 결과의 hour_ts가 이 값보다 이른 행만 남긴다.
+            학습 window 종료일 다음날 00:00을 쓰는 exclusive upper bound다.
     returns:
         DataFrame: 최종 병합 테이블 (station_no, rental_count, return_count, bike_count,
             stockout_flag, capacity, lat, lon, temp, precip, pop_total, hour_ts,
@@ -173,8 +241,21 @@ def build_merged_table(spark: SparkSession, since: str | None = None) -> DataFra
 
     if since is not None:
         status = status.filter(F.col("hour_ts") >= F.lit(since))
-        weather = weather.filter(F.col("hour_ts") >= F.lit(since))
+        # target 시작 tick도 inference와 같이 직전 최대 3시간 관측을 쓸 수 있어야
+        # 한다. weather source만 context를 더 읽고, 최종 행 범위는 status grid가
+        # 여전히 since 이상으로 제한한다.
+        weather = weather.filter(F.col("hour_ts") >= F.lit(_weather_context_start(since)))
         population = population.filter(F.col("hour_ts") >= F.lit(since))
+    if until is not None:
+        status = status.filter(F.col("hour_ts") < F.lit(until))
+        weather = weather.filter(F.col("hour_ts") < F.lit(until))
+        population = population.filter(F.col("hour_ts") < F.lit(until))
+
+    weather = _forward_fill_weather_to_ticks(
+        weather,
+        config.GRID_TICK_MINUTES,
+        silver_schema.WEATHER_MAX_STALENESS_HOURS,
+    )
 
     # 그리드 = station_status에 실제로 관측 기록이 있는 (station_id, hour_ts)를
     # GRID_TICK_MINUTES 간격으로 펼친 것 — 8,760시간 dense grid를 따로 만들지 않는다.
@@ -198,9 +279,8 @@ def build_merged_table(spark: SparkSession, since: str | None = None) -> DataFra
         master.select("station_id", "station_no", "capacity", "lat", "lon", "grid_id"), on="station_id", how="left"
     )
 
+    df = df.join(weather, on="hour_ts", how="left")
     df = df.withColumn("_hour_floor", F.date_trunc("hour", F.col("hour_ts")))
-    df = df.join(weather.withColumnRenamed("hour_ts", "_hour_floor"), on="_hour_floor", how="left")
-
     df = df.join(population.withColumnRenamed("hour_ts", "_hour_floor"), on=["grid_id", "_hour_floor"], how="left")
     df = df.drop("_hour_floor")
     df = df.fillna(0.0, subset=["pop_total"])
@@ -209,8 +289,8 @@ def build_merged_table(spark: SparkSession, since: str | None = None) -> DataFra
     df = df.withColumn("day", F.datediff(F.col("hour_ts"), F.lit(DAY_INDEX_EPOCH.isoformat())))
     df = df.withColumn("hour", F.hour("hour_ts"))  # 더 이상 모델 feature 아님 — 출력/CLI 식별용
     # minute = 자정 기준 경과분(hour*60+분, ml_core.minute_of_day와 동일 공식) — hour
-    # 대신 쓰는 실제 모델 feature. 그리드가 20분 tick이라 hour만 쓰면 같은 시간
-    # 안의 17:00/17:20/17:40이 모델에 전부 같은 값으로 보이는데, minute은 그
+    # 대신 쓰는 실제 모델 feature. 그리드가 5분 tick이라 hour만 쓰면 같은 시간
+    # 안의 17:00/17:05/.../17:55가 모델에 전부 같은 값으로 보이는데, minute은 그
     # 구분을 그대로 담는다.
     df = df.withColumn("minute", F.hour("hour_ts") * 60 + F.minute("hour_ts"))
     df = df.withColumn("dow", F.weekday("hour_ts"))  # Monday=0 ... Sunday=6, pandas .dt.dayofweek와 동일
@@ -228,6 +308,15 @@ def build_merged_table(spark: SparkSession, since: str | None = None) -> DataFra
     for col_name, dtype in NATIVE_COLUMN_DTYPES.items():
         df = df.withColumn(col_name, F.col(col_name).cast(dtype))
 
+    if until is not None:
+        # target은 `[T, T+TARGET_HORIZON)`이므로 source 종료 직전 tick은 완결된
+        # 라벨이 아니다. 마지막 완결 기준시각까지만 남겨 12/31 23:55처럼 다음 해
+        # outcome이 잘린 행을 정상 라벨로 학습하지 않는다.
+        complete_through = (
+            datetime.fromisoformat(until)
+            - timedelta(minutes=config.TARGET_HORIZON_MINUTES)
+        ).strftime("%Y-%m-%d %H:%M:%S")
+        df = df.filter(F.col("hour_ts") <= F.lit(complete_through))
     return df
 
 

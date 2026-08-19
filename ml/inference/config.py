@@ -55,9 +55,9 @@ HORIZON_COUNT = common_config.HORIZON_COUNT
 
 EXPOSURE_STOCKOUT_VALUE = common_config.EXPOSURE_STOCKOUT_VALUE
 
-# 배치 조회 CLI의 기본 조회 기간 — training이 이제 연중 특정 day-of-month(3/20=valid,
-# 7/24=test)를 흩뿌려 학습하므로(training/config.py 참고) 연속 구간 개념 자체가
-# 없다. 임의로 하나의 test day-of-month(7일)를 기본값으로 둔다 — 실제 조회 시
-# --start-date/--end-date로 원하는 기간을 지정하면 된다.
-TEST_START = "2025-06-07"
-TEST_END = "2025-06-07"
+# 배치 조회 CLI의 기본 조회 기간 — 2025 feature mart를 만든 기본 학습 split의
+# TEST_DAYS_OF_MONTH={17,19} 중 실제 test 파티션 하나를 고정한다. 학습 전용 split
+# 환경변수를 inference가 파싱하면 잘못된 값 하나로 실시간 추론 import까지 죽을 수
+# 있으므로 두 설정의 런타임 의존성은 만들지 않는다.
+TEST_START = "2025-06-17"
+TEST_END = TEST_START

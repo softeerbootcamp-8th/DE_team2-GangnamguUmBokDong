@@ -20,6 +20,11 @@ uv sync   # pyproject.toml/uv.lock 기준 .venv 생성 — pandas/numpy + ml_cor
 `training`이 먼저 모델을 학습·승격해둬야 한다([training/README.md](../training/README.md)).
 로컬 개발은 `.env`의 S3 자격증명으로 MinIO(`make up`)를 거친다.
 
+추론은 챔피언 booster를 로드하기 전에 모델 옆 effective profile의 서빙 피처
+계약과 현재 `common_config`를 비교한다. rolling/window/embargo, target horizon,
+grid, horizon 수가 다르거나 profile 아티팩트가 없으면 잘못된 의미의 피처로
+조용히 예측하지 않고 즉시 실패한다.
+
 **단일 시점 예측을 쓰려면 추가로 fallback 프로필 2개를 한 번 만들어야 한다**
 (`feature_engine`이 만든 병합 테이블/생활인구 테이블이 먼저 S3에 있어야 함):
 
@@ -59,7 +64,7 @@ predict_rental_demand(
 #     'population_source': 'provided', 'stockout_source': 'provided'}
 ```
 
-`minute`은 `GRID_TICK_MINUTES`(기본 20)의 배수만 유효하다 — 정시로만 고정하면
+`minute`은 운영 계약인 `GRID_TICK_MINUTES=5`의 배수만 유효하다 — 정시로만 고정하면
 그 사이 tick을 요청할 수 없다. `horizon`(1~`HORIZON_COUNT`, 기본 12)은
 "몇 시간 뒤를 물을지"를 그대로 모델 feature로 넘긴다(아래 "여러 horizon
 한 번에" 참고) — `predict_return_demand()`는 시그니처가 같지만 `stockout`이

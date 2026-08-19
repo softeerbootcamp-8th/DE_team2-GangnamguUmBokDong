@@ -64,6 +64,7 @@ config.py`의 `safety_cutoff_date()`, `monitor_performance.py`의 "완결된 달
     EMR:  spark-submit --deploy-mode cluster feature_engine/run_pipeline.py
 """
 
+import os
 from datetime import datetime, timedelta
 
 from core import s3 as s3_io
@@ -71,7 +72,7 @@ from pyspark.sql import functions as F
 
 from . import config
 from .build_features import build_features
-from .build_merged_table import build_merged_table
+from .build_merged_table import _weather_context_start, build_merged_table
 from .build_rolling_rental_features import build_rolling_rental_features
 from .build_targets import build_targets
 from .silver_source import (
@@ -85,6 +86,7 @@ from .watermark import read_watermark, write_watermark
 
 
 def _current_params() -> dict:
+    """현재 feature parameter 조합을 watermark 기록 형식으로 반환한다."""
     return {
         "window_minutes": config.ROLLING_WINDOW_MINUTES,
         "embargo_minutes": config.ROLLING_EMBARGO_MINUTES,
@@ -92,52 +94,108 @@ def _current_params() -> dict:
     }
 
 
-def _refresh_primary_tables(spark, since: str | None = None) -> None:
+def _window_timestamp_bounds() -> tuple[str, str]:
+    """inclusive 날짜 window를 Spark용 `[since, until)` timestamp 경계로 바꾼다."""
+    since = config.WINDOW_START.strftime("%Y-%m-%d 00:00:00")
+    until = (config.WINDOW_END + timedelta(days=1)).strftime("%Y-%m-%d 00:00:00")
+    return since, until
+
+
+def _target_complete_through(until: str) -> str:
+    """source upper bound 안에서 전체 target horizon이 완결되는 마지막 tick을 반환한다."""
+    return (
+        datetime.fromisoformat(until)
+        - timedelta(minutes=config.TARGET_HORIZON_MINUTES)
+    ).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _explicit_window_requested() -> bool:
+    """최초학습 등 명시적 고정 window 환경변수가 설정됐는지 반환한다."""
+    return "TRAIN_WINDOW_START" in os.environ and "TRAIN_WINDOW_END" in os.environ
+
+
+def _refresh_primary_tables(
+    spark,
+    since: str | None = None,
+    until: str | None = None,
+) -> None:
     """Silver로부터 station_master/targets/station_status/weather/population을 통째로
     다시 만들어 `build_merged_table.py`가 읽는 경로(`config.STATION_MASTER_PARQUET` 등)에
     저장한다.
 
-    이 5개는 전체 빌드든 증분 빌드든 항상 **`since`부터 지금까지 전체 재계산**한다 —
+    이 5개는 전체 빌드든 증분 빌드든 항상 **target `since`부터 `until` 직전까지
+    필요한 범위를 전체 재계산**한다. 단, weather는 첫 target tick도 inference와
+    같은 as-of fallback을 할 수 있도록 `since` 이전 최대 3시간 source context를
+    중간 산출물에 함께 둔다 —
     station_status(연 22M행 규모)/weather(연 8,760행)/population/targets는 EMR Spark
     풀 리빌드로 감당 못 할 크기가 아니고, 예전처럼 "이미 어딘가에 존재하는 1차 정제
     산출물"이 아니라 이제 이 패키지가 직접 Silver에서 만들어내므로 부분 갱신 로직을
     따로 둘 이유가 없다. 증분 실행에서 실제로 아끼는 부분은 그 뒤 단계(대여이력
     lag/rolling 재계산, `build_rolling_rental_features`/`build_merged_table`의 `since`)다.
 
-    **2026-08부터 `since`가 필수에 가까워짐** — `silver_source._silver_glob()`이
+    **2026-08부터 `since`/`until`이 필수에 가까워짐** — `silver_source._silver_glob()`이
     더 이상 연도로 안 좁히므로(고정 TRAIN_YEAR 폐지, 롤링 윈도우로 전환), `since`
     없이 부르면 Silver에 쌓인 전체 히스토리를 매번 다시 계산하게 된다. 호출부
-    (`_run_full_build()`/`_run_incremental()`)는 항상 `config.WINDOW_START`를
-    넘긴다 — station_master는 시간 축이 없는 참조 테이블이라 `since` 필터 대상이
-    아니다.
+    (`_run_full_build()`/`_run_incremental()`)는 항상 `config.WINDOW_START`와
+    `WINDOW_END + 1일 00:00`을 넘긴다. 둘을 생략해 직접 호출해도 같은 config 경계를
+    기본으로 쓴다. station_master는 과거 enriched snapshot이 있다는 보장이 없는
+    serving용 current dimension이라 시간 필터 대상이 아니며 항상 최신을 쓴다.
     """
-    read_station_master(spark).write.mode("overwrite").parquet(config.STATION_MASTER_PARQUET)
-    read_station_status(spark, since=since).write.mode("overwrite").parquet(config.STATION_STATUS_PARQUET)
-    read_weather(spark, since=since).write.mode("overwrite").parquet(config.WEATHER_PARQUET)
-    read_population(spark, since=since).write.mode("overwrite").parquet(config.POPULATION_PARQUET)
+    window_since, window_until = _window_timestamp_bounds()
+    since = since or window_since
+    until = until or window_until
 
-    rental_targets, return_targets = build_targets(spark, since=since)
+    read_station_master(spark).write.mode("overwrite").parquet(config.STATION_MASTER_PARQUET)
+    read_station_status(spark, since=since, until=until).write.mode("overwrite").parquet(
+        config.STATION_STATUS_PARQUET
+    )
+    # 최종 target window의 첫 tick도 inference와 동일하게 직전 최대 3시간 관측을
+    # fallback할 수 있도록 weather 중간 산출물에만 앞쪽 context를 보존한다.
+    read_weather(
+        spark,
+        since=_weather_context_start(since),
+        until=until,
+    ).write.mode("overwrite").parquet(config.WEATHER_PARQUET)
+    read_population(spark, since=since, until=until).write.mode("overwrite").parquet(
+        config.POPULATION_PARQUET
+    )
+
+    rental_targets, return_targets = build_targets(spark, since=since, until=until)
     rental_targets.write.mode("overwrite").parquet(config.TARGETS_PARQUET)
     return_targets.write.mode("overwrite").parquet(config.RETURN_TARGETS_PARQUET)
 
 
 def _run_full_build(spark) -> None:
-    """워터마크가 없을 때 — Silver 전체로 1차 정제부터 처음부터 만든다."""
-    window_since = config.WINDOW_START.strftime("%Y-%m-%d 00:00:00")
+    """워터마크가 없거나 명시적 window일 때 해당 구간을 처음부터 만든다."""
+    window_since, window_until = _window_timestamp_bounds()
     print(
-        f"[{config.PARAM_COMBO_ID}] 워터마크 없음 -> Silver에서 {window_since}~{config.WINDOW_END} "
-        "구간으로 처음부터 생성"
+        f"[{config.PARAM_COMBO_ID}] 전체 overwrite -> Silver에서 "
+        f"{window_since}~{config.WINDOW_END} 구간으로 처음부터 생성"
     )
 
-    _refresh_primary_tables(spark, since=window_since)
+    _refresh_primary_tables(spark, since=window_since, until=window_until)
 
-    build_rolling_rental_features(spark, output_path=config.ROLLING_RENTAL_FEATURES_PARQUET)
+    rolling_context_since = (
+        datetime.fromisoformat(window_since)
+        - timedelta(minutes=config.ROLLING_WINDOW_MINUTES + config.ROLLING_EMBARGO_MINUTES)
+    ).strftime("%Y-%m-%d %H:%M:%S")
+    build_rolling_rental_features(
+        spark,
+        output_path=config.ROLLING_RENTAL_FEATURES_PARQUET,
+        since=rolling_context_since,
+        until=window_until,
+    )
 
-    merged = build_merged_table(spark)
+    merged = build_merged_table(spark, since=window_since, until=window_until)
     merged.write.mode("overwrite").parquet(config.MERGED_TABLE_PARQUET)
 
     merged_reloaded = spark.read.parquet(config.MERGED_TABLE_PARQUET)
     features_df = build_features(spark, merged_reloaded)
+    target_complete_through = _target_complete_through(window_until)
+    features_df = features_df.filter(
+        (F.col("hour_ts") >= F.lit(window_since))
+        & (F.col("hour_ts") <= F.lit(target_complete_through))
+    )
     # 증분 실행이 date 파티션 단위 overwrite로 과거 구간을 사후 보정하므로(아래
     # _run_incremental 참고), 전체 빌드도 처음부터 같은 파티션 레이아웃으로 써야 한다.
     features_df.write.mode("overwrite").partitionBy("date").parquet(config.FEATURES_TABLE_PARQUET)
@@ -235,21 +293,34 @@ def _run_incremental(spark, watermark: dict) -> None:
     # 아니라 학습기간 롤링 윈도우 시작점(config.WINDOW_START)을 쓴다 — station_status/
     # weather/population/targets는 그 자체가 학습에 쓰이는 전체 구간을 커버해야 하고,
     # 증분 워터마크보다 훨씬 이전 데이터도 필요하기 때문이다.
-    window_since = config.WINDOW_START.strftime("%Y-%m-%d 00:00:00")
-    _refresh_primary_tables(spark, since=window_since)
+    window_since, window_until = _window_timestamp_bounds()
+    _refresh_primary_tables(spark, since=window_since, until=window_until)
 
     # rolling_rental_features는 매번 챔피언 경로에 영구 저장하지 않는다 — lookback
     # 구간(기본 35일)만 있으면 항상 다시 계산할 수 있을 만큼 가벼워서(창 폭이 최대
     # 90분), 매 증분마다 저장소를 늘리기보다 build_features가 읽을 임시 parquet으로만
     # 써둔다.
     rolling_tmp_path = f"{config.OUTPUT_ROOT}/_rolling_incremental_tmp.parquet"
-    build_rolling_rental_features(spark, output_path=rolling_tmp_path, since=read_since_str)
+    build_rolling_rental_features(
+        spark,
+        output_path=rolling_tmp_path,
+        since=read_since_str,
+        until=window_until,
+    )
 
-    merged_increment = build_merged_table(spark, since=read_since_str)
+    merged_increment = build_merged_table(
+        spark,
+        since=read_since_str,
+        until=window_until,
+    )
     features_increment = build_features(spark, merged_increment, rolling_parquet_path=rolling_tmp_path)
     # lag/rolling 계산용으로만 더 읽은 read_since_dt~since_dt 구간은 실제 overwrite
     # 대상이 아니다(위 주석 참고) — since_dt 이후만 남긴다.
-    features_increment = features_increment.filter(F.col("hour_ts") >= F.lit(since_str))
+    target_complete_through = _target_complete_through(window_until)
+    features_increment = features_increment.filter(
+        (F.col("hour_ts") >= F.lit(since_str))
+        & (F.col("hour_ts") <= F.lit(target_complete_through))
+    )
 
     if features_increment.limit(1).count() == 0:
         print(f"[{config.PARAM_COMBO_ID}] 재계산 구간({since_str}~)에 데이터 없음 — 건너뜀")
@@ -273,7 +344,10 @@ def main() -> None:
     """피처마트 파이프라인을 실행한다 (워터마크 유무에 따라 전체 빌드 또는 증분 실행)."""
     spark = get_spark()
     watermark = read_watermark(config.WATERMARK_PATH)
-    if watermark is None:
+    # 명시적 window는 같은 profile output에 과거 rolling 실행의 바깥 파티션이 남아
+    # 있을 수 있다. incremental dynamic overwrite로는 이번 DataFrame에 없는 미래
+    # 파티션을 지울 수 없으므로, watermark 존재 여부와 무관하게 전체 overwrite한다.
+    if watermark is None or _explicit_window_requested():
         _run_full_build(spark)
     else:
         _run_incremental(spark, watermark)

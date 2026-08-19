@@ -1,10 +1,11 @@
 """5분 핵심 파이프라인 DAG의 구성과 의존성을 검증한다."""
 
 from datetime import timedelta
+from itertools import pairwise
 
 from airflow.providers.standard.operators.bash import BashOperator
+from airflow.task.trigger_rule import TriggerRule
 from airflow.timetables.trigger import CronTriggerTimetable
-
 from config.schedules import EXECUTION_TIMEOUT_OVERRIDES, REALTIME_5MIN_CRON, TIMEZONE
 from config.sources import REALTIME_5MIN_SOURCES, RENTAL_HISTORY_LOOKBACK_HOURS
 from dags.realtime_5min import dag
@@ -64,6 +65,10 @@ def test_normalizer_strict_then_fallback():
     assert "--baseline-date-mode latest" in fallback.bash_command
     assert "--baseline-date-mode strict" in strict.bash_command
 
+    normalized = dag.get_task("population_normalized")
+    assert normalized.upstream_task_ids == {"run_normalizer_strict", "run_normalizer_fallback"}
+    assert normalized.trigger_rule == TriggerRule.ONE_SUCCESS
+
 
 def test_inference_waits_for_realtime_bikes_and_normalized_population():
     """날씨는 별도 DAG의 최신 Silver를 읽고, 이 DAG의 실시간 입력은 직접 기다린다."""
@@ -77,6 +82,7 @@ def test_inference_waits_for_realtime_bikes_and_normalized_population():
     }
     assert "collect_population_realtime" not in upstream_ids
     assert "collect_weather_ultra_short_live" not in dag.task_ids
+    assert run_inference.trigger_rule == TriggerRule.ALL_SUCCESS
 
 
 def test_inference_then_load_forecast_points():
@@ -194,7 +200,7 @@ def test_replay_runs_sequentially_to_cap_api_concurrency():
     병렬로 받는다(bike_rental_history.yaml: 4). 동시에 띄우면 같은 API에 대한 동시
     요청이 배수로 늘어나므로 사슬로 묶어 4로 고정한다."""
     chain = [dag.get_task("collect_bike_rental_history"), *_replay_tasks()]
-    for upstream, downstream in zip(chain, chain[1:]):
+    for upstream, downstream in pairwise(chain):
         assert downstream.task_id in {t.task_id for t in upstream.downstream_list}
 
 

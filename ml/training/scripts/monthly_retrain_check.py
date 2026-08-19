@@ -25,9 +25,12 @@
 — "성능이 나빠졌으니 최신 데이터로 다시 학습해보자"가 먼저지, 하이퍼파라미터
 자체를 바꾸는 건 별개 문제이기 때문이다. 그래도 못 넘으면 미리 등록해둔 다른
 프로필(S3 `profiles/*.json` — `ml_core.common_config.list_profile_names()`가 나열,
-`ml_core.profile_registry.push_profile()`로 생성)을 이름순으로 순차 시도하고,
-가진 프로필을 전부 써도 못 넘으면 챔피언을 그대로 두고 다음 달을 기약한다(정상
-종료 — 예외를 던지지 않는다).
+`ml_core.profile_registry.push_profile()`로 생성)을 이름순으로 순차 시도한다.
+단, 자동 승격은 현재 서빙과 같은 피처 계약 안에서 LightGBM/학습 기간만 튜닝하는
+경우에 한한다. rolling/window/horizon처럼 피처 의미가 다른 후보는 무거운 Spark·
+학습을 시작하기 전에 건너뛴다. 그런 계약 변경은 feature 생성·두 모델·inference를
+함께 전환하는 별도 배포가 필요하다. 호환 후보를 전부 써도 못 넘으면 챔피언을
+그대로 두고 다음 달을 기약한다(정상 종료 — 예외를 던지지 않는다).
 
 **프로필마다 별도 프로세스가 필요한 이유**: `ml_core.common_config`는 프로세스가
 시작할 때 `ML_PROFILE` 환경변수로 프로필 값을 한 번만 읽어 모듈 전역 상수로
@@ -58,6 +61,11 @@ from ml_core.paths import (
     model_json_key,
     read_champion_prefix,
 )
+from ml_core.serving_contract import (
+    SERVING_FEATURE_PROFILE_KEYS,
+    ServingProfileContractError,
+    assert_serving_profiles_compatible,
+)
 
 from ..config import unique_archive_date
 from ..monitor_performance import _load_baseline_metrics, check_all_models
@@ -66,12 +74,33 @@ from ..promotion import promote_challenger, should_promote
 SPARK_PYTHON = ML_ROOT / "feature_engine" / ".venv" / "bin" / "python"
 
 _TRAIN_SCRIPTS = {"rental": "training.train_rental_model", "return": "training.train_return_model"}
+_EXPLICIT_TRAIN_WINDOW_ENV = ("TRAIN_WINDOW_START", "TRAIN_WINDOW_END")
 
 
 def _notify(message: str) -> None:
     """학습/승격 진행 상황을 알린다 — 지금은 표준 출력뿐이지만, 나중에 실제
     알림 채널(Slack 등)이 생기면 이 함수만 바꾸면 된다."""
     print(f"[monthly_retrain] {message}", flush=True)
+
+
+def _monthly_subprocess_env(profile_name: str, env_overrides: dict[str, str]) -> dict[str, str]:
+    """월별 재학습용 rolling window 환경을 만든다.
+
+    최초 2025년 챔피언 생성 때 사용한 명시적 `TRAIN_WINDOW_START/END`가 상위
+    셸이나 장기 실행 스케줄러에 남아 있어도 월별 자식 프로세스가 상속하면 안 된다.
+    두 값을 제거해 `common_config.training_window()`의 최신 rolling 경로를 강제하고,
+    나머지 프로필 및 시도별 override는 그대로 전달한다.
+    """
+    env = dict(os.environ)
+    for name in _EXPLICIT_TRAIN_WINDOW_ENV:
+        env.pop(name, None)
+    rolling_overrides = {
+        name: value
+        for name, value in env_overrides.items()
+        if name not in _EXPLICIT_TRAIN_WINDOW_ENV
+    }
+    env.update({"ML_PROFILE": profile_name, **rolling_overrides})
+    return env
 
 
 def _print_report(results: list[dict]) -> None:
@@ -126,19 +155,30 @@ def _candidate_profiles(model_name: str) -> list[tuple[str, dict[str, str]]]:
     이미 `TRAIN_LOOKBACK_MONTHS` 환경변수를 프로필 값 위에 override할 수 있게
     지원하므로(`_int_env()`), 프로필 자체를 새로 만들어 S3에 올릴 필요 없이
     이 환경변수 하나만 얹으면 된다.
-    **2차 이후**: 그래도 챔피언을 못 넘으면, 미리 등록해둔 다른 프로필(임베고/
-    앵커 조합이 다른 것들, `ml_core.profile_registry.push_profile()`로 생성)을
-    이름순으로 순차 시도한다 — 이쪽은 프로필에 저장된 기간 값을 그대로 쓴다.
+    **2차 이후**: 그래도 챔피언을 못 넘으면, 미리 등록해둔 다른 프로필
+    (`ml_core.profile_registry.push_profile()`로 생성)을 이름순으로 검토한다.
+    현재 서빙 계약과 같은 후보(LGB/학습 전용 설정 차이)만 실제로 실행하고,
+    임베고/앵커처럼 피처 의미가 다른 후보는 `_validate_candidate_serving_contract()`가
+    무거운 작업 전에 건너뛴다. 이쪽은 프로필에 저장된 기간 값을 그대로 쓴다.
 
     S3 `profiles/` 목록이 비어 있거나 조회에 실패해도(`list_profile_names()`가
-    `[]` 반환) 1차 시도는 항상 존재한다 — 목록 여부와 무관하게 챔피언(또는 기본)
-    프로필 하나는 무조건 후보에 들어가야, 재학습이 시도 0번으로 조용히 끝나는
-    일이 없다.
+    `[]` 반환) 1차 시도와 내장 `builtin-default`는 항상 존재한다. 기존 챔피언이
+    원격 프로필이면 그 조건으로 최신 데이터 재학습을 먼저 시도한 뒤, 새 코드의
+    안전한 5분 내장 기본값도 후보로 검토해야 한다(현재 서빙 계약과 다르면 preflight에서
+    건너뜀). 이름이 겹치면 한 번만 남긴다.
     """
     primary = _champion_profile_name(model_name) or common_config.PROFILE_NAME
-    others = sorted(n for n in common_config.list_profile_names() if n != primary)
+    ordered_names = [
+        primary,
+        common_config.BUILTIN_PROFILE_NAME,
+        *sorted(common_config.list_profile_names()),
+    ]
+    unique_names = list(dict.fromkeys(ordered_names))
     refreshed_period = {"TRAIN_LOOKBACK_MONTHS": str(common_config.TRAIN_LOOKBACK_MONTHS)}
-    return [(primary, refreshed_period), *[(name, {}) for name in others]]
+    return [
+        (name, refreshed_period if index == 0 else {})
+        for index, name in enumerate(unique_names)
+    ]
 
 
 def _trigger_feature_pipeline(profile_name: str, env_overrides: dict[str, str]) -> None:
@@ -162,7 +202,7 @@ def _trigger_feature_pipeline(profile_name: str, env_overrides: dict[str, str]) 
     """
     if not SPARK_PYTHON.exists():
         raise RuntimeError(f"{SPARK_PYTHON}가 없습니다 — feature_engine/에서 'uv sync'를 먼저 실행해야 합니다")
-    env = {**os.environ, "ML_PROFILE": profile_name, **env_overrides}
+    env = _monthly_subprocess_env(profile_name, env_overrides)
     _notify(f"'{profile_name}' 프로필로 feature_engine.spark.run_pipeline 실행 중...")
     subprocess.run([str(SPARK_PYTHON), "-m", "feature_engine.spark.run_pipeline"], cwd=ML_ROOT, check=True, env=env)
     _notify(f"'{profile_name}' 프로필로 feature_engine.spark.build_multi_horizon_features 실행 중...")
@@ -171,6 +211,39 @@ def _trigger_feature_pipeline(profile_name: str, env_overrides: dict[str, str]) 
         cwd=ML_ROOT,
         check=True,
         env=env,
+    )
+
+
+def _validate_candidate_serving_contract(profile_name: str, env_overrides: dict[str, str]) -> None:
+    """후보 프로필이 현재 서빙 계약과 같은지 무거운 작업 전에 검증한다.
+
+    feature/training subprocess는 현재 환경을 상속한 뒤 ``env_overrides``를 마지막에
+    덮는다. 여기서도 같은 우선순위를 적용해야 preflight와 실제 학습 프로필이
+    어긋나지 않는다. 서빙 계약 키는 모두 분 단위 또는 개수 정수다.
+
+    raises:
+        ServingProfileContractError: 후보를 읽거나 해석할 수 없거나 현재 서빙
+            피처 계약과 다를 때
+    """
+    try:
+        candidate_profile = common_config._load_profile(profile_name)
+        subprocess_env = _monthly_subprocess_env(profile_name, env_overrides)
+        for key in SERVING_FEATURE_PROFILE_KEYS:
+            raw_value = subprocess_env.get(key)
+            if raw_value is not None:
+                candidate_profile[key] = int(raw_value)
+    # 한 후보의 S3/파싱 실패는 다음 후보로 격리하되 KeyboardInterrupt/SystemExit은
+    # Exception 바깥이라 정상적으로 전파한다.
+    except Exception as exc:
+        raise ServingProfileContractError(
+            f"후보 프로필 '{profile_name}'을 서빙 계약으로 해석할 수 없습니다: {exc}"
+        ) from exc
+
+    assert_serving_profiles_compatible(
+        common_config.effective_profile(),
+        candidate_profile,
+        expected_source="현재 서빙",
+        actual_source=f"후보 프로필 '{profile_name}'",
     )
 
 
@@ -203,7 +276,8 @@ def _run_training_subprocess(
         subprocess.CalledProcessError: 학습 자체가 실패했을 때
         RuntimeError: 학습은 성공했다고 나왔는데 metrics.json을 못 찾았을 때(버그 신호)
     """
-    env = {**os.environ, "ML_PROFILE": profile_name, "MODEL_ARCHIVE_DATE": archive_date, **env_overrides}
+    env = _monthly_subprocess_env(profile_name, env_overrides)
+    env["MODEL_ARCHIVE_DATE"] = archive_date
     _notify(f"[{model_name}] '{profile_name}' 프로필로 학습 중...")
     subprocess.run([sys.executable, "-m", _TRAIN_SCRIPTS[model_name]], cwd=ML_ROOT, check=True, env=env)
 
@@ -236,6 +310,14 @@ def _attempt_promotion(model_name: str, champion_metrics: dict | None) -> bool:
     archive_date = unique_archive_date()
     for profile_name, env_overrides in _candidate_profiles(model_name):
         try:
+            _validate_candidate_serving_contract(profile_name, env_overrides)
+        except ServingProfileContractError as exc:
+            _notify(
+                f"[{model_name}] '{profile_name}' 후보 건너뜀(현재 서빙 계약과 불일치: {exc}) "
+                "— feature 생성/학습을 시작하지 않음"
+            )
+            continue
+        try:
             _trigger_feature_pipeline(profile_name, env_overrides)
             challenger_metrics = _run_training_subprocess(model_name, profile_name, archive_date, env_overrides)
         except subprocess.CalledProcessError as exc:
@@ -248,7 +330,14 @@ def _attempt_promotion(model_name: str, champion_metrics: dict | None) -> bool:
 
         if promote:
             archive_prefix = archive_models_prefix(archive_date, profile_name)
-            promote_challenger(model_name, archive_prefix)
+            try:
+                promote_challenger(model_name, archive_prefix)
+            except ServingProfileContractError as exc:
+                _notify(
+                    f"[{model_name}] '{profile_name}' 챌린저 승격 거부(서빙 계약 불일치: {exc}) "
+                    "— 다음 프로필로 넘어감"
+                )
+                continue
             _notify(f"[{model_name}] '{profile_name}' 챌린저를 챔피언으로 승격 — 포인터가 {archive_prefix}를 가리키도록 전환")
             return True
 

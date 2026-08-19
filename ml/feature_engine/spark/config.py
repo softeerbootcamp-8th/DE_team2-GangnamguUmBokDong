@@ -30,13 +30,14 @@ import os
 
 from ml_core import common_config
 
-# --- 학습기간 롤링 윈도우 (Silver glob/공휴일 계산 범위 — silver_source.py,
-# build_merged_table.py) — 2026-08부터 고정 TRAIN_YEAR 대신 "오늘 기준 최근
-# TRAIN_LOOKBACK_MONTHS개월"로 매번 다시 계산한다(common_config.training_window()).
+# --- 학습기간 윈도우 (Silver glob/공휴일 계산 범위 — silver_source.py,
+# build_merged_table.py) — 최초 과거 학습은 TRAIN_WINDOW_START/END 쌍으로 정확한
+# 구간을 지정하고, 미지정 시 "오늘 기준 최근 TRAIN_LOOKBACK_MONTHS개월"로 매번
+# 다시 계산한다(common_config.training_window()).
 # 매달 재학습 전에 feature_engine이 먼저 다시 도는데, 고정 연도면 다음 해로
 # 넘어갈 때마다 코드/환경변수를 수동으로 바꿔야 했다 — 이제 프로필의
-# TRAIN_LOOKBACK_MONTHS/TRAINING_SAFETY_MARGIN_DAYS 값만 바뀌면(재배포 없이,
-# S3 프로필 갱신만으로) 다음 실행부터 반영된다.
+# rolling 경로에서는 TRAIN_LOOKBACK_MONTHS/TRAINING_SAFETY_MARGIN_DAYS 값만
+# 바뀌면(재배포 없이, S3 프로필 갱신만으로) 다음 실행부터 반영된다.
 WINDOW_START, WINDOW_END = common_config.training_window()
 
 # ml_core.s3_io가 boto3 쪽에서 쓰는 것과 같은 환경변수 — 기본값은 dev/MinIO의

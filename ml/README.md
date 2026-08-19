@@ -1,7 +1,7 @@
 # 따릉이 수요예측 — LightGBM 대여/반납 파이프라인
 
 collector가 S3(MinIO) Silver 레이어에 쌓은 원본(대여이력, 정류소, 날씨, 250m
-생활인구)을 station×20분tick 단위로 병합하고, lag feature를 붙여 대여/반납을
+생활인구)을 station×5분 tick 단위로 병합하고, lag feature를 붙여 대여/반납을
 완전히 분리된 LightGBM 모델(Poisson+exposure, quantile P10/50/90)로
 학습·추론하는 파이프라인.
 
@@ -14,7 +14,7 @@ collector가 S3(MinIO) Silver 레이어에 쌓은 원본(대여이력, 정류소
 | 폴더 | 역할 | 실행 환경 |
 |---|---|---|
 | **[../libs/ml_core/](../libs/ml_core/README.md)** | 세 인스턴스가 공유하는 파라미터·경로·핵심 알고리즘(censoring 로직, 모델 계약, 채점 함수). `ml/`과 별도로 관리되는 독립 라이브러리(`<repo-root>/libs/ml_core/`) — 아래 세 폴더가 각자 editable 의존성으로 참조 | 어디든(가벼운 순수 로직) |
-| **[feature_engine/](feature_engine/README.md)** | station×20분tick feature 테이블 생성(Spark, EMR/로컬 `local[*]` 단일 노드), Silver를 직접 읽어 대여/반납 multi-horizon 테이블 2개를 만든다 — **본 서비스 코드는 `spark/`뿐**(옛 pandas 1차/2차정제는 전부 삭제됨) | `feature_engine/.venv`(uv, Python 3.11)/EMR |
+| **[feature_engine/](feature_engine/README.md)** | station×5분 tick feature 테이블 생성(Spark, EMR/로컬 `local[*]` 단일 노드), Silver를 직접 읽어 대여/반납 multi-horizon 테이블 2개를 만든다 — **본 서비스 코드는 `spark/`뿐**(옛 pandas 1차/2차정제는 전부 삭제됨) | `feature_engine/.venv`(uv, Python 3.11)/EMR |
 | **[training/](training/README.md)** | feature 테이블로 LightGBM 대여/반납 모델 학습, 챔피언 승격, 성능 모니터링 — [MLflow](../docs/ml/MLFLOW_SETUP.md)로 실험 추적 | `training/.venv`(uv) |
 | **[inference/](inference/README.md)** | 학습된 모델로 배치 조회 + 단일/다중 시점 예측 | `inference/.venv`(uv) |
 | **data/** | 로컬 개발용 샘플 원본(`dev/seed_s3_from_local.py`가 이걸 Silver 스키마로 MinIO에 시딩) — 실제 원본은 collector가 S3 Silver에 직접 쌓는다, 로컬 파일시스템 폴백 없음 | — |

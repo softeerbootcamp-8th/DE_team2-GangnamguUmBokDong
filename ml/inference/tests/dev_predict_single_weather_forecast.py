@@ -12,6 +12,7 @@ lookback_hours) 넘게 미래면 그 구간에 관측 데이터가 원천적으�
 테스트에서 검증).
 """
 
+import numpy as np
 import pandas as pd
 
 from inference import predict_single as ps
@@ -63,12 +64,18 @@ def test_falls_back_to_observation_when_forecast_missing(monkeypatch):
     날씨" 재사용)로 폴백한다 — 조용히 저하되지만 크래시하지 않는다."""
     anchor_ts = pd.Timestamp("2026-08-17 10:00:00")
     target_ts = anchor_ts + pd.Timedelta(hours=5)
+    observation_timestamps = []
     monkeypatch.setattr(ps, "_get_forecast_weather", lambda target_ts, **kw: None)
-    monkeypatch.setattr(ps, "_get_recent_weather", lambda target_ts, **kw: {"temp": 21.0, "precip": 0.0})
+    monkeypatch.setattr(
+        ps,
+        "_get_recent_weather",
+        lambda observed_ts, **kw: observation_timestamps.append(observed_ts) or {"temp": 21.0, "precip": 0.0},
+    )
 
     temp, precip = ps._resolve_live_weather(target_ts, anchor_ts, None, None)
 
     assert (temp, precip) == (21.0, 0.0)
+    assert observation_timestamps == [anchor_ts]
 
 
 def test_explicit_values_skip_both_lookups(monkeypatch):
@@ -113,6 +120,26 @@ def test_get_forecast_weather_picks_nearest_row_from_latest_issue_file(monkeypat
     assert result == {"temp": 24.0, "precip": 1.5}
 
 
+def test_get_forecast_weather_averages_all_valid_grids_at_nearest_time(monkeypatch):
+    """가장 가까운 예보 시각의 유효 격자를 전부 평균하고 깨진 격자는 제외한다."""
+    target_ts = pd.Timestamp("2026-08-17 15:05:00")
+
+    def _fake_read_many(keys, columns=None):
+        latest = pd.concat([
+            _forecast_row("20260817", "1500", 20.0, "강수없음"),
+            _forecast_row("20260817", "1500", 24.0, "2.0mm"),
+            _forecast_row("20260817", "1500", 999.0, "1.0mm"),
+            _forecast_row("20260817", "1800", 10.0, "100.0mm"),
+        ])
+        return [None] * (len(keys) - 1) + [latest]
+
+    monkeypatch.setattr(ps.s3_io, "read_parquet_many", _fake_read_many)
+
+    result = ps._get_forecast_weather(target_ts)
+
+    assert result == {"temp": 22.0, "precip": 1.0}
+
+
 def test_get_forecast_weather_returns_none_when_no_files_found(monkeypatch):
     target_ts = pd.Timestamp("2026-08-17 15:00:00")
     monkeypatch.setattr(ps.s3_io, "read_parquet_many", lambda keys, columns=None: [None] * len(keys))
@@ -130,3 +157,67 @@ def test_get_forecast_weather_returns_none_when_precip_unparseable(monkeypatch):
     monkeypatch.setattr(ps.s3_io, "read_parquet_many", _fake_read_many)
 
     assert ps._get_forecast_weather(target_ts) is None
+
+
+def test_get_forecast_weather_coerces_broken_timestamp_and_uses_valid_row(monkeypatch):
+    """깨진 예보 시각 한 행 때문에 파일 전체 조회가 실패하지 않아야 한다."""
+    target_ts = pd.Timestamp("2026-08-17 15:00:00")
+
+    def _fake_read_many(keys, columns=None):
+        latest = pd.concat([
+            _forecast_row("broken", "time", 99.0, "강수없음"),
+            _forecast_row("20260817", "1500", 24.0, "1.5mm"),
+        ])
+        return [None] * (len(keys) - 1) + [latest]
+
+    monkeypatch.setattr(ps.s3_io, "read_parquet_many", _fake_read_many)
+
+    assert ps._get_forecast_weather(target_ts) == {"temp": 24.0, "precip": 1.5}
+
+
+def test_get_forecast_weather_rejects_row_too_far_from_target(monkeypatch):
+    """가까운 시각이 없는 발표본을 엉뚱한 target의 예보로 사용하지 않는다."""
+    target_ts = pd.Timestamp("2026-08-17 15:00:00")
+
+    def _fake_read_many(keys, columns=None):
+        distant = _forecast_row("20260817", "1800", 22.0, "강수없음")
+        return [None] * (len(keys) - 1) + [distant]
+
+    monkeypatch.setattr(ps.s3_io, "read_parquet_many", _fake_read_many)
+
+    assert ps._get_forecast_weather(target_ts) is None
+
+
+def _observed_row(temp, precip) -> pd.DataFrame:
+    """실황 Silver 원본 컬럼으로 관측 한 행을 만든다."""
+    return pd.DataFrame([{"T1H": temp, "RN1": precip}])
+
+
+def test_get_recent_weather_skips_invalid_latest_tick(monkeypatch):
+    """최신 tick이 NaN이면 그대로 반환하지 않고 이전의 유효한 관측으로 돌아간다."""
+    target_ts = pd.Timestamp("2026-08-17 15:00:00")
+
+    def _fake_read_many(keys, columns=None):
+        values = [None] * len(keys)
+        values[-2] = _observed_row(23.0, 0.5)
+        values[-1] = _observed_row(np.nan, "broken")
+        return values
+
+    monkeypatch.setattr(ps.s3_io, "read_parquet_many", _fake_read_many)
+
+    assert ps._get_recent_weather(target_ts) == {"temp": 23.0, "precip": 0.5}
+
+
+def test_get_recent_weather_skips_out_of_range_latest_tick(monkeypatch):
+    """Collector 계약 범위를 벗어난 최신 관측도 이전 정상 tick으로 대체한다."""
+    target_ts = pd.Timestamp("2026-08-17 15:00:00")
+
+    def _fake_read_many(keys, columns=None):
+        values = [None] * len(keys)
+        values[-2] = _observed_row(23.0, 0.5)
+        values[-1] = _observed_row(999.0, -1.0)
+        return values
+
+    monkeypatch.setattr(ps.s3_io, "read_parquet_many", _fake_read_many)
+
+    assert ps._get_recent_weather(target_ts) == {"temp": 23.0, "precip": 0.5}

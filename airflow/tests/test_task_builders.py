@@ -62,6 +62,15 @@ def test_inference_task_cwd_is_ml_not_ml_inference(dag):
     assert ".replace(" in task.bash_command
 
 
+def test_inference_task_requires_all_direct_inputs_to_succeed(dag):
+    """normalizer 분기는 DAG 합류점이 처리하므로 추론 자체는 필수 입력 전체를 기다린다."""
+    from airflow.task.trigger_rule import TriggerRule
+
+    task = build_inference_task(dag)
+
+    assert task.trigger_rule == TriggerRule.ALL_SUCCESS
+
+
 def test_urgency_task_cwd_and_flags(dag):
     """rebalance는 loader/nowcaster처럼 flat 레이아웃이라 -m 실행이 필요 없다 —
     ml/inference와 달리 uv --project가 아니라 uv run --frozen을 쓴다."""
@@ -123,7 +132,6 @@ def test_replay_template_renders_to_a_whole_hour_earlier():
 
     import jinja2
     from airflow.sdk.execution_time import macros
-
     from orchestration.templates import KST_WINDOW_START, kst_window_start_shifted
 
     kst = timezone(timedelta(hours=9))
@@ -187,7 +195,6 @@ def test_daily_replay_templates_render_d_minus_six_boundaries():
 
 def test_replay_collector_task_contract(dag):
     from airflow.task.trigger_rule import TriggerRule
-
     from orchestration.collector_task import build_collector_replay_task
 
     task = build_collector_replay_task(dag, "bike_rental_history", 1)

@@ -20,10 +20,11 @@ horizon=1이면 anchor_ts==target_ts라 원본 테이블의 해당 행과 완전
 반납 쪽을 시작한다 — 이 self-join 자체가 원본의 최대 HORIZON_COUNT배 행 수로
 불어나므로(아래 "규모" 참고), 두 개를 동시에 메모리에 띄우지 않기 위함이다.
 
-**`date`를 target_ts 쪽에서 가져오는 이유**: `training/train_common._split()`이 `date`로
-train/valid/test 경계를 가른다. 라벨(타겟 이벤트)이 실제로 언제 일어났는지를 기준으로 잘라야
-walk-forward 검증이 안전하다 — anchor_ts 기준으로 자르면 horizon이 큰 행의 라벨이 다음
-split으로 새는 누출이 생긴다.
+**`date`를 target_ts 쪽에서 가져오는 이유**: `training/train_common._dates_for_split()`이
+`date`로 train/valid/test 경계를 가른다. 라벨(타겟 이벤트)이 실제로 언제 일어났는지를
+기준으로 나누고, 같은 anchor가 target 날짜 경계를 넘어 두 split에 들어가는 문제는
+training의 `SPLIT_EMBARGO_DAYS` purge로 막는다. anchor_ts 날짜만으로 자르면 horizon이
+큰 행의 라벨이 다음 split으로 새는 더 직접적인 누출이 생긴다.
 
 **station 활성 구간 밖 처리**: target_ts에 해당하는 행이 그리드에 없으면(station 비활성
 구간이거나, 아직 관측되지 않은 미래라 증분 파이프라인이 그 시점까지 못 만들었을 때) inner
@@ -39,6 +40,8 @@ EMR 대상이다(로컬 검증은 짧은 기간의 합성 데이터로만).
 """
 
 from __future__ import annotations
+
+from datetime import datetime, timedelta
 
 from ml_core import common_config
 from pyspark.sql import DataFrame, SparkSession
@@ -59,7 +62,7 @@ _COMMON_TARGET_COLUMNS = [
     *(c for c in common_config.BASE_FEATURE_COLUMNS if c != "horizon"),
     "hour_ts",  # self-join 키(target_ts) — _shift_for_horizon()이 소모하고 버림
     "hour",  # 더 이상 모델 feature 아님(minute이 대체) — scoring.predict() 출력/CLI 식별용
-    "date",  # train_common._split()의 train/valid/test 경계 판정용 — 모델 feature 아님
+    "date",  # train_common._dates_for_split()의 train/valid/test 경계 판정용 — 모델 feature 아님
 ]
 
 # station_id(텍스트)는 이 테이블에 아예 안 담는다 — horizon self-join으로 원본의
@@ -183,11 +186,31 @@ def _anchor_input(features: DataFrame) -> DataFrame | None:
     return anchor_input
 
 
+def _features_in_training_window(features: DataFrame) -> DataFrame:
+    """tick feature를 config의 inclusive 날짜 window 안으로 제한한다.
+
+    `run_pipeline`이 같은 경계를 적용하지만, 과거 rolling 실행의 파티션이나 수동
+    생성 파일이 입력 경로에 남아 있어도 최종 multi-horizon 학습 테이블에 섞이지
+    않게 소비 지점에서 한 번 더 방어한다.
+    """
+    since = config.WINDOW_START.strftime("%Y-%m-%d 00:00:00")
+    complete_through = (
+        datetime.combine(config.WINDOW_END + timedelta(days=1), datetime.min.time())
+        - timedelta(minutes=config.TARGET_HORIZON_MINUTES)
+    ).strftime("%Y-%m-%d %H:%M:%S")
+    return features.filter(
+        (F.col("hour_ts") >= F.lit(since))
+        & (F.col("hour_ts") <= F.lit(complete_through))
+    )
+
+
 def _run_cli() -> None:
     from .spark_session import get_spark
 
     spark = get_spark()
-    features = spark.read.parquet(config.FEATURES_TABLE_PARQUET)
+    features = _features_in_training_window(
+        spark.read.parquet(config.FEATURES_TABLE_PARQUET)
+    )
     anchor_input = _anchor_input(features)
 
     # 대여를 끝까지 만들어 S3에 쓰고 나서 반납을 시작한다 — 두 self-join 결과
