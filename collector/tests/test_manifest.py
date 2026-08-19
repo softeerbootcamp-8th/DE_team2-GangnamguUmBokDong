@@ -24,6 +24,8 @@ from manifest import (
     save_retry_marker,
 )
 
+pytestmark = pytest.mark.usefixtures("_bucket")
+
 KST = ZoneInfo("Asia/Seoul")
 WINDOW_START = datetime(2026, 8, 12, 14, 10, tzinfo=KST)
 WINDOW_END = datetime(2026, 8, 12, 14, 15, tzinfo=KST)

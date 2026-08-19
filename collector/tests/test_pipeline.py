@@ -17,6 +17,8 @@ from config.schema import Backfill, Policies, Quality, Schedule, SourceConfig
 from config.schema import Storage as StorageConfig
 from manifest import FailureReason, RunStatus, Stage
 
+pytestmark = pytest.mark.usefixtures("_bucket")
+
 KST = ZoneInfo("Asia/Seoul")
 WINDOW_START = datetime(2026, 8, 12, 14, 10, tzinfo=KST)
 
