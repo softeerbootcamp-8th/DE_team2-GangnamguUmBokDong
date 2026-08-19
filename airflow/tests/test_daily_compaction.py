@@ -1,11 +1,11 @@
 """일 배치 compaction DAG와 태스크 빌더를 검증한다."""
 
 from airflow.timetables.trigger import CronTriggerTimetable
-
 from config.schedules import COMPACTION_CRON
-from config.sources import COMPACTION_SOURCES
+from config.sources import COMPACTION_SOURCES, DAILY_ARCHIVE_DELAY_DAYS
 from dags.daily_compaction import dag
 from orchestration.compaction_task import COLLECTOR_DIR, build_compaction_task
+from orchestration.templates import kst_date_days_ago
 
 
 class TestCompactionTask:
@@ -21,6 +21,15 @@ class TestCompactionTask:
 
         assert "--date" not in task.bash_command
         assert "--from" not in task.bash_command
+
+    def test_passes_explicit_delayed_date(self, dag):
+        target_date = kst_date_days_ago(DAILY_ARCHIVE_DELAY_DAYS)
+        task = build_compaction_task(
+            dag, "bike_rental_history", target_date=target_date
+        )
+
+        assert "--date" in task.bash_command
+        assert "macros.timedelta(days=6)" in task.bash_command
 
     def test_no_virtual_env_leak(self, dag):
         task = build_compaction_task(dag, "bike_station_realtime")
@@ -49,13 +58,40 @@ class TestDag:
         assert dag.max_active_runs == 1
 
     def test_runs_after_the_daily_collectors(self):
-        """수집이 도는 03:00보다 뒤여야 전날치가 온전히 모인다."""
+        """일별 API 부하가 낮은 04:30에 D-6 확정 배치를 실행한다."""
         assert COMPACTION_CRON == "30 4 * * *"
 
-    def test_one_task_per_source(self):
-        assert set(dag.task_ids) == {f"compact_{source}" for source in COMPACTION_SOURCES}
+    def test_replays_all_24_rental_hours(self):
+        replay_ids = {
+            f"replay_bike_rental_history_{hour:02d}h" for hour in range(24)
+        }
+        assert replay_ids <= set(dag.task_ids)
 
-    def test_tasks_are_independent(self):
-        """한 소스의 압축 실패가 다른 소스를 막지 않아야 한다."""
-        for task_id in dag.task_ids:
-            assert dag.get_task(task_id).upstream_list == []
+        for hour in range(24):
+            task = dag.get_task(f"replay_bike_rental_history_{hour:02d}h")
+            assert "--source bike_rental_history" in task.bash_command
+            assert "--force" in task.bash_command
+            assert "macros.timedelta(days=6)" in task.bash_command
+
+    def test_replay_tasks_are_sequential(self):
+        for hour in range(23):
+            current = dag.get_task(f"replay_bike_rental_history_{hour:02d}h")
+            following = dag.get_task(
+                f"replay_bike_rental_history_{hour + 1:02d}h"
+            )
+            assert following.task_id in current.downstream_task_ids
+
+    def test_compacts_only_d_minus_six(self):
+        for source in COMPACTION_SOURCES:
+            task = dag.get_task(f"compact_{source}")
+            assert "--date" in task.bash_command
+            assert "macros.timedelta(days=6)" in task.bash_command
+
+    def test_compaction_waits_for_all_replays(self):
+        last_replay = "replay_bike_rental_history_23h"
+        for source in COMPACTION_SOURCES:
+            task = dag.get_task(f"compact_{source}")
+            assert task.upstream_task_ids == {last_replay}
+
+    def test_expected_task_count(self):
+        assert len(dag.task_ids) == 24 + len(COMPACTION_SOURCES)

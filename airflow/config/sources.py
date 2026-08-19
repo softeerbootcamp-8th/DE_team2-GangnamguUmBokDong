@@ -46,3 +46,6 @@ NORMALIZER_BASELINE_MODE_FALLBACK = "latest"
 # 1로 시작한다. 요청 2배로 누락의 88%를 잡는다. 부족하면 2로 올린다 — 이 상수만
 # 바꾸면 태스크가 따라 늘어난다.
 RENTAL_HISTORY_LOOKBACK_HOURS = 1
+
+# 일별 archive를 확정하기 전에 대여이력을 전체 재조회할 지연 일수.
+DAILY_ARCHIVE_DELAY_DAYS = 6

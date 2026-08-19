@@ -8,13 +8,16 @@
 from __future__ import annotations
 
 from config.schedules import COMPACTION_EXECUTION_TIMEOUT
+
 from orchestration.task_builder import REPO_ROOT, build_module_task
 
 COLLECTOR_DIR = str(REPO_ROOT / "collector")
 
 
-def build_compaction_task(dag, source_id: str):
-    cmd = f"uv run --frozen python compact.py --source {source_id}"
+def build_compaction_task(dag, source_id: str, *, target_date: str | None = None):
+    """소스의 기본 범위 또는 지정 날짜를 압축하는 태스크를 만든다."""
+    date_arg = f" --date {target_date}" if target_date else ""
+    cmd = f"uv run --frozen python compact.py --source {source_id}{date_arg}"
     return build_module_task(
         dag,
         f"compact_{source_id}",

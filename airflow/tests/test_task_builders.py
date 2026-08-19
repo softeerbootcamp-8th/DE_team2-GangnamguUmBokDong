@@ -135,11 +135,40 @@ def test_replay_template_renders_to_a_whole_hour_earlier():
 
 def test_replay_template_rejects_non_positive_hours():
     import pytest
-
     from orchestration.templates import kst_window_start_shifted
 
     with pytest.raises(ValueError):
         kst_window_start_shifted(0)
+
+
+def test_daily_replay_templates_render_d_minus_six_boundaries():
+    """D-6의 00시와 23시 API 구간 끝 시각을 정확히 렌더링한다."""
+    from datetime import datetime, timedelta, timezone
+
+    import jinja2
+    from airflow.sdk.execution_time import macros
+    from orchestration.templates import (
+        kst_date_days_ago,
+        kst_day_hour_replay_days_ago,
+    )
+
+    kst = timezone(timedelta(hours=9))
+    context = {
+        "dag_run": type("R", (), {
+            "logical_date": datetime(2026, 8, 19, 4, 30, tzinfo=kst),
+            "start_date": None,
+        })(),
+        "macros": macros,
+    }
+    env = jinja2.Environment()
+
+    target_date = env.from_string(kst_date_days_ago(6)).render(context)
+    first_end = env.from_string(kst_day_hour_replay_days_ago(6, 0)).render(context)
+    last_end = env.from_string(kst_day_hour_replay_days_ago(6, 23)).render(context)
+
+    assert target_date == "2026-08-13"
+    assert datetime.fromisoformat(first_end) == datetime(2026, 8, 13, 0, 55, tzinfo=kst)
+    assert datetime.fromisoformat(last_end) == datetime(2026, 8, 13, 23, 55, tzinfo=kst)
 
 
 def test_replay_collector_task_contract(dag):
@@ -153,3 +182,16 @@ def test_replay_collector_task_contract(dag):
     assert "--source bike_rental_history" in task.bash_command
     assert "--force" in task.bash_command
     assert task.trigger_rule == TriggerRule.ALL_DONE
+
+
+def test_daily_history_replay_task_contract(dag):
+    """D-6 시간대 끝 시각을 사용해 대여이력 전체를 강제 재수집한다."""
+    from orchestration.collector_task import build_daily_history_replay_task
+
+    task = build_daily_history_replay_task(dag, 23, 6)
+
+    assert task.task_id == "replay_bike_rental_history_23h"
+    assert "--source bike_rental_history" in task.bash_command
+    assert "--force" in task.bash_command
+    assert "macros.timedelta(days=6)" in task.bash_command
+    assert "hour=23, minute=55" in task.bash_command
