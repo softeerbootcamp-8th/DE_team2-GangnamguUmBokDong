@@ -17,8 +17,15 @@
 (`models/champion/{model_name}.json`)가 그 아카이브 prefix를 가리키도록 원자적으로
 전환한다 — 파일을 복사하지 않는다(승격 도중 파일이 부분적으로만 바뀌어 서로 다른
 버전이 섞이는 문제를 피하기 위함, `ml_core.paths.read_champion_prefix()` docstring
-참고). 만족 못 하면 다른 프로필(S3 `profiles/*.json` — `ml_core.common_config.
-list_profile_names()`가 나열, `ml_core.profile_registry.push_profile()`로 생성)로 다시 시도하고,
+참고).
+
+**재시도 순서(`_candidate_profiles()`)**: 1차는 챔피언이 실제로 학습됐던 프로필의
+하이퍼파라미터(임베고/앵커/LGB 파라미터 등)를 그대로 쓰되 학습기간만 지금의
+기본 롤링 윈도우(`TRAIN_LOOKBACK_MONTHS`, 최신 증분 포함)로 갱신해서 재시도한다
+— "성능이 나빠졌으니 최신 데이터로 다시 학습해보자"가 먼저지, 하이퍼파라미터
+자체를 바꾸는 건 별개 문제이기 때문이다. 그래도 못 넘으면 미리 등록해둔 다른
+프로필(S3 `profiles/*.json` — `ml_core.common_config.list_profile_names()`가 나열,
+`ml_core.profile_registry.push_profile()`로 생성)을 이름순으로 순차 시도하고,
 가진 프로필을 전부 써도 못 넘으면 챔피언을 그대로 두고 다음 달을 기약한다(정상
 종료 — 예외를 던지지 않는다).
 
@@ -45,7 +52,12 @@ import sys
 
 from core import s3 as s3_io
 from ml_core import common_config
-from ml_core.paths import ML_ROOT, archive_models_prefix, model_json_key
+from ml_core.paths import (
+    ML_ROOT,
+    archive_models_prefix,
+    model_json_key,
+    read_champion_prefix,
+)
 
 from ..config import today_kst
 from ..monitor_performance import _load_baseline_metrics, check_all_models
@@ -79,15 +91,57 @@ def _print_report(results: list[dict]) -> None:
             print(f"    - {reason}")
 
 
-def _candidate_profiles() -> list[str]:
-    """시도할 프로필 순서 — 기본 프로필을 가장 먼저, 나머지는 이름순."""
-    names = common_config.list_profile_names()
-    if common_config.PROFILE_NAME in names:
-        names = [common_config.PROFILE_NAME] + [n for n in names if n != common_config.PROFILE_NAME]
-    return names
+def _champion_profile_name(model_name: str) -> str | None:
+    """지금 챔피언이 실제로 학습될 때 쓴 프로필 이름 — 그 프로필의 하이퍼파라미터
+    (임베고/앵커/LGB 파라미터 등)를 재학습 1차 시도에서 그대로 재사용하기 위함
+    (`_candidate_profiles()` 참고). `train_common.train_target()`이 학습 시점에
+    저장해두는 `{model_name}_profile.json`(`profile_name` 필드 포함)에서 읽는다.
+
+    챔피언이 아직 없거나(최초 학습 전) 그 기록을 못 찾으면 None — 호출부가
+    `common_config.PROFILE_NAME`(이 프로세스의 기본 프로필)으로 대체한다.
+    """
+    try:
+        archive_prefix = read_champion_prefix(model_name)
+    except FileNotFoundError:
+        return None
+    payload = s3_io.read_json(model_json_key(model_name, "profile", archive_prefix))
+    if payload is None:
+        print(
+            f"[monthly_retrain] ERROR: [{model_name}] 챔피언 프로필 기록을 못 찾음({archive_prefix}) "
+            "— 현재 프로세스 기본 프로필로 대체",
+            file=sys.stderr,
+        )
+        return None
+    return payload["profile_name"]
 
 
-def _trigger_feature_pipeline(profile_name: str) -> None:
+def _candidate_profiles(model_name: str) -> list[tuple[str, dict[str, str]]]:
+    """시도할 (프로필 이름, 이 시도에만 덮어쓸 환경변수) 순서.
+
+    **1차**: 챔피언이 실제로 학습됐던 프로필을 그대로 쓰되(임베고/앵커/LGB
+    파라미터 등은 안 건드림), 학습기간만 지금 프로세스의 기본 롤링 윈도우
+    (`TRAIN_LOOKBACK_MONTHS`, 최신 증분 포함)로 갱신해서 재시도한다 — "성능이
+    나빠졌으니 일단 최신 데이터로 다시 학습해보자"가 첫 시도여야지, 하이퍼파라미터
+    자체를 바꾸는 건 별개 문제라 여기서 같이 안 한다. `common_config.py`가
+    이미 `TRAIN_LOOKBACK_MONTHS` 환경변수를 프로필 값 위에 override할 수 있게
+    지원하므로(`_int_env()`), 프로필 자체를 새로 만들어 S3에 올릴 필요 없이
+    이 환경변수 하나만 얹으면 된다.
+    **2차 이후**: 그래도 챔피언을 못 넘으면, 미리 등록해둔 다른 프로필(임베고/
+    앵커 조합이 다른 것들, `ml_core.profile_registry.push_profile()`로 생성)을
+    이름순으로 순차 시도한다 — 이쪽은 프로필에 저장된 기간 값을 그대로 쓴다.
+
+    S3 `profiles/` 목록이 비어 있거나 조회에 실패해도(`list_profile_names()`가
+    `[]` 반환) 1차 시도는 항상 존재한다 — 목록 여부와 무관하게 챔피언(또는 기본)
+    프로필 하나는 무조건 후보에 들어가야, 재학습이 시도 0번으로 조용히 끝나는
+    일이 없다.
+    """
+    primary = _champion_profile_name(model_name) or common_config.PROFILE_NAME
+    others = sorted(n for n in common_config.list_profile_names() if n != primary)
+    refreshed_period = {"TRAIN_LOOKBACK_MONTHS": str(common_config.TRAIN_LOOKBACK_MONTHS)}
+    return [(primary, refreshed_period), *[(name, {}) for name in others]]
+
+
+def _trigger_feature_pipeline(profile_name: str, env_overrides: dict[str, str]) -> None:
     """feature_engine/spark의 증분 파이프라인 + multi-horizon 테이블 생성을 지정한
     프로필로 Spark 전용 venv(Python 3.11)에서 실행한다.
 
@@ -100,10 +154,15 @@ def _trigger_feature_pipeline(profile_name: str) -> None:
     않아 매번 전체를 다시 만든다(feature_engine/spark/build_multi_horizon_features.py
     docstring 참고) — multi-horizon 테이블이 원본의 최대 HORIZON_COUNT배라 이 단계가
     가장 오래 걸리는 부분이 될 수 있다.
+
+    args:
+        env_overrides: `ML_PROFILE=profile_name` 위에 이 시도에서만 덮어쓸 환경변수
+            (`_candidate_profiles()` 참고 — 챔피언 프로필 재시도에서 학습기간만
+            갱신할 때 씀. 빈 dict면 프로필 값 그대로).
     """
     if not SPARK_PYTHON.exists():
         raise RuntimeError(f"{SPARK_PYTHON}가 없습니다 — feature_engine/에서 'uv sync'를 먼저 실행해야 합니다")
-    env = {**os.environ, "ML_PROFILE": profile_name}
+    env = {**os.environ, "ML_PROFILE": profile_name, **env_overrides}
     _notify(f"'{profile_name}' 프로필로 feature_engine.spark.run_pipeline 실행 중...")
     subprocess.run([str(SPARK_PYTHON), "-m", "feature_engine.spark.run_pipeline"], cwd=ML_ROOT, check=True, env=env)
     _notify(f"'{profile_name}' 프로필로 feature_engine.spark.build_multi_horizon_features 실행 중...")
@@ -115,7 +174,9 @@ def _trigger_feature_pipeline(profile_name: str) -> None:
     )
 
 
-def _run_training_subprocess(model_name: str, profile_name: str, archive_date: str) -> dict:
+def _run_training_subprocess(
+    model_name: str, profile_name: str, archive_date: str, env_overrides: dict[str, str]
+) -> dict:
     """`model_name`을 지정한 프로필로 학습하는 subprocess를 띄우고, 그 결과로
     아카이브에 쓰인 metrics를 다시 읽어 반환한다.
 
@@ -131,13 +192,15 @@ def _run_training_subprocess(model_name: str, profile_name: str, archive_date: s
         archive_date: "YYYY-MM-DD" — 이 시도 전체(feature 파이프라인 포함)가 공유하는
             날짜. 자정을 넘겨 실행되더라도 아카이브 경로가 어긋나지 않게 오케스트레이터가
             한 번만 계산해서 넘긴다.
+        env_overrides: `_trigger_feature_pipeline()` 참고 — 같은 시도 안에서 feature
+            파이프라인과 반드시 같은 값을 써야 학습기간이 어긋나지 않는다.
     returns:
         dict: train_target()이 저장한 metrics.json
     raises:
         subprocess.CalledProcessError: 학습 자체가 실패했을 때
         RuntimeError: 학습은 성공했다고 나왔는데 metrics.json을 못 찾았을 때(버그 신호)
     """
-    env = {**os.environ, "ML_PROFILE": profile_name, "MODEL_ARCHIVE_DATE": archive_date}
+    env = {**os.environ, "ML_PROFILE": profile_name, "MODEL_ARCHIVE_DATE": archive_date, **env_overrides}
     _notify(f"[{model_name}] '{profile_name}' 프로필로 학습 중...")
     subprocess.run([sys.executable, "-m", _TRAIN_SCRIPTS[model_name]], cwd=ML_ROOT, check=True, env=env)
 
@@ -159,10 +222,10 @@ def _attempt_promotion(model_name: str, champion_metrics: dict | None) -> bool:
         bool: 승격이 일어났는지
     """
     archive_date = today_kst().isoformat()
-    for profile_name in _candidate_profiles():
+    for profile_name, env_overrides in _candidate_profiles(model_name):
         try:
-            _trigger_feature_pipeline(profile_name)
-            challenger_metrics = _run_training_subprocess(model_name, profile_name, archive_date)
+            _trigger_feature_pipeline(profile_name, env_overrides)
+            challenger_metrics = _run_training_subprocess(model_name, profile_name, archive_date, env_overrides)
         except subprocess.CalledProcessError as exc:
             _notify(f"[{model_name}] '{profile_name}' 시도 실패(subprocess 오류: {exc}) — 다음 프로필로 넘어감")
             continue

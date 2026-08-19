@@ -35,6 +35,7 @@ pandas/pyarrow를 무조건 import한다 — 이 파일은 위에서 말한 "pan
 
 import json
 import os
+import sys
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -68,7 +69,7 @@ _DEFAULT_PROFILE = {
     "COVERAGE_DRIFT_THRESHOLD": 0.15,
     "MONITOR_LOOKBACK_MONTHS": 1,
     # --- 2026-08 추가: 학습기간 롤링 윈도우 (TRAIN_YEAR 고정값 폐지) ---
-    "TRAIN_LOOKBACK_MONTHS": 18,
+    "TRAIN_LOOKBACK_MONTHS": 12,
     "TRAINING_SAFETY_MARGIN_DAYS": 7,
 }
 
@@ -108,10 +109,10 @@ def _load_profile() -> dict:
     try:
         profile = _fetch_profile_from_s3(name)
     except Exception as exc:  # noqa: BLE001 — S3 조회 실패 사유와 무관하게 무조건 폴백
-        print(f"[common_config] S3에서 프로필 '{name}' 조회 실패({exc}) — 내장 기본값 사용")
+        print(f"[common_config] ERROR: S3에서 프로필 '{name}' 조회 실패({exc}) — 내장 기본값 사용", file=sys.stderr)
         return _DEFAULT_PROFILE
     if profile is None:
-        print(f"[common_config] S3에 프로필 '{name}' 없음(profiles/{name}.json) — 내장 기본값 사용")
+        print(f"[common_config] ERROR: S3에 프로필 '{name}' 없음(profiles/{name}.json) — 내장 기본값 사용", file=sys.stderr)
         return _DEFAULT_PROFILE
     print(f"[common_config] 프로필 '{name}'을 S3에서 읽음")
     return profile

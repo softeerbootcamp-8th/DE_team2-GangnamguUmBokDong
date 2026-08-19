@@ -134,7 +134,7 @@ def synthetic_environment(spark, tmp_path, monkeypatch):
     # 예전엔 TRAIN_YEAR=2025로 Silver glob 자체를 연도로 좁혔다 — 지금은 glob이 연도와
     # 무관하고(_silver_glob() 참고) 대신 _refresh_primary_tables()에 넘기는 since(=
     # config.WINDOW_START)로 좁힌다. 실제 "오늘" 기준으로 계산되는 WINDOW_START(기본
-    # 18개월 전)는 이 fixture의 테스트 데이터(2025-01-01~약 01-26)보다 나중일 수 있어
+    # 12개월 전)는 이 fixture의 테스트 데이터(2025-01-01~약 01-26)보다 나중일 수 있어
     # 그대로 두면 _run_incremental() 내부의 _refresh_primary_tables() 호출이 테스트
     # 데이터를 전부 걸러낸다 — 데이터 범위를 확실히 덮는 고정 윈도우로 monkeypatch.
     monkeypatch.setattr(fe_config, "WINDOW_START", date(2025, 1, 1))
