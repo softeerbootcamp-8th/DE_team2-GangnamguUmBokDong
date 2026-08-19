@@ -48,13 +48,14 @@ rows = [
     {"sta_id": "102", "observed_at": "2026-08-16 14:05:00", "parking_bike_tot_cnt": 8},
 ]
 
-# (sta_id, observed_at) 복합키 충돌 시 parking_bike_tot_cnt 갱신
+# sta_id 충돌 시 더 최신 관측의 시각과 재고를 함께 갱신
 upsert(
     conn=conn,
     table="station_stock",
     rows=rows,
-    conflict_cols=["sta_id", "observed_at"],
-    update_cols=["parking_bike_tot_cnt"],
+    conflict_cols=["sta_id"],
+    update_cols=["observed_at", "parking_bike_tot_cnt"],
+    guard_col="observed_at",
 )
 ```
 
