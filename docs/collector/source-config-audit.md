@@ -596,7 +596,9 @@ raw에 오는데 선언되지 않아 버려진다. 일 최저·최고기온은 "
 연령대 비율 8개(`PPLTN_RATE_0`~`70`)와 `RESNT_PPLTN_RATE`/`NON_RESNT_PPLTN_RATE`도
 필요 여부를 판단해야 한다.
 
-`FCST_PPLTN`(12개 중첩 배열)은 현재 엔진 타입으로 표현 불가 — 별도 설계가 필요하다.
+`FCST_PPLTN`(12개 중첩 배열)은 **해소됐다**: 어댑터의 `_flatten_forecast()`가 `FCST_TIME`
+오름차순으로 `FCST_1_*`~`FCST_12_*` 슬롯 컬럼으로 펼치고, yaml이 그 49개를 optional로
+선언한다. `normalizer`가 향후 12시간 인구 보정에 쓴다.
 
 ### 5-7. `bike_station_master`의 좌표 `range` 누락 🟠
 

@@ -475,3 +475,83 @@ class TestTopLevelResultCode:
         results = list(SeoulOpenApiAdapter.fetch(_config(page_size=2), window=None, client=client))
 
         assert results[0].error is FetchErrorKind.FATAL
+
+
+class TestForecastFlatten:
+    """citydata_ppltn의 `FCST_PPLTN` 중첩 배열이 슬롯 컬럼으로 펼쳐지는지 확인한다."""
+
+    @staticmethod
+    def _config():
+        return _StubConfig(
+            {"service": "citydata_ppltn", "page_size": 1000, "root_key": "SeoulRtd.citydata_ppltn"}
+        )
+
+    @staticmethod
+    def _chunk(row: dict) -> bytes:
+        return json.dumps({"SeoulRtd.citydata_ppltn": [row]}).encode()
+
+    @staticmethod
+    def _forecast(hour: int, pop: int) -> dict:
+        return {
+            "FCST_TIME": f"2026-08-19 {hour:02d}:00",
+            "FCST_CONGEST_LVL": "여유",
+            "FCST_PPLTN_MIN": str(pop),
+            "FCST_PPLTN_MAX": str(pop + 500),
+        }
+
+    def test_twelve_slots_become_flat_columns(self):
+        row = {"AREA_CD": "POI001", "FCST_YN": "Y",
+               "FCST_PPLTN": [self._forecast(10 + i, 1000 * i) for i in range(12)]}
+        rows = SeoulOpenApiAdapter.normalize([self._chunk(row)], self._config())
+
+        assert len(rows) == 1
+        assert rows[0]["FCST_1_TIME"] == "2026-08-19 10:00"
+        assert rows[0]["FCST_1_PPLTN_MIN"] == "0"
+        assert rows[0]["FCST_12_TIME"] == "2026-08-19 21:00"
+        assert rows[0]["FCST_12_PPLTN_MAX"] == "11500"
+        assert rows[0]["FCST_12_CONGEST_LVL"] == "여유"
+
+    def test_nested_key_is_removed_so_parquet_only_sees_scalars(self):
+        row = {"AREA_CD": "POI001", "FCST_PPLTN": [self._forecast(10, 100)]}
+        rows = SeoulOpenApiAdapter.normalize([self._chunk(row)], self._config())
+
+        assert "FCST_PPLTN" not in rows[0]
+        assert all(not isinstance(v, (list, dict)) for v in rows[0].values())
+
+    def test_slots_are_numbered_by_time_not_response_order(self):
+        row = {"AREA_CD": "POI001",
+               "FCST_PPLTN": [self._forecast(15, 300), self._forecast(13, 100), self._forecast(14, 200)]}
+        rows = SeoulOpenApiAdapter.normalize([self._chunk(row)], self._config())
+
+        assert rows[0]["FCST_1_TIME"] == "2026-08-19 13:00"
+        assert rows[0]["FCST_2_TIME"] == "2026-08-19 14:00"
+        assert rows[0]["FCST_3_TIME"] == "2026-08-19 15:00"
+
+    def test_short_array_leaves_remaining_slots_absent(self):
+        row = {"AREA_CD": "POI001", "FCST_PPLTN": [self._forecast(10 + i, 100) for i in range(5)]}
+        rows = SeoulOpenApiAdapter.normalize([self._chunk(row)], self._config())
+
+        assert rows[0]["FCST_5_TIME"] == "2026-08-19 14:00"
+        assert not [k for k in rows[0] if k.startswith(("FCST_6_", "FCST_7_", "FCST_12_"))]
+
+    def test_missing_forecast_array_keeps_other_columns(self):
+        row = {"AREA_CD": "POI001", "FCST_YN": "N", "AREA_PPLTN_MIN": "100"}
+        rows = SeoulOpenApiAdapter.normalize([self._chunk(row)], self._config())
+
+        assert rows[0] == {"AREA_CD": "POI001", "FCST_YN": "N", "AREA_PPLTN_MIN": "100"}
+
+    def test_entries_without_time_are_dropped(self):
+        row = {"AREA_CD": "POI001",
+               "FCST_PPLTN": [{"FCST_PPLTN_MIN": "100"}, self._forecast(11, 200)]}
+        rows = SeoulOpenApiAdapter.normalize([self._chunk(row)], self._config())
+
+        assert rows[0]["FCST_1_TIME"] == "2026-08-19 11:00"
+        assert "FCST_2_TIME" not in rows[0]
+
+    def test_other_sources_are_untouched(self):
+        config = _StubConfig({"service": "bikeList", "page_size": 1000, "root_key": "rentBikeStatus.row"})
+        chunk = json.dumps({"rentBikeStatus": {"row": [{"stationId": "ST-1", "FCST_PPLTN": [{"x": 1}]}]}}).encode()
+
+        rows = SeoulOpenApiAdapter.normalize([chunk], config)
+
+        assert rows[0]["FCST_PPLTN"] == [{"x": 1}]
