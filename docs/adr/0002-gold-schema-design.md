@@ -65,7 +65,7 @@ station_urgency로 "어디가 급한지"는 알아도 "트럭이 몇 대를 옮�
 `rebalance_routes`(route_id PK, region, status, proposed_at/dispatched_at/completed_at)와 `rebalance_route_stops`(route_id+visit_order PK, sta_id, action, bike_cnt) 두 테이블을 추가한다(004_rebalance_routes.sh). `rebalance/routes.py`가 매 사이클 `proposed` 라우트를 새로 만들어 loader가 insert하고, 상태 전이(dispatched/completed)는 운영자가 대시보드에서 조작(#110)하므로 두 테이블 다 `update_cols=[]`(DO NOTHING)로 적재한다 — 배치 재실행이 운영자가 바꿔놓은 status를 덮어쓰면 안 되기 때문이다.
 
 ## 결과
-`rebalance_routes`/`rebalance_route_stops`는 station_stock/forecast_points/station_urgency와 달리 배치가 "덮어쓰는" 게 아니라 "계속 쌓이면서 상태만 바뀌는" 테이블이라, 지금까지의 두 패턴(이력 누적, 최신 1건 upsert)과는 다른 세 번째 패턴이다. 오래된 완료/취소 라우트를 언제까지 남겨둘지(보존 기간)는 아직 정하지 않았다 — 트래픽이 쌓이면 그때 정리 정책을 추가한다. 같은 수요에 대해 매 배치 새 `proposed` 라우트가 계속 쌓이는 것을 막기 위해, 순수요 계산 시 `dispatched`뿐 아니라 `proposed` 상태 라우트도 이미 커버된 수요로 넷팅한다.
+`rebalance_routes`/`rebalance_route_stops`는 station_stock/forecast_points/station_urgency와 달리 배치가 "덮어쓰는" 게 아니라 "계속 쌓이면서 상태만 바뀌는" 테이블이라, 지금까지의 두 패턴(이력 누적, 최신 1건 upsert)과는 다른 세 번째 패턴이다. 오래된 완료/취소 라우트를 언제까지 남겨둘지(보존 기간)는 아직 정하지 않았다 — 트래픽이 쌓이면 그때 정리 정책을 추가한다.
 
 ---
 
@@ -84,3 +84,18 @@ station_urgency로 "어디가 급한지"는 알아도 "트럭이 몇 대를 옮�
 
 ## 결과
 `station_urgency`의 row 수가 대여소 수만큼 고정되고 무한 증가하지 않는다. `station_urgency`를 읽는 소비자가 늘어나면(예: 재배치 라우트 배치) 그쪽도 동일한 신선도 조건을 직접 챙겨야 한다 — 테이블 자체가 강제해주지는 않는다.
+
+---
+
+# 아무도 안 건드린 proposed 라우트는 다음 배치가 지운다
+
+## 배경
+`route_id`를 매 사이클 새 UUID로 발급하는 건(운영자가 바꿔놓은 status를 배치 재실행이 덮어쓰지 않기 위함) 의도한 대로 동작하지만, 부작용이 있다 — `_dispatched_qty()`가 `dispatched` 상태만 순수요 계산에서 빼기 때문에, 아직 아무도 안 건드린 `proposed` 라우트는 다음 사이클에서도 그대로 다시 계산 대상에 들어가 거의 같은 내용의 라우트가 또 생긴다. 한 권역의 픽업 수요만 트럭 용량(20대)을 넘어도 사이클 하나에서 여러 라우트가 나오므로(`routes.py`의 `while` 분할), 바쁜 시간대엔 5분마다 수십 개씩 새로 생기고 예전 것은 그대로 남아 하루 수천 건 단위로 쌓일 수 있다.
+
+5분마다 재계산하는 것 자체는 맞다 — 재고·예측이 계속 바뀌므로 최신 정보로 다시 만든 라우트가 더 정확하다. 문제는 "재계산"이 아니라 "예전 미처리 제안을 안 지우고 쌓아두는 것"이다.
+
+## 결정
+`loader`가 `rebalance_routes`를 적재하기 직전에, 아직 `proposed`인(=아무도 안 건드린) 라우트와 그 스톱을 지우고 나서 이번 사이클의 새 라우트를 넣는다(`loader/main.py:_retire_stale_proposed_routes`). `dispatched`/`completed`로 이미 넘어간 라우트는 운영자가 실제로 처리한 기록이므로 건드리지 않는다. `cancelled`로 상태만 바꿔서 남기는 대신 완전히 삭제하는 이유는, 아무도 안 건드린 제안은 "무슨 일이 일어났다"는 기록 자체가 없고(사람이 아무 조작도 안 함), `rebalance/routes_main.py`가 매 사이클 결과를 이미 S3(`routes/`, `route_stops/`)에 영구 저장해두므로 RDS에서 지워도 "그때 뭘 제안했었는지"라는 정보를 잃지 않기 때문이다 — station_urgency(#124)와 같은 논리다.
+
+## 결과
+`proposed` 상태 row는 항상 권역 수(11개) 이하로 유지된다. `dispatched`/`completed`는 여전히 계속 쌓이지만, 실제 트럭 운행 건수만큼만 늘어나 사이클마다 늘어나는 것보다 훨씬 느리다 — 오래된 `completed`/`cancelled`(향후 운영자가 명시적으로 취소하는 경우)를 언제까지 남길지는 위에서 이미 미뤄둔 질문 그대로 남아있다.
