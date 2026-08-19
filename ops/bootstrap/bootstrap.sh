@@ -14,14 +14,17 @@ source .env
 set +a
 
 echo "[bootstrap] postgres / minio / airflow를 기동합니다 (최초 실행 시 이미지 빌드로 시간이 걸릴 수 있습니다)..."
-docker compose --env-file .env -f ops/compose/docker-compose.yml up -d --build
+make up
 
 cat <<EOF
 
-[bootstrap] 완료. apps/api, apps/web, collector, ml/*는 그대로 uv run / npm run으로 로컬 실행하면 됩니다.
+[bootstrap] 완료. #129 Gold PostGIS baseline 확인을 통과했습니다.
+[bootstrap] collector와 ml/*는 각 프로젝트에서 uv run으로 로컬 실행하면 됩니다.
 
   - Postgres       : localhost:${POSTGRES_PORT:-5432}  (db: ${POSTGRES_APP_DB:-app})
   - MinIO 콘솔     : http://localhost:${MINIO_CONSOLE_PORT:-9001}  (${MINIO_ROOT_USER:-minioadmin} / ${MINIO_ROOT_PASSWORD:-minioadmin})
   - Airflow 웹서버 : http://localhost:${AIRFLOW_WEBSERVER_PORT:-8080}  (${AIRFLOW_ADMIN_USER:-admin} / ${AIRFLOW_ADMIN_PASSWORD:-admin})
+  - API            : http://localhost:${API_PORT:-8000}
+  - Web            : http://localhost:${WEB_PORT:-5173}
 
 EOF
