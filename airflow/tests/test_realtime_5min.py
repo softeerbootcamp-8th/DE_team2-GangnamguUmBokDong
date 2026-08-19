@@ -4,6 +4,7 @@ from datetime import timedelta
 
 from airflow.providers.standard.operators.bash import BashOperator
 from airflow.timetables.trigger import CronTriggerTimetable
+
 from config.schedules import EXECUTION_TIMEOUT_OVERRIDES, REALTIME_5MIN_CRON, TIMEZONE
 from config.sources import REALTIME_5MIN_SOURCES, RENTAL_HISTORY_LOOKBACK_HOURS
 from dags.realtime_5min import dag
@@ -28,6 +29,9 @@ def test_expected_tasks_exist():
         "load_forecast_points",
         "compute_urgency",
         "load_station_urgency",
+        "compute_routes",
+        "load_rebalance_routes",
+        "load_rebalance_route_stops",
     } | {
         # 대여이력 과거 시간대 재조회. 상수를 올리면 태스크가 따라 늘어난다.
         f"collect_bike_rental_history_replay_{h}h"
@@ -93,6 +97,27 @@ def test_inference_then_compute_urgency_then_load_station_urgency():
     assert {t.task_id for t in compute_urgency.upstream_list} == {"run_inference"}
     assert load_station_urgency.task_id in {t.task_id for t in compute_urgency.downstream_list}
     assert {t.task_id for t in load_station_urgency.upstream_list} == {"compute_urgency", "load_stations"}
+
+
+def test_compute_urgency_then_compute_routes_then_load_rebalance_tables_sequentially():
+    """라우트 생성(rebalance/routes.py)도 urgency와 마찬가지로 S3만 읽는다(dispatched
+    넷팅을 위한 좁은 RDS 조회 하나 제외) — compute_urgency에만 의존하고
+    load_station_urgency와는 독립적으로 실행된다(이유: #109). rebalance_route_stops는
+    rebalance_routes(route_id FK)·stations(sta_id FK) 둘 다를 참조하므로,
+    load_rebalance_routes가 끝나고 load_stations도 끝난 뒤에만 실행돼야 한다 —
+    병렬로 두면 stops가 routes보다 먼저 끝나 FK 위반이 날 수 있다."""
+    compute_urgency = dag.get_task("compute_urgency")
+    compute_routes = dag.get_task("compute_routes")
+    load_rebalance_routes = dag.get_task("load_rebalance_routes")
+    load_rebalance_route_stops = dag.get_task("load_rebalance_route_stops")
+
+    assert compute_routes.task_id in {t.task_id for t in compute_urgency.downstream_list}
+    assert {t.task_id for t in compute_routes.upstream_list} == {"compute_urgency"}
+    assert {t.task_id for t in load_rebalance_routes.upstream_list} == {"compute_routes"}
+    assert {t.task_id for t in load_rebalance_route_stops.upstream_list} == {
+        "load_rebalance_routes",
+        "load_stations",
+    }
 
 
 def test_collector_task_execution_contract():

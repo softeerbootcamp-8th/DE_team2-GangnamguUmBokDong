@@ -34,6 +34,19 @@ def _urgency_key(window_start: datetime) -> str:
     return f"urgency/dt={window_start:%Y-%m-%d}/hh={window_start:%H}/urgency_{window_start:%H%M}.parquet"
 
 
+def _routes_key(window_start: datetime) -> str:
+    """지정된 윈도우 시각에 대응하는 라우트 배치 결과(헤더) Parquet S3 키를 생성한다.
+    rebalance/routes_main.py의 _routes_key와 같은 포맷을 여기서도 자체 복제한다
+    (_urgency_key와 동일한 이유)."""
+    return f"routes/dt={window_start:%Y-%m-%d}/hh={window_start:%H}/routes_{window_start:%H%M}.parquet"
+
+
+def _route_stops_key(window_start: datetime) -> str:
+    """지정된 윈도우 시각에 대응하는 라우트 배치 결과(스톱) Parquet S3 키를 생성한다.
+    rebalance/routes_main.py의 _route_stops_key와 같은 포맷을 여기서도 자체 복제한다."""
+    return f"route_stops/dt={window_start:%Y-%m-%d}/hh={window_start:%H}/route_stops_{window_start:%H%M}.parquet"
+
+
 def read_silver(source_id: str, window_start: datetime) -> pq.Table:
     """지정한 소스 및 윈도우 시각의 Silver Parquet 파일을 읽어 PyArrow Table로 반환한다.
 
@@ -80,6 +93,40 @@ def read_urgency(window_start: datetime) -> pq.Table:
         FileNotFoundError: 해당 S3 객체가 없을 때
     """
     key = _urgency_key(window_start)
+    body = get_object_bytes(key)
+    if body is None:
+        raise FileNotFoundError(f"S3 object not found: {key}")
+    return pq.read_table(io.BytesIO(body))
+
+
+def read_routes(window_start: datetime) -> pq.Table:
+    """지정한 윈도우 시각의 라우트 배치 결과(헤더) Parquet 파일을 읽어 PyArrow Table로 반환한다.
+
+    args:
+        window_start: 라우트 배치 윈도우 시작 시각 (KST)
+    returns:
+        읽어온 PyArrow Table
+    raises:
+        FileNotFoundError: 해당 S3 객체가 없을 때
+    """
+    key = _routes_key(window_start)
+    body = get_object_bytes(key)
+    if body is None:
+        raise FileNotFoundError(f"S3 object not found: {key}")
+    return pq.read_table(io.BytesIO(body))
+
+
+def read_route_stops(window_start: datetime) -> pq.Table:
+    """지정한 윈도우 시각의 라우트 배치 결과(스톱) Parquet 파일을 읽어 PyArrow Table로 반환한다.
+
+    args:
+        window_start: 라우트 배치 윈도우 시작 시각 (KST)
+    returns:
+        읽어온 PyArrow Table
+    raises:
+        FileNotFoundError: 해당 S3 객체가 없을 때
+    """
+    key = _route_stops_key(window_start)
     body = get_object_bytes(key)
     if body is None:
         raise FileNotFoundError(f"S3 object not found: {key}")
