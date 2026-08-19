@@ -35,6 +35,23 @@ def test_forecast_points_reader_delegates_to_read_predictions(monkeypatch):
     assert result["station_id"].tolist() == ["101"]
 
 
+def test_expire_col_set_for_sliding_window_and_expiry_tables():
+    """지난 시각/만료된 행이 계속 쌓이는 테이블(#116/#117)만 expire_col이 있어야 한다."""
+    assert TABLE_SPECS["weather_forecast"].expire_col == "forecast_dttm"
+    assert TABLE_SPECS["weather_forecast_ultra"].expire_col == "forecast_dttm"
+    assert TABLE_SPECS["forecast_points"].expire_col == "predicted_dttm"
+    assert TABLE_SPECS["cultural_events"].expire_col == "end_date"
+    assert TABLE_SPECS["cultural_events_performance"].expire_col == "end_date"
+
+
+def test_expire_col_absent_for_master_and_latest_only_tables():
+    """마스터 데이터(stations)나 최신 1건만 유지하는 테이블(station_stock,
+    weather_current)은 정리 대상이 아니다."""
+    assert TABLE_SPECS["stations"].expire_col is None
+    assert TABLE_SPECS["station_stock"].expire_col is None
+    assert TABLE_SPECS["weather_current"].expire_col is None
+
+
 def test_station_urgency_table_spec_registered():
     spec = TABLE_SPECS["station_urgency"]
 
