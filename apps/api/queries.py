@@ -4,8 +4,6 @@ from datetime import UTC, date, datetime, timedelta
 
 from core.db import fetch_all, fetch_one
 
-STOCK_HISTORY_WINDOW_MIN = 25
-
 # station_urgency는 sta_id당 최신 1건만 upsert되므로(#124), 배치가 몇 회 연속으로
 # 멈춰도 마지막 값이 그대로 남는다. "낡은 값을 최신인 것처럼 보여주지 않는다"는
 # 원칙(#107)을 유지하려면 조회 시점에 신선도를 직접 걸러야 한다 — 5분 배치가
@@ -35,28 +33,13 @@ def _floor_to_5min(dt: datetime) -> datetime:
     return dt - timedelta(minutes=dt.minute % 5, seconds=dt.second, microseconds=dt.microsecond)
 
 
-def _group_by_sta_id(rows: list[dict]) -> dict[str, list[dict]]:
-    """sta_id 컬럼 기준으로 행을 묶는다(그 컬럼은 결과 dict에서 빠진다)."""
-    grouped: dict[str, list[dict]] = defaultdict(list)
-    for row in rows:
-        sta_id = row.pop("sta_id")
-        grouped[sta_id].append(row)
-    return grouped
-
-
 def fetch_stations() -> list[dict]:
     """대여소 마스터와 각 대여소의 최신 재고를 반환한다."""
     query = """
         SELECT s.sta_id, s.sta_nm, s.gu, s.sta_addr, s.lat, s.lon, s.hold_cnt,
                stock.parking_bike_tot_cnt, stock.observed_at AS base_dttm
         FROM stations s
-        JOIN LATERAL (
-            SELECT parking_bike_tot_cnt, observed_at
-            FROM station_stock
-            WHERE station_stock.sta_id = s.sta_id
-            ORDER BY observed_at DESC
-            LIMIT 1
-        ) stock ON true
+        JOIN station_stock stock ON stock.sta_id = s.sta_id
         ORDER BY s.sta_id
     """
     return fetch_all(query)
@@ -68,13 +51,7 @@ def fetch_station(sta_id: str) -> dict | None:
         SELECT s.sta_id, s.sta_nm, s.gu, s.sta_addr, s.lat, s.lon, s.hold_cnt,
                stock.parking_bike_tot_cnt, stock.observed_at AS base_dttm
         FROM stations s
-        JOIN LATERAL (
-            SELECT parking_bike_tot_cnt, observed_at
-            FROM station_stock
-            WHERE station_stock.sta_id = s.sta_id
-            ORDER BY observed_at DESC
-            LIMIT 1
-        ) stock ON true
+        JOIN station_stock stock ON stock.sta_id = s.sta_id
         WHERE s.sta_id = %(sta_id)s
     """
     return fetch_one(query, {"sta_id": sta_id})
@@ -96,21 +73,6 @@ def fetch_forecast_points(sta_id: str, now: datetime) -> list[dict]:
         ORDER BY predicted_dttm
     """
     return fetch_all(query, {"sta_id": sta_id, "now": now})
-
-
-def fetch_all_stock_history(sta_ids: list[str], now: datetime) -> dict[str, list[dict]]:
-    """여러 대여소의 최근 재고 이력을 대여소당 1번이 아니라 쿼리 1번으로 가져와
-    sta_id별로 묶어서 반환한다(/alerts처럼 전체 대여소를 훑는 경우 N+1을 피하려고)."""
-    query = """
-        SELECT sta_id, observed_at, parking_bike_tot_cnt
-        FROM station_stock
-        WHERE sta_id = ANY(%(sta_ids)s) AND observed_at >= %(since)s
-        ORDER BY sta_id, observed_at
-    """
-    since = now - timedelta(minutes=STOCK_HISTORY_WINDOW_MIN)
-    rows = fetch_all(query, {"sta_ids": sta_ids, "since": since})
-    grouped = _group_by_sta_id(rows)
-    return {sta_id: grouped.get(sta_id, []) for sta_id in sta_ids}
 
 
 def fetch_alerts(now: datetime) -> list[dict]:
@@ -154,8 +116,8 @@ def now_utc() -> datetime:
 
 def _fetch_stops_for_routes(route_ids: list[str]) -> dict[str, list[dict]]:
     """여러 라우트의 스톱을 쿼리 1번으로 가져와 route_id별로 묶어서 반환한다
-    (fetch_all_stock_history와 같은 N+1 방지 패턴). stations와 조인해 지도 렌더링에
-    필요한 sta_nm/lat/lon도 같이 준다."""
+    (N+1 쿼리를 피하기 위함). stations와 조인해 지도 렌더링에 필요한
+    sta_nm/lat/lon도 같이 준다."""
     if not route_ids:
         return {}
     query = """

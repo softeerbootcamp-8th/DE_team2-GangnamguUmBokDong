@@ -22,7 +22,7 @@ S3 실버 계층(Silver Parquet) 및 머신러닝 추론 결과(ML Predictions)�
 | 논리 스펙 키 (`tables.yaml`) | 물리 DB 테이블 | S3 소스 식별자 | DB 충돌 키 (`conflict_cols`) | 주요 갱신 컬럼 (`update_cols`) |
 |---|---|---|---|---|
 | `stations` | `stations` | `bike_station_realtime` | `[sta_id]` | 대여소명, 자치구, 상세주소, 위도, 경도, 거치대수 |
-| `station_stock` | `station_stock` | `bike_station_realtime` | `[sta_id, observed_at]` | 실시간 거치 대수 (`parking_bike_tot_cnt`) |
+| `station_stock` | `station_stock` | `bike_station_realtime` | `[sta_id]` | 최신 관측 시각, 실시간 거치 대수 (`parking_bike_tot_cnt`) |
 | `weather_current` | `weather_current` | `weather_ultra_short_live` | `[gu]` | 관측일시, 기온(T1H), 습도(REH), 풍속(WSD), 강수량(RN1), 강수형태(PTY) |
 | `weather_forecast` | `weather_forecast` | `weather_short_term_forecast` | `[gu, forecast_dttm]` | 하늘상태(SKY), 강수형태(PTY), 기온(TMP), 강수확률(POP), 강수량(PCP), 습도, 풍속 |
 | `weather_forecast_ultra` | `weather_forecast` | `weather_ultra_short_forecast` | `[gu, forecast_dttm]` | 하늘상태(SKY), 강수형태(PTY), 기온(T1H), 강수량(RN1), 습도, 풍속 |
