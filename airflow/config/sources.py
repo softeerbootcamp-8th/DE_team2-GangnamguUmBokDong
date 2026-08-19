@@ -23,9 +23,6 @@ COMPACTION_SOURCES = (
     "weather_ultra_short_live",
 )
 
-NORMALIZER_BASELINE_MODE_PRIMARY = "strict"
-NORMALIZER_BASELINE_MODE_FALLBACK = "latest"
-
 # bike_rental_history를 몇 시간 전까지 다시 수집할지.
 #
 # tbCycleRentData는 `RENT_DT`(대여 시각) 기준으로 한 시간치를 주지만 목록에는

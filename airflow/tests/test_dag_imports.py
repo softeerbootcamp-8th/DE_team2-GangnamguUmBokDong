@@ -18,18 +18,18 @@ def test_e2e_realtime_dag_id():
 
 
 def test_realtime_population_is_normalized_before_inference():
-    normalized = realtime_5min_dag.dag.get_task("population_normalized")
-    assert normalized.upstream_task_ids == {"run_normalizer_strict", "run_normalizer_fallback"}
-    assert "population_normalized" in realtime_5min_dag.dag.get_task("run_inference").upstream_task_ids
+    normalizer = realtime_5min_dag.dag.get_task("run_normalizer")
+    assert normalizer.upstream_task_ids == {"collect_population_realtime"}
+    assert "run_normalizer" in realtime_5min_dag.dag.get_task("run_inference").upstream_task_ids
     assert "collect_population_realtime" not in realtime_5min_dag.dag.get_task("run_inference").upstream_task_ids
     # 날씨는 weather_10min/weather_3h DAG가 쓴 최신 Silver를 inference가 직접 읽는다.
     assert "collect_weather_ultra_short_live" not in realtime_5min_dag.dag.task_ids
 
 
 def test_e2e_population_is_normalized_before_inference():
-    normalized = e2e_realtime_dag.dag.get_task("population_normalized")
-    assert normalized.upstream_task_ids == {"run_normalizer_strict", "run_normalizer_fallback"}
-    assert "population_normalized" in e2e_realtime_dag.dag.get_task("run_inference").upstream_task_ids
+    normalizer = e2e_realtime_dag.dag.get_task("run_normalizer")
+    assert normalizer.upstream_task_ids == {"collect_population_realtime"}
+    assert "run_normalizer" in e2e_realtime_dag.dag.get_task("run_inference").upstream_task_ids
     assert "collect_population_realtime" not in e2e_realtime_dag.dag.get_task("run_inference").upstream_task_ids
     assert "collect_weather_ultra_short_live" in e2e_realtime_dag.dag.get_task("run_inference").upstream_task_ids
     assert "enrich_station_master" in e2e_realtime_dag.dag.get_task("run_inference").upstream_task_ids

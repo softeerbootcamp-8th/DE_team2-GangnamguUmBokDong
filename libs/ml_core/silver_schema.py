@@ -104,6 +104,10 @@ WEATHER_SHORT_FORECAST_SOURCE_ID = "weather_short_term_forecast"
 POPULATION_SOURCE_ID = "living_population_grid"
 # `normalizer`가 5분마다 만드는, population_realtime으로 보정한 생활인구.
 # inference의 실시간 인구 조회 전용이며 학습/평가는 POPULATION_SOURCE_ID를 사용한다.
+#
+# 미래 시각의 tick 키(정시 `HH00`)에는 실시간 도시데이터의 `FCST_PPLTN`(향후 12시간
+# 예측)으로 보정한 값이 들어있다 — 관측치가 아니라 예측치이고, 실제 그 시각이 오면
+# 관측 기반 값으로 덮어써진다. 스키마는 현재분과 동일하므로 조회 경로는 같다.
 POPULATION_NORMALIZED_SOURCE_ID = "living_population_normalized"
 
 WEATHER_FORECAST_COLUMN_MAPS = {

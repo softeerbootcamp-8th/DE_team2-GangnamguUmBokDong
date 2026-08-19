@@ -11,17 +11,13 @@ schedule=None으로 두어 개발/통합 검증 시에만 수동 실행한다.
 
 population_realtime Silver는 inference 전에 normalizer를 반드시 통과한다.
 weather_ultra_short_live Silver도 같은 window에 수집된 뒤 inference로 진입한다.
-strict가 성공하면 fallback은 skipped되고, strict가 실패하면 fallback(latest)이 실행된다.
-둘 중 하나가 성공한 경우 ``population_normalized`` 합류 task가 성공해 inference로 진행한다.
+normalizer는 한 번 실행으로 현재 시각과 향후 12시간 예측 시각을 모두 보정한다 —
+baseline이 항상 nowcaster 추정치라 예전의 strict/fallback 두 갈래는 없앴다.
 """
 
 import pendulum
-from airflow.providers.standard.operators.empty import EmptyOperator
-from airflow.task.trigger_rule import TriggerRule
 from config.schedules import TIMEZONE
 from config.sources import (
-    NORMALIZER_BASELINE_MODE_FALLBACK,
-    NORMALIZER_BASELINE_MODE_PRIMARY,
     REALTIME_5MIN_SOURCES,
     STATION_MASTER_SOURCE,
     WEATHER_10MIN_SOURCE,
@@ -55,20 +51,8 @@ with DAG(
     load_station_stock = build_db_loader_task(dag, "station_stock")
     collector_tasks["bike_station_realtime"] >> load_stations >> load_station_stock
 
-    run_normalizer_strict = build_normalizer_task(dag, "run_normalizer_strict", NORMALIZER_BASELINE_MODE_PRIMARY)
-    run_normalizer_fallback = build_normalizer_task(
-        dag,
-        "run_normalizer_fallback",
-        NORMALIZER_BASELINE_MODE_FALLBACK,
-        trigger_rule="all_failed",
-    )
-    population_normalized = EmptyOperator(
-        task_id="population_normalized",
-        trigger_rule=TriggerRule.ONE_SUCCESS,
-    )
-
-    collector_tasks["population_realtime"] >> run_normalizer_strict >> run_normalizer_fallback
-    [run_normalizer_strict, run_normalizer_fallback] >> population_normalized
+    run_normalizer = build_normalizer_task(dag)
+    collector_tasks["population_realtime"] >> run_normalizer
 
     run_inference = build_inference_task(dag)
     inference_inputs = [
@@ -76,7 +60,7 @@ with DAG(
         for source_id, task in collector_tasks.items()
         if source_id != "population_realtime"
     ]
-    [*inference_inputs, collect_weather, population_normalized, enrich_station_master] >> run_inference
+    [*inference_inputs, collect_weather, run_normalizer, enrich_station_master] >> run_inference
 
     load_forecast_points = build_db_loader_task(dag, "forecast_points")
     [run_inference, load_station_stock] >> load_forecast_points

@@ -27,6 +27,11 @@ EXECUTION_TIMEOUT_OVERRIDES = {
 }
 
 NOWCASTING_EXECUTION_TIMEOUT = timedelta(seconds=600)
+# normalizer는 tick 1회에 현재 + 향후 12시간, 최대 13개 시각을 보정한다. 가장 무거운
+# 교차 계산은 시각과 무관해 1회만 돌므로 시각 수에 비례하지 않는다. 로컬 실측
+# (2026-08-19 21:40 tick, 격자 8,564개 x 13시각, baseline 2개 날짜 = nowcast 27MB):
+# 10.7초. 5분 tick에 여유가 크지만 baseline 크기가 늘 수 있어 상한은 300초로 둔다.
+NORMALIZER_EXECUTION_TIMEOUT = timedelta(seconds=300)
 # 변경이 없는 날짜는 LIST 한 번으로 끝나지만, 백필이 들어온 날은 하루치 parquet을
 # 전부 다시 읽는다. bike_rental_history 기준 288개가 상한이다.
 COMPACTION_EXECUTION_TIMEOUT = timedelta(seconds=900)
