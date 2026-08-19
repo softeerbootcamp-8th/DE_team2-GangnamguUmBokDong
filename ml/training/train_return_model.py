@@ -18,7 +18,7 @@ from ml_core import common_config
 from ml_core.paths import archive_models_prefix
 
 from .config import today_kst
-from .train_common import load_training_table, run_and_notify_on_failure, train_target
+from .train_common import run_and_notify_on_failure, train_target
 
 
 def main() -> dict:
@@ -30,8 +30,7 @@ def main() -> dict:
     archive_date = os.environ.get("MODEL_ARCHIVE_DATE", today_kst().isoformat())
     models_prefix = archive_models_prefix(archive_date, common_config.PROFILE_NAME)
 
-    df = load_training_table("return")
-    metrics = train_target(df, "return_count", "return", exposure_col=None, models_prefix=models_prefix)
+    metrics = train_target("return_count", "return", exposure_col=None, models_prefix=models_prefix)
     print(json.dumps(metrics, indent=2, ensure_ascii=False))
     return metrics
 

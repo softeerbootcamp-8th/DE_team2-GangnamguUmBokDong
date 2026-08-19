@@ -46,23 +46,25 @@ def today_kst() -> date:
 # 썼다 — multi-horizon 테이블이 원본의 최대 HORIZON_COUNT배 행 수라 단일 머신
 # LightGBM이 1년 전체를 못 받았기 때문(history.md 18번 항목).
 #
-# **2026-08 실측**: 대여/반납 분리 + lag 1개로 줄인 뒤에도(피처 축소 이후) 20분
-# tick·2025년 전체 multi-horizon 테이블이 8억 행이라 여전히 로컬(RAM 18GB)에서
-# pandas로 한 번에 못 읽는다(에러 메시지도 없이 SIGKILL) — 그래서 day-of-month
-# 배수 기준으로 한 번 더 줄인다: train은 **`TRAIN_DAY_DIVISOR`의 배수인 날 전부**
-# (기본 2 = 짝수날), valid/test는 `VALID_DAYS_OF_MONTH`/`TEST_DAYS_OF_MONTH`로
-# 지정한 날짜만 쓴다. 그 어디에도 안 뽑힌 나머지 날짜(대부분)는 train에도 안
-# 들어가고 통째로 버려진다 — 표본 추출(TRAIN/VALID/TEST_SAMPLE_FRAC)과 별개로,
-# 애초에 읽어들이는 행 수 자체를 줄이는 용도다(`train_common._wanted_dates()`가
-# 읽기 전에 미리 걸러서 S3에서 받아오지도 않는다 — `_split()`에서 걸러서는 이미
-# 로드 자체가 OOM으로 죽은 뒤라 늦다). 여전히 OOM이면 `TRAIN_DAY_DIVISOR`를
-# 3, 5로 올려가며 더 줄인다(3의 배수 ≈ 매달 10일, 5의 배수 ≈ 매달 6일).
+# **2026-08 실측 + 이후 정책 변경**: 대여/반납 분리 + lag 1개로 줄인 뒤에도(피처
+# 축소 이후) 20분 tick·2025년 전체 multi-horizon 테이블이 8억 행이라 로컬
+# (RAM 18GB)에서 pandas로 한 번에 못 읽어서(에러 메시지도 없이 SIGKILL), 한때
+# day-of-month 배수로 날짜 자체를 줄이는(`TRAIN_DAY_DIVISOR`, 기본 2=짝수날만)
+# 임시 조치를 도입했었다. **20분(또는 그 이하) tick 앵커 밀도는 유지해야 한다는
+# 요구사항이 확정되면서(minute 단위 서빙 요청을 실제로 커버해야 함 — 시간
+# 단위로 앵커를 줄이면 모델이 그 minute 값들을 아예 학습에서 못 봄), 날짜를
+# 솎아내는 방식으로 메모리를 줄이는 건 기본값에서 뺐다** — `TRAIN_DAY_DIVISOR`
+# 기본값을 다시 1(=날짜 필터 없음, 1년 전체)로 되돌렸다. 로컬 RAM 한계는 이제
+# 샘플링이 아니라 스트리밍/청크 학습·분산 학습·더 큰 머신 같은 실제 엔지니어링
+# 해법으로 풀 것 — 그게 어려운 특수 상황(예: 로컬에서 급하게 뭔가 검증)에서만
+# `TRAIN_DAY_DIVISOR`를 다시 2, 3, 5로 올리는 임시 dial로 남겨둔다.
 #
-# VALID_DAYS_OF_MONTH/TEST_DAYS_OF_MONTH는 **`TRAIN_DAY_DIVISOR`의 배수가 아닌
-# 날짜만** 넣어야 한다 — 겹치면 train과 valid/test 양쪽에 같은 행이 들어가는
-# 누출이 생긴다. 기본값(11,13,17,19)은 전부 소수라 2/3/5 중 어떤 TRAIN_DAY_DIVISOR를
-# 써도(현재 시도하는 값들 범위 안에서는) 자동으로 안전하다 — divisor를 바꿀 때마다
-# 이 값도 같이 바꿀 필요가 없게 일부러 이렇게 골랐다.
+# train은 **`TRAIN_DAY_DIVISOR`의 배수인 날 중 VALID/TEST로 안 뽑힌 날**
+# (기본 1 = 사실상 전체 날짜), valid/test는 `VALID_DAYS_OF_MONTH`/
+# `TEST_DAYS_OF_MONTH`로 지정한 날짜만 쓴다 — `train_common._dates_for_split()`이
+# valid/test 여부를 먼저 확정하고(`elif`) 그 나머지 중에서만 train 배수 조건을 보므로,
+# TRAIN_DAY_DIVISOR가 1이라 "모든 날짜가 배수"인 경우에도 valid/test 날짜가
+# train으로 새지 않는다.
 #
 # 대여이력은 반납이 완료돼야 Silver에 나타난다(feature_engine/spark/run_pipeline.py의
 # 날짜 파티션 overwrite 보정과 같은 이유) — 그래서 가장 최근 TRAINING_SAFETY_MARGIN_DAYS
@@ -73,7 +75,7 @@ def today_kst() -> date:
 # 믿고 학습해도 된다"는 별도의(더 짧은) 마진이다.
 TRAINING_SAFETY_MARGIN_DAYS = int(os.environ.get("TRAINING_SAFETY_MARGIN_DAYS", "7"))
 TRAIN_YEAR = int(os.environ.get("TRAIN_YEAR", "2025"))
-TRAIN_DAY_DIVISOR = int(os.environ.get("TRAIN_DAY_DIVISOR", "2"))
+TRAIN_DAY_DIVISOR = int(os.environ.get("TRAIN_DAY_DIVISOR", "1"))
 VALID_DAYS_OF_MONTH = frozenset(int(d) for d in os.environ.get("VALID_DAYS_OF_MONTH", "11,13").split(","))
 TEST_DAYS_OF_MONTH = frozenset(int(d) for d in os.environ.get("TEST_DAYS_OF_MONTH", "17,19").split(","))
 
@@ -101,23 +103,24 @@ TRAIN_SAMPLE_FRAC = float(os.environ.get("TRAIN_SAMPLE_FRAC", "1.0"))
 VALID_SAMPLE_FRAC = float(os.environ.get("VALID_SAMPLE_FRAC", "1.0"))
 TEST_SAMPLE_FRAC = float(os.environ.get("TEST_SAMPLE_FRAC", "1.0"))
 
-# **2026-08 실측**: 날짜를 짝/홀수로 227/365일(62%)까지 줄여도(위 참고) 2025년
-# 전체 multi-horizon 테이블은 여전히 로컬(RAM 18GB)에서 OOM(SIGKILL)이 났다 —
-# TRAIN_SAMPLE_FRAC 등 행 단위 표본 추출은 로드가 끝난 뒤(`_split()`)에나 적용돼서
-# OOM 자체는 못 막는다. 같은 날짜 파티션 안에 horizon 1~HORIZON_COUNT이 전부
-# 섞여 있는 게 남은 가장 큰 배율이라, 읽는 시점에 `horizon <= MAX_TRAIN_HORIZON`
-# 필터를 걸어(core.s3.read_parquet의 filters=, row-group 단위로 걸러져서 날짜
-# 필터와 같은 원리로 로드 자체를 줄인다) 그 배율 자체를 줄인다. 기본값은 제한
-# 없음(HORIZON_COUNT 그대로) — 값을 낮추면 그 이상 horizon에 대한 예측 품질은
-# 검증되지 않는다(모델이 그 구간의 실제 예를 아예 못 봄).
+# **2026-08**: 같은 날짜 파티션 안에 horizon 1~HORIZON_COUNT이 전부 섞여 있어
+# 날짜 필터만으론 못 줄이는 배율이라, 필요하면 읽는 시점에
+# `horizon <= MAX_TRAIN_HORIZON` 필터를 걸(core.s3.read_parquet의 filters=,
+# row-group 단위로 걸러져서 날짜 필터와 같은 원리로 로드 자체를 줄인다) 수
+# 있게 남겨둔 dial이다. **기본값은 제한 없음(HORIZON_COUNT=12 그대로, 즉 항상
+# 전체 horizon으로 학습)** — horizon도 낮추지 않는 게 확정된 정책이라(위
+# TRAIN_DAY_DIVISOR 주석 참고), OOM 대응은 이 값을 낮추는 대신 실제
+# 스트리밍/분산 학습 쪽으로 푼다. 로컬에서 급하게 뭔가 검증할 때만 임시로
+# 낮출 것 — 낮추면 그 이상 horizon에 대한 예측 품질은 검증되지 않는다(모델이
+# 그 구간의 실제 예를 아예 못 봄).
 MAX_TRAIN_HORIZON = int(os.environ.get("MAX_TRAIN_HORIZON", str(common_config.HORIZON_COUNT)))
 
 # **2026-08**: divisor=2+horizon<=6로 줄여도 로드가 8시간 넘게 걸리다 디스크
 # 스와핑(STAT=U, %CPU 급락)으로 판단해 강제 종료한 사건 이후 도입 — 그 전까지는
 # 로드가 실제로 진행 중인지 멈춘 것인지 `ps`의 경과시간을 수동으로 재확인하는 것
-# 말고는 알 방법이 없었다. `train_common.load_training_table()`이 파일을 읽을
-# 때마다(주기적으로) 완료 개수와 그 시점까지의 peak RSS(MB)를 이 파일에 이어쓴다
-# (표준출력과 별개 — 표준출력이 다른 곳으로 리다이렉트/버퍼링돼도 이 파일만
+# 말고는 알 방법이 없었다. `train_common`/`lazy_train_dataset`이 S3 파일이나 날짜
+# 청크를 읽을 때마다 완료 개수(또는 청크)와 그 시점까지의 peak RSS(MB)를 이 파일에
+# 이어쓴다(표준출력과 별개 — 표준출력이 다른 곳으로 리다이렉트/버퍼링돼도 이 파일만
 # tail 하면 진행 상황을 확인할 수 있다).
 TRAIN_PROGRESS_LOG_PATH = os.environ.get("TRAIN_PROGRESS_LOG_PATH", "training_progress.log")
 TRAIN_PROGRESS_LOG_INTERVAL_SECONDS = float(os.environ.get("TRAIN_PROGRESS_LOG_INTERVAL_SECONDS", "5"))

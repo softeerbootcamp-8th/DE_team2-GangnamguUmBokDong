@@ -57,6 +57,22 @@ def put_object_bytes(key: str, body: bytes) -> None:
     _client().put_object(Bucket=_bucket(), Key=key, Body=body)
 
 
+def _to_pandas_or_table(table: pq.Table, as_pandas: bool) -> pd.DataFrame | pq.Table:
+    """`table.to_pandas()` 변환 시 순간 메모리가 2배로 뜨는 걸 줄인다.
+
+    기본 `to_pandas()`는 원본 Arrow Table을 그대로 둔 채 새 pandas 배열을
+    만들어서, 변환이 끝나기 전까지 둘 다(Arrow Table + 새 DataFrame) 메모리에
+    떠 있다 — 학습 테이블처럼 큰 데이터에서 순간 피크가 최종 크기의 2배까지
+    간다(2026-08 리뷰 지적). `self_destruct=True`(+`split_blocks=True`, 이
+    조합이어야 실제 절감 효과가 있음 — pyarrow 문서)는 컬럼을 pandas로 옮기는
+    족족 Arrow 쪽 버퍼를 즉시 해제한다 — 대신 호출부가 변환 후 원본 `table`을
+    다시 쓰면 안 된다(이 함수의 모든 호출부는 변환 직후 바로 반환하므로 안전).
+    """
+    if not as_pandas:
+        return table
+    return table.to_pandas(self_destruct=True, split_blocks=True)
+
+
 def read_parquet(
     key: str,
     columns: list[str] | None = None,
@@ -110,7 +126,7 @@ def read_parquet(
     body = get_object_bytes(key)
     if body is not None:
         table = pq.read_table(io.BytesIO(body), columns=columns, filters=filters)
-        return table.to_pandas() if as_pandas else table
+        return _to_pandas_or_table(table, as_pandas)
 
     prefix = key if key.endswith("/") else f"{key}/"
     part_keys = sorted(k for k in list_keys(prefix) if k.endswith(".parquet"))
@@ -133,7 +149,7 @@ def read_parquet(
     combined = pa.concat_tables(tables)
     del tables
 
-    return combined.to_pandas() if as_pandas else combined
+    return _to_pandas_or_table(combined, as_pandas)
 
 
 def _read_parquet_by_dates(
@@ -217,7 +233,7 @@ def _read_parquet_by_dates(
 
     if columns is not None:
         combined = combined.select(columns)
-    return combined.to_pandas() if as_pandas else combined
+    return _to_pandas_or_table(combined, as_pandas)
 
 
 def read_parquet_many(

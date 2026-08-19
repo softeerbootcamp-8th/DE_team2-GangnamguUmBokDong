@@ -92,8 +92,8 @@ station_no는 처음부터 정수라 그 비용 자체가 없다(station_id는 �
 써야 한다 — 그래서 `FEATURE_COLUMNS`/`station_categories_path`/`load_station_dtype`은
 `ml_core/model_contract.py`로, `poisson_deviance`/`pinball_loss`는 `ml_core/metrics.py`로,
 채점 로직(`predict()`)은 `ml_core/scoring.py`로 뺐다. 이 폴더에는 학습에만
-필요한 것(`_split`, `_prepare_xy`, `_conformal_correction`, `train_target()`
-자체, LightGBM 파라미터 튜닝)만 남는다.
+필요한 것(`_dates_for_split`, `_conformal_correction`, `train_target()` 자체,
+`lazy_train_dataset.py`의 S3 지연 로딩, LightGBM 파라미터 튜닝)만 남는다.
 
 `monitor_performance.py`/`scripts/compare_baselines.py`가 `ml_core/scoring.py`의
 `predict()`를 가져다 쓰는 이유도 같다 — "저장된 모델로 채점"하는 로직은
@@ -166,27 +166,52 @@ station_categories는 옛 버전인 식으로 섞인 모델을 읽을 수 있었
 (별도 subprocess)해보고 `should_promote()`/`promote_challenger()`로 이어간다 —
 어느 프로필도 기준을 못 넘으면 챔피언은 그대로 두고 조용히 종료한다.
 
-## 9. 학습 테이블이 로컬 RAM보다 커질 때 — 날짜/horizon 필터 (2026-08 신규)
+## 9. 학습 테이블이 로컬 RAM보다 커질 때 — 날짜 파티션 단위 지연 로딩 (2026-08 전면 개편)
 
 multi-horizon 테이블은 원본 tick 테이블의 최대 `HORIZON_COUNT`배 행 수라
 ("horizon을 feature로" 설계, [feature_engine/DESIGN.md](../feature_engine/DESIGN.md) §7 참고),
-2025년 전체 기준 실측 8억 행대까지 커진다 — 로컬(RAM 18GB)에서 pandas로 한 번에
-못 읽는다(에러 메시지 없이 SIGKILL, 또는 디스크 스와핑으로 사실상 멈춤).
-`load_training_table()`이 두 단계로 미리 줄인다:
+20분 tick·full horizon·2025년 전체 기준 실측 8억 행대까지 커진다 — 통째로 하나의
+pandas DataFrame(float64/int64 컬럼 13개)으로 읽으면 원본만 수십GB라 로컬(RAM 18GB)
+에서 반복적으로 OOM이 났다. 앵커 tick 밀도(20분, 향후 5분 희망)와
+horizon(`HORIZON_COUNT` 전체)은 줄이지 않는 게 확정 정책이라(§ 아래 참고), 예전처럼
+`TRAIN_DAY_DIVISOR`로 날짜 자체를 솎아내 메모리를 줄이는 건 기본값에서 뺐다 —
+대신 `train_common.py`가 더 이상 데이터를 한 번에 로드하지 않고,
+**`lazy_train_dataset.py`가 날짜 파티션(`date=YYYY-MM-DD/`) 단위로 S3를 지연
+조회**한다.
 
-1. **날짜**: `TRAIN_DAY_DIVISOR`의 배수인 날짜 전부 + `VALID_DAYS_OF_MONTH`/
-   `TEST_DAYS_OF_MONTH`로 지정한 날짜만 S3에서 나열/다운로드한다(`_wanted_dates()`)
-   — 나머지 날짜는 애초에 안 받는다. `_split()`에서 걸러서는 이미 로드
-   자체가 죽은 뒤라 늦다.
-2. **horizon**: 같은 날짜 파티션 안에 horizon 1..`HORIZON_COUNT`가 전부
-   섞여 있어 날짜 필터만으론 못 줄인다 — `MAX_TRAIN_HORIZON`으로 읽는
-   시점에 `filters=[("horizon", "<=", MAX_TRAIN_HORIZON)]`(pyarrow row-group
-   필터)를 한 번 더 건다.
+핵심 아이디어는 LightGBM `lgb.Sequence` API가 `Dataset.construct()` 중에 각
+Sequence를 필요할 때만(그것도 두 단계 — 표본 추출용 개별 인덱스, 그 다음 실제
+적재용 연속 슬라이스 — 로) 접근한다는 점을 이용하는 것이다: 날짜 하나를
+`_DatePartitionSequence`로 표현해 `__getitem__`이 호출될 때만 그 날짜의 S3
+파일을 읽고, 공유 LRU 캐시(`ChunkCache`, 기본 최대 2개)로 오래된 날짜를
+비워서 항상 최대 1~2개 날짜분만 메모리에 남긴다(캐시에서 밀려난 날짜가 나중에
+다시 필요해지면 재조회 — 메모리 대신 네트워크 I/O를 쓰는 트레이드오프).
 
-기본값(`TRAIN_DAY_DIVISOR=2`=짝수날, `MAX_TRAIN_HORIZON`=제한 없음)으로도
-부족하면 divisor를 3, 5로 올리는 폴백을 쓴다 — `VALID_DAYS_OF_MONTH`/
-`TEST_DAYS_OF_MONTH` 기본값(11,13/17,19)은 전부 소수라 어떤 divisor를 써도
-자동으로 안전하다(겹쳐서 train과 누출되는 일이 없다). 로드가 실제로
-진행 중인지 확인하려면 `TRAIN_PROGRESS_LOG_PATH`(기본
-`training_progress.log`)를 tail — 파일 완료 개수와 그 시점 peak RSS를
-주기적으로 남긴다(표준출력과 별개 채널).
+- **train/valid**: `build_lazy_dataset()`이 이 방식으로 Sequence 기반 `lgb.Dataset`을
+  만든다. 라벨(+exposure)만 별도로 가벼운 사전 스캔(컬럼 1~2개, 8억 행이어도
+  수 GB대)으로 미리 확보한다(`lgb.Dataset(label=...)`은 라벨 배열을 구성 시점에
+  미리 다 가지고 있어야 하므로).
+- **test**: 학습에 안 쓰이고 `predict()`/지표 계산에만 쓰이므로 `Dataset`으로
+  만들지 않는다 — `predict_over_dates()`가 날짜별로 그 청크만 읽어 즉시
+  predict한 뒤, 큰 feature 행렬은 버리고 작은(1D) 예측값/라벨 배열만
+  이어붙인다. valid도 학습 후 conformal correction 계산에 같은 함수를 다시
+  쓴다(학습용 Sequence 적재와는 별개 시점이라 청크를 한 번 더 읽음).
+
+날짜(train/valid/test 소속)는 여전히 `TRAIN_DAY_DIVISOR`/`VALID_DAYS_OF_MONTH`/
+`TEST_DAYS_OF_MONTH`로 정해지지만, `_dates_for_split()`가 Spark의 `date=` 파티션
+이름 자체(day-of-month를 문자열에서 바로 뽑음)만으로 계산한다 — 데이터를 전혀
+읽지 않는 순수 캘린더 연산이라 예전 `_split()`(로드된 df의 `day` 컬럼을
+역산)보다 더 이르게, 더 싸게 구간을 확정한다. `TRAIN_DAY_DIVISOR`는 기본값
+1(=날짜 다운샘플링 없음, 1년 전체)이고, 로컬 RAM이 급하게 부족한 특수 상황에서만
+2, 3, 5로 올리는 비상 dial로 남아있다. `horizon`은 여전히 같은 날짜 파티션 안에
+1..`HORIZON_COUNT`가 섞여 있어 `filters=[("horizon", "<=", MAX_TRAIN_HORIZON)]`
+(pyarrow row-group 필터)로 따로 거른다.
+
+로드가 실제로 진행 중인지 확인하려면 `TRAIN_PROGRESS_LOG_PATH`(기본
+`training_progress.log`)를 tail — 날짜 청크 하나가 로드될 때마다(및 사전 스캔
+파일 완료마다) 그 시점 peak RSS를 남긴다(표준출력과 별개 채널).
+
+**범위 밖(2026-08 기준)**: 분산 학습(`LGB_TREE_LEARNER`≠"serial")은 아직 이
+지연 로딩과 연동되지 않았다 — `train_target()`이 `LGB_NUM_MACHINES>1`이면
+바로 `NotImplementedError`를 낸다(station_no 샤딩을 날짜별 로더 안에서 다시
+구현해야 함, 구조상 막혀있지 않으나 아직 안 만듦).
