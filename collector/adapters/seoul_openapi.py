@@ -127,6 +127,26 @@ def _fetch_page(client: httpx.Client, url: str, wrapper_key: str) -> _PageOutcom
     return _PageOutcome(payload=response.content, total=int(raw_total), error=None)
 
 
+def _fetch_poi(client: httpx.Client, url: str, wrapper_key: str) -> _PageOutcome:
+    """실시간 인구 POI 하나를 받아 실패 범주까지 판정한다."""
+    try:
+        response = client.get(url)
+        response.raise_for_status()
+        body = json.loads(response.content)
+        if not isinstance(body, dict):
+            raise json.JSONDecodeError("응답이 JSON 객체가 아님", "", 0)
+    except (httpx.RequestError, httpx.HTTPStatusError, json.JSONDecodeError):
+        return _PageOutcome(payload=None, total=None, error=FetchErrorKind.TRANSIENT)
+
+    # citydata_ppltn은 일반 페이지 응답과 달리 RESULT.CODE가 최상단 RESULT 객체의
+    # `RESULT.CODE` 키로 내려온다. 빈 POI(INFO-200)도 성공 조각으로 보존한다.
+    code = body.get("RESULT.CODE") or body.get("RESULT", {}).get("RESULT.CODE")
+    category = _classify(code)
+    if category is not None:
+        return _PageOutcome(payload=None, total=None, error=category)
+    return _PageOutcome(payload=response.content, total=None, error=None)
+
+
 @adapter("seoul_openapi")
 class SeoulOpenApiAdapter:
     """서울 열린데이터광장 공용 페이지네이션 규약 어댑터."""
@@ -182,56 +202,60 @@ class SeoulOpenApiAdapter:
             if poi_start < 1 or poi_end < poi_start:
                 raise ValueError("citydata_ppltn의 poi_start/poi_end 범위가 올바르지 않습니다")
 
-            # expected_total은 pipeline에서 기대 row 수를 뜻한다. POI 범위 크기는
-            # 요청 조각 수이고 INFO-200 조각은 정상적으로 0행일 수 있으므로, 여기서는
-            # None을 유지해 실제 요청 실패만 조각 기준 missing_ratio로 계산한다.
+            pois = []
             for i in range(poi_start, poi_end + 1):
                 poi_id = f"POI{i:03d}"
                 key = f"poi-{poi_id}"
-                
-                if key in skip:
-                    continue
-                
-                url = f"{_BASE_URL}/{_api_key()}/json/{service}/1/5/{poi_id}/"
-                try:
-                    response = client.get(url)
-                    response.raise_for_status()
-                    body = json.loads(response.content)
-                    wrapper = _extract(body, wrapper_key)
-                except (httpx.RequestError, httpx.HTTPStatusError, json.JSONDecodeError):
-                    yield FetchResult(
-                        key=key,
-                        payload=None,
-                        error=FetchErrorKind.TRANSIENT,
-                        expected_total=None,
-                    )
-                    continue
+                if key not in skip:
+                    url = f"{_BASE_URL}/{_api_key()}/json/{service}/1/5/{poi_id}/"
+                    pois.append((key, url))
 
-                code = body.get("RESULT.CODE") or body.get("RESULT", {}).get("RESULT.CODE")
-                category = _classify(code)
+            # expected_total은 pipeline에서 기대 row 수를 뜻한다. POI 범위 크기는
+            # 요청 조각 수이고 INFO-200 조각은 정상적으로 0행일 수 있으므로, 여기서는
+            # None을 유지해 실제 요청 실패만 조각 기준 missing_ratio로 계산한다.
+            concurrency = max(1, int(params.get("concurrency", _DEFAULT_CONCURRENCY)))
+            if concurrency == 1:
+                for key, url in pois:
+                    outcome = _fetch_poi(client, url, wrapper_key)
+                    yield FetchResult(
+                        key=key, payload=outcome.payload, error=outcome.error,
+                        expected_total=None,
+                    )
+                    if outcome.error is FetchErrorKind.FATAL:
+                        return
+                return
 
-                if category is None:
+            # 조각 순서는 유지하되 네트워크 요청은 미리 병렬로 시작한다. 전부 제출하면
+            # 마감 시한이나 FATAL 뒤에도 불필요한 요청이 계속되므로 2배수만 대기시킨다.
+            pool = ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="seoul-poi")
+            try:
+                queued = iter(pois)
+                inflight: deque[tuple[str, Future[_PageOutcome]]] = deque()
+
+                def submit_next_poi() -> bool:
+                    item = next(queued, None)
+                    if item is None:
+                        return False
+                    key, url = item
+                    inflight.append((key, pool.submit(_fetch_poi, client, url, wrapper_key)))
+                    return True
+
+                for _ in range(concurrency * 2):
+                    if not submit_next_poi():
+                        break
+
+                while inflight:
+                    key, future = inflight.popleft()
+                    outcome = future.result()
+                    submit_next_poi()
                     yield FetchResult(
-                        key=key,
-                        payload=response.content,
-                        error=None,
+                        key=key, payload=outcome.payload, error=outcome.error,
                         expected_total=None,
                     )
-                elif category is FetchErrorKind.FATAL:
-                    yield FetchResult(
-                        key=key,
-                        payload=None,
-                        error=category,
-                        expected_total=None,
-                    )
-                    return
-                else:
-                    yield FetchResult(
-                        key=key,
-                        payload=None,
-                        error=category,
-                        expected_total=None,
-                    )
+                    if outcome.error is FetchErrorKind.FATAL:
+                        return
+            finally:
+                pool.shutdown(wait=False, cancel_futures=True)
             return
 
         def page_url(start: int, end: int) -> str:
