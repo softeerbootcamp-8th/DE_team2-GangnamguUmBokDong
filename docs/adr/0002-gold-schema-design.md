@@ -51,3 +51,21 @@ station_stock을 `(sta_id, observed_at)`을 기본키로 하는 이력 테이블
 
 ## 결과
 `/alerts`가 매 요청마다 전체 대여소를 스캔하며 재계산하던 부하가 없어지고, 배치가 이미 계산해둔 값을 조회만 한다. 한 응답에 서로 다른 batch의 row가 섞이지 않으며 향후 route batch도 같은 `batch_run_at` snapshot을 고정해 사용할 수 있다. `compute_urgency`는 anchor tick과 정확히 일치하는 재고만 현재값으로 인정한다. inference는 학습된 station 집합의 partial 결과를 upstream에서 실패시키며, 정상 산출물에 없는 신설·미지원 station은 urgency 대상에서 제외하고 건수를 로그로 남긴다.
+
+---
+
+# station_urgency는 이력이 아니라 sta_id당 최신 1건만 upsert한다 (위 결정 일부 번복)
+
+## 배경
+위 결정에서 `station_urgency`를 `(batch_run_at, sta_id)` 복합 PK 이력 테이블로 두고 `/alerts`가 `MAX(batch_run_at)` snapshot만 조회하도록 했다(배치 섞임 버그 대응). 그런데 이 테이블에 이력을 남겨야 할 이유가 구조적으로 없다([#124](https://github.com/softeerbootcamp-8th/DE_team2-GangnamguUmBokDong/issues/124)):
+- `rebalance/urgency.py:compute_all()`은 매 배치마다 S3(재고 이력·예측)만 다시 읽어 처음부터 계산한다 — RDS `station_urgency`를 계산 입력으로 쓰는 곳이 없다.
+- `rebalance/main.py`가 매 배치 결과를 이미 S3(`urgency/dt=.../hh=.../urgency_HHMM.parquet`)에 영구 저장한다 — RDS가 이력을 안 남겨도 전체 이력은 S3에 그대로 남는다.
+- `/alerts` 외에 과거 배치의 urgency 값을 조회하는 소비자가 없다.
+
+그 결과 `station_urgency`는 삭제 로직 없이 5분마다 대여소 수만큼 영구히 쌓이기만 하는 테이블이 됐다.
+
+## 결정
+`station_urgency`의 PK를 `sta_id` 단일키로 되돌린다(진짜 upsert). 배치에서 빠진 대여소의 이전 값을 별도로 지우지는 않는다 — `sta_id`가 PK면 테이블 크기가 대여소 수만큼 고정되므로 지울 필요가 없고, 그 값을 최신으로 볼지는 읽는 쪽이 판단한다. 대신 `apps/api`의 `/alerts`가 `WHERE batch_run_at >= now() - ALERTS_FRESHNESS_WINDOW_MIN분`으로 명시적 신선도 조건을 걸어, 배치가 멈춘 대여소의 낡은 값이 최신인 것처럼 섞이지 않게 한다(`MAX(batch_run_at)` 서브쿼리는 더 이상 필요 없음).
+
+## 결과
+`station_urgency`의 row 수가 대여소 수만큼 고정되고 무한 증가하지 않는다. `station_urgency`를 읽는 소비자가 늘어나면(예: 재배치 라우트 배치) 그쪽도 동일한 신선도 조건을 직접 챙겨야 한다 — 테이블 자체가 강제해주지는 않는다.

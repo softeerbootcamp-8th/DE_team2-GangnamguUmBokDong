@@ -101,7 +101,7 @@ def list_alerts() -> list[dict]:
     urgency_score는 더 이상 요청마다 계산하지 않는다 — 5분 배치(rebalance/urgency.py)가
     미리 계산해 station_urgency 테이블에 적재해두고, 여기서는 그 결과만 조회한다.
     """
-    alerts = queries.fetch_alerts()
+    alerts = queries.fetch_alerts(queries.now_utc())
     return [
         {
             "sta_id": row["sta_id"],
