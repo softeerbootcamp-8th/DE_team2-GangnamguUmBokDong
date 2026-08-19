@@ -128,11 +128,17 @@ def evaluate_recent_performance(
     # 전체 기간"에 비례해서 계속 커진다(s3_io.py 모듈 docstring 참고).
     table_path = _TRAINING_TABLE_BY_MODEL[model_name]
     feature_columns = _FEATURE_COLUMNS_BY_MODEL[model_name]
-    # "date"는 안 넣는다 — Spark 파티션 컬럼이라 파일엔 없고, columns=에 넣으면
-    # 읽을 때마다 그 문자열을 행 수만큼 복제해 만들어야 하는데(core.s3
-    # ._read_parquet_by_dates() 참고) 이 함수는 그 값을 실제로 쓰지 않는다
-    # (date_range로 이미 파티션 자체를 걸렀고, horizon 필터는 별도 컬럼으로 함).
-    needed = sorted(set(feature_columns) | {target_col, "horizon"} | ({exposure_col} if exposure_col else set()))
+    # "date"/"hour"도 넣어야 한다 — scoring.predict()가 마지막에
+    # `df[["station_no", "date", "hour"]]`로 식별 컬럼을 그대로 뽑아 쓴다(리뷰
+    # 지적: 예전엔 여기서 뺐다가 predict()에서 매번 KeyError로 죽었다). "date"는
+    # Spark 파티션 컬럼이라 파일엔 없지만 core.s3._read_parquet_by_dates()가
+    # columns=에 포함된 경우에만 복원한다(그 함수의 2026-08 수정 참고 — 포함 안
+    # 하면 그 복원 자체를 건너뛰므로, 여기서 넣는다고 불필요한 비용이 생기진
+    # 않는다). "hour"는 더 이상 모델 feature가 아니지만(minute이 대체) 파일
+    # 내용에는 여전히 있는 식별용 컬럼이라 feature_columns에 안 잡힌다.
+    needed = sorted(
+        set(feature_columns) | {target_col, "horizon", "date", "hour"} | ({exposure_col} if exposure_col else set())
+    )
     df = s3_io.read_parquet(table_path, columns=needed, date_range=(start, end))
     if df is None:
         raise FileNotFoundError(f"S3에 없음: {table_path}")
