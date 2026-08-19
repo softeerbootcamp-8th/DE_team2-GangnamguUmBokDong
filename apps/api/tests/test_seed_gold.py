@@ -1,7 +1,6 @@
 """레거시 Gold 시드 차단 동작을 검증한다."""
 
 import pytest
-
 import seed_gold
 
 
@@ -13,5 +12,5 @@ def test_legacy_seed_returns_failure_without_database_access(
 
     captured = capsys.readouterr()
     assert "비활성화" in captured.err
-    assert "#152" in captured.err
-    assert "fixture/source publisher" in captured.err
+    assert "loader/gold_cli.py" in captured.err
+    assert "검증된 seed publisher" in captured.err

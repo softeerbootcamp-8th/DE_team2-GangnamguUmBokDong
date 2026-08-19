@@ -4,7 +4,7 @@ import sys
 
 DISABLED_MESSAGE = (
     "[gold-postgis] apps/api/seed_gold.py는 #129 Gold PostGIS 계약과 호환되지 않아 비활성화되었습니다. "
-    "후속 #152의 fixture/source publisher가 준비되면 그 경로로 재개하세요."
+    "loader/gold_cli.py의 검증된 seed publisher 경로를 사용하세요."
 )
 
 

@@ -108,5 +108,6 @@ ps:
 	$(COMPOSE) ps
 
 seed:
-	@echo "[gold-postgis] make seed는 비활성화되었습니다. 후속 #152 fixture/source publisher 경로를 사용하세요." >&2
+	@echo "[gold-postgis] make seed는 weather grid seed_version/effective_dttm SSOT 확정 전이라 비활성화되었습니다." >&2
+	@echo "[gold-postgis] 승인된 값으로 loader/gold_cli.py의 seed:dispatch_center, seed:weather_grid를 명시적으로 실행하세요." >&2
 	@false
