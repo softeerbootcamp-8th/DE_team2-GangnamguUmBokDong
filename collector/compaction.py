@@ -58,6 +58,8 @@ _ARROW_TYPES = {
     "float": pa.float64(),
     "bool": pa.bool_(),
     "precip": pa.float64(),  # 강수량 범주 문자열을 mm 실수로 바꾼 결과
+    "snow": pa.float64(),  # 적설 범주 문자열을 cm 실수로 바꾼 결과
+    "masked_float": pa.float64(),  # 마스킹(`*`)은 결측이 되고 나머지는 실수
 }
 
 # 출처 구분: compaction은 실시간 수집 데이터, bootstrap은 초기 로드 과거 데이터.

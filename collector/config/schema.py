@@ -62,7 +62,13 @@ class ColumnSpec(BaseModel):
 
     # "precip"은 기상청 강수량 범주 표기("강수없음", "30.0~50.0mm" 등)를 mm 실수로
     # 바꾸는 전용 캐스터다. 규칙은 `core.precip`에 있고 loader와 공유한다.
-    types: tuple[Literal["str", "int", "float", "bool", "precip"], ...] = Field(min_length=1)
+    # "snow"는 적설 표기("적설없음", "1.0~4.9cm" 등)를 cm 실수로 바꾼다 — 형태는
+    # 같지만 단위가 달라 서로의 표기를 받지 않는다(`core._amount` 참고).
+    # "masked_float"는 생활인구의 비식별 마스킹(`*`)을 결측으로 판정시킨다
+    # (`core.masked` 참고).
+    types: tuple[
+        Literal["str", "int", "float", "bool", "precip", "snow", "masked_float"], ...
+    ] = Field(min_length=1)
     required: bool = False
     range: Range | None = None
     enum: tuple[Any, ...] | None = None

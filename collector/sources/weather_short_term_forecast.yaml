@@ -103,7 +103,8 @@ columns:
   WAV:
     types: [float]
     range: {min: 0, max: 20}
-  # PCP와 같은 응답에 오는 적설 범주 표기("적설없음", "1.0cm 미만" 등)라 같은
-  # precip 캐스터를 쓴다(`core.precip._NONE_LABELS`에 "적설없음" 포함).
+  # PCP와 같은 응답에 오는 적설 범주 표기("적설없음", "1.0~4.9cm", "5.0cm" 등).
+  # 형태는 PCP와 같지만 단위가 cm라 precip이 아니라 snow 캐스터를 쓴다 — precip에
+  # 넘기면 "5.0cm"가 캐스팅 실패로 null이 된다(`core.snow` 참고). 값의 단위는 cm다.
   SNO:
-    types: [precip]
+    types: [snow]

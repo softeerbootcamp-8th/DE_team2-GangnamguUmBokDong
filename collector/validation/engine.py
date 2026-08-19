@@ -7,7 +7,9 @@ from dataclasses import dataclass
 from typing import Any
 
 from config.schema import ColumnSpec, Policies, SourceConfig
+from core.masked import MaskedValue, parse_masked_float
 from core.precip import parse_precip
+from core.snow import parse_snow
 from validation.registry import get_policy, get_row_policy, get_row_policy_params_model
 from validation.types import Action, Issue, IssueKind, RowVerdict, RunContext
 
@@ -37,6 +39,12 @@ _CASTERS: dict[str, Callable[[Any], Any]] = {
     # 기상청 강수량 범주 표기 전용. loader도 같은 규칙을 써야 silver와 RDB의 값이
     # 갈리지 않으므로 `core`에 둔다.
     "precip": parse_precip,
+    # 적설 범주 표기 전용. `precip`과 형태는 같지만 단위가 cm라 함수를 나눴다
+    # (`core._amount` docstring 참고).
+    "snow": parse_snow,
+    # 생활인구의 비식별 마스킹(`*`) 전용. `*`을 TYPE_ERROR가 아니라 결측으로
+    # 판정시킨다 — `_judge_column`이 MaskedValue를 잡아 되돌린다.
+    "masked_float": parse_masked_float,
 }
 
 
@@ -76,7 +84,16 @@ def _judge_column(raw_value: Any, column: str, spec: ColumnSpec) -> tuple[Any, I
         )
         return None, issue
 
-    casted, ok = _try_cast(raw_value, spec.types)
+    try:
+        casted, ok = _try_cast(raw_value, spec.types)
+    except MaskedValue:
+        # 비식별 마스킹(`*`)은 "가려진 값"이지 형식 오류가 아니다. 빈 값과 같은
+        # 결측으로 판정해 결측 정책이 걸리게 한다(사유는 `core.masked` 참고).
+        issue = Issue(
+            column=column, kind=IssueKind.MISSING, required=spec.required, raw_value=raw_value, spec=spec
+        )
+        return None, issue
+
     if not ok:
         issue = Issue(
             column=column, kind=IssueKind.TYPE_ERROR, required=spec.required, raw_value=raw_value, spec=spec

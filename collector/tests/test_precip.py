@@ -6,6 +6,9 @@ loader의 `_parse_precip_str`이 함께 쓰는 단일 규칙이다. 두 계층�
 
 범위형 값은 **하한**을 취한다(`"30.0~50.0mm"` → 30.0). 상한 없는 `"50.0mm 이상"`도
 같은 규칙으로 50.0이다 — 평균을 정의할 수 없어 하한 규칙으로 통일했다.
+
+적설(`SNO`)은 표기 형태가 같지만 단위가 cm라 이 함수가 받지 않는다.
+그 규칙과 "서로의 표기를 거부한다"는 검증은 `tests/test_snow.py`에 있다.
 """
 
 import pyarrow as pa
@@ -21,10 +24,6 @@ from validation.types import IssueKind
 class TestNoPrecipitation:
     def test_no_rain_is_zero(self):
         assert parse_precip("강수없음") == 0.0
-
-    def test_no_snow_is_zero(self):
-        """PCP와 같은 응답에 SNO(적설)가 함께 오고 표기가 같은 계열이다."""
-        assert parse_precip("적설없음") == 0.0
 
     def test_bare_zero_is_zero(self):
         """실호출에서 '강수없음'과 맨 '0'이 같은 응답에 섞여 나온다."""
