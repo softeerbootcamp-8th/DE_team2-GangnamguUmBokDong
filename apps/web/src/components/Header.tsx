@@ -8,6 +8,7 @@ const STATUS_POLL_INTERVAL_MS = 30_000;
 export function Header() {
   const [now, setNow] = useState(new Date());
   const [predictedAt, setPredictedAt] = useState<string | null>(null);
+  const [statusError, setStatusError] = useState(false);
 
   useEffect(() => {
     const clock = setInterval(() => setNow(new Date()), 1000);
@@ -16,10 +17,23 @@ export function Header() {
 
   useEffect(() => {
     let cancelled = false;
+    let requestGeneration = 0;
     function refresh() {
-      api.status().then((data) => {
-        if (!cancelled) setPredictedAt(data.base_dttm);
-      });
+      const currentGeneration = ++requestGeneration;
+      api
+        .status()
+        .then((data) => {
+          if (!cancelled && currentGeneration === requestGeneration) {
+            setPredictedAt(data.base_dttm);
+            setStatusError(false);
+          }
+        })
+        .catch(() => {
+          if (!cancelled && currentGeneration === requestGeneration) {
+            setPredictedAt(null);
+            setStatusError(true);
+          }
+        });
     }
     refresh();
     const timer = setInterval(refresh, STATUS_POLL_INTERVAL_MS);
@@ -37,7 +51,9 @@ export function Header() {
       </span>
       <div className="app-header-times">
         <span>현재 시각 {formatClock(now)}</span>
-        <span>예측 시각 {predictedAt ? formatIsoTime(predictedAt, { hour: "2-digit", minute: "2-digit" }) : "-"}</span>
+        <span className={statusError ? "status-error" : undefined}>
+          예측 시각 {statusError ? "갱신 실패" : predictedAt ? formatIsoTime(predictedAt, { hour: "2-digit", minute: "2-digit" }) : "-"}
+        </span>
       </div>
     </header>
   );

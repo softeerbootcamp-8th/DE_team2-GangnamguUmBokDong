@@ -381,7 +381,7 @@ function StationMarkers({
   // 옮겨서 대여소와 행사 사이의 거리를 눈으로 확인할 수 있게 한다.
   useEffect(() => {
     if (!focusedEvent) return;
-    map.setView([focusedEvent.lat, focusedEvent.lon], Math.max(map.getZoom(), COUNT_LABEL_MIN_ZOOM));
+    map.setView([focusedEvent.eventLat, focusedEvent.eventLon], Math.max(map.getZoom(), COUNT_LABEL_MIN_ZOOM));
   }, [focusedEvent, map]);
 
   const regionCell = useMemo(
@@ -410,11 +410,10 @@ function StationMarkers({
       )}
       {/* 주변 행사 탭에서 고른 행사의 위치(초록 점)와, 이 행사를 찾을 때 쓴
           대여소 기준 검색 반경(원, radius_km — 실측된 행사 고유의 영향
-          범위가 아니라 백엔드가 후보를 추릴 때 쓴 검색 반경이다). 대여소는
-          이미 검은 테두리로 구분돼 있어서 원은 행사 위치를 기준으로 그린다. */}
+          범위가 아니라 백엔드가 후보를 추릴 때 쓴 검색 반경이다). */}
       {focusedEvent && (
         <Circle
-          center={[focusedEvent.lat, focusedEvent.lon]}
+          center={[focusedEvent.searchCenterLat, focusedEvent.searchCenterLon]}
           radius={focusedEvent.radiusKm * 1000}
           pathOptions={{ color: EVENT_MARKER_COLOR, weight: 1.5, fillColor: EVENT_MARKER_COLOR, fillOpacity: 0.06, dashArray: "4 4" }}
           interactive={false}
@@ -422,7 +421,7 @@ function StationMarkers({
       )}
       {focusedEvent && (
         <CircleMarker
-          center={[focusedEvent.lat, focusedEvent.lon]}
+          center={[focusedEvent.eventLat, focusedEvent.eventLon]}
           radius={8}
           pathOptions={{ color: IDLE_BORDER, weight: 2, fillColor: EVENT_MARKER_COLOR, fillOpacity: 1 }}
           interactive={false}

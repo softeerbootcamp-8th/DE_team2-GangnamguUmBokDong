@@ -6,6 +6,7 @@
 
 - **React + TypeScript**: 화면을 지도/리스트/그래프/상세 패널 컴포넌트 단위로 나눠서 관리한다.
 - **Vite**: 개발 서버·번들러. 별도 웹팩 설정 없이 바로 개발할 수 있다.
+- **Vitest**: HTTP 오류 계약과 화면 상태 분기를 빠르게 검증한다.
 - **Leaflet + react-leaflet**: 지도 렌더링과 마커 표시. 오픈소스라 별도 API 키 없이 쓸 수 있다.
 - **순수 SVG**: 예측 그래프는 차트 라이브러리 없이 SVG로 직접 그린다(호버 크로스헤어, 범례, 직접 라벨 포함). 라이브러리 하나 안 붙여도 될 만큼 단순한 라인 차트라 이렇게 했다.
 
@@ -24,7 +25,7 @@ npm run dev            # http://localhost:5173
 ```
 web/
   index.html                 # Vite 엔트리 HTML, 페이지 타이틀
-  package.json                # 의존성 목록 + npm scripts(dev/build/preview)
+  package.json                # 의존성 목록 + npm scripts(dev/build/preview/test)
   package-lock.json
   vite.config.ts              # Vite 설정(React 플러그인 등록)
   tsconfig.json                # TypeScript 컴파일러 설정
@@ -61,7 +62,7 @@ web/
 지도와 리스트를 나누지 않고 하나의 통합 리스트(탭으로 필터만)로 둔 이유는, 재배치 트럭이 보통 회수 필요 대여소에서 걷은 자전거를 공급 필요 대여소에 채우는 식으로 한 동선에 묶어서 돌기 때문이다. 리스트 자체를 방향별로 완전히 쪼개면 그 동선 판단이 오히려 더 어려워져서, 동선 판단은 지도(위치 + 방향 + 긴급도가 한 마커에 다 있음)에서 하고 리스트의 탭은 "이 방향만 순서대로 보고 싶을 때" 쓰는 필터로만 뒀다.
 - **반납/대여 수요 예측 그래프** (`components/ForecastPanel.tsx`, `ForecastChart.tsx`, 하단 왼쪽): 선택된 대여소의 `/stations/{sta_id}/forecast` 12시간 그래프(대여·반납 두 선). `action_type`이 처음 `normal`이 아니게 되는 시점을 그래프 위에 세로선 + 시각 라벨로 표시한다(공급 필요는 빨강, 회수 필요는 파랑). 12시간 안에 위험해지지 않는 대여소는 마커를 안 그린다.
 - **예측 재고 그래프** (`components/StockPanel.tsx`, `StockChart.tsx`, 하단 가운데): 지금 재고에서 시작해 `predicted_bikes`를 이어 그린 선 하나 + 정원 위치의 점선 기준선. 대여·반납량(시간당 건수)과 재고(누적된 대수)는 단위가 달라서 한 그래프에 같이 넣으면 축이 두 개가 돼야 하므로, 처음부터 그래프 자체를 분리했다. "몇 시에 위험해지는지" 세로선 마커는 왼쪽 그래프에만 있고 여기엔 없다 — 재고 선이 0이나 정원에 닿는 지점 자체가 이미 위험 시점을 직관적으로 보여주기 때문이다. 대여소가 비콘 기반이라 반납이 막히지 않아 실제로 정원을 넘을 수 있어서, 재고 선이 점선 기준선 위로 올라갈 수 있다. y축은 정원과 실제 최댓값 중 큰 쪽에 맞춰 자동으로 늘어나서(`maxObserved`) 그 초과분이 잘리지 않는다.
-- **대여소 상세 데이터** (`components/DetailPanel.tsx`, 하단 오른쪽): 선택된 대여소의 `/stations/{sta_id}` 상세 정보 + 수요 영향 사유(`forecast.reasons`) 목록.
+- **대여소 상세 데이터** (`components/DetailPanel.tsx`, 하단 오른쪽): 선택된 대여소 정보와 주변 행사, 미래 12시간의 시간별 날씨를 탭으로 표시한다.
 
 지도 마커 클릭과 리스트 항목 클릭은 같은 선택 상태(`App.tsx`의 `selectedStationId`)를 공유해서 서로 연동된다. 예측(`/stations/{sta_id}/forecast`)은 `App.tsx`가 한 번만 가져와서 두 그래프 패널과 상세 패널이 같이 쓴다.
 
@@ -75,7 +76,8 @@ web/
 |---|---|---|
 | `/stations`, `/alerts` | `App.tsx`의 `POLL_INTERVAL_MS` | 15초 |
 | `/status`(예측 기준 시각) | `Header.tsx`의 `STATUS_POLL_INTERVAL_MS` | 30초 |
-| `/stations/{sta_id}/forecast` | `ForecastPanel.tsx` | 60초 |
+| `/stations/{sta_id}/forecast` | `App.tsx`의 `FORECAST_POLL_INTERVAL_MS` | 60초 |
+| `/stations/{sta_id}`, `/events`, `/weather` | `DetailPanel.tsx`의 `DETAIL_POLL_INTERVAL_MS` | 60초 |
 
 백엔드 데이터 자체의 갱신 주기(재고·예측 둘 다 5분, [`../api/README.md`](../api/README.md) 참고)보다 훨씬 잦게 폴링한다. 대부분의 요청은 이전과 같은 값을 그대로 받게 되지만, 사용자가 적어서 그 정도 중복 요청은 비용상 무시할 만하고, 그 대신 값이 바뀐 직후 최대 몇 초~수십 초 안에 화면에 반영된다(5분 주기 그대로 폴링했다면 최악의 경우 갱신 후 거의 5분 가까이 화면이 안 바뀔 수 있다). 트래픽이 늘어나서 이 중복 요청이 부담되면, 그때 폴링 주기를 늘리거나 서버 측 캐싱을 넣는 걸 검토한다.
 
