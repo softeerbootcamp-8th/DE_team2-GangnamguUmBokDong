@@ -81,33 +81,44 @@ def _current_params() -> dict:
     }
 
 
-def _refresh_primary_tables(spark) -> None:
+def _refresh_primary_tables(spark, since: str | None = None) -> None:
     """Silver로부터 station_master/targets/station_status/weather/population을 통째로
     다시 만들어 `build_merged_table.py`가 읽는 경로(`config.STATION_MASTER_PARQUET` 등)에
     저장한다.
 
-    이 5개는 전체 빌드든 증분 빌드든 항상 **전체 재계산**한다 — station_status(연
-    22M행 규모)/weather(연 8,760행)/population/targets는 EMR Spark 풀 리빌드로
-    감당 못 할 크기가 아니고, 예전처럼 "이미 어딘가에 존재하는 1차 정제 산출물"이
-    아니라 이제 이 패키지가 직접 Silver에서 만들어내므로 부분 갱신 로직을 따로 둘
-    이유가 없다. 증분 실행에서 실제로 아끼는 부분은 그 뒤 단계(대여이력 lag/rolling
-    재계산, `build_rolling_rental_features`/`build_merged_table`의 `since`)다.
+    이 5개는 전체 빌드든 증분 빌드든 항상 **`since`부터 지금까지 전체 재계산**한다 —
+    station_status(연 22M행 규모)/weather(연 8,760행)/population/targets는 EMR Spark
+    풀 리빌드로 감당 못 할 크기가 아니고, 예전처럼 "이미 어딘가에 존재하는 1차 정제
+    산출물"이 아니라 이제 이 패키지가 직접 Silver에서 만들어내므로 부분 갱신 로직을
+    따로 둘 이유가 없다. 증분 실행에서 실제로 아끼는 부분은 그 뒤 단계(대여이력
+    lag/rolling 재계산, `build_rolling_rental_features`/`build_merged_table`의 `since`)다.
+
+    **2026-08부터 `since`가 필수에 가까워짐** — `silver_source._silver_glob()`이
+    더 이상 연도로 안 좁히므로(고정 TRAIN_YEAR 폐지, 롤링 윈도우로 전환), `since`
+    없이 부르면 Silver에 쌓인 전체 히스토리를 매번 다시 계산하게 된다. 호출부
+    (`_run_full_build()`/`_run_incremental()`)는 항상 `config.WINDOW_START`를
+    넘긴다 — station_master는 시간 축이 없는 참조 테이블이라 `since` 필터 대상이
+    아니다.
     """
     read_station_master(spark).write.mode("overwrite").parquet(config.STATION_MASTER_PARQUET)
-    read_station_status(spark).write.mode("overwrite").parquet(config.STATION_STATUS_PARQUET)
-    read_weather(spark).write.mode("overwrite").parquet(config.WEATHER_PARQUET)
-    read_population(spark).write.mode("overwrite").parquet(config.POPULATION_PARQUET)
+    read_station_status(spark, since=since).write.mode("overwrite").parquet(config.STATION_STATUS_PARQUET)
+    read_weather(spark, since=since).write.mode("overwrite").parquet(config.WEATHER_PARQUET)
+    read_population(spark, since=since).write.mode("overwrite").parquet(config.POPULATION_PARQUET)
 
-    rental_targets, return_targets = build_targets(spark)
+    rental_targets, return_targets = build_targets(spark, since=since)
     rental_targets.write.mode("overwrite").parquet(config.TARGETS_PARQUET)
     return_targets.write.mode("overwrite").parquet(config.RETURN_TARGETS_PARQUET)
 
 
 def _run_full_build(spark) -> None:
     """워터마크가 없을 때 — Silver 전체로 1차 정제부터 처음부터 만든다."""
-    print(f"[{config.PARAM_COMBO_ID}] 워터마크 없음 -> Silver 전체로 처음부터 생성")
+    window_since = config.WINDOW_START.strftime("%Y-%m-%d 00:00:00")
+    print(
+        f"[{config.PARAM_COMBO_ID}] 워터마크 없음 -> Silver에서 {window_since}~{config.WINDOW_END} "
+        "구간으로 처음부터 생성"
+    )
 
-    _refresh_primary_tables(spark)
+    _refresh_primary_tables(spark, since=window_since)
 
     build_rolling_rental_features(spark, output_path=config.ROLLING_RENTAL_FEATURES_PARQUET)
 
@@ -192,7 +203,12 @@ def _run_incremental(spark, watermark: dict) -> None:
     print(f"[{config.PARAM_COMBO_ID}] 워터마크={watermark_dt} -> {since_str}부터 재계산(증분, "
           f"lookback={config.INCREMENTAL_LOOKBACK_HOURS}시간, 날짜 경계로 내림)")
 
-    _refresh_primary_tables(spark)
+    # _refresh_primary_tables()는 위 since_str(증분 워터마크 기준, 보통 최근 며칠~몇 주)이
+    # 아니라 학습기간 롤링 윈도우 시작점(config.WINDOW_START)을 쓴다 — station_status/
+    # weather/population/targets는 그 자체가 학습에 쓰이는 전체 구간을 커버해야 하고,
+    # 증분 워터마크보다 훨씬 이전 데이터도 필요하기 때문이다.
+    window_since = config.WINDOW_START.strftime("%Y-%m-%d 00:00:00")
+    _refresh_primary_tables(spark, since=window_since)
 
     # rolling_rental_features는 매번 챔피언 경로에 영구 저장하지 않는다 — lookback
     # 구간(기본 35일)만 있으면 항상 다시 계산할 수 있을 만큼 가벼워서(창 폭이 최대

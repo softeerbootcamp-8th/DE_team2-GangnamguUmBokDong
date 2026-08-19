@@ -282,12 +282,12 @@ def train_target(
     filters = [("horizon", "<=", config.MAX_TRAIN_HORIZON)]
 
     _validate_valid_test_days_dont_overlap_train()
-    safe_end = min(date(config.TRAIN_YEAR, 12, 31), config.safety_cutoff_date())
-    train_dates, valid_dates, test_dates = _dates_for_split(date(config.TRAIN_YEAR, 1, 1), safe_end)
+    train_dates, valid_dates, test_dates = _dates_for_split(config.TRAIN_WINDOW_START, config.TRAIN_WINDOW_END)
     if not train_dates or not valid_dates or not test_dates:
         raise ValueError(
             f"학습 구간에 날짜가 없음 — train {len(train_dates)}개, valid {len(valid_dates)}개, "
-            f"test {len(test_dates)}개 ({config.TRAIN_YEAR}년, ~{safe_end.isoformat()}까지) — "
+            f"test {len(test_dates)}개 ({config.TRAIN_WINDOW_START.isoformat()}~"
+            f"{config.TRAIN_WINDOW_END.isoformat()}) — "
             "VALID_DAYS_OF_MONTH/TEST_DAYS_OF_MONTH/TRAIN_DAY_DIVISOR 설정을 확인하세요"
         )
     _append_progress_log(
@@ -328,7 +328,8 @@ def train_target(
         if is_primary:
             mlflow.log_params({
                 "model_name": model_name,
-                "train_year": config.TRAIN_YEAR,
+                "train_window_start": config.TRAIN_WINDOW_START.isoformat(),
+                "train_window_end": config.TRAIN_WINDOW_END.isoformat(),
                 "train_day_divisor": config.TRAIN_DAY_DIVISOR,
                 "max_train_horizon": config.MAX_TRAIN_HORIZON,
                 "valid_days_of_month": sorted(config.VALID_DAYS_OF_MONTH),

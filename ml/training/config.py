@@ -8,8 +8,7 @@
 """
 
 import os
-from datetime import date, datetime, timedelta
-from zoneinfo import ZoneInfo
+from datetime import date, timedelta
 
 from ml_core import common_config
 from ml_core.paths import (
@@ -27,19 +26,9 @@ __all__ = [
     "today_kst",
 ]
 
-_KST = ZoneInfo("Asia/Seoul")
-
-
-def today_kst() -> date:
-    """KST(Asia/Seoul) 기준 오늘 날짜.
-
-    원본 데이터(트립 시각 등) 자체가 한국 로컬 wall-clock이라
-    `feature_engine/spark/spark_session.py`와 같은 이유로 KST로 통일한다 —
-    `date.today()`(시스템 타임존에 의존)를 그대로 쓰면 배포 환경의 타임존에 따라
-    "오늘"의 경계가 달라질 수 있다.
-    """
-    return datetime.now(_KST).date()
-
+# KST 기준 "오늘"은 이제 common_config.py 소유다(feature_engine도 학습기간 롤링
+# 윈도우 계산에 필요해져서 공유 위치로 옮김) — 여기는 하위 호환을 위해 그대로 재수출.
+today_kst = common_config.today_kst
 
 # --- 학습/검증/평가 split (day-of-month 기준) ---
 # 예전엔 TRAIN/VALID/TEST를 시간 순(walk-forward)으로 연속 구간(20/5/5일)만 뽑아
@@ -47,17 +36,17 @@ def today_kst() -> date:
 # LightGBM이 1년 전체를 못 받았기 때문(history.md 18번 항목).
 #
 # **2026-08 실측 + 이후 정책 변경**: 대여/반납 분리 + lag 1개로 줄인 뒤에도(피처
-# 축소 이후) 20분 tick·2025년 전체 multi-horizon 테이블이 8억 행이라 로컬
+# 축소 이후) 20분 tick·1년 전체 multi-horizon 테이블이 8억 행이라 로컬
 # (RAM 18GB)에서 pandas로 한 번에 못 읽어서(에러 메시지도 없이 SIGKILL), 한때
 # day-of-month 배수로 날짜 자체를 줄이는(`TRAIN_DAY_DIVISOR`, 기본 2=짝수날만)
 # 임시 조치를 도입했었다. **20분(또는 그 이하) tick 앵커 밀도는 유지해야 한다는
 # 요구사항이 확정되면서(minute 단위 서빙 요청을 실제로 커버해야 함 — 시간
 # 단위로 앵커를 줄이면 모델이 그 minute 값들을 아예 학습에서 못 봄), 날짜를
 # 솎아내는 방식으로 메모리를 줄이는 건 기본값에서 뺐다** — `TRAIN_DAY_DIVISOR`
-# 기본값을 다시 1(=날짜 필터 없음, 1년 전체)로 되돌렸다. 로컬 RAM 한계는 이제
-# 샘플링이 아니라 스트리밍/청크 학습·분산 학습·더 큰 머신 같은 실제 엔지니어링
-# 해법으로 풀 것 — 그게 어려운 특수 상황(예: 로컬에서 급하게 뭔가 검증)에서만
-# `TRAIN_DAY_DIVISOR`를 다시 2, 3, 5로 올리는 임시 dial로 남겨둔다.
+# 기본값을 다시 1(=날짜 필터 없음, 전체 윈도우 사용)로 되돌렸다. 대신 실제 메모리
+# 문제는 `lazy_train_dataset.py`의 날짜 파티션 단위 스트리밍 학습으로 푼다 —
+# 그게 어려운 특수 상황(예: 로컬에서 급하게 뭔가 검증)에서만 `TRAIN_DAY_DIVISOR`를
+# 다시 2, 3, 5로 올리는 임시 dial로 남겨둔다.
 #
 # train은 **`TRAIN_DAY_DIVISOR`의 배수인 날 중 VALID/TEST로 안 뽑힌 날**
 # (기본 1 = 사실상 전체 날짜), valid/test는 `VALID_DAYS_OF_MONTH`/
@@ -65,24 +54,36 @@ def today_kst() -> date:
 # valid/test 여부를 먼저 확정하고(`elif`) 그 나머지 중에서만 train 배수 조건을 보므로,
 # TRAIN_DAY_DIVISOR가 1이라 "모든 날짜가 배수"인 경우에도 valid/test 날짜가
 # train으로 새지 않는다.
-#
-# 대여이력은 반납이 완료돼야 Silver에 나타난다(feature_engine/spark/run_pipeline.py의
-# 날짜 파티션 overwrite 보정과 같은 이유) — 그래서 가장 최근 TRAINING_SAFETY_MARGIN_DAYS
-# (기본 7일)는 rental_count 집계가 아직 안 끝났을 수 있어 학습/평가 라벨로 쓰지 않는다
-# (TRAIN_YEAR가 이미 지난 해라면 사실상 영향 없음 — "오늘"에 가까운 올해를 학습할 때만
-# 실제로 걸러진다). feature_engine의 INCREMENTAL_LOOKBACK_HOURS(35일 — 사후 보정을
-# 계속 반영하기 위한 feature mart 쪽 마진)와는 목적이 다른, "이 정도 지났으면 라벨을
-# 믿고 학습해도 된다"는 별도의(더 짧은) 마진이다.
-TRAINING_SAFETY_MARGIN_DAYS = int(os.environ.get("TRAINING_SAFETY_MARGIN_DAYS", "7"))
-TRAIN_YEAR = int(os.environ.get("TRAIN_YEAR", "2025"))
 TRAIN_DAY_DIVISOR = int(os.environ.get("TRAIN_DAY_DIVISOR", "1"))
 VALID_DAYS_OF_MONTH = frozenset(int(d) for d in os.environ.get("VALID_DAYS_OF_MONTH", "11,13").split(","))
 TEST_DAYS_OF_MONTH = frozenset(int(d) for d in os.environ.get("TEST_DAYS_OF_MONTH", "17,19").split(","))
+
+# --- 학습기간 롤링 윈도우 (2026-08부터, 고정 TRAIN_YEAR 폐지) ---
+# `common_config.training_window()`가 프로필의 TRAIN_LOOKBACK_MONTHS/
+# TRAINING_SAFETY_MARGIN_DAYS로 "오늘 기준 최근 N개월"을 계산한다 — 매달 재학습
+# 전에 이 프로세스가 새로 뜨므로, 매번 새로 계산된 값을 그대로 쓰면 코드 변경
+# 없이 다음 실행부터 최신 구간이 반영된다(feature_engine/spark/config.py와 동일
+# 함수를 공유 — 둘이 다른 값을 보면 학습기간과 실제 존재하는 feature mart 구간이
+# 어긋난다).
+#
+# TRAINING_SAFETY_MARGIN_DAYS는 대여이력이 반납 완료 시에만 Silver에 나타나는
+# 것과 같은 이유로(feature_engine/spark/run_pipeline.py의 날짜 파티션 overwrite
+# 보정 참고) 최근 며칠은 라벨이 아직 안 굳었을 수 있어 학습/평가에서 뺀다 — 예전엔
+# 이 파일 전용 환경변수였는데, feature_engine도 같은 마진이 필요해져서
+# common_config로 승격됐다(값은 여기서 재수출해 기존 `config.TRAINING_SAFETY_MARGIN_DAYS`
+# 참조/monkeypatch 하위 호환을 유지).
+TRAINING_SAFETY_MARGIN_DAYS = common_config.TRAINING_SAFETY_MARGIN_DAYS
+TRAIN_WINDOW_START, TRAIN_WINDOW_END = common_config.training_window()
 
 
 def safety_cutoff_date(as_of: date | None = None) -> date:
     """`as_of - TRAINING_SAFETY_MARGIN_DAYS` — 이 날짜를 넘는 라벨은 아직 확정되지
     않았을 수 있어 학습/평가에 쓰지 않는다.
+
+    `monitor_performance.py`가 여전히 이 함수를 쓴다(월별 실측 성능 구간 계산,
+    학습기간 자체와는 다른 용도) — `TRAIN_WINDOW_END`는 이미 이 마진이 적용된
+    값이라 `train_common.py`는 이 함수를 직접 부르지 않고 `TRAIN_WINDOW_END`를
+    그대로 쓴다.
 
     args:
         as_of: 기준 날짜(기본 오늘) — 테스트에서 날짜를 고정하기 위한 override

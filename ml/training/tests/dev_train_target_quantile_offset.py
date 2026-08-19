@@ -64,8 +64,8 @@ def _seed_rental_table(n_each: int = 8) -> None:
 
 
 def test_rental_quantile_predictions_are_not_contaminated_by_exposure_offset(monkeypatch):
-    monkeypatch.setattr(config, "TRAIN_YEAR", 2025)
-    monkeypatch.setattr(config, "safety_cutoff_date", lambda as_of=None: date(2025, 12, 31))
+    monkeypatch.setattr(config, "TRAIN_WINDOW_START", date(2025, 1, 1))
+    monkeypatch.setattr(config, "TRAIN_WINDOW_END", date(2025, 12, 31))
     monkeypatch.setattr(config, "LGB_NUM_BOOST_ROUND", 5)
     monkeypatch.setattr(config, "LGB_EARLY_STOPPING_ROUNDS", 5)
 

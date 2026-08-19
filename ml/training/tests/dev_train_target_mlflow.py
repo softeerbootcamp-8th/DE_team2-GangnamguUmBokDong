@@ -31,8 +31,11 @@ def _local_mlflow(tmp_path, monkeypatch):
     # (training은 의도적으로 mlflow-skinny만 씀) 이 플래그로 로컬 파일 backend를 쓴다.
     monkeypatch.setenv("MLFLOW_ALLOW_FILE_STORE", "true")
     monkeypatch.setattr(train_common.mlflow_tracking, "MLFLOW_TRACKING_URI", str(tmp_path / "mlruns"))
-    monkeypatch.setattr(config, "TRAIN_YEAR", 2025)
-    monkeypatch.setattr(config, "safety_cutoff_date", lambda as_of=None: date(2025, 12, 31))
+    # 고정 TRAIN_YEAR 대신 TRAIN_WINDOW_START/END로 학습기간을 직접 고정한다(2026-08,
+    # common_config.training_window()가 실제 "오늘" 기준으로 계산하므로 테스트에선
+    # 아래 시딩 데이터(1/2, 1/11, 1/17)를 확실히 덮는 고정 구간으로 override).
+    monkeypatch.setattr(config, "TRAIN_WINDOW_START", date(2025, 1, 1))
+    monkeypatch.setattr(config, "TRAIN_WINDOW_END", date(2025, 12, 31))
     monkeypatch.setattr(config, "LGB_NUM_BOOST_ROUND", 3)
     monkeypatch.setattr(config, "LGB_EARLY_STOPPING_ROUNDS", 3)
 

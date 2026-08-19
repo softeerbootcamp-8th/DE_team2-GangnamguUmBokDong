@@ -17,7 +17,8 @@
 (`models/champion/{model_name}.json`)가 그 아카이브 prefix를 가리키도록 원자적으로
 전환한다 — 파일을 복사하지 않는다(승격 도중 파일이 부분적으로만 바뀌어 서로 다른
 버전이 섞이는 문제를 피하기 위함, `ml_core.paths.read_champion_prefix()` docstring
-참고). 만족 못 하면 다른 프로필(`libs/ml_core/profiles/*.json`)로 다시 시도하고,
+참고). 만족 못 하면 다른 프로필(S3 `profiles/*.json` — `ml_core.common_config.
+list_profile_names()`가 나열, `ml_core.profile_registry.push_profile()`로 생성)로 다시 시도하고,
 가진 프로필을 전부 써도 못 넘으면 챔피언을 그대로 두고 다음 달을 기약한다(정상
 종료 — 예외를 던지지 않는다).
 

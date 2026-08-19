@@ -16,16 +16,32 @@ import boto3
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
+from botocore.config import Config as BotoConfig
 from botocore.exceptions import ClientError
 
 
-def _client():
-    """S3 호환 클라이언트를 생성한다."""
+def _client(timeout_seconds: float | None = None):
+    """S3 호환 클라이언트를 생성한다.
+
+    args:
+        timeout_seconds: 지정하면 connect/read timeout을 이 값으로 두고 재시도를
+            끈다(`retries={"max_attempts": 1}`) — 기본(None)은 boto3 기본 재시도
+            정책 그대로(연결 자체가 안 되는 엔드포인트에서 실측 8.5초 소요). 프로필처럼
+            "S3가 응답 안 하면 즉시 내장 기본값으로 폴백"해야 하는 드문 호출에서만 쓴다
+            — 대부분의 호출(학습 데이터 로드 등)은 느리더라도 끝까지 재시도하는 게
+            맞아 기본값을 안 바꾼다.
+    """
+    config = None
+    if timeout_seconds is not None:
+        config = BotoConfig(
+            connect_timeout=timeout_seconds, read_timeout=timeout_seconds, retries={"max_attempts": 1}
+        )
     return boto3.client(
         "s3",
         endpoint_url=os.environ.get("S3_ENDPOINT_URL") or None,
         aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID", "minioadmin"),
         aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY", "minioadmin"),
+        config=config,
     )
 
 
@@ -34,18 +50,21 @@ def _bucket() -> str:
     return os.environ.get("S3_BUCKET", "gangnamgu")
 
 
-def get_object_bytes(key: str) -> bytes | None:
+def get_object_bytes(key: str, timeout_seconds: float | None = None) -> bytes | None:
     """S3 객체를 bytes로 읽는다.
 
     args:
         key: 읽을 객체의 전체 키
+        timeout_seconds: `_client()` 참고 — 지정하면 짧은 timeout+재시도 없음으로 조회한다.
     returns:
         객체 본문 bytes, 키가 없으면 None
     raises:
         ClientError: NoSuchKey가 아닌 다른 S3 오류가 발생했을 때
+        botocore.exceptions.EndpointConnectionError 등: timeout_seconds 지정 시
+            엔드포인트 자체가 응답하지 않으면 그대로 던진다 — 호출부가 폴백을 결정한다.
     """
     try:
-        return _client().get_object(Bucket=_bucket(), Key=key)["Body"].read()
+        return _client(timeout_seconds).get_object(Bucket=_bucket(), Key=key)["Body"].read()
     except ClientError as exc:
         if exc.response["Error"]["Code"] == "NoSuchKey":
             return None
@@ -283,9 +302,13 @@ def write_parquet(data: pd.DataFrame | pq.Table, key: str) -> None:
     put_object_bytes(key, buffer.getvalue())
 
 
-def read_json(key: str):
-    """S3의 JSON 객체를 읽는다 (dict 또는 list — JSON 최상위 값 그대로). 키가 없으면 None."""
-    body = get_object_bytes(key)
+def read_json(key: str, timeout_seconds: float | None = None):
+    """S3의 JSON 객체를 읽는다 (dict 또는 list — JSON 최상위 값 그대로). 키가 없으면 None.
+
+    args:
+        timeout_seconds: `_client()` 참고.
+    """
+    body = get_object_bytes(key, timeout_seconds=timeout_seconds)
     if body is None:
         return None
     return json.loads(body)

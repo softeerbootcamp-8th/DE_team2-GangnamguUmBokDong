@@ -96,13 +96,15 @@ NATIVE_COLUMN_DTYPES = {
 
 
 def _holidays_for_train_year() -> set[str]:
-    """`config.TRAIN_YEAR` 전후(±1년) 대한민국 공휴일을 계산한다.
+    """`config.WINDOW_START`~`WINDOW_END`(롤링 학습기간) 전후(±1년) 대한민국 공휴일을 계산한다.
 
     `holidays` 패키지(ml_core.holidays_kr)로 오프라인 계산하므로 analysis_summary.json
     같은 사전 준비 파일이 필요 없다. 앞뒤로 1년씩 여유를 두는 이유: 증분(`since`)
-    재계산이나 연말/연초 경계에 걸치는 구간이 TRAIN_YEAR 밖 날짜를 포함할 수 있어서다.
+    재계산이나 연말/연초 경계에 걸치는 구간이 윈도우 밖 날짜를 포함할 수 있어서다.
+    윈도우 자체가 연도를 걸칠 수 있으므로(2026-08부터, 고정 TRAIN_YEAR 폐지) 범위
+    전체를 `range()`로 커버한다.
     """
-    return korean_holidays([config.TRAIN_YEAR - 1, config.TRAIN_YEAR, config.TRAIN_YEAR + 1])
+    return korean_holidays(range(config.WINDOW_START.year - 1, config.WINDOW_END.year + 2))
 
 
 def _expand_hourly_to_ticks(status: DataFrame, tick_minutes: int, spark: SparkSession) -> DataFrame:
