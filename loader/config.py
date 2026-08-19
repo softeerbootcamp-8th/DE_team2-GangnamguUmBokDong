@@ -47,8 +47,14 @@ def _load_table_specs() -> dict[str, TableSpec]:
         transform_fn = getattr(transform, raw["transform"])
 
         reader_fn = None
-        if raw.get("reader") == "read_predictions":
-            reader_fn = lambda ws: reader.read_predictions(ws).to_pandas()
+        if raw.get("reader"):
+            reader_name = raw["reader"]
+            # getattr을 람다 밖에서 한 번만 실행해 캡처하면 안 된다 — 테스트가
+            # `monkeypatch.setattr("config.reader.read_predictions", ...)`처럼
+            # 모듈 속성을 나중에 바꿔치기하므로, 호출 시점마다 다시 조회해야
+            # 그 패치가 반영된다(기존 하드코딩 버전의 lambda ws: reader.read_predictions(ws)와
+            # 동일한 지연 조회 방식을 유지).
+            reader_fn = lambda ws, reader_name=reader_name: getattr(reader, reader_name)(ws).to_pandas()
 
         specs[table_name] = TableSpec(
             source_id=raw["source_id"],

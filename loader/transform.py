@@ -341,6 +341,31 @@ def forecast_points_from_predictions(df: pd.DataFrame, batch_run_at: datetime) -
     return records
 
 
+def station_urgency_from_urgency_batch(df: pd.DataFrame, batch_run_at: datetime) -> list[dict]:
+    """rebalance 배치(urgency.compute_all)의 결과 DataFrame을 station_urgency 테이블
+    레코드 목록으로 변환한다.
+
+    args:
+        df: rebalance가 S3에 쓴 urgency 결과 DataFrame(sta_id, urgency_score,
+            minutes_until_critical, action_type)
+        batch_run_at: 배치 실행 시각 (KST)
+    returns:
+        station_urgency 테이블 적재용 레코드 목록
+    """
+    records = []
+    for row in df.to_dict("records"):
+        records.append(
+            {
+                "sta_id": str(row["sta_id"]),
+                "urgency_score": float(row["urgency_score"]),
+                "minutes_until_critical": int(row["minutes_until_critical"]),
+                "action_type": row["action_type"],
+                "batch_run_at": batch_run_at,
+            }
+        )
+    return records
+
+
 def _to_float(value) -> float | None:
     """문자열 또는 숫자 값을 float으로 변환한다 (변환 불가 시 None)."""
     if value is None or value == "":

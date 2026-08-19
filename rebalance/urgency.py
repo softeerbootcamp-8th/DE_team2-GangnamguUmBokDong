@@ -1,7 +1,22 @@
+"""대여소별 재배치 긴급도(urgency_score) 배치 계산.
+
+과거 apps/api/scoring.py에 있던 로직을 그대로 이식했다(계산 로직 변경 없음) —
+urgency_score는 이제 요청마다가 아니라 5분 배치로 한 번만 계산되고, 결과는
+station_urgency 테이블에 적재돼 apps/api/main.py:list_alerts()가 그 결과만
+조회한다. enrich_forecast_points는 apps/api(/stations/{sta_id}/forecast, 실시간)와
+공유해야 해서 libs/core/src/core/forecast.py로 옮겨 거기서 가져다 쓴다.
+"""
+
+from __future__ import annotations
+
+import logging
 import math
 from datetime import datetime
 
-from scoring_config import (
+import pandas as pd
+import reader
+from core.forecast import enrich_forecast_points
+from core.scoring_config import (
     FIRST_FORECAST_MIN,
     HALF_LIFE_MIN,
     RESPONSE_LAG_MIN,
@@ -9,27 +24,7 @@ from scoring_config import (
     SUPPLY_LOW_STOCK_RATIO,
 )
 
-
-def enrich_forecast_points(current_stock: int, hold_cnt: int, raw_points: list[dict]) -> list[dict]:
-    """모델이 낸 대여·반납량(원본치)에 현재 재고를 누적해 예측 재고·action_type을 계산한다.
-
-    0 밑으로는 못 내려가게 막지만(자전거 수가 마이너스일 순 없다), 정원 위로는 막지
-    않는다. 거치대에 꽂는 방식이 아니라 비콘 기반이라 반납 자체는 막히지 않아서,
-    실제로 정원을 넘는 대여소가 있기 때문이다.
-    """
-    predicted = current_stock
-    supply_threshold = SUPPLY_LOW_STOCK_RATIO * hold_cnt
-    points = []
-    for raw in raw_points:
-        predicted = max(0, predicted + raw["predicted_return_cnt"] - raw["predicted_rent_cnt"])
-        if predicted <= supply_threshold:
-            action_type = "supply_needed"
-        elif predicted >= hold_cnt:
-            action_type = "retrieval_needed"
-        else:
-            action_type = "normal"
-        points.append({**raw, "predicted_bikes": predicted, "action_type": action_type})
-    return points
+logger = logging.getLogger(__name__)
 
 
 def _regression_slope(xs: list[float], ys: list[float]) -> float:
@@ -161,8 +156,8 @@ def urgency_score(
     slack = max(0.0, time_to_critical - RESPONSE_LAG_MIN)
     time_factor = 2 ** (-slack / HALF_LIFE_MIN)
 
-    # hold_cnt=0(신규/이상 등록 등)인 대여소가 들어오면 division by zero로 API
-    # 전체가 500 에러를 내므로, 최소 1로 방어한다.
+    # hold_cnt=0(신규/이상 등록 등)인 대여소가 들어오면 division by zero로 배치가
+    # 죽으므로, 최소 1로 방어한다.
     safe_hold_cnt = max(hold_cnt, 1)
     if action_type == "retrieval_needed":
         ratio = _max_overshoot(current, hold_cnt, points) / safe_hold_cnt
@@ -172,3 +167,73 @@ def urgency_score(
 
     score = round(100 * time_factor * impact_factor, 1)
     return score, round(time_to_critical), action_type
+
+
+def _predicted_points_by_station(predictions: pd.DataFrame) -> dict[str, list[dict]]:
+    """예측 결과 DataFrame(station_id, date, hour, minute, horizon, rental_pred_mean,
+    return_pred_mean)을 대여소별로 horizon 순 정렬된 {predicted_rent_cnt,
+    predicted_return_cnt} 리스트로 바꾼다. 반올림은 loader/transform.py의
+    forecast_points_from_predictions와 같은 규칙(round)을 쓴다."""
+    by_station: dict[str, list[dict]] = {}
+    for sta_id, group in predictions.groupby("station_id"):
+        ordered = group.sort_values("horizon")
+        by_station[str(sta_id)] = [
+            {
+                "predicted_rent_cnt": round(row.rental_pred_mean),
+                "predicted_return_cnt": round(row.return_pred_mean),
+            }
+            for row in ordered.itertuples(index=False)
+        ]
+    return by_station
+
+
+def compute_all(anchor: datetime) -> pd.DataFrame:
+    """anchor 시점 기준 전체 대여소의 urgency_score를 계산한다.
+
+    입력은 전부 S3(재고 이력·예측 결과)에서만 읽는다 — RDS는 이 배치가 만든 결과를
+    loader가 station_urgency에 적재할 때만 쓰인다(배치 자신은 RDS를 건드리지 않음).
+    """
+    if anchor.minute % 5 or anchor.second or anchor.microsecond:
+        raise ValueError(f"anchor must align to a 5-minute tick: {anchor}")
+
+    stock_history_by_station = reader.read_recent_stock(anchor)
+    predictions = reader.read_predictions(anchor)
+    points_by_station = _predicted_points_by_station(predictions)
+
+    # 5분 snapshot 배치의 "현재 재고"는 anchor tick에서 직접 관측된 값만 쓴다.
+    # 5분 이내(예: 14:00을 14:05에 허용)로 느슨하게 잡으면 서로 다른 snapshot의
+    # 재고가 한 결과에 섞일 수 있으므로, 누락 station은 이번 batch에서 제외한다.
+    current_histories = {
+        sta_id: history
+        for sta_id, history in stock_history_by_station.items()
+        if history and history[-1]["observed_at"] == anchor
+    }
+    unsupported_stations = set(current_histories) - set(points_by_station)
+    if unsupported_stations:
+        # run_inference는 학습된 model category만 예측하고, 그 집합 안에서 partial이
+        # 발생하면 exit 1로 downstream을 막는다. 따라서 여기의 stock-only station은
+        # 신설 등 모델 미지원 대상으로 간주해 제외하되 운영 가시성을 위해 집계한다.
+        logger.warning(
+            "excluding %d current-stock stations without model predictions",
+            len(unsupported_stations),
+        )
+    computable_station_ids = set(current_histories) & set(points_by_station)
+
+    rows = []
+    for sta_id in sorted(computable_station_ids):
+        history = current_histories[sta_id]
+        current = history[-1]["parking_bike_tot_cnt"]
+        hold_cnt = history[-1]["hold_cnt"]
+        raw_points = points_by_station[sta_id]
+        points = enrich_forecast_points(current, hold_cnt, raw_points)
+
+        score, minutes, action_type = urgency_score(current, hold_cnt, history, points, anchor)
+        rows.append(
+            {
+                "sta_id": sta_id,
+                "urgency_score": score,
+                "minutes_until_critical": minutes,
+                "action_type": action_type,
+            }
+        )
+    return pd.DataFrame(rows, columns=["sta_id", "urgency_score", "minutes_until_critical", "action_type"])

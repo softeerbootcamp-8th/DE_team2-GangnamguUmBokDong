@@ -1,4 +1,4 @@
-"""로컬 개발용 대여소 2,746곳 + 재고 이력 + 예측치를 골드 테이블에 채운다.
+"""로컬 개발용 대여소 2,746곳 + 재고·예측·urgency를 골드 테이블에 채운다.
 
 collector→gold를 채우는 실제 ETL이 아직 없어서, apps/api를 로컬에서 켜보려면
 이 스크립트로 더미 데이터를 직접 넣어야 한다. 실행: `uv run python seed_gold.py`
@@ -25,7 +25,6 @@ from datetime import timedelta
 from pathlib import Path
 
 from core.db import get_connection
-
 from queries import now_utc
 
 STATIONS = json.loads((Path(__file__).parent / "seed_data" / "stations_seoul.json").read_text(encoding="utf-8"))
@@ -58,6 +57,7 @@ def seed() -> None:
 
     stock_rows = []
     forecast_rows = []
+    urgency_rows = []
     for station in STATIONS:
         sta_id = str(station["sta_id"])
         for minutes_ago, parking_bike_tot_cnt in station["stock_history"]:
@@ -67,11 +67,13 @@ def seed() -> None:
             forecast_rows.append(
                 (sta_id, now + timedelta(hours=hour), predicted_rent_cnt, predicted_return_cnt, now)
             )
+        urgency_rows.append((now, sta_id, 0.0, 720, "normal"))
 
     with get_connection() as conn, conn.cursor() as cur:
         # 이전에 다른 STATIONS 구성으로 시드를 돌린 적이 있으면, 지금 목록에 없는
         # sta_id가 stations 테이블에 잔여물로 남아있을 수 있다(예: 예전 33곳짜리
         # 시드의 흔적). 그런 것도 같이 지운다.
+        cur.execute("DELETE FROM station_urgency")
         cur.execute("DELETE FROM forecast_points WHERE sta_id != ALL(%s)", (sta_ids,))
         cur.execute("DELETE FROM station_stock WHERE sta_id != ALL(%s)", (sta_ids,))
         cur.execute("DELETE FROM stations WHERE sta_id != ALL(%s)", (sta_ids,))
@@ -115,6 +117,19 @@ def seed() -> None:
             forecast_rows,
         )
 
+        cur.executemany(
+            """
+            INSERT INTO station_urgency
+                (batch_run_at, sta_id, urgency_score, minutes_until_critical, action_type)
+            VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT (batch_run_at, sta_id) DO UPDATE SET
+                urgency_score = EXCLUDED.urgency_score,
+                minutes_until_critical = EXCLUDED.minutes_until_critical,
+                action_type = EXCLUDED.action_type
+            """,
+            urgency_rows,
+        )
+
         today = now_utc().date()
         cur.executemany(
             """
@@ -149,7 +164,7 @@ def seed() -> None:
             ],
         )
 
-    print(f"seeded {len(STATIONS)} stations, {len(SEED_EVENTS)} cultural events")
+    print(f"seeded {len(STATIONS)} stations with urgency, {len(SEED_EVENTS)} cultural events")
 
 
 if __name__ == "__main__":
