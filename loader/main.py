@@ -54,7 +54,7 @@ def run(table: str, window_start: datetime) -> None:
             if excluded_count:
                 print(f"excluded {excluded_count} urgency rows absent from stations")
             rows = filtered_rows
-        upsert(conn, target_table, rows, spec.conflict_cols, spec.update_cols)
+        upsert(conn, target_table, rows, spec.conflict_cols, spec.update_cols, guard_col=spec.guard_col)
         conn.commit()
 
     print(f"upserted {len(rows)} rows into {target_table}")

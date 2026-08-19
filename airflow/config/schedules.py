@@ -13,6 +13,9 @@ WEATHER_3H_CRON = "0 */3 * * *"
 # 확인해 필요하면 조정한다.
 DAILY_CRON = "0 3 * * *"
 
+# 하루치 silver를 archive로 묶는 배치. 일 단위 수집(03:00)이 끝난 뒤에 돈다.
+COMPACTION_CRON = "30 4 * * *"
+
 DEFAULT_RETRIES = 2
 DEFAULT_RETRY_DELAY = timedelta(seconds=30)
 DEFAULT_EXECUTION_TIMEOUT = timedelta(seconds=240)
@@ -24,6 +27,9 @@ EXECUTION_TIMEOUT_OVERRIDES = {
 }
 
 NOWCASTING_EXECUTION_TIMEOUT = timedelta(seconds=600)
+# 변경이 없는 날짜는 LIST 한 번으로 끝나지만, 백필이 들어온 날은 하루치 parquet을
+# 전부 다시 읽는다. bike_rental_history 기준 288개가 상한이다.
+COMPACTION_EXECUTION_TIMEOUT = timedelta(seconds=900)
 # 실측 데이터 없음(placeholder) — 로컬에서 --all-stations 1회 실행 시간을 재본 뒤 조정.
 INFERENCE_EXECUTION_TIMEOUT = timedelta(seconds=300)
 DB_LOADER_EXECUTION_TIMEOUT = timedelta(seconds=120)

@@ -24,62 +24,65 @@ columns:
   CELL_ID:
     types: [str]
     required: true
+  # 이 소스는 소수 인구를 '*'로 가려서 보낸다(실측: SPOP 9.8%, 나이·성별 컬럼 53.4%).
+  # masked_float 캐스터가 '*'을 TYPE_ERROR가 아니라 결측으로 판정시킨다 — 그래야
+  # manifest 집계가 missing으로 잡히고 optional_missing 정책이 걸린다(`core.masked` 참고).
   SPOP:
-    types: [float]
+    types: [masked_float]
     range: {min: 0, max: 10000000}
   M00:
-    types: [float]
+    types: [masked_float]
   M10:
-    types: [float]
+    types: [masked_float]
   M15:
-    types: [float]
+    types: [masked_float]
   M20:
-    types: [float]
+    types: [masked_float]
   M25:
-    types: [float]
+    types: [masked_float]
   M30:
-    types: [float]
+    types: [masked_float]
   M35:
-    types: [float]
+    types: [masked_float]
   M40:
-    types: [float]
+    types: [masked_float]
   M45:
-    types: [float]
+    types: [masked_float]
   M50:
-    types: [float]
+    types: [masked_float]
   M55:
-    types: [float]
+    types: [masked_float]
   M60:
-    types: [float]
+    types: [masked_float]
   M65:
-    types: [float]
+    types: [masked_float]
   M70:
-    types: [float]
+    types: [masked_float]
   F00:
-    types: [float]
+    types: [masked_float]
   F10:
-    types: [float]
+    types: [masked_float]
   F15:
-    types: [float]
+    types: [masked_float]
   F20:
-    types: [float]
+    types: [masked_float]
   F25:
-    types: [float]
+    types: [masked_float]
   F30:
-    types: [float]
+    types: [masked_float]
   F35:
-    types: [float]
+    types: [masked_float]
   F40:
-    types: [float]
+    types: [masked_float]
   F45:
-    types: [float]
+    types: [masked_float]
   F50:
-    types: [float]
+    types: [masked_float]
   F55:
-    types: [float]
+    types: [masked_float]
   F60:
-    types: [float]
+    types: [masked_float]
   F65:
-    types: [float]
+    types: [masked_float]
   F70:
-    types: [float]
+    types: [masked_float]

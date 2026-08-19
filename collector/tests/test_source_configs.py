@@ -47,16 +47,36 @@ class TestAllSourcesLoad:
         assert config.adapter in ("seoul_openapi", "kma_apihub")
         assert config.config_version.startswith("sha256:")
 
+    def test_no_source_declares_response_pagination_meta(self):
+        """`RNUM`·`START_INDEX`·`END_INDEX`는 데이터가 아니라 요청/응답 메타다.
+
+        실측에서 `START_INDEX`/`END_INDEX`는 전 행이 `(0, 0)`이고 `RNUM`은 그 응답
+        안에서의 행 번호다. 선언하면 두 가지가 나빠진다.
+
+        1. archive에 의미 없는 컬럼이 쌓인다(`docs/collector/bootstrap-design.md`도
+           "archive에도 의미가 없다"고 적어뒀다 — CSV bootstrap은 채울 수조차 없다).
+        2. `compaction.dedup`이 `_window_start`를 뺀 **전체 데이터 컬럼**으로 묶으므로
+           `RNUM`이 dedup 키에 들어간다. 같은 시간대를 여러 윈도우가 반복 수집할 때
+           목록에 지연 등록이 끼어들어 `RNUM`이 한 칸 밀리면, 같은 대여가 서로 다른
+           행으로 남아 중복이 걷히지 않는다.
+        """
+        forbidden = {"RNUM", "START_INDEX", "END_INDEX"}
+        for source_id in SOURCE_IDS:
+            config = config_loader.load(source_id, base_dir=SOURCES_DIR)
+            declared = forbidden & set(config.columns)
+            assert not declared, f"{source_id}에 응답 메타 컬럼이 선언돼 있다: {sorted(declared)}"
+
     def test_bike_rental_history_preserves_string_compatible_types(self):
         config = config_loader.load("bike_rental_history", base_dir=SOURCES_DIR)
 
+        # 윈도우 직전 순간(window_last)의 시를 요청한다 — 매시 끝자락 누락 방지.
+        # `RNUM`은 의도적으로 선언하지 않는다(위 응답 메타 테스트 참고).
         assert config.adapter_params["path_suffix"] == (
-            "/{window_start:%Y-%m-%d}/{window_start:%H}"
+            "/{window_last:%Y-%m-%d}/{window_last:%H}"
         )
         assert config.columns["USE_MIN"].types == ("str", "int")
         assert config.columns["USE_DST"].types == ("str", "float")
         assert config.columns["BIRTH_YEAR"].types == ("str", "int")
-        assert config.columns["RNUM"].types == ("str", "int")
 
     def test_population_realtime_covers_current_121_pois(self):
         config = config_loader.load("population_realtime", base_dir=SOURCES_DIR)
@@ -278,13 +298,12 @@ class TestKmaSourceEndToEnd:
     @pytest.mark.parametrize(
         "source_id", ["weather_ultra_short_live", "weather_short_term_forecast"]
     )
-    def test_weather_grids_cover_25_seoul_gu_one_to_one(self, source_id):
-        """loader/gu_mapping.py의 `_GRID_TO_GU_TABLE`은 여기 grids 목록과 1:1로
-        맞춰 25개 구 전부를 대표하도록 만들어졌다. 격자를 늘리거나 줄일 때 loader
-        쪽 테이블과 어긋나면 일부 구의 weather_current/weather_forecast가 조용히
-        비게 되므로, 최소한 "정확히 25개, 중복 없음"은 여기서 회귀로 잡는다."""
+    def test_weather_grids_cover_all_real_stations_without_duplicates(self, source_id):
+        """grids 목록은 `loader/scripts/generate_weather_grids.py`가 실제 대여소
+        좌표(`apps/api/seed_data/stations_seoul.json`) 전부를 `latlon_to_grid`로
+        변환해 만든 고유 격자 집합이다(현재 34개). 더는 "구당 격자 1개" 하드코딩
+        테이블에 맞출 필요가 없으므로, 여기서는 "중복 없음"만 회귀로 잡는다."""
         config = config_loader.load(source_id, base_dir=SOURCES_DIR)
         grids = config.adapter_params["grids"]
 
-        assert len(grids) == 25
-        assert len({tuple(g) for g in grids}) == 25
+        assert len(grids) == len({tuple(g) for g in grids})

@@ -167,6 +167,124 @@ def test_fetch_yields_raw_response_unmodified():
     assert results[0].payload == raw
 
 
+def _page_body(total_count, page_no, items):
+    return json.dumps(
+        {
+            "response": {
+                "header": {"resultCode": "00"},
+                "body": {
+                    "dataType": "JSON",
+                    "items": {"item": items},
+                    "pageNo": page_no,
+                    "numOfRows": 1000,
+                    "totalCount": total_count,
+                },
+            }
+        }
+    ).encode()
+
+
+def test_fetch_fetches_second_page_when_total_count_exceeds_num_of_rows():
+    """totalCount(1052)가 numOfRows(1000)를 넘으면 2페이지를 마저 받아 하나의
+    격자 결과로 합쳐야 한다(#버그: 예전엔 1페이지만 받고 나머지 52건을 유실했다)."""
+    page1_items = [{"category": "TMP", "fcstValue": str(i)} for i in range(1000)]
+    page2_items = [{"category": "REH", "fcstValue": str(i)} for i in range(52)]
+    calls = []
+
+    def handler(request):
+        params = dict(request.url.params)
+        page_no = int(params["pageNo"])
+        calls.append(page_no)
+        if page_no == 1:
+            return httpx.Response(200, content=_page_body(1052, 1, page1_items))
+        return httpx.Response(200, content=_page_body(1052, 2, page2_items))
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    results = list(KmaApiHubAdapter.fetch(_config(grids=[[60, 127]]), _window(), client=client))
+
+    assert calls == [1, 2]
+    assert len(results) == 1
+    assert results[0].key == "grid-060x127"
+    assert results[0].error is None
+
+    merged = json.loads(results[0].payload)
+    items = merged["response"]["body"]["items"]["item"]
+    assert len(items) == 1052
+
+
+def test_fetch_single_page_when_total_count_missing_stays_unmodified():
+    """totalCount가 없는(기존 소스 전부 해당) 응답은 예전처럼 1페이지만 받고,
+    원본 바이트를 그대로 넘긴다(회귀 방지)."""
+    raw = _body(items=[{"category": "T1H", "obsrValue": "31.6"}])
+    calls = []
+
+    def handler(request):
+        calls.append(dict(request.url.params)["pageNo"])
+        return httpx.Response(200, content=raw)
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    results = list(KmaApiHubAdapter.fetch(_config(grids=[[60, 127]]), _window(), client=client))
+
+    assert calls == ["1"]
+    assert results[0].payload == raw
+
+
+def test_fetch_single_page_when_total_count_fits_num_of_rows():
+    """totalCount(8)가 numOfRows(1000)보다 작으면(초단기실황 실제 사례) 추가
+    페이지를 요청하지 않는다 — 회귀 없음 확인."""
+    items = [{"category": f"C{i}", "obsrValue": str(i)} for i in range(8)]
+    raw = _page_body(8, 1, items)
+    calls = []
+
+    def handler(request):
+        calls.append(dict(request.url.params)["pageNo"])
+        return httpx.Response(200, content=raw)
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    results = list(KmaApiHubAdapter.fetch(_config(grids=[[60, 127]]), _window(), client=client))
+
+    assert calls == ["1"]
+    assert results[0].payload == raw
+
+
+def test_fetch_transient_on_second_page_fails_whole_grid_not_just_that_page():
+    """2페이지째가 실패하면 1페이지만 부분 반영하지 않고 격자 전체를 TRANSIENT로
+    실패 처리한다 — 다음 라운드가 1페이지부터 다시 받아야 하기 때문이다."""
+    page1_items = [{"category": "TMP", "fcstValue": str(i)} for i in range(1000)]
+
+    def handler(request):
+        page_no = dict(request.url.params)["pageNo"]
+        if page_no == "1":
+            return httpx.Response(200, content=_page_body(1052, 1, page1_items))
+        return httpx.Response(503, content=b"")
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    results = list(KmaApiHubAdapter.fetch(_config(grids=[[60, 127]]), _window(), client=client))
+
+    assert len(results) == 1
+    assert results[0].key == "grid-060x127"
+    assert results[0].error is FetchErrorKind.TRANSIENT
+    assert results[0].payload is None
+
+
+def test_fetch_fatal_on_second_page_stops_entire_fetch():
+    page1_items = [{"category": "TMP", "fcstValue": str(i)} for i in range(1000)]
+
+    def handler(request):
+        page_no = dict(request.url.params)["pageNo"]
+        if page_no == "1":
+            return httpx.Response(200, content=_page_body(1052, 1, page1_items))
+        return httpx.Response(401, content=b"")
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    results = list(
+        KmaApiHubAdapter.fetch(_config(grids=[[60, 127], [61, 127]]), _window(), client=client)
+    )
+
+    assert len(results) == 1
+    assert results[0].error is FetchErrorKind.FATAL
+
+
 def test_normalize_pivots_long_rows_into_wide_records_grouped_by_remaining_fields():
     chunk = _body(
         items=[

@@ -5,13 +5,16 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 from datetime import UTC, date, datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pandas as pd
-from gu_mapping import grid_to_gu, latlon_to_gu
+
+from core.precip import parse_precip
+from gu_mapping import grid_to_gu, latlon_to_grid, latlon_to_gu
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +50,7 @@ def stations_from_silver(df: pd.DataFrame) -> list[dict]:
         gu = latlon_to_gu(lat, lon)
         if gu is None:
             continue  # 서울 자치구 경계 밖(인접 도시 접경) 정거장은 제외
+        grid_nx, grid_ny = latlon_to_grid(lat, lon)
         records.append(
             {
                 "sta_id": str(row["stationId"]),
@@ -56,6 +60,8 @@ def stations_from_silver(df: pd.DataFrame) -> list[dict]:
                 "lat": lat,
                 "lon": lon,
                 "hold_cnt": int(row["rackTotCnt"]),
+                "grid_nx": grid_nx,
+                "grid_ny": grid_ny,
             }
         )
     return records
@@ -93,18 +99,22 @@ def weather_current_from_silver(df: pd.DataFrame) -> list[dict]:
     returns:
         weather_current 테이블 적재용 자치구별 최신 실황 레코드 목록
     """
-    by_gu: dict[str, dict] = {}
+    by_grid: dict[tuple[int, int], dict] = {}
     for row in df.to_dict("records"):
-        gu = grid_to_gu(row["nx"], row["ny"])
+        nx, ny = int(row["nx"]), int(row["ny"])
+        gu = grid_to_gu(nx, ny)
         if gu is None:
             continue
         observed_at = _kst_to_utc(str(row["baseDate"]), str(row["baseTime"]))
 
-        # 최신 데이터 보장: 이미 담긴 구의 데이터보다 과거 시간이면 무시한다
-        existing = by_gu.get(gu)
+        # 최신 데이터 보장: 이미 담긴 격자의 데이터보다 과거 시간이면 무시한다
+        key = (nx, ny)
+        existing = by_grid.get(key)
         if existing is not None and existing["observed_at"] >= observed_at:
             continue
-        by_gu[gu] = {
+        by_grid[key] = {
+            "nx": nx,
+            "ny": ny,
             "gu": gu,
             "observed_at": observed_at,
             "temperature": _to_float(row.get("T1H")),  # T1H: 기온(°C)
@@ -113,7 +123,7 @@ def weather_current_from_silver(df: pd.DataFrame) -> list[dict]:
             "rainfall": _to_float(row.get("RN1")),     # RN1: 1시간 강수량(mm)
             "pty_type": _to_int(row.get("PTY")),       # PTY: 강수형태 코드
         }
-    return list(by_gu.values())
+    return list(by_grid.values())
 
 
 def weather_forecast_from_silver(df: pd.DataFrame) -> list[dict]:
@@ -124,18 +134,21 @@ def weather_forecast_from_silver(df: pd.DataFrame) -> list[dict]:
     returns:
         weather_forecast 테이블 적재용 예보 레코드 목록
     """
-    by_key: dict[tuple[str, datetime], dict] = {}
+    by_key: dict[tuple[int, int, datetime], dict] = {}
     for row in df.to_dict("records"):
-        gu = grid_to_gu(row["nx"], row["ny"])
+        nx, ny = int(row["nx"]), int(row["ny"])
+        gu = grid_to_gu(nx, ny)
         if gu is None:
             continue
         forecast_dttm = _kst_to_utc(str(row["fcstDate"]), str(row["fcstTime"]))
         base_dttm = _kst_to_utc(str(row["baseDate"]), str(row["baseTime"]))
-        key = (gu, forecast_dttm)
+        key = (nx, ny, forecast_dttm)
         existing = by_key.get(key)
         if existing is not None and existing["base_dttm"] >= base_dttm:
             continue
         by_key[key] = {
+            "nx": nx,
+            "ny": ny,
             "gu": gu,
             "forecast_dttm": forecast_dttm,
             "sky_cond": _to_int(row.get("SKY")),       # SKY: 하늘상태 코드(1:맑음, 3:구름많음, 4:흐림)
@@ -151,24 +164,24 @@ def weather_forecast_from_silver(df: pd.DataFrame) -> list[dict]:
 
 
 def _parse_precip_str(value) -> float | None:
-    """기상청 강수량 문자열(예: '강수없음', '1.0mm 미만', '30.0~50.0mm')을 실수값(float)으로 변환한다."""
-    # 1. 빈 값이면 None 반환
+    """기상청 강수량 표기를 float으로 변환한다. 해석할 수 없으면 None.
+
+    변환 규칙은 `core.precip.parse_precip`이 갖는다 — collector가 silver에 쓸 때
+    쓰는 것과 같은 함수다. 여기서 하는 일은 결측·해석 실패를 예외 대신 None으로
+    바꾸는 것뿐이다(upsert에서 그 컬럼이 NULL이 된다).
+
+    collector가 `types: [precip]`으로 저장하기 시작한 뒤로 silver의 PCP·RN1은
+    이미 실수다. 그래도 문자열 경로를 남겨 둔다 — 전환 이전에 쌓인 silver를
+    다시 읽을 때 필요하다.
+    """
     if value is None or value == "":
         return None
-    text = str(value).strip()
-    # 2. 비/눈이 안 오는 경우 0.0으로 변환
-    if text in ("강수없음", "적설없음"):
-        return 0.0
-    # 3. "1.0mm 미만" 형태는 소량의 강수를 의미하는 0.5로 변환
-    if "미만" in text:
-        return 0.5
-    # 4. "mm" 단위를 제거하고, "30.0~50.0" 같은 범위는 앞의 하한값(30.0)만 추출
-    text = text.replace("mm", "").strip()
-    if "~" in text:
-        text = text.split("~")[0]
-    # 5. 최종 숫자로 변환 (예외 발생 시 None 반환)
+    if isinstance(value, float) and math.isnan(value):
+        # 숫자 컬럼의 결측은 pandas에서 NaN으로 온다. float()를 그냥 통과하므로
+        # 여기서 막지 않으면 NaN이 그대로 RDB에 들어간다.
+        return None
     try:
-        return float(text)
+        return parse_precip(value)
     except (TypeError, ValueError):
         return None
 
@@ -181,24 +194,27 @@ def weather_forecast_ultra_from_silver(df: pd.DataFrame) -> list[dict]:
     returns:
         weather_forecast 테이블 적재용 초단기예보 레코드 목록
     """
-    by_key: dict[tuple[str, datetime], dict] = {}
+    by_key: dict[tuple[int, int, datetime], dict] = {}
     for row in df.to_dict("records"):
-        gu = grid_to_gu(row["nx"], row["ny"])
+        nx, ny = int(row["nx"]), int(row["ny"])
+        gu = grid_to_gu(nx, ny)
         if gu is None:
             continue
         forecast_dttm = _kst_to_utc(str(row["fcstDate"]), str(row["fcstTime"]))
         base_dttm = _kst_to_utc(str(row["baseDate"]), str(row["baseTime"]))
-        key = (gu, forecast_dttm)
+        key = (nx, ny, forecast_dttm)
         existing = by_key.get(key)
         if existing is not None and existing["base_dttm"] >= base_dttm:
             continue
         by_key[key] = {
+            "nx": nx,
+            "ny": ny,
             "gu": gu,
             "forecast_dttm": forecast_dttm,
             "sky_cond": _to_int(row.get("SKY")),       # SKY: 하늘상태 코드(1:맑음, 3:구름많음, 4:흐림)
             "pty_type": _to_int(row.get("PTY")),       # PTY: 강수형태 코드
             "temperature": _to_float(row.get("T1H")),  # T1H: 기온(°C)
-            "precip_prob": None,                       # 초단기예보에는 강수확률(POP)이 없음
+            "precip_prob": _to_float(row.get("POP")),  # POP: 강수확률(%)
             "precip_amount": _parse_precip_str(row.get("RN1")),  # RN1: 1시간 강수량(mm)
             "humidity": _to_float(row.get("REH")),     # REH: 습도(%)
             "wind_speed": _to_float(row.get("WSD")),   # WSD: 풍속(m/s)

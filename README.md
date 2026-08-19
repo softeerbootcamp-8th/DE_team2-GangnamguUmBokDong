@@ -46,8 +46,9 @@
 | --- | --- | --- |
 | 서울시 공공자전거 따릉이 대여이력 정보 | 서울 열린데이터광장 | [바로가기](https://data.seoul.go.kr/dataList/OA-15182/F/1/datasetView.do) |
 | 서울 실시간 인구 데이터 | 서울 열린데이터광장 | [바로가기](https://data.seoul.go.kr/dataList/OA-21778/F/1/datasetView.do) |
+| 자치구별 서울 생활인구(250m) | 서울 열린데이터광장 | [바로가기](https://data.seoul.go.kr/dataList/OA-23019/S/1/datasetView.do) |
 | 서울시 공공자전거 따릉이 실시간 대여정보 | 서울 열린데이터광장 | [바로가기](https://data.seoul.go.kr/dataList/OA-15493/A/1/datasetView.do) |
-| 기상청 기상기후데이터 | 기상청 API 허브 | [바로가기](https://apihub.kma.go.kr/) |
+| 기상청 동네예보(단기예보, 초단기예보, 실황) 격자자료 | 기상청 API 허브 | [바로가기](https://apihub.kma.go.kr/) |
 | 서울시 문화행사 정보 | 서울 열린데이터광장 | [바로가기](https://data.seoul.go.kr/dataList/OA-15486/S/1/datasetView.do?tab=A) |
 | 서울시 체육시설 공연행사 정보 | 서울 열린데이터광장 | [바로가기](https://data.seoul.go.kr/dataList/OA-15497/A/1/datasetView.do) |
 

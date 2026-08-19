@@ -13,35 +13,6 @@ _BOUNDARY_PATH = Path(__file__).parent / "assets" / "seoul_gu_boundary.geojson"
 # 서울 시내 격자(5km 간격)가 인접 구로 잘못 배정되는 것은 막지 않되, 서울 밖 좌표 방지용 거리 상한(degree)
 _MAX_NEAREST_GU_DEGREES = 0.3
 
-# collector/sources/weather_*.yaml의 25개 자치구 대표 격자 1:1 매핑 테이블
-_GRID_TO_GU_TABLE: dict[tuple[int, int], str] = {
-    (61, 125): "강남구",
-    (63, 126): "강동구",
-    (60, 129): "강북구",
-    (57, 127): "강서구",
-    (59, 124): "관악구",
-    (62, 126): "광진구",
-    (58, 125): "구로구",
-    (58, 124): "금천구",
-    (62, 129): "노원구",
-    (61, 129): "도봉구",
-    (61, 127): "동대문구",
-    (59, 125): "동작구",
-    (58, 127): "마포구",
-    (59, 127): "서대문구",
-    (61, 124): "서초구",
-    (61, 126): "성동구",
-    (61, 128): "성북구",
-    (62, 125): "송파구",
-    (58, 126): "양천구",
-    (59, 126): "영등포구",
-    (60, 126): "용산구",
-    (59, 128): "은평구",
-    (60, 127): "종로구",
-    (60, 128): "중구",
-    (62, 127): "중랑구",
-}
-
 _GU_POLYGONS: list[tuple[str, object]] | None = None
 _GU_CENTROIDS: list[tuple[str, float, float]] | None = None
 
@@ -149,8 +120,8 @@ def grid_to_latlon(nx: float, ny: float) -> tuple[float, float]:
 def grid_to_gu(nx: float, ny: float) -> str | None:
     """기상청 격자 좌표(nx, ny)를 서울 자치구 이름으로 매핑한다.
 
-    사전 정의된 25개 자치구 1:1 고정 매핑 테이블을 우선 조회하며,
-    미등록 격자는 Point-in-Polygon 및 최근접 중심점 순으로 계산합니다.
+    위경도로 변환한 뒤 Point-in-Polygon으로 판정하고, 경계 밖이면 최근접
+    중심점(`_nearest_gu`)으로 매핑한다.
 
     args:
         nx: 기상청 X 격자 좌표
@@ -158,11 +129,45 @@ def grid_to_gu(nx: float, ny: float) -> str | None:
     returns:
         매핑된 서울 자치구 이름 또는 None
     """
-    key = (int(nx), int(ny))
-    # (1순위) 미리 정의된 격자-자치구 매핑 테이블 조회
-    if key in _GRID_TO_GU_TABLE:
-        return _GRID_TO_GU_TABLE[key]
-
-    # (2순위 fallback) 테이블에 없는 격자는 위경도로 변환 후 geometry 기반 매핑
     lat, lon = grid_to_latlon(nx, ny)
     return latlon_to_gu(lat, lon) or _nearest_gu(lat, lon)
+
+
+def latlon_to_grid(lat: float, lon: float) -> tuple[int, int]:
+    """WGS84 위경도 좌표를 가장 가까운 기상청 격자 좌표(nx, ny)로 변환한다.
+
+    `grid_to_latlon`의 정확한 역변환이다(같은 람베르트 등각원추투영 계수를 쓴다).
+
+    args:
+        lat: 위도 (WGS84)
+        lon: 경도 (WGS84)
+    returns:
+        가장 가까운 격자의 (nx, ny) 정수 좌표
+    """
+    re = _RE / _GRID
+    slat1 = _SLAT1 * _DEGRAD
+    slat2 = _SLAT2 * _DEGRAD
+    olon = _OLON * _DEGRAD
+    olat = _OLAT * _DEGRAD
+
+    sn = math.tan(math.pi * 0.25 + slat2 * 0.5) / math.tan(math.pi * 0.25 + slat1 * 0.5)
+    sn = math.log(math.cos(slat1) / math.cos(slat2)) / math.log(sn)
+    sf = math.tan(math.pi * 0.25 + slat1 * 0.5)
+    sf = sf**sn * math.cos(slat1) / sn
+    ro = math.tan(math.pi * 0.25 + olat * 0.5)
+    ro = re * sf / ro**sn
+
+    ra = math.tan(math.pi * 0.25 + (lat * _DEGRAD) * 0.5)
+    ra = re * sf / ra**sn
+    theta = lon * _DEGRAD - olon
+    if theta > math.pi:
+        theta -= 2.0 * math.pi
+    if theta < -math.pi:
+        theta += 2.0 * math.pi
+    theta *= sn
+
+    xn = ra * math.sin(theta)
+    yn = ra * math.cos(theta)
+    nx = xn + _XO
+    ny = _YO + ro - yn
+    return round(nx), round(ny)

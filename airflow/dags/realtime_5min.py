@@ -48,8 +48,9 @@ from config.sources import (
     NORMALIZER_BASELINE_MODE_FALLBACK,
     NORMALIZER_BASELINE_MODE_PRIMARY,
     REALTIME_5MIN_SOURCES,
+    RENTAL_HISTORY_LOOKBACK_HOURS,
 )
-from orchestration.collector_task import build_collector_task
+from orchestration.collector_task import build_collector_replay_task, build_collector_task
 from orchestration.db_loader_task import build_db_loader_task
 from orchestration.inference_task import build_inference_task
 from orchestration.normalizer_task import build_normalizer_task
@@ -95,6 +96,16 @@ with DAG(
 
     load_forecast_points = build_db_loader_task(dag, "forecast_points")
     [run_inference, load_station_stock] >> load_forecast_points
+
+    # 대여이력 과거 시간대 재조회. 현재 tick 수집 뒤에 사슬로 이어 붙인다 — 동시에
+    # 띄우면 각 호출이 페이지를 4개씩 병렬로 받으므로 같은 API에 대한 동시 요청이
+    # 배수로 늘어난다. 사슬로 묶으면 4로 고정되고, 실측 14.4초/호출이라 5분 tick에
+    # 충분히 들어간다. run_inference의 상위에는 두지 않는다(과거 보강이므로).
+    replay_chain = collector_tasks["bike_rental_history"]
+    for hours_back in range(1, RENTAL_HISTORY_LOOKBACK_HOURS + 1):
+        replay = build_collector_replay_task(dag, "bike_rental_history", hours_back)
+        replay_chain >> replay
+        replay_chain = replay
 
     compute_urgency = build_urgency_task(dag)
     load_station_urgency = build_db_loader_task(dag, "station_urgency")

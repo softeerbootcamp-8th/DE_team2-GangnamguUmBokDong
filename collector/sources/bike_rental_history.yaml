@@ -6,10 +6,27 @@ adapter_params:
   service: tbCycleRentData
   page_size: 1000
   root_key: rentData.row
-  # API가 시간까지만 받으므로 5분 실행은 현재 시간대의 누적 snapshot을 다시 읽는다.
-  # 시간 중 신규 대여를 5분 단위로 반영하기 위한 선택이며, 소비자는
-  # (BIKE_ID, RENT_DT)로 중복 제거한다.
-  path_suffix: "/{window_start:%Y-%m-%d}/{window_start:%H}"
+  # 이 API는 `/{날짜}/{시}`를 받아 그 한 시간치를 준다(하루치가 아니다). 시 자리에
+  # 날짜를 넣으면 유효한 시가 아니라 API가 00시로 폴백하므로, 하루 종일 00시대만
+  # 반복 수집하게 된다.
+  #
+  # window_last(윈도우 직전 순간)를 쓰는 이유는 매시 끝자락 누락을 막기 위해서다.
+  # window_start를 쓰면 19:00 윈도우가 19시대를 요청해 18:55~19:00 대여를 아무도
+  # 가져가지 않는다.
+  path_suffix: "/{window_last:%Y-%m-%d}/{window_last:%H}"
+
+  # 페이지를 4개씩 병렬로 받는다. 이 소스만 켜는 이유는 페이지 수가 압도적이어서다 —
+  # 실측 하루 145,165건에 시간대별 1~17페이지이고, 피크(18시)가 17페이지다.
+  #
+  # 실측(2026-08-19, 18시 17페이지): 순차 72.7초, 4워커 17.0초(4.3배),
+  # 8워커 10.5초(6.9배). 행 수는 세 경우 모두 16,899로 일치했다.
+  # fetch 예산은 min(주기/2, 30분) = 150초라 순차로는 느린 시점에 여유가 28초까지
+  # 줄었다(페이지당 최대 관측 7.19초 × 17).
+  #
+  # 8이 아니라 4인 이유: 17초면 예산에 8배 여유라 더 줄일 이득이 없고, 아래
+  # collect_lookback_hours 때문에 한 tick에 이 소스 호출이 3개 뜨므로 같은 API에
+  # 대한 동시 요청이 3×concurrency가 된다(4 → 12).
+  concurrency: 4
 
 schedule:
   interval: 5m
@@ -27,6 +44,12 @@ quality:
 backfill:
   enabled: true
   max_age: 7d
+
+compaction:
+  # API가 시간 단위라 한 시간 안의 12개 윈도우가 같은 시간대를 누적으로 받아온다
+  # (5분 증분을 보려면 이 누적이 필요하다). 그대로 이어붙이면 같은 대여 기록이
+  # 최대 12번 들어가므로 archive를 만들 때 걷어낸다.
+  dedup: true
 
 policies:
   required_missing: drop_row
@@ -71,9 +94,14 @@ columns:
     types: [str]
   BIKE_SE_CD:
     types: [str]
-  START_INDEX:
-    types: [int]
-  END_INDEX:
-    types: [int]
-  RNUM:
-    types: [str, int]
+
+# `START_INDEX`·`END_INDEX`·`RNUM`은 의도적으로 선언하지 않는다. 데이터가 아니라
+# 요청/응답 메타이기 때문이다 — 실측에서 START/END_INDEX는 전 행이 (0, 0)이고
+# RNUM은 그 응답 안에서의 행 번호다.
+#
+# 특히 RNUM은 dedup을 망가뜨린다. compaction.dedup이 `_window_start`를 뺀 전체
+# 데이터 컬럼으로 묶으므로 RNUM이 dedup 키에 들어가는데, 이 API의 목록은 RTN_DT
+# 오름차순이라 반납이 지연 등록되면 앞자리에 끼어들어 뒤 기록의 RNUM이 한 칸씩
+# 밀린다. 그러면 같은 대여가 서로 다른 행으로 남아 중복이 걷히지 않는다.
+# 회귀 방지는 tests/test_source_configs.py의
+# test_no_source_declares_response_pagination_meta가 맡는다.
