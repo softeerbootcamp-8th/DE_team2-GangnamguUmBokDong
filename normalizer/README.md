@@ -22,6 +22,7 @@
 | `grid.py` | 국가지점번호 `CELL_ID`를 EPSG:5179 좌표로 변환하고 250m 정사각 격자 폴리곤 생성 |
 | `poi.py` | 121개 POI Shapefile 로딩, 위상 오류(`make_valid`) 복구, EPSG:5179 좌표계 변환 및 메모리 캐싱 |
 | `merge.py` | `STRtree` 공간 조인, 면적 가중 밀도 합성, 연령·성별 재분배, 면적 내림차순 순차 갱신 |
+| `station_master.py` | 대여소 master에 생활인구 250m `CELL_ID`(`grid_id`, STRtree 공간 조인)와 기상청 5km 격자(`weather_nx`/`weather_ny`, `core.weather_grid`)를 보강 |
 | `storage.py` | S3 실버 읽기/쓰기 및 실행 메타데이터 Manifest JSON 저장 |
 
 ---
@@ -58,16 +59,53 @@ s3://<bucket>/
 ├── silver/
 │   ├── living_population_grid/dt=YYYY-MM-DD/                   # [입력 1] 베이스라인 격자 인구
 │   ├── population_realtime/dt=YYYY-MM-DD/hh=HH/HHMM.parquet    # [입력 2] 5분 실시간 POI 인구
-│   └── living_population_normalized/dt=YYYY-MM-DD/hh=HH/       # [출력] 5분 정규화 격자 인구
+│   ├── living_population_normalized/dt=YYYY-MM-DD/hh=HH/       # [출력] 5분 정규화 격자 인구
+│   │   └── HHMM.parquet
+│   │
+│   ├── bike_station_master/dt=YYYY-MM-DD/hh=HH/HHMM.parquet    # [입력 3] 일 1회 대여소 master
+│   ├── bike_station_realtime/dt=YYYY-MM-DD/hh=HH/HHMM.parquet  # [입력 4] 좌표·이름·거치대 수 보완용
+│   └── station_master_enriched/dt=YYYY-MM-DD/hh=HH/            # [출력] 격자 보강 대여소 master
 │       └── HHMM.parquet
 │
-└── _manifest/living_population_normalized/dt=YYYY-MM-DD/hh=HH/
+└── _manifest/<source_id>/dt=YYYY-MM-DD/hh=HH/
     └── HHMM.json                                               # 실행 결과 메타데이터 (매칭 건수 등)
 ```
 
+`_manifest`의 `<source_id>`는 파이프라인별로 `living_population_normalized` 또는
+`station_master_enriched`다.
+
 ---
 
-## 5. 실행 방법
+## 5. 대여소 마스터 격자 보강 (`station_master.py`)
+
+`bike_station_master`(따릉이 API 원본)에는 격자 식별자가 없다. 인구·날씨 피처를 대여소에
+붙이려면 격자 조인이 필요하므로, 하루 1회(`station_master` DAG) 미리 계산해
+`station_master_enriched` Silver로 굳혀 둔다.
+
+| 컬럼 | 타입 | 출처 | 결측 조건 |
+|---|---|---|---|
+| `station_id` | string | master `RNTLS_ID` | 없음(없는 행은 제외) |
+| `station_no` | string | master `ADDR2` | `ADDR2` 없을 때 |
+| `station_name` | string | 실시간 `stationName` → master `ADDR1` → `ADDR2` | 셋 다 없을 때 |
+| `capacity` | int64 | 실시간 `rackTotCnt` | 해당 실시간 행이 없을 때 |
+| `lat` | double | master `LAT` → (무효 시) 실시간 `stationLatitude` | 숫자 변환 실패 시. `0.0`은 그대로 실린다 |
+| `lon` | double | master `LOT` → (무효 시) 실시간 `stationLongitude` | 위와 동일 |
+| `grid_id` | string | 생활인구 250m `CELL_ID` (EPSG:5179 폴리곤 `STRtree` 공간 조인) | 좌표 무효 **또는** 어느 격자 폴리곤에도 속하지 않을 때 |
+| `weather_nx` | int64 | 기상청 5km 격자 X (`core.weather_grid.latlon_to_grid`) | 좌표 무효일 때만 |
+| `weather_ny` | int64 | 기상청 5km 격자 Y (같은 함수) | 좌표 무효일 때만 |
+
+두 격자 컬럼의 결측 조건이 다르다. `weather_nx`/`weather_ny`는 좌표가 유효하면 순수 산술로
+항상 채워지는 대신 운영 수집 격자(현재 34개) 밖의 번호일 수 있고, `grid_id`는 좌표가
+유효해도 생활인구 baseline 커버리지 밖이면 `None`이다. 따라서 `weather_nx`가 채워진 행 수는
+항상 `grid_id`가 채워진 행 수 이상이며, `MIN_GRID_COVERAGE = 0.95`(`grid_id` 매핑률) 게이트가
+둘을 함께 보호한다 — 좌표가 대량으로 깨지면 두 격자가 같이 비므로 이 게이트에서 실패한다.
+
+**좌표 유효성 판정**: `_valid_wgs84`가 위도 36.5~38.5, 경도 125.5~128.5를 요구한다. master의
+`LAT`/`LOT`가 `0`인 대여소는 이 검사에서 걸러지므로 적도상 엉뚱한 격자가 계산되지 않는다.
+
+---
+
+## 6. 실행 방법
 
 ```bash
 # 1. 의존성 설치
@@ -79,6 +117,9 @@ uv run python main.py --window-start 2026-08-15T14:05:00+09:00
 # 최신 가용 파티션 폴백 모드 실행 (Airflow 재시도용)
 uv run python main.py --window-start 2026-08-15T14:05:00+09:00 --baseline-date-mode latest
 
-# 3. 단위 테스트 실행
+# 3. 대여소 마스터 격자 보강 1회 실행
+uv run python station_master.py --window-start 2026-08-15T03:00:00+09:00 --baseline-date-mode latest
+
+# 4. 단위 테스트 실행
 uv run pytest
 ```

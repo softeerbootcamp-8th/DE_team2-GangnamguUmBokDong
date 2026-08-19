@@ -12,7 +12,7 @@ S3 실버 계층(Silver Parquet) 및 머신러닝 추론 결과(ML Predictions)�
 | `tables.yaml` | 테이블별 S3 소스, 변환 함수, DB 충돌(PK/Unique) 컬럼 및 갱신 컬럼 정의 선언적 명세서 |
 | `config.py` | `tables.yaml`을 로드하여 `TableSpec` 데이터클래스 레지스트리(`TABLE_SPECS`) 구성 |
 | `transform.py` | Silver DataFrame $\rightarrow$ Gold DB 레코드 딕셔너리 변환 함수 모음 (타입 변환, 결측치 처리, 날짜 파싱 등) |
-| `gu_mapping.py` | 위경도(WGS84) $\rightarrow$ 서울시 25개 자치구 공간 판정(Point-in-Polygon) 및 기상청 격자($nx, ny$) 매핑 |
+| `gu_mapping.py` | 위경도(WGS84) $\rightarrow$ 서울시 25개 자치구 공간 판정(Point-in-Polygon). 격자($nx, ny$) $\leftrightarrow$ 위경도 변환은 `core.weather_grid`를 재수출 |
 | `reader.py` | `core.s3`를 사용하여 S3의 실버 파티션 및 ML 추론 Parquet을 PyArrow Table로 읽기 |
 
 ---
@@ -37,7 +37,7 @@ S3 실버 계층(Silver Parquet) 및 머신러닝 추론 결과(ML Predictions)�
 ### ① 서울 25개 자치구 경계 및 외래키(FK) 무결성 보호 (`gu_mapping.py`)
 - **Point-in-Polygon 판정**: 서울시 25개 자치구 GeoJSON 폴리곤을 로드하여 `Shapely`의 `polygon.contains(point)`로 소속 자치구를 매핑합니다.
 - **경계 외 정거장 필터링**: 서울 자치구 경계 밖의 정거장은 마스터 테이블(`stations`)에 적재되지 않으므로, 실시간 재고(`station_stock`)에서도 동일하게 제외하여 외래키 위반 에러를 원천 차단합니다.
-- **기상청 5km 격자 매핑**: 서울 25개 구청의 격자 1:1 매핑 테이블을 우선 조회하고, 누락 시 등각원추투영 기준점 최근접 중심점으로 Fallback합니다.
+- **기상청 5km 격자 매핑**: 람베르트 등각원추투영 공식(`core.weather_grid.latlon_to_grid`)으로 좌표를 최근접 격자로 직접 변환합니다. 이 공식은 `normalizer`(보강 station master의 `weather_nx`/`weather_ny`)와 `scripts/generate_weather_grids.py`(수집 격자 34개 목록 생성)도 같이 씁니다.
 
 ### ② 다중 소스의 단일 Gold 테이블 병합 (`_TABLE_ALIASES`)
 S3의 서로 다른 데이터 소스가 Gold DB의 동일한 단일 테이블로 통합 적재되는 구조를 지원합니다:
