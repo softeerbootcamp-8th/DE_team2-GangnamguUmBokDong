@@ -73,3 +73,20 @@ jobs:
       - name: Stop test infrastructure
         if: always()
         run: make down
+
+  quality:
+    name: Lint and Test
+    if: always()
+    needs:
+      - unit-tests
+      - integration-tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Verify required checks
+        env:
+          UNIT_RESULT: ${{ needs.unit-tests.result }}
+          INTEGRATION_RESULT: ${{ needs.integration-tests.result }}
+        run: |
+          test "$UNIT_RESULT" = "success"
+          test "$INTEGRATION_RESULT" = "success"
