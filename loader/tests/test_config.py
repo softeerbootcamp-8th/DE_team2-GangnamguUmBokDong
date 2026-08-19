@@ -38,8 +38,8 @@ def test_forecast_points_reader_delegates_to_read_predictions(monkeypatch):
 def test_station_urgency_table_spec_registered():
     spec = TABLE_SPECS["station_urgency"]
 
-    assert spec.conflict_cols == ["batch_run_at", "sta_id"]
-    assert spec.update_cols == ["urgency_score", "minutes_until_critical", "action_type"]
+    assert spec.conflict_cols == ["sta_id"]
+    assert spec.update_cols == ["urgency_score", "minutes_until_critical", "action_type", "bike_qty", "batch_run_at"]
     assert spec.reader is not None
 
 
@@ -60,6 +60,56 @@ def test_station_urgency_reader_delegates_to_read_urgency(monkeypatch):
     assert captured["window_start"] == window_start
     assert isinstance(result, pd.DataFrame)
     assert result["sta_id"].tolist() == ["101"]
+
+
+def test_rebalance_routes_table_spec_registered():
+    spec = TABLE_SPECS["rebalance_routes"]
+
+    assert spec.conflict_cols == ["route_id"]
+    assert spec.update_cols == []  # 운영자가 바꾼 status를 배치 재실행이 덮어쓰지 않도록 DO NOTHING
+    assert spec.reader is not None
+
+
+def test_rebalance_routes_reader_delegates_to_read_routes(monkeypatch):
+    captured = {}
+
+    def fake_read_routes(window_start):
+        captured["window_start"] = window_start
+        return pa.table({"route_id": ["r1"]})
+
+    monkeypatch.setattr("config.reader.read_routes", fake_read_routes)
+
+    window_start = datetime(2026, 8, 16, 14, 5, tzinfo=UTC)
+    result = TABLE_SPECS["rebalance_routes"].read(window_start)
+
+    assert captured["window_start"] == window_start
+    assert isinstance(result, pd.DataFrame)
+    assert result["route_id"].tolist() == ["r1"]
+
+
+def test_rebalance_route_stops_table_spec_registered():
+    spec = TABLE_SPECS["rebalance_route_stops"]
+
+    assert spec.conflict_cols == ["route_id", "visit_order"]
+    assert spec.update_cols == []
+    assert spec.reader is not None
+
+
+def test_rebalance_route_stops_reader_delegates_to_read_route_stops(monkeypatch):
+    captured = {}
+
+    def fake_read_route_stops(window_start):
+        captured["window_start"] = window_start
+        return pa.table({"route_id": ["r1"]})
+
+    monkeypatch.setattr("config.reader.read_route_stops", fake_read_route_stops)
+
+    window_start = datetime(2026, 8, 16, 14, 5, tzinfo=UTC)
+    result = TABLE_SPECS["rebalance_route_stops"].read(window_start)
+
+    assert captured["window_start"] == window_start
+    assert isinstance(result, pd.DataFrame)
+    assert result["route_id"].tolist() == ["r1"]
 
 
 def test_default_reader_still_uses_read_silver(monkeypatch):

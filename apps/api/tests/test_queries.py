@@ -1,5 +1,7 @@
 """queries.py 테스트: 대여소 조회(fetch_stations), 행사 거리 계산(_haversine_km, #102)."""
 
+from datetime import UTC, datetime, timedelta
+
 import queries
 from queries import _haversine_km
 
@@ -23,27 +25,27 @@ def test_fetch_stations_does_not_require_forecasts(monkeypatch):
     assert captured["params"] is None
 
 
-def test_fetch_alerts_reads_only_latest_batch(monkeypatch):
-    """이전 batch에만 있던 station이 최신 snapshot 조회에 섞이지 않는다."""
+def test_fetch_alerts_excludes_stale_batches(monkeypatch):
+    """station_urgency는 sta_id당 최신 1건만 upsert되므로(#124), 배치가 멈춘
+    대여소의 낡은 값이 조회 시점에 걸러져야 한다."""
     captured = {}
+    now = datetime(2026, 8, 19, 14, 5, tzinfo=UTC)
     stored = [
-        {"sta_id": "A", "batch_run_at": "14:00", "urgency_score": 70.0},
-        {"sta_id": "B", "batch_run_at": "14:00", "urgency_score": 60.0},
-        {"sta_id": "C", "batch_run_at": "14:00", "urgency_score": 50.0},
-        {"sta_id": "A", "batch_run_at": "14:05", "urgency_score": 90.0},
-        {"sta_id": "B", "batch_run_at": "14:05", "urgency_score": 80.0},
+        {"sta_id": "A", "batch_run_at": now, "urgency_score": 90.0},
+        {"sta_id": "B", "batch_run_at": now - timedelta(minutes=queries.ALERTS_FRESHNESS_WINDOW_MIN + 5), "urgency_score": 80.0},
     ]
 
     def fake_fetch_all(query, params=None):
         captured["query"] = query
-        latest_batch = max(row["batch_run_at"] for row in stored)
-        return [row for row in stored if row["batch_run_at"] == latest_batch]
+        captured["params"] = params
+        return [row for row in stored if row["batch_run_at"] >= params["cutoff"]]
 
     monkeypatch.setattr(queries, "fetch_all", fake_fetch_all)
 
-    assert [row["sta_id"] for row in queries.fetch_alerts()] == ["A", "B"]
+    assert [row["sta_id"] for row in queries.fetch_alerts(now)] == ["A"]
+    assert captured["params"]["cutoff"] == now - timedelta(minutes=queries.ALERTS_FRESHNESS_WINDOW_MIN)
     normalized = " ".join(captured["query"].split()).upper()
-    assert "WHERE U.BATCH_RUN_AT = ( SELECT MAX(BATCH_RUN_AT) FROM STATION_URGENCY )" in normalized
+    assert "WHERE U.BATCH_RUN_AT >= %(CUTOFF)S" in normalized
 
 
 def test_same_point_is_zero_distance():
