@@ -13,7 +13,7 @@ WEATHER_3H_CRON = "0 */3 * * *"
 # 확인해 필요하면 조정한다.
 DAILY_CRON = "0 3 * * *"
 
-# 하루치 silver를 archive로 묶는 배치. 일 단위 수집(03:00)이 끝난 뒤에 돈다.
+# D-6 대여이력 재수집 후 같은 날짜의 silver를 archive로 묶는 배치.
 COMPACTION_CRON = "30 4 * * *"
 
 DEFAULT_RETRIES = 2

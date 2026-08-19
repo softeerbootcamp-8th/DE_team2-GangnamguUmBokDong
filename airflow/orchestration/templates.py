@@ -21,6 +21,32 @@ KST_HOUR = "{{ " + _KST_WINDOW_TS + ".hour }}"
 KST_MINUTE = "{{ " + _KST_WINDOW_TS + ".minute }}"
 
 
+def kst_date_days_ago(days: int) -> str:
+    """공통 기준 시각에서 `days`일 전의 KST 날짜 템플릿을 반환한다."""
+    if days <= 0:
+        raise ValueError(f"days는 양수여야 한다: {days}")
+    shifted = f"({_KST_WINDOW_TS} - macros.timedelta(days={days}))"
+    return "{{ " + f'{shifted}.strftime("%Y-%m-%d")' + " }}"
+
+
+def kst_day_hour_replay_days_ago(days: int, hour: int) -> str:
+    """`days`일 전 `hour`시의 마지막 5분 윈도우를 KST 템플릿으로 반환한다.
+
+    과거 시각을 다시 호출하므로 같은 시간대의 어느 5분 윈도우든 API 응답은 같다.
+    H:55를 사용하면 기존 마지막 스냅샷을 덮어쓰면서 결과가 대상 날짜의 파티션에
+    남는다. H+1:00을 쓰면 23시 결과가 다음 날짜 파티션으로 넘어가므로 피한다.
+    """
+    if days <= 0:
+        raise ValueError(f"days는 양수여야 한다: {days}")
+    if not 0 <= hour <= 23:
+        raise ValueError(f"hour는 0~23이어야 한다: {hour}")
+    window_start = (
+        f"({_KST_WINDOW_TS}.replace(hour={hour}, minute=55, second=0, microsecond=0) "
+        f"- macros.timedelta(days={days}))"
+    )
+    return "{{ " + f"{window_start}.isoformat()" + " }}"
+
+
 def kst_window_start_shifted(hours: int) -> str:
     """공통 기준 시각을 `hours`시간 앞으로 당긴 `--window-start` 템플릿.
 
