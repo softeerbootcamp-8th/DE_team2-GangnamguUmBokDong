@@ -7,7 +7,8 @@
 """
 
 import io
-from datetime import datetime
+import json
+from datetime import datetime, timedelta
 
 import boto3
 import pyarrow as pa
@@ -27,6 +28,7 @@ OVERLAPPING_CELL_ID = "다사61004575"
 PASS_THROUGH_CELL_ID = "다바10759525"
 
 WINDOW_START = datetime(2026, 8, 15, 14, 5, tzinfo=KST)
+CURRENT_KEY = "silver/living_population_normalized/dt=2026-08-15/hh=14/1405.parquet"
 
 
 def _s3():
@@ -39,33 +41,62 @@ def _put_parquet(key: str, table: pa.Table) -> None:
     _s3().put_object(Bucket=TEST_BUCKET, Key=key, Body=buffer.getvalue())
 
 
-def _seed_grid_silver() -> None:
-    rows = {
-        "CELL_ID": [OVERLAPPING_CELL_ID, PASS_THROUGH_CELL_ID],
-        "TT": ["14", "14"],
-        "H_DNG_CD": ["1168064", "1168064"],
-        "SPOP": [200.0, 50.0],
-    }
+def _grid_table(hours: list[str], spop: tuple[float, float]) -> pa.Table:
+    """두 격자(겹침/비겹침)에 대해 지정한 TT들을 채운 baseline 테이블을 만든다."""
+    cells = [OVERLAPPING_CELL_ID, PASS_THROUGH_CELL_ID]
+    rows = {"CELL_ID": [], "TT": [], "H_DNG_CD": [], "SPOP": []}
     for c in merge.AGE_COLUMNS:
-        rows[c] = [None, None]
-    rows["M00"] = [100.0, 25.0]
-    rows["F00"] = [100.0, 25.0]
+        rows[c] = []
+    for hour in hours:
+        for cell_id, cell_spop in zip(cells, spop):
+            rows["CELL_ID"].append(cell_id)
+            rows["TT"].append(hour)
+            rows["H_DNG_CD"].append("1168064")
+            rows["SPOP"].append(cell_spop)
+            for c in merge.AGE_COLUMNS:
+                rows[c].append(cell_spop / 2 if c in ("M00", "F00") else None)
+    return pa.table(rows)
 
-    table = pa.table(rows)
-    _put_parquet("silver/living_population_grid/dt=2026-08-15/hh=14/1400.parquet", table)
+
+def _seed_nowcast_baseline() -> None:
+    """nowcaster 추정치를 오늘·내일 두 날짜에 심는다(12시간 앞이 자정을 넘는다)."""
+    today_hours = [f"{h:02d}" for h in range(14, 24)]
+    tomorrow_hours = [f"{h:02d}" for h in range(4)]
+    _put_parquet(
+        "silver/living_population_grid/dt=2026-08-15/hh=00/nowcast.parquet",
+        _grid_table(today_hours, (200.0, 50.0)),
+    )
+    _put_parquet(
+        "silver/living_population_grid/dt=2026-08-16/hh=00/nowcast.parquet",
+        _grid_table(tomorrow_hours, (200.0, 50.0)),
+    )
 
 
-def _seed_realtime_silver() -> None:
-    table = pa.table({
-        "AREA_NM": ["강남 MICE 관광특구"],
-        "AREA_CD": ["POI001"],
-        "AREA_CONGEST_LVL": ["보통"],
-        "AREA_PPLTN_MIN": [1000],
-        "AREA_PPLTN_MAX": [1400],
-        "MALE_PPLTN_RATE": [52.0],
-        "FEMALE_PPLTN_RATE": [48.0],
-    })
-    _put_parquet("silver/population_realtime/dt=2026-08-15/hh=14/1405.parquet", table)
+def _seed_realtime_silver(*, with_forecast: bool = True) -> None:
+    row = {
+        "AREA_NM": "강남 MICE 관광특구",
+        "AREA_CD": "POI001",
+        "AREA_CONGEST_LVL": "보통",
+        "AREA_PPLTN_MIN": 1000,
+        "AREA_PPLTN_MAX": 1400,
+        "MALE_PPLTN_RATE": 52.0,
+        "FEMALE_PPLTN_RATE": 48.0,
+        "FCST_YN": "Y" if with_forecast else "N",
+    }
+    for slot in range(1, 13):
+        stamp = WINDOW_START.replace(minute=0) + timedelta(hours=slot)
+        row[f"FCST_{slot}_TIME"] = stamp.strftime("%Y-%m-%d %H:%M") if with_forecast else None
+        row[f"FCST_{slot}_PPLTN_MIN"] = 3000 if with_forecast else None
+        row[f"FCST_{slot}_PPLTN_MAX"] = 3400 if with_forecast else None
+    _put_parquet(
+        "silver/population_realtime/dt=2026-08-15/hh=14/1405.parquet", pa.Table.from_pylist([row])
+    )
+
+
+def _read_normalized(key: str) -> dict[str, dict]:
+    body = _s3().get_object(Bucket=TEST_BUCKET, Key=key)["Body"].read()
+    table = pq.read_table(io.BytesIO(body))
+    return {row["CELL_ID"]: row for row in table.to_pylist()}, table
 
 
 class TestPoi001RealGeometryFixture:
@@ -89,57 +120,129 @@ class TestPoi001RealGeometryFixture:
 
 
 class TestEndToEndRun:
-    def test_run_updates_overlapping_cell_and_passes_through_the_rest(self):
-        _seed_grid_silver()
+    def test_current_tick_updates_overlapping_cell_and_passes_through_the_rest(self):
+        _seed_nowcast_baseline()
         _seed_realtime_silver()
 
-        exit_code = main.run(WINDOW_START, "strict")
+        assert main.run(WINDOW_START) == 0
 
-        assert exit_code == 0
+        rows, table = _read_normalized(CURRENT_KEY)
+        assert set(rows) == {OVERLAPPING_CELL_ID, PASS_THROUGH_CELL_ID}
 
-        key = "silver/living_population_normalized/dt=2026-08-15/hh=14/1405.parquet"
-        body = _s3().get_object(Bucket=TEST_BUCKET, Key=key)["Body"].read()
-        table = pq.read_table(io.BytesIO(body))
-        rows = {row["CELL_ID"]: row for row in table.to_pylist()}
-
-        assert set(rows.keys()) == {OVERLAPPING_CELL_ID, PASS_THROUGH_CELL_ID}
-
-        # 겹치지 않는 격자는 원본 그대로 pass-through.
+        # 겹치지 않는 격자는 baseline 그대로 pass-through.
         passthrough = rows[PASS_THROUGH_CELL_ID]
         assert passthrough["SPOP"] == 50
         assert passthrough["M00"] == 25
         assert passthrough["F00"] == 25
         assert passthrough["H_DNG_CD"] == "1168064"
 
-        # 크게 겹치는 격자는 POI 인구추정치((1000+1400)/2=1200) 쪽으로 크게 이동해
-        # 원본(200)과는 뚜렷이 달라야 한다.
+        # 크게 겹치는 격자는 실측 POI 인구((1000+1400)/2=1200) 쪽으로 이동한다.
         overlapping = rows[OVERLAPPING_CELL_ID]
         assert overlapping["SPOP"] != 200
-        assert abs(overlapping["SPOP"] - 1200) < abs(200 - 1200)  # POI 쪽으로 이동했는지
+        assert abs(overlapping["SPOP"] - 1200) < abs(200 - 1200)
 
-        # 출력 스키마: CELL_ID, H_DNG_CD, SPOP + 28개 연령 컬럼, 전부 int64.
-        expected_columns = {"CELL_ID", "H_DNG_CD", "SPOP", *merge.AGE_COLUMNS}
-        assert set(table.column_names) == expected_columns
+        # 출력 스키마 회귀 방어: 추론기가 이 파일을 지금과 같은 코드로 읽는다.
+        assert set(table.column_names) == {"CELL_ID", "H_DNG_CD", "SPOP", *merge.AGE_COLUMNS}
         for name in ("SPOP", *merge.AGE_COLUMNS):
             assert table.schema.field(name).type == pa.int64()
 
-    def test_run_writes_manifest_with_baseline_metadata(self):
-        _seed_grid_silver()
+    def test_writes_a_tick_for_every_forecast_hour_including_after_midnight(self):
+        _seed_nowcast_baseline()
         _seed_realtime_silver()
 
-        main.run(WINDOW_START, "strict")
+        main.run(WINDOW_START)
 
-        import json
+        for slot in range(1, 13):
+            target = WINDOW_START.replace(minute=0) + timedelta(hours=slot)
+            key = (
+                f"silver/living_population_normalized/dt={target:%Y-%m-%d}/"
+                f"hh={target:%H}/{target:%H%M}.parquet"
+            )
+            rows, table = _read_normalized(key)
+            assert set(rows) == {OVERLAPPING_CELL_ID, PASS_THROUGH_CELL_ID}
+            # 미래 파일도 현재분과 같은 스키마여야 한다 — 추론기가 같은 코드로 읽는다.
+            assert set(table.column_names) == {"CELL_ID", "H_DNG_CD", "SPOP", *merge.AGE_COLUMNS}
+
+        # 자정 넘김: 다음 날 파티션이 실제로 쓰였다.
+        assert "dt=2026-08-16" in str(
+            _s3().list_objects_v2(
+                Bucket=TEST_BUCKET, Prefix="silver/living_population_normalized/dt=2026-08-16/"
+            )
+        )
+
+    def test_forecast_tick_scales_total_and_keeps_baseline_gender_ratio(self):
+        _seed_nowcast_baseline()
+        _seed_realtime_silver()
+
+        main.run(WINDOW_START)
+
+        target = WINDOW_START.replace(minute=0) + timedelta(hours=1)
+        rows, _ = _read_normalized(
+            f"silver/living_population_normalized/dt={target:%Y-%m-%d}/"
+            f"hh={target:%H}/{target:%H%M}.parquet"
+        )
+        overlapping = rows[OVERLAPPING_CELL_ID]
+
+        # 예측 인구((3000+3400)/2=3200) 쪽으로 이동한다.
+        assert abs(overlapping["SPOP"] - 3200) < abs(200 - 3200)
+        # 성비는 baseline 그대로(M00:F00 = 1:1), 총량만 커진다.
+        assert overlapping["M00"] == overlapping["F00"]
+        assert overlapping["M00"] + overlapping["F00"] == pytest.approx(overlapping["SPOP"], abs=1)
+
+    def test_without_forecasts_only_the_current_tick_is_written(self):
+        _seed_nowcast_baseline()
+        _seed_realtime_silver(with_forecast=False)
+
+        assert main.run(WINDOW_START) == 0
+
+        rows, _ = _read_normalized(CURRENT_KEY)
+        assert set(rows) == {OVERLAPPING_CELL_ID, PASS_THROUGH_CELL_ID}
+        listing = _s3().list_objects_v2(
+            Bucket=TEST_BUCKET, Prefix="silver/living_population_normalized/"
+        )
+        assert [item["Key"] for item in listing["Contents"]] == [CURRENT_KEY]
+
+    def test_manifest_records_targets_and_baseline_dates(self):
+        _seed_nowcast_baseline()
+        _seed_realtime_silver()
+
+        main.run(WINDOW_START)
+
         key = "_manifest/living_population_normalized/dt=2026-08-15/hh=14/1405.json"
         body = json.loads(_s3().get_object(Bucket=TEST_BUCKET, Key=key)["Body"].read())
 
-        assert body["baseline_date"] == "2026-08-15"
-        assert body["baseline_date_mode"] == "strict"
+        assert body["baseline_dates"] == ["2026-08-15", "2026-08-16"]
         assert body["cell_count"] == 2
         assert body["poi_matched_count"] == 1
+        assert body["poi_forecast_count"] == 1
+        assert body["forecast_horizons"] == 12
+        assert len(body["written_keys"]) == 13
+        assert body["skipped_targets"] == []
 
-    def test_run_raises_when_grid_partition_missing_in_strict_mode(self):
-        _seed_realtime_silver()  # grid silver는 심지 않음
+    def test_missing_future_baseline_skips_that_hour_only(self):
+        """내일 추정치가 없으면 자정 이후 시각만 건너뛰고 나머지는 쓴다."""
+        today_hours = [f"{h:02d}" for h in range(14, 24)]
+        _put_parquet(
+            "silver/living_population_grid/dt=2026-08-15/hh=00/nowcast.parquet",
+            _grid_table(today_hours, (200.0, 50.0)),
+        )
+        _seed_realtime_silver()
+
+        assert main.run(WINDOW_START) == 0
+
+        listing = _s3().list_objects_v2(
+            Bucket=TEST_BUCKET, Prefix="silver/living_population_normalized/"
+        )
+        written = [item["Key"] for item in listing["Contents"]]
+        assert CURRENT_KEY in written
+        assert not [k for k in written if "dt=2026-08-16" in k]
+
+        manifest_key = "_manifest/living_population_normalized/dt=2026-08-15/hh=14/1405.json"
+        body = json.loads(_s3().get_object(Bucket=TEST_BUCKET, Key=manifest_key)["Body"].read())
+        assert len(body["skipped_targets"]) == 3  # 다음 날 01/02/03시
+
+    def test_raises_when_the_current_baseline_is_missing(self):
+        _seed_realtime_silver()  # nowcast 추정치를 심지 않음
 
         with pytest.raises(storage.PartitionNotFoundError):
-            main.run(WINDOW_START, "strict")
+            main.run(WINDOW_START)

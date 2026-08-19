@@ -13,12 +13,15 @@ import pytest
 from shapely.geometry import box
 
 from merge import (
+    AGE_COLUMNS,
     FEMALE_AGE_COLUMNS,
     MALE_AGE_COLUMNS,
     GridCell,
     PoiSnapshot,
+    find_overlap_areas,
     find_overlaps,
     merge_cell,
+    merge_cell_total_only,
     round_output_row,
 )
 
@@ -217,3 +220,93 @@ class TestFindOverlaps:
     def test_no_pois_returns_empty_dict(self):
         cell = GridCell(cell_id="C1", h_dng_cd="H1", spop=1.0, ages=_zero_ages(), geometry=box(0, 0, 1, 1))
         assert find_overlaps([cell], []) == {}
+
+
+class TestMergeCellTotalOnly:
+    """미래 시각용: 총량만 예측값으로 합성하고 성·연령 구성비는 baseline을 따른다."""
+
+    @staticmethod
+    def _forecast_poi(pop_estimate: float) -> PoiSnapshot:
+        # 성비는 예측에 없어 0.0으로 두고, 이 경로는 성비를 쓰지 않는다.
+        return PoiSnapshot(
+            area_cd="POI001", male_rate=0.0, female_rate=0.0,
+            pop_estimate=pop_estimate,
+            geometry=box(953810.0, 1952620.0, 954060.0, 1952870.0), area_m2=62500.0,
+        )
+
+    def test_total_follows_density_update_like_the_observed_path(self):
+        cell = _grid_cell(100.0, {**_zero_ages(), "M20": 60.0, "F20": 40.0})
+
+        result = merge_cell_total_only(cell, [(self._forecast_poi(200.0), 18750.0)])
+
+        assert result.spop == pytest.approx(130.0)
+
+    def test_gender_and_age_ratio_is_preserved(self):
+        cell = _grid_cell(100.0, {**_zero_ages(), "M20": 60.0, "F20": 40.0})
+
+        result = merge_cell_total_only(cell, [(self._forecast_poi(200.0), 18750.0)])
+
+        assert result.ages["M20"] == pytest.approx(78.0)  # 130 * 0.6
+        assert result.ages["F20"] == pytest.approx(52.0)  # 130 * 0.4
+        assert sum(result.ages.values()) == pytest.approx(result.spop)
+
+    def test_ignores_poi_rates_entirely(self):
+        """성비가 들어와도 무시한다 — 예측 시각의 성비는 baseline이 결정한다."""
+        cell = _grid_cell(100.0, {**_zero_ages(), "M20": 60.0, "F20": 40.0})
+        skewed = PoiSnapshot(
+            area_cd="POI001", male_rate=90.0, female_rate=10.0, pop_estimate=200.0,
+            geometry=box(953810.0, 1952620.0, 954060.0, 1952870.0), area_m2=62500.0,
+        )
+
+        result = merge_cell_total_only(cell, [(skewed, 18750.0)])
+
+        assert result.ages["M20"] == pytest.approx(78.0)
+        assert result.ages["F20"] == pytest.approx(52.0)
+
+    def test_zero_baseline_ages_split_evenly(self):
+        cell = _grid_cell(0.0, _zero_ages())
+
+        result = merge_cell_total_only(cell, [(self._forecast_poi(200.0), 62500.0)])
+
+        assert result.spop == pytest.approx(200.0)
+        assert all(v == pytest.approx(200.0 / len(AGE_COLUMNS)) for v in result.ages.values())
+        assert sum(result.ages.values()) == pytest.approx(result.spop)
+
+    def test_no_overlap_passes_baseline_through(self):
+        cell = _grid_cell(50.0, {**_zero_ages(), "M20": 30.0, "F20": 20.0})
+
+        result = merge_cell_total_only(cell, [])
+
+        assert result.spop == 50.0
+        assert result.ages["M20"] == 30.0
+
+
+class TestFindOverlapAreas:
+    """교차 계산은 지오메트리만 본다 — 그래서 13개 시각이 결과를 공유할 수 있다."""
+
+    def test_returns_area_codes_so_snapshots_can_be_swapped_per_target(self):
+        cell = _grid_cell(100.0)
+        poi_geom = PoiSnapshot(
+            area_cd="POI001", male_rate=50.0, female_rate=50.0, pop_estimate=0.0,
+            geometry=box(953810.0, 1952620.0, 954060.0, 1952870.0), area_m2=62500.0,
+        )
+
+        result = find_overlap_areas([cell], [poi_geom])
+
+        assert list(result) == [cell.cell_id]
+        assert result[cell.cell_id][0][0] == "POI001"
+        assert result[cell.cell_id][0][1] == pytest.approx(62500.0)
+
+    def test_bind_snapshots_drops_pois_without_a_value_for_that_target(self):
+        from merge import bind_snapshots
+
+        available = PoiSnapshot(
+            area_cd="POI001", male_rate=0.0, female_rate=0.0, pop_estimate=100.0,
+            geometry=box(0, 0, 1, 1), area_m2=1.0,
+        )
+
+        bound = bind_snapshots(
+            [("POI001", 100.0), ("POI002", 200.0)], {"POI001": available}
+        )
+
+        assert [pair[0].area_cd for pair in bound] == ["POI001"]

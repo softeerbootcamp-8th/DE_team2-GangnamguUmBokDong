@@ -142,21 +142,16 @@ def enrich_station_master(
     }
 
 
-def run(window_start: datetime, baseline_date_mode: str) -> int:
-    """같은 window의 API master를 보강해 파티션 Silver와 manifest를 쓴다."""
-    if baseline_date_mode == "strict":
-        baseline_date = window_start.date()
-        if not storage.partition_exists(storage.GRID_SOURCE_ID, baseline_date):
-            raise storage.PartitionNotFoundError(
-                f"living_population_grid의 dt={baseline_date:%Y-%m-%d} 파티션이 없음(strict 모드)"
-            )
-    else:
-        baseline_date = storage.find_latest_partition_date_on_or_before(
-            storage.GRID_SOURCE_ID, window_start.date()
-        )
+def run(window_start: datetime) -> int:
+    """같은 window의 API master를 보강해 파티션 Silver와 manifest를 쓴다.
+
+    격자 목록은 nowcaster 추정치에서 얻는다 — 실측 원본은 관측일이 4~5일 늦어 그날의
+    파티션이 있다고 해서 그날 격자를 뜻하지 않는다(`storage.read_nowcast_grid` 참고).
+    """
+    baseline_date = window_start.date()
 
     master_table = storage.read_station_master_silver(window_start)
-    grid_table = storage.read_grid_silver(baseline_date)
+    grid_table = storage.read_nowcast_grid(baseline_date)
     realtime_table = storage.read_latest_bike_realtime_silver(window_start)
     output, metrics = enrich_station_master(master_table, grid_table, realtime_table)
     output_key = storage.write_enriched_station_master(window_start, output)
@@ -165,7 +160,6 @@ def run(window_start: datetime, baseline_date_mode: str) -> int:
         {
             "source_id": storage.ENRICHED_STATION_MASTER_SOURCE_ID,
             "baseline_date": baseline_date.isoformat(),
-            "baseline_date_mode": baseline_date_mode,
             "output_key": output_key,
             **metrics,
         },
@@ -183,11 +177,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """CLI 인자를 파싱한다."""
     parser = argparse.ArgumentParser(prog="station_master.py")
     parser.add_argument("--window-start", required=True, help="ISO8601, KST 오프셋(+09:00) 포함")
-    parser.add_argument(
-        "--baseline-date-mode",
-        choices=["strict", "latest"],
-        default="latest",
-    )
     return parser.parse_args(argv)
 
 
@@ -195,7 +184,7 @@ def main(argv: list[str] | None = None) -> int:
     """CLI 실행 오류를 Airflow가 감지할 수 있는 종료 코드로 바꾼다."""
     args = parse_args(argv)
     try:
-        return run(datetime.fromisoformat(args.window_start), args.baseline_date_mode)
+        return run(datetime.fromisoformat(args.window_start))
     except (storage.PartitionNotFoundError, ValueError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
