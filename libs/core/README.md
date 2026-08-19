@@ -14,6 +14,7 @@
 | `regions.py` | 대여소를 11개 지역센터 중 최근접으로 배정(apps/api, rebalance 공유) | `DISPATCH_CENTERS`, `nearest_region()` |
 | `forecast.py` | 예측 원본치를 누적해 예측 재고·action_type을 계산(apps/api, rebalance 공유) | `enrich_forecast_points()` |
 | `scoring_config.py` | urgency_score/enrich_forecast_points 계산에 쓰이는 튜닝 상수 | `SUPPLY_LOW_STOCK_RATIO`, `SEVERITY_SCALE` 등 |
+| `gold_publication/` | Gold v1 canonical 문서·immutable object 검증·publication transaction | `verify_publication_evidence()`, `execute_publication()` |
 
 ---
 
@@ -73,3 +74,20 @@ df = read_parquet("silver/bike_station_realtime/dt=2026-08-16/hh=14/1405.parquet
 # 2. Parquet 저장
 write_parquet(df, "silver/processed_data/output.parquet")
 ```
+
+### ④ Gold publication 공통 경계 (`gold_publication/`)
+
+Gold publisher는 typed artifact set·input fingerprint·manifest를 만든 뒤 다음
+순서를 지킵니다.
+
+1. input과 output artifact를 불변 URI에 먼저 쓰고 exact bytes SHA-256을 고정합니다.
+2. `verify_publication_evidence()`로 실제 object bytes·canonical fingerprint·전체 업무
+   시각을 검증합니다. manifest는 이 검증이 성공한 뒤 마지막 immutable
+   object로 쓰고 다시 읽습니다.
+3. verifier가 반환한 `VerifiedPublicationEvidence`만 `execute_publication()`에
+   전달합니다. lock 안 검증, state claim, target 전체 교체는 같은 PostgreSQL
+   transaction에서 실행합니다.
+
+publisher는 raw `claim_publication()`을 직접 호출하거나 공통 verifier 없이
+target을 변경하면 안 됩니다. 조건부 EMPTY, topology 전체성, station·stock
+동일 release 같은 key별 규칙은 lock 안 callback에서 추가로 증명합니다.
