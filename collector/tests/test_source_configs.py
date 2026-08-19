@@ -46,6 +46,25 @@ class TestAllSourcesLoad:
         assert config.adapter in ("seoul_openapi", "kma_apihub")
         assert config.config_version.startswith("sha256:")
 
+    def test_no_source_declares_response_pagination_meta(self):
+        """`RNUM`·`START_INDEX`·`END_INDEX`는 데이터가 아니라 요청/응답 메타다.
+
+        실측에서 `START_INDEX`/`END_INDEX`는 전 행이 `(0, 0)`이고 `RNUM`은 그 응답
+        안에서의 행 번호다. 선언하면 두 가지가 나빠진다.
+
+        1. archive에 의미 없는 컬럼이 쌓인다(`docs/collector/bootstrap-design.md`도
+           "archive에도 의미가 없다"고 적어뒀다 — CSV bootstrap은 채울 수조차 없다).
+        2. `compaction.dedup`이 `_window_start`를 뺀 **전체 데이터 컬럼**으로 묶으므로
+           `RNUM`이 dedup 키에 들어간다. 같은 시간대를 여러 윈도우가 반복 수집할 때
+           목록에 지연 등록이 끼어들어 `RNUM`이 한 칸 밀리면, 같은 대여가 서로 다른
+           행으로 남아 중복이 걷히지 않는다.
+        """
+        forbidden = {"RNUM", "START_INDEX", "END_INDEX"}
+        for source_id in SOURCE_IDS:
+            config = config_loader.load(source_id, base_dir=SOURCES_DIR)
+            declared = forbidden & set(config.columns)
+            assert not declared, f"{source_id}에 응답 메타 컬럼이 선언돼 있다: {sorted(declared)}"
+
 
 class TestOptionalKeysOmittable:
     """새로 늘어난 3개 키가 생략 가능하고, 생략 시 기존과 같이 동작하는지 확인한다."""
