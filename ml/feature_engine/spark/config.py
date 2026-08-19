@@ -7,12 +7,13 @@ S3(MinIO)를 거친다 — 로컬 파일시스템 폴백은 없다. 경로는 �
 `pathlib.Path`나 `"/".join(...)`을 쓰지 않고 f-string으로 그때그때 만든다
 (`collector/storage.py`와 통일된 컨벤션).
 
-**입력**: collector Silver(`SILVER_ROOT` 아래, `silver_source.py` 참고)뿐이다.
-`ml/data/processed_v2/*` 같은 로컬 파생 데이터는 전혀 안 본다 —
-station_master/targets/station_status/weather/population(예전엔 "이미 S3에
-존재한다고 가정"했던 1차 정제 산출물)을 이제 이 패키지가 Silver로부터 직접
-만들어(`run_pipeline._refresh_primary_tables()`) 아래 경로들에 저장한 뒤, 그걸
-"피처마트 생성"(2차 정제) 단계가 읽는다 — 두 단계 다 이 패키지 안에 있다.
+**입력**: 과거·월별 학습 fact는 collector/nowcaster가 확정한 일별
+`ARCHIVE_ROOT/{source_id}/dt=YYYY-MM-DD.parquet`만 읽는다. 최신
+`station_master_enriched`는 historical snapshot을 보장할 수 없는 current dimension이라
+예외적으로 `SILVER_ROOT`에서 읽는다. `ml/data/processed_v2/*` 같은 로컬 파생 데이터는
+입력으로 보지 않는다. archive fact에서 targets/station_status/weather/population을
+직접 만들어(`run_pipeline._refresh_primary_tables()`) 아래 중간 경로에 저장한 뒤,
+"피처마트 생성"(2차 정제) 단계가 읽는다.
 
 `src/`와 반드시 같은 값을 써야 하는 파라미터(censoring 윈도우, lag/rolling 등)는
 `common_config.py`(ml/ 루트, 순수 상수 모듈 — pandas/pyspark 등 무거운 의존성 없음)에서
@@ -30,7 +31,7 @@ import os
 
 from ml_core import common_config
 
-# --- 학습기간 윈도우 (Silver glob/공휴일 계산 범위 — silver_source.py,
+# --- 학습기간 윈도우 (Archive 날짜 선택/공휴일 계산 범위 — silver_source.py,
 # build_merged_table.py) — 최초 과거 학습은 TRAIN_WINDOW_START/END 쌍으로 정확한
 # 구간을 지정하고, 미지정 시 "오늘 기준 최근 TRAIN_LOOKBACK_MONTHS개월"로 매번
 # 다시 계산한다(common_config.training_window()).
@@ -52,12 +53,15 @@ def _s3a(key: str) -> str:
     return f"s3a://{S3_BUCKET}/{key}"
 
 
-# collector Silver 계층의 루트 — `silver_source.py`가 이 아래에서 소스별 glob을
-# 만든다. 테스트에서 로컬 tmp_path 디렉터리로 monkeypatch하기 쉽도록 이 하나의
-# 상수로 분리해뒀다(`dev_spark_incremental.py` 참고).
+# collector Archive 계층의 루트 — 과거·월별 학습 fact reader가 이 아래에서 날짜별
+# flat parquet의 정확한 목록을 만든다. 전체 prefix glob은 사용하지 않는다.
+ARCHIVE_ROOT = os.environ.get("ARCHIVE_ROOT", _s3a("archive"))
+
+# collector Silver 계층의 루트 — serving과 같은 최신 station_master_enriched
+# current dimension 하나만 이 루트에서 읽는다.
 SILVER_ROOT = os.environ.get("SILVER_ROOT", _s3a("silver"))
 
-# --- 1차 정제 산출물 (이제 이 패키지가 Silver로부터 직접 만들어 저장 — silver_source.py) ---
+# --- 1차 정제 산출물 (archive fact/current master에서 직접 만들어 저장 — silver_source.py) ---
 STATION_MASTER_PARQUET = os.environ.get("STATION_MASTER_PARQUET", _s3a("processed_v2/station_master.parquet"))
 TARGETS_PARQUET = os.environ.get("TARGETS_PARQUET", _s3a("processed_v2/targets_2025.parquet"))
 RETURN_TARGETS_PARQUET = os.environ.get("RETURN_TARGETS_PARQUET", _s3a("processed_v2/return_targets_2025.parquet"))
@@ -115,3 +119,6 @@ WATERMARK_PATH = f"{OUTPUT_ROOT_KEY}/_watermark.json"
 # lag_168h(7일)보다 넉넉하게 잡은 안전 마진 — 이보다 짧으면 새로 추가되는 구간의
 # 초반 며칠치 lag/rolling이 이전 데이터를 못 보고 결측/오류가 날 수 있다.
 INCREMENTAL_LOOKBACK_HOURS = common_config.INCREMENTAL_LOOKBACK_HOURS
+# 반납 완료 뒤에야 Archive에 나타나는 대여이력을 target window 끝 뒤에서 얼마나
+# 더 읽을지 정한다. training/config.py와 같은 common profile 값이다.
+TRAINING_SAFETY_MARGIN_DAYS = common_config.TRAINING_SAFETY_MARGIN_DAYS

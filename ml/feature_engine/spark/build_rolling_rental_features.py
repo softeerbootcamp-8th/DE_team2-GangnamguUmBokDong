@@ -1,4 +1,4 @@
-"""Silver `bike_rental_history` -> station별 point-in-time 대여 카운트 (PySpark).
+"""Archive `bike_rental_history` -> station별 point-in-time 대여 카운트 (PySpark).
 
 트립 로딩·station_id 매칭은 `silver_source.read_rental_trips()`가 담당한다 — 자세한
 설계 배경은 REALTIME_FEATURES.md 참고.
@@ -19,7 +19,7 @@ def load_rental_trip_events(
     since: str | None = None,
     until: str | None = None,
 ) -> DataFrame:
-    """Silver 대여이력에서 station_id 매칭된 트립만 추린다(대여 쪽 station_id 기준).
+    """Archive 대여이력에서 station_id 매칭된 트립만 추린다(대여 쪽 station_id 기준).
 
     args:
         spark: SparkSession

@@ -26,11 +26,10 @@ brew install libomp   # macOS에서 LightGBM 실행에 필요
 2025년 전체를 정확히 사용한다. 두 변수는 반드시 쌍으로 지정해야 하며, 한쪽만
 있거나 날짜 형식이 잘못됐거나 시작일이 종료일보다 늦으면 실행 전에 실패한다.
 
-단, 운영 historical fact의 확정 입력 계약은 `archive/`다. 현재 feature engine이
-트립/재고/날씨/인구를 아직 Silver에서 읽으므로 archive reader와 2025 backfill이
-통합되기 전 아래 순서는 production 최초 챔피언을 끝까지 만드는 완성 절차가 아니다.
-그 prerequisite가 끝난 뒤 실행해야 한다(최신 station master만 Silver current
-dimension을 사용).
+운영 historical fact의 확정 입력 계약은 날짜별 `archive/`다. feature engine은
+트립/재고/날씨/인구를 Archive에서만 읽고 누락 날짜를 fail-closed하며, 최신 station
+master만 Silver current dimension을 사용한다. 따라서 아래 실행 전에 2025와 필요한
+앞뒤 context Archive partition이 모두 적재돼 있어야 한다.
 
 ```bash
 cd ml

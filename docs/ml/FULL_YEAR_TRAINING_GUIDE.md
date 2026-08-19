@@ -10,17 +10,17 @@
 에서 읽고, 온라인 5분 추론만 최신 `silver/`를 읽는 것이다. collector의 CSV/API
 bootstrap도 과거 원천을 archive에 적재한다.
 
-현재 `feature_engine.spark.silver_source`는 historical fact(트립/재고/날씨/인구)를
-아직 Silver에서만 읽는다. 따라서 **archive reader와 2025 archive backfill이 통합되기
-전에는 아래 명령을 production 최초 챔피언 생성 절차로 실행할 수 없다.** 이 연결은
-다음 통합 작업의 필수 blocker다. 최신 `station_master_enriched`만 historical snapshot이
-없는 current dimension으로 Silver에서 읽는 계약을 유지한다.
+`feature_engine.spark.silver_source`는 historical fact(트립/재고/날씨/인구)를
+날짜별 Archive에서 읽고 누락 날짜를 fail-closed한다. 최신
+`station_master_enriched`만 historical snapshot이 없는 current dimension으로
+Silver에서 읽는 계약을 유지한다. 따라서 아래 실행 전 남은 데이터 전제는 2025와
+앞뒤 context Archive partition을 실제로 모두 적재하는 것이다.
 
 ## 전제 조건
 
 - 2025 CSV/API 원천이 source별 `archive/` partition에 모두 적재돼 있어야 한다.
-- feature engine historical reader가 archive schema를 현재 feature schema로 변환해야
-  한다. 트립/재고/날씨/인구 fact에 `silver/` fallback을 두면 안 된다.
+- feature engine historical reader는 archive schema를 현재 feature schema로 변환하며,
+  트립/재고/날씨/인구 fact에 `silver/` fallback을 두지 않는다.
 - 최신 `silver/station_master_enriched`는 current station dimension 입력으로 사용할
   수 있다.
 - 위 archive 경로로 작은 날짜 구간의 feature/target parity 검증이 먼저 통과해야 한다.
@@ -36,8 +36,7 @@ cd ml
 (cd inference && uv sync)
 ```
 
-archive에 필요한 2025 원천 파티션이 적재되고 archive reader 통합이 끝난 뒤 다음
-순서로 실행한다.
+archive에 필요한 2025 원천 및 앞뒤 context 파티션이 적재된 뒤 다음 순서로 실행한다.
 
 ```bash
 cd ml

@@ -3,15 +3,15 @@
 파라미터 조합(`config.PARAM_COMBO_ID` — window/embargo/tick 값으로 정해짐)별로
 워터마크(`watermark.py`)를 확인한다:
 
-- **워터마크가 없으면**(이 조합으로 처음 만드는 것) Silver 전체로 1차 정제 산출물
-  (station_master/targets/station_status/weather/population, `silver_source.py`)을
-  새로 만들고, 그걸로 피처마트를 처음부터 만든다.
+- **워터마크가 없으면**(이 조합으로 처음 만드는 것) 확정 일별 Archive fact와 최신
+  Silver station master로 1차 정제 산출물(targets/station_status/weather/population,
+  `silver_source.py`)을 새로 만들고, 그걸로 피처마트를 처음부터 만든다.
 - **워터마크가 있으면** "워터마크 - `config.INCREMENTAL_LOOKBACK_HOURS`"를 **그 날짜의
   자정으로 내림**한 시각부터 다시 계산해서, 그 날짜 이후 파티션을 통째로
   **덮어쓴다**(append가 아님 — 아래 "왜 append가 아니라 overwrite인가" 참고).
 
 **왜 append가 아니라 (날짜 파티션) overwrite인가 — 대여 건수의 지연 반영 문제**:
-Silver `bike_rental_history`는 트립이 **반납 완료된 시점에야** 한 행으로 나타난다
+Archive `bike_rental_history`는 트립이 **반납 완료된 시점에야** 한 행으로 나타날 수 있다
 (`silver_source.read_rental_trips()` 참고) — 대여 시작 시각(`start_dt`)이 아니라
 반납 시각을 기준으로 데이터가 들어온다. 즉 어떤 트립이 유난히 오래 걸리면(장시간
 대여, 반납 실패 후 재시도 등), 그 트립의 `start_dt`가 가리키는 시간대는 **이미
@@ -119,7 +119,7 @@ def _refresh_primary_tables(
     since: str | None = None,
     until: str | None = None,
 ) -> None:
-    """Silver로부터 station_master/targets/station_status/weather/population을 통째로
+    """Archive fact와 최신 Silver master에서 1차 정제 테이블을 통째로
     다시 만들어 `build_merged_table.py`가 읽는 경로(`config.STATION_MASTER_PARQUET` 등)에
     저장한다.
 
@@ -129,17 +129,16 @@ def _refresh_primary_tables(
     중간 산출물에 함께 둔다 —
     station_status(연 22M행 규모)/weather(연 8,760행)/population/targets는 EMR Spark
     풀 리빌드로 감당 못 할 크기가 아니고, 예전처럼 "이미 어딘가에 존재하는 1차 정제
-    산출물"이 아니라 이제 이 패키지가 직접 Silver에서 만들어내므로 부분 갱신 로직을
+    산출물"이 아니라 이제 이 패키지가 Archive/current Silver에서 만들어내므로 부분 갱신 로직을
     따로 둘 이유가 없다. 증분 실행에서 실제로 아끼는 부분은 그 뒤 단계(대여이력
     lag/rolling 재계산, `build_rolling_rental_features`/`build_merged_table`의 `since`)다.
 
-    **2026-08부터 `since`/`until`이 필수에 가까워짐** — `silver_source._silver_glob()`이
-    더 이상 연도로 안 좁히므로(고정 TRAIN_YEAR 폐지, 롤링 윈도우로 전환), `since`
-    없이 부르면 Silver에 쌓인 전체 히스토리를 매번 다시 계산하게 된다. 호출부
-    (`_run_full_build()`/`_run_incremental()`)는 항상 `config.WINDOW_START`와
-    `WINDOW_END + 1일 00:00`을 넘긴다. 둘을 생략해 직접 호출해도 같은 config 경계를
-    기본으로 쓴다. station_master는 과거 enriched snapshot이 있다는 보장이 없는
-    serving용 current dimension이라 시간 필터 대상이 아니며 항상 최신을 쓴다.
+    `since`/`until`은 archive 일별 파일의 정확한 목록과 행 timestamp 재필터에 함께
+    쓰인다. 호출부(`_run_full_build()`/`_run_incremental()`)는 항상
+    `config.WINDOW_START`와 `WINDOW_END + 1일 00:00`을 넘기며, 둘을 생략해 직접
+    호출하면 같은 config 경계를 기본으로 쓴다. station_master는 과거 enriched
+    snapshot이 있다는 보장이 없는 serving용 current dimension이라 시간 필터 대상이
+    아니며 항상 최신 Silver를 쓴다.
     """
     window_since, window_until = _window_timestamp_bounds()
     since = since or window_since
@@ -169,7 +168,7 @@ def _run_full_build(spark) -> None:
     """워터마크가 없거나 명시적 window일 때 해당 구간을 처음부터 만든다."""
     window_since, window_until = _window_timestamp_bounds()
     print(
-        f"[{config.PARAM_COMBO_ID}] 전체 overwrite -> Silver에서 "
+        f"[{config.PARAM_COMBO_ID}] 전체 overwrite -> Archive에서 "
         f"{window_since}~{config.WINDOW_END} 구간으로 처음부터 생성"
     )
 
@@ -253,7 +252,7 @@ def _run_incremental(spark, watermark: dict) -> None:
     구간에 걸리는 날짜 파티션을 통째로 덮어쓴다.
 
     append가 아니라 overwrite인 이유, 파티션을 자정 경계로 내려야 하는 이유는 모듈
-    docstring 참고 — 요약하면 대여이력은 반납 완료 시에만 Silver에 나타나므로, 이미
+    docstring 참고 — 요약하면 대여이력은 반납 완료 시에야 Archive에 나타날 수 있으므로, 이미
     발행된 과거 날짜의 `rental_count`가 뒤늦게 늘어날 수 있고 이 재계산이 그걸
     보정한다.
 
