@@ -71,6 +71,16 @@ class SeoulOpenApiAdapter:
     """서울 열린데이터광장 공용 페이지네이션 규약 어댑터."""
 
     @staticmethod
+    def planned_parts(config: SourceConfig, window) -> frozenset[str] | None:
+        """요청 전에 전체 키를 아는 POI 소스의 조각 계획을 반환한다."""
+        params = config.adapter_params
+        if params["service"] != "citydata_ppltn":
+            return None
+        poi_start = int(params.get("poi_start", 1))
+        poi_end = int(params["poi_end"])
+        return frozenset(f"poi-POI{i:03d}" for i in range(poi_start, poi_end + 1))
+
+    @staticmethod
     def fetch(
         config: SourceConfig,
         window,

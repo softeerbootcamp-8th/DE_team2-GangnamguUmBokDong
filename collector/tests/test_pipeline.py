@@ -7,9 +7,10 @@ from typing import ClassVar
 from zoneinfo import ZoneInfo
 
 import httpx
+import pytest
+
 import manifest as manifest_module
 import pipeline
-import pytest
 import storage
 from adapters.base import FetchErrorKind, FetchResult, adapter
 from config.schema import Backfill, Policies, Quality, Schedule, SourceConfig
@@ -46,6 +47,11 @@ class _ScriptedAdapter:
     fetch_calls: ClassVar[int] = 0
     results: ClassVar[list] = []  # list[list[FetchResult]] — 호출마다 하나씩 소비
     rows_by_key: ClassVar[dict] = {}  # chunk key -> normalize가 반환할 행 하나
+    planned: ClassVar[frozenset[str] | None] = None
+
+    @staticmethod
+    def planned_parts(config, window):
+        return _ScriptedAdapter.planned
 
     @staticmethod
     def fetch(config, window, *, client, skip=frozenset(), expected_total=None):
@@ -69,6 +75,7 @@ def scripted_adapter(clean_adapter_registry, monkeypatch):
     _ScriptedAdapter.fetch_calls = 0
     _ScriptedAdapter.results = []
     _ScriptedAdapter.rows_by_key = {}
+    _ScriptedAdapter.planned = None
     adapter("t_pipeline_adapter")(_ScriptedAdapter)
     return _ScriptedAdapter
 
@@ -134,6 +141,21 @@ class TestFreshFetchSuccess:
         assert result.missing.parts == ()
         assert result.missing.basis == "parts"
         assert result.completeness == 1.0
+
+    def test_unvisited_planned_part_fails_zero_missing_ratio_gate(self, scripted_adapter, client):
+        """iterator가 조기 종료돼 yield되지 않은 계획 part도 누락으로 판정한다."""
+        scripted_adapter.planned = frozenset({"poi-POI001", "poi-POI002"})
+        scripted_adapter.results = [
+            [FetchResult(key="poi-POI001", payload=_chunk("row"), error=None, expected_total=None)]
+        ]
+        config = _config(quality=Quality(max_drop_ratio=1.0, max_missing_ratio=0.0, allow_empty=False))
+
+        result = pipeline.execute_window(config, WINDOW_START, client=client)
+
+        assert result.status == RunStatus.FAILED
+        assert result.failure_reason == FailureReason.FETCH_ERROR
+        assert result.missing.parts == ("poi-POI002",)
+        assert result.missing.basis == "parts"
 
 
 class TestSkipBranch:

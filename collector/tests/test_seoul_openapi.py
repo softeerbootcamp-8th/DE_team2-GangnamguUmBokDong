@@ -6,6 +6,7 @@ import json
 
 import httpx
 import pytest
+
 from adapters.base import FetchErrorKind
 from adapters.seoul_openapi import SeoulOpenApiAdapter
 
@@ -166,6 +167,9 @@ def test_population_fetch_uses_configured_poi_range_and_does_not_stop_at_gap():
         return httpx.Response(200, content=json.dumps(body).encode())
 
     client = httpx.Client(transport=httpx.MockTransport(handler))
+    assert SeoulOpenApiAdapter.planned_parts(config, window=None) == frozenset(
+        f"poi-POI{i:03d}" for i in range(117, 122)
+    )
     results = list(SeoulOpenApiAdapter.fetch(config, window=None, client=client))
 
     assert [result.key for result in results] == [

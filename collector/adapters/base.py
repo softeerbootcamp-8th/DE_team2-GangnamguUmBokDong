@@ -30,6 +30,11 @@
 알 수 있는 소스만 채운다. 서울은 첫 페이지의 `list_total_count`, 기상청은 `None`이다.
 pipeline이 이 값을 기억했다가 다음 라운드와 백필에 되돌려주므로, 첫 페이지를 skip해도
 계획을 세울 수 있다.
+
+## planned_parts
+요청 전에 전체 조각 키를 아는 어댑터만 제공한다. row 수와 별개인 요청 계획이며,
+fetch budget으로 iterator가 조기 종료돼 아직 yield하지 못한 키도 누락으로 기록하고
+백필할 수 있게 한다.
 """
 
 from __future__ import annotations
@@ -102,6 +107,9 @@ class Adapter(Protocol):
     # normalize: bytes 조각들을 파이썬 딕셔너리 리스트로 파싱하는 역할만 담당
     @staticmethod
     def normalize(chunks: list[bytes], config: SourceConfig) -> list[dict]: ...
+
+    @staticmethod
+    def planned_parts(config: SourceConfig, window: Window) -> frozenset[str] | None: ...
 
 
 class UnknownAdapterError(ValueError):
@@ -189,6 +197,7 @@ def fetch_with_rounds(
     sleep_fn=time.sleep,
     now_fn=time.monotonic,
     on_chunk=None,
+    planned_parts: frozenset[str] | None = None,
 ):
     """실패분을 모아 재순회하는 공통 라운드 루프이다.
 
@@ -206,6 +215,8 @@ def fetch_with_rounds(
         sleep_fn: 대기 함수 (테스트 시 모킹용)
         now_fn: 현재 시간 측정 함수 (테스트 시 모킹용)
         on_chunk: 조각 수집 성공 시 즉시 실행할 콜백 함수 (보통 S3 스트리밍 저장용)
+        planned_parts: 어댑터가 요청 전에 알 수 있는 전체 조각 키. 조기 budget
+            종료로 iterator가 도달하지 못한 키도 누락으로 기록하는 데 사용한다.
     returns:
         성공분(chunks), 누락분(missing), 전체 행 수(expected_total)를 담은 FetchRoundResult 객체
     """
@@ -280,4 +291,8 @@ def fetch_with_rounds(
     # 여기까지 남은 transient는 라운드를 다 써버려서 더 재시도하지 못하는 것들이다.
     # permanent와 합쳐 이번 실행에서 못 받은 조각으로 pipeline에 돌려준다.
     missing = {**permanent, **transient}
+    if planned_parts is not None:
+        covered = frozenset(skip) | collected.keys() | missing.keys()
+        for key in planned_parts - covered:
+            missing[key] = FetchErrorKind.TRANSIENT
     return FetchRoundResult(chunks=collected, missing=missing, expected_total=expected_total)

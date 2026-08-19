@@ -6,6 +6,9 @@ adapter_params:
   service: tbCycleRentData
   page_size: 1000
   root_key: rentData.row
+  # API가 시간까지만 받으므로 5분 실행은 현재 시간대의 누적 snapshot을 다시 읽는다.
+  # 시간 중 신규 대여를 5분 단위로 반영하기 위한 선택이며, 소비자는
+  # (BIKE_ID, RENT_DT)로 중복 제거한다.
   path_suffix: "/{window_start:%Y-%m-%d}/{window_start:%H}"
 
 schedule:
@@ -53,15 +56,15 @@ columns:
   RTN_HOLD:
     types: [str]
   USE_MIN:
-    types: [int]
+    types: [str, int]
   USE_DST:
-    types: [float]
+    types: [str, float]
   USR_CLS_CD:
     types: [str]
   SEX_CD:
     types: [str]
   BIRTH_YEAR:
-    types: [int]
+    types: [str, int]
   RENT_STATION_ID:
     types: [str]
   RETURN_STATION_ID:
@@ -73,4 +76,4 @@ columns:
   END_INDEX:
     types: [int]
   RNUM:
-    types: [int]
+    types: [str, int]
