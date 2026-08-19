@@ -43,6 +43,7 @@ from pathlib import Path
 import pyarrow as pa
 
 from bootstrap.config import BootstrapConfig
+from bootstrap.station_join import StationMap
 from core.wind import wind_components
 
 logger = logging.getLogger(__name__)
@@ -78,7 +79,12 @@ def _file_overlaps_range(path: Path, months: set[tuple[int, int]]) -> bool | Non
     return year_month in months
 
 
-def read_by_date(cfg: BootstrapConfig, csv_dir: Path, days: set[date]) -> dict[date, pa.Table]:
+def read_by_date(
+    cfg: BootstrapConfig,
+    csv_dir: Path,
+    days: set[date],
+    station_map: StationMap | None = None,
+) -> dict[date, pa.Table]:
     """디렉터리의 CSV들을 한 번씩 훑어 요청한 날짜별 Arrow 테이블로 나눈다.
 
     헤더는 `column_map`으로 물리 컬럼명이 되고, `value_map`에 있는 값은 변환된다.
@@ -92,12 +98,19 @@ def read_by_date(cfg: BootstrapConfig, csv_dir: Path, days: set[date]) -> dict[d
         cfg: 해당 소스의 bootstrap 설정
         csv_dir: CSV들이 있는 디렉터리. `cfg.file_pattern`에 맞는 파일만 읽는다.
         days: 담을 날짜 집합. 여기 없는 날짜의 행은 버린다.
+        station_map: `join`이 선언된 설정에서 조인에 쓸 매핑표. 선언되지 않았으면 무시된다.
     returns:
         `{날짜: pa.Table}`. 모든 컬럼은 문자열 타입이다. 행이 하나도 없는 날짜는
         키 자체가 없다.
     raises:
-        ValueError: 시각 컬럼을 설정된 형식으로 파싱할 수 없을 때.
+        ValueError: 시각 컬럼을 설정된 형식으로 파싱할 수 없을 때, 또는 `join`이
+            선언됐는데 `station_map`이 없을 때.
     """
+    if cfg.join is not None and station_map is None:
+        # 그냥 두면 조인 컬럼이 전부 비고 required인 stationId 결측으로 그 날짜의 행이
+        # 통째로 폐기된다. "적재는 성공했는데 archive가 비었다"보다 여기서 끊는 게 낫다.
+        raise ValueError(f"join(provider={cfg.join.provider})이 선언됐는데 station_map이 없다")
+
     months = {(d.year, d.month) for d in days}
     na_values = set(cfg.na_values)
     batches: dict[date, list[pa.RecordBatch]] = defaultdict(list)
@@ -114,7 +127,7 @@ def read_by_date(cfg: BootstrapConfig, csv_dir: Path, days: set[date]) -> dict[d
                 f"stage=bootstrap_csv file={path.name} 파일명에서 YYMM을 뽑을 수 없어 "
                 "전체를 읽는다"
             )
-        _read_file_into_batches(path, cfg, days, na_values, batches)
+        _read_file_into_batches(path, cfg, days, na_values, batches, station_map)
 
     return {day: pa.Table.from_batches(day_batches) for day, day_batches in batches.items()}
 
@@ -125,15 +138,25 @@ def _read_file_into_batches(
     days: set[date],
     na_values: set[str],
     batches: dict[date, list[pa.RecordBatch]],
+    station_map: StationMap | None = None,
 ) -> None:
     """CSV 한 파일을 청크 단위로 읽어 `batches`에 날짜별 RecordBatch를 쌓는다."""
     # 상수·분해 결과도 archive 스키마에 실려야 하므로 물리 컬럼 목록에 함께 넣는다.
     # 분해의 재료가 된 CSV 헤더(`일시` 등)는 여기 없다 — collector 컬럼이 아니다.
     physical_columns = [
-        *cfg.column_map.values(),
-        *cfg.constants,
-        *(target for spec in cfg.derived_time.values() for target in spec.into),
-        *((cfg.derived_wind.u, cfg.derived_wind.v) if cfg.derived_wind else ()),
+        name
+        for name in (
+            *cfg.column_map.values(),
+            *cfg.constants,
+            *(target for spec in cfg.derived_time.values() for target in spec.into),
+            *cfg.composed_time,
+            *(cfg.join.fills if cfg.join else ()),
+            *((cfg.derived_wind.u, cfg.derived_wind.v) if cfg.derived_wind else ()),
+        )
+        # 언더스코어로 시작하는 컬럼은 조인 키(`_station_no`)처럼 행을 만드는 데만 쓰는
+        # 임시 값이다. 어차피 `conform()`이 archive 스키마에서 떨어뜨리므로 여기서
+        # 빼서 큰 파일에서 헛되이 쌓이지 않게 한다.
+        if not name.startswith("_")
     ]
 
     with path.open(encoding=cfg.encoding, errors="replace", newline="") as handle:
@@ -146,8 +169,9 @@ def _read_file_into_batches(
                 for header, physical in cfg.column_map.items()
             }
             row.update(cfg.constants)
-            # 날짜 버킷팅(_row_date)이 분해 결과를 읽을 수 있어야 하므로 그보다 먼저 한다.
+            # 날짜 버킷팅(_row_date)이 분해·결합 결과를 읽을 수 있어야 하므로 그보다 먼저 한다.
             row.update(_derived_time_values(raw, cfg))
+            row.update(_composed_time_values(raw, cfg))
             day = _row_date(row, cfg)
             if day not in days:
                 continue
@@ -157,6 +181,8 @@ def _read_file_into_batches(
 
             # value_map이 풍속·풍향을 고칠 수도 있으므로 파생은 그 뒤에 계산한다.
             row.update(_derived_wind_values(row, cfg))
+            # value_map이 조인 키를 고칠 수도 있으므로 조인은 그 뒤에 온다.
+            row.update(_join_values(row, cfg, station_map))
 
             day_columns = chunk.setdefault(day, {name: [] for name in physical_columns})
             for name in physical_columns:
@@ -206,6 +232,66 @@ def _derived_time_values(raw: dict, cfg: BootstrapConfig) -> dict[str, str]:
         for target, fmt in spec.into.items():
             values[target] = parsed.strftime(fmt)
     return values
+
+
+def _composed_time_values(raw: dict, cfg: BootstrapConfig) -> dict[str, str]:
+    """`composed_time` 규칙으로 여러 시각 컬럼을 물리 컬럼 하나로 합친다.
+
+    재고 CSV는 시각이 `일시`(`2025-12-01`)와 `시간대`(`0`)로 나뉘어 있다. 값을 공백
+    하나로 이어 붙여(`"2025-12-01 0"`) 읽는데, `%H`는 제로패딩이 없는 한 자리 시각도
+    받으므로 CSV를 그대로 쓸 수 있다.
+
+    args:
+        raw: CSV 원본 행(헤더 기준). 결합 재료는 매핑 전 헤더로 읽는다.
+        cfg: `composed_time`을 담은 설정.
+    returns:
+        물리 컬럼명 -> 형식이 적용된 문자열.
+    raises:
+        ValueError: 이어 붙인 값을 `parse` 형식으로 읽을 수 없을 때. `derived_time`과
+            같은 이유로 여기서 끊는다 — 빈 값으로 넘기면 날짜 버킷팅이 죽거나 행이
+            통째로 사라진다.
+    """
+    values: dict[str, str] = {}
+    for target, spec in cfg.composed_time.items():
+        text = " ".join((raw.get(header) or "").strip() for header in spec.from_)
+        try:
+            parsed = datetime.strptime(text, spec.parse)
+        except ValueError as exc:
+            raise ValueError(
+                f"시각 컬럼 {list(spec.from_)}을 합친 '{text}'을 '{spec.parse}' 형식으로 "
+                f"읽을 수 없다 (대상 컬럼 '{target}')"
+            ) from exc
+        values[target] = parsed.strftime(spec.format)
+    return values
+
+
+def _join_values(row: dict, cfg: BootstrapConfig, station_map: StationMap | None) -> dict[str, str]:
+    """`join` 규칙으로 매핑표에서 가져온 컬럼 값을 만든다.
+
+    매핑표에 없는 대여소는 `fills` 전부가 빈 문자열이 된다. required인 `stationId`가
+    비면 검증 엔진의 `required_missing` 정책이 그 행을 폐기하므로, 여기서 따로
+    거르지 않는다 — 폐기 건수는 manifest의 `column_issues`에 남는다.
+
+    args:
+        row: 매핑·상수·분해·결합·value_map까지 끝난 행.
+        cfg: `join`을 담은 설정.
+        station_map: 조인에 쓸 매핑표.
+    returns:
+        `fills`에 선언된 물리 컬럼명 -> 값. 규칙이 없으면 빈 dict.
+    """
+    spec = cfg.join
+    if spec is None or station_map is None:
+        return {}
+
+    info = station_map.lookup(row.get(spec.by.number, ""), row.get(spec.by.name, ""))
+    available = {
+        "stationId": info.station_id if info else "",
+        "rackTotCnt": info.rack_tot_cnt if info else "",
+        "shared": info.shared if info else "",
+        "stationLatitude": info.latitude if info else "",
+        "stationLongitude": info.longitude if info else "",
+    }
+    return {column: available.get(column, "") for column in spec.fills}
 
 
 def _derived_wind_values(row: dict, cfg: BootstrapConfig) -> dict[str, str]:

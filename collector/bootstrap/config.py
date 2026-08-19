@@ -46,6 +46,65 @@ class DerivedTimeSpec(BaseModel):
     into: dict[str, str] = Field(min_length=1)
 
 
+class ComposedTimeSpec(BaseModel):
+    """여러 시각 컬럼을 물리 컬럼 하나로 합치는 규칙.
+
+    `derived_time`이 컬럼 하나를 여럿으로 나눈다면(1 -> N) 이것은 그 반대다(N -> 1).
+    재고 CSV는 시각이 `일시`(`2025-12-01`)와 `시간대`(`0`~`23`)로 나뉘어 있는데
+    `bike_station_realtime`은 시각 컬럼 하나(`stationDt`)를 기준으로 창을 나눈다.
+
+    `from`의 값들을 공백 하나로 이어 붙여 `parse`로 읽고 `format`으로 다시 찍는다.
+    `derived_time`과 마찬가지로 임의 표현식이 아니라 strftime 재포맷만 허용한다 —
+    설정 파일이 코드가 되는 것을 막기 위해서다.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True, populate_by_name=True)
+
+    # `from`은 파이썬 예약어라 필드명을 `from_`으로 두고 yaml 키를 alias로 받는다.
+    from_: tuple[str, ...] = Field(alias="from", min_length=1)
+    parse: str
+    format: str
+
+
+class JoinKeySpec(BaseModel):
+    """매핑표를 찾을 때 쓰는 물리 컬럼들. 번호로 먼저 찾고 없으면 이름으로 찾는다."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    number: str
+    name: str
+
+
+class JoinSpec(BaseModel):
+    """CSV에 없는 컬럼을 외부 매핑표에서 채우는 규칙.
+
+    재고 CSV는 `대여소번호`(`00102`)를 주는데 collector 스키마는 `stationId`(`ST-4`)를
+    required로 요구한다. 거치대 수·거치율·좌표도 CSV에 없다. `provider`가 가리키는
+    매핑표 생성기(`station_join`)가 그 값들을 만들어 온다.
+
+    `provider`를 자유 문자열로 두지 않는 이유는 오타를 실행 시점이 아니라 설정 로딩에서
+    끊기 위해서다 — 잘못된 이름이면 조인이 조용히 전부 실패하고, required 컬럼이
+    비어 그 날짜의 행이 전량 폐기된다.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    provider: Literal["bike_station"]
+    by: JoinKeySpec
+    # provider가 실제로 채울 수 있는 컬럼만 허용한다. 오타를 그냥 두면 그 컬럼이 조용히
+    # 빈 값이 되고, required 컬럼이었다면 그 날짜의 행이 통째로 폐기된다.
+    fills: tuple[
+        Literal[
+            "stationId",
+            "rackTotCnt",
+            "shared",
+            "stationLatitude",
+            "stationLongitude",
+        ],
+        ...,
+    ] = Field(min_length=1)
+
+
 class DerivedWindSpec(BaseModel):
     """풍속·풍향에서 동서(`UUU`)·남북(`VVV`) 성분을 계산하는 규칙.
 
@@ -97,6 +156,10 @@ class BootstrapConfig(BaseModel):
     constants: dict[str, str] = {}
     # 시각 컬럼 하나를 여러 물리 컬럼으로 분해한다(키는 CSV 헤더).
     derived_time: dict[str, DerivedTimeSpec] = {}
+    # 여러 시각 컬럼을 물리 컬럼 하나로 합친다(키는 물리 컬럼명).
+    composed_time: dict[str, ComposedTimeSpec] = {}
+    # CSV에 없는 컬럼을 외부 매핑표에서 채운다.
+    join: JoinSpec | None = None
     # 풍속·풍향에서 UUU·VVV를 계산한다.
     derived_wind: DerivedWindSpec | None = None
 
@@ -136,6 +199,8 @@ class BootstrapConfig(BaseModel):
                 if self.derived_wind is not None
                 else []
             ),
+            ("composed_time", self.composed_time.keys()),
+            *([("join", self.join.fills)] if self.join is not None else []),
         ]
         for origin, targets in sources:
             for target in targets:
