@@ -152,6 +152,116 @@ def now_utc() -> datetime:
     return datetime.now(UTC)
 
 
+def _fetch_stops_for_routes(route_ids: list[str]) -> dict[str, list[dict]]:
+    """여러 라우트의 스톱을 쿼리 1번으로 가져와 route_id별로 묶어서 반환한다
+    (fetch_all_stock_history와 같은 N+1 방지 패턴). stations와 조인해 지도 렌더링에
+    필요한 sta_nm/lat/lon도 같이 준다."""
+    if not route_ids:
+        return {}
+    query = """
+        SELECT s.route_id, s.visit_order, s.sta_id, st.sta_nm, st.lat, st.lon, s.action, s.bike_cnt
+        FROM rebalance_route_stops s
+        JOIN stations st ON st.sta_id = s.sta_id
+        WHERE s.route_id = ANY(%(route_ids)s)
+        ORDER BY s.route_id, s.visit_order
+    """
+    rows = fetch_all(query, {"route_ids": route_ids})
+    grouped: dict[str, list[dict]] = defaultdict(list)
+    for row in rows:
+        grouped[row.pop("route_id")].append(row)
+    return dict(grouped)
+
+
+def fetch_routes(
+    region: str | None = None, status: str | None = None, limit: int = 100, offset: int = 0
+) -> list[dict]:
+    """재배치 라우트 목록을 스톱과 함께 조회한다. region/status로 선택적으로 필터링한다.
+
+    compute_routes는 5분마다 여러 권역에 걸쳐 라우트를 새로 만들기 때문에(#114),
+    limit/offset 없이 전부 반환하면 응답이 무한정 커질 수 있다 — proposed_at
+    내림차순으로 최신 것부터 limit개만 반환한다."""
+    conditions: list[str] = []
+    params: dict = {"limit": limit, "offset": offset}
+    if region is not None:
+        conditions.append("region = %(region)s")
+        params["region"] = region
+    if status is not None:
+        conditions.append("status = %(status)s")
+        params["status"] = status
+    where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+
+    query = f"""
+        SELECT route_id, region, status, proposed_at, dispatched_at, completed_at
+        FROM rebalance_routes
+        {where}
+        ORDER BY proposed_at DESC
+        LIMIT %(limit)s OFFSET %(offset)s
+    """
+    routes = fetch_all(query, params)
+    stops_by_route = _fetch_stops_for_routes([route["route_id"] for route in routes])
+    for route in routes:
+        route["stops"] = stops_by_route.get(route["route_id"], [])
+    return routes
+
+
+def fetch_route(route_id: str) -> dict | None:
+    """라우트 하나를 스톱과 함께 조회한다. 없으면 None."""
+    query = """
+        SELECT route_id, region, status, proposed_at, dispatched_at, completed_at
+        FROM rebalance_routes
+        WHERE route_id = %(route_id)s
+    """
+    route = fetch_one(query, {"route_id": route_id})
+    if route is None:
+        return None
+    route["stops"] = _fetch_stops_for_routes([route_id]).get(route_id, [])
+    return route
+
+
+def dispatch_route(route_id: str, now: datetime) -> dict | str:
+    """proposed 상태인 라우트를 dispatched로 전이한다. 상태 체크를 UPDATE의 WHERE절에
+    넣고 RETURNING으로 전이된 행을 그 자리에서 바로 받는다 — UPDATE 따로,
+    조회 따로 하면 그 사이에 다른 요청이 상태를 또 바꿔서(예: 곧바로 complete)
+    응답이 실제로 일어난 일과 다른 상태를 보여줄 수 있다.
+
+    returns: 성공 시 stops 포함 라우트(dict) | "not_found"(라우트 없음) | "wrong_status"(proposed가 아님)
+    """
+    row = fetch_one(
+        """
+        UPDATE rebalance_routes
+        SET status = 'dispatched', dispatched_at = %(now)s
+        WHERE route_id = %(route_id)s AND status = 'proposed'
+        RETURNING route_id, region, status, proposed_at, dispatched_at, completed_at
+        """,
+        {"route_id": route_id, "now": now},
+    )
+    if row is None:
+        return "not_found" if fetch_route(route_id) is None else "wrong_status"
+    row["stops"] = _fetch_stops_for_routes([route_id]).get(route_id, [])
+    return row
+
+
+def complete_route(route_id: str, now: datetime) -> dict | str:
+    """dispatched 상태인 라우트를 completed로 전이한다. dispatch_route와 동일한 패턴
+    (RETURNING으로 원자적 응답).
+
+    returns: 성공 시 stops 포함 라우트(dict) | "not_found"(라우트 없음) | "wrong_status"(dispatched가 아님)
+    """
+    row = fetch_one(
+        """
+        UPDATE rebalance_routes
+        SET status = 'completed', completed_at = %(now)s
+        WHERE route_id = %(route_id)s AND status = 'dispatched'
+        RETURNING route_id, region, status, proposed_at, dispatched_at, completed_at
+        """,
+        {"route_id": route_id, "now": now},
+    )
+    if row is None:
+        return "not_found" if fetch_route(route_id) is None else "wrong_status"
+    row["stops"] = _fetch_stops_for_routes([route_id]).get(route_id, [])
+    return row
+
+
 def fetch_nearby_events(lat: float, lon: float, today: date) -> list[dict]:
     """(lat, lon) 기준 NEARBY_EVENT_RADIUS_KM 이내에서 아직 끝나지 않은 문화행사를
     가까운 순으로 반환한다.
