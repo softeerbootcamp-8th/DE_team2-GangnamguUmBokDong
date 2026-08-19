@@ -4,11 +4,17 @@ station_urgency(urgency.compute_all)로 "어디가 급한지"는 알지만 "트�
 어디로 몇 대를 옮겨야 하는지"는 없었다. 11개 권역(core.regions)별로 독립적으로,
 트럭 적재(수거) TRUCK_CAPACITY대 이하 제약 하에 그리디로 라우트를 만든다.
 
+우선순위는 compute_urgency 배치가 이미 계산해 S3에 써둔 결과를
+reader.read_urgency_result로 그대로 읽어서 쓴다 — urgency.compute_all()을
+여기서 다시 부르지 않는다. urgency 자체가 재계산은 결정적(같은 입력 -> 같은
+출력)이라 값은 같겠지만, Airflow에서 compute_urgency -> compute_routes로
+이미 순서가 있는데 그 순서가 실제 데이터 의존이 아니라 이름뿐인 의존이 되는
+건 물론, 같은 계산을 두 배치가 각각 처음부터 다시 하는 낭비이기도 하다.
+
 dispatched(운영자가 실행 선택) 상태인 라우트의 수요는 라우트를 만들기 *전에*
 순수요에서 빼야 한다 — 완성된 라우트에서 스톱만 사후 삭제하면 적재/방문순서
 정합성이 깨지기 때문이다. 이 넷팅을 위한 RDS 조회가 이 모듈에서 유일하게
-RDS를 건드리는 지점이고, 나머지 계산은 urgency.compute_all()이 이미 S3에서
-읽어온 결과를 그대로 재사용한다(재조회 없음).
+RDS를 건드리는 지점이다.
 """
 
 from __future__ import annotations
@@ -21,7 +27,7 @@ import pandas as pd
 from core.db import fetch_all
 from core.regions import DISPATCH_CENTERS, nearest_region
 
-import urgency
+import reader
 from routes_config import TRUCK_CAPACITY
 
 _REGION_COORDS = {name: (lat, lon) for name, lat, lon in DISPATCH_CENTERS}
@@ -156,10 +162,10 @@ def _build_region_routes(region: str, stations: pd.DataFrame, now: datetime) -> 
 def compute_all(anchor: datetime) -> tuple[list[dict], list[dict]]:
     """anchor 시점 기준 11개 권역 전체의 재배치 라우트를 만든다.
 
-    입력(urgency.compute_all)은 S3만 읽고, 여기서 유일하게 RDS(dispatched 넷팅)를
-    좁게 읽는다 — 나머지는 순수 계산이라 RDS/S3에 영향 없음.
+    입력(reader.read_urgency_result)은 S3만 읽고, 여기서 유일하게 RDS(dispatched
+    넷팅)를 좁게 읽는다 — 나머지는 순수 계산이라 RDS/S3에 영향 없음.
     """
-    stations = urgency.compute_all(anchor)
+    stations = reader.read_urgency_result(anchor)
     dispatched = _dispatched_qty()
     remaining = _remaining_need(stations, dispatched)
     if remaining.empty:

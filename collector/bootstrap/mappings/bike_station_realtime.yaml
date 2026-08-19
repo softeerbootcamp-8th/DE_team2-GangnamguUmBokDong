@@ -1,0 +1,22 @@
+# bikeListHist 과거 조회 API. 2023-08부터 조회된다.
+#
+# time_format이 10자리인 것이 중요하다. 8자리(20260817)를 주면 API가 에러 없이
+# 무시하고 최신 스냅샷을 반환한다 — 조용히 틀린 데이터가 들어온다.
+#
+# 응답 필드명이 bike_station_realtime.yaml의 컬럼과 같아서 column_map이 없다.
+kind: history_api
+service: bikeListHist
+time_format: "%Y%m%d%H"
+page_size: 1000
+
+window:
+  from_column: stationDt
+  format: "%Y%m%d%H"
+
+# bikeListHist는 실측상 한 시각에 스테이션마다 행을 2개 준다(3,198개소 x 2 =
+# 6,400행/시간). 그중 대부분(2,508쌍)은 값이 완전히 같고 일부(690쌍)만
+# parkingBikeTotCnt·shared가 다르다. stationDt가 시 단위라 둘을 구분할 방법이
+# 없으므로, 완전히 동일한 쌍만 하나로 합친다. `_window_start`를 포함한 전체
+# 컬럼으로 묶어야 한다 — 다른 시각의 값이 우연히 같을 때 시계열이 깨지면 안 된다
+# (compaction.dedup()을 그대로 쓰면 이 실수가 난다).
+dedup: true

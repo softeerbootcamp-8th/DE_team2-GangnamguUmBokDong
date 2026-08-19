@@ -59,6 +59,18 @@ class _ContextFilter(logging.Filter):
         return True
 
 
+class _SourceOnlyFilter(logging.Filter):
+    """source_id만 주입한다. window·attempt가 없는 배치 작업용."""
+
+    def __init__(self, source_id: str):
+        super().__init__()
+        self._source_id = source_id
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.source_id = self._source_id
+        return True
+
+
 class _KeyValueFormatter(logging.Formatter):
     """`LEVEL message key=value ...` 형식으로 렌더링한다.
 
@@ -111,6 +123,35 @@ def configure_logging(
     handler = logging.StreamHandler(stream if stream is not None else sys.stdout)
     handler.setFormatter(_KeyValueFormatter())
     handler.addFilter(_ContextFilter(source_id, window_start, attempt))
+    root.addHandler(handler)
+
+    return root
+
+
+def configure_batch_logging(
+    source_id: str, *, level: int = logging.INFO, stream=None
+) -> logging.Logger:
+    """source_id만 고정 필드로 붙이는 root 로거를 설정한다.
+
+    compaction처럼 날짜 범위를 처리하는 배치는 window·attempt라는 개념이 없다. 없는
+    값을 억지로 채우면(실행 시각을 window로 넣는 등) 로그를 읽는 사람이 그것을 실제
+    수집 윈도우로 오해한다. 포매터는 `configure_logging`과 같은 것을 쓰므로 출력
+    형식은 동일하고, 없는 필드만 빠진다.
+
+    args:
+        source_id: 이번 실행의 소스 id.
+        level: root 로거의 최소 레벨.
+        stream: 로그를 보낼 스트림. 생략하면 컨테이너 stdout(`sys.stdout`).
+    returns:
+        설정이 끝난 root 로거.
+    """
+    root = logging.getLogger()
+    root.handlers.clear()
+    root.setLevel(level)
+
+    handler = logging.StreamHandler(stream if stream is not None else sys.stdout)
+    handler.setFormatter(_KeyValueFormatter())
+    handler.addFilter(_SourceOnlyFilter(source_id))
     root.addHandler(handler)
 
     return root

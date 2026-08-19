@@ -9,16 +9,11 @@ from __future__ import annotations
 
 import argparse
 import sys
-from datetime import datetime
 
 from core.s3 import write_parquet
 
 import urgency
-from reader import anchor_timestamp
-
-
-def _urgency_key(window_start: datetime) -> str:
-    return f"urgency/dt={window_start:%Y-%m-%d}/hh={window_start:%H}/urgency_{window_start:%H%M}.parquet"
+from reader import _urgency_key, anchor_timestamp
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -27,6 +22,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--hour", type=int, required=True)
     parser.add_argument("--minute", type=int, required=True)
     args = parser.parse_args(argv)
+
+    if args.minute % 5:
+        parser.error("--minute must be aligned to a 5-minute tick")
 
     anchor = anchor_timestamp(args.date, args.hour, args.minute)
     result = urgency.compute_all(anchor)

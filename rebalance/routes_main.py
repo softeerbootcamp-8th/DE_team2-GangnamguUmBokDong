@@ -1,9 +1,9 @@
 """CLI 진입점: anchor 시점 기준 권역별 재배치 라우트를 만들어 S3에 저장한다.
 
 Airflow(compute_routes 태스크)가 compute_urgency 뒤에 `--date/--hour/--minute`
-(KST 벽시계 시각, main.py/urgency와 동일한 값)으로 실행한다. urgency 계산을
-다시 하지만(별도 프로세스라 결과 공유 불가) 입력은 여전히 S3뿐이고, dispatched
-넷팅을 위한 RDS 조회만 이 배치의 유일한 예외다.
+(KST 벽시계 시각, main.py/urgency와 동일한 값)으로 실행한다. urgency는
+compute_urgency가 S3에 이미 써둔 결과를 routes.py가 그대로 읽어서 쓰고
+(재계산하지 않음), dispatched 넷팅을 위한 RDS 조회만 이 배치의 유일한 예외다.
 """
 
 from __future__ import annotations

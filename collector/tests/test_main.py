@@ -131,3 +131,40 @@ class TestMain:
 
         assert captured["force"] is False
         assert captured["backfill"] is True
+
+
+class TestHttpTimeout:
+    """httpx 기본 timeout은 5초인데 서울 API의 실측 페이지 지연은 최대 7.19초였다.
+    기본값을 그대로 쓰면 느린 시점에 페이지마다 ReadTimeout으로 5초를 버리고
+    라운드 재시도(15s/30s 대기)로 넘어가 fetch 예산을 잠식한다."""
+
+    @pytest.fixture
+    def stub_config(self):
+        return SimpleNamespace(source_id="bike_station_realtime")
+
+    def test_client_timeout_is_explicit_and_longer_than_httpx_default(self, monkeypatch, stub_config):
+        captured = {}
+
+        class SpyClient:
+            def __init__(self, *args, **kwargs):
+                captured["timeout"] = kwargs.get("timeout")
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        monkeypatch.setattr(main.config_loader, "load", lambda source_id: stub_config)
+        monkeypatch.setattr(main.httpx, "Client", SpyClient)
+        monkeypatch.setattr(
+            main.pipeline, "execute_window",
+            lambda *a, **k: SimpleNamespace(status=RunStatus.SUCCEEDED),
+        )
+
+        main.main(["--source", "bike_station_realtime", "--window-start", "2026-08-12T14:10:00+09:00"])
+
+        timeout = captured["timeout"]
+        assert timeout is not None, "timeout을 명시하지 않으면 httpx 기본값 5초가 적용된다"
+        assert timeout.read > 5.0
+        assert timeout.connect is not None

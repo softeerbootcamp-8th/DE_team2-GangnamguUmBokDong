@@ -46,6 +46,15 @@ from manifest import RunStatus
 
 _OK_STATUSES = frozenset({RunStatus.SUCCEEDED, RunStatus.PARTIAL, RunStatus.EMPTY, RunStatus.SKIPPED})
 
+# httpx 기본값은 모든 단계에 5초다. 서울 열린데이터광장의 1000행 페이지 응답 시간을
+# 실측하면 시점에 따라 0.6~7.2초로 흔들려서, 기본값이면 느린 시점에 페이지마다
+# ReadTimeout으로 5초를 버리고 라운드 재시도(15s·30s 대기)로 넘어간다. 데이터를
+# 잃지는 않지만 fetch 예산(`effective_fetch_budget`)을 헛되게 태운다.
+#
+# read를 30초로 두는 근거는 실측 최댓값(7.2초)의 4배 여유다. connect는 짧게 둔다 —
+# 연결이 안 되는 상황은 기다려서 나아지지 않고, TRANSIENT로 라운드가 재시도한다.
+_HTTP_TIMEOUT = httpx.Timeout(connect=10.0, read=30.0, write=30.0, pool=30.0)
+
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """CLI 인자를 파싱한다.
@@ -120,7 +129,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # httpx.Client를 여기서 만들어 실행 하나에 재사용한다
     # 어댑터는 연결을 모르고 `client` 인자로 주입받기만 한다
-    with httpx.Client() as client:
+    with httpx.Client(timeout=_HTTP_TIMEOUT) as client:
         result = pipeline.execute_window(
             config, window_start, client=client, force=args.force, backfill=args.backfill,
         )

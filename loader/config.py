@@ -30,6 +30,7 @@ class TableSpec:
     conflict_cols: list[str]
     update_cols: list[str]
     reader: Callable[[datetime], pd.DataFrame] | None = None
+    guard_col: str | None = None
 
     def read(self, window_start: datetime) -> pd.DataFrame:
         """지정된 윈도우 시각의 S3 데이터를 읽어 Pandas DataFrame으로 반환한다."""
@@ -62,6 +63,7 @@ def _load_table_specs() -> dict[str, TableSpec]:
             conflict_cols=raw["conflict_cols"],
             update_cols=raw["update_cols"],
             reader=reader_fn,
+            guard_col=raw.get("guard_col"),
         )
     return specs
 

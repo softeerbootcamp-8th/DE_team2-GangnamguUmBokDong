@@ -20,9 +20,9 @@ def test_repo_root_resolves_to_repository_root():
     assert (REPO_ROOT / "ml" / "inference").is_dir()
 
 
-def test_collector_task_uses_kst_window_start_and_no_virtual_env(dag):
+def test_collector_task_uses_kst_window_start_and_own_project_environment(dag):
     task = build_collector_task(dag, "bike_station_realtime")
-    assert task.bash_command.startswith("env -u VIRTUAL_ENV ")
+    assert task.bash_command.startswith("env -u VIRTUAL_ENV -u UV_PROJECT_ENVIRONMENT ")
     assert "uv run --frozen python main.py --source bike_station_realtime" in task.bash_command
     assert "astimezone" in task.bash_command
     assert task.cwd == COLLECTOR_DIR
@@ -114,3 +114,57 @@ def test_all_module_wrappers_attach_success_and_failure_callbacks(dag):
     task = build_collector_task(dag, "bike_station_realtime")
     assert on_success_callback in task.on_success_callback
     assert on_failure_callback in task.on_failure_callback
+
+
+def test_replay_template_renders_to_a_whole_hour_earlier():
+    """`kst_window_start_shifted`가 실제로 Jinja에서 렌더링되는지 확인한다.
+    상수를 문자열로만 검사하면 `macros.timedelta`가 없어도 테스트가 통과해버린다."""
+    from datetime import datetime, timedelta, timezone
+
+    import jinja2
+    from airflow.sdk.execution_time import macros
+
+    from orchestration.templates import KST_WINDOW_START, kst_window_start_shifted
+
+    kst = timezone(timedelta(hours=9))
+    context = {
+        # 5분 경계가 아닌 수동 trigger 시각. 19:33 -> 19:30으로 내림된 뒤 이동해야 한다.
+        "dag_run": type("R", (), {
+            "logical_date": datetime(2026, 8, 18, 19, 33, 12, tzinfo=kst),
+            "start_date": None,
+        })(),
+        "macros": macros,
+    }
+    env = jinja2.Environment()
+
+    base = env.from_string(KST_WINDOW_START).render(context)
+    shifted = env.from_string(kst_window_start_shifted(1)).render(context)
+
+    assert datetime.fromisoformat(base) == datetime(2026, 8, 18, 19, 30, tzinfo=kst)
+    assert datetime.fromisoformat(shifted) == datetime(2026, 8, 18, 18, 30, tzinfo=kst)
+    assert datetime.fromisoformat(
+        env.from_string(kst_window_start_shifted(2)).render(context)
+    ) == datetime(2026, 8, 18, 17, 30, tzinfo=kst)
+
+
+def test_replay_template_rejects_non_positive_hours():
+    import pytest
+
+    from orchestration.templates import kst_window_start_shifted
+
+    with pytest.raises(ValueError):
+        kst_window_start_shifted(0)
+
+
+def test_replay_collector_task_contract(dag):
+    from airflow.task.trigger_rule import TriggerRule
+
+    from orchestration.collector_task import build_collector_replay_task
+
+    task = build_collector_replay_task(dag, "bike_rental_history", 1)
+
+    assert task.task_id == "collect_bike_rental_history_replay_1h"
+    assert task.cwd == COLLECTOR_DIR
+    assert "--source bike_rental_history" in task.bash_command
+    assert "--force" in task.bash_command
+    assert task.trigger_rule == TriggerRule.ALL_DONE

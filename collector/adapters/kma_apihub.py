@@ -13,15 +13,28 @@
 | `half_hourly` | 초단기예보 | 매시 30분 | 14:40 → 14:30 |
 | `vilage_fcst` | 단기예보 | 02, 05, 08...시 정각 | 05:05 → 02:00 |
 
+격자 하나의 행 수가 `numOfRows`(1000)를 넘으면(단기예보가 대표적: 3일치×14개
+카테고리=1052건) 응답 본문의 `totalCount`를 읽어 `pageNo`를 늘려가며 남은 페이지를
+전부 받는다. 여러 페이지를 받았어도 바깥에는 격자당 하나의 `FetchResult`만 내보낸다
+— 페이지는 이 어댑터 내부에서만 존재하는 구현 세부사항이고, 재시도·skip은 여전히
+격자 단위(`grid-060x127`)로만 이뤄진다. 페이지 중 하나라도 실패하면 그 격자 전체를
+실패로 처리해 다음 라운드가 처음부터(1페이지부터) 다시 받는다 — 부분 페이지만
+따로 재시도하면 "이 격자는 몇 페이지짜리였는지"를 라운드 사이에 기억할 방법이
+없기 때문이다.
+
 주의:
 - 인증키(`KMA_APIHUB_KEY`)는 로그·bronze에 남지 않게 마스킹한다.
 - 캐스팅은 검증 엔진의 `types`가 담당한다. pivot은 구조만 바꾸고 값은 문자열 그대로 둔다.
 - 실패 범주 판정은 base의 규칙을 따른다.
+- 페이지가 1개뿐이면(대부분의 경우) 원본 응답 바이트를 그대로 넘긴다. 2개 이상을
+  합칠 때만 페이지들의 item 배열을 이어붙인 JSON을 새로 만든다.
 """
 
 from __future__ import annotations
 
+import copy
 import json
+import math
 import os
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING
@@ -99,6 +112,21 @@ def _extract(body: dict, root_key: str) -> list[dict]:
     return node if isinstance(node, list) else []
 
 
+def _merge_pages(bodies: list[dict], root_key: str) -> bytes:
+    """여러 페이지의 item 배열을 하나로 이어붙인 JSON 본문(bytes)을 만든다.
+
+    첫 페이지의 envelope(header 등)을 그대로 쓰고 item 배열만 전체 페이지를
+    이어붙인 것으로 교체한다.
+    """
+    merged = copy.deepcopy(bodies[0])
+    node = merged
+    segments = root_key.split(".")
+    for segment in segments[:-1]:
+        node = node[segment]
+    node[segments[-1]] = [item for body in bodies for item in _extract(body, root_key)]
+    return json.dumps(merged).encode()
+
+
 @adapter("kma_apihub")
 class KmaApiHubAdapter:
     """기상청 API 허브 공용 격자 반복 어댑터."""
@@ -114,8 +142,9 @@ class KmaApiHubAdapter:
     ):
         params = config.adapter_params
         endpoint = params["endpoint"]
+        root_key = params["root_key"]
         time_rule = params.get("time_rule")
-        
+
         # time_rule 규칙에 따라 API 유효 시각으로 보정
         adjusted_time = _adjust_base_time(window.window_start, time_rule)
         base_date = adjusted_time.strftime("%Y%m%d")
@@ -126,45 +155,72 @@ class KmaApiHubAdapter:
             if key in skip:
                 continue
 
-            url = (
+            base_url = (
                 f"{_BASE_URL}/{endpoint}?authKey={_api_key()}&dataType=JSON"
-                f"&numOfRows={_NUM_OF_ROWS}&pageNo=1"
+                f"&numOfRows={_NUM_OF_ROWS}"
                 f"&base_date={base_date}&base_time={base_time}&nx={nx}&ny={ny}"
             )
-            try:
-                response = client.get(url)
-            except httpx.RequestError:
-                yield FetchResult(key=key, payload=None, error=FetchErrorKind.TRANSIENT, expected_total=None)
+
+            page_bodies: list[dict] = []
+            first_page_raw: bytes | None = None
+            total_pages = 1
+            page_no = 1
+            grid_failed = False
+
+            while page_no <= total_pages:
+                url = f"{base_url}&pageNo={page_no}"
+                try:
+                    response = client.get(url)
+                except httpx.RequestError:
+                    yield FetchResult(key=key, payload=None, error=FetchErrorKind.TRANSIENT, expected_total=None)
+                    grid_failed = True
+                    break
+
+                category = classify_http_status(response.status_code)
+                if category is FetchErrorKind.FATAL:
+                    # HTTP 레벨의 인증키 오류 등 확정적 원인인 경우, 즉시 중단.
+                    yield FetchResult(key=key, payload=None, error=category, expected_total=None)
+                    return
+                elif category is not None:
+                    # HTTP 상태 5xx (TRANSIENT) 또는 4xx (PERMANENT)
+                    yield FetchResult(key=key, payload=None, error=category, expected_total=None)
+                    grid_failed = True
+                    break
+
+                # HTTP 200 OK일 경우 본문의 resultCode 확인
+                try:
+                    body = json.loads(response.content)
+                    if not isinstance(body, dict):
+                        raise TypeError("응답이 JSON 객체가 아님")
+                    result_code = body.get("response", {}).get("header", {}).get("resultCode")
+                except (json.JSONDecodeError, TypeError):
+                    yield FetchResult(key=key, payload=None, error=FetchErrorKind.TRANSIENT, expected_total=None)
+                    grid_failed = True
+                    break
+
+                api_category = _classify_result_code(result_code)
+                if api_category is not None:
+                    if api_category is FetchErrorKind.FATAL:
+                        yield FetchResult(key=key, payload=None, error=api_category, expected_total=None)
+                        return
+                    yield FetchResult(key=key, payload=None, error=api_category, expected_total=None)
+                    grid_failed = True
+                    break
+
+                page_bodies.append(body)
+                if page_no == 1:
+                    first_page_raw = response.content
+                    total_count = body.get("response", {}).get("body", {}).get("totalCount")
+                    if isinstance(total_count, int) and total_count > _NUM_OF_ROWS:
+                        total_pages = math.ceil(total_count / _NUM_OF_ROWS)
+
+                page_no += 1
+
+            if grid_failed:
                 continue
 
-            category = classify_http_status(response.status_code)
-            if category is FetchErrorKind.FATAL:
-                # HTTP 레벨의 인증키 오류 등 확정적 원인인 경우, 즉시 중단.
-                yield FetchResult(key=key, payload=None, error=category, expected_total=None)
-                return
-            elif category is not None:
-                # HTTP 상태 5xx (TRANSIENT) 또는 4xx (PERMANENT)
-                yield FetchResult(key=key, payload=None, error=category, expected_total=None)
-                continue
-
-            # HTTP 200 OK일 경우 본문의 resultCode 확인
-            try:
-                body = json.loads(response.content)
-                if not isinstance(body, dict):
-                    raise TypeError("응답이 JSON 객체가 아님")
-                result_code = body.get("response", {}).get("header", {}).get("resultCode")
-            except (json.JSONDecodeError, TypeError):
-                yield FetchResult(key=key, payload=None, error=FetchErrorKind.TRANSIENT, expected_total=None)
-                continue
-
-            api_category = _classify_result_code(result_code)
-            if api_category is None:
-                yield FetchResult(key=key, payload=response.content, error=None, expected_total=None)
-            elif api_category is FetchErrorKind.FATAL:
-                yield FetchResult(key=key, payload=None, error=api_category, expected_total=None)
-                return
-            else:  # TRANSIENT 또는 PERMANENT
-                yield FetchResult(key=key, payload=None, error=api_category, expected_total=None)
+            payload = first_page_raw if len(page_bodies) == 1 else _merge_pages(page_bodies, root_key)
+            yield FetchResult(key=key, payload=payload, error=None, expected_total=None)
 
     @staticmethod
     def normalize(chunks: list[bytes], config: SourceConfig) -> list[dict]:
