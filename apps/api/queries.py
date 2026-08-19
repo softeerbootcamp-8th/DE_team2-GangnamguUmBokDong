@@ -6,6 +6,12 @@ from core.db import fetch_all, fetch_one
 
 STOCK_HISTORY_WINDOW_MIN = 25
 
+# station_urgency는 sta_id당 최신 1건만 upsert되므로(#124), 배치가 몇 회 연속으로
+# 멈춰도 마지막 값이 그대로 남는다. "낡은 값을 최신인 것처럼 보여주지 않는다"는
+# 원칙(#107)을 유지하려면 조회 시점에 신선도를 직접 걸러야 한다 — 5분 배치가
+# 한 번 밀리는 것까지는 허용하고, 그보다 오래되면 알림에서 제외한다.
+ALERTS_FRESHNESS_WINDOW_MIN = 10
+
 # 대여소 주변 몇 km 이내 행사를 "주변 행사"로 볼지. 지도의 주변 회수필요 후보
 # 반경(StationMap.tsx의 NEARBY_RADIUS_KM=1, 도보 이동 기준)보다 넉넉하게 잡았다
 # — 행사는 도보 범위를 넘어 대중교통으로도 사람을 끌어모으기 때문이다. 실측
@@ -107,22 +113,22 @@ def fetch_all_stock_history(sta_ids: list[str], now: datetime) -> dict[str, list
     return {sta_id: grouped.get(sta_id, []) for sta_id in sta_ids}
 
 
-def fetch_alerts() -> list[dict]:
+def fetch_alerts(now: datetime) -> list[dict]:
     """전체 대여소의 재배치 우선순위 알림을 station_urgency(배치가 미리 계산한
-    결과)의 최신 batch snapshot에서 urgency_score 내림차순으로 조회한다.
-    region은 위경도가 있어야 계산되므로 stations와 조인해서 같이 가져온다."""
+    결과)에서 urgency_score 내림차순으로 조회한다. ALERTS_FRESHNESS_WINDOW_MIN보다
+    오래된 값(배치가 멈췄거나 지연된 대여소)은 낡은 값을 최신인 것처럼 보여주지
+    않기 위해 제외한다. region은 위경도가 있어야 계산되므로 stations와 조인해서
+    같이 가져온다."""
     query = """
         SELECT s.sta_id, s.sta_nm, s.lat, s.lon,
                u.action_type, u.urgency_score, u.minutes_until_critical
         FROM station_urgency u
         JOIN stations s ON s.sta_id = u.sta_id
-        WHERE u.batch_run_at = (
-            SELECT MAX(batch_run_at)
-            FROM station_urgency
-        )
+        WHERE u.batch_run_at >= %(cutoff)s
         ORDER BY u.urgency_score DESC
     """
-    return fetch_all(query)
+    cutoff = now - timedelta(minutes=ALERTS_FRESHNESS_WINDOW_MIN)
+    return fetch_all(query, {"cutoff": cutoff})
 
 
 def fetch_batch_run_at(now: datetime) -> datetime:

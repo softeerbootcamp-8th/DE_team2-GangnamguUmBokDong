@@ -122,10 +122,11 @@ def seed() -> None:
             INSERT INTO station_urgency
                 (batch_run_at, sta_id, urgency_score, minutes_until_critical, action_type)
             VALUES (%s, %s, %s, %s, %s)
-            ON CONFLICT (batch_run_at, sta_id) DO UPDATE SET
+            ON CONFLICT (sta_id) DO UPDATE SET
                 urgency_score = EXCLUDED.urgency_score,
                 minutes_until_critical = EXCLUDED.minutes_until_critical,
-                action_type = EXCLUDED.action_type
+                action_type = EXCLUDED.action_type,
+                batch_run_at = EXCLUDED.batch_run_at
             """,
             urgency_rows,
         )
