@@ -50,4 +50,4 @@ station_stock을 `(sta_id, observed_at)`을 기본키로 하는 이력 테이블
 `predicted_bikes`/`shared_rate`처럼 순수하게 요청 시점에만 의미 있는 파생값(요청마다 다른 조건으로 조회될 수 있음)은 원래 결정 그대로 테이블로 두지 않는다 — 이번 변경은 urgency_score/action_type에 한정된다.
 
 ## 결과
-`/alerts`가 매 요청마다 전체 대여소를 스캔하며 재계산하던 부하가 없어지고, 배치가 이미 계산해둔 값을 조회만 한다. 한 응답에 서로 다른 batch의 row가 섞이지 않으며 향후 route batch도 같은 `batch_run_at` snapshot을 고정해 사용할 수 있다. `compute_urgency`는 anchor tick과 정확히 일치하는 재고만 현재값으로 인정하고, 해당 station의 inference 결과가 없으면 batch를 실패시킨다.
+`/alerts`가 매 요청마다 전체 대여소를 스캔하며 재계산하던 부하가 없어지고, 배치가 이미 계산해둔 값을 조회만 한다. 한 응답에 서로 다른 batch의 row가 섞이지 않으며 향후 route batch도 같은 `batch_run_at` snapshot을 고정해 사용할 수 있다. `compute_urgency`는 anchor tick과 정확히 일치하는 재고만 현재값으로 인정한다. inference는 학습된 station 집합의 partial 결과를 upstream에서 실패시키며, 정상 산출물에 없는 신설·미지원 station은 urgency 대상에서 제외하고 건수를 로그로 남긴다.

@@ -12,9 +12,9 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+from urgency import compute_all
 
 from tests.conftest import TEST_BUCKET
-from urgency import compute_all
 
 # ml/inference의 _target_timestamp와 같은 이유로 pd.Timestamp를 쓴다(naive
 # datetime을 datetime.strptime/datetime()으로 직접 만들면 tzinfo 누락으로
@@ -111,7 +111,7 @@ def test_compute_all_requires_prediction_parquet():
         compute_all(ANCHOR)
 
 
-def test_compute_all_rejects_missing_station_prediction():
+def test_compute_all_excludes_and_logs_station_without_model_prediction(caplog):
     _put_tick(
         ANCHOR,
         [
@@ -121,22 +121,42 @@ def test_compute_all_rejects_missing_station_prediction():
     )
     _put_predictions(["101"])
 
-    with pytest.raises(ValueError, match="prediction coverage missing.*102"):
+    result = compute_all(ANCHOR)
+
+    assert result["sta_id"].tolist() == ["101"]
+    assert "excluding 1 current-stock stations without model predictions" in caplog.text
+
+
+def test_compute_all_requires_anchor_stock_snapshot():
+    _put_tick(pd.Timestamp(2026, 8, 16, 14, 0), [{"stationId": "101", "parkingBikeTotCnt": 5, "rackTotCnt": 10}])
+    _put_predictions(["101"])
+
+    with pytest.raises(FileNotFoundError, match="stock snapshot parquet not found"):
         compute_all(ANCHOR)
 
 
+def test_compute_all_rejects_anchor_outside_five_minute_grid():
+    with pytest.raises(ValueError, match="anchor must align to a 5-minute tick"):
+        compute_all(pd.Timestamp(2026, 8, 16, 14, 33))
+
+
 @pytest.mark.parametrize(
-    ("last_observed_at", "expected_station_ids"),
+    ("last_observed_at", "included"),
     [
-        (pd.Timestamp(2026, 8, 16, 14, 5), ["101"]),
-        (pd.Timestamp(2026, 8, 16, 14, 0), []),
-        (pd.Timestamp(2026, 8, 16, 13, 45), []),
+        (pd.Timestamp(2026, 8, 16, 14, 5), True),
+        (pd.Timestamp(2026, 8, 16, 14, 0), False),
+        (pd.Timestamp(2026, 8, 16, 13, 45), False),
     ],
 )
-def test_compute_all_uses_only_anchor_stock_snapshot(last_observed_at, expected_station_ids):
+def test_compute_all_uses_only_anchor_stock_snapshot(last_observed_at, included):
     _put_tick(last_observed_at, [{"stationId": "101", "parkingBikeTotCnt": 5, "rackTotCnt": 10}])
-    _put_predictions(["101"])
+    prediction_station_ids = ["101"]
+    if last_observed_at != ANCHOR:
+        # anchor 파일 자체는 존재하지만 101이 빠진 상황으로 station freshness를 검증한다.
+        _put_tick(ANCHOR, [{"stationId": "999", "parkingBikeTotCnt": 5, "rackTotCnt": 10}])
+        prediction_station_ids.append("999")
+    _put_predictions(prediction_station_ids)
 
     result = compute_all(ANCHOR)
 
-    assert result["sta_id"].tolist() == expected_station_ids
+    assert ("101" in result["sta_id"].tolist()) is included

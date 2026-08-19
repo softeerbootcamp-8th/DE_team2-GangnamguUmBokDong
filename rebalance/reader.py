@@ -48,8 +48,11 @@ def read_recent_stock(anchor: datetime, lookback_minutes: int = 25) -> dict[str,
     함께 있어 별도 RDS 조회가 필요 없다.
     """
     history: dict[str, list[dict]] = {}
+    anchor_tick = _floor_to_tick(anchor, _BIKE_REALTIME_TICK_MINUTES)
     for observed_at, key in _bike_realtime_tick_keys(anchor, lookback_minutes):
         df = read_parquet(key, columns=["stationId", "parkingBikeTotCnt", "rackTotCnt"])
+        if observed_at == anchor_tick and df is None:
+            raise FileNotFoundError(f"stock snapshot parquet not found for {anchor_tick}: {key}")
         if df is None or df.empty:
             continue
         for row in df.itertuples(index=False):

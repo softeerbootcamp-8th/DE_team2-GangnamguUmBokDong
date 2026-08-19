@@ -79,8 +79,8 @@ def test_inference_then_load_forecast_points():
 
 def test_inference_then_compute_urgency_then_load_station_urgency():
     """urgency_score 계산(rebalance)은 S3(재고 이력·예측 결과)만 읽어서 RDS 적재
-    (load_station_stock/load_forecast_points)를 기다릴 필요가 없다 — run_inference에만
-    의존한다(이유: #107)."""
+    (load_station_stock/load_forecast_points)를 기다릴 필요가 없다. 단, urgency loader는
+    stations FK가 준비된 뒤 실행돼야 한다."""
     run_inference = dag.get_task("run_inference")
     compute_urgency = dag.get_task("compute_urgency")
     load_station_urgency = dag.get_task("load_station_urgency")
@@ -88,7 +88,7 @@ def test_inference_then_compute_urgency_then_load_station_urgency():
     assert compute_urgency.task_id in {t.task_id for t in run_inference.downstream_list}
     assert {t.task_id for t in compute_urgency.upstream_list} == {"run_inference"}
     assert load_station_urgency.task_id in {t.task_id for t in compute_urgency.downstream_list}
-    assert {t.task_id for t in load_station_urgency.upstream_list} == {"compute_urgency"}
+    assert {t.task_id for t in load_station_urgency.upstream_list} == {"compute_urgency", "load_stations"}
 
 
 def test_collector_task_execution_contract():

@@ -9,10 +9,12 @@ station_urgency 테이블에 적재돼 apps/api/main.py:list_alerts()가 그 결
 
 from __future__ import annotations
 
+import logging
 import math
 from datetime import datetime
 
 import pandas as pd
+import reader
 from core.forecast import enrich_forecast_points
 from core.scoring_config import (
     FIRST_FORECAST_MIN,
@@ -22,7 +24,7 @@ from core.scoring_config import (
     SUPPLY_LOW_STOCK_RATIO,
 )
 
-import reader
+logger = logging.getLogger(__name__)
 
 
 def _regression_slope(xs: list[float], ys: list[float]) -> float:
@@ -191,6 +193,9 @@ def compute_all(anchor: datetime) -> pd.DataFrame:
     입력은 전부 S3(재고 이력·예측 결과)에서만 읽는다 — RDS는 이 배치가 만든 결과를
     loader가 station_urgency에 적재할 때만 쓰인다(배치 자신은 RDS를 건드리지 않음).
     """
+    if anchor.minute % 5 or anchor.second or anchor.microsecond:
+        raise ValueError(f"anchor must align to a 5-minute tick: {anchor}")
+
     stock_history_by_station = reader.read_recent_stock(anchor)
     predictions = reader.read_predictions(anchor)
     points_by_station = _predicted_points_by_station(predictions)
@@ -203,13 +208,20 @@ def compute_all(anchor: datetime) -> pd.DataFrame:
         for sta_id, history in stock_history_by_station.items()
         if history and history[-1]["observed_at"] == anchor
     }
-    missing_predictions = set(current_histories) - set(points_by_station)
-    if missing_predictions:
-        missing = ", ".join(sorted(missing_predictions))
-        raise ValueError(f"prediction coverage missing for current stock stations: {missing}")
+    unsupported_stations = set(current_histories) - set(points_by_station)
+    if unsupported_stations:
+        # run_inference는 학습된 model category만 예측하고, 그 집합 안에서 partial이
+        # 발생하면 exit 1로 downstream을 막는다. 따라서 여기의 stock-only station은
+        # 신설 등 모델 미지원 대상으로 간주해 제외하되 운영 가시성을 위해 집계한다.
+        logger.warning(
+            "excluding %d current-stock stations without model predictions",
+            len(unsupported_stations),
+        )
+    computable_station_ids = set(current_histories) & set(points_by_station)
 
     rows = []
-    for sta_id, history in current_histories.items():
+    for sta_id in sorted(computable_station_ids):
+        history = current_histories[sta_id]
         current = history[-1]["parking_bike_tot_cnt"]
         hold_cnt = history[-1]["hold_cnt"]
         raw_points = points_by_station[sta_id]

@@ -12,9 +12,8 @@ import sys
 from datetime import datetime
 
 import pandas as pd
-from core.s3 import write_parquet
-
 import urgency
+from core.s3 import write_parquet
 
 
 def _anchor_timestamp(date: str, hour: int, minute: int) -> pd.Timestamp:
@@ -35,6 +34,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--hour", type=int, required=True)
     parser.add_argument("--minute", type=int, required=True)
     args = parser.parse_args(argv)
+
+    if args.minute % 5:
+        parser.error("--minute must be aligned to a 5-minute tick")
 
     anchor = _anchor_timestamp(args.date, args.hour, args.minute)
     result = urgency.compute_all(anchor)

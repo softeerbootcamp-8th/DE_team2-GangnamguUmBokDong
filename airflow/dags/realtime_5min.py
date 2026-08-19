@@ -30,8 +30,8 @@ Airflow dependency는 실제 데이터 계약을 기준으로 둔다.
 - bike_station_realtime -> stations -> station_stock
 - inference + station_stock -> forecast_points
 - inference -> compute_urgency(rebalance, S3만 읽음) -> load_station_urgency
-  (load_station_stock/load_forecast_points와 독립적으로 병렬 실행됨 — 대여소별
-  긴급도 계산이 RDS가 아니라 S3(재고 이력·예측 결과)만 읽기 때문. 이유: #107)
+  (compute는 RDS load와 병렬이지만, load_station_urgency는 stations FK를 위해
+  load_stations도 기다린다. load_station_stock/load_forecast_points와는 독립적이다.)
 
 ## 금지 사항
 
@@ -98,4 +98,5 @@ with DAG(
 
     compute_urgency = build_urgency_task(dag)
     load_station_urgency = build_db_loader_task(dag, "station_urgency")
-    run_inference >> compute_urgency >> load_station_urgency
+    run_inference >> compute_urgency
+    [compute_urgency, load_stations] >> load_station_urgency

@@ -83,4 +83,5 @@ with DAG(
 
     compute_urgency = build_urgency_task(dag)
     load_station_urgency = build_db_loader_task(dag, "station_urgency")
-    run_inference >> compute_urgency >> load_station_urgency
+    run_inference >> compute_urgency
+    [compute_urgency, load_stations] >> load_station_urgency
