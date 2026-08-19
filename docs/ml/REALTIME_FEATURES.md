@@ -1,6 +1,16 @@
 # Point-in-Time 대여 카운트 (Train-Serving Skew 대응)
 
-이 문서는 5분마다 갱신되는 실시간 서빙 롤링 피처에서 발생하는 **우측 절단
+**(2026-08 갱신 — "5분"이 두 가지 다른 의미로 섞여 있던 걸 분리한다)**
+이 문서 전체에서 "5분"은 원래 두 가지를 동시에 가리켰다: ① 서빙(추론)이
+갱신되는 주기, ② 아래 rolling 계산 자체의 tick 간격. 지금은 둘이 다르다 —
+① 서빙 주기는 여전히 5분이다(Airflow `realtime_5min` DAG가 `predict_single.py
+--all-stations`를 5분마다 호출). ② 학습 feature grid의 tick 간격은
+20분(`GRID_TICK_MINUTES`)으로 바뀌었다 — 아래 §2의 "5분 tick"/"embargo 30분"은
+전부 **20분 tick / embargo 40분**으로 읽을 것(정확한 현재 값은
+`libs/ml_core/profiles/default.json`). 이 문서는 그 두 갱신 전, 초기 설계
+당시 기준으로 쓰였다.
+
+이 문서는 실시간 서빙 롤링 피처에서 발생하는 **우측 절단
 (right-censoring) train-serving skew**를 다룬다. 핵심 로직(`ml_core/rolling_window_features.py`,
 `feature_engine/spark/build_rolling_rental_features.py`)은 이미 기존 배치 파이프라인
 ([feature_engine/DESIGN.md](feature_engine/DESIGN.md), [inference/DESIGN.md](inference/DESIGN.md))에 실제로 연결돼 있다 —
@@ -76,7 +86,7 @@ offset으로 다루고 있다 ([training/DESIGN.md](training/DESIGN.md) 2절). �
 
 ## 3. 핵심 규칙 (학습·서빙이 반드시 동일하게 지켜야 하는 계약)
 
-구현은 [`ml_core/rolling_window_features.py`](../libs/ml_core/rolling_window_features.py) 하나에 몰아뒀다(`ml/`과 별도로 관리되는 `libs/ml_core/` 라이브러리):
+구현은 [`ml_core/rolling_window_features.py`](../../libs/ml_core/rolling_window_features.py) 하나에 몰아뒀다(`ml/`과 별도로 관리되는 `libs/ml_core/` 라이브러리):
 
 | 함수 | 용도 |
 |---|---|
@@ -156,59 +166,51 @@ grid를 만들면 된다 — 7절 참고).
 
 ## 4-2. 학습 파이프라인 반영 — `feature_engine/spark/build_features.py`
 
-`_add_rental_lag_rolling(df)`가 대여의 "직전 1시간" 피처만 point-in-time
-censored 값으로 대체한다:
+**(2026-08 갱신) 지금은 대여 lag 피처가 `rental_lag_1h` 하나뿐이다** —
+`roll_mean/std_3h·24h`, `rental_lag_24h/168h`는 피처 중요도 분석 후 전부
+제거됐다(현재 전체 피처 목록의 단일 소스는 `libs/ml_core/common_config.py`/
+`model_contract.py`). 아래는 그 제거 전, `rental_lag_1h`가 여럿 중 하나였던
+시절 기준의 원래 설명이다 — `rental_lag_1h`를 point-in-time censored 값으로
+만드는 핵심 원리(가장 최근 구간만 censoring 처리하면 충분한 이유)는 지금도
+그대로 유효하다:
 
 - 시간 단위 그리드에서 시각 T의 버킷 경계는 항상 T로부터 0분 또는 60분 배수만큼
-  떨어져 있다 — 즉 `rental_lag_1h`(T-1h~T, 경과 0분)만 실측 완료율 4~8% 수준으로
-  심하게 노출돼 있고, `roll_mean/std_3h·24h`의 `shift(1)` 윈도우에서 가장 최신
-  항도 결국 같은 T-1h 값이라 똑같이 노출돼 있다. `T-2h`부터는 경과 60분(실측
-  ~92~94%)로 이미 이 설계 자체가 "충분히 좋다"고 받아들인 수준이라 추가 처리하지
-  않는다.
-- `_rental_visible(df)`가 `rolling_rental_features_2025.parquet`(4절 산출물)을
-  `lookup_count_at_ticks()`로 station_id/hour_ts별로 조회한다 — 이 값이
-  `rental_lag_1h`에 직접 들어가고(추가 shift 불필요, 정의상 이미 T-30분 이전
-  정보만 씀), `roll_mean/std_3h·24h`는 이 값을 station별로 `rolling(window=3
-  또는 24, min_periods=1)`한 mean/std로 대체한다 — 모든 항을 같은 censored
-  정의로 통일해서, 서로 다른 윈도우 정의를 한 평균에 섞지 않는다.
-- `rental_lag_24h`/`168h`는 예측 시점엔 이미 완전히 해소된 값이라 raw
-  `rental_count`를 그대로 shift해서 쓴다. `return_*` 7개는 이 파일이 전혀
-  건드리지 않는다(`_add_return_lag_rolling`, 반납은 지연 관측 문제 없음).
-- `_check_rolling_freshness()`가 `rolling_rental_features_2025.parquet`의
-  최신 tick이 feature 테이블이 필요로 하는 최신 hour_ts보다 오래됐으면
-  `RuntimeError`를 던진다 — 두 산출물이 조용히 어긋나는 사고를 막는 가드.
-- 컬럼 이름(`rental_lag_1h` 등)은 바꾸지 않았다 — 스키마는 그대로, 의미만
-  바뀐다 (`train_common.FEATURE_COLUMNS`/`predict_common.py` 등 아무것도 안
-  건드려도 됨).
+  떨어져 있다 — 즉 `rental_lag_1h`(T-1h~T, 경과 0분)만 실측 완료율이 낮은
+  수준으로 심하게 노출돼 있다. `T-2h`부터는 경과 60분(실측 ~92~94%)로 이미
+  이 설계 자체가 "충분히 좋다"고 받아들인 수준이라 추가 처리하지 않는다 —
+  그래서 censoring 처리 대상이 애초에 `rental_lag_1h` 하나로 좁혀져 있었고,
+  나머지 lag/rolling이 없어진 지금도 이 부분 로직은 그대로 재사용된다.
+- 지금 `feature_engine/spark/build_features.py`가 `rolling_rental_features`
+  (4절 산출물)를 `lookup_count_at_ticks()`로 station_no/hour_ts별로 조회해
+  그 값을 `rental_lag_1h`에 직접 넣는다(추가 shift 불필요, 정의상 이미
+  embargo 이전 정보만 씀). `return_lag_1h`는 이 파일이 전혀 건드리지 않는다
+  (반납은 지연 관측 문제 없음, raw 값 그대로).
+- 두 산출물(rolling 결과와 feature 테이블)이 조용히 어긋나는 사고를 막는
+  freshness 가드가 있다 — 최신 tick 정합성을 확인 후 어긋나면 명시적으로
+  실패한다.
 
 ## 4-3. 추론 파이프라인 반영 — `inference/predict_single.py`
 
 `predict_single.py`는 실시간 서빙을 흉내내는 단일 시점 예측 모듈이라(3절 참고),
 학습과 다른 이유로 같은 문제를 겪는다 — 이전에는 히스토리를 시간 단위로 이미
-집계된 `station_hour_merged_2025.parquet`에서만 가져왔는데, 그 집계 자체가
-censoring을 반영하지 않은 "완전한" 값이었다. 이제 대여의 "직전 1시간" 4개
-피처는 트립 단위 원본으로 다시 계산한다:
+집계된 병합 테이블에서만 가져왔는데, 그 집계 자체가 censoring을 반영하지
+않은 "완전한" 값이었다. `rental_lag_1h`(2026-08 갱신 — 예전엔 대여 쪽 4개
+피처였다)는 트립 단위 원본으로 다시 계산한다:
 
-- `_get_rental_events_by_station()`이 `load_rental_trip_events()`(4절)로 2025년
-  전체 트립(station_id, start_dt, end_dt)을 한 번 로드해 station별로 캐시한다
-  — `_get_history_by_station()`(시간 단위 집계, 반납 전체 + 대여 lag_24h/168h용)과
-  별개의 캐시.
+- `_get_rental_events_by_station()`이 `load_rental_trip_events()`(4절)로 전체
+  트립(station_id, start_dt, end_dt)을 한 번 로드해 station별로 캐시한다 —
+  `_get_history_by_station()`(시간 단위 집계, `return_lag_1h`용)과 별개의 캐시.
 - `_censored_rental_recent()`가 3절의 서빙용 함수
-  `count_visible_in_window(events, as_of, window_minutes=60, embargo_minutes=30)`을
-  `rental_lag_1h`는 `target_ts` 자체에, `roll_mean/std_3h`는 `target_ts,
-  target_ts-1h, target_ts-2h` 3개 anchor에, `roll_mean/std_24h`는 24개
-  anchor에 반복 호출해서 계산한다 — 4-2절 배치 쪽과 정의(anchor 오프셋)가
-  동일하다 (`tests/dev_rental_censoring_cross_parity.py`가 둘의 출력이
-  일치함을 확인).
+  `count_visible_in_window(events, as_of, window_minutes=60, embargo_minutes=40)`을
+  `target_ts` 기준으로 호출해서 `rental_lag_1h`를 계산한다 — 배치
+  (`feature_engine/spark/build_features.py`)와 정의(윈도우/embargo)가 동일하다
+  (`tests/dev_rental_censoring_cross_parity.py`가 둘의 출력이 일치함을 확인).
 - fallback 판정: 시간 단위 집계는 "히스토리에 없으면 NaN"이 곧 결측이었지만,
   트립 단위 소스에서는 "윈도우에 트립 0건"(정상 관측값 0)과 "그 시점 자체가
   로드된 트립 데이터 커버리지 밖"(진짜 결측)을 구분해야 한다. 로드 시점에
   캐시해둔 `(start_dt.min(), start_dt.max())` 커버리지 범위로, anchor의 윈도우가
   그 범위를 전혀 안 겹치면 fallback(profile 대체), 겹치면 0을 포함한 실제
-  카운트를 그대로 쓴다. 이 커버리지는 (지금처럼 로드된 데이터가 2025년 전체인
-  한) 정류소별이 아니라 전역이라, 2025년 중간에 신설된 정류소의 개업 전 구간도
-  "정상 0"으로 취급된다 — 기존 시간 단위 grid(연중 내내 0-fill)도 같은 한계가
-  있어 새로 생긴 문제는 아니다.
+  카운트를 그대로 쓴다.
 - 이 두 함수는 아직 CLI/대화형 시뮬레이션용이다 — 3절이 이미 강조하듯,
   실제 실시간 서빙 모듈이 Python으로 만들어지면 `count_visible_in_window()`를
   그대로 import하는 걸 권장하고, 다른 스택이면 최소한 이 문서의 윈도우 정의를
@@ -261,44 +263,58 @@ censoring을 반영하지 않은 "완전한" 값이었다. 이제 대여의 "직
 
 ---
 
-## 6. 테스트 — `tests/`
+## 6. 테스트 (2026-08 갱신 — 경로가 바뀌었고, feature_engine legacy pandas 테스트는 삭제됨)
 
 ```bash
 cd ml
-./.venv/bin/python -m pytest tests/ -v
+./training/.venv/bin/python -m pytest ../libs/ml_core/tests/dev_rolling_window_features.py -q
+./inference/.venv/bin/python -m pytest inference/tests/dev_predict_single_rental_censoring.py inference/tests/dev_rental_censoring_cross_parity.py -q
 ```
 
-| 파일 | 성격 | 확인 내용 |
+`dev_features_rental_censoring.py`/`dev_completion_curve_integration.py`(옛
+`feature_engine/legacy/` pandas 구현 전용 테스트)는 그 legacy 코드 자체가
+삭제되면서 같이 없어졌다. 지금 남아 있는 것:
+
+| 파일 | 위치 | 확인 내용 |
 |---|---|---|
-| `dev_rolling_window_features.py` | 단위 테스트(합성 데이터, 11개) | `add_censored_visibility`(개념 검증) + `censored_rolling_counts`/`lookup_count_at_ticks`(실제 채택 설계) — 창 진입/이탈 경계, 반납 지연 시 시야 게이팅, embargo+폭보다 느린 트립은 영구 제외, 배치·서빙 두 함수가 같은 결론을 냄 |
-| `dev_completion_curve_integration.py` | 통합 테스트(실제 데이터, `data/parquet/` 필요 — 없으면 skip) | 완료율 곡선이 단조증가하는지, 0분 시점은 저평가·60분 시점은 대부분 회복되는지 |
-| `dev_features_rental_censoring.py` | 단위 테스트(합성 데이터) | `_add_rental_lag_rolling`이 `censored_rolling_counts`+`lookup_count_at_ticks`와 일치, `rental_lag_24h/168h`와 `return_*`는 기존 raw shift/rolling과 정확히 같음, freshness 가드 동작 |
-| `dev_predict_single_rental_censoring.py` | 단위 테스트(합성 데이터) | `_censored_rental_recent`이 `count_visible_in_window`와 일치, 윈도우 내 0건은 fallback 아님, 커버리지 밖은 fallback, `rental_lag_24h/168h`·`return_*`는 트립 소스가 비어 있어도 무관 |
-| `dev_rental_censoring_cross_parity.py` | 단위 테스트(합성 데이터) | 4-2절(배치)과 4-3절(서빙)이 같은 트립에 대해 `rental_lag_1h`/`roll_mean_3h/24h`를 정확히 같은 값으로 계산하는지 대조 — 3절이 요구하는 "핵심 필터 조건은 동일해야 함"을 코드로 검증 |
+| `dev_rolling_window_features.py` | `libs/ml_core/tests/` | `add_censored_visibility`(개념 검증) + `censored_rolling_counts`/`lookup_count_at_ticks`(실제 채택 설계) — 창 진입/이탈 경계, 반납 지연 시 시야 게이팅, embargo+폭보다 느린 트립은 영구 제외, 배치·서빙 두 함수가 같은 결론을 냄 |
+| `dev_predict_single_rental_censoring.py` | `ml/inference/tests/` | `_censored_rental_recent`이 `count_visible_in_window`와 일치, 윈도우 내 0건은 fallback 아님, 커버리지 밖은 fallback |
+| `dev_rental_censoring_cross_parity.py` | `ml/inference/tests/` | 배치(`feature_engine/spark/build_features.py`)와 서빙(`predict_single.py`)이 같은 트립에 대해 `rental_lag_1h`를 정확히 같은 값으로 계산하는지 대조 — 3절이 요구하는 "핵심 필터 조건은 동일해야 함"을 코드로 검증 |
 
 ---
 
-## 7. 다음 단계 후보
+## 7. 다음 단계 후보 (2026-08 기준 갱신)
 
-1. 실제로 5분 단위 LightGBM 모델을 학습하기로 하면, 이 sparse 결과를 dense
-   station×5분틱 grid로 채우는 단계 추가 (`lookup_count_at_ticks()` 재사용)
-2. `count_visible_in_window()`를 실제 서빙 모듈(예: `client/backend`)에서 import하거나
-   로직을 포팅 — `predict_single.py`(4-3절)는 CLI/대화형 시뮬레이션일 뿐 실제
-   프로덕션 서빙이 아니므로, 이 항목은 여전히 미해결 상태
-3. S3 파티션 저장으로 전환 (지금은 로컬 단일 parquet)
-4. 날씨·인구 등 다른 실시간 feature에도 비슷한 지연 관측 이슈가 있는지 점검
-   (예: 인구 데이터가 D+5일 지연 제공된다는 점은 이미 알고 있음 —
-   [inference/DESIGN.md](inference/DESIGN.md))
-5. **(8절에서 실행 중)** `width`/`embargo`를 지금 값(60/30)에서 튜닝할 필요가
-   있는지 검토 — `training/scripts/run_embargo_sweep.py`로 실제 모델 성능 기준 비교 진행
+1. ~~실제로 5분 단위 LightGBM 모델을 학습하기로 하면...~~ **완료** — tick 단위
+   grid는 실제로 도입됐다(다만 5분이 아니라 20분, `GRID_TICK_MINUTES`).
+2. `count_visible_in_window()`를 실제 서빙 모듈에서 import하거나 로직을
+   포팅 — `predict_single.py`는 여전히 "실시간 서빙을 흉내내는 배치/CLI"이지
+   상시 구동 서버가 아니다(§6 "실시간 트립 카운트 스토어" 참고, 이 저장소엔
+   아직 그런 서버가 없다) — 여전히 미해결.
+3. S3 파티션 저장으로 전환 — **완료**, collector가 Silver를 S3에 쌓고
+   `feature_engine/spark/silver_source.py`가 그걸 직접 읽는다
+   ([feature_engine/DESIGN.md](feature_engine/DESIGN.md) §7 참고).
+4. 날씨·인구 등 다른 실시간 feature에도 비슷한 지연 관측 이슈가 있는지 점검 —
+   날씨는 별도로 "관측 vs 예보" 문제가 있다는 게 밝혀져 처리됐다
+   ([inference/DESIGN.md](inference/DESIGN.md) §3 "날씨는 lag와 다르게
+   다룬다" 참고).
+5. `width`/`embargo` 튜닝 — **완료**(60분/40분으로 조정, 아래 §8은 그 튜닝에
+   쓰였던 스윕 인프라의 기록이며 지금은 삭제됨).
 
 ---
 
-## 8. embargo/window 하이퍼파라미터 스윕 — 챔피언-챌린저 실험 인프라
+## 8. (2026-08 기준 삭제됨) embargo/window 하이퍼파라미터 스윕 — 당시 실험 인프라
+
+**아래 절이 설명하는 `training/experiment_log.py`/`training/scripts/run_embargo_sweep.py`/
+`models/experiments/` 인프라는 저장소에서 완전히 삭제됐다.** embargo/window
+튜닝이라는 목적 자체는 달성됐고(7절 5번), 그 이후의 실험 기록/격리는
+[MLFLOW_SETUP.md](MLFLOW_SETUP.md)의 MLflow 통합으로 대체됐다 — "나중에
+MLflow 같은 정식 tracker로 옮기더라도"라고 예전에 적어뒀던 그 이관이 실제로
+일어났다. 아래는 당시 그 스윕이 어떻게 동작했는지의 기록으로만 남긴다.
 
 7절 5번("width/embargo 튜닝 필요성은 실제 모델 성능으로 평가해봐야 안다")을
 실행하기 위해, `config.py`의 `ROLLING_WINDOW_MINUTES`/`EMBARGO_MINUTES`/`TICK_MINUTES`를
-하드코딩 대신 **호출부에서 override 가능한 파라미터**로 열어뒀다:
+하드코딩 대신 **호출부에서 override 가능한 파라미터**로 열어뒀었다:
 
 | 함수 | 새 파라미터 |
 |---|---|
@@ -306,22 +322,20 @@ cd ml
 | `features.build_features()` / `_add_lag_rolling()` / `_add_rental_lag_rolling()` / `_rental_visible()` | `rolling_parquet_path` — None이면 챔피언 산출물(`config.ROLLING_RENTAL_FEATURES_PARQUET`) |
 | `train_common.train_target()` / `station_categories_path()` / `load_station_dtype()` | `models_dir` — None이면 챔피언 경로(`config.MODELS_DIR`) |
 
-인자를 안 주면 전부 기존(챔피언) 동작과 100% 동일하다 — 실험은 별도 경로에만
-쓰고 챔피언 아티팩트(`data/processed_v2/rolling_rental_features_2025.parquet`,
-`station_hour_features_2025.parquet`, `models/rental_*`)는 절대 덮어쓰지 않는다.
+인자를 안 주면 전부 기존(챔피언) 동작과 100% 동일했다 — 실험은 별도 경로에만
+쓰고 챔피언 아티팩트는 절대 덮어쓰지 않는 원칙.
 
 **`training/experiment_log.py`**: 실행 1건(파라미터 조합 + git sha/dirty + 평가 지표 +
-아티팩트 경로)을 `models/experiments/manifest.jsonl`에 한 줄씩 append한다. 나중에
-MLflow 같은 정식 experiment tracker로 옮기더라도 이 스키마는 그대로 재사용
-가능한 최소 형태로 유지했다 — 지금 UI/DB를 새로 만들지 않는다.
+아티팩트 경로)을 `models/experiments/manifest.jsonl`에 한 줄씩 append했다.
 
 **`training/scripts/run_embargo_sweep.py`**: `window=60분, tick=5분`은 고정하고
 `embargo` 후보(`[0,15,30,45]`분)마다 rolling 피처 재생성 → features 재생성 →
 대여 모델 재학습을 반복해, 후보당 `models/experiments/rental_embargo{N}/`에
-저장하고 manifest에 기록한 뒤 마지막에 비교표(`data/processed_v2/experiments/embargo_sweep_summary.csv`)를 낸다. 후보당 ~25~30분(트립 로딩은 후보 간 공유해 1회만) — 4개 기준 약 2시간.
+저장하고 manifest에 기록한 뒤 마지막에 비교표를 냈다. 후보당 ~25~30분(트립
+로딩은 후보 간 공유해 1회만) — 4개 기준 약 2시간.
 
 이 인프라는 향후 "EMR에서 최근 1개월 정확도 평가 → 기준 미달 시 재학습 → 그래도
 미달이면 embargo/window 등을 스스로 조정하며 재학습"하는 자동화 루프의 재료가
-된다: 코드는 하나로 유지하고(파이프라인 폴더를 버전별로 복제하지 않음),
-파라미터·모델·지표를 실행마다 버전 태그처럼 남겨서 챔피언-챌린저 비교와 승격
+된다는 취지로 만들어졌었다: 코드는 하나로 유지하고(파이프라인 폴더를 버전별로
+복제하지 않음), 파라미터·모델·지표를 실행마다 버전 태그처럼 남겨서 챔피언-챌린저 비교와 승격
 로직을 그 위에 얹는 구조다.
