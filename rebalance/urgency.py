@@ -193,15 +193,26 @@ def compute_all(anchor: datetime) -> pd.DataFrame:
     """
     stock_history_by_station = reader.read_recent_stock(anchor)
     predictions = reader.read_predictions(anchor)
-    points_by_station = _predicted_points_by_station(predictions) if predictions is not None else {}
+    points_by_station = _predicted_points_by_station(predictions)
+
+    # 5분 snapshot 배치의 "현재 재고"는 anchor tick에서 직접 관측된 값만 쓴다.
+    # 5분 이내(예: 14:00을 14:05에 허용)로 느슨하게 잡으면 서로 다른 snapshot의
+    # 재고가 한 결과에 섞일 수 있으므로, 누락 station은 이번 batch에서 제외한다.
+    current_histories = {
+        sta_id: history
+        for sta_id, history in stock_history_by_station.items()
+        if history and history[-1]["observed_at"] == anchor
+    }
+    missing_predictions = set(current_histories) - set(points_by_station)
+    if missing_predictions:
+        missing = ", ".join(sorted(missing_predictions))
+        raise ValueError(f"prediction coverage missing for current stock stations: {missing}")
 
     rows = []
-    for sta_id, history in stock_history_by_station.items():
-        if not history:
-            continue
+    for sta_id, history in current_histories.items():
         current = history[-1]["parking_bike_tot_cnt"]
         hold_cnt = history[-1]["hold_cnt"]
-        raw_points = points_by_station.get(sta_id, [])
+        raw_points = points_by_station[sta_id]
         points = enrich_forecast_points(current, hold_cnt, raw_points)
 
         score, minutes, action_type = urgency_score(current, hold_cnt, history, points, anchor)

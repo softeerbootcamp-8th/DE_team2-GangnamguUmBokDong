@@ -109,13 +109,17 @@ def fetch_all_stock_history(sta_ids: list[str], now: datetime) -> dict[str, list
 
 def fetch_alerts() -> list[dict]:
     """전체 대여소의 재배치 우선순위 알림을 station_urgency(배치가 미리 계산한
-    결과)에서 urgency_score 내림차순으로 조회한다. region은 위경도가 있어야
-    계산되므로 stations와 조인해서 같이 가져온다."""
+    결과)의 최신 batch snapshot에서 urgency_score 내림차순으로 조회한다.
+    region은 위경도가 있어야 계산되므로 stations와 조인해서 같이 가져온다."""
     query = """
         SELECT s.sta_id, s.sta_nm, s.lat, s.lon,
                u.action_type, u.urgency_score, u.minutes_until_critical
         FROM station_urgency u
         JOIN stations s ON s.sta_id = u.sta_id
+        WHERE u.batch_run_at = (
+            SELECT MAX(batch_run_at)
+            FROM station_urgency
+        )
         ORDER BY u.urgency_score DESC
     """
     return fetch_all(query)

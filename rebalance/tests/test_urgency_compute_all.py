@@ -11,6 +11,7 @@ import boto3
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
+import pytest
 
 from tests.conftest import TEST_BUCKET
 from urgency import compute_all
@@ -32,10 +33,28 @@ def _put_tick(window_start: datetime, rows: list[dict]) -> None:
     _put_parquet(key, pa.Table.from_pylist(rows))
 
 
-def test_compute_all_detects_declining_trend_without_predictions():
+def _put_predictions(station_ids: list[str]) -> None:
+    key = f"predictions/dt={ANCHOR:%Y-%m-%d}/hh={ANCHOR:%H}/inference_{ANCHOR:%H%M}.parquet"
+    rows = [
+        {
+            "station_id": station_id,
+            "date": "2026-08-16",
+            "hour": 15,
+            "minute": 5,
+            "horizon": 1,
+            "rental_pred_mean": 0.0,
+            "return_pred_mean": 0.0,
+        }
+        for station_id in station_ids
+    ]
+    _put_parquet(key, pa.Table.from_pylist(rows))
+
+
+def test_compute_all_detects_declining_trend_with_prediction_artifact():
     # 14:00에 10대 -> 14:05(anchor)에 5대. hold_cnt(rackTotCnt)=10.
     _put_tick(pd.Timestamp(2026, 8, 16, 14, 0), [{"stationId": "101", "parkingBikeTotCnt": 10, "rackTotCnt": 10}])
     _put_tick(ANCHOR, [{"stationId": "101", "parkingBikeTotCnt": 5, "rackTotCnt": 10}])
+    _put_predictions(["101"])
 
     result = compute_all(ANCHOR)
 
@@ -83,3 +102,41 @@ def test_compute_all_combines_stock_history_with_predictions():
     # 5 -> 1건 대여로 4 -> 8건 대여로 -4, 최대 부족량 4) 기준 ratio=4/10, score=8.3.
     assert row["sta_id"] == "101"
     assert (row["urgency_score"], row["minutes_until_critical"], row["action_type"]) == (8.3, 120, "supply_needed")
+
+
+def test_compute_all_requires_prediction_parquet():
+    _put_tick(ANCHOR, [{"stationId": "101", "parkingBikeTotCnt": 5, "rackTotCnt": 10}])
+
+    with pytest.raises(FileNotFoundError, match="prediction parquet not found"):
+        compute_all(ANCHOR)
+
+
+def test_compute_all_rejects_missing_station_prediction():
+    _put_tick(
+        ANCHOR,
+        [
+            {"stationId": "101", "parkingBikeTotCnt": 5, "rackTotCnt": 10},
+            {"stationId": "102", "parkingBikeTotCnt": 5, "rackTotCnt": 10},
+        ],
+    )
+    _put_predictions(["101"])
+
+    with pytest.raises(ValueError, match="prediction coverage missing.*102"):
+        compute_all(ANCHOR)
+
+
+@pytest.mark.parametrize(
+    ("last_observed_at", "expected_station_ids"),
+    [
+        (pd.Timestamp(2026, 8, 16, 14, 5), ["101"]),
+        (pd.Timestamp(2026, 8, 16, 14, 0), []),
+        (pd.Timestamp(2026, 8, 16, 13, 45), []),
+    ],
+)
+def test_compute_all_uses_only_anchor_stock_snapshot(last_observed_at, expected_station_ids):
+    _put_tick(last_observed_at, [{"stationId": "101", "parkingBikeTotCnt": 5, "rackTotCnt": 10}])
+    _put_predictions(["101"])
+
+    result = compute_all(ANCHOR)
+
+    assert result["sta_id"].tolist() == expected_station_ids

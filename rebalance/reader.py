@@ -63,6 +63,14 @@ def read_recent_stock(anchor: datetime, lookback_minutes: int = 25) -> dict[str,
     return history
 
 
-def read_predictions(window_start: datetime) -> pd.DataFrame | None:
-    """예측 배치 결과(대여소별 시간대별 대여·반납 원본치)를 읽는다. 파일이 없으면 None."""
-    return read_parquet(_predictions_key(window_start))
+def read_predictions(window_start: datetime) -> pd.DataFrame:
+    """예측 배치 결과를 읽고, 해당 anchor의 산출물이 없으면 실패한다.
+
+    compute_urgency는 run_inference의 직접 downstream이므로 파일 부재는 정상적인
+    trend-only 입력이 아니라 upstream 산출물 계약 위반이다.
+    """
+    key = _predictions_key(window_start)
+    predictions = read_parquet(key)
+    if predictions is None:
+        raise FileNotFoundError(f"prediction parquet not found for {window_start}: {key}")
+    return predictions
