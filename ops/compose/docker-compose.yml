@@ -8,6 +8,7 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
       POSTGRES_APP_DB: ${POSTGRES_APP_DB:-app}
       POSTGRES_AIRFLOW_DB: ${POSTGRES_AIRFLOW_DB:-airflow}
+      POSTGRES_MLFLOW_DB: ${POSTGRES_MLFLOW_DB:-mlflow}
     ports:
       - "${POSTGRES_PORT:-5432}:5432"
     volumes:
