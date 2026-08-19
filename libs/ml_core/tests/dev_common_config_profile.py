@@ -36,6 +36,22 @@ def test_load_profile_prefers_s3_value_over_embedded_default(monkeypatch):
     assert common_config._load_profile()["ROLLING_EMBARGO_MINUTES"] == 12345
 
 
+def test_load_profile_merges_partial_s3_profile_with_embedded_defaults(monkeypatch):
+    """회귀 재현 — S3에 이번 PR 이전에 올려둔(또는 사람이 손으로 만든) 프로필처럼
+    신규 키(TRAIN_LOOKBACK_MONTHS 등)가 빠진 채로 있으면, 그 키가 내장 기본값으로
+    채워져야 한다. 병합 없이 그대로 반환하면 이 파일 끝의
+    `_PROFILE["TRAIN_LOOKBACK_MONTHS"]`에서 KeyError가 나 전 서비스가 import
+    시점에 죽는다(리뷰 지적)."""
+    partial = {"ROLLING_EMBARGO_MINUTES": 999}  # TRAIN_LOOKBACK_MONTHS 등 신규 키 없음
+    s3_io.write_json("profiles/partial.json", partial)
+    monkeypatch.setenv("ML_PROFILE", "partial")
+
+    profile = common_config._load_profile()
+
+    assert profile["ROLLING_EMBARGO_MINUTES"] == 999  # S3 값이 우선
+    assert profile["TRAIN_LOOKBACK_MONTHS"] == common_config._DEFAULT_PROFILE["TRAIN_LOOKBACK_MONTHS"]  # 누락분은 기본값
+
+
 def test_load_profile_falls_back_when_s3_unreachable(monkeypatch):
     # moto가 목킹하는 건 boto3 호출 자체라, 잘못된 엔드포인트로 돌리면 moto 밖으로
     # 나가 실제 네트워크 에러가 난다 — _load_profile()이 이 경우도 예외를 삼키고

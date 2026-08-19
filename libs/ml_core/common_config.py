@@ -115,7 +115,13 @@ def _load_profile() -> dict:
         print(f"[common_config] ERROR: S3에 프로필 '{name}' 없음(profiles/{name}.json) — 내장 기본값 사용", file=sys.stderr)
         return _DEFAULT_PROFILE
     print(f"[common_config] 프로필 '{name}'을 S3에서 읽음")
-    return profile
+    # 내장 기본값과 병합한다(S3 값이 우선) — 이 프로필이 이번 PR 이전에 올려둔
+    # 것이거나 push_profile()로 사람이 손으로 만든 것이면 신규 키(TRAIN_LOOKBACK_
+    # MONTHS 등)가 없을 수 있는데, 그대로 반환하면 이 파일 끝부분의
+    # `_PROFILE["TRAIN_LOOKBACK_MONTHS"]` 같은 곳에서 KeyError가 나 feature_engine/
+    # training/inference가 전부 import 시점에 죽는다(리뷰 지적) — 병합하면 누락된
+    # 키만 내장 기본값으로 자연히 메워진다.
+    return {**_DEFAULT_PROFILE, **profile}
 
 
 def list_profile_names() -> list[str]:
