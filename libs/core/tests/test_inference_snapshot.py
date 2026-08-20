@@ -27,6 +27,7 @@ from core.inference_snapshot import (
     InferenceSnapshotStatus,
     ModelManifestRef,
     ParquetOutputRef,
+    ServingPlanRef,
     ServingReleaseRef,
     build_inference_snapshot_manifest,
     build_model_manifest_ref,
@@ -55,6 +56,7 @@ EXPECTED_IDS_SHA256 = "d" * 64
 POPULATION_SHA256 = "e" * 64
 WEATHER_SHA256 = "f" * 64
 OUTPUT_SHA256 = "0" * 64
+SERVING_PLAN_SHA256 = "9" * 64
 EFFECTIVE_CONTRACT_VERSION = "sha256:" + "6" * 64
 RENTAL_MODEL_VERSION = "sha256:" + "1" * 64
 RETURN_MODEL_VERSION = "sha256:" + "2" * 64
@@ -88,6 +90,16 @@ def _model_ref(kind: ModelKind, **overrides: object) -> ModelManifestRef:
     }
     fields.update(overrides)
     return ModelManifestRef(**fields)  # type: ignore[arg-type]
+
+
+def _serving_plan(**overrides: object) -> ServingPlanRef:
+    """테스트용 exact serving plan artifact ref를 만든다."""
+    fields: dict[str, object] = {
+        "byte_sha256": SERVING_PLAN_SHA256,
+        "uri": (f"s3://fixture/serving-plans/sha256={SERVING_PLAN_SHA256}.json"),
+    }
+    fields.update(overrides)
+    return ServingPlanRef(**fields)  # type: ignore[arg-type]
 
 
 def _station_dependency(**overrides: object) -> Dependency:
@@ -179,6 +191,7 @@ def _succeeded(**overrides: object) -> InferenceSnapshotManifest:
         "status": InferenceSnapshotStatus.SUCCEEDED,
         "producer_version": "inference-producer-v1",
         "serving_release": _serving_release(),
+        "serving_plan": _serving_plan(),
         "rental_model_manifest": _model_ref(ModelKind.RENTAL),
         "return_model_manifest": _model_ref(ModelKind.RETURN),
         "station_dependency": _station_dependency(),
@@ -200,6 +213,7 @@ def _empty(**overrides: object) -> InferenceSnapshotManifest:
         "status": InferenceSnapshotStatus.EMPTY,
         "producer_version": "inference-producer-v1",
         "serving_release": _serving_release(),
+        "serving_plan": _serving_plan(),
         "rental_model_manifest": _model_ref(ModelKind.RENTAL),
         "return_model_manifest": _model_ref(ModelKind.RETURN),
         "station_dependency": _station_dependency(),
@@ -252,6 +266,9 @@ def test_inference_manifest_has_stable_exact_canonical_bytes() -> None:
         b'"uri":"s3://fixture/model-manifests/return/'
         b'sha256=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc.json"},'
         b'"revision_no":0,"schema_version":"ml-inference-snapshot-manifest-v1",'
+        b'"serving_plan":{"byte_sha256":"9999999999999999999999999999999999999999999999999999999999999999",'
+        b'"uri":"s3://fixture/serving-plans/'
+        b'sha256=9999999999999999999999999999999999999999999999999999999999999999.json"},'
         b'"serving_release":{"byte_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",'
         b'"effective_contract_version":"sha256:'
         b'6666666666666666666666666666666666666666666666666666666666666666",'
@@ -407,6 +424,22 @@ def test_direct_typed_manifest_rejects_unsorted_duplicate_inputs() -> None:
     )
     with pytest.raises(InferenceSnapshotContractError, match="URI는 여러 role"):
         replace(manifest, inputs=(first, duplicate_uri))
+
+    duplicate_plan = ImmutableInputRef(
+        manifest.serving_plan.byte_sha256,
+        "serving_plan_duplicate",
+        manifest.serving_plan.uri,
+    )
+    with pytest.raises(InferenceSnapshotContractError, match="explicit ref"):
+        replace(
+            manifest,
+            inputs=tuple(
+                sorted(
+                    (*manifest.inputs, duplicate_plan),
+                    key=lambda value: (value.role.encode(), value.uri.encode()),
+                )
+            ),
+        )
 
 
 def test_all_provenance_versions_are_content_derived_sha256_strings() -> None:

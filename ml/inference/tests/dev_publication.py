@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
+import boto3
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
@@ -22,7 +24,7 @@ from core.gold_publication import (
     parse_canonical_json,
     sha256_hex,
 )
-from core.inference_snapshot import parse_inference_output_parquet
+from core.inference_snapshot import ServingPlanRef, parse_inference_output_parquet
 from core.model_snapshot import (
     MODEL_ARTIFACT_ROLES,
     IdSetArtifactRef,
@@ -31,6 +33,8 @@ from core.model_snapshot import (
     build_model_snapshot_manifest,
 )
 from ml_core.serving_contract import SERVING_FEATURE_PROFILE_KEYS
+from ml_core.serving_release import validate_station_profile_payload
+from moto import mock_aws
 
 from inference import config
 from inference import predict_single as ps
@@ -49,6 +53,17 @@ _ARTIFACT_EXTENSIONS = {
     "station_categories": "json",
     "station_crosswalk": "json",
 }
+_STATION_PROFILE_COLUMNS = (
+    "station_no",
+    "minute",
+    "dow",
+    "month",
+    "rental_mean",
+    "rental_std",
+    "return_mean",
+    "return_std",
+    "n_samples",
+)
 
 
 class MemoryObjectStore:
@@ -145,12 +160,17 @@ def _runtime_contract() -> dict[str, int]:
 
 
 def _station_profile_payload(station_nos: tuple[int, ...]) -> bytes:
-    """Exact 9-column/dtype의 작은 valid station profile Parquet을 만든다."""
-    count = len(station_nos)
+    """Runtime model grid의 global minute set을 갖는 valid profile Parquet을 만든다."""
+    rows = [
+        (station_no, minute)
+        for station_no in station_nos
+        for minute in range(0, 1440, config.GRID_TICK_MINUTES)
+    ]
+    count = len(rows)
     table = pa.Table.from_arrays(
         (
-            pa.array(station_nos, type=pa.int16()),
-            pa.array([0] * count, type=pa.int16()),
+            pa.array([station_no for station_no, _minute in rows], type=pa.int16()),
+            pa.array([minute for _station_no, minute in rows], type=pa.int16()),
             pa.array([0] * count, type=pa.int8()),
             pa.array([1] * count, type=pa.int8()),
             pa.array([1.0] * count, type=pa.float32()),
@@ -159,18 +179,19 @@ def _station_profile_payload(station_nos: tuple[int, ...]) -> bytes:
             pa.array([0.0] * count, type=pa.float32()),
             pa.array([1] * count, type=pa.int32()),
         ),
-        names=pub._PROFILE_COLUMNS,
+        names=_STATION_PROFILE_COLUMNS,
     )
     sink = pa.BufferOutputStream()
     pq.write_table(table, sink)
     return sink.getvalue().to_pybytes()
 
 
-def _parquet_bytes(table: pa.Table) -> bytes:
-    """Arrow table을 fixture Parquet bytes로 직렬화한다."""
-    sink = pa.BufferOutputStream()
-    pq.write_table(table, sink)
-    return sink.getvalue().to_pybytes()
+def _verified_station_profile(station_nos: tuple[int, ...]):
+    """Serving release와 같은 validator로 exact retained profile fixture를 만든다."""
+    return validate_station_profile_payload(
+        _station_profile_payload(station_nos),
+        expected_grid_tick_minutes=config.GRID_TICK_MINUTES,
+    )
 
 
 def _model_snapshot(
@@ -278,7 +299,7 @@ def _pinned_release(
             rental_snapshot=rental,
             return_snapshot=returned,
             effective_contract_payload=contract_payload,
-            station_profile_payload=_station_profile_payload(station_nos),
+            station_profile=_verified_station_profile(station_nos),
         ),
     )
 
@@ -292,6 +313,16 @@ def _dependency(logical: datetime = LOGICAL) -> Dependency:
         manifest_uri="s3://fixture/station-publication.json",
         publication_key="station",
         revision_no=0,
+    )
+
+
+def _serving_plan_ref(label: str = "plan-a") -> ServingPlanRef:
+    """Plan schema를 발명하지 않고 exact artifact identity만 fixture로 만든다."""
+    payload = canonical_json_bytes({"fixture": label})
+    digest = sha256_hex(payload)
+    return ServingPlanRef(
+        byte_sha256=digest,
+        uri=f"s3://fixture/serving-plans/sha256={digest}.json",
     )
 
 
@@ -330,6 +361,11 @@ def _predictor_state() -> tuple[dict[str, object], object]:
     return state, _predictor
 
 
+def _install_predictor(monkeypatch, predictor) -> None:
+    """Production algorithm symbol을 test predictor로 교체한다."""
+    monkeypatch.setattr(pub, "predict_demand_multi_hour_all_stations", predictor)
+
+
 @pytest.fixture
 def _pinned_scoring_stubs(monkeypatch):
     """LightGBM text parsing만 대체하고 producer의 context 배선은 유지한다."""
@@ -362,16 +398,17 @@ def test_success_exact_replay_and_correction_are_revisioned_manifest_last(
     pinned = _pinned_release()
     calls = _install_release_loader(monkeypatch, pinned)
     state, predictor = _predictor_state()
+    _install_predictor(monkeypatch, predictor)
     store = MemoryObjectStore()
     catalog = pub.InMemoryInferenceRevisionCatalog()
     kwargs = {
         "logical_dttm": LOGICAL,
         "station_dependency": _dependency(),
+        "serving_plan": _serving_plan_ref(),
         "expected_sta_ids": build_id_set(["ST-1"]),
         "object_base_uri": OBJECT_BASE_URI,
         "object_store": store,
         "revision_catalog": catalog,
-        "predictor": predictor,
     }
 
     first = pub.run_and_publish_inference(**kwargs)
@@ -405,7 +442,41 @@ def test_success_exact_replay_and_correction_are_revisioned_manifest_last(
     assert (rollover["hour"], rollover["minute"]) == (0, 55)
     records = catalog.snapshot(LOGICAL).records
     assert tuple(record.revision_no for record in records) == (0, 1)
+    assert catalog.latest_revision(LOGICAL) == records[-1]
     assert sum("/inference/manifests/" in uri for uri in store.objects) == 2
+
+
+def test_serving_plan_correction_forces_new_inference_revision(
+    monkeypatch,
+    _pinned_scoring_stubs,
+):
+    """같은 anchor/expected라도 exact serving plan identity가 바뀌면 replay하지 않는다."""
+    _install_release_loader(monkeypatch, _pinned_release())
+    _state, predictor = _predictor_state()
+    _install_predictor(monkeypatch, predictor)
+    store = MemoryObjectStore()
+    catalog = pub.InMemoryInferenceRevisionCatalog()
+    common = {
+        "logical_dttm": LOGICAL,
+        "station_dependency": _dependency(),
+        "expected_sta_ids": build_id_set(["ST-1"]),
+        "object_base_uri": OBJECT_BASE_URI,
+        "object_store": store,
+        "revision_catalog": catalog,
+    }
+
+    first = pub.run_and_publish_inference(
+        **common,
+        serving_plan=_serving_plan_ref("plan-a"),
+    )
+    corrected = pub.run_and_publish_inference(
+        **common,
+        serving_plan=_serving_plan_ref("plan-b"),
+    )
+
+    assert first.manifest.revision_no == 0
+    assert corrected.manifest.revision_no == 1
+    assert corrected.manifest.serving_plan == _serving_plan_ref("plan-b")
 
 
 def test_partial_failure_writes_no_output_manifest_or_catalog_record(
@@ -426,15 +497,17 @@ def test_partial_failure_writes_no_output_manifest_or_catalog_record(
             "actual_count": 0,
         }
 
+    _install_predictor(monkeypatch, _partial)
+
     with pytest.raises(pub.InferencePublicationError, match="partial/failed"):
         pub.run_and_publish_inference(
             logical_dttm=LOGICAL,
             station_dependency=_dependency(),
+            serving_plan=_serving_plan_ref(),
             expected_sta_ids=build_id_set(["ST-1"]),
             object_base_uri=OBJECT_BASE_URI,
             object_store=store,
             revision_catalog=catalog,
-            predictor=_partial,
         )
 
     assert not any("/outputs/" in uri or "/manifests/" in uri for uri in store.objects)
@@ -453,15 +526,17 @@ def test_input_drift_fails_before_authority_manifest(
         s3_io._record_object_read("silver/drift.parquet", b"before")
         s3_io._record_object_read("silver/drift.parquet", b"after")
 
+    _install_predictor(monkeypatch, _drift)
+
     with pytest.raises(s3_io.S3InputDriftError, match="run 중 변경"):
         pub.run_and_publish_inference(
             logical_dttm=LOGICAL,
             station_dependency=_dependency(),
+            serving_plan=_serving_plan_ref(),
             expected_sta_ids=build_id_set(["ST-1"]),
             object_base_uri=OBJECT_BASE_URI,
             object_store=store,
             revision_catalog=catalog,
-            predictor=_drift,
         )
 
     assert not any("/manifests/" in uri for uri in store.objects)
@@ -486,14 +561,16 @@ def test_disjoint_model_support_publishes_true_empty_without_predictor(
     def _must_not_run(**_kwargs):
         raise AssertionError("EMPTY support에서는 predictor를 호출하면 안 됩니다.")
 
+    _install_predictor(monkeypatch, _must_not_run)
+
     result = pub.run_and_publish_inference(
         logical_dttm=LOGICAL,
         station_dependency=_dependency(),
+        serving_plan=_serving_plan_ref(),
         expected_sta_ids=build_id_set([]),
         object_base_uri=OBJECT_BASE_URI,
         object_store=store,
         revision_catalog=catalog,
-        predictor=_must_not_run,
     )
 
     assert result.manifest.status.value == "empty"
@@ -503,17 +580,47 @@ def test_disjoint_model_support_publishes_true_empty_without_predictor(
 
 
 def test_support_mismatch_fails_before_predictor(monkeypatch, _pinned_scoring_stubs):
-    """Caller expected IDs가 pinned support 교집합과 다르면 fail-closed한다."""
+    """Caller expected에 pinned support 교집합 밖 ID가 있으면 fail-closed한다."""
     _install_release_loader(monkeypatch, _pinned_release())
-    with pytest.raises(pub.InferencePublicationError, match="support 교집합"):
+    with pytest.raises(pub.InferencePublicationError, match="support 밖"):
         pub.run_and_publish_inference(
             logical_dttm=LOGICAL,
             station_dependency=_dependency(),
+            serving_plan=_serving_plan_ref(),
             expected_sta_ids=build_id_set(["ST-X"]),
             object_base_uri=OBJECT_BASE_URI,
             object_store=MemoryObjectStore(),
             revision_catalog=pub.InMemoryInferenceRevisionCatalog(),
         )
+
+
+def test_active_expected_subset_of_model_support_publishes_exact_subset(
+    monkeypatch,
+    _pinned_scoring_stubs,
+):
+    """Inactive model-supported station은 제외하고 caller active expected×12만 게시한다."""
+    pinned = _pinned_release(
+        rental_station_nos=(1, 2),
+        rental_sta_ids=("ST-1", "ST-2"),
+        return_station_nos=(1, 2),
+        return_sta_ids=("ST-1", "ST-2"),
+    )
+    _install_release_loader(monkeypatch, pinned)
+    _state, predictor = _predictor_state()
+    _install_predictor(monkeypatch, predictor)
+
+    result = pub.run_and_publish_inference(
+        logical_dttm=LOGICAL,
+        station_dependency=_dependency(),
+        serving_plan=_serving_plan_ref(),
+        expected_sta_ids=build_id_set(["ST-1"]),
+        object_base_uri=OBJECT_BASE_URI,
+        object_store=MemoryObjectStore(),
+        revision_catalog=pub.InMemoryInferenceRevisionCatalog(),
+    )
+
+    assert result.manifest.counts.expected_station_count == 1
+    assert result.manifest.counts.actual_row_count == 12
 
 
 def test_runtime_contract_mismatch_fails_before_profile_or_scoring(
@@ -531,6 +638,7 @@ def test_runtime_contract_mismatch_fails_before_profile_or_scoring(
         pub.run_and_publish_inference(
             logical_dttm=LOGICAL,
             station_dependency=_dependency(),
+            serving_plan=_serving_plan_ref(),
             expected_sta_ids=build_id_set(["ST-1"]),
             object_base_uri=OBJECT_BASE_URI,
             object_store=store,
@@ -557,6 +665,7 @@ def test_station_profile_must_cover_both_model_category_sets(
         pub.run_and_publish_inference(
             logical_dttm=LOGICAL,
             station_dependency=_dependency(),
+            serving_plan=_serving_plan_ref(),
             expected_sta_ids=build_id_set([]),
             object_base_uri=OBJECT_BASE_URI,
             object_store=MemoryObjectStore(),
@@ -564,40 +673,11 @@ def test_station_profile_must_cover_both_model_category_sets(
         )
 
 
-def test_station_profile_semantics_reject_empty_duplicate_and_nonfinite_values():
-    """Release preflight의 SHA 검증 뒤 producer가 profile 의미도 fail-closed한다."""
-    valid = pq.read_table(pa.BufferReader(_station_profile_payload((1,))))
-    duplicate = pa.concat_tables([valid, valid])
-    nonfinite = valid.set_column(
-        valid.schema.get_field_index("rental_mean"),
-        "rental_mean",
-        pa.array([float("nan")], type=pa.float32()),
-    )
-    empty = valid.slice(0, 0)
-
-    pub._validate_station_profile_payload(
-        _parquet_bytes(valid),
-        required_station_nos={1},
-    )
-    with pytest.raises(pub.InferencePublicationError, match="0행"):
-        pub._validate_station_profile_payload(
-            _parquet_bytes(empty),
-            required_station_nos={1},
-        )
-    with pytest.raises(pub.InferencePublicationError, match="logical key가 중복"):
-        pub._validate_station_profile_payload(
-            _parquet_bytes(duplicate),
-            required_station_nos={1},
-        )
-    with pytest.raises(pub.InferencePublicationError, match="finite nonnegative"):
-        pub._validate_station_profile_payload(
-            _parquet_bytes(nonfinite),
-            required_station_nos={1},
-        )
-
-
-def test_stale_logical_fails_before_serving_pointer_read(monkeypatch):
-    """Global latest보다 과거 logical은 model pointer도 읽지 않고 거부한다."""
+def test_cross_logical_out_of_order_publish_keeps_catalog_latest_max(
+    monkeypatch,
+    _pinned_scoring_stubs,
+):
+    """더 최신 logical slot이 있어도 과거 immutable manifest를 허용하고 max는 유지한다."""
     catalog = pub.InMemoryInferenceRevisionCatalog()
     later = LOGICAL + timedelta(minutes=5)
     catalog.claim(
@@ -608,21 +688,24 @@ def test_stale_logical_fails_before_serving_pointer_read(monkeypatch):
             manifest_uri="s3://fixture/inference/sha256=" + "c" * 64 + ".json",
         )
     )
-    monkeypatch.setattr(
-        pub,
-        "load_current_serving_release",
-        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("pointer read")),
+    _install_release_loader(monkeypatch, _pinned_release())
+    _state, predictor = _predictor_state()
+    _install_predictor(monkeypatch, predictor)
+
+    result = pub.run_and_publish_inference(
+        logical_dttm=LOGICAL,
+        station_dependency=_dependency(),
+        serving_plan=_serving_plan_ref(),
+        expected_sta_ids=build_id_set(["ST-1"]),
+        object_base_uri=OBJECT_BASE_URI,
+        object_store=MemoryObjectStore(),
+        revision_catalog=catalog,
     )
 
-    with pytest.raises(pub.InferenceStaleError):
-        pub.run_and_publish_inference(
-            logical_dttm=LOGICAL,
-            station_dependency=_dependency(),
-            expected_sta_ids=build_id_set(["ST-1"]),
-            object_base_uri=OBJECT_BASE_URI,
-            object_store=MemoryObjectStore(),
-            revision_catalog=catalog,
-        )
+    snapshot = catalog.snapshot(LOGICAL)
+    assert result.manifest.logical_dttm == LOGICAL
+    assert len(snapshot.records) == 1
+    assert snapshot.latest_logical_dttm == later
 
 
 def test_catalog_change_during_compute_is_concurrent_writer_conflict(
@@ -633,6 +716,7 @@ def test_catalog_change_during_compute_is_concurrent_writer_conflict(
     _install_release_loader(monkeypatch, _pinned_release())
     state, predictor = _predictor_state()
     del state
+    _install_predictor(monkeypatch, predictor)
     store = MemoryObjectStore()
 
     class _ChangingCatalog(pub.InMemoryInferenceRevisionCatalog):
@@ -644,24 +728,114 @@ def test_catalog_change_during_compute_is_concurrent_writer_conflict(
             self.read_count += 1
             snapshot = super().snapshot(logical_dttm)
             if self.read_count == 2:
+                competing = pub.InferenceRevisionRecord(
+                    logical_dttm=logical_dttm,
+                    revision_no=0,
+                    manifest_byte_sha256="d" * 64,
+                    manifest_uri=(
+                        "s3://fixture/inference/manifests/sha256=" + "d" * 64 + ".json"
+                    ),
+                )
                 return pub.InferenceCatalogSnapshot(
-                    records=snapshot.records,
-                    latest_logical_dttm=logical_dttm + timedelta(minutes=5),
+                    records=(competing,),
+                    latest_logical_dttm=logical_dttm,
                 )
             return snapshot
 
     catalog = _ChangingCatalog()
-    with pytest.raises(pub.InferenceRevisionConflictError, match="catalog가 변경"):
+    with pytest.raises(pub.InferenceRevisionConflictError, match="같은 logical"):
         pub.run_and_publish_inference(
             logical_dttm=LOGICAL,
             station_dependency=_dependency(),
+            serving_plan=_serving_plan_ref(),
             expected_sta_ids=build_id_set(["ST-1"]),
             object_base_uri=OBJECT_BASE_URI,
             object_store=store,
             revision_catalog=catalog,
-            predictor=predictor,
         )
     assert not any("/manifests/" in uri for uri in store.objects)
+
+
+def test_same_logical_claim_race_is_fail_closed(
+    monkeypatch,
+    _pinned_scoring_stubs,
+):
+    """Final snapshot 뒤 같은 revision slot을 선점한 writer가 있으면 manifest를 쓰지 않는다."""
+    _install_release_loader(monkeypatch, _pinned_release())
+    _state, predictor = _predictor_state()
+    _install_predictor(monkeypatch, predictor)
+    store = MemoryObjectStore()
+
+    class _ClaimRaceCatalog(pub.InMemoryInferenceRevisionCatalog):
+        def claim(self, record):
+            competing = pub.InferenceRevisionRecord(
+                logical_dttm=record.logical_dttm,
+                revision_no=record.revision_no,
+                manifest_byte_sha256="e" * 64,
+                manifest_uri=(
+                    "s3://fixture/inference/manifests/sha256=" + "e" * 64 + ".json"
+                ),
+            )
+            super().claim(competing)
+            super().claim(record)
+
+    with pytest.raises(pub.InferenceRevisionConflictError, match="먼저 claim"):
+        pub.run_and_publish_inference(
+            logical_dttm=LOGICAL,
+            station_dependency=_dependency(),
+            serving_plan=_serving_plan_ref(),
+            expected_sta_ids=build_id_set(["ST-1"]),
+            object_base_uri=OBJECT_BASE_URI,
+            object_store=store,
+            revision_catalog=_ClaimRaceCatalog(),
+        )
+
+    assert not any("/manifests/" in uri for uri in store.objects)
+
+
+def test_custom_object_store_requires_matching_revision_catalog():
+    """Injected object backend와 global S3 catalog를 조용히 섞지 않는다."""
+    with pytest.raises(pub.InferencePublicationError, match="revision_catalog"):
+        pub.run_and_publish_inference(
+            logical_dttm=LOGICAL,
+            station_dependency=_dependency(),
+            serving_plan=_serving_plan_ref(),
+            expected_sta_ids=build_id_set(["ST-1"]),
+            object_base_uri=OBJECT_BASE_URI,
+            object_store=MemoryObjectStore(),
+        )
+
+
+def test_s3_revision_catalog_claim_snapshot_and_latest_use_same_bucket(
+    monkeypatch,
+):
+    """Production S3 adapter가 immutable slot CAS와 latest revision 조회를 왕복한다."""
+    bucket = "inference-catalog-fixture"
+    with mock_aws():
+        client = boto3.client("s3", region_name="us-east-1")
+        client.create_bucket(Bucket=bucket)
+        monkeypatch.setenv("S3_BUCKET", bucket)
+        monkeypatch.setattr(s3_io, "_client", lambda _timeout=None: client)
+        store = pub.S3ImmutableObjectStore(client)
+        catalog = pub.S3InferenceRevisionCatalog(
+            f"s3://{bucket}/authority",
+            store,
+        )
+        record = pub.InferenceRevisionRecord(
+            logical_dttm=LOGICAL,
+            revision_no=0,
+            manifest_byte_sha256="f" * 64,
+            manifest_uri=(
+                f"s3://{bucket}/authority/inference/manifests/sha256={'f' * 64}.json"
+            ),
+        )
+
+        catalog.claim(record)
+
+        assert catalog.snapshot(LOGICAL).records == (record,)
+        assert catalog.latest_revision(LOGICAL) == record
+        with pytest.raises(pub.InferenceRevisionConflictError, match="먼저 claim"):
+            catalog.claim(record)
 
 
 @pytest.mark.parametrize("failure", ["collision", "readback"])
@@ -673,6 +847,7 @@ def test_output_collision_or_readback_failure_never_claims_manifest(
     """Output put/readback이 완전하지 않으면 catalog와 authority manifest를 건드리지 않는다."""
     _install_release_loader(monkeypatch, _pinned_release())
     _state, predictor = _predictor_state()
+    _install_predictor(monkeypatch, predictor)
     store = RejectingObjectStore(
         reject_put="/inference/outputs/" if failure == "collision" else None,
         reject_read="/inference/outputs/" if failure == "readback" else None,
@@ -683,11 +858,11 @@ def test_output_collision_or_readback_failure_never_claims_manifest(
         pub.run_and_publish_inference(
             logical_dttm=LOGICAL,
             station_dependency=_dependency(),
+            serving_plan=_serving_plan_ref(),
             expected_sta_ids=build_id_set(["ST-1"]),
             object_base_uri=OBJECT_BASE_URI,
             object_store=store,
             revision_catalog=catalog,
-            predictor=predictor,
         )
 
     assert catalog.snapshot(LOGICAL).records == ()
@@ -701,6 +876,7 @@ def test_manifest_collision_leaves_no_authority_bytes_and_retryable_reservation(
     """Catalog claim 뒤 manifest put collision은 기존 bytes를 덮지 않고 slot만 남긴다."""
     _install_release_loader(monkeypatch, _pinned_release())
     _state, predictor = _predictor_state()
+    _install_predictor(monkeypatch, predictor)
     store = RejectingObjectStore(reject_put="/inference/manifests/")
     catalog = pub.InMemoryInferenceRevisionCatalog()
 
@@ -708,11 +884,11 @@ def test_manifest_collision_leaves_no_authority_bytes_and_retryable_reservation(
         pub.run_and_publish_inference(
             logical_dttm=LOGICAL,
             station_dependency=_dependency(),
+            serving_plan=_serving_plan_ref(),
             expected_sta_ids=build_id_set(["ST-1"]),
             object_base_uri=OBJECT_BASE_URI,
             object_store=store,
             revision_catalog=catalog,
-            predictor=predictor,
         )
 
     assert len(catalog.snapshot(LOGICAL).records) == 1
@@ -724,9 +900,34 @@ def test_authority_context_uses_pinned_profile_instead_of_legacy_global_cache():
     ps._station_profile_station_index = {999: 0}
     ps._station_profile_values = pa.array([999.0]).to_numpy()
 
-    with ps.authority_inference_run(_station_profile_payload((1,))):
+    with ps.authority_inference_run(_verified_station_profile((1,))):
         station_index, values = ps._get_station_profile()
 
     assert station_index == {1: 0}
     assert values.shape[0] == 1
     assert ps._station_profile_values is None
+
+
+def test_authority_context_rejects_concurrent_legacy_prediction_run():
+    """Legacy entrypoint가 global cache를 쓰는 동안 authority가 cache를 지우지 않는다."""
+    entered = threading.Event()
+    release = threading.Event()
+
+    @ps._serialize_prediction_run
+    def _legacy_run():
+        entered.set()
+        release.wait(timeout=5)
+
+    worker = threading.Thread(target=_legacy_run)
+    worker.start()
+    assert entered.wait(timeout=5)
+    try:
+        with (
+            pytest.raises(RuntimeError, match="다른 prediction run"),
+            ps.authority_inference_run(_verified_station_profile((1,))),
+        ):
+            pass
+    finally:
+        release.set()
+        worker.join(timeout=5)
+    assert not worker.is_alive()

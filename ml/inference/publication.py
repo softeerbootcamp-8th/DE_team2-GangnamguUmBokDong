@@ -8,20 +8,17 @@ revision catalog를 claim하고 success/EMPTY manifest를 마지막에 기록한
 
 from __future__ import annotations
 
-import io
 import re
 import threading
-from collections.abc import Callable, Iterable
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Protocol, cast
 from urllib.parse import urlsplit
 
-import numpy as np
 import pandas as pd
 import pyarrow as pa
-import pyarrow.parquet as pq
 from core import s3 as s3_io
 from core.gold_publication import (
     Dependency,
@@ -44,6 +41,7 @@ from core.inference_snapshot import (
     InferenceSnapshotStatus,
     ModelManifestRef,
     ParquetOutputRef,
+    ServingPlanRef,
     ServingReleaseRef,
     build_inference_snapshot_manifest,
     build_model_manifest_ref,
@@ -62,6 +60,7 @@ from ml_core.serving_contract import SERVING_FEATURE_PROFILE_KEYS
 from ml_core.serving_release import (
     PinnedServingRelease,
     ServingReleasePointerStore,
+    VerifiedStationProfile,
     load_current_serving_release,
     parse_effective_serving_contract,
 )
@@ -78,34 +77,6 @@ INFERENCE_PRODUCER_VERSION = "gold-inference-producer-v1"
 INFERENCE_REVISION_RECORD_SCHEMA_VERSION = "ml-inference-revision-record-v1"
 """Logical time별 immutable revision slot의 schema version이다."""
 
-_PROFILE_COLUMNS = (
-    "station_no",
-    "minute",
-    "dow",
-    "month",
-    "rental_mean",
-    "rental_std",
-    "return_mean",
-    "return_std",
-    "n_samples",
-)
-_PROFILE_STAT_COLUMNS = (
-    "rental_mean",
-    "rental_std",
-    "return_mean",
-    "return_std",
-)
-_PROFILE_ARROW_TYPES = {
-    "station_no": pa.int16(),
-    "minute": pa.int16(),
-    "dow": pa.int8(),
-    "month": pa.int8(),
-    "rental_mean": pa.float32(),
-    "rental_std": pa.float32(),
-    "return_mean": pa.float32(),
-    "return_std": pa.float32(),
-    "n_samples": pa.int32(),
-}
 _REVISION_RECORD_KEYS = frozenset(
     {
         "logical_dttm",
@@ -126,10 +97,6 @@ class InferencePublicationError(RuntimeError):
 
 class InferenceRevisionConflictError(InferencePublicationError):
     """같은 catalog snapshot에서 시작한 다른 writer가 revision을 먼저 claim했다."""
-
-
-class InferenceStaleError(InferencePublicationError):
-    """더 최신 logical inference가 이미 catalog에 존재한다."""
 
 
 class InferenceRunStatus(StrEnum):
@@ -241,6 +208,10 @@ class InferenceRevisionCatalog(Protocol):
         """해당 logical/revision의 고정 slot이 비어 있을 때만 예약한다."""
         ...
 
+    def latest_revision(self, logical_dttm: datetime) -> InferenceRevisionRecord | None:
+        """해당 logical의 가장 큰 immutable revision record를 반환한다."""
+        ...
+
 
 @dataclass(frozen=True, slots=True)
 class PublishedInferenceSnapshot:
@@ -326,6 +297,11 @@ class S3InferenceRevisionCatalog:
                 f"inference revision을 다른 writer가 먼저 claim했습니다: {uri}"
             )
 
+    def latest_revision(self, logical_dttm: datetime) -> InferenceRevisionRecord | None:
+        """S3 catalog에서 logical별 가장 큰 revision record를 반환한다."""
+        records = self.snapshot(logical_dttm).records
+        return records[-1] if records else None
+
     def _record_uri(self, logical_dttm: datetime, revision_no: int) -> str:
         """Logical time과 zero-padded revision의 fixed catalog slot URI를 만든다."""
         return (
@@ -366,11 +342,17 @@ class InMemoryInferenceRevisionCatalog:
                 )
             self._records[key] = record
 
+    def latest_revision(self, logical_dttm: datetime) -> InferenceRevisionRecord | None:
+        """Lock-consistent snapshot에서 logical별 가장 큰 revision을 반환한다."""
+        records = self.snapshot(logical_dttm).records
+        return records[-1] if records else None
+
 
 def run_and_publish_inference(
     *,
     logical_dttm: datetime,
     station_dependency: Dependency,
+    serving_plan: ServingPlanRef,
     expected_sta_ids: IdSet,
     object_base_uri: str,
     producer_version: str = INFERENCE_PRODUCER_VERSION,
@@ -378,18 +360,16 @@ def run_and_publish_inference(
     pointer_store: ServingReleasePointerStore | None = None,
     pointer_key: str | None = None,
     revision_catalog: InferenceRevisionCatalog | None = None,
-    predictor: Callable[
-        ..., dict[str, object]
-    ] = predict_demand_multi_hour_all_stations,
 ) -> PublishedInferenceSnapshot:
     """Pinned model 쌍으로 station×12를 계산하고 immutable authority를 공개한다.
 
-    ``expected_sta_ids``는 caller가 prepared incoming station tuple에서 결정해 넘기지만,
-    현재 v1에서는 pinned rental/return support 교집합과 exact 같아야 한다. Partial이나
-    failed station은 output/manifest를 쓰기 전에 실패한다. Model/release/profile bytes는
-    explicit manifest field라 generic ``inputs``에 중복하지 않고, 계산 구간에서
-    ``core.s3``가 실제 반환한 non-model bytes만 stable ``s3_input_<key-sha256>`` role로
-    고정한다.
+    ``expected_sta_ids``는 caller가 prepared incoming active station과 pinned
+    rental/return support의 교집합으로 결정한다. Producer는 caller 집합이 두 model
+    support 안에 있는지 다시 검증하고 그 exact station×12만 계산한다. Partial이나
+    failed station은 output/manifest를 쓰기 전에 실패한다. Model/release/profile
+    bytes는 explicit manifest field라 generic ``inputs``에 중복하지 않고, 계산
+    구간에서 ``core.s3``가 실제 반환한 non-model bytes만 stable
+    ``s3_input_<key-sha256>`` role로 고정한다.
     """
     logical = _utc_dttm(logical_dttm)
     if type(station_dependency) is not Dependency:
@@ -402,6 +382,8 @@ def run_and_publish_inference(
         raise InferencePublicationError(
             "station_dependency는 inference logical_dttm보다 미래일 수 없습니다."
         )
+    if type(serving_plan) is not ServingPlanRef:
+        raise TypeError("serving_plan은 exact ServingPlanRef여야 합니다.")
     if type(expected_sta_ids) is not IdSet:
         raise TypeError("expected_sta_ids는 exact IdSet이어야 합니다.")
     if type(producer_version) is not str or not producer_version:
@@ -409,6 +391,10 @@ def run_and_publish_inference(
             "producer_version은 non-empty string이어야 합니다."
         )
     _split_base_uri(object_base_uri)
+    if object_store is not None and revision_catalog is None:
+        raise InferencePublicationError(
+            "custom object_store에는 같은 backend의 revision_catalog를 명시해야 합니다."
+        )
 
     immutable = object_store if object_store is not None else S3ImmutableObjectStore()
     catalog = (
@@ -417,13 +403,6 @@ def run_and_publish_inference(
         else S3InferenceRevisionCatalog(object_base_uri, immutable)
     )
     initial_catalog = catalog.snapshot(logical)
-    if (
-        initial_catalog.latest_logical_dttm is not None
-        and initial_catalog.latest_logical_dttm > logical
-    ):
-        raise InferenceStaleError(
-            "더 최신 logical inference가 이미 존재해 과거 snapshot을 게시할 수 없습니다."
-        )
 
     # 이 함수 안에서 유일한 serving pointer read다. Returned preflight가 exact
     # transitive payload를 보존하므로 이후 legacy champion pointer나 model key를
@@ -444,8 +423,8 @@ def run_and_publish_inference(
         )
     support = _validate_expected_support(pinned, expected_sta_ids)
     required_station_nos = _required_station_nos(pinned)
-    _validate_station_profile_payload(
-        pinned.preflight.station_profile_payload,
+    _validate_station_profile(
+        pinned.preflight.station_profile,
         required_station_nos=required_station_nos,
     )
     pinned_models = {
@@ -467,11 +446,11 @@ def run_and_publish_inference(
     if expected_sta_ids.ids:
         kst_logical = pd.Timestamp(logical).tz_convert("Asia/Seoul")
         with (
-            authority_inference_run(pinned.preflight.station_profile_payload),
+            authority_inference_run(pinned.preflight.station_profile),
             use_pinned_scoring_models(pinned_models),
             s3_io.capture_object_reads() as read_capture,
         ):
-            outcome = predictor(
+            outcome = predict_demand_multi_hour_all_stations(
                 date=kst_logical.strftime("%Y-%m-%d"),
                 hour=int(kst_logical.hour),
                 minute=int(kst_logical.minute),
@@ -513,6 +492,7 @@ def run_and_publish_inference(
         logical_dttm=logical,
         producer_version=producer_version,
         pinned=pinned,
+        serving_plan=serving_plan,
         station_dependency=station_dependency,
         inputs=inputs,
         expected_ref=expected_ref,
@@ -527,16 +507,17 @@ def run_and_publish_inference(
 
 
 def _validate_expected_support(pinned: PinnedServingRelease, expected: IdSet) -> IdSet:
-    """Pinned rental/return support 교집합과 caller expected set의 exact equality를 강제한다."""
+    """Caller expected가 pinned rental/return support 교집합의 subset인지 검증한다."""
     rental = pinned.preflight.rental_snapshot.support_sta_ids
     returned = pinned.preflight.return_snapshot.support_sta_ids
     support = build_id_set(set(rental.ids).intersection(returned.ids))
-    if support != expected:
+    unsupported = tuple(sorted(set(expected.ids).difference(support.ids)))
+    if unsupported:
         raise InferencePublicationError(
-            "expected station IDs가 pinned rental/return support 교집합과 다릅니다: "
-            f"expected_sha={expected.sha256}, support_sha={support.sha256}"
+            "expected station IDs에 pinned rental/return support 밖의 ID가 있습니다: "
+            f"{unsupported[:10]}"
         )
-    return support
+    return expected
 
 
 def _validate_runtime_contract(payload: bytes) -> None:
@@ -572,74 +553,23 @@ def _required_station_nos(pinned: PinnedServingRelease) -> set[int]:
     return set(rental).union(returned)
 
 
-def _validate_station_profile_payload(
-    payload: bytes, *, required_station_nos: set[int]
+def _validate_station_profile(
+    profile: VerifiedStationProfile, *, required_station_nos: set[int]
 ) -> None:
-    """Pinned station fallback Parquet의 exact schema·값·support coverage를 검증한다."""
-    if type(payload) is not bytes:
-        raise TypeError("station profile payload는 bytes여야 합니다.")
-    try:
-        table = pq.read_table(io.BytesIO(payload))
-    except (OSError, ValueError, pa.ArrowException) as exc:
+    """Release preflight가 검증한 profile을 runtime grid/model coverage에 결합한다."""
+    if type(profile) is not VerifiedStationProfile:
+        raise TypeError("station profile은 exact VerifiedStationProfile이어야 합니다.")
+    if profile.grid_tick_minutes != config.GRID_TICK_MINUTES:
         raise InferencePublicationError(
-            "station profile Parquet을 읽을 수 없습니다."
-        ) from exc
-    if tuple(table.column_names) != _PROFILE_COLUMNS:
-        raise InferencePublicationError(
-            f"station profile column이 exact 계약과 다릅니다: {tuple(table.column_names)}"
+            "station profile grid와 runtime model grid가 다릅니다: "
+            f"profile={profile.grid_tick_minutes}, runtime={config.GRID_TICK_MINUTES}"
         )
-    if table.num_rows == 0:
-        raise InferencePublicationError("station profile은 0행일 수 없습니다.")
-    for name, expected_type in _PROFILE_ARROW_TYPES.items():
-        actual_type = table.schema.field(name).type
-        if actual_type != expected_type:
-            raise InferencePublicationError(
-                f"station profile {name} type이 다릅니다: "
-                f"expected={expected_type}, actual={actual_type}"
-            )
-    if any(table.column(name).null_count for name in _PROFILE_COLUMNS):
+    expected_minutes = tuple(range(0, 1440, config.GRID_TICK_MINUTES))
+    if profile.minute_values != expected_minutes:
         raise InferencePublicationError(
-            "station profile column은 모두 non-null이어야 합니다."
+            "station profile minute set이 runtime model grid와 다릅니다."
         )
-
-    frame = table.to_pandas()
-    station_no = pd.to_numeric(frame["station_no"], errors="coerce")
-    minute = pd.to_numeric(frame["minute"], errors="coerce")
-    dow = pd.to_numeric(frame["dow"], errors="coerce")
-    month = pd.to_numeric(frame["month"], errors="coerce")
-    n_samples = pd.to_numeric(frame["n_samples"], errors="coerce")
-    if (
-        station_no.isna().any()
-        or (station_no % 1 != 0).any()
-        or minute.isna().any()
-        or (~minute.between(0, 1439)).any()
-        or (minute % config.GRID_TICK_MINUTES != 0).any()
-        or dow.isna().any()
-        or (~dow.between(0, 6)).any()
-        or (dow % 1 != 0).any()
-        or month.isna().any()
-        or (~month.between(1, 12)).any()
-        or (month % 1 != 0).any()
-        or n_samples.isna().any()
-        or (n_samples % 1 != 0).any()
-        or (n_samples <= 0).any()
-    ):
-        raise InferencePublicationError(
-            "station profile key/range/grid/sample 값이 잘못됐습니다."
-        )
-    logical = pd.DataFrame(
-        {"station_no": station_no, "minute": minute, "dow": dow, "month": month}
-    )
-    if logical.duplicated(keep=False).any():
-        raise InferencePublicationError("station profile logical key가 중복됐습니다.")
-    for name in _PROFILE_STAT_COLUMNS:
-        values = pd.to_numeric(frame[name], errors="coerce").to_numpy(dtype="float64")
-        if not np.isfinite(values).all() or (values < 0).any():
-            raise InferencePublicationError(
-                f"station profile {name}은 finite nonnegative여야 합니다."
-            )
-    observed_station_nos = set(station_no.astype("int64").tolist())
-    missing = sorted(required_station_nos.difference(observed_station_nos))
+    missing = sorted(required_station_nos.difference(profile.station_nos))
     if missing:
         raise InferencePublicationError(
             f"station profile이 model support station_no를 누락했습니다: {missing[:10]}"
@@ -786,6 +716,7 @@ def _publish_revisioned_manifest(
     logical_dttm: datetime,
     producer_version: str,
     pinned: PinnedServingRelease,
+    serving_plan: ServingPlanRef,
     station_dependency: Dependency,
     inputs: tuple[ImmutableInputRef, ...],
     expected_ref: IdSetArtifactRef,
@@ -807,6 +738,7 @@ def _publish_revisioned_manifest(
         status=status,
         producer_version=producer_version,
         serving_release=serving_ref,
+        serving_plan=serving_plan,
         rental_model_manifest=rental_ref,
         return_model_manifest=return_ref,
         station_dependency=station_dependency,
@@ -826,9 +758,9 @@ def _publish_revisioned_manifest(
         latest.manifest_byte_sha256 == same_revision_candidate.sha256
         and latest.manifest_uri == same_uri
     ):
-        if catalog.snapshot(logical_dttm) != initial_catalog:
+        if catalog.snapshot(logical_dttm).records != initial_catalog.records:
             raise InferenceRevisionConflictError(
-                "inference 계산 중 catalog가 변경되어 replay를 중단합니다."
+                "같은 logical의 inference catalog가 변경되어 replay를 중단합니다."
             )
         try:
             _readback_manifest(object_store, latest, same_revision_candidate)
@@ -872,6 +804,7 @@ def _publish_revisioned_manifest(
         status=status,
         producer_version=producer_version,
         serving_release=serving_ref,
+        serving_plan=serving_plan,
         rental_model_manifest=rental_ref,
         return_model_manifest=return_ref,
         station_dependency=station_dependency,
@@ -888,9 +821,9 @@ def _publish_revisioned_manifest(
         "json",
     )
     current_catalog = catalog.snapshot(logical_dttm)
-    if current_catalog != initial_catalog:
+    if current_catalog.records != initial_catalog.records:
         raise InferenceRevisionConflictError(
-            "inference 계산 중 catalog가 변경되어 stale writer를 중단합니다."
+            "같은 logical의 inference catalog가 변경되어 writer를 중단합니다."
         )
     record = InferenceRevisionRecord(
         logical_dttm=logical_dttm,

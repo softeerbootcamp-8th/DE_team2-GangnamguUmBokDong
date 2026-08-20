@@ -79,6 +79,7 @@ _MANIFEST_KEYS = frozenset(
         "revision_no",
         "schema_version",
         "serving_release",
+        "serving_plan",
         "station_dependency",
         "status",
     }
@@ -96,6 +97,7 @@ _MODEL_REF_KEYS = frozenset(
     }
 )
 _INPUT_REF_KEYS = frozenset({"byte_sha256", "role", "uri"})
+_SERVING_PLAN_REF_KEYS = frozenset({"byte_sha256", "uri"})
 _ID_SET_REF_KEYS = frozenset({"byte_sha256", "id_count", "schema_version", "uri"})
 _OUTPUT_REF_KEYS = frozenset({"byte_sha256", "row_count", "uri"})
 _COUNTS_KEYS = frozenset(
@@ -153,6 +155,23 @@ class ServingReleaseRef:
             "serving release effective_contract_version",
         )
         _require_content_version(self.release_version, "serving release version")
+        validate_content_addressed_s3_uri(
+            self.uri,
+            self.byte_sha256,
+            expected_extension="json",
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ServingPlanRef:
+    """Inference expected scope를 결정한 exact serving-plan artifact identity다."""
+
+    byte_sha256: str
+    uri: str
+
+    def __post_init__(self) -> None:
+        """Serving-plan checksum과 content-addressed JSON URI를 검증한다."""
+        _require_sha256(self.byte_sha256, "serving plan byte_sha256")
         validate_content_addressed_s3_uri(
             self.uri,
             self.byte_sha256,
@@ -260,6 +279,7 @@ class InferenceSnapshotManifest:
     status: InferenceSnapshotStatus
     producer_version: str
     serving_release: ServingReleaseRef
+    serving_plan: ServingPlanRef
     rental_model_manifest: ModelManifestRef
     return_model_manifest: ModelManifestRef
     station_dependency: Dependency
@@ -333,6 +353,7 @@ def build_inference_snapshot_manifest(
     status: InferenceSnapshotStatus,
     producer_version: str,
     serving_release: ServingReleaseRef,
+    serving_plan: ServingPlanRef,
     rental_model_manifest: ModelManifestRef,
     return_model_manifest: ModelManifestRef,
     station_dependency: Dependency,
@@ -358,6 +379,7 @@ def build_inference_snapshot_manifest(
         status=status,
         producer_version=producer_version,
         serving_release=serving_release,
+        serving_plan=serving_plan,
         rental_model_manifest=rental_model_manifest,
         return_model_manifest=return_model_manifest,
         station_dependency=station_dependency,
@@ -593,6 +615,7 @@ def parse_inference_snapshot_manifest(payload: bytes) -> InferenceSnapshotManife
             document["producer_version"], "producer_version"
         ),
         serving_release=_parse_serving_release(document["serving_release"]),
+        serving_plan=_parse_serving_plan_ref(document["serving_plan"]),
         rental_model_manifest=_parse_model_ref(
             document["rental_model_manifest"], "rental_model_manifest"
         ),
@@ -634,6 +657,11 @@ def validate_inference_snapshot_manifest(
         manifest.serving_release,
         ServingReleaseRef,
         "serving_release",
+    )
+    _require_exact_instance(
+        manifest.serving_plan,
+        ServingPlanRef,
+        "serving_plan",
     )
     _require_exact_instance(
         manifest.rental_model_manifest,
@@ -701,6 +729,10 @@ def validate_inference_snapshot_manifest(
     if len(set(input_uris)) != len(input_uris):
         raise InferenceSnapshotContractError(
             "inference input URI는 여러 role이 공유할 수 없습니다."
+        )
+    if manifest.serving_plan.uri in input_uris:
+        raise InferenceSnapshotContractError(
+            "serving plan explicit ref는 generic input에 중복될 수 없습니다."
         )
 
     _require_exact_instance(
@@ -830,6 +862,7 @@ def _manifest_document(
         "revision_no": manifest.revision_no,
         "schema_version": manifest.schema_version,
         "serving_release": _serving_release_document(manifest.serving_release),
+        "serving_plan": _serving_plan_ref_document(manifest.serving_plan),
         "station_dependency": _dependency_document(manifest.station_dependency),
         "status": manifest.status.value,
     }
@@ -854,6 +887,11 @@ def _model_ref_document(value: ModelManifestRef) -> dict[str, JsonValue]:
         "model_version": value.model_version,
         "uri": value.uri,
     }
+
+
+def _serving_plan_ref_document(value: ServingPlanRef) -> dict[str, JsonValue]:
+    """Serving plan ref를 canonical JSON object로 바꾼다."""
+    return {"byte_sha256": value.byte_sha256, "uri": value.uri}
 
 
 def _input_ref_document(value: ImmutableInputRef) -> dict[str, JsonValue]:
@@ -931,6 +969,22 @@ def _parse_model_ref(value: JsonValue, label: str) -> ModelManifestRef:
             document["model_version"], f"{label}.model_version"
         ),
         uri=_require_string(document["uri"], f"{label}.uri"),
+    )
+
+
+def _parse_serving_plan_ref(value: JsonValue) -> ServingPlanRef:
+    """JSON object를 exact ServingPlanRef로 파싱한다."""
+    document = _require_exact_object(
+        value,
+        _SERVING_PLAN_REF_KEYS,
+        "serving_plan",
+    )
+    return ServingPlanRef(
+        byte_sha256=_require_string(
+            document["byte_sha256"],
+            "serving_plan.byte_sha256",
+        ),
+        uri=_require_string(document["uri"], "serving_plan.uri"),
     )
 
 
