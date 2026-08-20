@@ -30,6 +30,7 @@ services:
           pg_isready -h 127.0.0.1 -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_APP_DB:-app}
       interval: 5s
       timeout: 5s
+      start_period: 60s
       retries: 10
 
   # 기존 볼륨에는 DDL을 재적용하지 않는다. 새 볼륨의 원자적 baseline 적용 후에도
