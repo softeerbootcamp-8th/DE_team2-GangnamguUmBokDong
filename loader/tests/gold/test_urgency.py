@@ -1,21 +1,51 @@
 """Gold urgency projection의 완전성·artifact 분리 계약을 검증한다."""
 
+import importlib.util
+import sys
 from datetime import UTC, datetime, timedelta, timezone
+from pathlib import Path
+from types import ModuleType
+from typing import Any
 
+import boto3
 import pyarrow as pa
 import pytest
-from core.gold_publication import ContractViolation
+from core.forecast import enrich_forecast_points
+from core.gold_publication import (
+    ContractViolation,
+    InputArtifact,
+    S3ImmutableObjectStore,
+    sha256_hex,
+)
+from core.source_snapshot import (
+    SourceSnapshotCounts,
+    SourceSnapshotStatus,
+    build_source_snapshot_manifest,
+)
 from gold.common import parquet_bytes
+from gold.demand import DemandForecastRecord
+from gold.source_catalog import S3SourceSnapshotCatalog
+from gold.station_stock import StationStockRecord
 from gold.urgency import (
+    ActiveStation,
     StationUrgencyRecord,
+    StockHistoryPoint,
+    UrgencyCalculationInputs,
     UrgencyProjection,
     UrgencyRecord,
+    _bike_qty_v1,
+    _history_window_from_manifest,
+    _stock_history_input_artifacts,
+    _urgency_score_v1,
+    _validate_history_catalog,
     build_urgency_projection,
+    compute_urgency_projection,
     urgency_records_from_parquet,
     urgency_records_to_parquet,
 )
 
 BASE = datetime(2026, 8, 20, 0, 5, tzinfo=UTC)
+BUCKET = "test-bucket"
 
 
 def _record(
@@ -267,3 +297,227 @@ def test_empty_urgency_uses_no_artifact_instead_of_empty_parquet() -> None:
     """조건부 EMPTY publication은 artifacts=[] 계약을 우회하지 않는다."""
     with pytest.raises(ContractViolation, match=r"artifacts=\[\]"):
         urgency_records_to_parquet((), expected_sta_ids=())
+
+
+def test_compute_projection_allows_new_station_absent_from_old_complete_windows() -> (
+    None
+):
+    """Complete history window 자체는 필수지만 신설 station의 과거 row 부재는 허용한다."""
+    inputs = _calculation_inputs(history_station_ids=())
+
+    projection = compute_urgency_projection(inputs)
+
+    assert projection.expected_sta_ids == ("ST-1",)
+    assert projection.records == (
+        UrgencyRecord(
+            sta_id="ST-1",
+            base_dttm=BASE,
+            urgency_score=53.5,
+            critical_remaining_min=0,
+            rebalance_need_type_cd="supply_needed",
+            bike_qty=19,
+        ),
+    )
+
+
+def test_calculation_inputs_fix_history_roles_to_oldest_first_offsets() -> None:
+    """History role 하나라도 t-25..-5 순서를 바꾸면 계산 전에 거부한다."""
+    inputs = _calculation_inputs(history_station_ids=("ST-1",))
+    swapped = (
+        inputs.history_windows[1],
+        inputs.history_windows[0],
+        *inputs.history_windows[2:],
+    )
+
+    with pytest.raises(ContractViolation, match="시각 순서"):
+        UrgencyCalculationInputs(
+            active_stations=inputs.active_stations,
+            history_windows=swapped,
+            current_stock=inputs.current_stock,
+            demand=inputs.demand,
+            base_dttm=inputs.base_dttm,
+        )
+
+
+def test_scoring_and_bike_quantity_are_equivalent_to_rebalance_v1() -> None:
+    """Production publisher 계산이 기존 rebalance urgency 함수와 exact하게 같다."""
+    legacy = _load_legacy_urgency_module()
+    history = [
+        {"observed_at": BASE - timedelta(minutes=10), "parking_bike_tot_cnt": 6},
+        {"observed_at": BASE, "parking_bike_tot_cnt": 4},
+    ]
+    raw_points = [
+        {"predicted_rent_cnt": 3, "predicted_return_cnt": 1},
+        {"predicted_rent_cnt": 0, "predicted_return_cnt": 8},
+    ]
+    points = enrich_forecast_points(4, 20, raw_points)
+
+    expected = legacy.urgency_score(4, 20, history, points, BASE)
+    actual = _urgency_score_v1(4, 20, history, points, BASE)
+
+    assert actual == expected
+    assert _bike_qty_v1(4, 20, actual[2], points) == legacy.bike_qty(
+        4,
+        20,
+        expected[2],
+        points,
+    )
+
+
+def test_history_null_parking_is_station_observation_absence() -> None:
+    """Complete window의 nullable parking 한 건은 batch 실패가 아닌 해당 point 부재다."""
+    store = S3ImmutableObjectStore(boto3.client("s3", region_name="us-east-1"))
+    silver = parquet_bytes(
+        pa.table(
+            {
+                "stationId": pa.array(["ST-1", "ST-2"], type=pa.string()),
+                "parkingBikeTotCnt": pa.array([None, 4], type=pa.int64()),
+            }
+        )
+    )
+    silver_sha = sha256_hex(silver)
+    silver_uri = f"s3://{BUCKET}/history/sha256={silver_sha}.parquet"
+    store.put_once(silver_uri, silver, expected_sha256=silver_sha)
+    manifest = _source_manifest(
+        BASE - timedelta(minutes=25), 0, silver_uri, silver_sha, 2
+    )
+    manifest_uri = f"s3://{BUCKET}/history/manifest-{manifest.sha256}.json"
+    store.put_once(
+        manifest_uri,
+        manifest.canonical_bytes,
+        expected_sha256=manifest.sha256,
+        require_canonical_json=True,
+    )
+    artifact = InputArtifact(
+        byte_sha256=manifest.sha256,
+        role="stock_history_manifest_01",
+        uri=manifest_uri,
+    )
+
+    points = _history_window_from_manifest(
+        store,
+        artifact,
+        {manifest_uri: manifest.canonical_bytes},
+        expected_logical_dttm=BASE - timedelta(minutes=25),
+    )
+
+    assert points == (StockHistoryPoint("ST-2", BASE - timedelta(minutes=25), 4),)
+
+
+def test_history_ref_must_be_exact_window_latest_correction() -> None:
+    """Caller가 같은 logical의 old revision URI를 주면 catalog latest와 달라 거부한다."""
+    client = boto3.client("s3", region_name="us-east-1")
+    store = S3ImmutableObjectStore(client)
+    references = []
+    for offset in (-25, -20, -15, -10, -5):
+        logical = BASE + timedelta(minutes=offset)
+        revision_zero = _source_manifest(
+            logical,
+            0,
+            f"s3://{BUCKET}/silver/sha256={'1' * 64}.parquet",
+            "1" * 64,
+            1,
+        )
+        uri = _authority_uri(revision_zero)
+        client.put_object(
+            Bucket=BUCKET,
+            Key=uri.removeprefix(f"s3://{BUCKET}/"),
+            Body=revision_zero.canonical_bytes,
+        )
+        references.append((uri, revision_zero.sha256))
+        if offset == -25:
+            revision_one = _source_manifest(
+                logical,
+                1,
+                f"s3://{BUCKET}/silver/sha256={'2' * 64}.parquet",
+                "2" * 64,
+                1,
+            )
+            corrected_uri = _authority_uri(revision_one)
+            client.put_object(
+                Bucket=BUCKET,
+                Key=corrected_uri.removeprefix(f"s3://{BUCKET}/"),
+                Body=revision_one.canonical_bytes,
+            )
+    catalog = S3SourceSnapshotCatalog(client, store, bucket=BUCKET)
+    inputs = _stock_history_input_artifacts(tuple(references))
+
+    with pytest.raises(ContractViolation, match="latest correction"):
+        _validate_history_catalog(catalog, inputs, BASE)
+
+
+def _calculation_inputs(
+    *,
+    history_station_ids: tuple[str, ...],
+) -> UrgencyCalculationInputs:
+    """Pure production scoring 테스트용 exact 6-window 입력을 만든다."""
+    active = (ActiveStation("ST-1", 20, 127.0, 37.5, "center"),)
+    history = tuple(
+        tuple(
+            StockHistoryPoint(station_id, BASE + timedelta(minutes=offset), 2)
+            for station_id in history_station_ids
+        )
+        for offset in (-25, -20, -15, -10, -5)
+    )
+    current = (StationStockRecord("ST-1", BASE, 1),)
+    demand = tuple(
+        DemandForecastRecord(
+            base_dttm=BASE,
+            sta_id="ST-1",
+            predicted_dttm=BASE + timedelta(hours=horizon),
+            predicted_rent_cnt=3,
+            predicted_rtn_cnt=1,
+        )
+        for horizon in range(1, 13)
+    )
+    return UrgencyCalculationInputs(active, history, current, demand, BASE)
+
+
+def _load_legacy_urgency_module() -> ModuleType:
+    """Sibling rebalance의 production scoring module을 동등성 검증용으로 연다."""
+    rebalance_dir = Path(__file__).resolve().parents[3] / "rebalance"
+    spec = importlib.util.spec_from_file_location(
+        "legacy_rebalance_urgency",
+        rebalance_dir / "urgency.py",
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.path.insert(0, str(rebalance_dir))
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.path.remove(str(rebalance_dir))
+    return module
+
+
+def _source_manifest(
+    logical_dttm: datetime,
+    revision_no: int,
+    silver_uri: str,
+    silver_sha256: str,
+    count: int,
+) -> Any:
+    """Realtime complete source authority fixture를 만든다."""
+    return build_source_snapshot_manifest(
+        source_id="bike_station_realtime",
+        logical_dttm=logical_dttm,
+        revision_no=revision_no,
+        status=SourceSnapshotStatus.SUCCEEDED,
+        config_version="urgency-test-v1",
+        silver_uri=silver_uri,
+        silver_byte_sha256=silver_sha256,
+        counts=SourceSnapshotCounts(count, count, count, 0, 0),
+        planned_parts=("page-1",),
+        completed_parts=("page-1",),
+    )
+
+
+def _authority_uri(manifest: Any) -> str:
+    """Source catalog canonical authority URI를 만든다."""
+    logical = manifest.logical_dttm.astimezone(UTC)
+    return (
+        f"s3://{BUCKET}/source_snapshot_manifest/{manifest.source_id}/"
+        f"dt={logical:%Y-%m-%d}/hh={logical:%H}/"
+        f"logical={logical:%Y%m%dT%H%M%S}{logical.microsecond:06d}Z/"
+        f"revision={manifest.revision_no:010d}.json"
+    )
