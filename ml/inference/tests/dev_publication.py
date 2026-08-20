@@ -30,6 +30,7 @@ from core.model_snapshot import (
     IdSetArtifactRef,
     ModelArtifact,
     ModelKind,
+    build_id_set_artifact_ref,
     build_model_snapshot_manifest,
 )
 from ml_core.serving_contract import SERVING_FEATURE_PROFILE_KEYS
@@ -157,6 +158,32 @@ def _uri(namespace: str, payload: bytes, extension: str) -> str:
 def _runtime_contract() -> dict[str, int]:
     """현재 inference process의 exact 7-key serving contract를 반환한다."""
     return {key: getattr(config, key) for key in SERVING_FEATURE_PROFILE_KEYS}
+
+
+def test_plan_expected_id_ref_is_validated_and_preserved() -> None:
+    """Inference manifest는 같은 ID bytes를 새 URI로 재게시하지 않는다."""
+    store = MemoryObjectStore()
+    expected = build_id_set(("ST-1", "ST-2"))
+    uri = (
+        "s3://fixture/gold-authority/serving-plan/inputs/expected-sta-ids/"
+        f"sha256={expected.sha256}.json"
+    )
+    reference = build_id_set_artifact_ref(expected, uri)
+    store.put_once(
+        uri,
+        expected.canonical_bytes,
+        expected_sha256=expected.sha256,
+        require_canonical_json=True,
+    )
+
+    result = pub._validate_expected_ids_ref(
+        expected,
+        reference,
+        object_store=store,
+    )
+
+    assert result == reference
+    assert result.uri == uri
 
 
 def _station_profile_payload(station_nos: tuple[int, ...]) -> bytes:

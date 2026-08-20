@@ -24,16 +24,16 @@ from core.gold_publication import (
     ObjectMissingError,
     S3ImmutableObjectStore,
     build_id_set,
+    parse_id_set,
     sha256_hex,
 )
 from core.inference_catalog import (
-    INFERENCE_REVISION_RECORD_SCHEMA_VERSION,
-    InMemoryInferenceRevisionCatalog,
     InferenceCatalogError,
     InferenceCatalogSnapshot,
     InferenceRevisionCatalog,
     InferenceRevisionConflictError,
     InferenceRevisionRecord,
+    InMemoryInferenceRevisionCatalog,  # noqa: F401 - 기존 test/public import 호환이다.
     S3InferenceRevisionCatalog,
     split_inference_object_base_uri,
 )
@@ -112,6 +112,7 @@ def run_and_publish_inference(
     station_dependency: Dependency,
     serving_plan: ServingPlanRef,
     expected_sta_ids: IdSet,
+    expected_sta_ids_ref: IdSetArtifactRef | None = None,
     object_base_uri: str,
     producer_version: str = INFERENCE_PRODUCER_VERSION,
     object_store: ImmutableObjectStore | None = None,
@@ -144,6 +145,11 @@ def run_and_publish_inference(
         raise TypeError("serving_plan은 exact ServingPlanRef여야 합니다.")
     if type(expected_sta_ids) is not IdSet:
         raise TypeError("expected_sta_ids는 exact IdSet이어야 합니다.")
+    if (
+        expected_sta_ids_ref is not None
+        and type(expected_sta_ids_ref) is not IdSetArtifactRef
+    ):
+        raise TypeError("expected_sta_ids_ref는 exact IdSetArtifactRef여야 합니다.")
     if type(producer_version) is not str or not producer_version:
         raise InferencePublicationError(
             "producer_version은 non-empty string이어야 합니다."
@@ -208,10 +214,18 @@ def run_and_publish_inference(
         ),
     }
 
-    expected_ref = _publish_expected_ids(
-        support,
-        object_base_uri=object_base_uri,
-        object_store=immutable,
+    expected_ref = (
+        _publish_expected_ids(
+            support,
+            object_base_uri=object_base_uri,
+            object_store=immutable,
+        )
+        if expected_sta_ids_ref is None
+        else _validate_expected_ids_ref(
+            support,
+            expected_sta_ids_ref,
+            object_store=immutable,
+        )
     )
     inputs: tuple[ImmutableInputRef, ...] = ()
     output_ref: ParquetOutputRef | None = None
@@ -377,6 +391,32 @@ def _publish_expected_ids(
         object_store, uri, id_set.canonical_bytes, require_canonical_json=True
     )
     return build_id_set_artifact_ref(id_set, uri)
+
+
+def _validate_expected_ids_ref(
+    id_set: IdSet,
+    reference: IdSetArtifactRef,
+    *,
+    object_store: ImmutableObjectStore,
+) -> IdSetArtifactRef:
+    """Plan의 expected ID exact ref와 actual bytes를 검증해 그대로 보존한다."""
+    if (
+        reference.byte_sha256 != id_set.sha256
+        or reference.id_count != len(id_set.ids)
+    ):
+        raise InferencePublicationError(
+            "serving plan expected ID ref가 검증된 ID set과 다릅니다."
+        )
+    payload = object_store.read_bytes(
+        reference.uri,
+        reference.byte_sha256,
+        require_canonical_json=True,
+    )
+    if parse_id_set(payload) != id_set:
+        raise InferencePublicationError(
+            "serving plan expected ID actual bytes가 검증된 ID set과 다릅니다."
+        )
+    return reference
 
 
 def _complete_output_table(
