@@ -2,6 +2,7 @@
 
 import dags.daily_compaction as daily_compaction_dag
 import dags.daily_population_and_events as daily_dag
+import dags.monthly_retrain as monthly_retrain_dag
 import dags.realtime_5min as realtime_5min_dag
 import dags.station_master as station_master_dag
 import dags.weather_3h as weather_3h_dag
@@ -18,6 +19,7 @@ def test_all_dag_ids_import() -> None:
         weather_3h_dag.dag.dag_id,
         daily_dag.dag.dag_id,
         daily_compaction_dag.dag.dag_id,
+        monthly_retrain_dag.dag.dag_id,
     } == {
         "realtime_5min",
         "station_master",
@@ -25,6 +27,7 @@ def test_all_dag_ids_import() -> None:
         "weather_3h",
         "daily_population_and_events",
         "daily_compaction",
+        "monthly_retrain",
     }
 
 
