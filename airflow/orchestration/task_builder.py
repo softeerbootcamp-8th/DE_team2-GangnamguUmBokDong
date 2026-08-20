@@ -9,10 +9,13 @@ Airflow는 각 모듈을 독립된 CLI로만 호출한다 — 모듈 내부 코�
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 from airflow.providers.standard.operators.bash import BashOperator
 from airflow.task.trigger_rule import TriggerRule
+
 from callbacks.task_callbacks import on_failure_callback, on_success_callback
 from config.schedules import (
     DEFAULT_EXECUTION_TIMEOUT,
@@ -36,16 +39,24 @@ def build_module_task(
     retry_delay=DEFAULT_RETRY_DELAY,
     execution_timeout=DEFAULT_EXECUTION_TIMEOUT,
     trigger_rule: str = TriggerRule.ALL_SUCCESS,
+    env: dict[str, str] | None = None,
+    output_processor: Callable[[str], Any] | None = None,
 ) -> BashOperator:
-    return BashOperator(
-        task_id=task_id,
-        bash_command=f"env -u VIRTUAL_ENV -u UV_PROJECT_ENVIRONMENT {bash_command}",
-        cwd=module_dir,
-        retries=retries,
-        retry_delay=retry_delay,
-        execution_timeout=execution_timeout,
-        trigger_rule=trigger_rule,
-        on_success_callback=on_success_callback,
-        on_failure_callback=on_failure_callback,
-        dag=dag,
-    )
+    """독립 uv project CLI를 공통 retry/callback 환경의 BashOperator로 만든다."""
+    arguments: dict[str, Any] = {
+        "task_id": task_id,
+        "bash_command": f"env -u VIRTUAL_ENV -u UV_PROJECT_ENVIRONMENT {bash_command}",
+        "cwd": module_dir,
+        "retries": retries,
+        "retry_delay": retry_delay,
+        "execution_timeout": execution_timeout,
+        "trigger_rule": trigger_rule,
+        "env": env,
+        "append_env": True,
+        "on_success_callback": on_success_callback,
+        "on_failure_callback": on_failure_callback,
+        "dag": dag,
+    }
+    if output_processor is not None:
+        arguments["output_processor"] = output_processor
+    return BashOperator(**arguments)
