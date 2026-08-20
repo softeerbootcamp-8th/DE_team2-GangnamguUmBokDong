@@ -16,19 +16,29 @@
 폴더 자기 `.venv`(`<폴더>/.venv/bin/python`, `uv sync`로 미리 준비돼 있어야 함)를
 쓴다. `feature_engine`은 Spark로만 한다(`feature_engine/.venv`, 로컬은 `local[*]`
 단일 노드 모드) — `feature_engine/.venv`가 없으면 이 단계에서 바로 실패하니 먼저
-[feature_engine/README.md](feature_engine/README.md)의 세팅을 따를 것. **1차
-정제(pandas)도 포함해서 feature_engine의 pandas 코드 전체가 `feature_engine/legacy/`로
-이동했다** — 실제 배포에서는 1차 정제 자체를 이 저장소 밖에서 처리하므로, 아래
-첫 스텝(`feature_engine.legacy.scripts.run_build_pipeline`)은 로컬에서
-2차정제(Spark)를 테스트해볼 입력을 만드는 용도일 뿐 본 서비스 경로가 아니다 —
-배경은 [LEGACY_AUDIT.md](LEGACY_AUDIT.md) 참고.
+[feature_engine/README.md](feature_engine/README.md)의 세팅을 따를 것.
+
+**(2026-08) `feature_engine/legacy/`(pandas 1차정제)는 저장소에서 완전히
+삭제됐다** — collector가 S3 Silver에 원본을 직접 쌓고
+`feature_engine/spark/silver_source.py`가 그걸 바로 읽으므로, 이 스크립트의
+`dataset` 단계는 이제 Spark 2단계(병합·피처화 → multi-horizon 확장)만 실행한다.
+**로컬 개발 환경에는 실제 collector가 없으므로, 이 스크립트를 처음 실행하기
+전에 딱 한 번(그리고 반복 실행할 필요는 없음)** 아래를 먼저 해둘 것 — 매번
+자동으로 다시 실행하면 느리고, 이미 시딩된 데이터를 매번 덮어써서 반복
+실행 취지("빠르게 검증")에 안 맞아 이 스크립트에는 안 넣었다:
+
+```bash
+# 저장소 루트에서
+make up   # postgres/minio(/mlflow/airflow) 기동
+uv run python dev/seed_s3_from_local.py --start-date 2025-01-01 --end-date 2025-12-31
+```
 
 `libs/ml_core/paths.py`(각 폴더가 editable 의존성으로 참조하는 공유 라이브러리)가
-Spark 산출물 경로(`data/processed_v2/spark/{FEATURE_PARAM_COMBO_ID}/...`)를
+Spark 산출물 S3 키(`processed_v2/spark/{FEATURE_PARAM_COMBO_ID}/...`)를
 `feature_engine/spark/config.py`와 정확히 같은 공식으로 계산하므로, dataset 단계가
 쓴 파일을 training/inference가 그대로 읽는다(파라미터 조합을 바꾸려면
 `FEATURE_ENGINEERING_OUTPUT_ROOT`/`FEATURE_PARAM_COMBO_ID` 환경변수를 두 쪽 다 같이
-설정할 것 — LEGACY_AUDIT.md 참고).
+설정할 것 — [feature_engine/README.md](feature_engine/README.md) 참고).
 
 실행(이 스크립트 자체는 stdlib만 써서 임의의 python3로 실행 가능 — 각 단계는
 내부적으로 해당 폴더의 `.venv`를 골라서 씀):
@@ -52,12 +62,7 @@ def _venv_python(folder: str) -> str:
 STEPS = {
     "dataset": [
         (
-            "feature_engine: 1차 정제(legacy pandas, 1~5단계 — 로컬 테스트 입력 준비용)",
-            _venv_python("feature_engine"),
-            ["-m", "feature_engine.legacy.scripts.run_build_pipeline"],
-        ),
-        (
-            "feature_engine: 피처마트 생성(Spark, 2차정제 6~8단계, local[*] 단일 노드)",
+            "feature_engine: Silver -> 병합 테이블 -> tick 단위 feature 테이블(Spark, local[*] 단일 노드)",
             _venv_python("feature_engine"),
             ["-m", "feature_engine.spark.run_pipeline"],
         ),
@@ -108,8 +113,8 @@ def main() -> None:
         run_stage(stage)
 
     print(
-        "\n완료 — 예: ./inference/.venv/bin/python -m inference.predict_rental_demand "
-        "--station-id ST-2000 --start-date 2025-06-01 --end-date 2025-06-07"
+        "\n완료 — 예: ./inference/.venv/bin/python -m inference.predict_single "
+        "--station-id ST-2000 --date 2025-06-01 --hour 8"
     )
 
 

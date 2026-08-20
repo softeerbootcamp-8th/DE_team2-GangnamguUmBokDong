@@ -1,11 +1,22 @@
-"""챌린저 모델이 챔피언을 대체할 만한지 판정하고, 대체할 때 아카이브 사본을
-챔피언 자리(`ml_core.paths.MODELS_PREFIX`)로 복사한다.
+"""챌린저 모델이 챔피언을 대체할 만한지 판정하고, 대체할 때 챔피언 포인터를
+챌린저의 아카이브 prefix로 원자적으로 전환한다.
 
-**왜 재학습이 아니라 복사인가**: LightGBM 학습은 `LGB_PARAMS_COMMON`에 고정
-시드가 없어 완전히 결정적이라고 보장할 수 없다 — 같은 데이터로 다시 학습하면
+**왜 재학습이 아니라 아카이브를 그대로 쓰는가**: LightGBM 학습은 `LGB_PARAMS_COMMON`에
+고정 시드가 없어 완전히 결정적이라고 보장할 수 없다 — 같은 데이터로 다시 학습하면
 챌린저와 미묘하게 다른 모델이 나올 수 있다. `train_rental_model.py`/
-`train_return_model.py`가 이미 아카이브에 써둔 파일을 그대로 복사해야만 "승격된
-챔피언"이 "방금 평가했던 챌린저"와 바이트 단위로 동일함을 보장한다.
+`train_return_model.py`가 이미 아카이브에 써둔 파일을 그대로 챔피언으로 삼아야만
+"승격된 챔피언"이 "방금 평가했던 챌린저"와 바이트 단위로 동일함을 보장한다.
+
+**왜 파일 복사가 아니라 포인터 전환인가**: 예전엔 archive 밑의 파일 8개
+(booster 4개 + station_categories/conformal_correction/metrics/profile)를
+챔피언 prefix로 하나씩 복사했다 — S3는 여러 키에 걸친 트랜잭션을 지원하지
+않으므로, 복사가 절반쯤 끝난 순간 inference가 실행되면 booster는 새 버전인데
+station_categories는 옛 버전인 식으로 섞인 모델을 읽을 수 있었다(station_id
+카테고리 코드가 학습 시점의 정렬 순서에 의존해서, 섞이면 성능 저하가 아니라
+엉뚱한 정류소에 대한 예측이 조용히 나감). archive 자체는 학습이 끝난 뒤 다시
+안 바뀌는 immutable 산출물이므로, `ml_core.paths.write_champion_pointer()`로
+"지금 챔피언은 이 archive_prefix다"라는 포인터 객체 하나만 원자적으로 바꾸면
+파일을 복사할 필요가 아예 없다(자세한 근거는 `read_champion_prefix()` docstring 참고).
 
 **승격 기준**(둘 다 만족해야 승격): `poisson_deviance_test`가 챔피언보다 나쁘지
 않고(작거나 같고), `p10_p90_coverage_calibrated_test`가 목표 커버리지
@@ -17,9 +28,9 @@
 
 from __future__ import annotations
 
-from core import s3 as s3_io
 from ml_core import common_config
-from ml_core.paths import MODELS_PREFIX
+from ml_core.paths import read_champion_prefix, write_champion_pointer
+from ml_core.scoring import load_boosters, load_conformal_correction
 
 
 def should_promote(challenger_metrics: dict, champion_metrics: dict | None) -> tuple[bool, list[str]]:
@@ -56,28 +67,30 @@ def should_promote(challenger_metrics: dict, champion_metrics: dict | None) -> t
     return deviance_ok and coverage_ok, reasons
 
 
-def promote_challenger(model_name: str, archive_prefix: str) -> list[str]:
-    """`archive_prefix` 아래 `{model_name}_`로 시작하는 아티팩트를 챔피언 자리로 복사한다.
+def promote_challenger(model_name: str, archive_prefix: str) -> dict:
+    """model_name의 챔피언이 archive_prefix를 가리키도록 포인터를 원자적으로 전환한다.
 
-    파일명은 그대로 유지한다("rental_poisson.txt"는 챔피언에서도 "rental_poisson.txt")
-    — 챔피언 전용 이름을 따로 만들지 않는다. 같은 prefix에 다른 model_name의
-    아티팩트가 섞여 있어도(예: rental/return을 같은 archive_prefix에 같이 학습해
-    저장하는 경우) model_name이 다른 파일은 건드리지 않는다.
+    더 이상 archive 밑의 파일을 챔피언 자리로 복사하지 않는다(모듈 docstring
+    참고) — 포인터 하나만 바꾸면 승격이 끝난다.
+
+    **2026-08**: `write_champion_pointer()` 자신은 캐시를 안 비운다(그 함수
+    docstring 참고 — `read_champion_prefix()`만 비우면 `load_boosters()`/
+    `load_conformal_correction()`은 옛 값에 머물러 셋이 서로 다른 archive를
+    가리키는 불일치가 생긴다, 실측 확인됨). 셋 다 아는 유일한 지점이 여기라서,
+    포인터를 쓴 직후 세 캐시를 한꺼번에 비운다 — "학습해봤더니 구려서 같은
+    프로세스 안에서 재학습→재승격"을 반복하는 코드가 있다면, 재승격 직후
+    다음 채점부터 booster/correction/station_categories가 전부 새 archive
+    하나로 일관되게 나온다.
 
     args:
         model_name: "rental" 또는 "return"
         archive_prefix: 이번에 승격할 학습 결과가 있는 아카이브 prefix
             (`ml_core.paths.archive_models_prefix()`가 만든 값)
     returns:
-        list[str]: 챔피언 자리로 복사된 파일명 목록(로그/알림용)
+        dict: `write_champion_pointer()`가 실제로 기록한 포인터 내용(로그/알림용)
     """
-    prefix = archive_prefix if archive_prefix.endswith("/") else f"{archive_prefix}/"
-    copied = []
-    for key in s3_io.list_keys(prefix):
-        filename = key[len(prefix):]
-        if not filename.startswith(f"{model_name}_"):
-            continue
-        body = s3_io.get_object_bytes(key)
-        s3_io.put_object_bytes(f"{MODELS_PREFIX}/{filename}", body)
-        copied.append(filename)
-    return copied
+    record = write_champion_pointer(model_name, archive_prefix)
+    read_champion_prefix.cache_clear()
+    load_boosters.cache_clear()
+    load_conformal_correction.cache_clear()
+    return record

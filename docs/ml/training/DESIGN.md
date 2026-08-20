@@ -1,6 +1,6 @@
 # training — 설계 문서
 
-실행 방법은 [README.md](README.md), 결정의 배경/시행착오는 [history.md](../history.md)를
+실행 방법은 [README.md](../../../ml/training/README.md), 결정의 배경/시행착오는 [history.md](../history.md)를
 참고. 이 문서는 "지금 코드가 왜 이렇게 짜여 있는지"에 집중한다.
 
 ## 1. 왜 학습은 Spark가 아니라 로컬 LightGBM인가
@@ -71,15 +71,19 @@ conformity score(구간 밖으로 벗어난 정도)의 분위수를 correction�
 `[p10-correction, p90+correction]`을 적용한다(`train_common._conformal_correction()`,
 Romano et al. CQR) — 테스트셋 P10~P90 커버리지가 이론값(기본 0.80)에 더 가까워짐.
 
-## 4. station_id 카테고리 — 학습/서빙이 반드시 같은 코드를 써야 함
+## 4. station_no 카테고리 — 학습/서빙이 반드시 같은 코드를 써야 함
 
-`train_target()`이 전체 데이터 기준 station_id `CategoricalDtype`을 한 번만
-고정하고 `{model_name}_station_categories.json`에 저장한다. split(train/valid/test)마다
-따로 `astype("category")`하면 LightGBM 카테고리 코드(정수)가 어긋나 조용히
-오염되는 흔한 실수라 명시적으로 피한다. `inference`는 `ml_core/model_contract.py`의
-`load_station_dtype()`으로 이 파일을 그대로 읽어 인코딩을 재현한다 — 이 계약이
-깨지면(둘이 다른 카테고리 순서를 쓰면) 모델이 station_id를 조용히 잘못
-해석한다.
+모델 feature는 station_id(텍스트, "ST-2565")가 아니라 station_no(정수
+일련번호)다 — Parquet dictionary encoding이 `to_pandas()`에서 안 살아남아
+매 학습 읽기마다 object dtype 문자열 배열을 통째로 만드는 비용이 있었는데,
+station_no는 처음부터 정수라 그 비용 자체가 없다(station_id는 출력/CLI 식별
+용도로만 계속 쓰임). `train_target()`이 전체 데이터 기준 station_no
+`CategoricalDtype`을 한 번만 고정하고 `{model_name}_station_categories.json`에
+저장한다. split(train/valid/test)마다 따로 `astype("category")`하면 LightGBM
+카테고리 코드(정수)가 어긋나 조용히 오염되는 흔한 실수라 명시적으로 피한다.
+`inference`는 `ml_core/model_contract.py`의 `load_station_dtype()`으로 이
+파일을 그대로 읽어 인코딩을 재현한다 — 이 계약이 깨지면(둘이 다른 카테고리
+순서를 쓰면) 모델이 station_no를 조용히 잘못 해석한다.
 
 ## 5. `ml_core/`으로 뺀 것과 이 폴더에 남은 것
 
@@ -88,8 +92,8 @@ Romano et al. CQR) — 테스트셋 P10~P90 커버리지가 이론값(기본 0.8
 써야 한다 — 그래서 `FEATURE_COLUMNS`/`station_categories_path`/`load_station_dtype`은
 `ml_core/model_contract.py`로, `poisson_deviance`/`pinball_loss`는 `ml_core/metrics.py`로,
 채점 로직(`predict()`)은 `ml_core/scoring.py`로 뺐다. 이 폴더에는 학습에만
-필요한 것(`_split`, `_prepare_xy`, `_conformal_correction`, `train_target()`
-자체, LightGBM 파라미터 튜닝)만 남는다.
+필요한 것(`_dates_for_split`, `_conformal_correction`, `train_target()` 자체,
+`lazy_train_dataset.py`의 S3 지연 로딩, LightGBM 파라미터 튜닝)만 남는다.
 
 `monitor_performance.py`/`scripts/compare_baselines.py`가 `ml_core/scoring.py`의
 `predict()`를 가져다 쓰는 이유도 같다 — "저장된 모델로 채점"하는 로직은
@@ -109,12 +113,105 @@ Poisson deviance가 계절성에 강하게 비례한다는 걸 실측으로 확�
 바꾸는 개선(history.md 9번 항목 마지막 문단) — 계절이 서서히 바뀌는 건 흡수하고
 급격한 이탈만 잡도록.
 
-## 7. 실험 격리 원칙
+## 7. 실험 격리 원칙 — S3 아카이브 + MLflow (2026-08 갱신)
 
-`scripts/run_embargo_sweep.py`, `scripts/build_embargo_candidate.py` 같은 스윕
-스크립트는 `feature_engine`/`ml_core`/`training`을 전부 가져다 쓰지만, 산출물은
-항상 `models/experiments/{run_id}/`, `data/processed_v2/experiments/`처럼 챔피언
-경로와 분리된 곳에 쓴다 — 스윕이 실패하거나 중간에 멈춰도 챔피언 아티팩트는
-안전하다. `experiment_log.py`가 실행마다 (run_id, git_sha, dirty, params, metrics)를
-`manifest.jsonl`에 append해서, 나중에 정식 experiment tracker(MLflow 등)로 옮길 때도
-그대로 이관 가능한 최소 스키마를 유지한다.
+예전엔 `scripts/run_embargo_sweep.py`/`build_embargo_candidate.py` 같은 별도
+스윕 스크립트와 `experiment_log.py`가 만드는 `manifest.jsonl`로 실험을
+격리·기록했다 — 지금은 둘 다 삭제됐고, 격리/기록 방식이 다음 두 가지로
+정리됐다:
+
+- **격리**: 모든 학습은 `train_target()` 호출 한 번마다 S3 아카이브
+  (`libs/ml_core/paths.archive_models_prefix(date, profile_name)`)에만 쓴다 —
+  챔피언 자리에는 절대 직접 안 쓴다(§8 참고). 실험이 몇 번을 실패하거나
+  중간에 멈춰도 챔피언 아티팩트는 그 자체로 안전하다.
+- **기록**: (run_id, params, metrics, artifacts)를 이제 정식
+  experiment tracker인 [MLflow](../MLFLOW_SETUP.md)가 기록한다 — 예전
+  `manifest.jsonl`이 하던 일을 그대로 대체하되, 파일을 직접 열어 파싱하는
+  대신 웹 UI에서 여러 시도(예: `TRAIN_DAY_DIVISOR`/`MAX_TRAIN_HORIZON` 조합)를
+  나란히 비교할 수 있게 됐다. 자세한 설정/기록 내용은
+  [MLFLOW_SETUP.md](../MLFLOW_SETUP.md).
+
+## 8. 챔피언/챌린저 승격 — 파일 복사가 아니라 포인터 전환 (2026-08 신규)
+
+학습(`train_rental_model`/`train_return_model`)은 항상 S3 아카이브에만 쓰고,
+"지금 서빙 중인 모델"(챔피언)은 별도 포인터 객체
+(`champion/{model_name}.json`, `ml_core.paths.write_champion_pointer()`/
+`read_champion_prefix()`)가 어느 archive_prefix를 가리키는지로 정해진다.
+
+**왜 파일 복사가 아니라 포인터인가**: 예전엔 승격할 때 archive의 파일 8개
+(booster 4개 + station_categories/conformal_correction/metrics/profile)를
+챔피언 prefix로 하나씩 복사했다 — S3는 여러 키에 걸친 트랜잭션을 지원하지
+않으므로, 복사가 절반쯤 끝난 순간 inference가 실행되면 booster는 새 버전인데
+station_categories는 옛 버전인 식으로 섞인 모델을 읽을 수 있었다(station_no
+카테고리 코드가 학습 시점의 정렬 순서에 의존해서, 섞이면 성능 저하가 아니라
+엉뚱한 정류소에 대한 예측이 조용히 나감). archive 자체는 immutable이므로
+포인터 하나만 원자적으로 바꾸면 파일을 복사할 필요가 아예 없다.
+
+`training.promotion.should_promote(challenger_metrics, champion_metrics)`이
+판정한다 — 챔피언이 없으면 무조건 승격(부트스트랩). 있으면 **둘 다** 만족해야
+승격: `poisson_deviance_test`가 챔피언보다 나쁘지 않고(작거나 같고),
+`p10_p90_coverage_calibrated_test`가 목표 커버리지(§6와 같은
+`common_config.CONFORMAL_TARGET_COVERAGE`) ± 허용 드리프트
+(`COVERAGE_DRIFT_THRESHOLD`) 범위 안 — 승격 전용 새 절대 임계값을 따로 만들지
+않고 §6이 이미 근거를 댄 상대 임계값을 재사용한다. `promote_challenger()`는
+포인터를 쓴 뒤 `read_champion_prefix()`/`load_boosters()`/
+`load_conformal_correction()` 세 캐시를 전부 비운다 — 재학습해봤더니 구려서
+같은 프로세스 안에서 재학습→재승격을 반복하는 코드가 있다면, 재승격 직후
+다음 채점부터 셋이 전부 새 archive로 일관되게 나오게 하기 위함이다(하나만
+비우면 셋 중 일부만 새 값을 보는 더 나쁜 불일치가 생긴다 — 실측 확인됨,
+`libs/ml_core/paths.py`의 `read_champion_prefix()` docstring 참고).
+
+`scripts/monthly_retrain_check.py`가 `monitor_performance.check_all_models()`로
+재학습 필요 여부를 판정한 뒤, 필요하면 후보 프로필들을 순서대로 재학습
+(별도 subprocess)해보고 `should_promote()`/`promote_challenger()`로 이어간다 —
+어느 프로필도 기준을 못 넘으면 챔피언은 그대로 두고 조용히 종료한다.
+
+## 9. 학습 테이블이 로컬 RAM보다 커질 때 — 날짜 파티션 단위 지연 로딩 (2026-08 전면 개편)
+
+multi-horizon 테이블은 원본 tick 테이블의 최대 `HORIZON_COUNT`배 행 수라
+("horizon을 feature로" 설계, [feature_engine/DESIGN.md](../feature_engine/DESIGN.md) §7 참고),
+20분 tick·full horizon·2025년 전체 기준 실측 8억 행대까지 커진다 — 통째로 하나의
+pandas DataFrame(float64/int64 컬럼 13개)으로 읽으면 원본만 수십GB라 로컬(RAM 18GB)
+에서 반복적으로 OOM이 났다. 앵커 tick 밀도(20분, 향후 5분 희망)와
+horizon(`HORIZON_COUNT` 전체)은 줄이지 않는 게 확정 정책이라(§ 아래 참고), 예전처럼
+`TRAIN_DAY_DIVISOR`로 날짜 자체를 솎아내 메모리를 줄이는 건 기본값에서 뺐다 —
+대신 `train_common.py`가 더 이상 데이터를 한 번에 로드하지 않고,
+**`lazy_train_dataset.py`가 날짜 파티션(`date=YYYY-MM-DD/`) 단위로 S3를 지연
+조회**한다.
+
+핵심 아이디어는 LightGBM `lgb.Sequence` API가 `Dataset.construct()` 중에 각
+Sequence를 필요할 때만(그것도 두 단계 — 표본 추출용 개별 인덱스, 그 다음 실제
+적재용 연속 슬라이스 — 로) 접근한다는 점을 이용하는 것이다: 날짜 하나를
+`_DatePartitionSequence`로 표현해 `__getitem__`이 호출될 때만 그 날짜의 S3
+파일을 읽고, 공유 LRU 캐시(`ChunkCache`, 기본 최대 2개)로 오래된 날짜를
+비워서 항상 최대 1~2개 날짜분만 메모리에 남긴다(캐시에서 밀려난 날짜가 나중에
+다시 필요해지면 재조회 — 메모리 대신 네트워크 I/O를 쓰는 트레이드오프).
+
+- **train/valid**: `build_lazy_dataset()`이 이 방식으로 Sequence 기반 `lgb.Dataset`을
+  만든다. 라벨(+exposure)만 별도로 가벼운 사전 스캔(컬럼 1~2개, 8억 행이어도
+  수 GB대)으로 미리 확보한다(`lgb.Dataset(label=...)`은 라벨 배열을 구성 시점에
+  미리 다 가지고 있어야 하므로).
+- **test**: 학습에 안 쓰이고 `predict()`/지표 계산에만 쓰이므로 `Dataset`으로
+  만들지 않는다 — `predict_over_dates()`가 날짜별로 그 청크만 읽어 즉시
+  predict한 뒤, 큰 feature 행렬은 버리고 작은(1D) 예측값/라벨 배열만
+  이어붙인다. valid도 학습 후 conformal correction 계산에 같은 함수를 다시
+  쓴다(학습용 Sequence 적재와는 별개 시점이라 청크를 한 번 더 읽음).
+
+날짜(train/valid/test 소속)는 여전히 `TRAIN_DAY_DIVISOR`/`VALID_DAYS_OF_MONTH`/
+`TEST_DAYS_OF_MONTH`로 정해지지만, `_dates_for_split()`가 Spark의 `date=` 파티션
+이름 자체(day-of-month를 문자열에서 바로 뽑음)만으로 계산한다 — 데이터를 전혀
+읽지 않는 순수 캘린더 연산이라 예전 `_split()`(로드된 df의 `day` 컬럼을
+역산)보다 더 이르게, 더 싸게 구간을 확정한다. `TRAIN_DAY_DIVISOR`는 기본값
+1(=날짜 다운샘플링 없음, 1년 전체)이고, 로컬 RAM이 급하게 부족한 특수 상황에서만
+2, 3, 5로 올리는 비상 dial로 남아있다. `horizon`은 여전히 같은 날짜 파티션 안에
+1..`HORIZON_COUNT`가 섞여 있어 `filters=[("horizon", "<=", MAX_TRAIN_HORIZON)]`
+(pyarrow row-group 필터)로 따로 거른다.
+
+로드가 실제로 진행 중인지 확인하려면 `TRAIN_PROGRESS_LOG_PATH`(기본
+`training_progress.log`)를 tail — 날짜 청크 하나가 로드될 때마다(및 사전 스캔
+파일 완료마다) 그 시점 peak RSS를 남긴다(표준출력과 별개 채널).
+
+**범위 밖(2026-08 기준)**: 분산 학습(`LGB_TREE_LEARNER`≠"serial")은 아직 이
+지연 로딩과 연동되지 않았다 — `train_target()`이 `LGB_NUM_MACHINES>1`이면
+바로 `NotImplementedError`를 낸다(station_no 샤딩을 날짜별 로더 안에서 다시
+구현해야 함, 구조상 막혀있지 않으나 아직 안 만듦).
