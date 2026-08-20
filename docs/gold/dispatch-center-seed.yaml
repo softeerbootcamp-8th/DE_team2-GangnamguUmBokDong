@@ -1,0 +1,105 @@
+schema_version: 1
+seed_version: dispatch-center-v1
+effective_dttm: "2026-08-19T03:15:38Z"
+coordinate_reference_system: EPSG:4326
+coordinate_order: [longitude, latitude]
+assignment_policy:
+  method: nearest_geography_distance
+  tie_breaker: dispatch_center_id_ascending
+source:
+  repository_path: libs/core/src/core/regions.py
+  git_commit: afa840e5dabcdc6aa12eb2c988b8d1c2aeacc734
+  file_sha256: ae65ca27ca8fe8603bfd4048c3e8e4cbd5070665c019751428603336373dbbad
+  description: >-
+    서울시설공단 지역센터 주소 조사에서 만든 기존 프로젝트 좌표를 구조화한 seed다.
+    현장 측량 좌표나 공식 관할 경계가 아니며 라우팅 그룹의 최근접 기준점으로만 쓴다.
+
+centers:
+  - dispatch_center_id: sangam
+    dispatch_center_nm: 상암
+    longitude: 126.8972
+    latitude: 37.5683
+    location_accuracy_cd: landmark_approximation
+    location_source_desc: core.regions.py의 주소 조사 기반 랜드마크 근사
+    location_verified_dt: null
+    is_active: true
+  - dispatch_center_id: jungnang
+    dispatch_center_nm: 중랑
+    longitude: 127.0581
+    latitude: 37.5583
+    location_accuracy_cd: landmark_approximation
+    location_source_desc: core.regions.py의 주소 조사 기반 랜드마크 근사
+    location_verified_dt: null
+    is_active: true
+  - dispatch_center_id: sejongno
+    dispatch_center_nm: 세종로
+    longitude: 126.9769
+    latitude: 37.5716
+    location_accuracy_cd: landmark_approximation
+    location_source_desc: core.regions.py의 주소 조사 기반 랜드마크 근사
+    location_verified_dt: null
+    is_active: true
+  - dispatch_center_id: dobong
+    dispatch_center_nm: 도봉
+    longitude: 127.04583
+    latitude: 37.68944
+    location_accuracy_cd: landmark_approximation
+    location_source_desc: core.regions.py의 주소 조사 기반 랜드마크 근사
+    location_verified_dt: null
+    is_active: true
+  - dispatch_center_id: hunryeonwon
+    dispatch_center_nm: 훈련원
+    longitude: 127.0031
+    latitude: 37.5674
+    location_accuracy_cd: landmark_approximation
+    location_source_desc: core.regions.py의 주소 조사 기반 랜드마크 근사
+    location_verified_dt: null
+    is_active: true
+  - dispatch_center_id: isu
+    dispatch_center_nm: 이수
+    longitude: 126.9845
+    latitude: 37.4982
+    location_accuracy_cd: landmark_approximation
+    location_source_desc: core.regions.py의 주소 조사 기반 랜드마크 근사
+    location_verified_dt: null
+    is_active: true
+  - dispatch_center_id: gaehwa
+    dispatch_center_nm: 개화
+    longitude: 126.7980
+    latitude: 37.5780
+    location_accuracy_cd: landmark_approximation
+    location_source_desc: core.regions.py의 주소 조사 기반 랜드마크 근사
+    location_verified_dt: null
+    is_active: true
+  - dispatch_center_id: cheonwang
+    dispatch_center_nm: 천왕
+    longitude: 126.83861
+    latitude: 37.48667
+    location_accuracy_cd: landmark_approximation
+    location_source_desc: core.regions.py의 주소 조사 기반 랜드마크 근사
+    location_verified_dt: null
+    is_active: true
+  - dispatch_center_id: yeongnam
+    dispatch_center_nm: 영남
+    longitude: 126.9037
+    latitude: 37.5178
+    location_accuracy_cd: administrative_centroid
+    location_source_desc: core.regions.py의 행정동 중심점 근사; 최대 약 1km 오차 가능
+    location_verified_dt: null
+    is_active: true
+  - dispatch_center_id: cheonho
+    dispatch_center_nm: 천호
+    longitude: 127.1237667
+    latitude: 37.5385167
+    location_accuracy_cd: landmark_approximation
+    location_source_desc: core.regions.py의 주소 조사 기반 랜드마크 근사
+    location_verified_dt: null
+    is_active: true
+  - dispatch_center_id: hangnyeoul
+    dispatch_center_nm: 학여울
+    longitude: 127.07954
+    latitude: 37.49352
+    location_accuracy_cd: landmark_approximation
+    location_source_desc: core.regions.py의 주소 조사 기반 랜드마크 근사
+    location_verified_dt: null
+    is_active: true
