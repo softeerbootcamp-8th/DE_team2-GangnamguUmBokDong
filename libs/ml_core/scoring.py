@@ -27,7 +27,7 @@ import numpy as np
 import pandas as pd
 from core import s3 as s3_io
 
-from . import metrics, model_io
+from . import common_config, metrics, model_io
 from .model_contract import (
     RENTAL_FEATURE_COLUMNS,
     RETURN_FEATURE_COLUMNS,
@@ -35,12 +35,13 @@ from .model_contract import (
     station_dtype_from_payload,
 )
 from .paths import model_json_key, model_key, read_champion_prefix
+from .serving_contract import (
+    assert_serving_profiles_compatible,
+    load_model_profile,
+)
 
 BOOSTER_SUFFIXES = ["poisson", "q10", "q50", "q90"]
-_FEATURE_COLUMNS_BY_MODEL = {
-    "rental": RENTAL_FEATURE_COLUMNS,
-    "return": RETURN_FEATURE_COLUMNS,
-}
+_FEATURE_COLUMNS_BY_MODEL = {"rental": RENTAL_FEATURE_COLUMNS, "return": RETURN_FEATURE_COLUMNS}
 
 
 @dataclass(frozen=True, slots=True)
@@ -161,6 +162,30 @@ def use_pinned_scoring_models(
 
 
 @cache
+def validate_champion_serving_contract(model_name: str) -> dict[str, object]:
+    """챔피언 아티팩트와 현재 프로세스의 서빙 피처 계약이 같은지 검증한다.
+
+    검증 결과를 모델별로 캐시해 요청마다 S3의 profile.json을 다시 읽지 않는다.
+    챔피언 승격 시 ``training.promotion.promote_challenger()``가 booster/보정값과
+    함께 이 캐시도 비운다.
+
+    returns:
+        dict[str, object]: 검증된 챔피언의 서빙 피처 계약
+    raises:
+        ServingProfileContractError: 프로필 아티팩트가 없거나 현재 서빙 설정과
+            호환되지 않을 때
+    """
+    archive_prefix = read_champion_prefix(model_name)
+    champion_profile = load_model_profile(model_name, archive_prefix)
+    return assert_serving_profiles_compatible(
+        common_config.effective_profile(),
+        champion_profile,
+        expected_source="현재 서빙",
+        actual_source=f"{model_name} 챔피언({archive_prefix})",
+    )
+
+
+@cache
 def load_boosters(model_name: str) -> dict[str, lgb.Booster]:
     """model_name의 booster 4개(poisson, q10, q50, q90)를 챔피언 archive에서 로드한다.
 
@@ -187,10 +212,9 @@ def load_boosters(model_name: str) -> dict[str, lgb.Booster]:
         dict[str, lgb.Booster]: {"poisson": ..., "q10": ..., "q50": ..., "q90": ...}
     """
     archive_prefix = read_champion_prefix(model_name)
+    validate_champion_serving_contract(model_name)
     return {
-        suffix: model_io.download_and_load_booster(
-            model_key(model_name, suffix, archive_prefix)
-        )
+        suffix: model_io.download_and_load_booster(model_key(model_name, suffix, archive_prefix))
         for suffix in BOOSTER_SUFFIXES
     }
 
@@ -215,9 +239,7 @@ def load_conformal_correction(model_name: str) -> float:
     return data["correction"]
 
 
-def predict(
-    df: pd.DataFrame, model_name: str, exposure_col: str | None = None
-) -> pd.DataFrame:
+def predict(df: pd.DataFrame, model_name: str, exposure_col: str | None = None) -> pd.DataFrame:
     """station×tick feature 행마다 point(poisson) + quantile(P10/50/90, conformal 보정 적용) 예측.
 
     args:
@@ -238,22 +260,23 @@ def predict(
     if pinned_models is not None and pinned is None:
         raise ValueError(f"pinned scoring context에 model이 없습니다: {model_name}")
 
-    station_dtype = (
-        pinned.station_dtype if pinned is not None else load_station_dtype(model_name)
-    )
+    if pinned is None:
+        # Legacy offline/monitor 경로는 기존 champion profile 검증과 lazy load를
+        # 유지한다. Authority 경로는 이미 pinned release 계약을 검증했으므로 이
+        # branch에 들어오지 않아 run 도중 mutable champion pointer를 다시 읽지 않는다.
+        validate_champion_serving_contract(model_name)
+        station_dtype = load_station_dtype(model_name)
+        boosters = load_boosters(model_name)
+        correction = load_conformal_correction(model_name)
+    else:
+        station_dtype = pinned.station_dtype
+        boosters = pinned.boosters
+        correction = pinned.conformal_correction
+
     X = df[_FEATURE_COLUMNS_BY_MODEL[model_name]].copy()
     X["station_no"] = X["station_no"].astype(station_dtype)
 
-    boosters = pinned.boosters if pinned is not None else load_boosters(model_name)
-    correction = (
-        pinned.conformal_correction
-        if pinned is not None
-        else load_conformal_correction(model_name)
-    )
-
-    exposure = (
-        df[exposure_col].to_numpy() if exposure_col is not None else np.ones(len(df))
-    )
+    exposure = df[exposure_col].to_numpy() if exposure_col is not None else np.ones(len(df))
 
     pred_mean = exposure * boosters["poisson"].predict(X)
     pred_p10 = np.clip(boosters["q10"].predict(X) - correction, 0, None)

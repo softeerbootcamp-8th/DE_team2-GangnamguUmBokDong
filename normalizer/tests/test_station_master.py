@@ -4,7 +4,6 @@ import pyarrow as pa
 import pytest
 from core.weather_grid import latlon_to_grid
 from pyproj import Transformer
-
 from station_master import _OUTPUT_SCHEMA, enrich_station_master
 
 
@@ -24,7 +23,13 @@ def test_enrich_station_master_maps_api_and_realtime_coordinates():
     lat, lon = _cell_center_wgs84(cell_id)
     master = pa.Table.from_pylist(
         [
-            {"RNTLS_ID": "ST-1", "ADDR1": "주소1", "ADDR2": "1", "LAT": lat, "LOT": lon},
+            {
+                "RNTLS_ID": "ST-1",
+                "ADDR1": "주소1",
+                "ADDR2": "더샵스타시티 C동 앞",
+                "LAT": lat,
+                "LOT": lon,
+            },
             {"RNTLS_ID": "ST-2", "ADDR1": "주소2", "ADDR2": "2", "LAT": 0.0, "LOT": 0.0},
         ]
     )
@@ -45,7 +50,9 @@ def test_enrich_station_master_maps_api_and_realtime_coordinates():
     rows = {row["station_id"]: row for row in result.to_pylist()}
 
     assert rows["ST-1"]["grid_id"] == cell_id
+    assert rows["ST-1"]["station_no"] == 1
     assert rows["ST-2"]["grid_id"] == cell_id
+    assert rows["ST-2"]["station_no"] == 2
     assert rows["ST-2"]["station_name"] == "실시간 이름"
     assert rows["ST-2"]["capacity"] == 15
     assert metrics["grid_coverage"] == 1.0
@@ -82,8 +89,8 @@ def test_enrich_station_master_weather_grid_is_none_when_coordinates_missing():
     cell_id = "다사53815262"
     lat, lon = _cell_center_wgs84(cell_id)
     master = pa.Table.from_pylist(
-        [{"RNTLS_ID": f"ST-{i}", "ADDR1": "주소", "ADDR2": str(i), "LAT": lat, "LOT": lon} for i in range(19)]
-        + [{"RNTLS_ID": "ST-BAD", "ADDR1": "주소", "ADDR2": "bad", "LAT": 0.0, "LOT": 0.0}]
+        [{"RNTLS_ID": f"ST-{i}", "ADDR1": "주소", "ADDR2": str(i), "LAT": lat, "LOT": lon} for i in range(1, 20)]
+        + [{"RNTLS_ID": "ST-20", "ADDR1": "주소", "ADDR2": "bad", "LAT": 0.0, "LOT": 0.0}]
     )
     baseline = pa.Table.from_pylist([{"CELL_ID": cell_id}])
 
@@ -91,11 +98,39 @@ def test_enrich_station_master_weather_grid_is_none_when_coordinates_missing():
     rows = {row["station_id"]: row for row in result.to_pylist()}
 
     assert metrics["grid_coverage"] == 0.95
-    assert rows["ST-BAD"]["weather_nx"] is None
-    assert rows["ST-BAD"]["weather_ny"] is None
+    assert rows["ST-20"]["weather_nx"] is None
+    assert rows["ST-20"]["weather_ny"] is None
+
+
+@pytest.mark.parametrize("station_id", ["ST-BAD", "ST-1-extra", "1", "ST-"])
+def test_enrich_station_master_rejects_malformed_station_id(station_id):
+    """ADDR2 값과 무관하게 RNTLS_ID가 엄격한 ST-숫자 형식이 아니면 실패한다."""
+    cell_id = "다사53815262"
+    lat, lon = _cell_center_wgs84(cell_id)
+    master = pa.Table.from_pylist(
+        [{"RNTLS_ID": station_id, "ADDR1": "주소", "ADDR2": "123", "LAT": lat, "LOT": lon}]
+    )
+    baseline = pa.Table.from_pylist([{"CELL_ID": cell_id}])
+
+    with pytest.raises(ValueError, match="ST-<숫자>"):
+        enrich_station_master(master, baseline)
+
+
+def test_enrich_station_master_rejects_station_no_outside_int16_range():
+    """Spark ShortType과 모델 계약을 넘는 station suffix는 Arrow cast 전에 거부한다."""
+    cell_id = "다사53815262"
+    lat, lon = _cell_center_wgs84(cell_id)
+    master = pa.Table.from_pylist(
+        [{"RNTLS_ID": "ST-32768", "ADDR1": "주소", "ADDR2": "1", "LAT": lat, "LOT": lon}]
+    )
+    baseline = pa.Table.from_pylist([{"CELL_ID": cell_id}])
+
+    with pytest.raises(ValueError, match="int16 범위 밖"):
+        enrich_station_master(master, baseline)
 
 
 def test_output_schema_declares_weather_grid_columns():
     """스키마 계약: 소비 측이 컬럼 존재를 가정할 수 있어야 한다."""
+    assert _OUTPUT_SCHEMA.field("station_no").type == pa.int16()
     assert _OUTPUT_SCHEMA.field("weather_nx").type == pa.int64()
     assert _OUTPUT_SCHEMA.field("weather_ny").type == pa.int64()

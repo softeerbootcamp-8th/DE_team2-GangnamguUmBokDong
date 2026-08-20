@@ -7,6 +7,7 @@ import dags.realtime_5min as realtime_5min_dag
 import dags.station_master as station_master_dag
 import dags.weather_3h as weather_3h_dag
 import dags.weather_10min as weather_10min_dag
+from airflow.task.trigger_rule import TriggerRule
 
 
 def test_realtime_5min_dag_id():
@@ -18,45 +19,25 @@ def test_e2e_realtime_dag_id():
 
 
 def test_realtime_population_is_normalized_before_inference():
-    normalized = realtime_5min_dag.dag.get_task("population_normalized")
-    assert normalized.upstream_task_ids == {
-        "run_normalizer_strict",
-        "run_normalizer_fallback",
-    }
-    assert (
-        "population_normalized"
-        in realtime_5min_dag.dag.get_task("run_inference").upstream_task_ids
-    )
-    assert (
-        "collect_population_realtime"
-        not in realtime_5min_dag.dag.get_task("run_inference").upstream_task_ids
-    )
+    normalizer = realtime_5min_dag.dag.get_task("run_normalizer")
+    inference = realtime_5min_dag.dag.get_task("run_inference")
+    assert normalizer.upstream_task_ids == {"collect_population_realtime"}
+    assert "run_normalizer" in inference.upstream_task_ids
+    assert "collect_population_realtime" not in inference.upstream_task_ids
+    assert inference.trigger_rule == TriggerRule.ALL_SUCCESS
     # 날씨는 weather_10min/weather_3h DAG가 쓴 최신 Silver를 inference가 직접 읽는다.
     assert "collect_weather_ultra_short_live" not in realtime_5min_dag.dag.task_ids
 
 
 def test_e2e_population_is_normalized_before_inference():
-    normalized = e2e_realtime_dag.dag.get_task("population_normalized")
-    assert normalized.upstream_task_ids == {
-        "run_normalizer_strict",
-        "run_normalizer_fallback",
-    }
-    assert (
-        "population_normalized"
-        in e2e_realtime_dag.dag.get_task("run_inference").upstream_task_ids
-    )
-    assert (
-        "collect_population_realtime"
-        not in e2e_realtime_dag.dag.get_task("run_inference").upstream_task_ids
-    )
-    assert (
-        "collect_weather_ultra_short_live"
-        in e2e_realtime_dag.dag.get_task("run_inference").upstream_task_ids
-    )
-    assert (
-        "enrich_station_master"
-        in e2e_realtime_dag.dag.get_task("run_inference").upstream_task_ids
-    )
+    normalizer = e2e_realtime_dag.dag.get_task("run_normalizer")
+    inference = e2e_realtime_dag.dag.get_task("run_inference")
+    assert normalizer.upstream_task_ids == {"collect_population_realtime"}
+    assert "run_normalizer" in inference.upstream_task_ids
+    assert "collect_population_realtime" not in inference.upstream_task_ids
+    assert inference.trigger_rule == TriggerRule.ALL_SUCCESS
+    assert "collect_weather_ultra_short_live" in inference.upstream_task_ids
+    assert "enrich_station_master" in inference.upstream_task_ids
 
 
 def test_realtime_derived_gold_waits_for_inference_and_station_release():

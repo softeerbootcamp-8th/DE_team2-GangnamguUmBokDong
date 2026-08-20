@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 import pytest
 from core import s3 as s3_io
-from ml_core import scoring
+from ml_core import common_config, scoring
 from ml_core.day_index import day_index
 from ml_core.model_contract import RETURN_FEATURE_COLUMNS
 from ml_core.paths import model_json_key, read_champion_prefix, write_champion_pointer
@@ -212,6 +212,10 @@ def test_evaluate_recent_performance_does_not_crash_on_missing_date_hour_columns
     s3_io.write_parquet(pd.DataFrame(rows), f"{table_path}/date={seeded_date}/part-0000.parquet")
 
     write_champion_pointer("return", "models/archive/dt=test/default")
+    s3_io.write_json(
+        model_json_key("return", "profile", "models/archive/dt=test/default"),
+        common_config.effective_profile(),
+    )
     s3_io.write_json(
         model_json_key("return", "metrics", "models/archive/dt=test/default"),
         {"poisson_deviance_test": 1.0, "p10_p90_coverage_calibrated_test": 0.8, "rmse_test": 2.0},

@@ -1,10 +1,9 @@
 """predict_single.py의 두 가지 API 계약을 검증한다 (PR 리뷰에서 지적된 문제 재발 방지).
 
-1. **tick 단위 시각 지정** — 공개 API가 `date`+`hour`만 받으면 그 시간 안의 세부
-   tick(예: GRID_TICK_MINUTES=20이면 17:00/17:20/17:40) 요청을 전부 정시 기준으로
-   뭉개 계산하게 된다(feature_engine의 학습 그리드가 그 tick 단위인데 서빙
-   인터페이스가 그 정밀도를 못 받는 문제). `minute` 인자가 실제로 target_ts/lag
-   앵커에 반영되는지 확인한다.
+1. **tick 단위 시각 지정** — 공개 API가 `date`+`hour`만 받으면 운영의 5분 요청
+   (예: 17:00/17:05/.../17:55)을 전부 정시 기준으로 뭉개 계산하게 된다. 모델
+   학습 grid는 기본 20분이어도 실시간 point-in-time 피처는 요청 시각을 정확히
+   써야 하므로, `minute` 인자가 target_ts/lag 앵커에 반영되는지 확인한다.
 2. **배치 실패의 완결성 계약** — `predict_demand_multi_hour_all_stations()`가 일부
    station 실패를 조용히 skip하면 downstream(Gold 적재 등)이 "전체 성공"과
    "일부 누락"을 구분할 수 없다. 반환값에 실패 station 목록/기대·실제 건수가
@@ -106,56 +105,58 @@ def _fake_predict(df: pd.DataFrame, model_name: str, exposure_col: str | None = 
 
 
 def test_target_timestamp_combines_date_hour_minute():
-    assert ps._target_timestamp("2025-06-01", 17, 40) == pd.Timestamp("2025-06-01 17:40:00")
+    """20분 모델 grid와 무관하게 운영 5분 앵커를 정확히 보존한다."""
+    assert ps._target_timestamp("2025-06-01", 17, 5) == pd.Timestamp("2025-06-01 17:05:00")
+    assert ps._target_timestamp("2025-06-01", 17, 55) == pd.Timestamp("2025-06-01 17:55:00")
     assert ps._target_timestamp("2025-06-01", 17) == pd.Timestamp("2025-06-01 17:00:00")  # minute 기본값 0
 
 
 @pytest.mark.parametrize("hour,minute", [(24, 0), (-1, 0), (17, 7), (17, 60), (17, -5)])
-def test_target_timestamp_rejects_out_of_range(hour, minute):
-    """hour는 0~23, minute은 GRID_TICK_MINUTES의 배수(0~59)여야 한다."""
+def test_target_timestamp_rejects_invalid_serving_tick_or_range(hour, minute):
+    """hour는 0~23, minute은 SERVING_TICK_MINUTES의 배수(0~59)여야 한다."""
     with pytest.raises(ValueError):
         ps._target_timestamp("2025-06-01", hour, minute)
 
 
 def test_lag_rolling_features_differ_by_minute_within_same_hour():
-    """17:00과 17:20은 '같은 hour'지만 다른 tick 앵커라 rental_lag_1h 값이 달라야 한다.
+    """17:00과 17:05는 '같은 hour'지만 다른 tick 앵커라 rental_lag_1h 값이 달라야 한다.
 
     hour만 받는 인터페이스라면 이 두 요청이 구분 불가능했을 것 — minute이 실제로
     앵커에 반영된다는 걸 값 차이로 직접 보인다.
     """
-    # censoring 윈도우 = [T-100분, T-40분). T=17:00 -> [15:20,16:20), T=17:20 -> [15:40,16:40).
-    # start_dt=16:30은 후자에만 들어간다 — 두 anchor가 정확히 이 트립 하나 때문에 갈린다.
-    trips = pd.DataFrame([_trip("A", "2025-06-01 16:30:00", "2025-06-01 16:40:00")])
+    # censoring 윈도우 = [T-100분, T-40분). T=17:00 -> [15:20,16:20), T=17:05 -> [15:25,16:25).
+    # start_dt=16:22는 후자에만 들어간다 — 5분 차이가 실제 feature 차이로 이어져야 한다.
+    trips = pd.DataFrame([_trip("A", "2025-06-01 16:22:00", "2025-06-01 16:30:00")])
     _set_rental_events(trips)
     _set_return_history("A", "2025-06-01 16:00:00")
     ps._station_profile_station_index = {}
     ps._station_profile_values = np.empty((0, 0, 0, 0, 0), dtype="float32")
 
     out_1700, fb_1700 = ps._lag_rolling_features("A", 1, pd.Timestamp("2025-06-01 17:00:00"))
-    out_1720, fb_1720 = ps._lag_rolling_features("A", 1, pd.Timestamp("2025-06-01 17:20:00"))
+    out_1705, fb_1705 = ps._lag_rolling_features("A", 1, pd.Timestamp("2025-06-01 17:05:00"))
 
-    assert not ({"rental_lag_1h"} & set(fb_1700 + fb_1720))  # 둘 다 fallback 없이 계산됨
-    assert out_1700["rental_lag_1h"] != out_1720["rental_lag_1h"]
+    assert not ({"rental_lag_1h"} & set(fb_1700 + fb_1705))  # 둘 다 fallback 없이 계산됨
+    assert out_1700["rental_lag_1h"] != out_1705["rental_lag_1h"]
 
 
 def test_build_feature_record_honors_minute():
-    """_build_feature_record(hour=17, minute=40)이 실제로 target_ts=17:40을 앵커로 써서
+    """_build_feature_record(hour=17, minute=5)가 실제로 target_ts=17:05를 앵커로 써서
     _lag_rolling_features를 직접 부른 것과 같은 값을 내는지 확인한다 — 공개 API
     (predict_rental_demand 등)가 이 함수를 감싸기만 하므로, 여기서 맞으면 그 위층도
     그대로 맞는다."""
-    trips = pd.DataFrame([_trip("A", "2025-06-01 17:10:00", "2025-06-01 17:20:00")])
+    trips = pd.DataFrame([_trip("A", "2025-06-01 16:00:00", "2025-06-01 16:05:00")])
     _set_rental_events(trips)
-    _set_return_history("A", "2025-06-01 16:40:00")
+    _set_return_history("A", "2025-06-01 16:05:00")
     ps._station_profile_station_index = {}
     ps._station_profile_values = np.empty((0, 0, 0, 0, 0), dtype="float32")
     _set_station_master(["A"])
 
     record, fallback, population_fallback = ps._build_feature_record(
-        station_id="A", date="2025-06-01", hour=17, minute=40,
+        station_id="A", date="2025-06-01", hour=17, minute=5,
         temp=20.0, precip=0.0, population=3000.0, stockout=False,
     )
 
-    target_ts = pd.Timestamp("2025-06-01 17:40:00")
+    target_ts = pd.Timestamp("2025-06-01 17:05:00")
     expected, expected_fallback = ps._lag_rolling_features("A", 1, target_ts)
 
     assert record["rental_lag_1h"] == pytest.approx(expected["rental_lag_1h"])
@@ -167,7 +168,7 @@ def test_build_feature_record_rejects_invalid_minute():
     _set_station_master(["A"])
     with pytest.raises(ValueError):
         ps._build_feature_record(
-            station_id="A", date="2025-06-01", hour=17, minute=7,  # GRID_TICK_MINUTES 배수 아님
+            station_id="A", date="2025-06-01", hour=17, minute=7,  # SERVING_TICK_MINUTES 배수 아님
             temp=20.0, precip=0.0, population=3000.0, stockout=False,
         )
 
@@ -219,6 +220,153 @@ def test_predict_demand_multi_hour_all_stations_no_failures_when_all_known(monke
 
     assert outcome["failed"] == []
     assert outcome["expected_count"] == outcome["actual_count"] == 1
+
+
+@pytest.mark.parametrize(
+    ("column", "bad_value"),
+    [
+        ("station_no", "broken"),
+        ("capacity", np.nan),
+        ("lat", np.inf),
+        ("lon", 0.0),
+        ("grid_id", "  "),
+    ],
+)
+def test_predict_demand_multi_hour_all_stations_isolates_malformed_master_row(
+    monkeypatch, column, bad_value
+):
+    """깨진 마스터 필드 하나가 전체 배치를 중단하지 않고 해당 station만 실패시킨다."""
+    trips = pd.DataFrame([_trip("A", "2025-06-01 09:00:00", "2025-06-01 09:05:00")])
+    _set_rental_events(trips)
+    _set_return_history("A", "2025-06-01 09:00:00")
+    ps._station_profile_station_index = {}
+    ps._station_profile_values = np.empty((0, 0, 0, 0, 0), dtype="float32")
+    ps._population_profile = {}
+    _set_station_master(["A", "BROKEN"])
+    if column == "station_no":
+        ps._station_master["station_no"] = ps._station_master["station_no"].astype(object)
+    ps._station_master.loc["BROKEN", column] = bad_value
+    monkeypatch.setattr(ps, "predict", _fake_predict)
+
+    outcome = ps.predict_demand_multi_hour_all_stations(
+        date="2025-06-01", hour=10, temp=20.0, precip=0.0,
+        station_ids=["A", "BROKEN"], n_hours=1,
+    )
+
+    assert outcome["expected_count"] == 2
+    assert outcome["actual_count"] == 1
+    assert [row["station_id"] for row in outcome["results"]] == ["A"]
+    assert [failure["station_id"] for failure in outcome["failed"]] == ["BROKEN"]
+    assert column in outcome["failed"][0]["error"]
+
+
+def test_default_all_stations_reports_malformed_station_no_instead_of_omitting_it(monkeypatch):
+    """기본 station 선택도 파싱 불가 station_no를 조용히 필터링하지 않고 failed로 남긴다."""
+    trips = pd.DataFrame([_trip("A", "2025-06-01 09:00:00", "2025-06-01 09:05:00")])
+    _set_rental_events(trips)
+    _set_return_history("A", "2025-06-01 09:00:00")
+    ps._station_profile_station_index = {}
+    ps._station_profile_values = np.empty((0, 0, 0, 0, 0), dtype="float32")
+    ps._population_profile = {}
+    _set_station_master(["A", "BROKEN"])
+    ps._station_master["station_no"] = ps._station_master["station_no"].astype(object)
+    ps._station_master.loc["BROKEN", "station_no"] = "broken"
+    monkeypatch.setattr(ps, "load_station_dtype", lambda model_name: pd.CategoricalDtype(categories=[1]))
+    monkeypatch.setattr(ps, "predict", _fake_predict)
+
+    outcome = ps.predict_demand_multi_hour_all_stations(
+        date="2025-06-01", hour=10, temp=20.0, precip=0.0, n_hours=1
+    )
+
+    assert outcome["expected_count"] == 2
+    assert outcome["actual_count"] == 1
+    assert [failure["station_id"] for failure in outcome["failed"]] == ["BROKEN"]
+
+
+def test_all_stations_releases_rental_boosters_before_return_scoring(monkeypatch):
+    """연속 호출도 각 모델 채점 뒤 캐시를 비워 booster 8개 동시 상주를 막는다."""
+    trips = pd.DataFrame([_trip("A", "2025-06-01 09:00:00", "2025-06-01 09:05:00")])
+    _set_rental_events(trips)
+    _set_return_history("A", "2025-06-01 09:00:00")
+    ps._station_profile_station_index = {}
+    ps._station_profile_values = np.empty((0, 0, 0, 0, 0), dtype="float32")
+    ps._population_profile = {}
+    _set_station_master(["A"])
+
+    events = []
+
+    def _record_predict(df, model_name, exposure_col=None):
+        events.append(f"predict:{model_name}")
+        return _fake_predict(df, model_name, exposure_col)
+
+    monkeypatch.setattr(ps, "predict", _record_predict)
+    monkeypatch.setattr(ps.scoring_io.load_boosters, "cache_clear", lambda: events.append("cache_clear"))
+    monkeypatch.setattr(ps.gc, "collect", lambda: events.append("gc"))
+
+    for _ in range(2):
+        ps.predict_demand_multi_hour_all_stations(
+            date="2025-06-01", hour=10, temp=20.0, precip=0.0,
+            station_ids=["A"], n_hours=1,
+        )
+
+    expected_cycle = ["predict:rental", "cache_clear", "gc", "predict:return", "cache_clear", "gc"]
+    assert events == expected_cycle * 2
+
+
+def test_multi_hour_releases_rental_boosters_before_return_scoring(monkeypatch):
+    """단일 정류소 다중 horizon 경로도 return 채점 전 rental booster를 해제한다."""
+    trips = pd.DataFrame([_trip("A", "2025-06-01 09:00:00", "2025-06-01 09:05:00")])
+    _set_rental_events(trips)
+    _set_return_history("A", "2025-06-01 09:00:00")
+    ps._station_profile_station_index = {}
+    ps._station_profile_values = np.empty((0, 0, 0, 0, 0), dtype="float32")
+    ps._population_profile = {}
+    _set_station_master(["A"])
+
+    events = []
+
+    def _record_predict(df, model_name, exposure_col=None):
+        events.append(f"predict:{model_name}")
+        return _fake_predict(df, model_name, exposure_col)
+
+    monkeypatch.setattr(ps, "predict", _record_predict)
+    monkeypatch.setattr(ps.scoring_io.load_boosters, "cache_clear", lambda: events.append("cache_clear"))
+    monkeypatch.setattr(ps.gc, "collect", lambda: events.append("gc"))
+
+    ps.predict_demand_multi_hour(
+        station_id="A", date="2025-06-01", hour=10,
+        temp=20.0, precip=0.0, n_hours=1,
+    )
+
+    assert events == ["predict:rental", "cache_clear", "gc", "predict:return", "cache_clear", "gc"]
+
+
+def test_public_single_apis_release_boosters_after_each_score(monkeypatch):
+    """공개 단건 API와 이를 쓰는 기본 CLI 경로가 모델별 booster를 즉시 해제한다."""
+    trips = pd.DataFrame([_trip("A", "2025-06-01 09:00:00", "2025-06-01 09:05:00")])
+    _set_rental_events(trips)
+    _set_return_history("A", "2025-06-01 09:00:00")
+    ps._station_profile_station_index = {}
+    ps._station_profile_values = np.empty((0, 0, 0, 0, 0), dtype="float32")
+    _set_station_master(["A"])
+    events = []
+
+    def _record_predict(df, model_name, exposure_col=None):
+        events.append(f"predict:{model_name}")
+        return _fake_predict(df, model_name, exposure_col)
+
+    monkeypatch.setattr(ps, "predict", _record_predict)
+    monkeypatch.setattr(ps.scoring_io.load_boosters, "cache_clear", lambda: events.append("cache_clear"))
+    monkeypatch.setattr(ps.gc, "collect", lambda: events.append("gc"))
+
+    ps.predict_rental_demand(
+        "A", "2025-06-01", 10, temp=20.0, precip=0.0, population=100.0, stockout=False
+    )
+    ps.predict_return_demand(
+        "A", "2025-06-01", 10, temp=20.0, precip=0.0, population=100.0
+    )
+
+    assert events == ["predict:rental", "cache_clear", "gc", "predict:return", "cache_clear", "gc"]
 
 
 def test_single_station_cli_saves_to_s3(monkeypatch):
@@ -294,17 +442,15 @@ def test_all_stations_cli_exits_zero_on_full_success(monkeypatch):
 
     assert code == 0
     assert len(parquet_calls) == 1  # 성공 결과는 항상 저장
-    assert json_calls == []  # 실패가 없으니 failed 목록 파일도 없음
+    assert len(json_calls) == 1
+    assert json_calls[0][1] == []  # 이전 partial 실행의 stale sidecar를 명시적으로 정리
 
 
-def test_all_stations_cli_exits_zero_on_partial_failure_but_writes_failed_list(monkeypatch):
-    """**2026-08 정정**: 부분 실패(2,582개 중 1개 등)로 전체 배치 태스크를 실패
-    처리해서 이미 저장된 나머지 성공 결과의 DB 적재까지 막던 문제를 고쳤다 —
-    이제는 하나라도 성공하면 exit 0으로 통과시키되, 실패 목록은 별도 파일로
-    계속 남겨서 추적 가능하게 한다."""
+def test_all_stations_cli_exits_one_on_partial_failure_and_writes_diagnostics(monkeypatch):
+    """부분 결과는 parquet/sidecar로 진단 가능하게 남기되 downstream 적재를 막는다."""
     code, parquet_calls, json_calls = _run_all_stations_cli(monkeypatch, _fake_all_stations_outcome(3, 2))
 
-    assert code == 0
+    assert code == 1
     assert len(parquet_calls) == 1
     assert len(json_calls) == 1  # 실패 1건은 별도 파일로 남음
     _failed_key, failed_data = json_calls[0]
@@ -312,11 +458,21 @@ def test_all_stations_cli_exits_zero_on_partial_failure_but_writes_failed_list(m
 
 
 def test_all_stations_cli_exits_one_on_total_failure(monkeypatch):
-    """성공한 게 하나도 없으면(시스템 자체가 잘못됐다는 신호) 여전히 exit 1로 막는다."""
-    code, _parquet_calls, json_calls = _run_all_stations_cli(monkeypatch, _fake_all_stations_outcome(3, 0))
+    """완전 실패는 기존 정상 parquet을 빈 결과로 덮어쓰지 않고 exit 1로 막는다."""
+    code, parquet_calls, json_calls = _run_all_stations_cli(monkeypatch, _fake_all_stations_outcome(3, 0))
 
     assert code == 1
+    assert parquet_calls == []
     assert len(json_calls) == 1
+
+
+def test_all_stations_cli_treats_zero_expected_and_zero_actual_as_failure(monkeypatch):
+    """기본 후보 계산이 비어도 '0건 완전 성공'으로 통과하거나 기존 결과를 지우지 않는다."""
+    code, parquet_calls, json_calls = _run_all_stations_cli(monkeypatch, _fake_all_stations_outcome(0, 0))
+
+    assert code == 1
+    assert parquet_calls == []
+    assert json_calls[0][1] == []
 
 
 def test_single_station_multi_hour_cli_saves_to_s3(monkeypatch):

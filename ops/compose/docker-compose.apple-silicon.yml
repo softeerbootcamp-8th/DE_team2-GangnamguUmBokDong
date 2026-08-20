@@ -1,0 +1,8 @@
+# Apple Silicon 로컬 개발 전용 override.
+# amd64-only PostGIS 두 서비스만 Docker Desktop 에뮬레이션으로 실행한다.
+services:
+  postgres:
+    platform: linux/amd64
+
+  postgres-schema-check:
+    platform: linux/amd64

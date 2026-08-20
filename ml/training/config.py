@@ -10,6 +10,7 @@
 import os
 import uuid
 from datetime import date, timedelta
+from math import ceil
 
 from ml_core import common_config
 from ml_core.paths import (
@@ -62,35 +63,50 @@ def unique_archive_date(as_of: date | None = None) -> str:
 # LightGBM이 1년 전체를 못 받았기 때문(history.md 18번 항목).
 #
 # **2026-08 실측 + 이후 정책 변경**: 대여/반납 분리 + lag 1개로 줄인 뒤에도(피처
-# 축소 이후) 20분 tick·1년 전체 multi-horizon 테이블이 8억 행이라 로컬
-# (RAM 18GB)에서 pandas로 한 번에 못 읽어서(에러 메시지도 없이 SIGKILL), 한때
+# 축소 이후) 1년 전체 multi-horizon 테이블을 로컬 RAM 18GB에서 pandas로 한 번에
+# 못 읽어서(에러 메시지도 없이 SIGKILL), 한때
 # day-of-month 배수로 날짜 자체를 줄이는(`TRAIN_DAY_DIVISOR`, 기본 2=짝수날만)
-# 임시 조치를 도입했었다. **20분(또는 그 이하) tick 앵커 밀도는 유지해야 한다는
-# 요구사항이 확정되면서(minute 단위 서빙 요청을 실제로 커버해야 함 — 시간
-# 단위로 앵커를 줄이면 모델이 그 minute 값들을 아예 학습에서 못 봄), 날짜를
-# 솎아내는 방식으로 메모리를 줄이는 건 기본값에서 뺐다** — `TRAIN_DAY_DIVISOR`
-# 기본값을 다시 1(=날짜 필터 없음, 전체 윈도우 사용)로 되돌렸다. 대신 실제 메모리
-# 문제는 `lazy_train_dataset.py`의 날짜 파티션 단위 스트리밍 학습으로 푼다 —
-# 그게 어려운 특수 상황(예: 로컬에서 급하게 뭔가 검증)에서만 `TRAIN_DAY_DIVISOR`를
-# 다시 2, 3, 5로 올리는 임시 dial로 남겨둔다.
+# 임시 조치를 도입했었다. 현재는 날짜·계절·기상 다양성을 보존하고 시간축 중복만
+# 줄이도록 `TRAIN_ANCHOR_TICK_MINUTES`가 학습 밀도를 명시한다(기본 g20/r20/a20,
+# 비교용 g5/r5/a5 또는 g5/r5/a20 등; 서빙은 모두 5분 고정). 따라서 날짜를
+# 솎는 `TRAIN_DAY_DIVISOR` 기본값은
+# 1(=전체 윈도우)이며, 로컬 긴급 검증처럼 불가피할 때만 임시 dial로 사용한다.
 #
-# train은 **`TRAIN_DAY_DIVISOR`의 배수인 날 중 VALID/TEST로 안 뽑힌 날**
+# train은 **`TRAIN_DAY_DIVISOR`의 배수인 날 중 VALID/TEST 및 그 embargo 구간으로
+# 안 뽑힌 날**
 # (기본 1 = 사실상 전체 날짜), valid/test는 `VALID_DAYS_OF_MONTH`/
 # `TEST_DAYS_OF_MONTH`로 지정한 날짜만 쓴다 — `train_common._dates_for_split()`이
-# valid/test 여부를 먼저 확정하고(`elif`) 그 나머지 중에서만 train 배수 조건을 보므로,
-# TRAIN_DAY_DIVISOR가 1이라 "모든 날짜가 배수"인 경우에도 valid/test 날짜가
-# train으로 새지 않는다.
+# valid/test 여부를 먼저 확정하고 그 앞뒤 `SPLIT_EMBARGO_DAYS`까지 purge한 뒤
+# train 배수 조건을 보므로, TRAIN_DAY_DIVISOR가 1이라 "모든 날짜가 배수"인
+# 경우에도 평가 anchor가 train으로 새지 않는다.
 TRAIN_DAY_DIVISOR = int(os.environ.get("TRAIN_DAY_DIVISOR", "1"))
-VALID_DAYS_OF_MONTH = frozenset(int(d) for d in os.environ.get("VALID_DAYS_OF_MONTH", "11,13").split(","))
-TEST_DAYS_OF_MONTH = frozenset(int(d) for d in os.environ.get("TEST_DAYS_OF_MONTH", "17,19").split(","))
 
-# --- 학습기간 롤링 윈도우 (2026-08부터, 고정 TRAIN_YEAR 폐지) ---
-# `common_config.training_window()`가 프로필의 TRAIN_LOOKBACK_MONTHS/
-# TRAINING_SAFETY_MARGIN_DAYS로 "오늘 기준 최근 N개월"을 계산한다 — 매달 재학습
-# 전에 이 프로세스가 새로 뜨므로, 매번 새로 계산된 값을 그대로 쓰면 코드 변경
-# 없이 다음 실행부터 최신 구간이 반영된다(feature_engine/spark/config.py와 동일
-# 함수를 공유 — 둘이 다른 값을 보면 학습기간과 실제 존재하는 feature mart 구간이
-# 어긋난다).
+
+def _day_set_env(name: str, default: str) -> frozenset[int]:
+    """쉼표로 구분한 학습 split 날짜 환경변수를 검증해 반환한다."""
+    try:
+        days = frozenset(int(value.strip()) for value in os.environ.get(name, default).split(",") if value.strip())
+    except ValueError as exc:
+        raise ValueError(f"{name}은 쉼표로 구분한 정수여야 합니다") from exc
+    if not days or any(day < 1 or day > 31 for day in days):
+        raise ValueError(f"{name}은 1~31 사이 날짜를 하나 이상 포함해야 합니다: {sorted(days)}")
+    return days
+
+
+VALID_DAYS_OF_MONTH = _day_set_env("VALID_DAYS_OF_MONTH", "11,13")
+TEST_DAYS_OF_MONTH = _day_set_env("TEST_DAYS_OF_MONTH", "17,19")
+if VALID_DAYS_OF_MONTH & TEST_DAYS_OF_MONTH:
+    raise ValueError(
+        "VALID_DAYS_OF_MONTH와 TEST_DAYS_OF_MONTH는 겹칠 수 없습니다: "
+        f"{sorted(VALID_DAYS_OF_MONTH & TEST_DAYS_OF_MONTH)}"
+    )
+
+# --- 학습기간 윈도우 (고정 최초학습 또는 rolling 재학습) ---
+# `common_config.training_window()`는 TRAIN_WINDOW_START/END 쌍이 있으면 그 exact
+# 구간을, 없으면 프로필의 TRAIN_LOOKBACK_MONTHS/TRAINING_SAFETY_MARGIN_DAYS로
+# "오늘 기준 최근 N개월"을 계산한다. feature_engine/spark/config.py와 동일 함수를
+# 공유하므로 두 단계가 다른 범위를 보는 것을 막는다. 월별 재학습은 고정 구간
+# 변수를 제거하고 rolling 값을 매번 새로 계산해 최신 데이터까지 포함한다.
 #
 # TRAINING_SAFETY_MARGIN_DAYS는 대여이력이 반납 완료 시에만 Silver에 나타나는
 # 것과 같은 이유로(feature_engine/spark/run_pipeline.py의 날짜 파티션 overwrite
@@ -120,15 +136,24 @@ def safety_cutoff_date(as_of: date | None = None) -> date:
 
 QUANTILE_ALPHAS = [0.1, 0.5, 0.9]
 
-# multi-horizon 테이블은 원본 feature 테이블의 최대 HORIZON_COUNT(기본 12)배 행 수라(T0
-# 앵커를 tick 전체로 유지 — feature_engine/spark/build_multi_horizon_features.py
-# 참고), 학습 머신 RAM에 안 맞으면 OOM이 난다(history.md 18번 항목이 실제로 겪은 문제와
-# 같은 종류 — 그때는 train/valid/test 각각 다른 비율로 표본을 뽑아 해결했다). 기본값은
-# "표본 없음"(1.0)이라 실행해보고 OOM이 나면 실제 학습 머신 스펙에 맞춰 낮출 것 — 정확한
-# 안전 값은 이 저장소만으로는 알 수 없다.
-TRAIN_SAMPLE_FRAC = float(os.environ.get("TRAIN_SAMPLE_FRAC", "1.0"))
-VALID_SAMPLE_FRAC = float(os.environ.get("VALID_SAMPLE_FRAC", "1.0"))
-TEST_SAMPLE_FRAC = float(os.environ.get("TEST_SAMPLE_FRAC", "1.0"))
+
+def _reject_unsupported_sample_frac_env() -> None:
+    """구현되지 않은 row-fraction 샘플링 환경변수를 명시적으로 거부한다.
+
+    과거 `TRAIN/VALID/TEST_SAMPLE_FRAC` 상수는 실제 데이터 로더 어느 곳에서도
+    적용되지 않아 값을 낮춰도 전 행을 읽는 가짜 dial이었다. OOM 폴백은 실제로
+    작동하는 `TRAIN_DAY_DIVISOR`와 `MAX_TRAIN_HORIZON`만 사용한다.
+    """
+    names = ("TRAIN_SAMPLE_FRAC", "VALID_SAMPLE_FRAC", "TEST_SAMPLE_FRAC")
+    configured = sorted(name for name in names if name in os.environ)
+    if configured:
+        raise ValueError(
+            f"지원하지 않는 샘플링 환경변수입니다: {configured}. "
+            "TRAIN_DAY_DIVISOR 또는 MAX_TRAIN_HORIZON을 사용하세요"
+        )
+
+
+_reject_unsupported_sample_frac_env()
 
 # **2026-08**: 같은 날짜 파티션 안에 horizon 1~HORIZON_COUNT이 전부 섞여 있어
 # 날짜 필터만으론 못 줄이는 배율이라, 필요하면 읽는 시점에
@@ -141,6 +166,25 @@ TEST_SAMPLE_FRAC = float(os.environ.get("TEST_SAMPLE_FRAC", "1.0"))
 # 낮출 것 — 낮추면 그 이상 horizon에 대한 예측 품질은 검증되지 않는다(모델이
 # 그 구간의 실제 예를 아예 못 봄).
 MAX_TRAIN_HORIZON = int(os.environ.get("MAX_TRAIN_HORIZON", str(common_config.HORIZON_COUNT)))
+if not 1 <= MAX_TRAIN_HORIZON <= common_config.HORIZON_COUNT:
+    raise ValueError(
+        f"MAX_TRAIN_HORIZON은 1~{common_config.HORIZON_COUNT} 사이여야 합니다: {MAX_TRAIN_HORIZON}"
+    )
+
+# multi-horizon 한 anchor는 target 날짜가 자정을 넘으면 서로 다른 `date=` 파티션에
+# 최대 MAX_TRAIN_HORIZON개 행으로 나뉜다. train/valid/test를 day-of-month로만
+# 인터리브하면 같은 anchor의 거의 같은 입력이 train과 평가셋에 동시에 들어가므로,
+# horizon 이동 폭과 target 집계 창을 모두 덮는 날짜 단위 purge 구간을 둔다.
+# 현재 12시간 예측·60분 target이면 1일이며, horizon을 늘리면 자동으로 커진다.
+_MIN_SPLIT_EMBARGO_DAYS = ceil(
+    (((MAX_TRAIN_HORIZON - 1) * 60) + common_config.TARGET_HORIZON_MINUTES) / (24 * 60)
+)
+SPLIT_EMBARGO_DAYS = int(os.environ.get("SPLIT_EMBARGO_DAYS", str(_MIN_SPLIT_EMBARGO_DAYS)))
+if SPLIT_EMBARGO_DAYS < _MIN_SPLIT_EMBARGO_DAYS:
+    raise ValueError(
+        f"SPLIT_EMBARGO_DAYS={SPLIT_EMBARGO_DAYS}는 horizon/target 기준 최소값 "
+        f"{_MIN_SPLIT_EMBARGO_DAYS}보다 작을 수 없습니다"
+    )
 
 # **2026-08**: divisor=2+horizon<=6로 줄여도 로드가 8시간 넘게 걸리다 디스크
 # 스와핑(STAT=U, %CPU 급락)으로 판단해 강제 종료한 사건 이후 도입 — 그 전까지는

@@ -3,12 +3,27 @@
 실행 방법은 [README.md](../../../ml/training/README.md), 결정의 배경/시행착오는 [history.md](../history.md)를
 참고. 이 문서는 "지금 코드가 왜 이렇게 짜여 있는지"에 집중한다.
 
+현재 시간 해상도 기본 계약은 **g20/r20/a20 학습 + 5분 서빙**이다. g/r은
+`{5, 10, 15, 20, 30, 60}`분 중 같은 값을 쓰고, formal
+`TRAIN_ANCHOR_TICK_MINUTES`(a)는 생략 시 g와 같으며 명시 시 g 이상인
+배수이면서 1시간과 1일을 나눠야 한다. 모델 grid/anchor는 학습 데이터의
+해상도이고 `SERVING_TICK_MINUTES=5`는 별도 고정 계약이다.
+
+해상도 비교는 A=g20/r20/a20, B=g5/r5/a20, C=g5/r5/a5 세 arm으로 한다.
+A와 B의 공통 20분 anchor는 feature/label parity를 확인하고, 정확도는 세 모델
+모두 같은 독립 5분 test mart에서 평가한다. 각 arm의 자체 test split 지표는
+행 집합이 다르므로 서로 직접 비교하지 않는다.
+
 ## 1. 왜 학습은 Spark가 아니라 로컬 LightGBM인가
 
 `feature_engine`은 Spark로 분산 처리하지만(EMR, 데이터 규모가 히스토리 길이에
-비례해 계속 커짐), 학습은 항상 **최근 N개월만 잘라서** 단일 머신 LightGBM으로
+비례해 계속 커짐), 운영 재학습은 **최근 N개월만 잘라서** 단일 머신 LightGBM으로
 돌린다 — 학습 데이터량이 히스토리 길이와 무관하게 고정되므로 확장성 문제가
-없다. 처음엔 이 이유로 LightGBM 자체 분산 학습(Socket/MPI)이나
+없다. 단, 최초 챔피언은 `TRAIN_WINDOW_START=2025-01-01`과
+`TRAIN_WINDOW_END=2025-12-31`을 feature_engine/training 양쪽에 함께 주어 2025년
+전체를 exact window로 사용한다. 두 변수가 없을 때만 최근 N개월 rolling 규칙을
+적용하며, 한쪽만 있거나 오형식·역전이면 fail-closed한다. 처음엔 이 이유로
+LightGBM 자체 분산 학습(Socket/MPI)이나
 SynapseML(LightGBM-on-Spark)도 검토했지만 채택하지 않았었다(history.md 5번
 항목) — EMR 클러스터를 쓴다고 학습이 자동으로 분산되는 게 아니라 별도
 인프라/구현 부담이 컸기 때문. 이후 여러 해치 데이터로 확장 계획이 서면서
@@ -138,6 +153,12 @@ Poisson deviance가 계절성에 강하게 비례한다는 걸 실측으로 확�
 (`champion/{model_name}.json`, `ml_core.paths.write_champion_pointer()`/
 `read_champion_prefix()`)가 어느 archive_prefix를 가리키는지로 정해진다.
 
+최초 챔피언은 각 학습 CLI의 명시적 `--promote-if-no-champion`으로만 만든다.
+학습 성공 후에도 `promotion.bootstrap_challenger()`가 일반 승격과 같은 effective
+profile 계약 검증을 거치며, 같은 모델 포인터가 이미 있으면 오류로 중단해 기존
+챔피언을 덮지 않는다. 대여/반납을 독립적으로 부트스트랩하므로 첫 모델 성공 뒤
+둘째 모델만 실패해도 실패한 명령만 안전하게 재실행할 수 있다.
+
 **왜 파일 복사가 아니라 포인터인가**: 예전엔 승격할 때 archive의 파일 8개
 (booster 4개 + station_categories/conformal_correction/metrics/profile)를
 챔피언 prefix로 하나씩 복사했다 — S3는 여러 키에 걸친 트랜잭션을 지원하지
@@ -170,12 +191,12 @@ station_categories는 옛 버전인 식으로 섞인 모델을 읽을 수 있었
 
 multi-horizon 테이블은 원본 tick 테이블의 최대 `HORIZON_COUNT`배 행 수라
 ("horizon을 feature로" 설계, [feature_engine/DESIGN.md](../feature_engine/DESIGN.md) §7 참고),
-20분 tick·full horizon·2025년 전체 기준 실측 8억 행대까지 커진다 — 통째로 하나의
+과거 20분 base/anchor·full horizon·2025년 전체 기준으로도 실측 8억 행대까지 커졌다 — 통째로 하나의
 pandas DataFrame(float64/int64 컬럼 13개)으로 읽으면 원본만 수십GB라 로컬(RAM 18GB)
-에서 반복적으로 OOM이 났다. 앵커 tick 밀도(20분, 향후 5분 희망)와
-horizon(`HORIZON_COUNT` 전체)은 줄이지 않는 게 확정 정책이라(§ 아래 참고), 예전처럼
-`TRAIN_DAY_DIVISOR`로 날짜 자체를 솎아내 메모리를 줄이는 건 기본값에서 뺐다 —
-대신 `train_common.py`가 더 이상 데이터를 한 번에 로드하지 않고,
+에서 반복적으로 OOM이 났다. 기본은 20분 anchor이며 필요하면 formal 설정으로
+5분 base/anchor도 선택할 수 있다. 어느 해상도든 날짜·계절·기상 다양성과
+`HORIZON_COUNT` 전체를 우선 보존하므로 `TRAIN_DAY_DIVISOR`로 날짜를
+솎아내는 방식은 기본값에서 뺐다. 대신 `train_common.py`가 데이터를 한 번에 로드하지 않고,
 **`lazy_train_dataset.py`가 날짜 파티션(`date=YYYY-MM-DD/`) 단위로 S3를 지연
 조회**한다.
 
@@ -206,6 +227,17 @@ Sequence를 필요할 때만(그것도 두 단계 — 표본 추출용 개별 �
 2, 3, 5로 올리는 비상 dial로 남아있다. `horizon`은 여전히 같은 날짜 파티션 안에
 1..`HORIZON_COUNT`가 섞여 있어 `filters=[("horizon", "<=", MAX_TRAIN_HORIZON)]`
 (pyarrow row-group 필터)로 따로 거른다.
+
+`TRAIN_SAMPLE_FRAC`/`VALID_SAMPLE_FRAC`/`TEST_SAMPLE_FRAC`는 실제 로더에 연결되지
+않은 채 설정만 존재했던 가짜 dial이라 제거했다. 설정 시 명시적으로 실패하며,
+OOM 폴백은 실제 I/O를 줄이는 위 두 옵션만 지원한다. 날짜를 줄이면 계절·요일
+표본이 감소하고 horizon을 줄이면 먼 구간을 아예 학습하지 않는 품질 tradeoff가 있다.
+
+같은 anchor의 horizon 행이 자정을 넘어 서로 다른 target `date`에 저장될 수 있으므로,
+평가일 전후 `SPLIT_EMBARGO_DAYS`(현재 horizon/target 기준 최소 1일)는 train에서
+purge한다. valid/test가 서로 이 거리 안에 있으면 두 평가셋도 같은 anchor를 공유할
+수 있어 설정 오류로 실패한다. 이 embargo 없이 day-of-month만 인터리브하면 early
+stopping과 conformal correction이 같은 anchor 정보를 간접 공유해 낙관적으로 보인다.
 
 로드가 실제로 진행 중인지 확인하려면 `TRAIN_PROGRESS_LOG_PATH`(기본
 `training_progress.log`)를 tail — 날짜 청크 하나가 로드될 때마다(및 사전 스캔

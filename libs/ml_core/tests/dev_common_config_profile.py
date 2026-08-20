@@ -7,12 +7,31 @@
 가짜 S3를 만들어준 뒤에).
 """
 
+import json
+import os
+import subprocess
+import sys
 from datetime import date
+from pathlib import Path
 
 import pytest
 from core import s3 as s3_io
 
-from ml_core import common_config, profile_registry
+from ml_core import common_config, profile_contract, profile_registry
+
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+
+
+def _fresh_process_env(**overrides: str) -> dict[str, str]:
+    """현재 worktree의 ml_core/core를 fresh subprocess가 import할 환경을 만든다."""
+    python_paths = [
+        str(_REPO_ROOT / "ml"),
+        str(_REPO_ROOT / "libs"),
+        str(_REPO_ROOT / "libs" / "core" / "src"),
+    ]
+    if existing := os.environ.get("PYTHONPATH"):
+        python_paths.append(existing)
+    return {**os.environ, "PYTHONPATH": os.pathsep.join(python_paths), **overrides}
 
 
 def test_fetch_profile_from_s3_returns_none_when_missing():
@@ -24,9 +43,41 @@ def test_fetch_profile_from_s3_returns_written_value():
     assert common_config._fetch_profile_from_s3("custom") == {"ROLLING_EMBARGO_MINUTES": 999}
 
 
-def test_load_profile_falls_back_to_embedded_default_when_s3_empty(monkeypatch):
+def test_load_profile_uses_builtin_default_without_querying_s3(monkeypatch):
+    """ML_PROFILE 미지정 기본 실행은 오래된 S3 default 객체의 영향을 받지 않아야 한다."""
+    monkeypatch.delenv("ML_PROFILE", raising=False)
+    monkeypatch.setattr(
+        common_config,
+        "_fetch_profile_from_s3",
+        lambda _name: pytest.fail("내장 기본 프로필에서 S3를 조회하면 안 됩니다"),
+    )
+
+    profile = common_config._load_profile()
+
+    assert common_config._selected_profile_name() == common_config.BUILTIN_PROFILE_NAME
+    assert profile == {
+        **common_config._DEFAULT_PROFILE,
+        "TRAIN_ANCHOR_TICK_MINUTES": 20,
+    }
+    assert profile["GRID_TICK_MINUTES"] == 20
+    assert profile["TRAIN_ANCHOR_TICK_MINUTES"] == 20
+
+
+def test_load_profile_does_not_let_stale_s3_default_override_implicit_builtin(monkeypatch):
+    s3_io.write_json(
+        "profiles/default.json",
+        {**common_config._DEFAULT_PROFILE, "GRID_TICK_MINUTES": 5, "ROLLING_TICK_MINUTES": 5},
+    )
+    monkeypatch.delenv("ML_PROFILE", raising=False)
+
+    assert common_config._load_profile()["GRID_TICK_MINUTES"] == 20
+
+
+def test_load_profile_fails_when_explicit_s3_profile_is_missing(monkeypatch):
     monkeypatch.setenv("ML_PROFILE", "nonexistent")
-    assert common_config._load_profile() == common_config._DEFAULT_PROFILE
+
+    with pytest.raises(FileNotFoundError, match="nonexistent"):
+        common_config._load_profile()
 
 
 def test_load_profile_prefers_s3_value_over_embedded_default(monkeypatch):
@@ -52,12 +103,299 @@ def test_load_profile_merges_partial_s3_profile_with_embedded_defaults(monkeypat
     assert profile["TRAIN_LOOKBACK_MONTHS"] == common_config._DEFAULT_PROFILE["TRAIN_LOOKBACK_MONTHS"]  # 누락분은 기본값
 
 
-def test_load_profile_falls_back_when_s3_unreachable(monkeypatch):
-    # moto가 목킹하는 건 boto3 호출 자체라, 잘못된 엔드포인트로 돌리면 moto 밖으로
-    # 나가 실제 네트워크 에러가 난다 — _load_profile()이 이 경우도 예외를 삼키고
-    # 폴백하는지 확인한다(S3 연결 자체가 안 되는 극단적인 경우).
-    monkeypatch.setenv("S3_ENDPOINT_URL", "http://localhost:0")
-    assert common_config._load_profile() == common_config._DEFAULT_PROFILE
+def test_future_lgb_profile_keys_survive_effective_params():
+    """max_bin 같은 새 키가 profile 병합과 실제 LightGBM params 생성에서 보존돼야 한다."""
+    profile = profile_contract.merge_and_validate_profile(
+        {"LGB_PARAMS_COMMON": {"max_bin": 31}},
+        "future-lgb-key",
+    )
+
+    params = common_config._build_lgb_params(profile["LGB_PARAMS_COMMON"])
+
+    assert params["max_bin"] == 31
+    assert params["num_leaves"] == common_config._DEFAULT_PROFILE["LGB_PARAMS_COMMON"]["num_leaves"]
+
+
+def test_load_profile_propagates_explicit_s3_failure(monkeypatch):
+    monkeypatch.setenv("ML_PROFILE", "remote")
+
+    def _raise(_name):
+        raise RuntimeError("S3 unavailable")
+
+    monkeypatch.setattr(common_config, "_fetch_profile_from_s3", _raise)
+
+    with pytest.raises(RuntimeError, match="S3 unavailable"):
+        common_config._load_profile()
+
+
+def test_load_profile_accepts_explicit_five_minute_experiment(monkeypatch):
+    experimental = {**common_config._DEFAULT_PROFILE, "GRID_TICK_MINUTES": 5, "ROLLING_TICK_MINUTES": 5}
+    s3_io.write_json("profiles/five-minute-experiment.json", experimental)
+    monkeypatch.setenv("ML_PROFILE", "five-minute-experiment")
+
+    profile = common_config._load_profile()
+
+    assert profile["GRID_TICK_MINUTES"] == 5
+    assert profile["ROLLING_TICK_MINUTES"] == 5
+
+
+@pytest.mark.parametrize("tick_minutes", [5, 10, 15, 20, 30, 60])
+def test_profile_accepts_supported_model_grids(tick_minutes):
+    """한 시간과 하루를 나누는 5분 배수 model grid는 비교 프로필로 사용할 수 있다."""
+    profile = profile_contract.merge_and_validate_profile(
+        {
+            "GRID_TICK_MINUTES": tick_minutes,
+            "ROLLING_TICK_MINUTES": tick_minutes,
+        },
+        f"grid-{tick_minutes}",
+    )
+
+    assert profile["GRID_TICK_MINUTES"] == tick_minutes
+    assert profile["TRAIN_ANCHOR_TICK_MINUTES"] == tick_minutes
+
+
+def test_load_profile_rejects_unsupported_model_grid(monkeypatch):
+    invalid = {**common_config._DEFAULT_PROFILE, "GRID_TICK_MINUTES": 25, "ROLLING_TICK_MINUTES": 25}
+    s3_io.write_json("profiles/unsupported-grid.json", invalid)
+    monkeypatch.setenv("ML_PROFILE", "unsupported-grid")
+
+    with pytest.raises(ValueError, match="지원하는 모델 grid"):
+        common_config._load_profile()
+
+
+def test_load_profile_rejects_mismatched_grid_and_rolling_ticks(monkeypatch):
+    invalid = {**common_config._DEFAULT_PROFILE, "GRID_TICK_MINUTES": 5, "ROLLING_TICK_MINUTES": 20}
+    s3_io.write_json("profiles/mismatched-grid.json", invalid)
+    monkeypatch.setenv("ML_PROFILE", "mismatched-grid")
+
+    with pytest.raises(ValueError, match="같아야 합니다"):
+        common_config._load_profile()
+
+
+def test_profile_rejects_grid_that_does_not_divide_target_horizon():
+    invalid = {
+        **common_config._DEFAULT_PROFILE,
+        "TARGET_HORIZON_MINUTES": 50,
+    }
+
+    with pytest.raises(ValueError, match="타겟 구간"):
+        profile_contract.validate_profile(invalid, "invalid-horizon")
+
+
+def test_profile_accepts_five_minute_grid_with_twenty_minute_training_anchor():
+    """5분 base feature를 유지하면서 20분마다 학습하는 hybrid 계약을 허용한다."""
+    profile = profile_contract.merge_and_validate_profile(
+        {
+            "GRID_TICK_MINUTES": 5,
+            "ROLLING_TICK_MINUTES": 5,
+            "TRAIN_ANCHOR_TICK_MINUTES": 20,
+        },
+        "hybrid",
+    )
+
+    assert profile["TRAIN_ANCHOR_TICK_MINUTES"] == 20
+
+
+@pytest.mark.parametrize(
+    ("grid_tick", "anchor_tick"),
+    [
+        (20, 10),
+        (20, 30),
+        (15, 20),
+        (5, 25),
+    ],
+)
+def test_profile_rejects_incompatible_training_anchor(grid_tick, anchor_tick):
+    """학습 anchor는 base grid의 성긴 부분집합이며 매시간 같은 위상을 가져야 한다."""
+    overrides = {
+        "GRID_TICK_MINUTES": grid_tick,
+        "ROLLING_TICK_MINUTES": grid_tick,
+        "TRAIN_ANCHOR_TICK_MINUTES": anchor_tick,
+    }
+
+    with pytest.raises(ValueError, match="TRAIN_ANCHOR_TICK_MINUTES"):
+        profile_contract.merge_and_validate_profile(overrides, "invalid-anchor")
+
+
+def test_load_profile_rejects_reserved_profile_name_metadata(monkeypatch):
+    s3_io.write_json(
+        "profiles/forged-name.json",
+        {**common_config._DEFAULT_PROFILE, "profile_name": "different-name"},
+    )
+    monkeypatch.setenv("ML_PROFILE", "forged-name")
+
+    with pytest.raises(ValueError, match="예약 메타데이터 키 profile_name"):
+        common_config._load_profile()
+
+
+def test_selected_profile_name_rejects_empty_explicit_value(monkeypatch):
+    monkeypatch.setenv("ML_PROFILE", "   ")
+
+    with pytest.raises(ValueError, match="빈 문자열"):
+        common_config._selected_profile_name()
+
+
+def test_effective_profile_includes_environment_overrides_in_fresh_process():
+    """모델에 저장할 snapshot은 프로필 원문이 아니라 실제 env override를 반영해야 한다."""
+    env = _fresh_process_env(
+        ROLLING_EMBARGO_MINUTES="55",
+        LGB_NUM_LEAVES="7",
+    )
+    env.pop("ML_PROFILE", None)
+    code = (
+        "import json; from ml_core import common_config; "
+        "print(json.dumps(common_config.effective_profile()))"
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    snapshot = json.loads(result.stdout)
+
+    assert snapshot["ROLLING_EMBARGO_MINUTES"] == 55
+    assert snapshot["LGB_PARAMS_COMMON"]["num_leaves"] == 7
+    assert snapshot["GRID_TICK_MINUTES"] == 20
+    assert snapshot["TRAIN_ANCHOR_TICK_MINUTES"] == 20
+
+
+def test_effective_profile_preserves_explicit_five_minute_grid_overrides():
+    """5분 A/B 실험은 grid와 rolling을 함께 override하면 아티팩트에 그대로 남아야 한다."""
+    env = _fresh_process_env(
+        GRID_TICK_MINUTES="5",
+        ROLLING_TICK_MINUTES="5",
+    )
+    env.pop("ML_PROFILE", None)
+    code = (
+        "import json; from ml_core import common_config; "
+        "print(json.dumps(common_config.effective_profile()))"
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    snapshot = json.loads(result.stdout)
+
+    assert snapshot["GRID_TICK_MINUTES"] == 5
+    assert snapshot["ROLLING_TICK_MINUTES"] == 5
+    assert snapshot["TRAIN_ANCHOR_TICK_MINUTES"] == 5
+
+
+def test_effective_profile_preserves_explicit_hybrid_training_anchor():
+    """canonical anchor override는 5분 base grid 위 20분 thinning으로 기록돼야 한다."""
+    env = _fresh_process_env(
+        GRID_TICK_MINUTES="5",
+        ROLLING_TICK_MINUTES="5",
+        TRAIN_ANCHOR_TICK_MINUTES="20",
+    )
+    env.pop("ML_PROFILE", None)
+    code = (
+        "import json; from ml_core import common_config; "
+        "print(json.dumps(common_config.effective_profile()))"
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    snapshot = json.loads(result.stdout)
+
+    assert snapshot["GRID_TICK_MINUTES"] == 5
+    assert snapshot["TRAIN_ANCHOR_TICK_MINUTES"] == 20
+
+
+def test_redundant_grid_environment_preserves_explicit_hybrid_profile_anchor():
+    """명시적 g5/a20 프로필은 redundant GRID/ROLLING=5 환경에서도 a20을 유지해야 한다."""
+    profile = profile_contract.merge_and_validate_profile(
+        {
+            "GRID_TICK_MINUTES": 5,
+            "ROLLING_TICK_MINUTES": 5,
+            "TRAIN_ANCHOR_TICK_MINUTES": 20,
+        },
+        "hybrid",
+    )
+
+    resolved = common_config._resolved_train_anchor_tick(
+        profile,
+        grid_tick=5,
+        env={"GRID_TICK_MINUTES": "5", "ROLLING_TICK_MINUTES": "5"},
+    )
+
+    assert resolved == 20
+
+
+@pytest.mark.parametrize(
+    ("legacy_env", "expected"),
+    [
+        ({"MULTI_HORIZON_ANCHOR_TICK_MINUTES": "60"}, 60),
+        ({"MULTI_HORIZON_ANCHOR_HOURLY_ONLY": "1"}, 60),
+    ],
+)
+def test_legacy_anchor_environment_aliases_are_materialized(legacy_env, expected):
+    """기존 anchor 환경변수도 검증 후 canonical effective profile로 기록한다."""
+    env = _fresh_process_env(**legacy_env)
+    env.pop("ML_PROFILE", None)
+    code = (
+        "import json; from ml_core import common_config; "
+        "print(json.dumps(common_config.effective_profile()))"
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+    assert json.loads(result.stdout)["TRAIN_ANCHOR_TICK_MINUTES"] == expected
+
+
+def test_conflicting_anchor_environment_aliases_fail_closed():
+    """canonical/legacy 환경변수가 서로 다른 학습 밀도를 요구하면 import가 실패해야 한다."""
+    env = _fresh_process_env(
+        TRAIN_ANCHOR_TICK_MINUTES="20",
+        MULTI_HORIZON_ANCHOR_TICK_MINUTES="60",
+    )
+    env.pop("ML_PROFILE", None)
+
+    result = subprocess.run(
+        [sys.executable, "-c", "from ml_core import common_config"],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+    assert result.returncode != 0
+    assert "서로 충돌" in result.stderr
+
+
+def test_profile_registry_import_does_not_require_valid_runtime_profile():
+    """깨진 ML_PROFILE 상태에서도 관리 모듈을 import해 원격 프로필을 복구할 수 있어야 한다."""
+    env = _fresh_process_env(ML_PROFILE="missing-profile-that-must-not-load")
+    code = (
+        "import sys; import ml_core.profile_registry; "
+        "assert 'ml_core.common_config' not in sys.modules"
+    )
+
+    subprocess.run(
+        [sys.executable, "-c", code],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
 
 
 @pytest.mark.parametrize(
@@ -74,6 +412,8 @@ def test_subtract_months_clamps_to_actual_month_end(d, months, expected):
 
 
 def test_training_window_uses_lookback_and_safety_margin(monkeypatch):
+    monkeypatch.delenv("TRAIN_WINDOW_START", raising=False)
+    monkeypatch.delenv("TRAIN_WINDOW_END", raising=False)
     monkeypatch.setattr(common_config, "TRAIN_LOOKBACK_MONTHS", 6)
     monkeypatch.setattr(common_config, "TRAINING_SAFETY_MARGIN_DAYS", 7)
 
@@ -81,6 +421,64 @@ def test_training_window_uses_lookback_and_safety_margin(monkeypatch):
 
     assert end == date(2026, 8, 12)  # 8/19 - 7일
     assert start == date(2026, 2, 12)  # end - 6개월
+
+
+def test_training_window_uses_exact_explicit_pair(monkeypatch):
+    """최초 챔피언은 현재 날짜와 무관하게 2025년 전체를 정확히 선택할 수 있어야 한다."""
+    monkeypatch.setenv("TRAIN_WINDOW_START", "2025-01-01")
+    monkeypatch.setenv("TRAIN_WINDOW_END", "2025-12-31")
+
+    assert common_config.training_window(as_of=date(2099, 1, 1)) == (
+        date(2025, 1, 1),
+        date(2025, 12, 31),
+    )
+
+
+def test_training_and_feature_engine_resolve_same_explicit_window_in_fresh_process():
+    """두 파이프라인 설정이 공용 API에서 동일한 2025 exact window를 받아야 한다."""
+    env = _fresh_process_env(
+        TRAIN_WINDOW_START="2025-01-01",
+        TRAIN_WINDOW_END="2025-12-31",
+    )
+    env.pop("ML_PROFILE", None)
+    code = (
+        "from training import config as training_config; "
+        "from feature_engine.spark import config as feature_config; "
+        "assert training_config.TRAIN_WINDOW_START.isoformat() == '2025-01-01'; "
+        "assert training_config.TRAIN_WINDOW_END.isoformat() == '2025-12-31'; "
+        "assert feature_config.WINDOW_START == training_config.TRAIN_WINDOW_START; "
+        "assert feature_config.WINDOW_END == training_config.TRAIN_WINDOW_END"
+    )
+
+    subprocess.run(
+        [sys.executable, "-c", code],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+
+@pytest.mark.parametrize(
+    ("start", "end", "message"),
+    [
+        ("2025-01-01", None, "반드시 함께"),
+        (None, "2025-12-31", "반드시 함께"),
+        ("2025-02-30", "2025-12-31", "YYYY-MM-DD"),
+        ("20250101", "2025-12-31", "YYYY-MM-DD"),
+        ("2025-12-31", "2025-01-01", "늦을 수 없습니다"),
+    ],
+)
+def test_training_window_rejects_incomplete_invalid_or_reversed_explicit_pair(monkeypatch, start, end, message):
+    """부분·오형식·역전 구간을 rolling으로 조용히 대체하면 안 된다."""
+    for name, value in (("TRAIN_WINDOW_START", start), ("TRAIN_WINDOW_END", end)):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+
+    with pytest.raises(ValueError, match=message):
+        common_config.training_window()
 
 
 def test_profile_registry_push_fetch_list_round_trip(tmp_path, monkeypatch):
@@ -98,3 +496,8 @@ def test_profile_registry_push_fetch_list_round_trip(tmp_path, monkeypatch):
     assert profile_registry.fetch_profile("roundtrip-test")["ROLLING_EMBARGO_MINUTES"] == 77
     assert "roundtrip-test" in profile_registry.list_profiles()
     assert "roundtrip-test" in common_config.list_profile_names()
+
+
+def test_profile_registry_rejects_reserved_builtin_name():
+    with pytest.raises(ValueError, match="예약된 내장 프로필"):
+        profile_registry.push_profile(common_config.BUILTIN_PROFILE_NAME, common_config._DEFAULT_PROFILE)

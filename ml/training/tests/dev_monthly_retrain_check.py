@@ -4,8 +4,9 @@
 `common_config.list_profile_names()`가 `[]`를 반환하는데, 예전 `_candidate_profiles()`는
 "PROFILE_NAME이 이미 목록에 있을 때만 맨 앞으로 재배치"할 뿐 없으면 추가하지
 않아서, 이 경우 후보가 아예 0개가 되어 `--execute`로 실행해도 재학습 시도 자체가
-0번으로 조용히 끝났다. 지금은 목록 여부와 무관하게 항상 최소 1개(챔피언이 학습됐던
-프로필, 없으면 이 프로세스의 기본 프로필)가 후보에 들어간다.
+0번으로 조용히 끝났다. 지금은 목록 여부와 무관하게 챔피언이 학습됐던 프로필
+(없으면 이 프로세스의 기본 프로필)과 내장 `builtin-default`가 중복 없이 후보에
+들어간다.
 
 **2026-08 재설계**: 1차 후보는 이제 임의의 "기본 프로필"이 아니라 **챔피언이 실제로
 학습됐던 프로필**이다(하이퍼파라미터는 그대로, 학습기간만 최신 롤링 윈도우로 갱신) —
@@ -15,13 +16,16 @@
 """
 
 import pytest
+from botocore.exceptions import EndpointConnectionError
 from core import s3 as s3_io
-from ml_core import common_config, scoring
+from ml_core import common_config, profile_contract, scoring
 from ml_core.paths import model_json_key, read_champion_prefix, write_champion_pointer
+from ml_core.serving_contract import ServingProfileContractError
 
 from training.scripts.monthly_retrain_check import (
     _candidate_profiles,
     _champion_profile_name,
+    _monthly_subprocess_env,
 )
 
 
@@ -70,7 +74,10 @@ def test_candidate_profiles_always_has_at_least_one_entry_when_s3_profile_list_i
 
     candidates = _candidate_profiles("rental")
 
-    assert candidates == [("default", {"TRAIN_LOOKBACK_MONTHS": "12"})]
+    assert candidates == [
+        ("default", {"TRAIN_LOOKBACK_MONTHS": "12"}),
+        (common_config.BUILTIN_PROFILE_NAME, {}),
+    ]
 
 
 def test_candidate_profiles_puts_champion_profile_first_with_period_override_then_others_sorted():
@@ -83,7 +90,44 @@ def test_candidate_profiles_puts_champion_profile_first_with_period_override_the
     assert candidates[0] == ("b-profile", {"TRAIN_LOOKBACK_MONTHS": str(common_config.TRAIN_LOOKBACK_MONTHS)})
     # 챔피언 프로필(b-profile)은 1차 시도에서 이미 다뤘으니 "나머지" 목록에서는 빠지고,
     # 나머지는 학습기간 override 없이(빈 dict) 이름순으로 온다.
-    assert candidates[1:] == [("a-profile", {}), ("c-profile", {})]
+    assert candidates[1:] == [
+        (common_config.BUILTIN_PROFILE_NAME, {}),
+        ("a-profile", {}),
+        ("c-profile", {}),
+    ]
+
+
+def test_candidate_profiles_includes_builtin_only_once_when_primary_or_s3_list_contains_it(monkeypatch):
+    """내장 프로필이 primary/S3 목록과 겹쳐도 재학습을 중복 실행하면 안 된다."""
+    monkeypatch.setattr(common_config, "PROFILE_NAME", common_config.BUILTIN_PROFILE_NAME)
+    monkeypatch.setattr(common_config, "list_profile_names", lambda: [common_config.BUILTIN_PROFILE_NAME, "remote"])
+
+    candidates = _candidate_profiles("rental")
+
+    assert candidates == [
+        (common_config.BUILTIN_PROFILE_NAME, {"TRAIN_LOOKBACK_MONTHS": str(common_config.TRAIN_LOOKBACK_MONTHS)}),
+        ("remote", {}),
+    ]
+
+
+def test_monthly_subprocess_env_always_uses_rolling_window(monkeypatch):
+    """최초 2025 고정 구간이 상위 환경에 남아 있어도 월별 재학습에 상속하지 않는다."""
+    monkeypatch.setenv("TRAIN_WINDOW_START", "2025-01-01")
+    monkeypatch.setenv("TRAIN_WINDOW_END", "2025-12-31")
+
+    env = _monthly_subprocess_env(
+        "remote",
+        {
+            "TRAIN_LOOKBACK_MONTHS": "6",
+            "TRAIN_WINDOW_START": "2099-01-01",
+            "TRAIN_WINDOW_END": "2099-12-31",
+        },
+    )
+
+    assert env["ML_PROFILE"] == "remote"
+    assert env["TRAIN_LOOKBACK_MONTHS"] == "6"
+    assert "TRAIN_WINDOW_START" not in env
+    assert "TRAIN_WINDOW_END" not in env
 
 
 def test_attempt_promotion_uses_a_unique_archive_prefix_each_call(monkeypatch):
@@ -95,6 +139,7 @@ def test_attempt_promotion_uses_a_unique_archive_prefix_each_call(monkeypatch):
     from training.scripts import monthly_retrain_check as mrc
 
     monkeypatch.setattr(mrc, "_candidate_profiles", lambda model_name: [("default", {})])
+    monkeypatch.setattr(mrc, "_validate_candidate_serving_contract", lambda profile_name, env_overrides: None)
     monkeypatch.setattr(mrc, "_trigger_feature_pipeline", lambda profile_name, env_overrides: None)
     monkeypatch.setattr(mrc, "should_promote", lambda challenger, champion: (False, ["기준 미달"]))
 
@@ -111,3 +156,184 @@ def test_attempt_promotion_uses_a_unique_archive_prefix_each_call(monkeypatch):
 
     assert len(used_archive_dates) == 2
     assert used_archive_dates[0] != used_archive_dates[1]
+
+
+def test_attempt_promotion_skips_incompatible_contract_and_tries_next_profile(monkeypatch):
+    """지표를 통과해도 계약 검증이 거부한 후보에서 월별 작업 전체가 멈추지 않는다."""
+    from training.scripts import monthly_retrain_check as mrc
+
+    monkeypatch.setattr(mrc, "_candidate_profiles", lambda model_name: [("bad-contract", {}), ("compatible", {})])
+    monkeypatch.setattr(mrc, "_validate_candidate_serving_contract", lambda profile_name, env_overrides: None)
+    monkeypatch.setattr(mrc, "_trigger_feature_pipeline", lambda profile_name, env_overrides: None)
+    monkeypatch.setattr(
+        mrc,
+        "_run_training_subprocess",
+        lambda model_name, profile_name, archive_date, env_overrides: {
+            "poisson_deviance_test": 0.5,
+            "p10_p90_coverage_calibrated_test": 0.8,
+        },
+    )
+    monkeypatch.setattr(mrc, "should_promote", lambda challenger, champion: (True, ["지표 통과"]))
+
+    promoted_profiles = []
+
+    def _promote(model_name: str, archive_prefix: str) -> dict:
+        promoted_profiles.append(archive_prefix.rsplit("/", 1)[-1])
+        if archive_prefix.endswith("/bad-contract"):
+            raise ServingProfileContractError("ROLLING_WINDOW_MINUTES 불일치")
+        return {"archive_prefix": archive_prefix}
+
+    monkeypatch.setattr(mrc, "promote_challenger", _promote)
+
+    assert mrc._attempt_promotion("rental", None) is True
+    assert promoted_profiles == ["bad-contract", "compatible"]
+
+
+def test_validate_candidate_contract_allows_training_only_differences(monkeypatch):
+    """preflight는 LGB 튜닝과 학습 기간 차이를 serving mismatch로 보지 않는다."""
+    from training.scripts import monthly_retrain_check as mrc
+
+    candidate = common_config.effective_profile()
+    candidate["TRAIN_LOOKBACK_MONTHS"] = 3
+    candidate["LGB_PARAMS_COMMON"] = {**candidate["LGB_PARAMS_COMMON"], "num_leaves": 127}
+    monkeypatch.setattr(common_config, "_load_profile", lambda profile_name: candidate)
+
+    mrc._validate_candidate_serving_contract("training-tuned", {})
+
+
+def test_validate_candidate_contract_applies_attempt_env_before_comparing(monkeypatch):
+    """subprocess에 전달할 override까지 반영해 feature 의미 차이를 미리 찾는다."""
+    from training.scripts import monthly_retrain_check as mrc
+
+    monkeypatch.setattr(common_config, "_load_profile", lambda profile_name: common_config.effective_profile())
+
+    with pytest.raises(ServingProfileContractError, match="ROLLING_WINDOW_MINUTES"):
+        mrc._validate_candidate_serving_contract(
+            "changed-window",
+            {"ROLLING_WINDOW_MINUTES": str(common_config.ROLLING_WINDOW_MINUTES + 5)},
+        )
+
+
+def test_validate_candidate_contract_resolves_anchor_from_effective_grid(monkeypatch):
+    """grid env만 바꾼 후보는 subprocess와 동일하게 anchor도 새 grid를 따라야 한다."""
+    from training.scripts import monthly_retrain_check as mrc
+
+    candidate = common_config.effective_profile()
+    monkeypatch.setattr(common_config, "_load_profile", lambda profile_name: candidate.copy())
+    captured = {}
+
+    def _capture(expected_profile, actual_profile, **_kwargs):
+        captured.update(actual_profile)
+
+    monkeypatch.setattr(mrc, "assert_serving_profiles_compatible", _capture)
+
+    mrc._validate_candidate_serving_contract(
+        "grid-five",
+        {
+            "GRID_TICK_MINUTES": "5",
+            "ROLLING_TICK_MINUTES": "5",
+        },
+    )
+
+    assert captured["GRID_TICK_MINUTES"] == 5
+    assert captured["TRAIN_ANCHOR_TICK_MINUTES"] == 5
+
+
+def test_validate_candidate_contract_preserves_explicit_hybrid_anchor(monkeypatch):
+    """grid env와 canonical anchor를 함께 주면 g5/a20 hybrid가 preflight에 보존돼야 한다."""
+    from training.scripts import monthly_retrain_check as mrc
+
+    candidate = common_config.effective_profile()
+    monkeypatch.setattr(common_config, "_load_profile", lambda profile_name: candidate.copy())
+    captured = {}
+
+    def _capture(expected_profile, actual_profile, **_kwargs):
+        captured.update(actual_profile)
+
+    monkeypatch.setattr(mrc, "assert_serving_profiles_compatible", _capture)
+
+    mrc._validate_candidate_serving_contract(
+        "hybrid",
+        {
+            "GRID_TICK_MINUTES": "5",
+            "ROLLING_TICK_MINUTES": "5",
+            "TRAIN_ANCHOR_TICK_MINUTES": "20",
+        },
+    )
+
+    assert captured["GRID_TICK_MINUTES"] == 5
+    assert captured["TRAIN_ANCHOR_TICK_MINUTES"] == 20
+
+
+def test_validate_candidate_contract_keeps_profile_hybrid_anchor_with_redundant_grid_env(monkeypatch):
+    """원격 g5/a20 후보는 redundant g5 환경변수를 상속해도 a5로 축소되면 안 된다."""
+    from training.scripts import monthly_retrain_check as mrc
+
+    candidate = profile_contract.merge_and_validate_profile(
+        {
+            "GRID_TICK_MINUTES": 5,
+            "ROLLING_TICK_MINUTES": 5,
+            "TRAIN_ANCHOR_TICK_MINUTES": 20,
+        },
+        "hybrid",
+    )
+    monkeypatch.setattr(common_config, "_load_profile", lambda profile_name: candidate.copy())
+    captured = {}
+
+    def _capture(expected_profile, actual_profile, **_kwargs):
+        captured.update(actual_profile)
+
+    monkeypatch.setattr(mrc, "assert_serving_profiles_compatible", _capture)
+
+    mrc._validate_candidate_serving_contract(
+        "hybrid",
+        {"GRID_TICK_MINUTES": "5", "ROLLING_TICK_MINUTES": "5"},
+    )
+
+    assert captured["GRID_TICK_MINUTES"] == 5
+    assert captured["TRAIN_ANCHOR_TICK_MINUTES"] == 20
+
+
+def test_validate_candidate_contract_wraps_s3_failure_for_candidate_skip(monkeypatch):
+    """원격 후보 하나의 S3 장애가 월별 후보 순회 전체를 중단시키면 안 된다."""
+    from training.scripts import monthly_retrain_check as mrc
+
+    def _raise_s3_error(_profile_name: str):
+        raise EndpointConnectionError(endpoint_url="http://unavailable-profile-store")
+
+    monkeypatch.setattr(common_config, "_load_profile", _raise_s3_error)
+
+    with pytest.raises(ServingProfileContractError, match="서빙 계약으로 해석할 수 없습니다"):
+        mrc._validate_candidate_serving_contract("unavailable", {})
+
+
+def test_attempt_promotion_skips_contract_mismatch_before_feature_or_training(monkeypatch):
+    """서빙 계약이 다른 후보에는 Spark와 LightGBM 비용을 쓰지 않는다."""
+    from training.scripts import monthly_retrain_check as mrc
+
+    monkeypatch.setattr(mrc, "_candidate_profiles", lambda model_name: [("bad-contract", {}), ("compatible", {})])
+
+    def _preflight(profile_name: str, env_overrides: dict[str, str]) -> None:
+        if profile_name == "bad-contract":
+            raise ServingProfileContractError("HORIZON_COUNT 불일치")
+
+    monkeypatch.setattr(mrc, "_validate_candidate_serving_contract", _preflight)
+    triggered_profiles = []
+    trained_profiles = []
+    monkeypatch.setattr(
+        mrc,
+        "_trigger_feature_pipeline",
+        lambda profile_name, env_overrides: triggered_profiles.append(profile_name),
+    )
+
+    def _train(model_name: str, profile_name: str, archive_date: str, env_overrides: dict[str, str]) -> dict:
+        trained_profiles.append(profile_name)
+        return {"poisson_deviance_test": 0.5, "p10_p90_coverage_calibrated_test": 0.8}
+
+    monkeypatch.setattr(mrc, "_run_training_subprocess", _train)
+    monkeypatch.setattr(mrc, "should_promote", lambda challenger, champion: (True, ["통과"]))
+    monkeypatch.setattr(mrc, "promote_challenger", lambda model_name, archive_prefix: {})
+
+    assert mrc._attempt_promotion("rental", None) is True
+    assert triggered_profiles == ["compatible"]
+    assert trained_profiles == ["compatible"]

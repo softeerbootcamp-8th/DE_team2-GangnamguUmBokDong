@@ -16,6 +16,7 @@ byte-identical 결과).
 moto S3에 multi-horizon 테이블을 직접 심는다(`dev_train_target_mlflow.py`와 같은 방식).
 """
 
+import weakref
 from datetime import date
 
 import pandas as pd
@@ -64,10 +65,29 @@ def _seed_rental_table(n_each: int = 8) -> None:
 
 
 def test_rental_quantile_predictions_are_not_contaminated_by_exposure_offset(monkeypatch):
+    from training import train_common
+
     monkeypatch.setattr(config, "TRAIN_WINDOW_START", date(2025, 1, 1))
     monkeypatch.setattr(config, "TRAIN_WINDOW_END", date(2025, 12, 31))
     monkeypatch.setattr(config, "LGB_NUM_BOOST_ROUND", 5)
     monkeypatch.setattr(config, "LGB_EARLY_STOPPING_ROUNDS", 5)
+
+    original_build = train_common.lazy_train_dataset.build_lazy_dataset
+    poisson_dataset_refs: list[weakref.ReferenceType] = []
+    build_count = 0
+
+    def _tracking_build(*args, **kwargs):
+        """quantile construct 전에 poisson train/valid Dataset이 실제 해제됐는지 확인한다."""
+        nonlocal build_count
+        if build_count == 2:
+            assert all(ref() is None for ref in poisson_dataset_refs)
+        result = original_build(*args, **kwargs)
+        if build_count < 2:
+            poisson_dataset_refs.append(weakref.ref(result[0]))
+        build_count += 1
+        return result
+
+    monkeypatch.setattr(train_common.lazy_train_dataset, "build_lazy_dataset", _tracking_build)
 
     _seed_rental_table()
     metrics = train_target(
@@ -78,3 +98,4 @@ def test_rental_quantile_predictions_are_not_contaminated_by_exposure_offset(mon
     # P10~P90 커버리지가 사실상 0에 가깝게 무너진다. 라벨 규모를 못 맞추더라도(작은
     # 합성 데이터라 학습이 완벽하진 않음) 완전 붕괴는 아니어야 한다.
     assert metrics["p10_p90_coverage_raw_test"] > 0.0
+    assert build_count == 4

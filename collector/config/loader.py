@@ -63,38 +63,77 @@ def _check_adapter_params(config: SourceConfig) -> list[str]:
         return []
 
     errors: list[str] = []
-    pagination = params.get("pagination")
-    if pagination not in (None, "probe_until_empty"):
-        errors.append(
-            "adapter_params.pagination: 생략하거나 'probe_until_empty'여야 합니다."
-        )
-    elif pagination == "probe_until_empty":
-        page_size = params.get("page_size")
-        if (
-            not isinstance(page_size, int)
-            or isinstance(page_size, bool)
-            or page_size < 1
-        ):
-            errors.append("adapter_params.page_size: 1 이상의 정수여야 합니다.")
-        if config.natural_key is None:
+    for required in ("service", "root_key"):
+        value = params.get(required)
+        if not isinstance(value, str) or not value.strip():
             errors.append(
-                "adapter_params.pagination: probe_until_empty에는 natural_key가 필수입니다."
+                f"adapter_params.{required}: 비어있지 않은 문자열이 필수입니다."
+            )
+    page_size = params.get("page_size")
+    if not isinstance(page_size, int) or isinstance(page_size, bool) or page_size < 1:
+        errors.append("adapter_params.page_size: 1 이상의 정수여야 합니다.")
+
+    pagination = params.get("pagination", "total")
+    if pagination not in {"total", "probe", "probe_until_empty"}:
+        errors.append(
+            "adapter_params.pagination: 'total', 'probe' 또는 "
+            "'probe_until_empty'여야 합니다."
+        )
+
+    for option in ("root_key_literal", "flatten_forecast"):
+        if option in params and not isinstance(params[option], bool):
+            errors.append(f"adapter_params.{option}: boolean이어야 합니다.")
+
+    if params.get("service") == "citydata_ppltn":
+        if pagination != "total":
+            errors.append(
+                "adapter_params.pagination: citydata_ppltn에는 probe를 사용할 수 없습니다."
+            )
+        if params.get("root_key_literal") is not True:
+            errors.append(
+                "adapter_params.root_key_literal: citydata_ppltn에는 true가 필수입니다."
+            )
+        if params.get("flatten_forecast") is not True:
+            errors.append(
+                "adapter_params.flatten_forecast: citydata_ppltn에는 true가 필수입니다."
             )
 
-    if params.get("service") != "citydata_ppltn":
+        poi_start = params.get("poi_start", 1)
+        poi_end = params.get("poi_end")
+        if not isinstance(poi_start, int) or isinstance(poi_start, bool):
+            errors.append("adapter_params.poi_start: 1 이상의 정수여야 합니다.")
+        if not isinstance(poi_end, int) or isinstance(poi_end, bool):
+            errors.append("adapter_params.poi_end: 필수이며 정수여야 합니다.")
+        if (
+            isinstance(poi_start, int)
+            and not isinstance(poi_start, bool)
+            and isinstance(poi_end, int)
+            and not isinstance(poi_end, bool)
+            and (poi_start < 1 or poi_end < poi_start)
+        ):
+            errors.append(
+                "adapter_params.poi_start/poi_end: 1 <= poi_start <= poi_end여야 합니다."
+            )
         return errors
 
-    poi_start = params.get("poi_start", 1)
-    poi_end = params.get("poi_end")
-    if not isinstance(poi_start, int) or isinstance(poi_start, bool):
-        errors.append("adapter_params.poi_start: 1 이상의 정수여야 합니다.")
-        return errors
-    if not isinstance(poi_end, int) or isinstance(poi_end, bool):
-        errors.append("adapter_params.poi_end: 필수이며 정수여야 합니다.")
-        return errors
-    if poi_start < 1 or poi_end < poi_start:
+    if pagination in {"probe", "probe_until_empty"}:
+        if config.natural_key is None:
+            errors.append(
+                "adapter_params.pagination: probe pagination에는 natural_key가 필수입니다."
+            )
+        max_probe_pages = params.get("max_probe_pages")
+        if (
+            not isinstance(max_probe_pages, int)
+            or isinstance(max_probe_pages, bool)
+            or max_probe_pages < 1
+        ):
+            errors.append(
+                "adapter_params.max_probe_pages: probe pagination이면 "
+                "1 이상의 정수가 필수입니다."
+            )
+    elif "max_probe_pages" in params:
         errors.append(
-            "adapter_params.poi_start/poi_end: 1 <= poi_start <= poi_end여야 합니다."
+            "adapter_params.max_probe_pages: probe pagination에서만 사용할 수 있습니다."
         )
     return errors
 

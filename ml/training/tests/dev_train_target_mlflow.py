@@ -19,6 +19,7 @@ import pandas as pd
 import pytest
 from core import s3 as s3_io
 from ml_core.day_index import day_index
+from ml_core.paths import model_json_key
 
 from training import config, train_common
 from training.train_common import train_target
@@ -75,18 +76,30 @@ def _latest_run(experiment_name: str):
     return client.search_runs([exp.experiment_id], max_results=1)[0]
 
 
-def test_train_target_ends_run_as_finished_on_success():
+def test_train_target_ends_run_as_finished_on_success(monkeypatch):
     _seed_return_table()
+    monkeypatch.setattr(
+        train_common.common_config,
+        "PROFILE",
+        {"profile_name": "forged-name", "ROLLING_EMBARGO_MINUTES": 40},
+    )
+    monkeypatch.setattr(train_common.common_config, "ROLLING_EMBARGO_MINUTES", 55)
+    models_prefix = "models/test/finished"
 
-    metrics = train_target("return_count", "return", models_prefix="models/test/finished")
+    metrics = train_target("return_count", "return", models_prefix=models_prefix)
 
     assert "rmse_test" in metrics
     run = _latest_run(config.MLFLOW_EXPERIMENT_NAME)
     assert run.info.status == "FINISHED"
     assert run.data.params["train_day_divisor"] == str(config.TRAIN_DAY_DIVISOR)
+    assert run.data.params["train_window_start"] == "2025-01-01"
+    assert run.data.params["train_window_end"] == "2025-12-31"
     assert "learning_rate" in run.data.params  # LGB_PARAMS_COMMON이 로깅됐는지
     assert "rmse_test" in run.data.metrics
     assert mlflow.active_run() is None
+    saved_profile = s3_io.read_json(model_json_key("return", "profile", models_prefix))
+    assert saved_profile["profile_name"] == train_common.common_config.PROFILE_NAME
+    assert saved_profile["ROLLING_EMBARGO_MINUTES"] == 55
 
 
 def test_train_target_ends_run_as_failed_on_exception(monkeypatch):
