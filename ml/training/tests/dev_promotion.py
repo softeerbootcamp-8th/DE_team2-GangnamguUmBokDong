@@ -1,16 +1,49 @@
-"""training.promotion의 승격 판정(should_promote)과 챔피언 포인터 전환
-(promote_challenger)을 검증한다."""
+"""모델 승격 정책과 포인터 전환을 검증한다.
 
+개별 challenger 판정뿐 아니라 rental/return pair serving release의 원자적 전환과
+fail-closed 조건을 함께 확인한다.
+"""
+
+import io
+from collections import Counter
+
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 from core import s3 as s3_io
+from core.gold_publication import sha256_hex
+from core.model_snapshot import (
+    ModelKind,
+    StationCrosswalkEntry,
+    build_station_crosswalk,
+)
 from ml_core import common_config, scoring
-from ml_core.paths import model_json_key, read_champion_prefix, write_champion_pointer
+from ml_core.paths import (
+    model_json_key,
+    model_key,
+    read_champion_prefix,
+    serving_release_pointer_key,
+    write_champion_pointer,
+)
 from ml_core.serving_contract import ServingProfileContractError
+from ml_core.serving_release import (
+    CrossContractServingReleaseError,
+    EffectiveContractRef,
+    ExplicitImmutablePayload,
+    ImmutableArtifactRef,
+    ModelManifestRef,
+    build_effective_serving_contract,
+    build_serving_release_manifest,
+    load_current_serving_release,
+)
 
 from training.promotion import (
     ChampionAlreadyExistsError,
+    PairServingReleaseRequiredError,
     bootstrap_challenger,
+    prepare_and_promote_serving_release_pair,
     promote_challenger,
+    promote_serving_release_pair,
     should_promote,
 )
 
@@ -35,6 +68,113 @@ def _write_profile(model_name: str, archive_prefix: str, profile: dict | None = 
     payload = profile or common_config.effective_profile()
     s3_io.write_json(model_json_key(model_name, "profile", archive_prefix), payload)
     return payload
+
+
+def _release_manifest(profile: dict):
+    """Promotion gate 테스트용 valid pair release manifest를 만든다."""
+    contract_payload = build_effective_serving_contract(profile)
+    contract_sha = sha256_hex(contract_payload)
+    contract_version = f"sha256:{contract_sha}"
+
+    def _model_ref(model_kind: ModelKind, digest: str) -> ModelManifestRef:
+        """지정 kind의 content-addressed model manifest ref를 만든다."""
+        return ModelManifestRef(
+            byte_sha256=digest,
+            effective_contract_version=contract_version,
+            model_kind=model_kind,
+            model_version=f"sha256:{digest}",
+            uri=(
+                f"s3://test-bucket/models/{model_kind.value}/"
+                f"sha256={digest}.json"
+            ),
+        )
+
+    profile_sha = "c" * 64
+    return build_serving_release_manifest(
+        rental_model_manifest=_model_ref(ModelKind.RENTAL, "a" * 64),
+        return_model_manifest=_model_ref(ModelKind.RETURN, "b" * 64),
+        station_profile=ImmutableArtifactRef(
+            byte_sha256=profile_sha,
+            uri=f"s3://test-bucket/profiles/sha256={profile_sha}.parquet",
+        ),
+        effective_contract=EffectiveContractRef(
+            byte_sha256=contract_sha,
+            uri=f"s3://test-bucket/contracts/sha256={contract_sha}.json",
+            version=contract_version,
+        ),
+    )
+
+
+def _station_source() -> ExplicitImmutablePayload:
+    """Pair promotion gate에 전달할 canonical immutable crosswalk source를 만든다."""
+    crosswalk = build_station_crosswalk(
+        [StationCrosswalkEntry(station_no=1, sta_id="ST-1")]
+    )
+    return ExplicitImmutablePayload(
+        payload=crosswalk.canonical_bytes,
+        byte_sha256=crosswalk.sha256,
+        uri=(
+            "s3://test-bucket/build-input/station-crosswalk/"
+            f"sha256={crosswalk.sha256}.json"
+        ),
+    )
+
+
+def _parquet_bytes(rows: dict[str, list]) -> bytes:
+    """Production orchestration 테스트용 single-object Parquet bytes를 만든다."""
+    buffer = io.BytesIO()
+    pq.write_table(pa.table(rows), buffer)
+    return buffer.getvalue()
+
+
+def _station_profile_rows(
+    station_nos: tuple[int, ...] = (1, 2),
+    *,
+    grid_tick_minutes: int = 20,
+) -> dict[str, list]:
+    """전역 tick과 model station coverage를 가진 최소 valid profile 행을 만든다."""
+    minutes = list(range(0, 1440, grid_tick_minutes))
+    repeated_station_nos = [
+        station_nos[index % len(station_nos)] for index in range(len(minutes))
+    ]
+    row_count = len(minutes)
+    return {
+        "station_no": repeated_station_nos,
+        "minute": minutes,
+        "dow": [0] * row_count,
+        "month": [1] * row_count,
+        "rental_mean": [1.0] * row_count,
+        "rental_std": [0.0] * row_count,
+        "return_mean": [1.0] * row_count,
+        "return_std": [0.0] * row_count,
+        "n_samples": [1] * row_count,
+    }
+
+
+def _write_model_archive(
+    model_name: str,
+    archive_prefix: str,
+    *,
+    profile: dict,
+    categories: list[int],
+) -> tuple[str, ...]:
+    """기존 training archive의 serving artifact 8개를 moto S3에 쓴다."""
+    keys: list[str] = []
+    for suffix in ("poisson", "q10", "q50", "q90"):
+        key = model_key(model_name, suffix, archive_prefix)
+        s3_io.put_object_bytes(key, f"{model_name}-{suffix}".encode())
+        keys.append(key)
+    json_payloads = {
+        "conformal_correction": {"correction": 1.0, "target_coverage": 0.8},
+        "metrics": {"poisson_deviance_test": 1.0},
+        "profile": profile,
+        "station_categories": categories,
+    }
+    for kind, payload in json_payloads.items():
+        key = model_json_key(model_name, kind, archive_prefix)
+        s3_io.write_json(key, payload)
+        keys.append(key)
+    return tuple(keys)
 
 
 def test_should_promote_when_no_champion_exists_yet():
@@ -182,7 +322,7 @@ def test_promote_challenger_rejects_profile_incompatible_with_active_serving():
     profile["ROLLING_EMBARGO_MINUTES"] += 5
     _write_profile("rental", archive_prefix, profile)
 
-    with pytest.raises(ServingProfileContractError, match="ROLLING_EMBARGO_MINUTES"):
+    with pytest.raises(PairServingReleaseRequiredError, match="pair.*ROLLING_EMBARGO_MINUTES"):
         promote_challenger("rental", archive_prefix)
 
     read_champion_prefix.cache_clear()
@@ -202,7 +342,7 @@ def test_promote_challenger_rejects_contract_different_from_other_champion():
     rental_prefix = "models/archive/dt=2026-08-17/current"
     _write_profile("rental", rental_prefix)
 
-    with pytest.raises(ServingProfileContractError, match="TARGET_HORIZON_MINUTES"):
+    with pytest.raises(PairServingReleaseRequiredError, match="pair.*TARGET_HORIZON_MINUTES"):
         promote_challenger("rental", rental_prefix)
 
     read_champion_prefix.cache_clear()
@@ -256,3 +396,154 @@ def test_promote_challenger_rejects_other_champion_without_profile():
     read_champion_prefix.cache_clear()
     with pytest.raises(FileNotFoundError):
         read_champion_prefix("rental")
+
+
+def test_pair_promotion_rejects_legacy_cross_contract_without_maintenance_gate():
+    """Release pointer가 없어도 기존 champion과 다른 contract는 자동 migration하지 않는다."""
+    legacy_prefix = "models/archive/dt=2026-08-01/legacy"
+    _write_profile("rental", legacy_prefix)
+    write_champion_pointer("rental", legacy_prefix)
+
+    changed_profile = common_config.effective_profile()
+    changed_profile["GRID_TICK_MINUTES"] = 10
+    changed_profile["ROLLING_TICK_MINUTES"] = 10
+    changed_profile["TRAIN_ANCHOR_TICK_MINUTES"] = 10
+
+    with pytest.raises(CrossContractServingReleaseError, match="maintenance"):
+        promote_serving_release_pair(
+            _release_manifest(changed_profile),
+            station_source=_station_source(),
+        )
+
+
+def test_pair_promotion_preserves_same_contract_legacy_compatibility(monkeypatch):
+    """기존 champion과 같은 serving contract pair는 기존 환경에서도 승격 경로에 진입한다."""
+    legacy_prefix = "models/archive/dt=2026-08-01/same-contract"
+    _write_profile("return", legacy_prefix)
+    write_champion_pointer("return", legacy_prefix)
+    manifest = _release_manifest(common_config.effective_profile())
+    sentinel = object()
+
+    def _publish(candidate, **kwargs):
+        """Pair wrapper가 검증 뒤 publication 경계를 호출했는지 기록한다."""
+        assert candidate is manifest
+        assert kwargs["allow_contract_change"] is False
+        return sentinel
+
+    monkeypatch.setattr("training.promotion.publish_serving_release", _publish)
+
+    assert (
+        promote_serving_release_pair(manifest, station_source=_station_source())
+        is sentinel
+    )
+
+
+def test_prepare_and_promote_pair_from_existing_archives_reads_sources_once(
+    monkeypatch,
+):
+    """기존 archive와 exact build source에서 production pair pointer까지 만든다."""
+    rental_prefix = "models/archive/dt=2026-08-20/rental"
+    return_prefix = "models/archive/dt=2026-08-20/return"
+    rental_profile = common_config.effective_profile()
+    return_profile = common_config.effective_profile()
+    return_profile["TRAIN_LOOKBACK_MONTHS"] = 6
+    return_profile["LGB_PARAMS_COMMON"] = {
+        **return_profile["LGB_PARAMS_COMMON"],
+        "num_leaves": 31,
+    }
+    source_keys = set(
+        _write_model_archive(
+            "rental",
+            rental_prefix,
+            profile=rental_profile,
+            categories=[2, 1],
+        )
+    )
+    source_keys.update(
+        _write_model_archive(
+            "return",
+            return_prefix,
+            profile=return_profile,
+            categories=[1, 2],
+        )
+    )
+    station_profile_key = "processed/features/release/station_profile.parquet"
+    station_master_key = "processed/features/release/station_master.parquet"
+    s3_io.put_object_bytes(
+        station_profile_key,
+        _parquet_bytes(_station_profile_rows()),
+    )
+    s3_io.put_object_bytes(
+        station_master_key,
+        _parquet_bytes(
+            {
+                "station_id": ["ST-1", "ST-2"],
+                "station_no": [1, 2],
+            }
+        ),
+    )
+    source_keys.update({station_profile_key, station_master_key})
+
+    read_counts: Counter[str] = Counter()
+    original_get_object_bytes = s3_io.get_object_bytes
+
+    def _counted_get_object_bytes(
+        key: str,
+        timeout_seconds: float | None = None,
+    ) -> bytes | None:
+        """Source exact-key read 횟수를 기록하고 기존 S3 helper를 호출한다."""
+        read_counts[key] += 1
+        return original_get_object_bytes(key, timeout_seconds=timeout_seconds)
+
+    monkeypatch.setattr(s3_io, "get_object_bytes", _counted_get_object_bytes)
+
+    pointer = prepare_and_promote_serving_release_pair(
+        rental_archive_prefix=rental_prefix,
+        return_archive_prefix=return_prefix,
+        station_profile_source_key=station_profile_key,
+        station_master_source_key=station_master_key,
+    )
+
+    assert pointer.generation == 0
+    assert {key: read_counts[key] for key in source_keys} == {
+        key: 1 for key in source_keys
+    }
+    pinned = load_current_serving_release()
+    assert pinned.pointer == pointer
+    assert pinned.preflight.rental_model.model_kind is ModelKind.RENTAL
+    assert pinned.preflight.return_model.model_kind is ModelKind.RETURN
+    rental_crosswalk = next(
+        artifact
+        for artifact in pinned.preflight.rental_model.artifacts
+        if artifact.role == "station_crosswalk"
+    )
+    return_crosswalk = next(
+        artifact
+        for artifact in pinned.preflight.return_model.artifacts
+        if artifact.role == "station_crosswalk"
+    )
+    assert rental_crosswalk.byte_sha256 == return_crosswalk.byte_sha256
+
+
+def test_prepare_pair_rejects_spark_station_master_prefix_before_pointer():
+    """여러 part가 있는 Spark prefix를 exact station source로 추정하지 않는다."""
+    station_profile_key = "processed/features/release/station_profile.parquet"
+    station_master_prefix = "processed_v2/station_master.parquet"
+    s3_io.put_object_bytes(
+        station_profile_key,
+        _parquet_bytes(_station_profile_rows(station_nos=(1,))),
+    )
+    s3_io.put_object_bytes(
+        f"{station_master_prefix}/part-00000.snappy.parquet",
+        _parquet_bytes({"station_id": ["ST-1"], "station_no": [1]}),
+    )
+
+    with pytest.raises(FileNotFoundError, match="exact single S3 object"):
+        prepare_and_promote_serving_release_pair(
+            rental_archive_prefix="models/archive/dt=2026-08-20/rental",
+            return_archive_prefix="models/archive/dt=2026-08-20/return",
+            station_profile_source_key=station_profile_key,
+            station_master_source_key=station_master_prefix,
+        )
+
+    assert s3_io.get_object_bytes(serving_release_pointer_key()) is None
