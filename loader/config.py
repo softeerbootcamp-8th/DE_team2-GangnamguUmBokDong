@@ -8,27 +8,48 @@ from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
-import yaml
-
 import reader
 import transform
+import yaml
 from retention_config import RETENTION_GRACE
 
 _TABLES_YAML_PATH = Path(__file__).parent / "tables.yaml"
 
-# 논리 spec 이름 → 물리 DB 테이블 이름 매핑
-# 서로 다른 여러 데이터 소스가 단일 Gold 테이블로 통합 적재되는 경우를 처리한다:
-# 1) 문화/공연 행사: cultural_event(문화행사)와 performance_event(공연행사) → cultural_events 테이블로 병합
-# 2) 날씨 예보: weather_short_term_forecast(단기)와 weather_ultra_short_forecast(초단기) → weather_forecast 테이블로 병합
-TABLE_ALIASES = {
-    "cultural_events_performance": "cultural_events",
-    "weather_forecast_ultra": "weather_forecast",
-}
+RETIRED_SOURCE_TABLES: frozenset[str] = frozenset(
+    {
+        "stations",
+        "station_stock",
+        "weather_current",
+        "weather_forecast",
+        "weather_forecast_ultra",
+        "cultural_events",
+        "cultural_events_performance",
+    }
+)
+RETIRED_SOURCE_IDS: frozenset[str] = frozenset(
+    {
+        "bike_station_realtime",
+        "weather_ultra_short_live",
+        "weather_short_term_forecast",
+        "weather_ultra_short_forecast",
+        "cultural_event",
+        "performance_event",
+    }
+)
+
+
+class RetiredSourceGoldPathError(ValueError):
+    """폐기된 Silver-to-Gold 원천 적재 경로 요청을 나타낸다."""
 
 
 def target_table_for(table: str) -> str:
-    """논리 spec 이름을 실제 적재/정리 대상인 물리 테이블 이름으로 해소한다."""
-    return TABLE_ALIASES.get(table, table)
+    """파생 스펙 이름을 Gold 적재 대상으로 해소하고 폐기 경로를 거부한다."""
+    if table in RETIRED_SOURCE_TABLES or table in RETIRED_SOURCE_IDS:
+        raise RetiredSourceGoldPathError(
+            f"{table!r}의 legacy Silver-to-Gold 적재 권한은 폐기되었다. "
+            "검증된 immutable manifest를 소비하는 source publication publisher를 사용하라."
+        )
+    return table
 
 
 def _read_silver_as_pandas(source_id: str, window_start: datetime) -> pd.DataFrame:
@@ -62,6 +83,19 @@ class TableSpec:
 def _load_table_specs() -> dict[str, TableSpec]:
     """tables.yaml을 읽어 TableSpec 레지스트리 딕셔너리를 생성한다."""
     raw_specs = yaml.safe_load(_TABLES_YAML_PATH.read_text(encoding="utf-8"))
+    retired_tables = sorted(set(raw_specs) & RETIRED_SOURCE_TABLES)
+    retired_sources = sorted(
+        {
+            raw["source_id"]
+            for raw in raw_specs.values()
+            if raw["source_id"] in RETIRED_SOURCE_IDS
+        }
+    )
+    if retired_tables or retired_sources:
+        raise RetiredSourceGoldPathError(
+            "tables.yaml이 폐기된 source publication 권한을 다시 선언했다: "
+            f"tables={retired_tables}, source_ids={retired_sources}"
+        )
     specs: dict[str, TableSpec] = {}
 
     for table_name, raw in raw_specs.items():
@@ -75,7 +109,9 @@ def _load_table_specs() -> dict[str, TableSpec]:
             # 모듈 속성을 나중에 바꿔치기하므로, 호출 시점마다 다시 조회해야
             # 그 패치가 반영된다(기존 하드코딩 버전의 lambda ws: reader.read_predictions(ws)와
             # 동일한 지연 조회 방식을 유지).
-            reader_fn = lambda ws, reader_name=reader_name: getattr(reader, reader_name)(ws).to_pandas()
+            reader_fn = lambda ws, reader_name=reader_name: getattr(
+                reader, reader_name
+            )(ws).to_pandas()
 
         specs[table_name] = TableSpec(
             source_id=raw["source_id"],
@@ -95,7 +131,8 @@ def _validate_retention_config(specs: dict[str, TableSpec]) -> None:
     적재 시점(main.run)에 검사하면 upsert 뒤 commit 전에 터져 그 실행의 적재까지
     통째로 롤백되므로, 설정 오류는 여기서 미리 잡는다."""
     missing = sorted(
-        {target_table_for(name) for name, spec in specs.items() if spec.expire_col} - set(RETENTION_GRACE)
+        {target_table_for(name) for name, spec in specs.items() if spec.expire_col}
+        - set(RETENTION_GRACE)
     )
     if missing:
         raise ValueError(

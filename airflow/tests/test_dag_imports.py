@@ -1,7 +1,5 @@
 """Airflow DAG 모듈이 문법/의존성 에러 없이 로드되고 핵심 E2E 의존성을 유지하는지 확인한다."""
 
-from airflow.task.trigger_rule import TriggerRule
-
 import dags.daily_compaction as daily_compaction_dag
 import dags.daily_population_and_events as daily_dag
 import dags.e2e_realtime as e2e_realtime_dag
@@ -9,6 +7,7 @@ import dags.realtime_5min as realtime_5min_dag
 import dags.station_master as station_master_dag
 import dags.weather_3h as weather_3h_dag
 import dags.weather_10min as weather_10min_dag
+from airflow.task.trigger_rule import TriggerRule
 
 
 def test_realtime_5min_dag_id():
@@ -41,24 +40,24 @@ def test_e2e_population_is_normalized_before_inference():
     assert "enrich_station_master" in inference.upstream_task_ids
 
 
-def test_realtime_gold_waits_for_inference_and_station_stock():
+def test_realtime_derived_gold_waits_for_inference_and_station_release():
     upstream = realtime_5min_dag.dag.get_task("load_forecast_points").upstream_task_ids
-    assert upstream == {"run_inference", "load_station_stock"}
+    assert upstream == {"run_inference", "publish_station_release"}
 
 
-def test_e2e_gold_waits_for_inference_and_station_stock():
+def test_e2e_derived_gold_waits_for_inference_and_station_release():
     upstream = e2e_realtime_dag.dag.get_task("load_forecast_points").upstream_task_ids
-    assert upstream == {"run_inference", "load_station_stock"}
+    assert upstream == {"run_inference", "publish_station_release"}
 
 
 def test_urgency_loaders_wait_for_stations_fk():
     assert realtime_5min_dag.dag.get_task("load_station_urgency").upstream_task_ids == {
         "compute_urgency",
-        "load_stations",
+        "publish_station_release",
     }
     assert e2e_realtime_dag.dag.get_task("load_station_urgency").upstream_task_ids == {
         "compute_urgency",
-        "load_stations",
+        "publish_station_release",
     }
 
 
@@ -85,3 +84,15 @@ def test_station_master_daily_collector_contract():
     enrich = station_master_dag.dag.get_task("enrich_station_master")
     assert enrich.upstream_task_ids == {"collect_bike_station_master"}
     assert "station_master.py" in enrich.bash_command
+    publish = station_master_dag.dag.get_task("publish_station_master_correction")
+    assert publish.upstream_task_ids == {"collect_bike_station_master"}
+    assert "--publication station-master-correction" in publish.bash_command
+
+
+def test_e2e_station_release_waits_for_both_source_snapshots():
+    publish = e2e_realtime_dag.dag.get_task("publish_station_release")
+
+    assert publish.upstream_task_ids == {
+        "collect_bike_station_master",
+        "collect_bike_station_realtime",
+    }

@@ -28,10 +28,9 @@
 
 ## expected_total
 알 수 있는 소스만 채운다. 일반 서울 API는 첫 페이지의 `list_total_count`, 기상청은
-`None`이다. `pagination: probe`인 서울 API는 빈 종료 페이지를 확인한 뒤 실제 row
-위치로 계산하며, 이 값만 `persist=False` 메타데이터 결과로 전달한다. pipeline이 값을
-기억했다가 다음 라운드와 백필에 되돌려주므로 성공 페이지를 skip해도 계획을 복원할 수
-있다.
+`None`이다. `pagination: probe_until_empty`인 서울 API는 빈 종료 페이지를 확인한 뒤
+실제 row 위치로 계산한다. 종료 응답도 Bronze part로 보존해 source snapshot이 완결성
+증거를 가지며, pipeline은 해당 값을 다음 라운드와 백필에 되돌려준다.
 
 ## planned_parts
 요청 전에 전체 조각 키를 아는 어댑터만 제공한다. row 수와 별개인 요청 계획이며,

@@ -6,7 +6,6 @@ from itertools import pairwise
 from airflow.providers.standard.operators.bash import BashOperator
 from airflow.task.trigger_rule import TriggerRule
 from airflow.timetables.trigger import CronTriggerTimetable
-
 from config.schedules import EXECUTION_TIMEOUT_OVERRIDES, REALTIME_5MIN_CRON, TIMEZONE
 from config.sources import REALTIME_5MIN_SOURCES, RENTAL_HISTORY_LOOKBACK_HOURS
 from dags.realtime_5min import dag
@@ -21,36 +20,34 @@ def test_schedule_and_run_policy():
 
 
 def test_expected_tasks_exist():
-    expected = {f"collect_{s}" for s in REALTIME_5MIN_SOURCES} | {
-        "load_stations",
-        "load_station_stock",
-        "run_normalizer",
-        "run_inference",
-        "load_forecast_points",
-        "compute_urgency",
-        "load_station_urgency",
-        "compute_routes",
-        "load_rebalance_routes",
-        "load_rebalance_route_stops",
-    } | {
-        # 대여이력 과거 시간대 재조회. 상수를 올리면 태스크가 따라 늘어난다.
-        f"collect_bike_rental_history_replay_{h}h"
-        for h in range(1, RENTAL_HISTORY_LOOKBACK_HOURS + 1)
-    }
+    expected = (
+        {f"collect_{s}" for s in REALTIME_5MIN_SOURCES}
+        | {
+            "publish_station_release",
+            "run_normalizer",
+            "run_inference",
+            "load_forecast_points",
+            "compute_urgency",
+            "load_station_urgency",
+            "compute_routes",
+            "load_rebalance_routes",
+            "load_rebalance_route_stops",
+        }
+        | {
+            # 대여이력 과거 시간대 재조회. 상수를 올리면 태스크가 따라 늘어난다.
+            f"collect_bike_rental_history_replay_{h}h"
+            for h in range(1, RENTAL_HISTORY_LOOKBACK_HOURS + 1)
+        }
+    )
     assert set(dag.task_ids) == expected
 
 
-def test_stations_loads_before_station_stock():
-    """station_stock.sta_id가 stations.sta_id를 FK 참조하므로 순차 실행이어야 한다."""
-    load_stations = dag.get_task("load_stations")
-    load_station_stock = dag.get_task("load_station_stock")
-    assert load_station_stock.task_id in {t.task_id for t in load_stations.downstream_list}
-
-
-def test_load_stations_depends_on_bike_station_realtime():
+def test_station_release_depends_on_bike_station_realtime():
     collect = dag.get_task("collect_bike_station_realtime")
-    load_stations = dag.get_task("load_stations")
-    assert load_stations.task_id in {t.task_id for t in collect.downstream_list}
+    publish = dag.get_task("publish_station_release")
+
+    assert publish.task_id in {t.task_id for t in collect.downstream_list}
+    assert "--publication station-release" in publish.bash_command
 
 
 def test_normalizer_is_a_single_task_after_population_collection():
@@ -61,6 +58,7 @@ def test_normalizer_is_a_single_task_after_population_collection():
     assert normalizer.task_id in {t.task_id for t in collect_population.downstream_list}
     assert normalizer.trigger_rule == "all_success"
     assert not [t for t in dag.task_ids if t.startswith("run_normalizer_")]
+
 
 def test_inference_waits_for_realtime_bikes_and_normalized_population():
     """날씨는 별도 DAG의 최신 Silver를 읽고, 이 DAG의 실시간 입력은 직접 기다린다."""
@@ -80,21 +78,32 @@ def test_inference_waits_for_realtime_bikes_and_normalized_population():
 def test_inference_then_load_forecast_points():
     run_inference = dag.get_task("run_inference")
     load_forecast_points = dag.get_task("load_forecast_points")
-    assert load_forecast_points.task_id in {t.task_id for t in run_inference.downstream_list}
+    assert load_forecast_points.task_id in {
+        t.task_id for t in run_inference.downstream_list
+    }
+    assert load_forecast_points.upstream_task_ids == {
+        "run_inference",
+        "publish_station_release",
+    }
 
 
 def test_inference_then_compute_urgency_then_load_station_urgency():
     """urgency_score 계산(rebalance)은 S3(재고 이력·예측 결과)만 읽어서 RDS 적재
-    (load_station_stock/load_forecast_points)를 기다릴 필요가 없다. 단, urgency loader는
-    stations FK가 준비된 뒤 실행돼야 한다."""
+    (station publication/load_forecast_points)를 기다릴 필요가 없다. 단, urgency loader는
+    station FK가 준비된 뒤 실행돼야 한다."""
     run_inference = dag.get_task("run_inference")
     compute_urgency = dag.get_task("compute_urgency")
     load_station_urgency = dag.get_task("load_station_urgency")
 
     assert compute_urgency.task_id in {t.task_id for t in run_inference.downstream_list}
     assert {t.task_id for t in compute_urgency.upstream_list} == {"run_inference"}
-    assert load_station_urgency.task_id in {t.task_id for t in compute_urgency.downstream_list}
-    assert {t.task_id for t in load_station_urgency.upstream_list} == {"compute_urgency", "load_stations"}
+    assert load_station_urgency.task_id in {
+        t.task_id for t in compute_urgency.downstream_list
+    }
+    assert {t.task_id for t in load_station_urgency.upstream_list} == {
+        "compute_urgency",
+        "publish_station_release",
+    }
 
 
 def test_compute_urgency_then_compute_routes_then_load_rebalance_tables_sequentially():
@@ -102,19 +111,23 @@ def test_compute_urgency_then_compute_routes_then_load_rebalance_tables_sequenti
     넷팅을 위한 좁은 RDS 조회 하나 제외) — compute_urgency에만 의존하고
     load_station_urgency와는 독립적으로 실행된다(이유: #109). rebalance_route_stops는
     rebalance_routes(route_id FK)·stations(sta_id FK) 둘 다를 참조하므로,
-    load_rebalance_routes가 끝나고 load_stations도 끝난 뒤에만 실행돼야 한다 —
+    load_rebalance_routes와 station publication이 끝난 뒤에만 실행돼야 한다 —
     병렬로 두면 stops가 routes보다 먼저 끝나 FK 위반이 날 수 있다."""
     compute_urgency = dag.get_task("compute_urgency")
     compute_routes = dag.get_task("compute_routes")
     load_rebalance_routes = dag.get_task("load_rebalance_routes")
     load_rebalance_route_stops = dag.get_task("load_rebalance_route_stops")
 
-    assert compute_routes.task_id in {t.task_id for t in compute_urgency.downstream_list}
+    assert compute_routes.task_id in {
+        t.task_id for t in compute_urgency.downstream_list
+    }
     assert {t.task_id for t in compute_routes.upstream_list} == {"compute_urgency"}
-    assert {t.task_id for t in load_rebalance_routes.upstream_list} == {"compute_routes"}
+    assert {t.task_id for t in load_rebalance_routes.upstream_list} == {
+        "compute_routes"
+    }
     assert {t.task_id for t in load_rebalance_route_stops.upstream_list} == {
         "load_rebalance_routes",
-        "load_stations",
+        "publish_station_release",
     }
 
 
@@ -133,7 +146,9 @@ def test_collector_task_execution_contract():
 def test_living_population_grid_timeout_override_not_used_in_this_dag():
     """living_population_grid는 daily DAG 소관이라 이 DAG에는 없다."""
     assert "collect_living_population_grid" not in dag.task_ids
-    assert EXECUTION_TIMEOUT_OVERRIDES["living_population_grid"] == timedelta(seconds=1200)
+    assert EXECUTION_TIMEOUT_OVERRIDES["living_population_grid"] == timedelta(
+        seconds=1200
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -153,8 +168,10 @@ def test_living_population_grid_timeout_override_not_used_in_this_dag():
 
 
 def _replay_tasks():
-    return [dag.get_task(f"collect_bike_rental_history_replay_{h}h")
-            for h in range(1, RENTAL_HISTORY_LOOKBACK_HOURS + 1)]
+    return [
+        dag.get_task(f"collect_bike_rental_history_replay_{h}h")
+        for h in range(1, RENTAL_HISTORY_LOOKBACK_HOURS + 1)
+    ]
 
 
 def test_lookback_is_one_hour():

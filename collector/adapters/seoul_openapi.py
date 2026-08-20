@@ -16,7 +16,8 @@ RESULT.CODE → 실패 범주:
 - 응답 필드는 전부 문자열로 내려온다. 캐스팅은 검증 엔진의 `types`가 맡고 어댑터는
   값에 손대지 않는다.
 - 기본 `pagination: total`은 전체 건수인 `list_total_count`를 사용한다. 현재 페이지
-  행 수를 돌려주는 `bikeList`는 `pagination: probe`로 빈 페이지까지 순차 탐색한다.
+  행 수를 돌려주는 `bikeList`는 `pagination: probe_until_empty`로 빈 페이지까지
+  순차 탐색한다.
 """
 
 from __future__ import annotations
@@ -56,21 +57,21 @@ def _api_key() -> str:
 
 def _classify(code: str | None) -> FetchErrorKind | None:
     """RESULT.CODE를 실패 범주로 매핑한다. None은 성공이다."""
-    
+
     # 코드가 없거나 문자열이 아니면 영구 실패로 취급한다.
     if not isinstance(code, str):
         return FetchErrorKind.PERMANENT
     # INFO-000(성공)과 INFO-200(빈 결과)는 성공으로 취급한다.
     if code in _SUCCESS_CODES:
-        return None 
+        return None
     # INFO-100(인증키 오류)는 치명적 에러로 취급한다.
     if code in _FATAL_CODES:
         return FetchErrorKind.FATAL
     # ERROR-5xx(서버 오류)는 일시적 에러로 취급한다.
     if code.startswith("ERROR-5"):
-        return FetchErrorKind.TRANSIENT  
+        return FetchErrorKind.TRANSIENT
     # 그 외 에러들은 영구적 에러로 취급한다.
-    return FetchErrorKind.PERMANENT  
+    return FetchErrorKind.PERMANENT
 
 
 def _extract(body: dict, wrapper_key: str) -> dict:
@@ -100,7 +101,12 @@ def _result_code(body: dict, wrapper_key: str) -> str | None:
 # 다루므로 여기서 평탄한 슬롯 컬럼으로 펼친다 — 어댑터가 값에 손대지 않는다는 원칙은
 # 지킨다(문자열을 그대로 옮기고 캐스팅은 엔진이 한다).
 _FCST_ARRAY_KEY = "FCST_PPLTN"
-_FCST_SLOT_FIELDS = ("FCST_TIME", "FCST_CONGEST_LVL", "FCST_PPLTN_MIN", "FCST_PPLTN_MAX")
+_FCST_SLOT_FIELDS = (
+    "FCST_TIME",
+    "FCST_CONGEST_LVL",
+    "FCST_PPLTN_MIN",
+    "FCST_PPLTN_MAX",
+)
 # 실측(2026-08-19 POI001): 1시간 간격 12개. 슬롯 번호는 "n시간 후"가 아니다 —
 # 20:55 관측의 첫 예측이 22:00이었다. 몇 시의 예측인지는 `FCST_n_TIME`이 말해주고,
 # 소비자(normalizer)는 슬롯 번호가 아니라 그 값으로 시각을 맞춘다.
@@ -117,7 +123,11 @@ def _flatten_forecast(row: dict) -> dict:
     if not isinstance(forecasts, list):
         return row
 
-    datable = [f for f in forecasts if isinstance(f, dict) and isinstance(f.get("FCST_TIME"), str)]
+    datable = [
+        f
+        for f in forecasts
+        if isinstance(f, dict) and isinstance(f.get("FCST_TIME"), str)
+    ]
     for slot, forecast in enumerate(
         sorted(datable, key=lambda f: f["FCST_TIME"])[:POPULATION_FORECAST_SLOT_COUNT],
         start=1,
@@ -140,7 +150,13 @@ class _PageOutcome:
     terminal: bool = False
 
 
-def _request_json(client: httpx.Client, url: str) -> tuple[bytes, dict] | FetchErrorKind:
+class NaturalKeyCardinalityError(ValueError):
+    """원천 행 수와 유효한 고유 자연키 수가 일치하지 않을 때 발생한다."""
+
+
+def _request_json(
+    client: httpx.Client, url: str
+) -> tuple[bytes, dict] | FetchErrorKind:
     """URL을 요청해 JSON 객체로 파싱한다. 예외를 밖으로 던지지 않는다.
 
     스레드풀에서 병렬 호출되므로 공유 상태를 두지 않는다. `httpx.Client`는 스레드
@@ -158,21 +174,92 @@ def _request_json(client: httpx.Client, url: str) -> tuple[bytes, dict] | FetchE
     return response.content, body
 
 
-def _fetch_page(client: httpx.Client, url: str, wrapper_key: str) -> _PageOutcome:
+def _page_rows(body: dict, wrapper_key: str, row_path: str) -> list | None:
+    """설정된 wrapper와 row 경로에서 원천 행 배열을 꺼낸다."""
+    node = _extract(body, wrapper_key)
+    for segment in row_path.split(".") if row_path else []:
+        if not isinstance(node, dict):
+            return None
+        node = node.get(segment)
+    return node if isinstance(node, list) else None
+
+
+def _optional_nonnegative_int(value: object) -> int | None:
+    """응답 메타를 음수가 아닌 정수로 읽고 malformed 값을 거부한다."""
+    if value is None:
+        return None
+    if type(value) is int:
+        parsed = value
+    elif type(value) is str and value.strip().isdigit():
+        parsed = int(value.strip())
+    else:
+        raise ValueError("list_total_count는 음수가 아닌 정수여야 합니다")
+    if parsed < 0:
+        raise ValueError("list_total_count는 음수가 아닌 정수여야 합니다")
+    return parsed
+
+
+def _fetch_page(
+    client: httpx.Client,
+    url: str,
+    wrapper_key: str,
+    row_path: str,
+    *,
+    ignore_total: bool = False,
+) -> _PageOutcome:
     """페이지 하나를 받아 실패 범주까지 판정한다."""
     result = _request_json(client, url)
     if isinstance(result, FetchErrorKind):
-        return _PageOutcome(payload=None, total=None, error=result)
+        return _PageOutcome(
+            payload=None,
+            total=None,
+            row_count=None,
+            terminal=False,
+            error=result,
+        )
     content, body = result
 
     # 서울 API는 보통 HTTP 200으로 응답하고, 논리적 성공/실패는 본문 코드에 담아 보낸다
-    category = _classify(_result_code(body, wrapper_key))
+    code = _result_code(body, wrapper_key)
+    category = _classify(code)
     if category is not None:
-        return _PageOutcome(payload=None, total=None, error=category)
+        return _PageOutcome(
+            payload=None,
+            total=None,
+            row_count=None,
+            terminal=False,
+            error=category,
+        )
 
     wrapper = _extract(body, wrapper_key)
-    raw_total = wrapper.get("list_total_count", 0) if isinstance(wrapper, dict) else 0
-    return _PageOutcome(payload=content, total=int(raw_total), error=None)
+    raw_total = wrapper.get("list_total_count") if isinstance(wrapper, dict) else None
+    rows = _page_rows(body, wrapper_key, row_path)
+    terminal = code == "INFO-200" or rows == []
+    if rows is None and not terminal:
+        return _PageOutcome(
+            payload=None,
+            total=None,
+            row_count=None,
+            terminal=False,
+            error=FetchErrorKind.PERMANENT,
+        )
+    try:
+        total = None if ignore_total else _optional_nonnegative_int(raw_total)
+    except ValueError:
+        return _PageOutcome(
+            payload=None,
+            total=None,
+            row_count=None,
+            terminal=False,
+            error=FetchErrorKind.PERMANENT,
+        )
+    return _PageOutcome(
+        payload=content,
+        total=total,
+        row_count=len(rows) if rows is not None else 0,
+        terminal=terminal,
+        error=None,
+    )
 
 
 def _fetch_probe_page(client: httpx.Client, url: str, wrapper_key: str) -> _PageOutcome:
@@ -218,7 +305,13 @@ def _fetch_poi(client: httpx.Client, url: str, wrapper_key: str) -> _PageOutcome
     """실시간 인구 POI 하나를 받아 실패 범주까지 판정한다."""
     result = _request_json(client, url)
     if isinstance(result, FetchErrorKind):
-        return _PageOutcome(payload=None, total=None, error=result)
+        return _PageOutcome(
+            payload=None,
+            total=None,
+            row_count=None,
+            terminal=False,
+            error=result,
+        )
     content, body = result
 
     # citydata_ppltn은 일반 페이지 응답과 달리 RESULT.CODE가 최상단 RESULT 객체의
@@ -226,8 +319,56 @@ def _fetch_poi(client: httpx.Client, url: str, wrapper_key: str) -> _PageOutcome
     code = body.get("RESULT.CODE") or body.get("RESULT", {}).get("RESULT.CODE")
     category = _classify(code)
     if category is not None:
-        return _PageOutcome(payload=None, total=None, error=category)
-    return _PageOutcome(payload=content, total=None, error=None)
+        return _PageOutcome(
+            payload=None,
+            total=None,
+            row_count=None,
+            terminal=False,
+            error=category,
+        )
+    return _PageOutcome(
+        payload=content,
+        total=None,
+        row_count=None,
+        terminal=False,
+        error=None,
+    )
+
+
+def _validate_natural_key(
+    rows: list[dict], natural_key: tuple[str, ...] | None
+) -> None:
+    """모든 raw 행에 자연키가 있고 행 수만큼 고유한지 검증한다."""
+    if natural_key is None:
+        return
+
+    identities: list[tuple[object, ...]] = []
+    for index, row in enumerate(rows):
+        identity = tuple(row.get(column) for column in natural_key)
+        if any(
+            value is None
+            or value == ""
+            or (isinstance(value, str) and not value.strip())
+            for value in identity
+        ):
+            columns = ", ".join(natural_key)
+            raise NaturalKeyCardinalityError(
+                f"raw row {index}의 natural_key({columns})가 비어 있습니다"
+            )
+        try:
+            hash(identity)
+        except TypeError as exc:
+            raise NaturalKeyCardinalityError(
+                f"raw row {index}의 natural_key 값은 scalar여야 합니다"
+            ) from exc
+        identities.append(identity)
+
+    unique_count = len(set(identities))
+    if unique_count != len(rows):
+        raise NaturalKeyCardinalityError(
+            "raw row count와 unique natural_key count가 다릅니다: "
+            f"rows={len(rows)}, unique={unique_count}"
+        )
 
 
 def _run_concurrent(items, concurrency: int, fetch_one, thread_name_prefix: str):
@@ -238,7 +379,9 @@ def _run_concurrent(items, concurrency: int, fetch_one, thread_name_prefix: str)
     개수를 concurrency의 2배로 묶는 이유는 메모리다 — 전부 던져두면 완료됐지만 아직
     내보내지 않은 응답이 쌓인다.
     """
-    pool = ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix=thread_name_prefix)
+    pool = ThreadPoolExecutor(
+        max_workers=concurrency, thread_name_prefix=thread_name_prefix
+    )
     try:
         queued = iter(items)
         inflight: deque[tuple[object, Future[_PageOutcome]]] = deque()
@@ -304,11 +447,9 @@ def _recover_probe_total(
 ) -> int | None:
     """종료 페이지만 재시도한 경우 직전 성공 페이지에서 실제 행 수를 복구한다.
 
-    probe의 종료 응답은 bronze로 저장하지 않으므로 보통 매 라운드 다시 확인된다.
-    다만 직전 라운드에서 종료 요청만 일시 실패했다면 이번 라운드의 데이터 페이지는
-    전부 skip에 들어 있다. 이때 직전 페이지 하나만 다시 읽어 마지막 페이지의 실제
-    행 수를 알아낸다. 데이터 payload를 다시 yield하지 않으므로 bronze는 중복 저장되지
-    않는다.
+    직전 라운드에서 종료 요청만 일시 실패했다면 이번 라운드의 데이터 페이지는 전부
+    skip에 들어 있다. 이때 직전 페이지 하나만 다시 읽어 마지막 페이지의 실제 행 수를
+    알아낸다. 데이터 payload를 다시 yield하지 않으므로 Bronze는 중복 저장되지 않는다.
     """
     previous_start = page_start - page_size
     if previous_start < 1:
@@ -338,10 +479,10 @@ def _fetch_probe_pages(
 ):
     """응답 total 대신 빈 페이지까지 순차 탐색하는 페이지 결과를 생성한다.
 
-    처음에는 끝을 모르므로 순차 탐색한다. 빈 row 또는 INFO-200 종료 응답은 원본
-    데이터가 아니어서 bronze에 저장하지 않고 `persist=False` 메타데이터 결과로
-    실제 expected_total만 전달한다. 이후 라운드에는 그 expected_total로 안정적인
-    고정 폭 페이지 목록을 복원해 성공 조각은 skip하고 실패 조각만 다시 요청한다.
+    처음에는 끝을 모르므로 순차 탐색한다. 빈 row 또는 INFO-200 종료 응답도 source
+    snapshot의 완결성 증거인 Bronze part로 보존하며 실제 expected_total을 함께
+    전달한다. 이후 라운드에는 그 expected_total로 안정적인 고정 폭 페이지 목록을
+    복원해 성공 조각은 skip하고 실패 조각만 다시 요청한다.
     """
     page_size = int(params["page_size"])
     max_probe_pages = int(params["max_probe_pages"])
@@ -422,11 +563,10 @@ def _fetch_probe_pages(
                     else last_data_start - 1 + last_data_rows
                 )
                 yield FetchResult(
-                    key=f"probe-end-{page_start:05d}",
-                    payload=None,
+                    key=key,
+                    payload=outcome.payload,
                     error=None,
                     expected_total=total,
-                    persist=False,
                 )
                 return
             if page_number > max_probe_pages:
@@ -451,6 +591,8 @@ def _fetch_probe_pages(
     page_start = 1
     last_data_start: int | None = None
     last_data_rows: int | None = None
+    received_rows = 0
+    skipped_data_page = False
     while True:
         page_number = ((page_start - 1) // page_size) + 1
         key = _probe_page_key(page_start, page_size)
@@ -462,6 +604,7 @@ def _fetch_probe_pages(
         if page_number > max_probe_pages + 1:
             raise AssertionError("probe 페이지 상한 검사가 누락됨")
         if key in skip and not is_boundary_probe:
+            skipped_data_page = True
             page_start += page_size
             continue
 
@@ -477,15 +620,19 @@ def _fetch_probe_pages(
                 error=outcome.error,
                 expected_total=None,
             )
-            if outcome.error is FetchErrorKind.FATAL or is_boundary_probe:
-                return
-            page_start += page_size
-            continue
+            # 끝을 모르는 상태에서 실패 page 너머를 탐색하면 중간 공백을 둔 채 뒤의
+            # terminal을 완결 증거로 오인할 수 있다. 다음 fetch round가 이 page부터
+            # 이어받도록 즉시 멈춘다.
+            return
 
         if outcome.terminal:
             if page_start == 1:
                 total = 0
-            elif last_data_start == page_start - page_size and last_data_rows is not None:
+            elif not skipped_data_page:
+                total = received_rows
+            elif (
+                last_data_start == page_start - page_size and last_data_rows is not None
+            ):
                 total = last_data_start - 1 + last_data_rows
             else:
                 total = _recover_probe_total(
@@ -503,18 +650,17 @@ def _fetch_probe_pages(
                 # Bronze가 정상 완료될 수 있다. 복구 불가능한 이번 라운드는 transient로
                 # 남겨 상위 라운드/quality gate가 fail-closed하게 처리한다.
                 yield FetchResult(
-                    key=f"probe-end-{page_start:05d}",
+                    key=key,
                     payload=None,
                     error=FetchErrorKind.TRANSIENT,
                     expected_total=None,
                 )
                 return
             yield FetchResult(
-                key=f"probe-end-{page_start:05d}",
-                payload=None,
+                key=key,
+                payload=outcome.payload,
                 error=None,
                 expected_total=total,
-                persist=False,
             )
             return
 
@@ -535,6 +681,7 @@ def _fetch_probe_pages(
         )
         last_data_start = page_start
         last_data_rows = outcome.row_count
+        received_rows += outcome.row_count or 0
         page_start += page_size
 
 
@@ -574,8 +721,7 @@ class SeoulOpenApiAdapter:
         service = params["service"]
         page_size = params["page_size"]
 
-        wrapper_key, _ = SeoulOpenApiAdapter._root_location(params)
-        
+        wrapper_key, row_path = SeoulOpenApiAdapter._root_location(params)
         path_suffix_template = params.get("path_suffix", "")
         suffix = ""
         if path_suffix_template:
@@ -595,7 +741,9 @@ class SeoulOpenApiAdapter:
             poi_start = int(params.get("poi_start", 1))
             poi_end = int(params["poi_end"])
             if poi_start < 1 or poi_end < poi_start:
-                raise ValueError("citydata_ppltn의 poi_start/poi_end 범위가 올바르지 않습니다")
+                raise ValueError(
+                    "citydata_ppltn의 poi_start/poi_end 범위가 올바르지 않습니다"
+                )
 
             pois = []
             for i in range(poi_start, poi_end + 1):
@@ -613,7 +761,9 @@ class SeoulOpenApiAdapter:
                 for key, url in pois:
                     outcome = _fetch_poi(client, url, wrapper_key)
                     yield FetchResult(
-                        key=key, payload=outcome.payload, error=outcome.error,
+                        key=key,
+                        payload=outcome.payload,
+                        error=outcome.error,
                         expected_total=None,
                     )
                     if outcome.error is FetchErrorKind.FATAL:
@@ -625,9 +775,13 @@ class SeoulOpenApiAdapter:
                 _, url = item
                 return _fetch_poi(client, url, wrapper_key)
 
-            for (key, _url), outcome in _run_concurrent(pois, concurrency, fetch_one_poi, "seoul-poi"):
+            for (key, _url), outcome in _run_concurrent(
+                pois, concurrency, fetch_one_poi, "seoul-poi"
+            ):
                 yield FetchResult(
-                    key=key, payload=outcome.payload, error=outcome.error,
+                    key=key,
+                    payload=outcome.payload,
+                    error=outcome.error,
                     expected_total=None,
                 )
             return
@@ -635,7 +789,7 @@ class SeoulOpenApiAdapter:
         def page_url(start: int, end: int) -> str:
             return f"{_BASE_URL}/{_api_key()}/json/{service}/{start}/{end}{suffix}/"
 
-        if params.get("pagination", "total") == "probe":
+        if params.get("pagination", "total") in {"probe", "probe_until_empty"}:
             yield from _fetch_probe_pages(
                 params=params,
                 client=client,
@@ -661,16 +815,25 @@ class SeoulOpenApiAdapter:
                 page_start += page_size
 
             key = f"page-{page_start:05d}-{page_start + page_size - 1:05d}"
-            outcome = _fetch_page(client, page_url(page_start, page_start + page_size - 1), wrapper_key)
+            outcome = _fetch_page(
+                client,
+                page_url(page_start, page_start + page_size - 1),
+                wrapper_key,
+                row_path,
+            )
 
             if outcome.error is not None:
-                yield FetchResult(key=key, payload=None, error=outcome.error, expected_total=None)
+                yield FetchResult(
+                    key=key, payload=None, error=outcome.error, expected_total=None
+                )
                 # total을 못 구했으면 남은 페이지 수를 알 방법이 없으므로 여기서 멈춘다.
                 return
 
             total = outcome.total or 0
             yield FetchResult(
-                key=key, payload=outcome.payload, error=None,
+                key=key,
+                payload=outcome.payload,
+                error=None,
                 # expected_total은 pipeline이 기억해뒀다가 다음 라운드·백필에 되돌려주는
                 # 값이라 처음 알아낸 순간에만 싣는다. 그 뒤로는 pipeline이 이미 갖고 있다.
                 expected_total=total if page_start == 1 else None,
@@ -697,9 +860,13 @@ class SeoulOpenApiAdapter:
 
         if concurrency == 1:
             for key, start, end in pages:
-                outcome = _fetch_page(client, page_url(start, end), wrapper_key)
+                outcome = _fetch_page(
+                    client, page_url(start, end), wrapper_key, row_path
+                )
                 yield FetchResult(
-                    key=key, payload=outcome.payload, error=outcome.error,
+                    key=key,
+                    payload=outcome.payload,
+                    error=outcome.error,
                     expected_total=total if start == 1 else None,
                 )
                 if outcome.error is FetchErrorKind.FATAL:
@@ -711,11 +878,15 @@ class SeoulOpenApiAdapter:
         # 그래서 _run_concurrent가 미리 요청하는 개수를 concurrency의 2배로 묶는다.
         def fetch_one_page(item: tuple[str, int, int]) -> _PageOutcome:
             _, start, end = item
-            return _fetch_page(client, page_url(start, end), wrapper_key)
+            return _fetch_page(client, page_url(start, end), wrapper_key, row_path)
 
-        for (key, start, _end), outcome in _run_concurrent(pages, concurrency, fetch_one_page, "seoul-page"):
+        for (key, start, _end), outcome in _run_concurrent(
+            pages, concurrency, fetch_one_page, "seoul-page"
+        ):
             yield FetchResult(
-                key=key, payload=outcome.payload, error=outcome.error,
+                key=key,
+                payload=outcome.payload,
+                error=outcome.error,
                 expected_total=total if start == 1 else None,
             )
 
@@ -738,7 +909,7 @@ class SeoulOpenApiAdapter:
                 node = node.get(segment)
             if isinstance(node, list):
                 rows.extend(node)
-
         if params.get("flatten_forecast", False):
-            return [_flatten_forecast(row) for row in rows if isinstance(row, dict)]
+            rows = [_flatten_forecast(row) for row in rows if isinstance(row, dict)]
+        _validate_natural_key(rows, getattr(config, "natural_key", None))
         return rows

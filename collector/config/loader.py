@@ -1,7 +1,7 @@
 """sources/{source_id}.yaml을 읽어 검증까지 마친 SourceConfig로 만드는 곳.
 
-파일을 읽고, Pydantic으로 타입을 검사하고, 정책 이름이 실제 등록된 것인지 확인한 뒤 문제가 없으면 SourceConfig를 반환한다. 
-여기서 오류를 다 걸러내야 네트워크를 타기 전에 잘못된 설정을 잡을 수 있다. 
+파일을 읽고, Pydantic으로 타입을 검사하고, 정책 이름이 실제 등록된 것인지 확인한 뒤 문제가 없으면 SourceConfig를 반환한다.
+여기서 오류를 다 걸러내야 네트워크를 타기 전에 잘못된 설정을 잡을 수 있다.
 통과한 설정에는 원본 YAML의 SHA-256 해시를 `config_version`으로 붙여, 나중에 어떤 설정으로 수집했는지 추적할 수 있게 한다.
 """
 
@@ -12,8 +12,6 @@ from pathlib import Path
 
 import yaml
 from pydantic import ValidationError
-
-from config.schema import SourceConfig
 from validation.registry import (
     get_row_policy_params_model,
     is_policy_registered,
@@ -21,6 +19,8 @@ from validation.registry import (
     policy_names,
     row_policy_names,
 )
+
+from config.schema import SourceConfig
 
 
 class ConfigError(ValueError):
@@ -49,6 +49,7 @@ def load(source_id: str, base_dir: Path = Path("sources")) -> SourceConfig:
     errors += _check_policy_names(config)
     errors += _check_row_params(config)
     errors += _check_adapter_params(config)
+    errors += _check_natural_key(config)
     if errors:
         raise ConfigError("\n".join(errors))
 
@@ -65,16 +66,19 @@ def _check_adapter_params(config: SourceConfig) -> list[str]:
     for required in ("service", "root_key"):
         value = params.get(required)
         if not isinstance(value, str) or not value.strip():
-            errors.append(f"adapter_params.{required}: 비어있지 않은 문자열이 필수입니다.")
+            errors.append(
+                f"adapter_params.{required}: 비어있지 않은 문자열이 필수입니다."
+            )
     page_size = params.get("page_size")
-    if (
-        not isinstance(page_size, int) or isinstance(page_size, bool) or page_size < 1
-    ):
+    if not isinstance(page_size, int) or isinstance(page_size, bool) or page_size < 1:
         errors.append("adapter_params.page_size: 1 이상의 정수여야 합니다.")
 
     pagination = params.get("pagination", "total")
-    if pagination not in {"total", "probe"}:
-        errors.append("adapter_params.pagination: 'total' 또는 'probe'여야 합니다.")
+    if pagination not in {"total", "probe", "probe_until_empty"}:
+        errors.append(
+            "adapter_params.pagination: 'total', 'probe' 또는 "
+            "'probe_until_empty'여야 합니다."
+        )
 
     for option in ("root_key_literal", "flatten_forecast"):
         if option in params and not isinstance(params[option], bool):
@@ -82,11 +86,17 @@ def _check_adapter_params(config: SourceConfig) -> list[str]:
 
     if params.get("service") == "citydata_ppltn":
         if pagination != "total":
-            errors.append("adapter_params.pagination: citydata_ppltn에는 probe를 사용할 수 없습니다.")
+            errors.append(
+                "adapter_params.pagination: citydata_ppltn에는 probe를 사용할 수 없습니다."
+            )
         if params.get("root_key_literal") is not True:
-            errors.append("adapter_params.root_key_literal: citydata_ppltn에는 true가 필수입니다.")
+            errors.append(
+                "adapter_params.root_key_literal: citydata_ppltn에는 true가 필수입니다."
+            )
         if params.get("flatten_forecast") is not True:
-            errors.append("adapter_params.flatten_forecast: citydata_ppltn에는 true가 필수입니다.")
+            errors.append(
+                "adapter_params.flatten_forecast: citydata_ppltn에는 true가 필수입니다."
+            )
 
         poi_start = params.get("poi_start", 1)
         poi_end = params.get("poi_end")
@@ -101,10 +111,16 @@ def _check_adapter_params(config: SourceConfig) -> list[str]:
             and not isinstance(poi_end, bool)
             and (poi_start < 1 or poi_end < poi_start)
         ):
-            errors.append("adapter_params.poi_start/poi_end: 1 <= poi_start <= poi_end여야 합니다.")
+            errors.append(
+                "adapter_params.poi_start/poi_end: 1 <= poi_start <= poi_end여야 합니다."
+            )
         return errors
 
-    if pagination == "probe":
+    if pagination in {"probe", "probe_until_empty"}:
+        if config.natural_key is None:
+            errors.append(
+                "adapter_params.pagination: probe pagination에는 natural_key가 필수입니다."
+            )
         max_probe_pages = params.get("max_probe_pages")
         if (
             not isinstance(max_probe_pages, int)
@@ -112,10 +128,34 @@ def _check_adapter_params(config: SourceConfig) -> list[str]:
             or max_probe_pages < 1
         ):
             errors.append(
-                "adapter_params.max_probe_pages: pagination=probe이면 1 이상의 정수가 필수입니다."
+                "adapter_params.max_probe_pages: probe pagination이면 "
+                "1 이상의 정수가 필수입니다."
             )
     elif "max_probe_pages" in params:
-        errors.append("adapter_params.max_probe_pages: pagination=probe에서만 사용할 수 있습니다.")
+        errors.append(
+            "adapter_params.max_probe_pages: probe pagination에서만 사용할 수 있습니다."
+        )
+    return errors
+
+
+def _check_natural_key(config: SourceConfig) -> list[str]:
+    """자연키가 선언 컬럼을 정확히 가리키고 식별 필드가 필수인지 확인한다."""
+    natural_key = config.natural_key
+    if natural_key is None:
+        return []
+
+    errors: list[str] = []
+    if len(set(natural_key)) != len(natural_key):
+        errors.append("natural_key: 중복 컬럼을 선언할 수 없습니다.")
+
+    for column in natural_key:
+        spec = config.columns.get(column)
+        if spec is None:
+            errors.append(f"natural_key: columns에 없는 '{column}'을 참조합니다.")
+        elif not spec.required:
+            errors.append(
+                f"natural_key: 식별 컬럼 '{column}'은 required=true여야 합니다."
+            )
     return errors
 
 
@@ -141,9 +181,13 @@ def _check_policy_names(config: SourceConfig) -> list[str]:
                 location = f"columns.{column_name}.{field}"
                 errors.append(_unregistered_message(location, name, policy_names()))
 
-    if config.policies.row is not None and not is_row_policy_registered(config.policies.row):
+    if config.policies.row is not None and not is_row_policy_registered(
+        config.policies.row
+    ):
         errors.append(
-            _unregistered_message("policies.row", config.policies.row, row_policy_names())
+            _unregistered_message(
+                "policies.row", config.policies.row, row_policy_names()
+            )
         )
 
     return errors

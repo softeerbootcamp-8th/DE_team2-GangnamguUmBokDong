@@ -3,7 +3,6 @@
 from datetime import timedelta
 
 from airflow.timetables.trigger import CronTriggerTimetable
-
 from config.schedules import (
     DAILY_CRON,
     EXECUTION_TIMEOUT_OVERRIDES,
@@ -24,17 +23,21 @@ def test_expected_tasks():
         "collect_living_population_grid",
         "run_nowcasting_estimate",
         "collect_cultural_event",
-        "load_cultural_events",
+        "publish_event_cultural_event",
         "collect_performance_event",
-        "load_cultural_events_performance",
+        "publish_event_performance_event",
     }
 
 
 def test_population_branch_independent_of_event_branch():
     collect_population = dag.get_task("collect_living_population_grid")
     collect_events = dag.get_task("collect_cultural_event")
-    assert collect_events.task_id not in {t.task_id for t in collect_population.downstream_list}
-    assert collect_population.task_id not in {t.task_id for t in collect_events.downstream_list}
+    assert collect_events.task_id not in {
+        t.task_id for t in collect_population.downstream_list
+    }
+    assert collect_population.task_id not in {
+        t.task_id for t in collect_events.downstream_list
+    }
 
 
 def test_population_then_nowcasting():
@@ -44,14 +47,22 @@ def test_population_then_nowcasting():
     assert nowcasting.execution_timeout == NOWCASTING_EXECUTION_TIMEOUT
 
 
-def test_events_then_load_cultural_events():
+def test_events_then_publish_source_scoped_projection():
     collect_events = dag.get_task("collect_cultural_event")
-    load_events = dag.get_task("load_cultural_events")
-    assert load_events.task_id in {t.task_id for t in collect_events.downstream_list}
-    assert "--table cultural_events" in load_events.bash_command
+    publish_events = dag.get_task("publish_event_cultural_event")
+    collect_performance = dag.get_task("collect_performance_event")
+    publish_performance = dag.get_task("publish_event_performance_event")
+
+    assert publish_events.upstream_task_ids == {collect_events.task_id}
+    assert "--publication event:cultural_event" in publish_events.bash_command
+    assert publish_performance.upstream_task_ids == {collect_performance.task_id}
+    assert "--publication event:performance_event" in publish_performance.bash_command
 
 
 def test_living_population_grid_uses_long_timeout():
     collect_population = dag.get_task("collect_living_population_grid")
-    assert collect_population.execution_timeout == EXECUTION_TIMEOUT_OVERRIDES["living_population_grid"]
+    assert (
+        collect_population.execution_timeout
+        == EXECUTION_TIMEOUT_OVERRIDES["living_population_grid"]
+    )
     assert collect_population.execution_timeout == timedelta(seconds=1200)
