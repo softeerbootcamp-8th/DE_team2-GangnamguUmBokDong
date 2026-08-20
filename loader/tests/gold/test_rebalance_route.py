@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
 import pyarrow as pa
 import pytest
@@ -14,6 +15,7 @@ from core.gold_publication import (
     parse_route_coverage,
     route_uuid_v5,
 )
+from gold import rebalance_route as route_module
 from gold.common import parquet_bytes, read_parquet_bytes
 from gold.rebalance_route import (
     INITIAL_TRUCK_LOAD,
@@ -33,6 +35,7 @@ from gold.rebalance_route import (
     route_plan_from_parquet,
     route_plan_to_parquet,
 )
+from gold.state import PublicationStateRecord
 
 _UTC_1600 = datetime(2026, 8, 19, 16, 0, tzinfo=UTC)
 _CENTER_LONGITUDE = 127.0
@@ -525,6 +528,69 @@ def test_revision_is_explicit_route_identity_input() -> None:
     assert revision_one.routes[0].route_id == str(
         route_uuid_v5("center_a", _UTC_1600, 1, 1)
     )
+
+
+def test_route_revision_preview_reuses_exact_content_and_increments_correction() -> (
+    None
+):
+    """현재 revision preview hash가 같으면 replay하고 다르면 정확히 하나 올린다."""
+    current = PublicationStateRecord(
+        publication_key="rebalance_route",
+        logical_dttm=_UTC_1600,
+        revision_no=7,
+        manifest_uri=f"s3://fixture/publication-{'1' * 64}.json",
+        artifact_set_sha256="2" * 64,
+        input_fingerprint_sha256="3" * 64,
+        published_row_cnt=1,
+    )
+    exact = SimpleNamespace(
+        logical_dttm=_UTC_1600,
+        revision_no=7,
+        artifact_set=SimpleNamespace(sha256="2" * 64),
+        input_fingerprint=SimpleNamespace(sha256="3" * 64),
+        plan=SimpleNamespace(routes=(object(),)),
+    )
+    changed = SimpleNamespace(
+        logical_dttm=_UTC_1600,
+        revision_no=7,
+        artifact_set=SimpleNamespace(sha256="4" * 64),
+        input_fingerprint=SimpleNamespace(sha256="3" * 64),
+        plan=SimpleNamespace(routes=(object(),)),
+    )
+
+    assert route_module._choose_route_revision(exact, current) == 7
+    assert route_module._choose_route_revision(changed, current) == 8
+
+
+def test_route_revision_preview_resets_new_anchor_and_rejects_overflow() -> None:
+    """새 logical은 revision 0이고 같은 logical 최대 revision correction은 실패한다."""
+    current = PublicationStateRecord(
+        publication_key="rebalance_route",
+        logical_dttm=_UTC_1600,
+        revision_no=2_147_483_647,
+        manifest_uri=f"s3://fixture/publication-{'1' * 64}.json",
+        artifact_set_sha256="2" * 64,
+        input_fingerprint_sha256="3" * 64,
+        published_row_cnt=1,
+    )
+    changed = SimpleNamespace(
+        logical_dttm=_UTC_1600,
+        revision_no=current.revision_no,
+        artifact_set=SimpleNamespace(sha256="4" * 64),
+        input_fingerprint=SimpleNamespace(sha256="3" * 64),
+        plan=SimpleNamespace(routes=(object(),)),
+    )
+    new_anchor = SimpleNamespace(
+        logical_dttm=_UTC_1600 + timedelta(minutes=5),
+        revision_no=0,
+        artifact_set=changed.artifact_set,
+        input_fingerprint=changed.input_fingerprint,
+        plan=changed.plan,
+    )
+
+    assert route_module._choose_route_revision(new_anchor, current) == 0
+    with pytest.raises(ContractViolation, match="INTEGER"):
+        route_module._choose_route_revision(changed, current)
 
 
 def test_plan_rejects_actionable_station_outside_current_active_topology() -> None:

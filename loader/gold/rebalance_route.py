@@ -5,31 +5,82 @@ from __future__ import annotations
 import math
 import re
 import unicodedata
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import Any
 from uuid import UUID
 
 import pyarrow as pa
 from core.gold_publication import (
+    Artifact,
+    ArtifactSet,
     ContractViolation,
+    ImmutableObjectStore,
+    InputArtifact,
+    InputFingerprint,
+    Parameter,
+    PreparedPublication,
+    PublicationManifest,
     RouteCoverageDocument,
     RouteCoverageStop,
+    VerifiedPublicationEvidence,
+    build_artifact_set,
+    build_id_set,
+    build_input_fingerprint,
     build_route_coverage,
     build_route_coverage_route,
+    parse_input_fingerprint,
+    parse_publication_manifest,
+    parse_route_coverage,
     route_uuid_v5,
+    sha256_hex,
+    validate_route_urgency_dependencies,
 )
+from psycopg import Connection, Cursor
+from psycopg.pq import TransactionStatus
+from psycopg.rows import tuple_row
 
-from .common import parquet_bytes, read_parquet_bytes
+from .common import (
+    OutputObject,
+    PublicationExecution,
+    build_prepared_publication,
+    content_addressed_uri,
+    materialize_publication,
+    parquet_bytes,
+    publish_verified,
+    read_parquet_bytes,
+    store_input_payload,
+)
+from .state import (
+    PublicationStateRecord,
+    load_dependencies,
+    load_publication_state,
+    read_state_manifest,
+)
 
 ROUTE_ALGORITHM_VERSION = "route-v1"
 TRUCK_CAPACITY = 20
 TRUCK_CAPACITY_CONFIG_VERSION = "truck-capacity-v1"
 INITIAL_TRUCK_LOAD = 0
+ROUTE_PUBLISHER_VERSION = "gold-route-publisher-v1"
+_MAX_DATABASE_REVISION = 2_147_483_647
 
 _STATION_ID = re.compile(r"ST-[0-9]+\Z")
 _URGENCY_ACTIONS = {"normal", "supply_needed", "retrieval_needed"}
 _ROUTE_ACTIONS = {"pickup", "dropoff"}
 _ROUTE_STATUSES = {"proposed", "dispatched", "completed"}
+_POSTGRES_INTEGER_MAX = 2_147_483_647
+_URGENCY_OUTPUT_SCHEMA = pa.schema(
+    (
+        pa.field("sta_id", pa.string(), nullable=False),
+        pa.field("base_dttm", pa.timestamp("us", tz="UTC"), nullable=False),
+        pa.field("urgency_score", pa.float64(), nullable=False),
+        pa.field("critical_remaining_min", pa.int32(), nullable=False),
+        pa.field("rebalance_need_type_cd", pa.string(), nullable=False),
+        pa.field("bike_qty", pa.int32(), nullable=False),
+    )
+)
 _ROUTES_SCHEMA = pa.schema(
     (
         pa.field("route_id", pa.string(), nullable=False),
@@ -315,6 +366,86 @@ class RouteParquetArtifacts:
 
 
 @dataclass(frozen=True, slots=True)
+class RouteUrgencySnapshot:
+    """검증된 urgency publication과 route 계산용 typed 행을 묶는다."""
+
+    manifest: PublicationManifest
+    input_fingerprint: InputFingerprint
+    manifest_input: InputArtifact
+    records: tuple[RouteUrgencyInput, ...]
+
+    def __post_init__(self) -> None:
+        """Manifest·fingerprint·input role·record 타입의 결합을 검증한다."""
+        if (
+            type(self.manifest) is not PublicationManifest
+            or self.manifest.publication_key != "station_urgency"
+        ):
+            raise ContractViolation(
+                "route urgency snapshot에는 station_urgency manifest가 필요합니다."
+            )
+        if type(self.input_fingerprint) is not InputFingerprint:
+            raise ContractViolation("urgency input fingerprint 타입이 잘못됐습니다.")
+        if (
+            type(self.manifest_input) is not InputArtifact
+            or self.manifest_input.role != "urgency_publication_manifest"
+        ):
+            raise ContractViolation(
+                "urgency publication manifest input role이 잘못됐습니다."
+            )
+        if type(self.records) is not tuple or any(
+            type(record) is not RouteUrgencyInput for record in self.records
+        ):
+            raise ContractViolation("route urgency records 타입이 잘못됐습니다.")
+
+
+@dataclass(frozen=True, slots=True)
+class RouteDatabaseSnapshot:
+    """한 route 계산이 고정한 topology와 terminal coverage를 표현한다."""
+
+    dispatch_centers: tuple[DispatchCenterTopology, ...]
+    stations: tuple[StationRouteTopology, ...]
+    route_coverage: RouteCoverageDocument
+
+    def __post_init__(self) -> None:
+        """DB snapshot의 exact tuple과 canonical coverage 타입을 검증한다."""
+        _index_centers(self.dispatch_centers)
+        _index_stations(self.stations)
+        if type(self.route_coverage) is not RouteCoverageDocument:
+            raise ContractViolation("route DB snapshot coverage 타입이 잘못됐습니다.")
+
+
+@dataclass(frozen=True, slots=True)
+class _RoutePublicationCandidate:
+    """Immutable write 전 revision별 route output과 hash preview를 보관한다."""
+
+    logical_dttm: datetime
+    revision_no: int
+    plan: RebalanceRoutePlan
+    outputs: tuple[OutputObject, ...]
+    artifact_set: ArtifactSet
+    input_fingerprint: InputFingerprint
+
+    def __post_init__(self) -> None:
+        """Candidate revision·plan·output·canonical document 타입을 검증한다."""
+        object.__setattr__(
+            self,
+            "logical_dttm",
+            _utc_dttm(self.logical_dttm, "candidate logical_dttm"),
+        )
+        _nonnegative_integer(self.revision_no, "candidate revision_no")
+        if type(self.plan) is not RebalanceRoutePlan:
+            raise ContractViolation("route candidate plan 타입이 잘못됐습니다.")
+        if type(self.outputs) is not tuple or any(
+            type(output) is not OutputObject for output in self.outputs
+        ):
+            raise ContractViolation("route candidate outputs 타입이 잘못됐습니다.")
+        if type(self.artifact_set) is not ArtifactSet:
+            raise ContractViolation("route candidate artifact set 타입이 잘못됐습니다.")
+        if type(self.input_fingerprint) is not InputFingerprint:
+            raise ContractViolation("route candidate fingerprint 타입이 잘못됐습니다.")
+
+
+@dataclass(frozen=True, slots=True)
 class _Candidate:
     """coverage를 차감한 현재 센터별 route 후보를 표현한다."""
 
@@ -525,6 +656,842 @@ def route_plan_from_parquet(
             "route artifacts가 locked topology·anchor·revision 재계산 결과와 다릅니다."
         )
     return actual
+
+
+def publish_rebalance_route(
+    connection: Connection[Any],
+    object_store: ImmutableObjectStore,
+    *,
+    urgency_manifest_uri: str,
+    urgency_manifest_sha256: str,
+    object_base_uri: str,
+    publisher_version: str = ROUTE_PUBLISHER_VERSION,
+) -> PublicationExecution:
+    """Urgency authority에서 proposed route aggregate를 계산해 원자 게시한다.
+
+    실제 urgency manifest·output·nested fingerprint를 exact-read하고, 현재 Gold
+    dependency·topology·terminal coverage를 고정한다. 같은 logical correction은 현재
+    revision plan을 메모리에서 먼저 비교한 뒤 필요할 때만 다음 revision UUID로 다시
+    계산하므로 tentative output object를 남기지 않는다.
+    """
+    urgency_snapshot = _read_route_urgency_snapshot(
+        object_store,
+        manifest_uri=urgency_manifest_uri,
+        manifest_sha256=urgency_manifest_sha256,
+    )
+    urgency_state = load_publication_state(connection, "station_urgency")
+    if urgency_state is None:
+        raise ContractViolation("station_urgency publication state가 없습니다.")
+    state_manifest = read_state_manifest(object_store, urgency_state)
+    if (
+        urgency_state.manifest_uri != urgency_manifest_uri
+        or state_manifest != urgency_snapshot.manifest
+        or urgency_snapshot.manifest.sha256 != urgency_manifest_sha256
+    ):
+        raise ContractViolation(
+            "요청한 urgency manifest가 현재 Gold station_urgency state와 다릅니다."
+        )
+
+    dependencies = load_dependencies(
+        connection,
+        (
+            "dispatch_center",
+            "station",
+            "station_demand_forecast",
+            "station_stock",
+            "station_urgency",
+        ),
+    )
+    urgency_dependency = next(
+        dependency
+        for dependency in dependencies
+        if dependency.publication_key == "station_urgency"
+    )
+    if urgency_dependency != urgency_state.dependency:
+        raise ContractViolation(
+            "urgency state가 route dependency를 읽는 동안 변경됐습니다."
+        )
+
+    logical_dttm = urgency_snapshot.manifest.logical_dttm
+    database_snapshot = _load_route_database_snapshot(connection, logical_dttm)
+    coverage_payload = database_snapshot.route_coverage.canonical_bytes
+    coverage_input = InputArtifact(
+        byte_sha256=database_snapshot.route_coverage.sha256,
+        role="route_coverage",
+        uri=content_addressed_uri(
+            object_base_uri,
+            publication_key="rebalance_route",
+            category="inputs",
+            name="route_coverage",
+            payload=coverage_payload,
+            suffix="json",
+        ),
+    )
+    input_fingerprint = build_input_fingerprint(
+        "rebalance_route",
+        dependencies,
+        (coverage_input, urgency_snapshot.manifest_input),
+        (
+            Parameter("route_algorithm_version", ROUTE_ALGORITHM_VERSION),
+            Parameter(
+                "route_coverage_sha256",
+                database_snapshot.route_coverage.sha256,
+            ),
+            Parameter("truck_capacity", str(TRUCK_CAPACITY)),
+            Parameter(
+                "truck_capacity_config_version",
+                TRUCK_CAPACITY_CONFIG_VERSION,
+            ),
+        ),
+    )
+    validate_route_urgency_dependencies(
+        input_fingerprint,
+        urgency_snapshot.input_fingerprint,
+    )
+
+    current = load_publication_state(connection, "rebalance_route")
+    tentative_revision = (
+        current.revision_no
+        if current is not None and current.logical_dttm == logical_dttm
+        else 0
+    )
+    candidate = _build_route_candidate(
+        revision_no=tentative_revision,
+        logical_dttm=logical_dttm,
+        database_snapshot=database_snapshot,
+        urgency_snapshot=urgency_snapshot,
+        input_fingerprint=input_fingerprint,
+        object_base_uri=object_base_uri,
+    )
+    revision_no = _choose_route_revision(candidate, current)
+    if revision_no != tentative_revision:
+        candidate = _build_route_candidate(
+            revision_no=revision_no,
+            logical_dttm=logical_dttm,
+            database_snapshot=database_snapshot,
+            urgency_snapshot=urgency_snapshot,
+            input_fingerprint=input_fingerprint,
+            object_base_uri=object_base_uri,
+        )
+    if _candidate_is_exact_replay(candidate, current):
+        current_plan = _load_current_proposed_plan(connection, candidate.plan)
+        if current_plan != candidate.plan:
+            raise ContractViolation(
+                "rebalance_route state는 replay지만 current proposed aggregate가 다릅니다."
+            )
+
+    stored_coverage = store_input_payload(
+        object_store,
+        base_uri=object_base_uri,
+        publication_key="rebalance_route",
+        role="route_coverage",
+        payload=coverage_payload,
+        suffix="json",
+        require_canonical_json=True,
+    )
+    if stored_coverage != coverage_input:
+        raise ContractViolation("stored route coverage identity가 preview와 다릅니다.")
+    materials = materialize_publication(
+        object_store,
+        base_uri=object_base_uri,
+        publication_key="rebalance_route",
+        dependencies=dependencies,
+        input_artifacts=(coverage_input, urgency_snapshot.manifest_input),
+        parameters=input_fingerprint.parameters,
+        outputs=candidate.outputs,
+    )
+    if (
+        materials.artifact_set != candidate.artifact_set
+        or materials.input_fingerprint != candidate.input_fingerprint
+    ):
+        raise ContractViolation(
+            "route immutable materialization이 revision preview와 다릅니다."
+        )
+    prepared = build_prepared_publication(
+        base_uri=object_base_uri,
+        publication_key="rebalance_route",
+        logical_dttm=logical_dttm,
+        publisher_version=publisher_version,
+        revision_no=revision_no,
+        target_row_counts={
+            "rebalance_route": len(candidate.plan.routes),
+            "rebalance_route_stop": len(candidate.plan.route_stops),
+        },
+        materials=materials,
+    )
+
+    def validate_staging(
+        publication: PreparedPublication,
+        payloads: Mapping[str, bytes],
+    ) -> Mapping[str, tuple[datetime, ...]]:
+        """Actual urgency·coverage·output bytes에서 같은 revision plan을 재증명한다."""
+        actual_urgency = _read_route_urgency_snapshot_from_verified_inputs(
+            object_store,
+            manifest_input=urgency_snapshot.manifest_input,
+            payloads=payloads,
+        )
+        actual_coverage = parse_route_coverage(payloads[coverage_input.uri])
+        if actual_coverage != database_snapshot.route_coverage:
+            raise ContractViolation(
+                "verified route coverage bytes가 준비한 DB projection과 다릅니다."
+            )
+        validate_route_urgency_dependencies(
+            publication.input_fingerprint,
+            actual_urgency.input_fingerprint,
+        )
+        expected = _plan_from_snapshots(
+            logical_dttm=publication.manifest.logical_dttm,
+            revision_no=publication.manifest.revision_no,
+            database_snapshot=database_snapshot,
+            urgency_snapshot=actual_urgency,
+        )
+        if expected != candidate.plan:
+            raise ContractViolation(
+                "verified urgency actual bytes가 준비한 route plan과 다릅니다."
+            )
+        _validate_route_output_artifacts(publication, payloads, expected)
+        return {
+            "proposed_dttm": tuple(route.proposed_dttm for route in expected.routes)
+        }
+
+    def validate_locked(
+        cursor: Cursor[tuple[Any, ...]],
+        evidence: tuple[VerifiedPublicationEvidence, ...],
+    ) -> None:
+        """Topology·route lock 안 DB snapshot과 coverage로 plan을 다시 계산한다."""
+        _require_route_evidence(evidence)
+        locked_snapshot = _route_database_snapshot_locked(cursor, logical_dttm)
+        if locked_snapshot != database_snapshot:
+            raise ContractViolation(
+                "route staging 이후 topology 또는 terminal coverage가 바뀌었습니다."
+            )
+        locked_plan = _plan_from_snapshots(
+            logical_dttm=logical_dttm,
+            revision_no=revision_no,
+            database_snapshot=locked_snapshot,
+            urgency_snapshot=urgency_snapshot,
+        )
+        if locked_plan != candidate.plan:
+            raise ContractViolation(
+                "locked topology·coverage route 재계산 결과가 staging과 다릅니다."
+            )
+
+    def mutate_targets(
+        cursor: Cursor[tuple[Any, ...]],
+        evidence: tuple[VerifiedPublicationEvidence, ...],
+    ) -> None:
+        """Proposed aggregate만 full reconcile하고 terminal route는 보존한다."""
+        _require_route_evidence(evidence)
+        _reconcile_route_plan(cursor, candidate.plan)
+
+    return publish_verified(
+        connection,
+        ((prepared, validate_staging),),
+        object_store,
+        mutate_targets,
+        validate_locked=validate_locked,
+    )
+
+
+def _build_route_candidate(
+    *,
+    revision_no: int,
+    logical_dttm: datetime,
+    database_snapshot: RouteDatabaseSnapshot,
+    urgency_snapshot: RouteUrgencySnapshot,
+    input_fingerprint: InputFingerprint,
+    object_base_uri: str,
+) -> _RoutePublicationCandidate:
+    """Revision UUID를 포함한 plan과 output artifact-set을 write 없이 preview한다."""
+    plan = _plan_from_snapshots(
+        logical_dttm=logical_dttm,
+        revision_no=revision_no,
+        database_snapshot=database_snapshot,
+        urgency_snapshot=urgency_snapshot,
+    )
+    outputs = _route_output_objects(plan)
+    artifacts = tuple(
+        Artifact(
+            byte_sha256=sha256_hex(output.payload),
+            role=output.role,
+            row_count=output.row_count,
+            uri=content_addressed_uri(
+                object_base_uri,
+                publication_key="rebalance_route",
+                category="outputs",
+                name=output.role,
+                payload=output.payload,
+                suffix=output.suffix,
+            ),
+        )
+        for output in outputs
+    )
+    return _RoutePublicationCandidate(
+        logical_dttm=logical_dttm,
+        revision_no=revision_no,
+        plan=plan,
+        outputs=outputs,
+        artifact_set=build_artifact_set(artifacts),
+        input_fingerprint=input_fingerprint,
+    )
+
+
+def _choose_route_revision(
+    candidate: _RoutePublicationCandidate,
+    current: PublicationStateRecord | None,
+) -> int:
+    """현재 revision preview가 replay인지 판정하고 correction revision을 반환한다."""
+    if current is None or current.logical_dttm != candidate.logical_dttm:
+        return 0
+    if _candidate_is_exact_replay(candidate, current):
+        return current.revision_no
+    if current.revision_no == _MAX_DATABASE_REVISION:
+        raise ContractViolation(
+            "rebalance_route correction revision이 INTEGER 한계에 도달했습니다."
+        )
+    return current.revision_no + 1
+
+
+def _candidate_is_exact_replay(
+    candidate: _RoutePublicationCandidate,
+    current: PublicationStateRecord | None,
+) -> bool:
+    """Candidate canonical content가 같은 logical current state인지 반환한다."""
+    if current is None or current.logical_dttm != candidate.logical_dttm:
+        return False
+    return (
+        candidate.revision_no == current.revision_no
+        and candidate.artifact_set.sha256 == current.artifact_set_sha256
+        and candidate.input_fingerprint.sha256 == current.input_fingerprint_sha256
+        and len(candidate.plan.routes) == current.published_row_cnt
+    )
+
+
+def _route_output_objects(plan: RebalanceRoutePlan) -> tuple[OutputObject, ...]:
+    """Nonempty route plan을 두 output으로 만들고 EMPTY는 artifact 없이 둔다."""
+    if not plan.routes:
+        return ()
+    artifacts = route_plan_to_parquet(plan)
+    return (
+        OutputObject("routes", artifacts.routes, len(plan.routes)),
+        OutputObject("route_stops", artifacts.route_stops, len(plan.route_stops)),
+    )
+
+
+def _plan_from_snapshots(
+    *,
+    logical_dttm: datetime,
+    revision_no: int,
+    database_snapshot: RouteDatabaseSnapshot,
+    urgency_snapshot: RouteUrgencySnapshot,
+) -> RebalanceRoutePlan:
+    """Typed urgency와 DB snapshot을 pure route-v1 planner 입력으로 바꾼다."""
+    return plan_rebalance_routes(
+        logical_dttm=logical_dttm,
+        revision_no=revision_no,
+        dispatch_centers=database_snapshot.dispatch_centers,
+        stations=database_snapshot.stations,
+        urgency=urgency_snapshot.records,
+        route_coverage=database_snapshot.route_coverage,
+    )
+
+
+def _read_route_urgency_snapshot(
+    object_store: ImmutableObjectStore,
+    *,
+    manifest_uri: str,
+    manifest_sha256: str,
+) -> RouteUrgencySnapshot:
+    """URI·SHA로 urgency manifest와 nested fingerprint·output actual bytes를 읽는다."""
+    manifest_payload = object_store.read_bytes(
+        manifest_uri,
+        manifest_sha256,
+        require_canonical_json=True,
+    )
+    if sha256_hex(manifest_payload) != manifest_sha256:
+        raise ContractViolation(
+            "urgency manifest actual bytes SHA가 요청값과 다릅니다."
+        )
+    manifest = parse_publication_manifest(manifest_payload)
+    fingerprint_payload = object_store.read_bytes(
+        manifest.input_fingerprint_uri,
+        manifest.input_fingerprint_sha256,
+        require_canonical_json=True,
+    )
+    return _build_route_urgency_snapshot(
+        object_store,
+        manifest_uri=manifest_uri,
+        expected_manifest_sha256=manifest_sha256,
+        manifest_payload=manifest_payload,
+        fingerprint_payload=fingerprint_payload,
+    )
+
+
+def _read_route_urgency_snapshot_from_verified_inputs(
+    object_store: ImmutableObjectStore,
+    *,
+    manifest_input: InputArtifact,
+    payloads: Mapping[str, bytes],
+) -> RouteUrgencySnapshot:
+    """공통 verifier가 읽은 manifest·nested fingerprint bytes에서 snapshot을 재구성한다."""
+    try:
+        manifest_payload = payloads[manifest_input.uri]
+    except KeyError as exc:
+        raise ContractViolation(
+            "route verifier payload에 urgency manifest가 없습니다."
+        ) from exc
+    manifest = parse_publication_manifest(manifest_payload)
+    try:
+        fingerprint_payload = payloads[manifest.input_fingerprint_uri]
+    except KeyError as exc:
+        raise ContractViolation(
+            "route verifier payload에 nested urgency fingerprint가 없습니다."
+        ) from exc
+    return _build_route_urgency_snapshot(
+        object_store,
+        manifest_uri=manifest_input.uri,
+        expected_manifest_sha256=manifest_input.byte_sha256,
+        manifest_payload=manifest_payload,
+        fingerprint_payload=fingerprint_payload,
+    )
+
+
+def _build_route_urgency_snapshot(
+    object_store: ImmutableObjectStore,
+    *,
+    manifest_uri: str,
+    expected_manifest_sha256: str,
+    manifest_payload: bytes,
+    fingerprint_payload: bytes,
+) -> RouteUrgencySnapshot:
+    """Urgency wire documents와 output Parquet을 typed route input으로 결합한다."""
+    if sha256_hex(manifest_payload) != expected_manifest_sha256:
+        raise ContractViolation(
+            "urgency manifest payload SHA가 input identity와 다릅니다."
+        )
+    manifest = parse_publication_manifest(manifest_payload)
+    if manifest.publication_key != "station_urgency":
+        raise ContractViolation("route input manifest가 station_urgency가 아닙니다.")
+    if manifest.sha256 != expected_manifest_sha256:
+        raise ContractViolation("urgency canonical manifest SHA가 요청값과 다릅니다.")
+    if sha256_hex(fingerprint_payload) != manifest.input_fingerprint_sha256:
+        raise ContractViolation(
+            "urgency nested fingerprint actual bytes SHA가 manifest와 다릅니다."
+        )
+    fingerprint = parse_input_fingerprint(
+        fingerprint_payload,
+        "station_urgency",
+    )
+    parameters = {
+        parameter.name: parameter.value for parameter in fingerprint.parameters
+    }
+
+    if manifest.published_row_cnt == 0:
+        records: tuple[RouteUrgencyInput, ...] = ()
+    else:
+        if len(manifest.artifacts) != 1:
+            raise ContractViolation(
+                "nonempty urgency manifest에는 output artifact 하나가 필요합니다."
+            )
+        artifact = manifest.artifacts[0]
+        if artifact.role != "station_urgency":
+            raise ContractViolation("urgency manifest output role이 잘못됐습니다.")
+        output_payload = object_store.read_bytes(
+            artifact.uri,
+            artifact.byte_sha256,
+        )
+        if sha256_hex(output_payload) != artifact.byte_sha256:
+            raise ContractViolation("urgency output actual bytes SHA가 다릅니다.")
+        table = read_parquet_bytes(output_payload)
+        if "sta_id" not in table.column_names:
+            raise ContractViolation("urgency output Parquet에 sta_id가 없습니다.")
+        expected_ids = tuple(table.column("sta_id").to_pylist())
+        records = _route_urgency_records_from_parquet(
+            output_payload,
+            expected_base_dttm=manifest.logical_dttm,
+            expected_sta_ids=expected_ids,
+        )
+        if artifact.row_count != len(records):
+            raise ContractViolation(
+                "urgency output physical row count가 manifest artifact와 다릅니다."
+            )
+    expected_ids = tuple(record.sta_id for record in records)
+    if parameters["expected_sta_id_sha256"] != build_id_set(expected_ids).sha256:
+        raise ContractViolation(
+            "urgency output station 집합이 nested expected_sta_id_sha256과 다릅니다."
+        )
+    if manifest.published_row_cnt != len(records):
+        raise ContractViolation(
+            "urgency manifest published_row_cnt가 actual output과 다릅니다."
+        )
+    return RouteUrgencySnapshot(
+        manifest=manifest,
+        input_fingerprint=fingerprint,
+        manifest_input=InputArtifact(
+            byte_sha256=expected_manifest_sha256,
+            role="urgency_publication_manifest",
+            uri=manifest_uri,
+        ),
+        records=records,
+    )
+
+
+def _route_urgency_records_from_parquet(
+    payload: bytes,
+    *,
+    expected_base_dttm: datetime,
+    expected_sta_ids: tuple[str, ...],
+) -> tuple[RouteUrgencyInput, ...]:
+    """Route가 소비하는 urgency output exact schema·anchor·ID 집합을 검증한다."""
+    table = read_parquet_bytes(payload)
+    if not table.schema.equals(_URGENCY_OUTPUT_SCHEMA, check_metadata=False):
+        raise ContractViolation(
+            "urgency output Parquet schema가 exact 계약과 다릅니다."
+        )
+    expected_base = _utc_dttm(expected_base_dttm, "urgency expected base_dttm")
+    canonical_ids = tuple(sorted(expected_sta_ids, key=_utf8_key))
+    if expected_sta_ids != canonical_ids or len(expected_sta_ids) != len(
+        set(expected_sta_ids)
+    ):
+        raise ContractViolation(
+            "urgency output sta_id는 중복 없이 UTF-8 순이어야 합니다."
+        )
+    records: list[RouteUrgencyInput] = []
+    actual_ids: list[str] = []
+    for row in table.to_pylist():
+        station_id = _station_id(row["sta_id"])
+        if _utc_dttm(row["base_dttm"], "urgency base_dttm") != expected_base:
+            raise ContractViolation(
+                "urgency output row base_dttm이 manifest logical_dttm과 다릅니다."
+            )
+        _postgres_nonnegative_integer(
+            row["critical_remaining_min"],
+            "urgency critical_remaining_min",
+        )
+        _postgres_nonnegative_integer(row["bike_qty"], "urgency bike_qty")
+        actual_ids.append(station_id)
+        records.append(
+            RouteUrgencyInput(
+                sta_id=station_id,
+                urgency_score=row["urgency_score"],
+                action_type=row["rebalance_need_type_cd"],
+                bike_qty=row["bike_qty"],
+            )
+        )
+    if tuple(actual_ids) != expected_sta_ids:
+        raise ContractViolation(
+            "urgency output actual station 순서·집합이 기대값과 다릅니다."
+        )
+    return tuple(records)
+
+
+def _load_route_database_snapshot(
+    connection: Connection[Any],
+    logical_dttm: datetime,
+) -> RouteDatabaseSnapshot:
+    """짧은 transaction에서 현재 topology와 terminal coverage를 함께 읽는다."""
+    if connection.info.transaction_status is not TransactionStatus.IDLE:
+        raise ContractViolation(
+            "route DB snapshot loader는 transaction이 시작되지 않은 연결이 필요합니다."
+        )
+    with connection.transaction(), connection.cursor(row_factory=tuple_row) as cursor:
+        return _route_database_snapshot_locked(cursor, logical_dttm)
+
+
+def _route_database_snapshot_locked(
+    cursor: Cursor[tuple[Any, ...]],
+    logical_dttm: datetime,
+) -> RouteDatabaseSnapshot:
+    """현재 cursor snapshot에서 topology와 canonical route coverage를 읽는다."""
+    logical = _utc_dttm(logical_dttm, "route logical_dttm")
+    cursor.execute(
+        """
+        SELECT dispatch_center_id,
+               ST_X(dispatch_center_point),
+               ST_Y(dispatch_center_point),
+               is_active
+          FROM dispatch_center
+         ORDER BY dispatch_center_id COLLATE "C"
+        """
+    )
+    centers = tuple(DispatchCenterTopology(*row) for row in cursor.fetchall())
+    cursor.execute(
+        """
+        SELECT sta_id,
+               dispatch_center_id,
+               ST_X(sta_point),
+               ST_Y(sta_point),
+               is_active
+          FROM station
+         ORDER BY sta_id COLLATE "C"
+        """
+    )
+    stations = tuple(StationRouteTopology(*row) for row in cursor.fetchall())
+    coverage = _route_coverage_locked(cursor, logical)
+    return RouteDatabaseSnapshot(centers, stations, coverage)
+
+
+def _route_coverage_locked(
+    cursor: Cursor[tuple[Any, ...]],
+    stock_anchor_dttm: datetime,
+) -> RouteCoverageDocument:
+    """DB dispatched 전체와 stock anchor 뒤 completed aggregate를 canonicalize한다."""
+    anchor = _utc_dttm(stock_anchor_dttm, "route stock anchor")
+    cursor.execute(
+        """
+        SELECT route_id::TEXT,
+               route_status_cd,
+               dispatched_dttm,
+               completed_dttm
+          FROM rebalance_route
+         WHERE route_status_cd = 'dispatched'
+            OR (route_status_cd = 'completed' AND completed_dttm > %s)
+         ORDER BY route_id::TEXT COLLATE "C"
+        """,
+        (anchor,),
+    )
+    headers = tuple(cursor.fetchall())
+    route_ids = tuple(row[0] for row in headers)
+    stops_by_route: dict[str, list[ExistingRouteStop]] = {
+        route_id: [] for route_id in route_ids
+    }
+    if route_ids:
+        cursor.execute(
+            """
+            SELECT route_id::TEXT,
+                   visit_no,
+                   sta_id,
+                   route_action_type_cd,
+                   bike_cnt
+              FROM rebalance_route_stop
+             WHERE route_id = ANY(%s::UUID[])
+             ORDER BY route_id::TEXT COLLATE "C", visit_no
+            """,
+            (list(route_ids),),
+        )
+        for route_id, visit_no, sta_id, action, bike_cnt in cursor.fetchall():
+            stops_by_route[route_id].append(
+                ExistingRouteStop(visit_no, sta_id, action, bike_cnt)
+            )
+    routes = tuple(
+        ExistingRoute(
+            route_id=route_id,
+            route_status_cd=status,
+            dispatched_dttm=dispatched_dttm,
+            completed_dttm=completed_dttm,
+            stops=tuple(stops_by_route[route_id]),
+        )
+        for route_id, status, dispatched_dttm, completed_dttm in headers
+    )
+    return build_current_route_coverage(stock_anchor_dttm=anchor, routes=routes)
+
+
+def _load_current_proposed_plan(
+    connection: Connection[Any],
+    expected_plan: RebalanceRoutePlan,
+) -> RebalanceRoutePlan:
+    """Replay drift 검사용 current proposed aggregate를 짧게 읽는다."""
+    if type(expected_plan) is not RebalanceRoutePlan:
+        raise ContractViolation("expected route plan 타입이 잘못됐습니다.")
+    if connection.info.transaction_status is not TransactionStatus.IDLE:
+        raise ContractViolation(
+            "proposed route loader는 transaction이 시작되지 않은 연결이 필요합니다."
+        )
+    with connection.transaction(), connection.cursor(row_factory=tuple_row) as cursor:
+        return _current_proposed_plan_locked(
+            cursor,
+            expected_route_order=tuple(
+                route.route_id for route in expected_plan.routes
+            ),
+        )
+
+
+def _current_proposed_plan_locked(
+    cursor: Cursor[tuple[Any, ...]],
+    *,
+    expected_route_order: tuple[str, ...] | None = None,
+) -> RebalanceRoutePlan:
+    """현재 proposed header와 stop을 deterministic aggregate로 읽는다."""
+    cursor.execute(
+        """
+        SELECT route_id::TEXT,
+               dispatch_center_id,
+               route_status_cd,
+               proposed_dttm,
+               dispatched_dttm,
+               completed_dttm
+          FROM rebalance_route
+         WHERE route_status_cd = 'proposed'
+         ORDER BY dispatch_center_id COLLATE "C", route_id::TEXT COLLATE "C"
+        """
+    )
+    routes = tuple(RebalanceRoute(*row) for row in cursor.fetchall())
+    if expected_route_order is not None:
+        expected_ids = tuple(
+            _canonical_uuid(route_id, "expected route_id")
+            for route_id in expected_route_order
+        )
+        routes_by_id = {route.route_id: route for route in routes}
+        if set(routes_by_id) == set(expected_ids):
+            routes = tuple(routes_by_id[route_id] for route_id in expected_ids)
+    route_ids = tuple(route.route_id for route in routes)
+    stops: tuple[RebalanceRouteStop, ...] = ()
+    if route_ids:
+        cursor.execute(
+            """
+            SELECT route_id::TEXT,
+                   visit_no,
+                   sta_id,
+                   route_action_type_cd,
+                   bike_cnt
+              FROM rebalance_route_stop
+             WHERE route_id = ANY(%s::UUID[])
+             ORDER BY array_position(%s::UUID[], route_id), visit_no
+            """,
+            (list(route_ids), list(route_ids)),
+        )
+        stops = tuple(RebalanceRouteStop(*row) for row in cursor.fetchall())
+    return RebalanceRoutePlan(routes, stops)
+
+
+def _validate_route_output_artifacts(
+    publication: PreparedPublication,
+    payloads: Mapping[str, bytes],
+    expected_plan: RebalanceRoutePlan,
+) -> None:
+    """Route output actual Parquet 두 개 또는 artifact 없는 EMPTY를 검증한다."""
+    artifacts = {artifact.role: artifact for artifact in publication.manifest.artifacts}
+    if not expected_plan.routes:
+        if artifacts:
+            raise ContractViolation(
+                "EMPTY route publication에 output artifact가 있습니다."
+            )
+        return
+    if set(artifacts) != {"routes", "route_stops"}:
+        raise ContractViolation(
+            "nonempty route publication에는 routes와 route_stops artifact가 필요합니다."
+        )
+    actual = route_plan_from_parquet(
+        payloads[artifacts["routes"].uri],
+        payloads[artifacts["route_stops"].uri],
+        expected_plan=expected_plan,
+    )
+    if actual != expected_plan:
+        raise ContractViolation("route output actual bytes가 expected plan과 다릅니다.")
+
+
+def _require_route_evidence(
+    evidence: tuple[VerifiedPublicationEvidence, ...],
+) -> VerifiedPublicationEvidence:
+    """Callback evidence가 rebalance_route 하나인지 검증한다."""
+    if len(evidence) != 1 or evidence[0].manifest.publication_key != "rebalance_route":
+        raise ContractViolation("rebalance_route publication evidence가 잘못됐습니다.")
+    return evidence[0]
+
+
+def _reconcile_route_plan(
+    cursor: Cursor[tuple[Any, ...]],
+    plan: RebalanceRoutePlan,
+) -> None:
+    """Proposed aggregate만 교체하고 terminal header·stop metadata를 보존한다."""
+    terminal_before = _terminal_route_snapshot_locked(cursor)
+    cursor.execute("DELETE FROM rebalance_route WHERE route_status_cd = 'proposed'")
+    if plan.routes:
+        cursor.executemany(
+            """
+            INSERT INTO rebalance_route (
+                route_id,
+                dispatch_center_id,
+                route_status_cd,
+                proposed_dttm,
+                dispatched_dttm,
+                completed_dttm
+            ) VALUES (%s, %s, %s, %s, %s, %s)
+            """,
+            [
+                (
+                    route.route_id,
+                    route.dispatch_center_id,
+                    route.route_status_cd,
+                    route.proposed_dttm,
+                    route.dispatched_dttm,
+                    route.completed_dttm,
+                )
+                for route in plan.routes
+            ],
+        )
+        cursor.executemany(
+            """
+            INSERT INTO rebalance_route_stop (
+                route_id,
+                visit_no,
+                sta_id,
+                route_action_type_cd,
+                bike_cnt
+            ) VALUES (%s, %s, %s, %s, %s)
+            """,
+            [
+                (
+                    stop.route_id,
+                    stop.visit_no,
+                    stop.sta_id,
+                    stop.route_action_type_cd,
+                    stop.bike_cnt,
+                )
+                for stop in plan.route_stops
+            ],
+        )
+    if (
+        _current_proposed_plan_locked(
+            cursor,
+            expected_route_order=tuple(route.route_id for route in plan.routes),
+        )
+        != plan
+    ):
+        raise ContractViolation(
+            "rebalance_route proposed full reconcile readback이 plan과 다릅니다."
+        )
+    if _terminal_route_snapshot_locked(cursor) != terminal_before:
+        raise ContractViolation(
+            "rebalance_route reconcile이 dispatched/completed 이력을 변경했습니다."
+        )
+
+
+def _terminal_route_snapshot_locked(
+    cursor: Cursor[tuple[Any, ...]],
+) -> tuple[tuple[Any, ...], tuple[tuple[Any, ...], ...]]:
+    """Terminal route와 stop의 모든 business·metadata 값을 비교용으로 읽는다."""
+    cursor.execute(
+        """
+        SELECT route_id::TEXT,
+               dispatch_center_id,
+               route_status_cd,
+               proposed_dttm,
+               dispatched_dttm,
+               completed_dttm,
+               created_dttm,
+               updated_dttm
+          FROM rebalance_route
+         WHERE route_status_cd IN ('dispatched', 'completed')
+         ORDER BY route_id::TEXT COLLATE "C"
+        """
+    )
+    routes = tuple(cursor.fetchall())
+    cursor.execute(
+        """
+        SELECT stop.route_id::TEXT,
+               stop.visit_no,
+               stop.sta_id,
+               stop.route_action_type_cd,
+               stop.bike_cnt,
+               stop.created_dttm
+          FROM rebalance_route_stop AS stop
+          JOIN rebalance_route AS route USING (route_id)
+         WHERE route.route_status_cd IN ('dispatched', 'completed')
+         ORDER BY stop.route_id::TEXT COLLATE "C", stop.visit_no
+        """
+    )
+    return routes, tuple(cursor.fetchall())
 
 
 def _index_centers(
@@ -833,6 +1800,14 @@ def _nonnegative_integer(value: object, label: str) -> int:
     if type(value) is not int or value < 0:
         raise ContractViolation(f"{label}는 0 이상 integer여야 합니다.")
     return value
+
+
+def _postgres_nonnegative_integer(value: object, label: str) -> int:
+    """값을 target의 비음수 PostgreSQL INTEGER 범위로 검증해 반환한다."""
+    number = _nonnegative_integer(value, label)
+    if number > _POSTGRES_INTEGER_MAX:
+        raise ContractViolation(f"{label}가 PostgreSQL INTEGER 범위를 벗어났습니다.")
+    return number
 
 
 def _utf8_key(value: str) -> bytes:
