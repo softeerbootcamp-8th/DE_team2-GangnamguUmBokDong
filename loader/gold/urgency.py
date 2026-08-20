@@ -27,6 +27,7 @@ from core.gold_publication import (
     validate_id_set_parameter,
     validate_input_fingerprint,
     validate_linked_dependency_manifests,
+    validate_sha256_hex,
 )
 from core.scoring_config import (
     FIRST_FORECAST_MIN,
@@ -70,6 +71,9 @@ from .versioning import PublicationCandidate, allocate_revision
 _STATION_ID = re.compile(r"ST-[0-9]+\Z")
 _NEED_TYPES = frozenset({"normal", "supply_needed", "retrieval_needed"})
 _POSTGRES_INTEGER_MAX = 2_147_483_647
+_SERVING_RELEASE_KEYS = frozenset(
+    {"station", "station_demand_forecast", "station_stock"}
+)
 BIKE_STATION_REALTIME_SOURCE_ID = "bike_station_realtime"
 URGENCY_PUBLISHER_VERSION = "gold-urgency-publisher-v1"
 _URGENCY_SCHEMA = pa.schema(
@@ -502,6 +506,7 @@ def publish_station_urgency(
     *,
     source_catalog: S3SourceSnapshotCatalog,
     stock_history_manifest_refs: tuple[tuple[str, str], ...],
+    serving_release_manifest_refs: Mapping[str, tuple[str, str]],
     object_base_uri: str,
     publisher_version: str = URGENCY_PUBLISHER_VERSION,
 ) -> PublicationExecution:
@@ -514,12 +519,19 @@ def publish_station_urgency(
     """
     if type(source_catalog) is not S3SourceSnapshotCatalog:
         raise ContractViolation("source_catalog는 S3SourceSnapshotCatalog여야 합니다.")
+    release_refs = _serving_release_manifest_refs(serving_release_manifest_refs)
     history_inputs = _stock_history_input_artifacts(stock_history_manifest_refs)
     dependencies = load_dependencies(
         connection,
         ("station", "station_demand_forecast", "station_stock"),
     )
     dependency_by_key = {item.publication_key: item for item in dependencies}
+    _validate_serving_release_state_refs(
+        connection,
+        object_store,
+        dependency_by_key,
+        release_refs,
+    )
     anchor = dependency_by_key["station_stock"].logical_dttm
     if dependency_by_key["station_demand_forecast"].logical_dttm != anchor:
         raise ContractViolation("urgency demand와 current stock anchor가 다릅니다.")
@@ -756,6 +768,55 @@ def _stock_history_input_artifacts(
         )
         for index, (uri, byte_sha256) in enumerate(references, start=1)
     )
+
+
+def _serving_release_manifest_refs(
+    values: Mapping[str, tuple[str, str]],
+) -> dict[str, tuple[str, str]]:
+    """Finalize가 반환한 station·demand·stock exact ref mapping을 검증한다."""
+    if type(values) is not dict or frozenset(values) != _SERVING_RELEASE_KEYS:
+        raise ContractViolation("urgency serving release ref key 집합이 잘못됐습니다.")
+    result: dict[str, tuple[str, str]] = {}
+    for key in sorted(values):
+        reference = values[key]
+        if (
+            type(reference) is not tuple
+            or len(reference) != 2
+            or any(type(item) is not str or not item for item in reference)
+        ):
+            raise ContractViolation(
+                f"{key} serving release ref는 exact URI·SHA tuple이어야 합니다."
+            )
+        validate_sha256_hex(reference[1])
+        result[key] = reference
+    return result
+
+
+def _validate_serving_release_state_refs(
+    connection: Connection[Any],
+    object_store: ImmutableObjectStore,
+    dependency_by_key: Mapping[str, Dependency],
+    references: Mapping[str, tuple[str, str]],
+) -> None:
+    """Urgency dependency state가 finalize가 넘긴 exact release인지 재검증한다."""
+    for key in sorted(_SERVING_RELEASE_KEYS):
+        dependency = dependency_by_key.get(key)
+        state = load_publication_state(connection, key)
+        uri, byte_sha256 = references[key]
+        if (
+            type(dependency) is not Dependency
+            or state is None
+            or state.dependency != dependency
+            or state.manifest_uri != uri
+        ):
+            raise ContractViolation(
+                f"{key} state가 finalize exact release ref와 다릅니다."
+            )
+        manifest = read_state_manifest(object_store, state)
+        if manifest.sha256 != byte_sha256:
+            raise ContractViolation(
+                f"{key} manifest SHA가 finalize exact release ref와 다릅니다."
+            )
 
 
 def _validate_history_catalog(

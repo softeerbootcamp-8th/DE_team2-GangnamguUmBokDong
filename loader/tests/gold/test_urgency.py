@@ -22,6 +22,7 @@ from core.source_snapshot import (
     SourceSnapshotStatus,
     build_source_snapshot_manifest,
 )
+
 from gold.common import parquet_bytes
 from gold.demand import DemandForecastRecord
 from gold.source_catalog import S3SourceSnapshotCatalog
@@ -35,6 +36,7 @@ from gold.urgency import (
     UrgencyRecord,
     _bike_qty_v1,
     _history_window_from_manifest,
+    _serving_release_manifest_refs,
     _stock_history_input_artifacts,
     _urgency_score_v1,
     _validate_history_catalog,
@@ -46,6 +48,22 @@ from gold.urgency import (
 
 BASE = datetime(2026, 8, 20, 0, 5, tzinfo=UTC)
 BUCKET = "test-bucket"
+
+
+def test_serving_release_refs_require_exact_three_key_mapping() -> None:
+    """Urgency가 finalize의 station·demand·stock exact URI/SHA 외 입력을 거부한다."""
+    valid = {
+        "station": ("s3://fixture/station.json", "a" * 64),
+        "station_demand_forecast": ("s3://fixture/demand.json", "b" * 64),
+        "station_stock": ("s3://fixture/stock.json", "c" * 64),
+    }
+    assert _serving_release_manifest_refs(valid) == valid
+    with pytest.raises(ContractViolation, match="key 집합"):
+        _serving_release_manifest_refs({"station": valid["station"]})
+    with pytest.raises(ContractViolation, match="SHA"):
+        _serving_release_manifest_refs(
+            {**valid, "station_stock": ("s3://fixture/stock.json", "bad")}
+        )
 
 
 def _record(

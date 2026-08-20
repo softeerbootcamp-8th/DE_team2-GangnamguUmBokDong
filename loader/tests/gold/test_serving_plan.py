@@ -16,6 +16,8 @@ from core.gold_publication import (
     sha256_hex,
 )
 from core.model_snapshot import IdSetArtifactRef, build_id_set_artifact_ref
+from core.serving_plan_input import read_serving_plan_inference_inputs
+
 from gold.serving_plan import (
     PreparedManifestRef,
     ServingPlan,
@@ -81,7 +83,7 @@ def _id_ref(name: str, values: tuple[str, ...]) -> IdSetArtifactRef:
     id_set = build_id_set(values)
     return build_id_set_artifact_ref(
         id_set,
-        f"s3://fixture/{name}/sha256={id_set.sha256}.json",
+        f"s3://fixture/gold/{name}/sha256={id_set.sha256}.json",
     )
 
 
@@ -91,7 +93,7 @@ def _dependency() -> Dependency:
         artifact_set_sha256=_SHA_A,
         input_fingerprint_sha256=_SHA_B,
         logical_dttm=_LOGICAL,
-        manifest_uri=f"s3://fixture/station/publication-{_SHA_C}.json",
+        manifest_uri=f"s3://fixture/gold/station/publication-{_SHA_C}.json",
         publication_key="station",
         revision_no=2,
     )
@@ -186,6 +188,72 @@ def test_serving_plan_artifact_exposes_inference_compatible_exact_ref() -> None:
             plan,
             f"s3://fixture/gold/serving-plan-{plan.sha256}.json",
             plan.sha256,
+        )
+
+
+def test_core_inference_extractor_matches_loader_canonical_plan() -> None:
+    """Loader actual canonical plan과 core inference subset parser drift를 막는다."""
+    store = _MemoryStore()
+    plan = _plan()
+    plan_uri = f"s3://fixture/gold/serving-plan/plans/sha256={plan.sha256}.json"
+    expected = build_id_set(("ST-1",))
+    store.put_once(
+        plan.expected_sta_ids.uri,
+        expected.canonical_bytes,
+        expected_sha256=expected.sha256,
+        require_canonical_json=True,
+    )
+    store.put_once(
+        plan_uri,
+        plan.canonical_bytes,
+        expected_sha256=plan.sha256,
+        require_canonical_json=True,
+    )
+
+    extracted = read_serving_plan_inference_inputs(
+        store,  # type: ignore[arg-type]
+        plan_uri=plan_uri,
+        plan_sha256=plan.sha256,
+    )
+
+    assert extracted.logical_dttm == plan.logical_dttm
+    assert extracted.object_base_uri == plan.object_base_uri
+    assert extracted.station_dependency == plan.station_dependency
+    assert extracted.expected_sta_ids_ref == plan.expected_sta_ids
+    assert extracted.expected_sta_ids == expected
+    assert (
+        extracted.serving_plan
+        == ServingPlanArtifact(
+            plan,
+            plan_uri,
+            plan.sha256,
+        ).serving_plan_ref
+    )
+
+
+def test_core_inference_extractor_rejects_cross_bucket_expected_ref() -> None:
+    """Plan bytes가 다른 bucket의 expected ID authority를 주입하지 못하게 한다."""
+    store = _MemoryStore()
+    document = parse_canonical_json(_plan().canonical_bytes)
+    assert isinstance(document, dict)
+    expected = document["expected_sta_ids"]
+    assert isinstance(expected, dict)
+    expected["uri"] = expected["uri"].replace("s3://fixture/", "s3://other/")
+    payload = canonical_json_bytes(document)
+    digest = sha256_hex(payload)
+    plan_uri = f"s3://fixture/gold/serving-plan/plans/sha256={digest}.json"
+    store.put_once(
+        plan_uri,
+        payload,
+        expected_sha256=digest,
+        require_canonical_json=True,
+    )
+
+    with pytest.raises(ContractViolation, match="object base 밖"):
+        read_serving_plan_inference_inputs(
+            store,  # type: ignore[arg-type]
+            plan_uri=plan_uri,
+            plan_sha256=digest,
         )
 
 

@@ -561,6 +561,8 @@ name = "inference"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
+    { name = "boto3" },
+    { name = "core" },
     { name = "holidays" },
     { name = "ml-core" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
@@ -577,6 +579,8 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "boto3", specifier = "==1.43.69" },
+    { name = "core", editable = "../../libs/core" },
     { name = "holidays", specifier = ">=0.65" },
     { name = "ml-core", editable = "../../libs/ml_core" },
     { name = "numpy" },

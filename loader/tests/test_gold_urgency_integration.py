@@ -25,6 +25,8 @@ from core.source_snapshot import (
     SourceSnapshotStatus,
     build_source_snapshot_manifest,
 )
+from psycopg import Connection
+
 from gold import urgency as urgency_module
 from gold.common import (
     OutputObject,
@@ -34,11 +36,10 @@ from gold.common import (
 )
 from gold.demand import DemandForecastRecord, demand_records_to_parquet
 from gold.source_catalog import S3SourceSnapshotCatalog
-from gold.state import load_dependencies
+from gold.state import load_dependencies, load_publication_state, read_state_manifest
 from gold.station_release import _stock_records_to_parquet
 from gold.station_stock import StationStockRecord
 from gold.urgency import publish_station_urgency
-from psycopg import Connection
 
 _DATABASE_URL = os.environ.get("GOLD_PUBLICATION_TEST_DATABASE_URL")
 _BUCKET = "test-bucket"
@@ -195,11 +196,18 @@ def _publish(
     history: tuple[tuple[str, str], ...],
 ) -> Any:
     """Fixture의 five-window identities로 urgency publisher를 실행한다."""
+    release_refs = {}
+    for key in ("station", "station_demand_forecast", "station_stock"):
+        state = load_publication_state(connection, key)
+        assert state is not None
+        manifest = read_state_manifest(store, state)
+        release_refs[key] = (state.manifest_uri, manifest.sha256)
     return publish_station_urgency(
         connection,
         store,
         source_catalog=source_catalog,
         stock_history_manifest_refs=history,
+        serving_release_manifest_refs=release_refs,
         object_base_uri=_BASE_URI,
     )
 

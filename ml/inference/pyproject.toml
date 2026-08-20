@@ -4,6 +4,8 @@ version = "0.1.0"
 description = "학습된 모델로 배치 조회 + 단일 시점 예측"
 requires-python = ">=3.11"
 dependencies = [
+    "boto3==1.43.69",
+    "core",
     "holidays>=0.65",
     "numpy",
     "pandas",
@@ -18,4 +20,5 @@ dev = ["moto[s3]>=5.2.2", "pytest"]
 package = false
 
 [tool.uv.sources]
+core = { path = "../../libs/core", editable = true }
 ml_core = { path = "../../libs/ml_core", editable = true }
