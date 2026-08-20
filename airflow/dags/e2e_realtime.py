@@ -1,43 +1,25 @@
-"""실제 컴포넌트 CLI 연결을 수동 검증하는 실시간 E2E DAG.
-
-운영 DAG인 ``realtime_5min``과 동일한 핵심 컴포넌트 계약을 사용하지만
-schedule=None으로 두어 개발/통합 검증 시에만 수동 실행한다.
-
-핵심 경로:
-
-    Collector -> population normalizer -----> Inference -> derived Gold Loader
-              -> weather --------------------^
-              -> source Gold publisher ------^
-
-population_realtime Silver는 inference 전에 normalizer를 반드시 통과한다.
-weather_ultra_short_live Silver도 같은 window에 수집된 뒤 inference로 진입한다.
-strict가 성공하면 fallback은 skipped되고, strict가 실패하면 fallback(latest)이 실행된다.
-둘 중 하나가 성공한 경우 ``population_normalized`` 합류 task가 성공해 inference로 진행한다.
-"""
+"""모든 source collector를 포함한 coordinated realtime chain 수동 E2E DAG다."""
 
 import pendulum
-from airflow.providers.standard.operators.empty import EmptyOperator
-from airflow.task.trigger_rule import TriggerRule
+from airflow import DAG
+
 from config.schedules import TIMEZONE
 from config.sources import (
-    NORMALIZER_BASELINE_MODE_FALLBACK,
-    NORMALIZER_BASELINE_MODE_PRIMARY,
     REALTIME_5MIN_SOURCES,
     STATION_MASTER_SOURCE,
+    WEATHER_3H_SOURCE,
     WEATHER_10MIN_SOURCE,
+    WEATHER_ULTRA_SHORT_FORECAST_SOURCE,
 )
 from orchestration.collector_task import build_collector_task
-from orchestration.db_loader_task import build_db_loader_task
-from orchestration.gold_publisher_task import build_gold_publisher_task
 from orchestration.inference_task import build_inference_task
-from orchestration.normalizer_task import (
-    build_normalizer_task,
-    build_station_master_enrichment_task,
-)
+from orchestration.normalizer_task import build_normalizer_task
 from orchestration.routes_task import build_routes_task
+from orchestration.serving_task import (
+    build_finalize_serving_task,
+    build_prepare_serving_task,
+)
 from orchestration.urgency_task import build_urgency_task
-
-from airflow import DAG
 
 with DAG(
     dag_id="e2e_realtime",
@@ -51,69 +33,43 @@ with DAG(
         source_id: build_collector_task(dag, source_id)
         for source_id in REALTIME_5MIN_SOURCES
     }
-    collect_weather = build_collector_task(dag, WEATHER_10MIN_SOURCE)
     collect_station_master = build_collector_task(dag, STATION_MASTER_SOURCE)
-    enrich_station_master = build_station_master_enrichment_task(dag)
-    [
-        collect_station_master,
-        collector_tasks["bike_station_realtime"],
-    ] >> enrich_station_master
-
-    publish_station_release = build_gold_publisher_task(dag, "station-release")
-    [
-        collect_station_master,
-        collector_tasks["bike_station_realtime"],
-    ] >> publish_station_release
-
-    run_normalizer_strict = build_normalizer_task(
-        dag, "run_normalizer_strict", NORMALIZER_BASELINE_MODE_PRIMARY
-    )
-    run_normalizer_fallback = build_normalizer_task(
+    collect_weather_live = build_collector_task(dag, WEATHER_10MIN_SOURCE)
+    collect_weather_short = build_collector_task(dag, WEATHER_3H_SOURCE)
+    collect_weather_ultra = build_collector_task(
         dag,
-        "run_normalizer_fallback",
-        NORMALIZER_BASELINE_MODE_FALLBACK,
-        trigger_rule="all_failed",
-    )
-    population_normalized = EmptyOperator(
-        task_id="population_normalized",
-        trigger_rule=TriggerRule.ONE_SUCCESS,
+        WEATHER_ULTRA_SHORT_FORECAST_SOURCE,
     )
 
-    (
-        collector_tasks["population_realtime"]
-        >> run_normalizer_strict
-        >> run_normalizer_fallback
-    )
-    [run_normalizer_strict, run_normalizer_fallback] >> population_normalized
+    run_normalizer = build_normalizer_task(dag)
+    collector_tasks["population_realtime"] >> run_normalizer
 
-    run_inference = build_inference_task(dag)
-    inference_inputs = [
-        task
-        for source_id, task in collector_tasks.items()
-        if source_id != "population_realtime"
-    ]
+    prepare_plan = build_prepare_serving_task(dag)
     [
-        *inference_inputs,
-        collect_weather,
-        population_normalized,
-        enrich_station_master,
+        collector_tasks["bike_station_realtime"],
+        collect_station_master,
+        collect_weather_short,
+        collect_weather_ultra,
+    ] >> prepare_plan
+
+    run_inference = build_inference_task(dag, plan_task_id=prepare_plan.task_id)
+    [
+        prepare_plan,
+        collector_tasks["bike_rental_history"],
+        collect_weather_live,
+        run_normalizer,
     ] >> run_inference
-
-    load_forecast_points = build_db_loader_task(dag, "forecast_points")
-    [run_inference, publish_station_release] >> load_forecast_points
-
-    compute_urgency = build_urgency_task(dag)
-    load_station_urgency = build_db_loader_task(dag, "station_urgency")
-    run_inference >> compute_urgency
-    [compute_urgency, publish_station_release] >> load_station_urgency
-
-    compute_routes = build_routes_task(dag)
-    load_rebalance_routes = build_db_loader_task(dag, "rebalance_routes")
-    load_rebalance_route_stops = build_db_loader_task(dag, "rebalance_route_stops")
-    (
-        compute_urgency
-        >> compute_routes
-        >> load_rebalance_routes
-        >> load_rebalance_route_stops
+    finalize_release = build_finalize_serving_task(
+        dag,
+        plan_task_id=prepare_plan.task_id,
+        inference_task_id=run_inference.task_id,
     )
-    publish_station_release >> load_rebalance_route_stops
+    publish_urgency = build_urgency_task(
+        dag,
+        final_task_id=finalize_release.task_id,
+    )
+    publish_routes = build_routes_task(
+        dag,
+        urgency_task_id=publish_urgency.task_id,
+    )
+    run_inference >> finalize_release >> publish_urgency >> publish_routes

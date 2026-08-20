@@ -22,16 +22,17 @@ STATION_MASTER_SOURCE_ID = "bike_station_master"
 STATION_MASTER_PREFIX = f"silver/{STATION_MASTER_SOURCE_ID}/"
 STATION_MASTER_ENRICHED_SOURCE_ID = "station_master_enriched"
 STATION_MASTER_ENRICHED_PREFIX = f"silver/{STATION_MASTER_ENRICHED_SOURCE_ID}/"
-# Spark feature pipeline이 사용하는 기존 정적 마스터 계약. 실시간 inference는
-# LAT/LOT에 grid_id를 공간 조인한 STATION_MASTER_ENRICHED_PREFIX를 사용한다.
+# 예전 dev seed 호환 키. 운영 inference와 Spark feature pipeline은 모두 normalizer가
+# grid_id를 보강해 partition으로 쌓는 STATION_MASTER_ENRICHED_PREFIX를 사용한다.
 STATION_MASTER_KEY = "silver/station/station_master.parquet"
 
-# 실제 예시 데이터에 station 마스터 샘플이 없어 아직 검증 못 했다 — 지금은
-# dev/seed_s3_from_local.py 기준을 그대로 둔다(docs/collector/ml-integration-requests.md
-# 확인 요청 참고).
+# normalizer 출력은 이미 표준 이름(station_id/station_no/...)이다. raw master의
+# ADDR2는 실제로 숫자와 상세주소가 섞여 있어 station_no alias로 절대 쓰지 않는다.
+# 모델용 station_no는 normalizer가 RNTLS_ID의 검증된 숫자 suffix로 생성한다.
+# 나머지 raw/예전 dev seed 물리 컬럼 alias만 호환을 위해 유지한다.
 STATION_COLUMN_MAP = {
     "RNTLS_ID": "station_id",
-    "ADDR2": "station_name",
+    "ADDR1": "station_name",
     "LAT": "lat",
     "LOT": "lon",
     "sta_id": "station_id",
@@ -96,38 +97,81 @@ POPULATION_COLUMN_MAP = {
     "SPOP": "pop_total",
 }
 
+# **2026-08 확정**: `loader/transform.py`의 `weather_forecast_from_silver()`가
+# 이 소스를 이미 실제로 소비하고 있어(collector 예보 수집 자체는 이 브랜치엔
+# 아직 없지만, loader 쪽에서 실제 raw 응답 기준으로 이미 구현/검증됨) 그 코드를
+# 그대로 근거로 쓴다 — 앞서(ml-integration-requests.md #6) "PCP는 숫자로 정규화돼
+# 내려온다"고 가정했던 건 틀렸다: PCP는 여전히 raw 텍스트("강수없음"/"1.0mm 미만"/
+# "30.0~50.0mm"/순수 숫자)로 온다(`parse_kma_precip_text()`가 loader의
+# `_parse_precip_str()`과 동일한 정책으로 파싱). 타겟 시각도 단일 컬럼이 아니라
+# `fcstDate`(YYYYMMDD)+`fcstTime`(HHMM, KST) 두 컬럼을 합쳐야 한다(발표 시각은
+# `baseDate`/`baseTime`). nx/ny(격자)는 무시한다 — `weather_ultra_short_live`
+# 관측 소스도 지금 격자 구분 없이 "서울 전체 공유" 1개 값으로 취급하므로
+# (`WEATHER_SOURCE_ID` 관련 함수들 참고) 예보만 격자를 따로 가리는 건 일관성이
+# 없다(추후 격자별로 세분화하려면 관측 쪽도 같이 손봐야 함).
+WEATHER_FORECAST_SOURCE_ID = "weather_short_term_forecast"
+WEATHER_FORECAST_COLUMN_MAP = {"TMP": "temp"}  # PCP는 parse_kma_precip_text()로 별도 처리(단순 rename 불가)
+WEATHER_FORECAST_DATE_COLUMN = "fcstDate"
+WEATHER_FORECAST_TIME_COLUMN = "fcstTime"
+# 실제 발표 주기/스케줄은 아직 확정되지 않았다(자동 수집 DAG 자체가 아직 없음,
+# ml-integration-requests.md #11) — 다른 소스와 같은 3시간 격자를 잠정 가정한다.
+WEATHER_FORECAST_ISSUE_TICK_MINUTES = 180
+
+# Collector의 weather schema와 동일한 유효 범위. 학습과 추론이 이 상수를 함께
+# 써야 범위 밖 관측을 서로 다르게 받아들이는 train-serving skew가 생기지 않는다.
+WEATHER_TEMP_MIN = -50.0
+WEATHER_TEMP_MAX = 50.0
+WEATHER_PRECIP_MIN = 0.0
+WEATHER_PRECIP_MAX = 500.0
+
+
+def parse_kma_precip_text(value) -> float | None:
+    """기상청 강수량 raw 값("강수없음"/"1.0mm 미만"/"30.0~50.0mm"/순수 숫자)을 float(mm)로 변환한다.
+
+    `loader/transform.py`의 `_parse_precip_str()`과 정확히 같은 정책이다 — 두
+    인스턴스가 서로 import하지 않는다는 원칙(이 파일 모듈 docstring 참고)이라
+    독립적으로 복제한다. 범위 표현("30.0~50.0mm")은 하한값을 쓴다(둘 다 동일).
+    """
+    if value is None or value == "":
+        return None
+    text = str(value).strip()
+    if text in ("강수없음", "적설없음"):
+        return 0.0
+    if "미만" in text:
+        return 0.5
+    text = text.replace("mm", "").strip()
+    if "~" in text:
+        text = text.split("~")[0]
+    try:
+        return float(text)
+    except (TypeError, ValueError):
+        return None
+
 BIKE_REALTIME_SOURCE_ID = "bike_station_realtime"
 RENTAL_SOURCE_ID = "bike_rental_history"
 WEATHER_SOURCE_ID = "weather_ultra_short_live"
-WEATHER_ULTRA_FORECAST_SOURCE_ID = "weather_ultra_short_forecast"
-WEATHER_SHORT_FORECAST_SOURCE_ID = "weather_short_term_forecast"
 POPULATION_SOURCE_ID = "living_population_grid"
-# `normalizer`가 5분마다 만드는, population_realtime으로 보정한 생활인구.
-# inference의 실시간 인구 조회 전용이며 학습/평가는 POPULATION_SOURCE_ID를 사용한다.
+# `normalizer`(舊 seoul-pop-normalizer)가 5분마다 만드는, 실시간 도시데이터(population_realtime)로
+# 보정한 생활인구 — 물리 스키마는 POPULATION_SOURCE_ID와 동일(CELL_ID/SPOP/H_DNG_CD/
+# 나이대x성별)하지만 YMD/TT 컬럼이 없다(시각이 이미 S3 키 경로에 있음 — silver_key()와
+# 동일한 dt=/hh=/HHMM 규칙). 서빙(inference)의 실시간 인구 조회 전용 — 학습/평가는
+# 여전히 POPULATION_SOURCE_ID(원본)를 그대로 쓴다(feature_engine/spark/silver_source.py
+# 참고, 정답 라벨은 사후 보정 없는 실측 그대로여야 하므로).
+#
+# 미래 시각의 tick 키(정시 `HH00`)에는 실시간 도시데이터의 `FCST_PPLTN`(향후 12시간
+# 예측)으로 보정한 값이 들어있다 — 관측치가 아니라 예측치이고, 실제 그 시각이 오면
+# 관측 기반 값으로 덮어써진다. 스키마는 현재분과 동일하므로 조회 경로는 같다.
 POPULATION_NORMALIZED_SOURCE_ID = "living_population_normalized"
-
-WEATHER_FORECAST_COLUMN_MAPS = {
-    WEATHER_ULTRA_FORECAST_SOURCE_ID: {
-        "T1H": "temp",
-        "RN1": "precip",
-        "WSD": "wind",
-        "REH": "humidity",
-    },
-    WEATHER_SHORT_FORECAST_SOURCE_ID: {
-        "TMP": "temp",
-        "PCP": "precip",
-        "WSD": "wind",
-        "REH": "humidity",
-    },
-}
 
 BIKE_REALTIME_TICK_MINUTES = 5
 RENTAL_TICK_MINUTES = 5
 
-# #89 E2E에서는 realtime_5min에서도 weather Silver가 5분 window_start로 생길 수 있으므로
-# :05/:15 파일까지 조회 대상에 포함한다.
+# #89 E2E에서는 realtime_5min DAG에서도 weather Silver가 5분 window_start로 생길 수
+# 있으므로(airflow/dags/realtime_5min.py) :05/:15 파일까지 조회 대상에 포함해야 한다.
 WEATHER_TICK_MINUTES = 5
-
+# 관측 날씨가 정확한 target tick에 없을 때 train/serve 모두 허용하는 최대
+# forward-fill/lookback 범위. 이 값보다 오래된 관측은 현재 날씨로 간주하지 않는다.
+WEATHER_MAX_STALENESS_HOURS = 3
 POPULATION_NORMALIZED_TICK_MINUTES = 5
 
 
@@ -164,27 +208,33 @@ def rental_tick_keys(anchor_ts: pd.Timestamp, lookback_hours: float) -> list[str
     return _tick_keys(RENTAL_SOURCE_ID, anchor_ts, lookback_hours, RENTAL_TICK_MINUTES)
 
 
-def weather_tick_keys(anchor_ts: pd.Timestamp, lookback_hours: float = 3.0) -> list[str]:
-    """`weather_ultra_short_live`의 5분 수집 키 목록(오래된 것부터 최신 순)."""
+def weather_tick_keys(
+    anchor_ts: pd.Timestamp,
+    lookback_hours: float = WEATHER_MAX_STALENESS_HOURS,
+) -> list[str]:
+    """`weather_ultra_short_live`의 5분 tick 키 목록(오래된 것부터 최신 순)."""
     return _tick_keys(WEATHER_SOURCE_ID, anchor_ts, lookback_hours, WEATHER_TICK_MINUTES)
 
 
-def source_prefix(source_id: str) -> str:
-    """source_id 하나의 Silver 전체 파티션 prefix."""
-    return f"silver/{source_id}/"
+def weather_forecast_issue_keys(anchor_ts: pd.Timestamp, lookback_hours: float = 24.0) -> list[str]:
+    """`weather_short_term_forecast`의 발표(issue) 파일 키 목록(오래된 것부터 최신 순).
+
+    다른 소스와 달리 이 파일 하나엔 미래 여러 시각의 예보가 여러 행으로 들어있다
+    (관측 소스처럼 "그 tick의 값 1개"가 아님) — 그래서 이 키들은 "그 시각의
+    예보값"이 아니라 "그 시각에 발표된 예보 파일 전체"를 가리킨다. 호출부가 가장
+    최근 발표 파일부터 훑으며 그 안에서 원하는 미래 시각(target_ts)에 가장 가까운
+    행을 골라 쓴다. lookback을 기본 24시간으로 넉넉히 잡은 이유는 실제 발표 주기가
+    3시간 격자에 정확히 맞아떨어지는지 아직 확정되지 않았기 때문(자동 수집 스케줄
+    자체가 아직 없음, `WEATHER_FORECAST_ISSUE_TICK_MINUTES` 주석 참고) — 최소 한
+    번은 걸리게 넉넉히 본다.
+    """
+    return _tick_keys(WEATHER_FORECAST_SOURCE_ID, anchor_ts, lookback_hours, WEATHER_FORECAST_ISSUE_TICK_MINUTES)
 
 
-def population_normalized_tick_keys(
-    anchor_ts: pd.Timestamp,
-    lookback_hours: float = 1.0,
-) -> list[str]:
+def population_normalized_tick_keys(anchor_ts: pd.Timestamp, lookback_hours: float = 1.0) -> list[str]:
     """`living_population_normalized`의 5분 tick 키 목록(오래된 것부터 최신 순)."""
-    return _tick_keys(
-        POPULATION_NORMALIZED_SOURCE_ID,
-        anchor_ts,
-        lookback_hours,
-        POPULATION_NORMALIZED_TICK_MINUTES,
-    )
+    return _tick_keys(POPULATION_NORMALIZED_SOURCE_ID, anchor_ts, lookback_hours, POPULATION_NORMALIZED_TICK_MINUTES)
+
 
 def population_daily_prefix(day: pd.Timestamp) -> str:
     """`living_population_grid`는 하루 1개 파일(YMD/TT 컬럼으로 그날 24시간을 전부
@@ -193,11 +243,6 @@ def population_daily_prefix(day: pd.Timestamp) -> str:
     실제로 존재하는 파일을 찾는다(`_get_recent_population()` 참고).
     """
     return f"silver/{POPULATION_SOURCE_ID}/dt={day:%Y-%m-%d}/"
-
-
-def normalized_population_daily_prefix(day: pd.Timestamp) -> str:
-    """Normalizer가 5분마다 쓰는 보정 인구 Silver의 날짜 prefix를 반환한다."""
-    return f"silver/{POPULATION_NORMALIZED_SOURCE_ID}/dt={day:%Y-%m-%d}/"
 
 
 def predictions_key(window_start: pd.Timestamp) -> str:

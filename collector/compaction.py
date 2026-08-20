@@ -41,12 +41,13 @@ from datetime import date, datetime, timedelta
 from math import ceil
 from zoneinfo import ZoneInfo
 
-import manifest as manifest_module
 import pyarrow as pa
-import storage
-from config.schema import SourceConfig
 from core.s3 import S3Object, read_parquet
 from core.source_snapshot import SourceSnapshotManifest, SourceSnapshotStatus
+
+import manifest as manifest_module
+import storage
+from config.schema import SourceConfig
 from manifest import RunStatus, Stage
 
 logger = logging.getLogger(__name__)
@@ -566,12 +567,20 @@ def compact_date(
         authority = _select_date_authority(config, objects, source_snapshot_windows)
         signature = _authority_signature(authority)
         previous = storage.read_archive_manifest(config.source_id, day)
-        if (
-            not authority.selected
-            and authority.completed_windows == 0
-            and previous is None
-        ):
-            return DateResult(day=day, status="empty")
+        if not authority.selected and authority.completed_windows == 0:
+            if previous is None:
+                return DateResult(day=day, status="empty")
+            if not force:
+                logger.warning(
+                    "stage=compaction status=skipped "
+                    f"source={config.source_id} date={day} "
+                    "reason=authority_regressed_to_zero_completed_windows"
+                )
+                return DateResult(
+                    day=day,
+                    status="skipped",
+                    archive_key=previous.get("archive_key"),
+                )
         if not force and previous and previous.get("silver_signature") == signature:
             return DateResult(
                 day=day,

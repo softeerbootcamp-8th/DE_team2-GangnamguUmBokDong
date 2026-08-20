@@ -1,126 +1,71 @@
-"""Gold publisher CLI의 fail-closed 시간·인자·환경 계약을 검증한다."""
+"""Seed/event Gold CLI와 retired standalone authority 경계를 검증한다."""
 
 from __future__ import annotations
 
-import sys
 from contextlib import nullcontext
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from types import SimpleNamespace
 
-import gold_cli
 import pytest
-from core.gold_publication.errors import ContractViolation
+from core.gold_publication import ContractViolation
+
+import gold_cli
 
 
 def test_window_start_requires_offset_and_normalizes_to_utc() -> None:
-    """Airflow KST window를 동일 instant의 UTC source logical time으로 바꾼다."""
+    """Source publication logical time은 offset 필수 UTC instant다."""
     assert gold_cli._parse_window_start("2026-08-20T09:05:00+09:00") == datetime(
-        2026,
-        8,
-        20,
-        0,
-        5,
-        tzinfo=UTC,
+        2026, 8, 20, 0, 5, tzinfo=UTC
     )
     with pytest.raises(ContractViolation, match="timezone offset"):
         gold_cli._parse_window_start("2026-08-20T09:05:00")
 
 
-def test_station_lookback_environment_is_explicit_canonical_hours(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize(
+    "publication",
+    ["station-release", "station-master-correction", "weather-forecast"],
+)
+def test_retired_standalone_publication_fails_before_io(
+    publication: str,
+    monkeypatch,
 ) -> None:
-    """station source scan이 무한하거나 암묵적인 기간을 사용하지 않는다."""
-    monkeypatch.setenv("GOLD_STATION_REALTIME_LOOKBACK_HOURS", "24")
-    assert gold_cli._lookback_from_env(
-        "GOLD_STATION_REALTIME_LOOKBACK_HOURS"
-    ) == timedelta(hours=24)
-    monkeypatch.setenv("GOLD_STATION_REALTIME_LOOKBACK_HOURS", "024")
-    with pytest.raises(ContractViolation, match="canonical"):
-        gold_cli._lookback_from_env("GOLD_STATION_REALTIME_LOOKBACK_HOURS")
+    """Standalone station/weather mode가 S3 env/client/DB 접근 전에 거부된다."""
+
+    def unexpected_io(*args, **kwargs):
+        """Retired path의 I/O를 테스트 실패로 바꾼다."""
+        pytest.fail(f"retired path I/O: args={args}, kwargs={kwargs}")
+
+    monkeypatch.delenv("S3_BUCKET", raising=False)
+    monkeypatch.setattr(gold_cli, "_s3_client", unexpected_io)
+    monkeypatch.setattr(gold_cli, "get_connection", unexpected_io)
+
+    with pytest.raises(ContractViolation, match="retired"):
+        gold_cli.run(publication, datetime(2026, 8, 20, tzinfo=UTC))
 
 
-def test_relocation_approval_requires_uri_and_sha_together() -> None:
-    """approval identity 절반만 전달해 출처 없는 relocation을 만들지 못하게 한다."""
-    with pytest.raises(ContractViolation, match="함께"):
-        gold_cli._read_optional_relocation_approval(
-            object(),  # type: ignore[arg-type]
-            "s3://fixture/approval.json",
-            None,
-        )
-
-
-def test_main_accepts_station_master_correction_mode(
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """daily master DAG의 station-only 모드가 CLI allowlist에 포함된다."""
-    calls: list[tuple[str, datetime]] = []
-
-    def fake_run(publication: str, window_start: datetime, **_kwargs: object) -> str:
-        """CLI dispatch 인자를 기록하고 성공 outcome을 반환한다."""
-        calls.append((publication, window_start))
-        return "published"
-
-    monkeypatch.setattr(gold_cli, "run", fake_run)
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        [
-            "gold_cli.py",
-            "--publication",
-            "station-master-correction",
-            "--window-start",
-            "2026-08-20T09:05:00+09:00",
-        ],
-    )
-
-    assert gold_cli.main() == 0
-    assert calls == [
-        (
-            "station-master-correction",
-            datetime(2026, 8, 20, 0, 5, tzinfo=UTC),
-        )
-    ]
-    assert "published" in capsys.readouterr().out
-
-
-def test_static_seed_modes_reach_verified_publishers(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """manual seed mode를 SSOT 시각과 명시 version으로만 게시한다."""
+def test_static_seed_modes_remain_reachable(monkeypatch) -> None:
+    """Manual dispatch/weather-grid seed authority는 verified publisher로 계속 연결된다."""
     connection = object()
-    published: list[tuple[str, str, datetime]] = []
+    published: list[tuple[str, str]] = []
 
     def result() -> SimpleNamespace:
-        """검증된 publisher의 성공 outcome fixture를 반환한다."""
+        """Published outcome fixture를 만든다."""
         return SimpleNamespace(
             result=SimpleNamespace(outcome=SimpleNamespace(value="published"))
         )
 
-    def publish_dispatch(
-        actual_connection: object,
-        _store: object,
-        *,
-        seed: object,
-        object_base_uri: str,
-    ) -> SimpleNamespace:
-        """dispatch seed CLI 인자를 기록한다."""
-        assert actual_connection is connection
+    def publish_dispatch(_connection, _store, *, seed, object_base_uri):
+        """Dispatch seed와 object base를 기록한다."""
+        assert _connection is connection
         assert object_base_uri == "s3://fixture/gold_publication"
-        published.append(("dispatch", seed.seed_version, seed.effective_dttm))
+        published.append(("dispatch", seed.seed_version))
         return result()
 
-    def publish_weather(
-        actual_connection: object,
-        _store: object,
-        *,
-        seed: object,
-        object_base_uri: str,
-    ) -> SimpleNamespace:
-        """weather seed CLI 인자를 기록한다."""
-        assert actual_connection is connection
+    def publish_weather(_connection, _store, *, seed, object_base_uri):
+        """Weather grid seed와 object base를 기록한다."""
+        assert _connection is connection
         assert object_base_uri == "s3://fixture/gold_publication"
-        published.append(("weather", seed.seed_version, seed.effective_dttm))
+        published.append(("weather", seed.seed_version))
         return result()
 
     monkeypatch.setenv("S3_BUCKET", "fixture")
@@ -135,15 +80,13 @@ def test_static_seed_modes_reach_verified_publishers(
     assert gold_cli.run("seed:dispatch_center", dispatch_time) == "published"
     assert gold_cli.run("seed:weather_grid", weather_time) == "published"
     assert published == [
-        ("dispatch", "dispatch-center-v1", dispatch_time),
-        ("weather", "approved-grid-v1", weather_time),
+        ("dispatch", "dispatch-center-v1"),
+        ("weather", "approved-grid-v1"),
     ]
 
 
-def test_dispatch_seed_rejects_non_ssot_effective_time(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """dispatch seed는 YAML effective_dttm을 caller 시각으로 덮어쓰지 않는다."""
+def test_dispatch_seed_rejects_non_ssot_effective_time(monkeypatch) -> None:
+    """Dispatch seed effective time을 CLI caller가 임의로 덮어쓰지 못한다."""
     monkeypatch.setenv("S3_BUCKET", "fixture")
     monkeypatch.setattr(gold_cli, "_s3_client", lambda: object())
     monkeypatch.setattr(gold_cli, "get_connection", lambda: nullcontext(object()))

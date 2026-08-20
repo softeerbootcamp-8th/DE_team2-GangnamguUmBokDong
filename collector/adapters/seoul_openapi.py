@@ -15,6 +15,9 @@ RESULT.CODE → 실패 범주:
   조각 키 어디에도 남지 않게 마스킹한다.
 - 응답 필드는 전부 문자열로 내려온다. 캐스팅은 검증 엔진의 `types`가 맡고 어댑터는
   값에 손대지 않는다.
+- 기본 `pagination: total`은 전체 건수인 `list_total_count`를 사용한다. 현재 페이지
+  행 수를 돌려주는 `bikeList`는 `pagination: probe_until_empty`로 빈 페이지까지
+  순차 탐색한다.
 """
 
 from __future__ import annotations
@@ -22,13 +25,13 @@ from __future__ import annotations
 import json
 import os
 from collections import deque
-from collections.abc import Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import TYPE_CHECKING
 
 import httpx
+from core.forecast import POPULATION_FORECAST_SLOT_COUNT
 
 from adapters.base import FetchErrorKind, FetchResult, adapter
 
@@ -93,15 +96,58 @@ def _result_code(body: dict, wrapper_key: str) -> str | None:
     return top_level if isinstance(top_level, str) else None
 
 
+# citydata_ppltn 응답의 `FCST_PPLTN`은 `{FCST_TIME, FCST_CONGEST_LVL, FCST_PPLTN_MIN,
+# FCST_PPLTN_MAX}`가 12개 들어있는 중첩 배열이다. 검증 엔진의 `types`는 스칼라만
+# 다루므로 여기서 평탄한 슬롯 컬럼으로 펼친다 — 어댑터가 값에 손대지 않는다는 원칙은
+# 지킨다(문자열을 그대로 옮기고 캐스팅은 엔진이 한다).
+_FCST_ARRAY_KEY = "FCST_PPLTN"
+_FCST_SLOT_FIELDS = (
+    "FCST_TIME",
+    "FCST_CONGEST_LVL",
+    "FCST_PPLTN_MIN",
+    "FCST_PPLTN_MAX",
+)
+# 실측(2026-08-19 POI001): 1시간 간격 12개. 슬롯 번호는 "n시간 후"가 아니다 —
+# 20:55 관측의 첫 예측이 22:00이었다. 몇 시의 예측인지는 `FCST_n_TIME`이 말해주고,
+# 소비자(normalizer)는 슬롯 번호가 아니라 그 값으로 시각을 맞춘다.
+
+
+def _flatten_forecast(row: dict) -> dict:
+    """`FCST_PPLTN` 중첩 배열을 `FCST_1_TIME`~`FCST_12_PPLTN_MAX` 슬롯 컬럼으로 펼친다.
+
+    `FCST_TIME` 오름차순으로 슬롯 번호를 매긴다 — API가 시간순으로 준다는 보장이
+    문서에 없다. 값이 없는 슬롯은 키를 만들지 않아 엔진의 `optional_missing`이
+    결측으로 처리하게 둔다. 원본 중첩 키는 제거한다(parquet·격리 저장이 스칼라만 받는다).
+    """
+    forecasts = row.pop(_FCST_ARRAY_KEY, None)
+    if not isinstance(forecasts, list):
+        return row
+
+    datable = [
+        f
+        for f in forecasts
+        if isinstance(f, dict) and isinstance(f.get("FCST_TIME"), str)
+    ]
+    for slot, forecast in enumerate(
+        sorted(datable, key=lambda f: f["FCST_TIME"])[:POPULATION_FORECAST_SLOT_COUNT],
+        start=1,
+    ):
+        for field in _FCST_SLOT_FIELDS:
+            value = forecast.get(field)
+            if value is not None:
+                row[f"FCST_{slot}_{field.removeprefix('FCST_')}"] = value
+    return row
+
+
 @dataclass(frozen=True, slots=True)
 class _PageOutcome:
     """페이지 하나의 조회 결과. 스레드풀 워커가 돌려주는 값이라 순수 데이터로 둔다."""
 
     payload: bytes | None
     total: int | None
-    row_count: int | None
-    terminal: bool
     error: FetchErrorKind | None
+    row_count: int | None = None
+    terminal: bool = False
 
 
 class NaturalKeyCardinalityError(ValueError):
@@ -139,14 +185,18 @@ def _page_rows(body: dict, wrapper_key: str, row_path: str) -> list | None:
 
 
 def _optional_nonnegative_int(value: object) -> int | None:
-    """응답 메타를 음수가 아닌 정수로 읽고 없거나 잘못됐으면 None을 반환한다."""
-    if value is None or isinstance(value, bool):
+    """응답 메타를 음수가 아닌 정수로 읽고 malformed 값을 거부한다."""
+    if value is None:
         return None
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):
-        return None
-    return parsed if parsed >= 0 else None
+    if type(value) is int:
+        parsed = value
+    elif type(value) is str and value.strip().isdigit():
+        parsed = int(value.strip())
+    else:
+        raise ValueError("list_total_count는 음수가 아닌 정수여야 합니다")
+    if parsed < 0:
+        raise ValueError("list_total_count는 음수가 아닌 정수여야 합니다")
+    return parsed
 
 
 def _fetch_page(
@@ -154,6 +204,8 @@ def _fetch_page(
     url: str,
     wrapper_key: str,
     row_path: str,
+    *,
+    ignore_total: bool = False,
 ) -> _PageOutcome:
     """페이지 하나를 받아 실패 범주까지 판정한다."""
     result = _request_json(client, url)
@@ -191,12 +243,61 @@ def _fetch_page(
             terminal=False,
             error=FetchErrorKind.PERMANENT,
         )
+    try:
+        total = None if ignore_total else _optional_nonnegative_int(raw_total)
+    except ValueError:
+        return _PageOutcome(
+            payload=None,
+            total=None,
+            row_count=None,
+            terminal=False,
+            error=FetchErrorKind.PERMANENT,
+        )
     return _PageOutcome(
         payload=content,
-        total=_optional_nonnegative_int(raw_total),
+        total=total,
         row_count=len(rows) if rows is not None else 0,
         terminal=terminal,
         error=None,
+    )
+
+
+def _fetch_probe_page(client: httpx.Client, url: str, wrapper_key: str) -> _PageOutcome:
+    """전체 건수를 신뢰하지 않는 페이지를 받아 행 수와 종료 여부를 판정한다.
+
+    `bikeList`의 `list_total_count`는 전체가 아니라 현재 응답의 행 수다. probe
+    모드에서는 이 값을 완전히 무시하고, 정상 응답의 `row` 길이와 INFO-200만
+    사용한다. INFO-000인데 row가 없거나 list가 아니면 빈 끝으로 오인해 수집을
+    조용히 자를 수 있으므로 영구 조각 오류로 돌린다.
+    """
+    result = _request_json(client, url)
+    if isinstance(result, FetchErrorKind):
+        return _PageOutcome(payload=None, total=None, error=result)
+    content, body = result
+
+    code = _result_code(body, wrapper_key)
+    category = _classify(code)
+    if category is not None:
+        return _PageOutcome(payload=None, total=None, error=category)
+    if code == "INFO-200":
+        return _PageOutcome(
+            payload=content,
+            total=None,
+            error=None,
+            row_count=0,
+            terminal=True,
+        )
+
+    wrapper = _extract(body, wrapper_key)
+    rows = wrapper.get("row") if isinstance(wrapper, dict) else None
+    if not isinstance(rows, list):
+        return _PageOutcome(payload=None, total=None, error=FetchErrorKind.PERMANENT)
+    return _PageOutcome(
+        payload=content,
+        total=None,
+        error=None,
+        row_count=len(rows),
+        terminal=not rows,
     )
 
 
@@ -232,62 +333,6 @@ def _fetch_poi(client: httpx.Client, url: str, wrapper_key: str) -> _PageOutcome
         terminal=False,
         error=None,
     )
-
-
-def _probe_until_empty(
-    *,
-    client: httpx.Client,
-    page_url,
-    wrapper_key: str,
-    row_path: str,
-    page_size: int,
-    skip: frozenset[str],
-    expected_total: int | None,
-) -> Iterator[FetchResult]:
-    """명시적인 빈 페이지를 확인할 때까지 total 메타를 무시하고 순차 조회한다.
-
-    짧은 비어 있지 않은 페이지 뒤에도 새 행이 올 수 있으므로 행 수나 페이지별
-    `list_total_count`로 끝을 추정하지 않는다. 종료 페이지 자체를 성공 조각으로
-    반환해 Bronze에 끝 확인 증거를 남긴다.
-    """
-    page_start = 1
-    received_rows = 0
-
-    while True:
-        page_end = page_start + page_size - 1
-        key = f"page-{page_start:05d}-{page_end:05d}"
-        if key in skip:
-            page_start += page_size
-            continue
-
-        outcome = _fetch_page(
-            client,
-            page_url(page_start, page_end),
-            wrapper_key,
-            row_path,
-        )
-        if outcome.error is not None:
-            yield FetchResult(
-                key=key,
-                payload=None,
-                error=outcome.error,
-                expected_total=None,
-            )
-            # 끝을 모르는 상태에서 실패 페이지 너머를 탐색하면 실제 전체 행 수를
-            # 계산할 수 없다. 다음 fetch round가 이 키부터 이어받게 한다.
-            return
-
-        received_rows += outcome.row_count or 0
-        terminal_total = expected_total if expected_total is not None else received_rows
-        yield FetchResult(
-            key=key,
-            payload=outcome.payload,
-            error=None,
-            expected_total=terminal_total if outcome.terminal else None,
-        )
-        if outcome.terminal:
-            return
-        page_start += page_size
 
 
 def _validate_natural_key(
@@ -368,9 +413,290 @@ def _run_concurrent(items, concurrency: int, fetch_one, thread_name_prefix: str)
         pool.shutdown(wait=False, cancel_futures=True)
 
 
+def _probe_page_key(start: int, page_size: int) -> str:
+    """probe 모드의 고정 폭 페이지 키를 만든다."""
+    return f"page-{start:05d}-{start + page_size - 1:05d}"
+
+
+def _minimum_total_covered_by_probe_parts(parts: frozenset[str]) -> int:
+    """이미 저장된 probe data part들이 보장하는 최소 row 위치를 반환한다.
+
+    ``page-N-M``이 성공 저장됐다는 것은 적어도 N번째 row가 그 snapshot에 있었다는
+    뜻이다. 종료 probe 재시도 중 더 작은 total이 관측되면 서로 다른 snapshot의
+    payload와 metadata를 섞는 것이므로 성공으로 확정할 수 없다.
+    """
+    starts: list[int] = []
+    for key in parts:
+        if not key.startswith("page-"):
+            continue
+        try:
+            starts.append(int(key.split("-", 2)[1]))
+        except (IndexError, ValueError):
+            continue
+    return max(starts, default=0)
+
+
+def _recover_probe_total(
+    *,
+    page_start: int,
+    page_size: int,
+    skip: frozenset[str],
+    client: httpx.Client,
+    page_url,
+    wrapper_key: str,
+) -> int | None:
+    """종료 페이지만 재시도한 경우 직전 성공 페이지에서 실제 행 수를 복구한다.
+
+    직전 라운드에서 종료 요청만 일시 실패했다면 이번 라운드의 데이터 페이지는 전부
+    skip에 들어 있다. 이때 직전 페이지 하나만 다시 읽어 마지막 페이지의 실제 행 수를
+    알아낸다. 데이터 payload를 다시 yield하지 않으므로 Bronze는 중복 저장되지 않는다.
+    """
+    previous_start = page_start - page_size
+    if previous_start < 1:
+        return 0
+    previous_key = _probe_page_key(previous_start, page_size)
+    if previous_key not in skip:
+        return None
+
+    outcome = _fetch_probe_page(
+        client,
+        page_url(previous_start, previous_start + page_size - 1),
+        wrapper_key,
+    )
+    if outcome.error is not None or outcome.terminal or outcome.row_count is None:
+        return None
+    return previous_start - 1 + outcome.row_count
+
+
+def _fetch_probe_pages(
+    *,
+    params: dict,
+    client: httpx.Client,
+    page_url,
+    wrapper_key: str,
+    skip: frozenset[str],
+    expected_total: int | None,
+):
+    """응답 total 대신 빈 페이지까지 순차 탐색하는 페이지 결과를 생성한다.
+
+    처음에는 끝을 모르므로 순차 탐색한다. 빈 row 또는 INFO-200 종료 응답도 source
+    snapshot의 완결성 증거인 Bronze part로 보존하며 실제 expected_total을 함께
+    전달한다. 이후 라운드에는 그 expected_total로 안정적인 고정 폭 페이지 목록을
+    복원해 성공 조각은 skip하고 실패 조각만 다시 요청한다.
+    """
+    page_size = int(params["page_size"])
+    max_probe_pages = int(params["max_probe_pages"])
+
+    if expected_total is not None:
+        page_count = (expected_total + page_size - 1) // page_size
+        if page_count > max_probe_pages:
+            start = max_probe_pages * page_size + 1
+            yield FetchResult(
+                key=_probe_page_key(start, page_size),
+                payload=None,
+                error=FetchErrorKind.PERMANENT,
+                expected_total=None,
+            )
+            return
+
+        pages = [
+            (start, _probe_page_key(start, page_size))
+            for start in range(1, page_count * page_size + 1, page_size)
+        ]
+        for index, (start, key) in enumerate(pages):
+            if key in skip:
+                continue
+            outcome = _fetch_probe_page(
+                client,
+                page_url(start, start + page_size - 1),
+                wrapper_key,
+            )
+            if outcome.terminal:
+                # 이전 라운드에서 확정한 행 수가 있는데 데이터 페이지가 사라지면
+                # 스냅샷이 호출 사이에 바뀐 것이다. 남은 범위를 모두 transient로
+                # 남겨 부분 snapshot을 완결로 오인하지 않는다.
+                for missing_start, missing_key in pages[index:]:
+                    if missing_key not in skip:
+                        yield FetchResult(
+                            key=missing_key,
+                            payload=None,
+                            error=FetchErrorKind.TRANSIENT,
+                            expected_total=None,
+                        )
+                return
+            yield FetchResult(
+                key=key,
+                payload=outcome.payload,
+                error=outcome.error,
+                expected_total=None,
+            )
+            if outcome.error is FetchErrorKind.FATAL:
+                return
+
+        # 고정된 expected_total만 믿고 끝내면 재시도 사이에 뒤로 늘어난 행을 놓친다.
+        # 기존 범위 바로 다음 페이지부터 terminal까지 다시 탐색해 growth를 수집하고
+        # 실제 total을 상위 라운드에 갱신한다. 정적 snapshot이면 추가 호출 한 번으로
+        # INFO-200을 확인하고 끝난다.
+        page_start = page_count * page_size + 1
+        last_data_start: int | None = None
+        last_data_rows: int | None = None
+        while True:
+            page_number = ((page_start - 1) // page_size) + 1
+            key = _probe_page_key(page_start, page_size)
+            outcome = _fetch_probe_page(
+                client,
+                page_url(page_start, page_start + page_size - 1),
+                wrapper_key,
+            )
+            if outcome.error is not None:
+                yield FetchResult(
+                    key=key,
+                    payload=None,
+                    error=outcome.error,
+                    expected_total=None,
+                )
+                return
+            if outcome.terminal:
+                total = (
+                    expected_total
+                    if last_data_start is None or last_data_rows is None
+                    else last_data_start - 1 + last_data_rows
+                )
+                yield FetchResult(
+                    key=key,
+                    payload=outcome.payload,
+                    error=None,
+                    expected_total=total,
+                )
+                return
+            if page_number > max_probe_pages:
+                yield FetchResult(
+                    key=key,
+                    payload=None,
+                    error=FetchErrorKind.PERMANENT,
+                    expected_total=None,
+                )
+                return
+            yield FetchResult(
+                key=key,
+                payload=outcome.payload,
+                error=None,
+                expected_total=None,
+            )
+            last_data_start = page_start
+            last_data_rows = outcome.row_count
+            page_start += page_size
+        return
+
+    page_start = 1
+    last_data_start: int | None = None
+    last_data_rows: int | None = None
+    received_rows = 0
+    skipped_data_page = False
+    while True:
+        page_number = ((page_start - 1) // page_size) + 1
+        key = _probe_page_key(page_start, page_size)
+
+        # max_probe_pages개의 데이터 페이지 뒤 딱 한 번 더 호출해 빈 끝을 확인한다.
+        # 그 호출에도 데이터가 있으면 설정 상한이 낮은 것이므로 조용히 자르지 않고
+        # 명시적인 누락으로 실패시킨다.
+        is_boundary_probe = page_number == max_probe_pages + 1
+        if page_number > max_probe_pages + 1:
+            raise AssertionError("probe 페이지 상한 검사가 누락됨")
+        if key in skip and not is_boundary_probe:
+            skipped_data_page = True
+            page_start += page_size
+            continue
+
+        outcome = _fetch_probe_page(
+            client,
+            page_url(page_start, page_start + page_size - 1),
+            wrapper_key,
+        )
+        if outcome.error is not None:
+            yield FetchResult(
+                key=key,
+                payload=None,
+                error=outcome.error,
+                expected_total=None,
+            )
+            # 끝을 모르는 상태에서 실패 page 너머를 탐색하면 중간 공백을 둔 채 뒤의
+            # terminal을 완결 증거로 오인할 수 있다. 다음 fetch round가 이 page부터
+            # 이어받도록 즉시 멈춘다.
+            return
+
+        if outcome.terminal:
+            if page_start == 1:
+                total = 0
+            elif not skipped_data_page:
+                total = received_rows
+            elif (
+                last_data_start == page_start - page_size and last_data_rows is not None
+            ):
+                total = last_data_start - 1 + last_data_rows
+            else:
+                total = _recover_probe_total(
+                    page_start=page_start,
+                    page_size=page_size,
+                    skip=skip,
+                    client=client,
+                    page_url=page_url,
+                    wrapper_key=wrapper_key,
+                )
+            minimum_covered_total = _minimum_total_covered_by_probe_parts(skip)
+            if total is None or total < minimum_covered_total:
+                # 직전 라운드의 성공 payload는 그대로 두고 더 작아진 snapshot의
+                # terminal/row_count만 metadata로 확정하면 fetched>expected인 혼합
+                # Bronze가 정상 완료될 수 있다. 복구 불가능한 이번 라운드는 transient로
+                # 남겨 상위 라운드/quality gate가 fail-closed하게 처리한다.
+                yield FetchResult(
+                    key=key,
+                    payload=None,
+                    error=FetchErrorKind.TRANSIENT,
+                    expected_total=None,
+                )
+                return
+            yield FetchResult(
+                key=key,
+                payload=outcome.payload,
+                error=None,
+                expected_total=total,
+            )
+            return
+
+        if is_boundary_probe:
+            yield FetchResult(
+                key=key,
+                payload=None,
+                error=FetchErrorKind.PERMANENT,
+                expected_total=None,
+            )
+            return
+
+        yield FetchResult(
+            key=key,
+            payload=outcome.payload,
+            error=None,
+            expected_total=None,
+        )
+        last_data_start = page_start
+        last_data_rows = outcome.row_count
+        received_rows += outcome.row_count or 0
+        page_start += page_size
+
+
 @adapter("seoul_openapi")
 class SeoulOpenApiAdapter:
     """서울 열린데이터광장 공용 페이지네이션 규약 어댑터."""
+
+    @staticmethod
+    def _root_location(params: dict) -> tuple[str, str]:
+        """설정에 따라 응답 wrapper 키와 그 아래 row 경로를 분리한다."""
+        root_key = params["root_key"]
+        if params.get("root_key_literal", False):
+            return root_key, ""
+        wrapper_key, _, row_path = root_key.partition(".")
+        return wrapper_key, row_path
 
     @staticmethod
     def planned_parts(config: SourceConfig, window) -> frozenset[str] | None:
@@ -395,14 +721,7 @@ class SeoulOpenApiAdapter:
         service = params["service"]
         page_size = params["page_size"]
 
-        # . 기준으로 문자열을 쪼개서 앞부분만 떼어낸다.
-        # "SeoulRtd.citydata_ppltn" 처럼 마침표가 포함된 단일 키가 응답의 최상단에 존재할 수 있다.
-        if params["root_key"] in {"SeoulRtd.citydata_ppltn"}:
-            wrapper_key = params["root_key"]
-            row_path = ""
-        else:
-            wrapper_key, _, row_path = params["root_key"].partition(".")
-
+        wrapper_key, row_path = SeoulOpenApiAdapter._root_location(params)
         path_suffix_template = params.get("path_suffix", "")
         suffix = ""
         if path_suffix_template:
@@ -470,13 +789,12 @@ class SeoulOpenApiAdapter:
         def page_url(start: int, end: int) -> str:
             return f"{_BASE_URL}/{_api_key()}/json/{service}/{start}/{end}{suffix}/"
 
-        if params.get("pagination") == "probe_until_empty":
-            yield from _probe_until_empty(
+        if params.get("pagination", "total") in {"probe", "probe_until_empty"}:
+            yield from _fetch_probe_pages(
+                params=params,
                 client=client,
                 page_url=page_url,
                 wrapper_key=wrapper_key,
-                row_path=row_path,
-                page_size=page_size,
                 skip=skip,
                 expected_total=expected_total,
             )
@@ -577,12 +895,8 @@ class SeoulOpenApiAdapter:
         """조각들을 순서대로 이어붙여 행 = 레코드 리스트로 만든다.
         네트워크를 타지 않는 순수 함수이다. bronze에서 다시 읽어 언제든 재호출된다.
         """
-        root_key = config.adapter_params["root_key"]
-        if root_key in {"SeoulRtd.citydata_ppltn"}:
-            wrapper_key = root_key
-            row_path = ""
-        else:
-            wrapper_key, _, row_path = root_key.partition(".")
+        params = config.adapter_params
+        wrapper_key, row_path = SeoulOpenApiAdapter._root_location(params)
 
         rows: list[dict] = []
         for chunk in chunks:
@@ -595,5 +909,7 @@ class SeoulOpenApiAdapter:
                 node = node.get(segment)
             if isinstance(node, list):
                 rows.extend(node)
+        if params.get("flatten_forecast", False):
+            rows = [_flatten_forecast(row) for row in rows if isinstance(row, dict)]
         _validate_natural_key(rows, getattr(config, "natural_key", None))
         return rows

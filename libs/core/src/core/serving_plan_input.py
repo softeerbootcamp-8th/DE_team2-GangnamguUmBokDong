@@ -1,0 +1,214 @@
+"""Inference CLI가 Gold serving plan에서 필요한 exact 입력만 안전하게 연다."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Any, cast
+from urllib.parse import urlsplit
+
+from .gold_publication import (
+    ContractViolation,
+    Dependency,
+    IdSet,
+    ImmutableObjectStore,
+    parse_canonical_json,
+    parse_id_set,
+    parse_utc_dttm,
+    sha256_hex,
+    validate_sha256_hex,
+)
+from .inference_snapshot import ServingPlanRef
+from .model_snapshot import IdSetArtifactRef
+
+SERVING_PLAN_SCHEMA_VERSION = "gold-serving-plan-v1"
+"""Inference input extractor가 허용하는 serving plan schema version이다."""
+
+_PLAN_KEYS = frozenset(
+    {
+        "activation_ready_sta_ids",
+        "expected_sta_ids",
+        "logical_dttm",
+        "object_base_uri",
+        "prepared_publications",
+        "prior_states",
+        "rental_support_sta_ids",
+        "return_support_sta_ids",
+        "schema_version",
+        "source_lookbacks",
+        "station_dependency",
+    }
+)
+_ID_SET_REF_KEYS = frozenset({"byte_sha256", "id_count", "schema_version", "uri"})
+_DEPENDENCY_KEYS = frozenset(
+    {
+        "artifact_set_sha256",
+        "input_fingerprint_sha256",
+        "logical_dttm",
+        "manifest_uri",
+        "publication_key",
+        "revision_no",
+    }
+)
+
+
+@dataclass(frozen=True, slots=True)
+class VerifiedServingPlanInferenceInputs:
+    """Exact plan과 expected ID bytes에서 검증된 inference 호출 입력이다."""
+
+    logical_dttm: datetime
+    object_base_uri: str
+    station_dependency: Dependency
+    serving_plan: ServingPlanRef
+    expected_sta_ids_ref: IdSetArtifactRef
+    expected_sta_ids: IdSet
+
+    def __post_init__(self) -> None:
+        """Plan-derived typed 값의 exact class와 anchor 결합을 검증한다."""
+        if type(self.station_dependency) is not Dependency:
+            raise ContractViolation("station dependency 타입이 잘못됐습니다.")
+        if type(self.serving_plan) is not ServingPlanRef:
+            raise ContractViolation("serving plan ref 타입이 잘못됐습니다.")
+        if type(self.expected_sta_ids_ref) is not IdSetArtifactRef:
+            raise ContractViolation("expected station ID ref 타입이 잘못됐습니다.")
+        if type(self.expected_sta_ids) is not IdSet:
+            raise ContractViolation("expected station ID set 타입이 잘못됐습니다.")
+        if self.station_dependency.logical_dttm != self.logical_dttm:
+            raise ContractViolation(
+                "serving plan logical과 station dependency logical이 다릅니다."
+            )
+
+
+def read_serving_plan_inference_inputs(
+    object_store: ImmutableObjectStore,
+    *,
+    plan_uri: str,
+    plan_sha256: str,
+) -> VerifiedServingPlanInferenceInputs:
+    """Plan과 expected ID set actual bytes를 URI·SHA로 exact-read한다."""
+    validate_sha256_hex(plan_sha256)
+    plan_ref = ServingPlanRef(byte_sha256=plan_sha256, uri=plan_uri)
+    payload = object_store.read_bytes(
+        plan_uri,
+        plan_sha256,
+        require_canonical_json=True,
+    )
+    if sha256_hex(payload) != plan_sha256:
+        raise ContractViolation("serving plan actual bytes SHA가 argument와 다릅니다.")
+    document = _exact_object(parse_canonical_json(payload), _PLAN_KEYS, "serving plan")
+    if document["schema_version"] != SERVING_PLAN_SCHEMA_VERSION:
+        raise ContractViolation("serving plan schema_version이 다릅니다.")
+    logical = parse_utc_dttm(_string(document["logical_dttm"], "logical_dttm"))
+    dependency = _parse_dependency(document["station_dependency"])
+    expected_ref = _parse_id_set_ref(document["expected_sta_ids"])
+    object_base_uri = _string(document["object_base_uri"], "object_base_uri")
+    _require_under_object_base(plan_uri, object_base_uri, "serving plan")
+    _require_under_object_base(expected_ref.uri, object_base_uri, "expected ID set")
+    _require_under_object_base(
+        dependency.manifest_uri,
+        object_base_uri,
+        "station dependency manifest",
+    )
+    expected_payload = object_store.read_bytes(
+        expected_ref.uri,
+        expected_ref.byte_sha256,
+        require_canonical_json=True,
+    )
+    expected = parse_id_set(expected_payload)
+    if (
+        expected.sha256 != expected_ref.byte_sha256
+        or len(expected.ids) != expected_ref.id_count
+    ):
+        raise ContractViolation(
+            "serving plan expected station ID actual bytes가 ref와 다릅니다."
+        )
+    return VerifiedServingPlanInferenceInputs(
+        logical_dttm=logical,
+        object_base_uri=object_base_uri,
+        station_dependency=dependency,
+        serving_plan=plan_ref,
+        expected_sta_ids_ref=expected_ref,
+        expected_sta_ids=expected,
+    )
+
+
+def _parse_id_set_ref(value: Any) -> IdSetArtifactRef:
+    """Expected station ID reference exact object를 파싱한다."""
+    document = _exact_object(value, _ID_SET_REF_KEYS, "expected_sta_ids")
+    return IdSetArtifactRef(
+        byte_sha256=_string(document["byte_sha256"], "expected byte_sha256"),
+        id_count=_nonnegative_int(document["id_count"], "expected id_count"),
+        schema_version=_string(document["schema_version"], "expected schema_version"),
+        uri=_string(document["uri"], "expected uri"),
+    )
+
+
+def _parse_dependency(value: Any) -> Dependency:
+    """Station dependency exact object를 파싱한다."""
+    document = _exact_object(value, _DEPENDENCY_KEYS, "station dependency")
+    return Dependency(
+        artifact_set_sha256=_string(
+            document["artifact_set_sha256"], "dependency artifact_set_sha256"
+        ),
+        input_fingerprint_sha256=_string(
+            document["input_fingerprint_sha256"],
+            "dependency input_fingerprint_sha256",
+        ),
+        logical_dttm=parse_utc_dttm(
+            _string(document["logical_dttm"], "dependency logical_dttm")
+        ),
+        manifest_uri=_string(document["manifest_uri"], "dependency manifest_uri"),
+        publication_key=_string(
+            document["publication_key"], "dependency publication_key"
+        ),
+        revision_no=_nonnegative_int(document["revision_no"], "dependency revision_no"),
+    )
+
+
+def _exact_object(value: Any, keys: frozenset[str], name: str) -> dict[str, Any]:
+    """JSON object의 exact key 집합을 검증한다."""
+    if type(value) is not dict or frozenset(value) != keys:
+        raise ContractViolation(f"{name} key 집합이 잘못됐습니다.")
+    return cast(dict[str, Any], value)
+
+
+def _string(value: Any, name: str) -> str:
+    """Nonblank exact string을 반환한다."""
+    if type(value) is not str or not value or value != value.strip():
+        raise ContractViolation(f"{name}은 nonblank exact string이어야 합니다.")
+    return value
+
+
+def _nonnegative_int(value: Any, name: str) -> int:
+    """Bool을 제외한 nonnegative exact integer를 반환한다."""
+    if type(value) is not int or value < 0:
+        raise ContractViolation(f"{name}은 nonnegative exact integer여야 합니다.")
+    return value
+
+
+def _require_under_object_base(uri: str, base_uri: str, name: str) -> None:
+    """Exact S3 ref가 plan object base의 같은 bucket·prefix 아래인지 검증한다."""
+    reference = urlsplit(uri)
+    base = urlsplit(base_uri)
+    base_key = base.path.lstrip("/").rstrip("/")
+    reference_key = reference.path.lstrip("/")
+    if (
+        base.scheme != "s3"
+        or not base.netloc
+        or not base_key
+        or base.query
+        or base.fragment
+        or reference.scheme != "s3"
+        or reference.netloc != base.netloc
+        or not reference_key.startswith(f"{base_key}/")
+        or reference.query
+        or reference.fragment
+    ):
+        raise ContractViolation(f"{name} URI가 serving plan object base 밖입니다.")
+
+
+__all__ = [
+    "SERVING_PLAN_SCHEMA_VERSION",
+    "VerifiedServingPlanInferenceInputs",
+    "read_serving_plan_inference_inputs",
+]

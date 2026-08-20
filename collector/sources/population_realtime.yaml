@@ -5,6 +5,10 @@ adapter_params:
   service: citydata_ppltn
   page_size: 1000
   root_key: SeoulRtd.citydata_ppltn
+  # 최상단 키 자체에 점이 들어가므로 경로 구분자로 해석하지 않는다.
+  root_key_literal: true
+  # FCST_PPLTN 중첩 배열을 Silver 검증용 FCST_n_* 스칼라 컬럼으로 펼친다.
+  flatten_forecast: true
   poi_start: 1
   poi_end: 121
   # 5분마다 POI 121개를 각각 호출하므로 4개씩 병렬 조회한다.
@@ -39,3 +43,144 @@ columns:
   FEMALE_PPLTN_RATE:
     types: [float]
     range: {min: 0, max: 100}
+
+  FCST_YN:
+    types: [str]
+  FCST_1_TIME:
+    types: [str]
+  FCST_1_CONGEST_LVL:
+    types: [str]
+    enum: ["\uC5EC\uC720", "\uBCF4\uD1B5", "\uC57D\uAC04 \uBD90\uBE54", "\uBD90\uBE54"]
+  FCST_1_PPLTN_MIN:
+    types: [int]
+    range: {min: 0, max: 500000}
+  FCST_1_PPLTN_MAX:
+    types: [int]
+    range: {min: 0, max: 500000}
+  FCST_2_TIME:
+    types: [str]
+  FCST_2_CONGEST_LVL:
+    types: [str]
+    enum: ["\uC5EC\uC720", "\uBCF4\uD1B5", "\uC57D\uAC04 \uBD90\uBE54", "\uBD90\uBE54"]
+  FCST_2_PPLTN_MIN:
+    types: [int]
+    range: {min: 0, max: 500000}
+  FCST_2_PPLTN_MAX:
+    types: [int]
+    range: {min: 0, max: 500000}
+  FCST_3_TIME:
+    types: [str]
+  FCST_3_CONGEST_LVL:
+    types: [str]
+    enum: ["\uC5EC\uC720", "\uBCF4\uD1B5", "\uC57D\uAC04 \uBD90\uBE54", "\uBD90\uBE54"]
+  FCST_3_PPLTN_MIN:
+    types: [int]
+    range: {min: 0, max: 500000}
+  FCST_3_PPLTN_MAX:
+    types: [int]
+    range: {min: 0, max: 500000}
+  FCST_4_TIME:
+    types: [str]
+  FCST_4_CONGEST_LVL:
+    types: [str]
+    enum: ["\uC5EC\uC720", "\uBCF4\uD1B5", "\uC57D\uAC04 \uBD90\uBE54", "\uBD90\uBE54"]
+  FCST_4_PPLTN_MIN:
+    types: [int]
+    range: {min: 0, max: 500000}
+  FCST_4_PPLTN_MAX:
+    types: [int]
+    range: {min: 0, max: 500000}
+  FCST_5_TIME:
+    types: [str]
+  FCST_5_CONGEST_LVL:
+    types: [str]
+    enum: ["\uC5EC\uC720", "\uBCF4\uD1B5", "\uC57D\uAC04 \uBD90\uBE54", "\uBD90\uBE54"]
+  FCST_5_PPLTN_MIN:
+    types: [int]
+    range: {min: 0, max: 500000}
+  FCST_5_PPLTN_MAX:
+    types: [int]
+    range: {min: 0, max: 500000}
+  FCST_6_TIME:
+    types: [str]
+  FCST_6_CONGEST_LVL:
+    types: [str]
+    enum: ["\uC5EC\uC720", "\uBCF4\uD1B5", "\uC57D\uAC04 \uBD90\uBE54", "\uBD90\uBE54"]
+  FCST_6_PPLTN_MIN:
+    types: [int]
+    range: {min: 0, max: 500000}
+  FCST_6_PPLTN_MAX:
+    types: [int]
+    range: {min: 0, max: 500000}
+  FCST_7_TIME:
+    types: [str]
+  FCST_7_CONGEST_LVL:
+    types: [str]
+    enum: ["\uC5EC\uC720", "\uBCF4\uD1B5", "\uC57D\uAC04 \uBD90\uBE54", "\uBD90\uBE54"]
+  FCST_7_PPLTN_MIN:
+    types: [int]
+    range: {min: 0, max: 500000}
+  FCST_7_PPLTN_MAX:
+    types: [int]
+    range: {min: 0, max: 500000}
+  FCST_8_TIME:
+    types: [str]
+  FCST_8_CONGEST_LVL:
+    types: [str]
+    enum: ["\uC5EC\uC720", "\uBCF4\uD1B5", "\uC57D\uAC04 \uBD90\uBE54", "\uBD90\uBE54"]
+  FCST_8_PPLTN_MIN:
+    types: [int]
+    range: {min: 0, max: 500000}
+  FCST_8_PPLTN_MAX:
+    types: [int]
+    range: {min: 0, max: 500000}
+  FCST_9_TIME:
+    types: [str]
+  FCST_9_CONGEST_LVL:
+    types: [str]
+    enum: ["\uC5EC\uC720", "\uBCF4\uD1B5", "\uC57D\uAC04 \uBD90\uBE54", "\uBD90\uBE54"]
+  FCST_9_PPLTN_MIN:
+    types: [int]
+    range: {min: 0, max: 500000}
+  FCST_9_PPLTN_MAX:
+    types: [int]
+    range: {min: 0, max: 500000}
+  FCST_10_TIME:
+    types: [str]
+  FCST_10_CONGEST_LVL:
+    types: [str]
+    enum: ["\uC5EC\uC720", "\uBCF4\uD1B5", "\uC57D\uAC04 \uBD90\uBE54", "\uBD90\uBE54"]
+  FCST_10_PPLTN_MIN:
+    types: [int]
+    range: {min: 0, max: 500000}
+  FCST_10_PPLTN_MAX:
+    types: [int]
+    range: {min: 0, max: 500000}
+  FCST_11_TIME:
+    types: [str]
+  FCST_11_CONGEST_LVL:
+    types: [str]
+    enum: ["\uC5EC\uC720", "\uBCF4\uD1B5", "\uC57D\uAC04 \uBD90\uBE54", "\uBD90\uBE54"]
+  FCST_11_PPLTN_MIN:
+    types: [int]
+    range: {min: 0, max: 500000}
+  FCST_11_PPLTN_MAX:
+    types: [int]
+    range: {min: 0, max: 500000}
+  FCST_12_TIME:
+    types: [str]
+  FCST_12_CONGEST_LVL:
+    types: [str]
+    enum: ["\uC5EC\uC720", "\uBCF4\uD1B5", "\uC57D\uAC04 \uBD90\uBE54", "\uBD90\uBE54"]
+  FCST_12_PPLTN_MIN:
+    types: [int]
+    range: {min: 0, max: 500000}
+  FCST_12_PPLTN_MAX:
+    types: [int]
+    range: {min: 0, max: 500000}
+
+# `FCST_*` 49개는 응답의 `FCST_PPLTN`(12개 중첩 배열)을 어댑터가 평탄화한 결과다
+# (`adapters/seoul_openapi.py:_flatten_forecast`). 슬롯 번호는 `FCST_TIME` 오름차순
+# 순서일 뿐 "n시간 후"가 아니다 — 어느 시각의 예측인지는 `FCST_n_TIME`이 말한다.
+# 전부 optional로 둔다: 예측을 제공하지 않는 POI(`FCST_YN='N'`)가 `required_missing:
+# drop_row`에 걸려 사라지면 그 지점의 현재 인구 보정까지 잃는다.

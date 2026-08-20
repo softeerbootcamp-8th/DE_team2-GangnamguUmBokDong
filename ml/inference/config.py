@@ -7,39 +7,37 @@
 
 from ml_core import common_config
 from ml_core.paths import (
-    ANALYSIS_SUMMARY_JSON,
     MERGED_TABLE_PARQUET,
     MODELS_PREFIX,
-    MULTI_HORIZON_FEATURES_TABLE_PARQUET,
     POPULATION_HOURLY_PROFILE_PARQUET,
     POPULATION_PARQUET,
     PROCESSED_V2_PREFIX,
+    RENTAL_MULTI_HORIZON_FEATURES_TABLE_PARQUET,
+    RETURN_MULTI_HORIZON_FEATURES_TABLE_PARQUET,
     STATION_HOURLY_PROFILE_PARQUET,
     STATION_MASTER_PARQUET,
-    load_holidays_2025,
 )
 
 __all__ = [
-    "ANALYSIS_SUMMARY_JSON",
     "EXPOSURE_STOCKOUT_VALUE",
     "GRID_TICK_MINUTES",
     "HORIZON_COUNT",
-    "LAG_HOURS",
     "MERGED_TABLE_PARQUET",
     "MODELS_PREFIX",
-    "MULTI_HORIZON_FEATURES_TABLE_PARQUET",
     "POPULATION_HOURLY_PROFILE_PARQUET",
     "POPULATION_PARQUET",
     "PROCESSED_V2_PREFIX",
+    "RENTAL_MULTI_HORIZON_FEATURES_TABLE_PARQUET",
+    "RETURN_MULTI_HORIZON_FEATURES_TABLE_PARQUET",
     "ROLLING_EMBARGO_MINUTES",
-    "ROLLING_WINDOWS",
     "ROLLING_WINDOW_MINUTES",
+    "SERVING_TICK_MINUTES",
     "STATION_HOURLY_PROFILE_PARQUET",
     "STATION_MASTER_PARQUET",
     "TARGET_HORIZON_MINUTES",
     "TEST_END",
     "TEST_START",
-    "load_holidays_2025",
+    "TRAIN_ANCHOR_TICK_MINUTES",
 ]
 
 # --- point-in-time censoring 파라미터 (feature_engine와 반드시 같은 값을 유지 —
@@ -48,10 +46,11 @@ ROLLING_TICK_MINUTES = common_config.ROLLING_TICK_MINUTES
 ROLLING_WINDOW_MINUTES = common_config.ROLLING_WINDOW_MINUTES
 ROLLING_EMBARGO_MINUTES = common_config.ROLLING_EMBARGO_MINUTES
 GRID_TICK_MINUTES = common_config.GRID_TICK_MINUTES
+TRAIN_ANCHOR_TICK_MINUTES = common_config.TRAIN_ANCHOR_TICK_MINUTES
 
-# --- lag/rolling 피처 파라미터 (feature_engine와 동일 — common_config.py에서 공유) ---
-LAG_HOURS = common_config.LAG_HOURS
-ROLLING_WINDOWS = common_config.ROLLING_WINDOWS
+# 모델 feature/target grid와 별개인 운영 호출 주기다. 기본 모델은 20분 grid로
+# 학습하더라도 Airflow는 매 5분 시각에 추론을 호출한다.
+SERVING_TICK_MINUTES = common_config.SERVING_TICK_MINUTES
 
 # --- 타겟 정의(실시간 rental_count/return_count 재집계에 필요 — feature_engine의
 # future_rolling_counts()와 같은 정의를 predict_single.py가 Silver rental로부터 직접
@@ -63,10 +62,9 @@ HORIZON_COUNT = common_config.HORIZON_COUNT
 
 EXPOSURE_STOCKOUT_VALUE = common_config.EXPOSURE_STOCKOUT_VALUE
 
-# 배치 조회 CLI의 기본 조회 기간 (테스트 기간, training/config.py와 같은 값을 유지해야
-# "학습 시 나온 지표"와 "배치 조회 CLI로 재현한 지표"가 어긋나지 않는다). training이
-# RAM 제약으로 학습 기간을 2025년 11월 한 달로 좁히면서(training/config.py 참고) 이
-# 값도 그 TEST_START/TEST_END와 같이 좁혀야 한다 — 실제 학습 머신에서 기간을 늘리면
-# 이 값도 같이 늘릴 것.
-TEST_START = "2025-11-26"
-TEST_END = "2025-11-30"
+# 배치 조회 CLI의 기본 조회 기간 — 2025 feature mart를 만든 기본 학습 split의
+# TEST_DAYS_OF_MONTH={17,19} 중 실제 test 파티션 하나를 고정한다. 학습 전용 split
+# 환경변수를 inference가 파싱하면 잘못된 값 하나로 실시간 추론 import까지 죽을 수
+# 있으므로 두 설정의 런타임 의존성은 만들지 않는다.
+TEST_START = "2025-06-17"
+TEST_END = TEST_START

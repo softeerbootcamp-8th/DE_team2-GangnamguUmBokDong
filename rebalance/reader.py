@@ -10,9 +10,15 @@ from __future__ import annotations
 
 import math
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 from core.s3 import read_parquet
+from core.source_snapshot_io import (
+    SourceSnapshotNotFoundError,
+    SourceSnapshotReadError,
+    read_exact_source_snapshot,
+)
 
 _BIKE_REALTIME_SOURCE_ID = "bike_station_realtime"
 _BIKE_REALTIME_TICK_MINUTES = 5
@@ -25,10 +31,6 @@ def anchor_timestamp(date: str, hour: int, minute: int) -> pd.Timestamp:
     이유로 pd.Timestamp를 쓴다(naive datetime을 datetime.strptime으로 직접 만들면
     tzinfo 누락으로 오해되기 쉬움)."""
     return pd.Timestamp(date) + pd.Timedelta(hours=hour, minutes=minute)
-
-
-def _silver_key(source_id: str, window_start: datetime) -> str:
-    return f"silver/{source_id}/dt={window_start:%Y-%m-%d}/hh={window_start:%H}/{window_start:%H%M}.parquet"
 
 
 def _predictions_key(window_start: datetime) -> str:
@@ -44,18 +46,34 @@ def _urgency_key(window_start: datetime) -> str:
 
 
 def _floor_to_tick(dt: datetime, tick_minutes: int) -> datetime:
-    return dt - timedelta(minutes=dt.minute % tick_minutes, seconds=dt.second, microseconds=dt.microsecond)
+    return dt - timedelta(
+        minutes=dt.minute % tick_minutes, seconds=dt.second, microseconds=dt.microsecond
+    )
 
 
-def _bike_realtime_tick_keys(anchor: datetime, lookback_minutes: int) -> list[tuple[datetime, str]]:
-    """anchor부터 과거 lookback_minutes 동안의 5분 tick (시각, 키) 목록(오래된 것부터 최신 순)."""
+def _bike_realtime_ticks(anchor: datetime, lookback_minutes: int) -> list[datetime]:
+    """anchor부터 lookback 동안의 5분 tick을 오래된 것부터 반환한다."""
     floored = _floor_to_tick(anchor, _BIKE_REALTIME_TICK_MINUTES)
     n_ticks = lookback_minutes // _BIKE_REALTIME_TICK_MINUTES + 1
-    ticks = [floored - timedelta(minutes=_BIKE_REALTIME_TICK_MINUTES * i) for i in range(n_ticks - 1, -1, -1)]
-    return [(t, _silver_key(_BIKE_REALTIME_SOURCE_ID, t)) for t in ticks]
+    return [
+        floored - timedelta(minutes=_BIKE_REALTIME_TICK_MINUTES * i)
+        for i in range(n_ticks - 1, -1, -1)
+    ]
 
 
-def read_recent_stock(anchor: datetime, lookback_minutes: int = 25) -> dict[str, list[dict]]:
+def _authority_time(value: datetime) -> datetime:
+    """Naive 운영 벽시계를 KST aware datetime으로 바꾼다."""
+    converted = value.to_pydatetime() if isinstance(value, pd.Timestamp) else value
+    return (
+        converted.replace(tzinfo=ZoneInfo("Asia/Seoul"))
+        if converted.tzinfo is None
+        else converted
+    )
+
+
+def read_recent_stock(
+    anchor: datetime, lookback_minutes: int = 25
+) -> dict[str, list[dict]]:
     """최근 lookback_minutes 동안의 5분 tick 재고 이력을 대여소별로 묶어서 반환한다.
 
     각 포인트는 {"observed_at", "parking_bike_tot_cnt", "hold_cnt", "lat", "lon"}를
@@ -69,13 +87,40 @@ def read_recent_stock(anchor: datetime, lookback_minutes: int = 25) -> dict[str,
     배정되므로 이 시점에 걸러낸다.
     """
     history: dict[str, list[dict]] = {}
-    columns = ["stationId", "parkingBikeTotCnt", "rackTotCnt", "stationLatitude", "stationLongitude"]
+    columns = [
+        "stationId",
+        "parkingBikeTotCnt",
+        "rackTotCnt",
+        "stationLatitude",
+        "stationLongitude",
+    ]
     anchor_tick = _floor_to_tick(anchor, _BIKE_REALTIME_TICK_MINUTES)
-    for observed_at, key in _bike_realtime_tick_keys(anchor, lookback_minutes):
-        df = read_parquet(key, columns=columns)
-        if observed_at == anchor_tick and df is None:
-            raise FileNotFoundError(f"stock snapshot parquet not found for {anchor_tick}: {key}")
-        if df is None or df.empty:
+    for observed_at in _bike_realtime_ticks(anchor, lookback_minutes):
+        try:
+            snapshot = read_exact_source_snapshot(
+                _BIKE_REALTIME_SOURCE_ID,
+                _authority_time(observed_at),
+                columns=columns,
+            )
+        except SourceSnapshotNotFoundError:
+            if observed_at == anchor_tick:
+                raise FileNotFoundError(
+                    f"stock snapshot parquet not found for {anchor_tick}: "
+                    "source authority missing"
+                ) from None
+            continue
+        except SourceSnapshotReadError as exc:
+            raise RuntimeError(
+                f"stock source snapshot contract failed for {observed_at}: {exc}"
+            ) from exc
+        if snapshot.table is None:
+            if observed_at == anchor_tick:
+                raise FileNotFoundError(
+                    f"stock source snapshot is empty for {anchor_tick}"
+                )
+            continue
+        df = snapshot.table.to_pandas()
+        if df.empty:
             continue
         for row in df.itertuples(index=False):
             lat, lon = float(row.stationLatitude), float(row.stationLongitude)
@@ -102,7 +147,9 @@ def read_predictions(window_start: datetime) -> pd.DataFrame:
     key = _predictions_key(window_start)
     predictions = read_parquet(key)
     if predictions is None:
-        raise FileNotFoundError(f"prediction parquet not found for {window_start}: {key}")
+        raise FileNotFoundError(
+            f"prediction parquet not found for {window_start}: {key}"
+        )
     return predictions
 
 

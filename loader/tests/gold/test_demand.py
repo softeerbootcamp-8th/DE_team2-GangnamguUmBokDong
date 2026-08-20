@@ -4,9 +4,14 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
+import pandas as pd
 import pyarrow as pa
 import pytest
-from core.gold_publication import ContractViolation
+from core.gold_publication import ContractViolation, build_id_set
+from core.inference_snapshot import (
+    canonicalize_inference_output_table,
+    serialize_inference_output_parquet,
+)
 from gold.common import parquet_bytes, read_parquet_bytes
 from gold.demand import (
     HORIZON_COUNT,
@@ -14,6 +19,7 @@ from gold.demand import (
     DemandPredictionRecord,
     DemandProjection,
     build_demand_projection,
+    demand_predictions_from_inference_parquet,
     demand_records_from_parquet,
     demand_records_to_parquet,
 )
@@ -70,6 +76,75 @@ def _projection(
         rental_model_station_ids=rental,
         return_model_station_ids=returned,
     )
+
+
+def _inference_authority_payload(
+    station_ids: tuple[str, ...] = ("ST-1",),
+) -> bytes:
+    """Core contract로 canonical 7-column inference authority bytes를 만든다."""
+    local_base = BASE + timedelta(hours=9)
+    rows = []
+    for station_id in station_ids:
+        for horizon in range(1, HORIZON_COUNT + 1):
+            target = local_base + timedelta(hours=horizon - 1)
+            rows.append(
+                {
+                    "station_id": station_id,
+                    "date": target.date().isoformat(),
+                    "hour": target.hour,
+                    "minute": target.minute,
+                    "horizon": horizon,
+                    "rental_pred_mean": float(horizon) + 0.5,
+                    "return_pred_mean": float(horizon) + 1.5,
+                    "rental_pred_p50": 999.0,
+                }
+            )
+    table = canonicalize_inference_output_table(
+        pd.DataFrame(rows),
+        logical_dttm=BASE,
+        expected_sta_ids=build_id_set(station_ids),
+    )
+    return serialize_inference_output_parquet(table)
+
+
+def test_inference_authority_adapter_uses_core_exact_schema_and_utc_anchor() -> None:
+    """Core authority rows를 target start 시각과 float64를 보존해 typed row로 읽는다."""
+    records = demand_predictions_from_inference_parquet(
+        _inference_authority_payload(),
+        expected_base_dttm=BASE,
+        expected_sta_ids=("ST-1",),
+    )
+
+    assert len(records) == HORIZON_COUNT
+    assert records[0] == DemandPredictionRecord(
+        base_dttm=BASE,
+        station_id="ST-1",
+        horizon=1,
+        target_dttm=BASE,
+        rental_pred_mean=1.5,
+        return_pred_mean=2.5,
+    )
+    assert records[-1].target_dttm == BASE + timedelta(hours=11)
+
+
+def test_inference_authority_adapter_binds_expected_station_id_set() -> None:
+    """Manifest expected ID와 output station 집합이 다르면 consumer도 fail closed한다."""
+    with pytest.raises(ContractViolation, match="station 집합"):
+        demand_predictions_from_inference_parquet(
+            _inference_authority_payload(),
+            expected_base_dttm=BASE,
+            expected_sta_ids=("ST-2",),
+        )
+
+
+def test_inference_authority_adapter_rejects_non_target_station_id() -> None:
+    """Core의 generic ID 계약을 통과해도 Gold ST-숫자 key가 아니면 거부한다."""
+    with pytest.raises(ContractViolation, match="ST-숫자"):
+        demand_predictions_from_inference_parquet(
+            _inference_authority_payload(("legacy-1",)),
+            expected_base_dttm=BASE,
+            expected_sta_ids=("legacy-1",),
+        )
 
 
 def test_projection_uses_exact_active_rental_return_intersection() -> None:

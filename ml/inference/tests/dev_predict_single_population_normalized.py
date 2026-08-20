@@ -56,17 +56,12 @@ def test_returns_target_tick_value_when_present(monkeypatch):
 
     result = ps._get_recent_population(target_ts)
 
-    assert list(result.columns) == ["pop_resd", "pop_long_foreign", "pop_short_foreign", "pop_total"]
-    row = result.loc["다사00000000"]
-    assert row["pop_total"] == 1234.0
-    assert row["pop_resd"] == 1234.0  # 국적 구분 없음 — 전부 내국인으로 근사
-    assert row["pop_long_foreign"] == 0.0
-    assert row["pop_short_foreign"] == 0.0
+    assert list(result.columns) == ["pop_total"]
+    assert result.loc["다사00000000", "pop_total"] == 1234.0
 
 
 def test_falls_back_to_earlier_tick_when_exact_tick_missing(monkeypatch):
-    """정규화가 아직 안 끝난 경우(target_ts 키 없음) — 거슬러 올라가 가장 최근
-    값을 대신 쓴다(_get_recent_weather()와 동일한 패턴)."""
+    """직접 호출·미래 예보 누락이면 제한된 lookback 안의 최근 값을 대신 쓴다."""
     target_ts = pd.Timestamp("2026-08-17 10:00:00")
 
     def _fake_read_many(keys, columns=None):
@@ -88,7 +83,7 @@ def test_returns_empty_dataframe_when_nothing_in_lookback_window(monkeypatch):
     result = ps._get_recent_population(pd.Timestamp("2026-08-17 10:00:00"))
 
     assert result.empty
-    assert list(result.columns) == ["pop_resd", "pop_long_foreign", "pop_short_foreign", "pop_total"]
+    assert list(result.columns) == ["pop_total"]
 
 
 def test_caches_result_per_target_ts(monkeypatch):
