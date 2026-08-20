@@ -10,6 +10,7 @@ COMPOSE = docker compose $(if $(wildcard .env),--env-file .env,) -f ops/compose/
 .PHONY: sync-all sync-ci-unit lint test-gold-bootstrap test-gold-transition-available test test-ci test-ci-unit test-ci-integration bootstrap up down logs ps seed seed-e2e e2e-preflight e2e-smoke
 
 E2E_LOGICAL_DTTM ?= $(shell TZ=Asia/Seoul date '+%Y-%m-%dT%H:%M:00+09:00' | awk -F: '{ printf "%s:%02d:00+09:00\n", $$1, int($$2 / 5) * 5 }')
+E2E_STATION_SOURCE_DTTM ?= $(shell date -d '$(E2E_LOGICAL_DTTM) 5 minutes ago' '+%Y-%m-%dT%H:%M:00%:z')
 
 sync-all:
 	@for p in $(PROJECTS); do \
@@ -120,11 +121,13 @@ seed:
 
 seed-e2e:
 	@$(COMPOSE) exec -T airflow-scheduler sh -lc \
-		'cd /workspace/loader && env -u VIRTUAL_ENV uv run --frozen python local_e2e.py seed --logical-dttm "$(E2E_LOGICAL_DTTM)"'
+		'cd /workspace/collector && env -u VIRTUAL_ENV UV_PROJECT_ENVIRONMENT=/opt/venvs/modules/collector uv run --frozen python main.py --source bike_station_realtime --window-start "$(E2E_STATION_SOURCE_DTTM)"'
+	@$(COMPOSE) exec -T airflow-scheduler sh -lc \
+		'cd /workspace/loader && env -u VIRTUAL_ENV LOCAL_E2E_ALLOW_FIXTURE=1 uv run --frozen python local_e2e.py seed --logical-dttm "$(E2E_LOGICAL_DTTM)"'
 
 e2e-preflight:
 	@$(COMPOSE) exec -T airflow-scheduler sh -lc \
-		'cd /workspace/loader && env -u VIRTUAL_ENV uv run --frozen python local_e2e.py check --logical-dttm "$(E2E_LOGICAL_DTTM)"'
+		'cd /workspace/loader && env -u VIRTUAL_ENV LOCAL_E2E_ALLOW_FIXTURE=1 uv run --frozen python local_e2e.py check --logical-dttm "$(E2E_LOGICAL_DTTM)"'
 
 e2e-smoke:
 	@python3 ops/e2e_smoke.py

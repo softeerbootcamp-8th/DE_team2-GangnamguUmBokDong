@@ -10,6 +10,8 @@ import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
+from zoneinfo import ZoneInfo
 
 import boto3
 import lightgbm as lgb
@@ -19,6 +21,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from core.db import get_connection
 from core.gold_publication import (
+    ContractViolation,
     S3ImmutableObjectStore,
     canonical_json_bytes,
     sha256_hex,
@@ -35,6 +38,7 @@ from core.source_snapshot_io import (
 )
 from core.weather_grid import latlon_to_grid
 from gold.dispatch_center import load_dispatch_center_seed, publish_dispatch_center
+from gold.source_policy import validate_source_snapshot_policy
 from gold.state import load_dependencies
 from gold.weather_grid import load_weather_grid_seed, publish_weather_grid
 from ml_core import common_config
@@ -52,7 +56,6 @@ from ml_core.serving_release import (
 )
 
 _ROOT = Path(__file__).resolve().parent.parent
-_STATION_ASSET = _ROOT / "apps/api/seed_data/stations_seoul.json"
 _CELL_ID = "다사53815262"
 _H_DNG_CD = "1168064000"
 _AGE_COLUMNS = (
@@ -86,6 +89,8 @@ _AGE_COLUMNS = (
     "F70",
 )
 _HISTORY_OFFSETS_MINUTES = (-25, -20, -15, -10, -5)
+_LOCAL_HOSTS = frozenset({"127.0.0.1", "host.docker.internal", "localhost", "minio", "postgres"})
+_KST = ZoneInfo("Asia/Seoul")
 _STATION_MASTER_COLUMNS = (
     "station_id",
     "station_no",
@@ -105,6 +110,22 @@ def _required_env(name: str) -> str:
     if value is None or not value or value != value.strip():
         raise ValueError(f"필수 환경변수가 없습니다: {name}")
     return value
+
+
+def _require_local_fixture_environment() -> None:
+    """명시적 opt-in과 로컬 DB·S3 endpoint를 모두 확인한다."""
+    if os.environ.get("LOCAL_E2E_ALLOW_FIXTURE") != "1":
+        raise ValueError("LOCAL_E2E_ALLOW_FIXTURE=1 명시적 opt-in이 필요합니다.")
+    endpoints = {
+        "DATABASE_URL": _required_env("DATABASE_URL"),
+        "S3_ENDPOINT_URL": _required_env("S3_ENDPOINT_URL"),
+    }
+    for name, value in endpoints.items():
+        parsed = urlsplit(value)
+        if parsed.scheme not in {"http", "postgres", "postgresql"}:
+            raise ValueError(f"{name}이 로컬 허용 scheme이 아닙니다.")
+        if parsed.hostname not in _LOCAL_HOSTS:
+            raise ValueError(f"{name}이 로컬 허용 host가 아닙니다: {parsed.hostname}")
 
 
 def _s3_client() -> Any:
@@ -128,24 +149,30 @@ def _parse_logical_dttm(raw: str) -> datetime:
     return logical
 
 
-def _load_stations() -> tuple[dict[str, object], ...]:
-    """API 로컬 자산을 모델·Silver fixture용 station 행으로 정규화한다."""
-    document = json.loads(_STATION_ASSET.read_bytes())
-    if type(document) is not list:
-        raise ValueError("stations_seoul.json은 JSON 배열이어야 합니다.")
-    by_station_no: dict[int, dict[str, object]] = {}
-    for raw in document:
-        if type(raw) is not dict:
-            continue
+def _stations_from_realtime(table: pa.Table) -> tuple[dict[str, object], ...]:
+    """Exact realtime snapshot을 station master·모델 공통 fixture로 변환한다."""
+    required = {
+        "stationId",
+        "stationName",
+        "rackTotCnt",
+        "stationLatitude",
+        "stationLongitude",
+    }
+    if missing := required - set(table.column_names):
+        raise ValueError(f"realtime station fixture 필수 컬럼이 없습니다: {sorted(missing)}")
+    by_station_id: dict[str, dict[str, object]] = {}
+    for raw in table.to_pylist():
         try:
-            station_no = int(raw["sta_id"])
-            latitude = float(raw["lat"])
-            longitude = float(raw["lon"])
-            capacity = int(raw["hold_cnt"])
+            station_id = str(raw["stationId"]).strip()
+            station_name = str(raw["stationName"]).strip()
+            latitude = float(raw["stationLatitude"])
+            longitude = float(raw["stationLongitude"])
+            capacity = int(raw["rackTotCnt"])
         except (KeyError, TypeError, ValueError):
             continue
         if (
-            not 1 <= station_no <= 32_767
+            not station_id.startswith("ST-")
+            or not station_name
             or not math.isfinite(latitude)
             or not math.isfinite(longitude)
             or not 36.5 <= latitude <= 38.5
@@ -153,17 +180,28 @@ def _load_stations() -> tuple[dict[str, object], ...]:
             or capacity <= 0
         ):
             continue
-        by_station_no[station_no] = {
+        by_station_id[station_id] = {
             "capacity": capacity,
             "lat": latitude,
             "lon": longitude,
-            "station_id": f"ST-{station_no}",
-            "station_name": str(raw.get("sta_nm") or f"local-e2e-{station_no}"),
-            "station_no": station_no,
+            "station_address": f"로컬 E2E fixture {station_name}",
+            "station_id": station_id,
+            "station_name": station_name,
         }
-    if not by_station_no:
-        raise ValueError("로컬 station fixture에 유효한 대여소가 없습니다.")
-    return tuple(by_station_no[key] for key in sorted(by_station_no))
+    if not by_station_id:
+        raise ValueError("realtime snapshot에 유효한 station fixture 행이 없습니다.")
+    return tuple(
+        {**by_station_id[station_id], "station_no": station_no}
+        for station_no, station_id in enumerate(sorted(by_station_id), start=1)
+    )
+
+
+def _load_stations(logical: datetime) -> tuple[dict[str, object], ...]:
+    """미리 수집한 exact realtime source에서 공통 station fixture를 읽는다."""
+    snapshot = read_exact_source_snapshot("bike_station_realtime", logical)
+    if snapshot.table is None:
+        raise ValueError("station fixture용 bike_station_realtime snapshot이 EMPTY입니다.")
+    return _stations_from_realtime(snapshot.table)
 
 
 def _parquet_bytes(table: pa.Table) -> bytes:
@@ -290,6 +328,112 @@ def _realtime_table(stations: tuple[dict[str, object], ...]) -> pa.Table:
     )
 
 
+def _master_table(stations: tuple[dict[str, object], ...]) -> pa.Table:
+    """Station Gold publisher가 소비하는 master source fixture를 만든다."""
+    return pa.Table.from_pylist(
+        [
+            {
+                "RNTLS_ID": station["station_id"],
+                "ADDR1": station["station_address"],
+                "ADDR2": "",
+                "LAT": station["lat"],
+                "LOT": station["lon"],
+            }
+            for station in stations
+        ]
+    )
+
+
+def _floor_logical(logical: datetime, tick_minutes: int) -> datetime:
+    """Timezone을 보존하며 logical time을 지정 분 경계로 내린다."""
+    midnight = logical.replace(hour=0, minute=0, second=0, microsecond=0)
+    elapsed_minutes = logical.hour * 60 + logical.minute
+    return midnight + timedelta(minutes=(elapsed_minutes // tick_minutes) * tick_minutes)
+
+
+def _weather_forecast_table(
+    logical: datetime,
+    base: datetime,
+    *,
+    source_id: str,
+) -> pa.Table:
+    """34개 grid와 향후 13시간을 덮는 결정적 KMA 예보 fixture를 만든다."""
+    grid_seed = load_weather_grid_seed(
+        _ROOT,
+        seed_version="local-e2e-weather-grid-v1",
+        effective_dttm=logical.astimezone(UTC) - timedelta(days=1),
+    )
+    first = logical.astimezone(_KST).replace(minute=0, second=0, microsecond=0)
+    first += timedelta(hours=1)
+    base_kst = base.astimezone(_KST)
+    rows = []
+    for grid in grid_seed.rows:
+        for offset in range(13):
+            target = first + timedelta(hours=offset)
+            common = {
+                "nx": grid.weather_grid_x_no,
+                "ny": grid.weather_grid_y_no,
+                "baseDate": f"{base_kst:%Y%m%d}",
+                "baseTime": f"{base_kst:%H%M}",
+                "fcstDate": f"{target:%Y%m%d}",
+                "fcstTime": f"{target:%H%M}",
+                "POP": 0.0,
+                "PTY": 0,
+                "REH": 50.0,
+                "SKY": 1,
+                "WSD": 1.0,
+            }
+            if source_id == "weather_short_term_forecast":
+                common.update({"PCP": "강수없음", "TMP": 20.0})
+            elif source_id == "weather_ultra_short_forecast":
+                common.update({"RN1": "강수없음", "T1H": 20.0})
+            else:
+                raise ValueError(f"지원하지 않는 forecast source입니다: {source_id}")
+            rows.append(common)
+    return pa.Table.from_pylist(rows)
+
+
+def _weather_live_table(logical: datetime) -> pa.Table:
+    """Inference horizon 1의 관측 fallback에 쓸 KMA 실황 fixture를 만든다."""
+    grid_seed = load_weather_grid_seed(
+        _ROOT,
+        seed_version="local-e2e-weather-grid-v1",
+        effective_dttm=logical.astimezone(UTC) - timedelta(days=1),
+    )
+    base = logical.astimezone(_KST)
+    return pa.Table.from_pylist(
+        [
+            {
+                "nx": grid.weather_grid_x_no,
+                "ny": grid.weather_grid_y_no,
+                "baseDate": f"{base:%Y%m%d}",
+                "baseTime": f"{base:%H%M}",
+                "T1H": 20.0,
+                "REH": 50.0,
+                "WSD": 1.0,
+                "RN1": 0.0,
+                "PTY": 0,
+            }
+            for grid in grid_seed.rows
+        ]
+    )
+
+
+def _kma_parts(logical: datetime) -> tuple[str, ...]:
+    """Checked-in weather seed에서 collector의 exact 34-grid part를 만든다."""
+    seed = load_weather_grid_seed(
+        _ROOT,
+        seed_version="local-e2e-weather-grid-v1",
+        effective_dttm=logical.astimezone(UTC) - timedelta(days=1),
+    )
+    return tuple(
+        sorted(
+            f"grid-{row.weather_grid_x_no:03d}x{row.weather_grid_y_no:03d}"
+            for row in seed.rows
+        )
+    )
+
+
 def _source_manifest_key(source_id: str, logical: datetime, revision: int) -> str:
     """Collector source authority와 같은 UTC manifest key를 만든다."""
     utc = logical.astimezone(UTC)
@@ -300,25 +444,141 @@ def _source_manifest_key(source_id: str, logical: datetime, revision: int) -> st
     )
 
 
-def _publish_history_snapshots(
-    client: Any,
+def _existing_snapshot_is_usable(
+    source_id: str,
+    snapshot: Any,
+    planned_parts: tuple[str, ...],
+) -> bool:
+    """기존 authority가 배포 policy 또는 fixture plan을 만족하는지 판정한다."""
+    if snapshot.table is None:
+        return False
+    try:
+        validate_source_snapshot_policy(snapshot.manifest)
+    except ContractViolation:
+        return snapshot.manifest.planned_parts == planned_parts
+    return True
+
+
+def _publish_source_snapshot(
     object_store: S3ImmutableObjectStore,
     bucket: str,
+    *,
+    source_id: str,
     logical: datetime,
-    stations: tuple[dict[str, object], ...],
-) -> tuple[str, ...]:
-    """Urgency가 요구하는 직전 5개 complete realtime authority를 만든다."""
-    source_id = "bike_station_realtime"
-    payload = _parquet_bytes(_realtime_table(stations))
+    table: pa.Table,
+    planned_parts: tuple[str, ...],
+) -> str:
+    """단일 source fixture를 공식 immutable authority manifest로 게시한다."""
+    try:
+        existing = read_exact_source_snapshot(source_id, logical)
+    except SourceSnapshotNotFoundError:
+        existing = None
+    revision = 0
+    if existing is not None:
+        if _existing_snapshot_is_usable(source_id, existing, planned_parts):
+            return _source_manifest_key(
+                source_id,
+                logical,
+                existing.manifest.revision_no,
+            )
+        revision = existing.manifest.revision_no + 1
+
+    payload = _parquet_bytes(table)
     digest = sha256_hex(payload)
     silver_uri = (
         f"s3://{bucket}/local_e2e/source_snapshot_silver/{source_id}/"
         f"sha256={digest}.parquet"
     )
     object_store.put_once(silver_uri, payload, expected_sha256=digest)
-    config_payload = (_ROOT / "collector/sources/bike_station_realtime.yaml").read_bytes()
-    config_version = f"sha256:{sha256_hex(config_payload)}"
-    count = len(stations)
+    config_payload = (_ROOT / f"collector/sources/{source_id}.yaml").read_bytes()
+    count = table.num_rows
+    manifest = build_source_snapshot_manifest(
+        source_id=source_id,
+        logical_dttm=logical,
+        revision_no=revision,
+        status=SourceSnapshotStatus.SUCCEEDED,
+        config_version=f"sha256:{sha256_hex(config_payload)}",
+        silver_uri=silver_uri,
+        silver_byte_sha256=digest,
+        counts=SourceSnapshotCounts(count, count, count, 0, 0),
+        planned_parts=planned_parts,
+        completed_parts=planned_parts,
+    )
+    key = _source_manifest_key(source_id, logical, revision)
+    object_store.put_once(
+        f"s3://{bucket}/{key}",
+        manifest.canonical_bytes,
+        expected_sha256=manifest.sha256,
+        require_canonical_json=True,
+    )
+    return key
+
+
+def _publish_prerequisite_source_snapshots(
+    object_store: S3ImmutableObjectStore,
+    bucket: str,
+    logical: datetime,
+    stations: tuple[dict[str, object], ...],
+) -> dict[str, str]:
+    """운영 DAG가 수집하지 않는 station·weather authority를 준비한다."""
+    kma_parts = _kma_parts(logical)
+    short_logical = _floor_logical(logical, 180)
+    ultra_logical = _floor_logical(logical, 30)
+    return {
+        "bike_station_master": _publish_source_snapshot(
+            object_store,
+            bucket,
+            source_id="bike_station_master",
+            logical=logical,
+            table=_master_table(stations),
+            planned_parts=(
+                "page-00001-01000",
+                "page-01001-02000",
+                "page-02001-03000",
+            ),
+        ),
+        "weather_short_term_forecast": _publish_source_snapshot(
+            object_store,
+            bucket,
+            source_id="weather_short_term_forecast",
+            logical=short_logical,
+            table=_weather_forecast_table(
+                logical,
+                short_logical,
+                source_id="weather_short_term_forecast",
+            ),
+            planned_parts=kma_parts,
+        ),
+        "weather_ultra_short_forecast": _publish_source_snapshot(
+            object_store,
+            bucket,
+            source_id="weather_ultra_short_forecast",
+            logical=ultra_logical,
+            table=_weather_forecast_table(
+                logical,
+                ultra_logical,
+                source_id="weather_ultra_short_forecast",
+            ),
+            planned_parts=kma_parts,
+        ),
+        "weather_ultra_short_live": _publish_source_snapshot(
+            object_store,
+            bucket,
+            source_id="weather_ultra_short_live",
+            logical=logical,
+            table=_weather_live_table(logical),
+            planned_parts=kma_parts,
+        ),
+    }
+
+
+def _publish_history_snapshots(
+    object_store: S3ImmutableObjectStore,
+    bucket: str,
+    logical: datetime,
+    stations: tuple[dict[str, object], ...],
+) -> tuple[str, ...]:
+    """Urgency가 요구하는 직전 5개 complete realtime authority를 만든다."""
     parts = (
         "page-00001-01000",
         "page-01001-02000",
@@ -328,48 +588,16 @@ def _publish_history_snapshots(
     keys = []
     for offset in _HISTORY_OFFSETS_MINUTES:
         window = logical + timedelta(minutes=offset)
-        try:
-            existing = read_exact_source_snapshot(source_id, window)
-        except SourceSnapshotNotFoundError:
-            existing = None
-        revision = 0
-        if existing is not None:
-            if existing.table is None:
-                raise ValueError(
-                    "기존 realtime history authority가 EMPTY입니다: "
-                    f"{window.isoformat()}"
-                )
-            if existing.manifest.planned_parts == parts:
-                keys.append(
-                    _source_manifest_key(
-                        source_id,
-                        window,
-                        existing.manifest.revision_no,
-                    )
-                )
-                continue
-            revision = existing.manifest.revision_no + 1
-        manifest = build_source_snapshot_manifest(
-            source_id=source_id,
-            logical_dttm=window,
-            revision_no=revision,
-            status=SourceSnapshotStatus.SUCCEEDED,
-            config_version=config_version,
-            silver_uri=silver_uri,
-            silver_byte_sha256=digest,
-            counts=SourceSnapshotCounts(count, count, count, 0, 0),
-            planned_parts=parts,
-            completed_parts=parts,
+        keys.append(
+            _publish_source_snapshot(
+                object_store,
+                bucket,
+                source_id="bike_station_realtime",
+                logical=window,
+                table=_realtime_table(stations),
+                planned_parts=parts,
+            )
         )
-        key = _source_manifest_key(source_id, window, revision)
-        uri = f"s3://{bucket}/{key}"
-        object_store.put_once(
-            uri,
-            manifest.canonical_bytes,
-            expected_sha256=manifest.sha256,
-            require_canonical_json=True,
-        )
-        keys.append(key)
     return tuple(keys)
 
 
@@ -579,14 +807,20 @@ def _publish_gold_dependencies(
 
 def seed(logical: datetime) -> dict[str, object]:
     """지정 logical time의 local E2E fixture 전체를 멱등 게시한다."""
+    _require_local_fixture_environment()
     bucket = _required_env("S3_BUCKET")
     client = _s3_client()
     object_store = S3ImmutableObjectStore(client)
-    stations = _load_stations()
+    stations = _load_stations(logical + timedelta(minutes=-5))
     nowcasts = _publish_nowcasts(client, bucket, logical)
     enriched = _publish_enriched_station_master(client, bucket, logical, stations)
+    prerequisite_sources = _publish_prerequisite_source_snapshots(
+        object_store,
+        bucket,
+        logical,
+        stations,
+    )
     history = _publish_history_snapshots(
-        client,
         object_store,
         bucket,
         logical,
@@ -601,6 +835,7 @@ def seed(logical: datetime) -> dict[str, object]:
         "history_window_count": len(history),
         "logical_dttm": logical.isoformat(),
         "nowcasts": nowcasts,
+        "prerequisite_source_count": len(prerequisite_sources),
         "serving_release_uri": release_uri,
         "station_count": len(stations),
     }
@@ -608,6 +843,7 @@ def seed(logical: datetime) -> dict[str, object]:
 
 def check(logical: datetime) -> dict[str, object]:
     """Local E2E fixture의 필수 object·pointer·DB dependency를 빠르게 검증한다."""
+    _require_local_fixture_environment()
     bucket = _required_env("S3_BUCKET")
     client = _s3_client()
     required_keys = [
@@ -630,6 +866,16 @@ def check(logical: datetime) -> dict[str, object]:
         )
         if snapshot.table is None:
             raise ValueError(f"local E2E history snapshot이 EMPTY입니다: {offset}")
+    prerequisite_windows = {
+        "bike_station_master": logical,
+        "weather_short_term_forecast": _floor_logical(logical, 180),
+        "weather_ultra_short_forecast": _floor_logical(logical, 30),
+        "weather_ultra_short_live": logical,
+    }
+    for source_id, window in prerequisite_windows.items():
+        snapshot = read_exact_source_snapshot(source_id, window)
+        if snapshot.table is None:
+            raise ValueError(f"local E2E prerequisite snapshot이 EMPTY입니다: {source_id}")
     object_store = S3ImmutableObjectStore(client)
     pinned = load_current_serving_release(
         object_store=object_store,
@@ -640,6 +886,7 @@ def check(logical: datetime) -> dict[str, object]:
     return {
         "dependency_count": len(dependencies),
         "history_window_count": len(_HISTORY_OFFSETS_MINUTES),
+        "prerequisite_source_count": len(prerequisite_windows),
         "release_version": pinned.manifest.release_version,
         "required_object_count": len(required_keys),
     }
