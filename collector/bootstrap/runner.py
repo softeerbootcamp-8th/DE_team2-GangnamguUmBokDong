@@ -96,6 +96,7 @@ def load_date(
     rows: list[dict],
     *,
     force: bool = False,
+    station_map_stats: dict | None = None,
 ) -> DateResult:
     """그 날짜의 행을 검증해 archive에 쓴다.
 
@@ -105,6 +106,9 @@ def load_date(
         day: 대상 날짜
         rows: 물리 컬럼명으로 정규화된 원시 행
         force: archive가 이미 있어도 다시 쓴다
+        station_map_stats: 조인 매핑표의 출처 정보. 주면 manifest에 그대로 실린다.
+            매핑표가 실행 시점 API 스냅샷이라 `rackTotCnt`·`shared`가 "그날의 값"이므로,
+            나중에 그 상수 컬럼의 출처를 되짚을 수 있어야 한다.
     returns:
         이 날짜의 처리 결과. 예외를 던지지 않는다.
     """
@@ -190,6 +194,8 @@ def load_date(
         "column_issues": column_issues,
         "silver_present": silver_present,
         "loaded_at": datetime.now(tz=_KST).isoformat(),
+        # 조인하지 않은 소스에는 키 자체를 두지 않는다.
+        **({"station_map": station_map_stats} if station_map_stats else {}),
     })
     logger.info(
         f"stage=bootstrap status=loaded source={scfg.source_id} date={day} "

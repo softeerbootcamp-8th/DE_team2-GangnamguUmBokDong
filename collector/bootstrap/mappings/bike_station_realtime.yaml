@@ -1,22 +1,71 @@
-# bikeListHist 과거 조회 API. 2023-08부터 조회된다.
+# 대여소별 공공자전거 대여가능 수량 CSV (서울 열린데이터광장 OA-22382)
 #
-# time_format이 10자리인 것이 중요하다. 8자리(20260817)를 주면 API가 에러 없이
-# 무시하고 최신 스냅샷을 반환한다 — 조용히 틀린 데이터가 들어온다.
+# ## `거치대수량`은 거치대 수가 아니다
 #
-# 응답 필드명이 bike_station_realtime.yaml의 컬럼과 같아서 column_map이 없다.
-kind: history_api
-service: bikeListHist
-time_format: "%Y%m%d%H"
-page_size: 1000
+# 이름과 달리 **대여가능 자전거 수**다. 같은 대여소의 2025-12-01 시간대별 값이
+# `8 → 12 → 3 → 11`로 움직인다. collector의 `parkingBikeTotCnt`에 대응한다.
+# 실제 거치대 수(`rackTotCnt`)는 이 CSV에 없어서 아래 join으로 채운다.
+#
+# ## 입력 실측 (2025-12분, 전수 프로파일링)
+#
+# cp949 + 한글 헤더 5컬럼. 2,076,131행(대여소 2,799 x 24시간 x 31일), 112MB.
+# `(일시, 시간대, 대여소번호)` 중복 0건, 전 컬럼 빈값 0건, `일시` 완전 오름차순.
+# 전체 스캔이 3.2초라 파일명 `_YYMM` 최적화가 없어도 실용적이다 — 파일명에서 YYMM을
+# 못 뽑으면 csv_source가 경고를 남기고 전체를 읽는다.
+#
+# ## 과거 조회 API에서 바뀐 이유
+#
+# 이전에는 `bikeListHist`(`kind: history_api`)를 썼다. API가 컬럼 7개를 1:1로 채우고
+# 각 시각의 실제 값을 준다는 점에서 품질은 그쪽이 낫지만, 3년 범위를 채우려면 시간마다
+# 한 번씩 26,000회를 호출해야 한다. 파일을 한 번에 넣기로 했고, 그 대가는 아래 join
+# 주석에 적었다. 되살릴 필요가 생기면 git 이력에 있다.
+
+kind: csv
+encoding: cp949
+
+# `--csv-dir`에 대여이력 CSV·기상 CSV가 함께 있다. 이 소스의 파일만 고른다.
+file_pattern: "대여소별 공공자전거 대여가능 수량*.csv"
+
+# 실측 빈값이 0건이고 `\N` 같은 별도 결측 표기도 없다.
+na_values: []
+
+column_map:
+  # 언더스코어 접두 = archive에 남지 않는 조인용 임시 컬럼. csv_source가 출력에서 뺀다.
+  대여소번호: _station_no
+  대여소명: stationName
+  거치대수량: parkingBikeTotCnt
+
+# CSV는 시각을 `일시`(2025-12-01)와 `시간대`(0~23, 제로패딩 없음) 두 컬럼에 나눠 준다.
+# `bike_station_realtime`은 시각 컬럼 하나를 기준으로 창을 나누므로 합친다.
+#
+# 결과 컬럼명을 `stationDt`로 두는 것은 의도적이다 — 과거 조회 API 경로가 쓰던 이름과
+# 같고, `collector/sources/bike_station_realtime.yaml`의 columns에 없어서 conform()이
+# archive에서 떨어뜨린다. 시각은 runner.group_by_window()가 읽어 `_window_start`로만
+# 남으므로 archive 스키마가 API 경로와 완전히 동일해진다.
+composed_time:
+  stationDt:
+    from: ["일시", "시간대"]
+    parse: "%Y-%m-%d %H"
+    format: "%Y%m%d%H"
+
+# CSV는 대여소를 `00102` 형식 번호로 가리키는데 collector는 `stationId`(`ST-4`)를
+# required로 요구한다. 거치대 수·거치율·좌표도 없다. station_join이 bikeList API와
+# 대여이력 CSV를 겹쳐 만든 매핑표에서 채운다(실측 미매칭 0.68%).
+#
+# ⚠️ `rackTotCnt`·`shared`는 매핑표를 만든 **그 시각의 값**이라 과거 날짜에서 기간 내내
+# 상수가 된다. 좌표는 대여소가 이전하지 않는 한 맞지만 이 둘은 그렇지 않다 — 거치대
+# 수는 증설·감축으로 변하고 거치율은 원래 시간마다 변한다. `_source_kind=bootstrap`
+# 행에서 두 컬럼을 피처로 쓰면 모델이 "변하지 않는다"를 학습한다. 값의 출처는 archive
+# manifest의 `station_map`에 남는다.
+join:
+  provider: bike_station
+  by: {number: _station_no, name: stationName}
+  fills: [stationId, rackTotCnt, shared, stationLatitude, stationLongitude]
 
 window:
   from_column: stationDt
   format: "%Y%m%d%H"
 
-# bikeListHist는 실측상 한 시각에 스테이션마다 행을 2개 준다(3,198개소 x 2 =
-# 6,400행/시간). 그중 대부분(2,508쌍)은 값이 완전히 같고 일부(690쌍)만
-# parkingBikeTotCnt·shared가 다르다. stationDt가 시 단위라 둘을 구분할 방법이
-# 없으므로, 완전히 동일한 쌍만 하나로 합친다. `_window_start`를 포함한 전체
-# 컬럼으로 묶어야 한다 — 다른 시각의 값이 우연히 같을 때 시계열이 깨지면 안 된다
-# (compaction.dedup()을 그대로 쓰면 이 실수가 난다).
-dedup: true
+# 실측 중복이 0건이다. API 경로가 dedup을 켰던 것은 `bikeListHist`가 한 시각에
+# 스테이션마다 행을 2개 주기 때문이고, CSV에는 그 문제가 없다.
+dedup: false

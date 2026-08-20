@@ -4,7 +4,6 @@ from datetime import UTC, datetime
 
 import pandas as pd
 import pyarrow as pa
-
 from config import TABLE_SPECS
 
 
@@ -50,6 +49,15 @@ def test_expire_col_absent_for_master_and_latest_only_tables():
     assert TABLE_SPECS["stations"].expire_col is None
     assert TABLE_SPECS["station_stock"].expire_col is None
     assert TABLE_SPECS["weather_current"].expire_col is None
+
+
+def test_station_stock_table_spec_upserts_latest_row_by_station() -> None:
+    """station_stock은 sta_id 충돌 시 관측 시각과 재고를 최신값으로 갱신한다."""
+    spec = TABLE_SPECS["station_stock"]
+
+    assert spec.conflict_cols == ["sta_id"]
+    assert spec.update_cols == ["observed_at", "parking_bike_tot_cnt"]
+    assert spec.guard_col == "observed_at"
 
 
 def test_station_urgency_table_spec_registered():

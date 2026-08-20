@@ -26,16 +26,39 @@ CREATE TABLE IF NOT EXISTS stations (
 ALTER TABLE stations ADD COLUMN IF NOT EXISTS grid_nx INTEGER;
 ALTER TABLE stations ADD COLUMN IF NOT EXISTS grid_ny INTEGER;
 
--- 대여소별 재고 관측 이력. 수집 파이프라인이 매 주기(예: 5분)마다 새 행을 추가한다
--- (upsert 아님, sta_id 기준 최신 한 줄이 아니라 계속 쌓인다). 예측 데이터가 나오기
--- 전(1시간 이내) 구간의 위험을 최근 재고 추세로 감지하는 데 필요해서 이력으로 둔다.
--- 보관 기간 정리는 아직 강제하지 않는다(필요해지면 정리 배치를 추가한다).
+-- 대여소별 최신 재고. 과거 관측 이력은 S3 Silver에 영구 보존되고 RDS 소비자는
+-- 현재값만 사용하므로, loader가 sta_id 기준으로 upsert해 최신 한 줄만 유지한다(#108).
 CREATE TABLE IF NOT EXISTS station_stock (
-    sta_id                  TEXT NOT NULL REFERENCES stations (sta_id),
+    sta_id                  TEXT PRIMARY KEY REFERENCES stations (sta_id),
     observed_at             TIMESTAMPTZ NOT NULL,
-    parking_bike_tot_cnt    INTEGER NOT NULL,
-    PRIMARY KEY (sta_id, observed_at)
+    parking_bike_tot_cnt    INTEGER NOT NULL
 );
+
+-- 과거 버전은 (sta_id, observed_at) 복합 PK로 관측 이력을 누적했다. 기존 볼륨은
+-- 대여소별 최신 관측 한 건만 남긴 뒤 단일 PK로 전환한다. 이미 단일 PK면 건너뛴다.
+DO $migration$
+DECLARE
+    primary_key_name TEXT;
+    primary_key_definition TEXT;
+BEGIN
+    SELECT conname, pg_get_constraintdef(oid)
+      INTO primary_key_name, primary_key_definition
+      FROM pg_constraint
+     WHERE conrelid = 'station_stock'::regclass
+       AND contype = 'p';
+
+    IF primary_key_definition IS DISTINCT FROM 'PRIMARY KEY (sta_id)' THEN
+        DELETE FROM station_stock stock
+              WHERE stock.observed_at < (
+                  SELECT max(observed_at) FROM station_stock WHERE sta_id = stock.sta_id
+              );
+        IF primary_key_name IS NOT NULL THEN
+            EXECUTE format('ALTER TABLE station_stock DROP CONSTRAINT %I', primary_key_name);
+        END IF;
+        ALTER TABLE station_stock ADD PRIMARY KEY (sta_id);
+    END IF;
+END
+$migration$;
 
 -- 예측 배치(ml/predict, 5분 주기)가 갱신한다. (sta_id, predicted_dttm) 기준으로
 -- upsert해서, 같은 미래 시각에 대한 예측은 항상 가장 최근 배치 결과 하나만 남는다.

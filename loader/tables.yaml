@@ -18,9 +18,10 @@ station_stock:
   transform: station_stock_from_silver
   conflict_cols:
     - sta_id
-    - observed_at
   update_cols:
+    - observed_at
     - parking_bike_tot_cnt
+  guard_col: observed_at
 
 # weather_current/weather_forecast는 gu(자치구) 대신 격자(nx, ny)를 조인 키로 쓴다.
 # gu는 표시용 파생 컬럼으로만 남는다(넓은 구에 여러 격자가 걸치는 문제를 gu 단위

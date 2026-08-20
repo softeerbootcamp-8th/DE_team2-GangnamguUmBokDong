@@ -6,7 +6,10 @@
     uv run --frozen python -m bootstrap --source bike_rental_history \
         --from 2025-01-01 --to 2025-12-31 --csv-dir ../data
     uv run --frozen python -m bootstrap --source bike_station_realtime \
-        --from 2025-01-01 --to 2025-12-31 --concurrency 4
+        --from 2025-12-01 --to 2025-12-31 --csv-dir ../data
+
+`bike_station_realtime`은 대여소 매핑표를 만들기 위해 `--csv-dir`에서 대여이력 CSV도
+찾는다(`station_join` 참고). 두 CSV를 같은 디렉터리에 두면 커버리지가 가장 높다.
 
 Airflow가 부르지 않는 수동 작업이라 태스크 빌더를 만들지 않는다.
 
@@ -40,7 +43,7 @@ from pathlib import Path
 import httpx
 
 import config.loader as config_loader
-from bootstrap import api_source, csv_source, runner
+from bootstrap import api_source, csv_source, runner, station_join
 from bootstrap import config as bootstrap_config
 from logging_setup import configure_batch_logging
 
@@ -105,11 +108,16 @@ def main(argv: list[str] | None = None) -> int:
                 f"stage=bootstrap source={args.source} csv_dir={csv_dir} "
                 "csv 파일을 하나도 찾지 못했다"
             )
-        by_date = csv_source.read_by_date(bcfg, csv_dir, set(days))
+        # 매핑표는 API를 여러 번 부르므로 범위 전체에 대해 한 번만 만든다.
+        station_map = station_join.build(csv_dir) if bcfg.join else None
+        station_map_stats = station_map.stats if station_map else None
+        by_date = csv_source.read_by_date(bcfg, csv_dir, set(days), station_map)
         for day in days:
             table = by_date.get(day)
             rows = table.to_pylist() if table is not None else []
-            results.append(runner.load_date(scfg, bcfg, day, rows, force=args.force))
+            results.append(runner.load_date(
+                scfg, bcfg, day, rows, force=args.force, station_map_stats=station_map_stats,
+            ))
     else:
         consecutive_failures = 0
         with httpx.Client(timeout=60.0) as client:

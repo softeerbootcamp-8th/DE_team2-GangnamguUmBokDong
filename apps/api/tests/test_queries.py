@@ -6,6 +6,7 @@ core.db(fetch_all/fetch_one)를 monkeypatch로 대체해 DB 연결 없이 검증
 
 from datetime import UTC, datetime, timedelta
 
+import pytest
 import queries
 from queries import _haversine_km
 
@@ -26,9 +27,29 @@ def test_fetch_stations_does_not_require_forecasts(monkeypatch):
 
     assert queries.fetch_stations() == expected
     assert "FROM stations s" in captured["query"]
-    assert "FROM station_stock" in captured["query"]
+    assert "JOIN station_stock stock ON stock.sta_id = s.sta_id" in captured["query"]
+    assert "LATERAL" not in captured["query"]
     assert "forecast_points" not in captured["query"]
     assert captured["params"] is None
+
+
+def test_fetch_station_joins_single_latest_stock_row(monkeypatch: pytest.MonkeyPatch) -> None:
+    """station_stock은 sta_id당 최신 한 행만 가지므로 대여소 상세도 일반 조인한다."""
+    expected = {"sta_id": "ST-1", "parking_bike_tot_cnt": 3}
+    captured = {}
+
+    def fake_fetch_one(query: str, params: dict | None = None) -> dict:
+        """실행할 쿼리와 파라미터를 기록하고 고정된 대여소를 반환한다."""
+        captured["query"] = query
+        captured["params"] = params
+        return expected
+
+    monkeypatch.setattr(queries, "fetch_one", fake_fetch_one)
+
+    assert queries.fetch_station("ST-1") == expected
+    assert "JOIN station_stock stock ON stock.sta_id = s.sta_id" in captured["query"]
+    assert "LATERAL" not in captured["query"]
+    assert captured["params"] == {"sta_id": "ST-1"}
 
 
 def test_fetch_alerts_excludes_stale_batches(monkeypatch):
