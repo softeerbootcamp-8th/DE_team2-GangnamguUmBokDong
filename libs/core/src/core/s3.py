@@ -1,6 +1,6 @@
-"""S3 / MinIO 제네릭 입출력 모듈.
+"""S3/MinIO 제네릭 입출력 모듈.
 
-Pandas DataFrame, JSON(dict/list), PyArrow Parquet 등의 데이터를 S3로 읽고 씁니다.
+pandas DataFrame, dict(JSON), pyarrow.parquet 등의 데이터를 S3로 읽고 씁니다.
 """
 
 from __future__ import annotations
@@ -8,43 +8,65 @@ from __future__ import annotations
 import io
 import json
 import os
+import threading
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
 
 import boto3
 import pandas as pd
+import pyarrow as pa
 import pyarrow.parquet as pq
+from botocore.config import Config as BotoConfig
 from botocore.exceptions import ClientError
 
 
-def _client():
-    """S3 호환 클라이언트를 생성하여 반환한다."""
+def _client(timeout_seconds: float | None = None):
+    """S3 호환 클라이언트를 생성한다.
+
+    args:
+        timeout_seconds: 지정하면 connect/read timeout을 이 값으로 두고 재시도를
+            끈다(`retries={"max_attempts": 1}`) — 기본(None)은 boto3 기본 재시도
+            정책 그대로(연결 자체가 안 되는 엔드포인트에서 실측 8.5초 소요). 프로필처럼
+            "S3가 응답 안 하면 즉시 내장 기본값으로 폴백"해야 하는 드문 호출에서만 쓴다
+            — 대부분의 호출(학습 데이터 로드 등)은 느리더라도 끝까지 재시도하는 게
+            맞아 기본값을 안 바꾼다.
+    """
+    config = None
+    if timeout_seconds is not None:
+        config = BotoConfig(
+            connect_timeout=timeout_seconds, read_timeout=timeout_seconds, retries={"max_attempts": 1}
+        )
     return boto3.client(
         "s3",
         endpoint_url=os.environ.get("S3_ENDPOINT_URL") or None,
         aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID", "minioadmin"),
         aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY", "minioadmin"),
+        config=config,
     )
 
 
 def _bucket() -> str:
-    """대상 S3 버킷 이름을 환경변수에서 읽어 반환한다."""
+    """대상 S3 버킷 이름을 환경 변수에서 읽어 반환한다."""
     return os.environ.get("S3_BUCKET", "gangnamgu")
 
 
-def get_object_bytes(key: str) -> bytes | None:
-    """S3 객체의 본문을 bytes로 읽어 반환한다.
+def get_object_bytes(key: str, timeout_seconds: float | None = None) -> bytes | None:
+    """S3 객체를 bytes로 읽는다.
 
     args:
-        key: 읽을 객체의 S3 키
+        key: 읽을 객체의 전체 키
+        timeout_seconds: `_client()` 참고 — 지정하면 짧은 timeout+재시도 없음으로 조회한다.
     returns:
-        객체 본문 bytes (키가 존재하지 않으면 None)
+        객체 본문 bytes, 키가 없으면 None
     raises:
-        ClientError: NoSuchKey 외의 S3 오류가 발생했을 때
+        ClientError: NoSuchKey가 아닌 다른 S3 오류가 발생했을 때
+        botocore.exceptions.EndpointConnectionError 등: timeout_seconds 지정 시
+            엔드포인트 자체가 응답하지 않으면 그대로 던진다 — 호출부가 폴백을 결정한다.
     """
     try:
-        return _client().get_object(Bucket=_bucket(), Key=key)["Body"].read()
+        return _client(timeout_seconds).get_object(Bucket=_bucket(), Key=key)["Body"].read()
     except ClientError as exc:
         if exc.response["Error"]["Code"] == "NoSuchKey":
             return None
@@ -52,13 +74,24 @@ def get_object_bytes(key: str) -> bytes | None:
 
 
 def put_object_bytes(key: str, body: bytes) -> None:
-    """바이트 데이터를 지정된 S3 키의 객체로 저장한다.
-
-    args:
-        key: 저장할 대상 S3 키
-        body: 저장할 데이터 바이트
-    """
+    """bytes를 S3 객체로 저장한다."""
     _client().put_object(Bucket=_bucket(), Key=key, Body=body)
+
+
+def _to_pandas_or_table(table: pq.Table, as_pandas: bool) -> pd.DataFrame | pq.Table:
+    """`table.to_pandas()` 변환 시 순간 메모리가 2배로 뜨는 걸 줄인다.
+
+    기본 `to_pandas()`는 원본 Arrow Table을 그대로 둔 채 새 pandas 배열을
+    만들어서, 변환이 끝나기 전까지 둘 다(Arrow Table + 새 DataFrame) 메모리에
+    떠 있다 — 학습 테이블처럼 큰 데이터에서 순간 피크가 최종 크기의 2배까지
+    간다(2026-08 리뷰 지적). `self_destruct=True`(+`split_blocks=True`, 이
+    조합이어야 실제 절감 효과가 있음 — pyarrow 문서)는 컬럼을 pandas로 옮기는
+    족족 Arrow 쪽 버퍼를 즉시 해제한다 — 대신 호출부가 변환 후 원본 `table`을
+    다시 쓰면 안 된다(이 함수의 모든 호출부는 변환 직후 바로 반환하므로 안전).
+    """
+    if not as_pandas:
+        return table
+    return table.to_pandas(self_destruct=True, split_blocks=True)
 
 
 def read_parquet(
@@ -66,50 +99,93 @@ def read_parquet(
     columns: list[str] | None = None,
     as_pandas: bool = True,
     date_range: tuple[str, str] | None = None,
+    dates: list[str] | None = None,
+    filters: list[tuple] | None = None,
+    on_complete: Callable[[int, int], None] | None = None,
 ) -> pd.DataFrame | pq.Table | None:
     """S3의 parquet을 pandas DataFrame 또는 pyarrow Table로 읽는다 — 파일 1개짜리 객체와 다중 파트 "디렉터리" 둘 다 지원한다.
 
     args:
         date_range: (start, end) "YYYY-MM-DD" 문자열(둘 다 포함) — 지정하면 `key`가
             Spark `partitionBy("date")`로 쓰인 `key/date=YYYY-MM-DD/part-*.parquet`
-            레이아웃이라고 보고 `_read_parquet_by_date_range()`로 위임한다. prefix
+            레이아웃이라고 보고 `_read_parquet_by_dates()`로 위임한다. prefix
             전체를 나열하는 대신 이 범위의 date= 서브prefix만 나열/다운로드해서,
             쌓인 전체 히스토리가 아니라 실제로 필요한 기간 크기에만 비용이 비례하게
             한다(ml/training이 매달 전체를 다시 받는 문제 대응). None이면(기본)
             prefix 전체를 읽는다 — 파티션 없는 데이터셋은 계속 이 경로를 쓴다.
+        dates: date_range(연속 구간) 대신 특정 날짜만 골라서 읽고 싶을 때 쓴다 —
+            예: 짝수날만/특정 요일만처럼 불연속 날짜 목록. "YYYY-MM-DD" 문자열
+            리스트, date_range와 동시에 줄 수 없다(training._split()의 짝/홀수
+            day-of-month 표본처럼, 애초에 필요한 파티션만 골라 읽어서 로드 자체의
+            메모리를 줄이는 용도 — `_split()`이 다운스트림에서 걸러도 이미 전체를
+            읽어버린 뒤라 소용없다).
+        filters: `date`/`dates`는 파티션(폴더) 단위 필터라 그걸로 못 거르는, 파일
+            *내용* 안의 일반 컬럼 값 필터(예: `[("horizon", "<=", 6)]`) — pyarrow의
+            `pq.read_table(..., filters=...)` 그대로 각 조각 파일에 적용된다(row-group
+            통계로 스킵 가능하면 스킵, 아니면 읽은 뒤 걸러서 최종 결과에만 안 남김).
+            여러 조건은 AND로 묶인다(`[("a", "<=", 1), ("b", ">", 2)]`). training의
+            multi-horizon 테이블처럼 같은 날짜 파티션 안에 여러 horizon이 섞여 있어
+            날짜만으로는 못 줄일 때 쓴다.
+        on_complete: 여러 파일 중 하나를 다 읽을 때마다 `(완료 개수, 전체 개수)`로
+            호출된다(`date_range`/`dates`/prefix 다중 파트처럼 파일이 여러 개일
+            때만 의미가 있음 — 단일 객체 GET 한 번으로 끝나는 경로에서는 안 불림).
+            대용량 학습 테이블 로드처럼 오래 걸리는 호출의 진행 상황을 로깅하고
+            싶을 때만 넘기면 된다.
     """
+    if date_range is not None and dates is not None:
+        raise ValueError("date_range와 dates는 동시에 지정할 수 없습니다.")
     if date_range is not None:
-        return _read_parquet_by_date_range(key, date_range, columns=columns, as_pandas=as_pandas)
+        date_strs = [day.strftime("%Y-%m-%d") for day in pd.date_range(date_range[0], date_range[1], freq="D")]
+        return _read_parquet_by_dates(
+            key, date_strs, columns=columns, as_pandas=as_pandas, filters=filters, on_complete=on_complete
+        )
+    if dates is not None:
+        return _read_parquet_by_dates(
+            key, dates, columns=columns, as_pandas=as_pandas, filters=filters, on_complete=on_complete
+        )
 
     body = get_object_bytes(key)
     if body is not None:
-        table = pq.read_table(io.BytesIO(body), columns=columns)
-        return table.to_pandas() if as_pandas else table
+        table = pq.read_table(io.BytesIO(body), columns=columns, filters=filters)
+        return _to_pandas_or_table(table, as_pandas)
 
     prefix = key if key.endswith("/") else f"{key}/"
     part_keys = sorted(k for k in list_keys(prefix) if k.endswith(".parquet"))
     if not part_keys:
         return None
 
-    tables = [t for t in read_parquet_many(part_keys, columns=columns, as_pandas=as_pandas) if t is not None]
+    # 조각마다 pandas DataFrame으로 각각 변환해 리스트에 쌓아뒀다가 pd.concat()하면,
+    # 그 순간 "조각 전부 + 새로 만든 합본"이 동시에 메모리에 떠 있는다(최종 크기의
+    # 최대 2배). 항상 Arrow Table로만 모아서(as_pandas=False) Arrow 레벨에서 먼저
+    # 합치고(zero-copy — ChunkedArray가 기존 버퍼를 복사 없이 이어붙임), pandas
+    # 변환은 최종 결과 하나에 대해 딱 한 번만 한다. 조각 목록은 합치자마자 바로
+    # 참조를 끊어서(del) 가비지 컬렉션이 즉시 회수할 수 있게 한다.
+    tables = [
+        t
+        for t in read_parquet_many(part_keys, columns=columns, as_pandas=False, filters=filters, on_complete=on_complete)
+        if t is not None
+    ]
     if not tables:
         return None
+    combined = pa.concat_tables(tables)
+    del tables
 
-    if as_pandas:
-        return pd.concat(tables, ignore_index=True)
-    else:
-        import pyarrow as pa
-
-        return pa.concat_tables(tables)
+    return _to_pandas_or_table(combined, as_pandas)
 
 
-def _read_parquet_by_date_range(
+def _read_parquet_by_dates(
     key: str,
-    date_range: tuple[str, str],
+    date_strs: list[str],
     columns: list[str] | None,
     as_pandas: bool,
+    filters: list[tuple] | None = None,
+    on_complete: Callable[[int, int], None] | None = None,
 ) -> pd.DataFrame | pq.Table | None:
-    """`date=` Hive 파티션 레이아웃에서 지정한 날짜 범위의 서브prefix만 나열/다운로드한다.
+    """`date=` Hive 파티션 레이아웃에서 지정한 날짜들의 서브prefix만 나열/다운로드한다.
+
+    연속 구간(`date_range`)이든 불연속 목록(`dates`, 예: 짝수날만)이든 호출부
+    (`read_parquet()`)가 이미 정확한 날짜 문자열 리스트로 펼쳐서 넘겨준다 — 여기는
+    그 목록을 그대로 순회할 뿐 범위/불연속 여부를 신경 쓰지 않는다.
 
     Spark는 파티션 컬럼 값을 파일 내용에 넣지 않고 디렉터리명(`date=YYYY-MM-DD/`)
     으로만 표현한다(Hive 컨벤션) — 그래서 파일에서 읽은 결과엔 "date" 컬럼이 아예
@@ -118,70 +194,120 @@ def _read_parquet_by_date_range(
 
     args:
         key: Spark `partitionBy("date")` 출력의 prefix(파티션 폴더들의 부모)
-        date_range: (start, end) "YYYY-MM-DD" 문자열, 둘 다 포함
-        columns: 읽을 컬럼(None이면 전체) — "date"가 포함돼도/안 돼도 결과에는
-            항상 복원된 "date"가 있고, 지정 시 그 컬럼 순서를 그대로 맞춰 반환한다
+        date_strs: 읽을 날짜("YYYY-MM-DD") 목록 — 연속/불연속 상관없음
+        columns: 읽을 컬럼(None이면 전체) — `None`이거나 명시적으로 `"date"`를
+            포함해야 결과에 복원된 "date"가 있다(포함 안 하면 애초에 안 만듦,
+            아래 참고). 지정 시 그 컬럼 순서를 그대로 맞춰 반환한다
         as_pandas: True면 DataFrame, False면 pyarrow Table 반환("date" 복원은
             내부적으로 항상 pandas로 하고 필요할 때만 마지막에 변환)
+        filters: `read_parquet()` docstring 참고 — 각 날짜 파티션 파일에 그대로 적용된다
+        on_complete: `read_parquet()` docstring 참고 — 날짜 전체에 걸친 파일 목록
+            기준으로 진행 상황을 보고한다(날짜 경계와 무관하게 하나의 카운터)
     returns:
-        범위 안에 데이터가 하나도 없으면 None
+        지정한 날짜들에 데이터가 하나도 없으면 None
     """
-    start, end = date_range
     prefix = key if key.endswith("/") else f"{key}/"
     file_columns = [c for c in columns if c != "date"] if columns is not None else None
 
-    frames = []
-    for day in pd.date_range(start, end, freq="D"):
-        date_str = day.strftime("%Y-%m-%d")
-        part_keys = sorted(k for k in list_keys(f"{prefix}date={date_str}/") if k.endswith(".parquet"))
-        if not part_keys:
-            continue
-        for df in read_parquet_many(part_keys, columns=file_columns, as_pandas=True):
-            if df is None:
-                continue
-            df = df.copy()
-            df["date"] = date_str
-            frames.append(df)
+    # 날짜별 LIST부터 병렬로 끝낸다 — 순서대로 하나씩 "LIST한 뒤 그 날짜 파일들을
+    # 내려받고, 그게 끝나야 다음 날짜 LIST를 시작"하는 계단식 패턴이면 학습처럼
+    # 몇 달치를 한 번에 읽을 때 그 사이 대기 시간이 그대로 쌓인다 — LIST 자체는
+    # 가벼운 호출이라 read_parquet_many()와 같은 동시성으로 먼저 다 끝내둔다.
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        keys_by_date = list(
+            pool.map(
+                lambda date_str: sorted(k for k in list_keys(f"{prefix}date={date_str}/") if k.endswith(".parquet")),
+                date_strs,
+            )
+        )
 
-    if not frames:
+    # 실제 파일 다운로드는 day 단위로 나눠 부르지 않고 전체 날짜 범위를 합친
+    # 키 목록 하나로 read_parquet_many()를 한 번만 호출한다 — 그래야 그 안의
+    # ThreadPoolExecutor가 날짜 경계와 무관하게 전체 구간에 대해 동시성을 최대로
+    # 활용한다(day마다 별도 풀을 새로 만들어 반복하면 그 사이 유휴 시간이 생김).
+    part_keys: list[str] = []
+    key_dates: list[str] = []
+    for date_str, day_keys in zip(date_strs, keys_by_date):
+        part_keys.extend(day_keys)
+        key_dates.extend([date_str] * len(day_keys))
+
+    if not part_keys:
         return None
-    result = pd.concat(frames, ignore_index=True)
+
+    # read_parquet()와 같은 이유로 Arrow Table 상태로만 모은다 — "date" 컬럼도
+    # pandas .copy()+할당 대신 Arrow 레벨에서 상수 컬럼으로 붙여서, 조각마다 pandas
+    # DataFrame을 따로 만들지 않는다(다중 파티션 읽기라 이 함수가 가장 큰 데이터를
+    # 다룰 가능성이 높음 — training의 multi-horizon 테이블 읽기).
+    #
+    # **"date"는 호출부가 실제로 요청했을 때만 붙인다(2026-08 수정)** — 예전엔
+    # `columns`에 "date"가 없어도 일단 전체 구간에 대해 행 수만큼 문자열 배열을
+    # 만들고 나중에(아래 `combined.select(columns)`에서) 버렸다. `lazy_train_dataset.
+    # station_categories_for_dates()`처럼 `columns=["station_no"]`로 1년 전체(약
+    # 8억 행)를 읽는 호출에서, 그 순간만 쓰고 버리는 date 문자열 배열이 수 GB
+    # 규모로 일시에 잡혀 있었다(리뷰 지적) — 스트리밍 경로를 만든 취지와 정반대라
+    # 애초에 요청 안 했으면 만들지 않는다.
+    want_date = columns is None or "date" in columns
+    tables = []
+    for date_str, table in zip(
+        key_dates,
+        read_parquet_many(part_keys, columns=file_columns, as_pandas=False, filters=filters, on_complete=on_complete),
+    ):
+        if table is None or table.num_rows == 0:
+            continue
+        if want_date:
+            date_column = pa.array([date_str] * table.num_rows)
+            table = table.append_column("date", date_column)
+        tables.append(table)
+
+    if not tables:
+        return None
+    combined = pa.concat_tables(tables)
+    del tables
+
     if columns is not None:
-        result = result[columns]
-    if as_pandas:
-        return result
-    import pyarrow as pa
-    return pa.Table.from_pandas(result, preserve_index=False)
+        combined = combined.select(columns)
+    return _to_pandas_or_table(combined, as_pandas)
+
 
 def read_parquet_many(
     keys: list[str],
     columns: list[str] | None = None,
     max_workers: int = 16,
     as_pandas: bool = True,
+    filters: list[tuple] | None = None,
+    on_complete: Callable[[int, int], None] | None = None,
 ) -> list[pd.DataFrame | pq.Table | None]:
-    """여러 S3 Parquet 객체를 스레드 풀을 활용해 병렬로 읽어온다.
+    """여러 parquet 키를 스레드로 병렬 조회한다.
 
     args:
-        keys: 읽을 대상 S3 키 목록
-        columns: 선택적으로 읽어올 컬럼 목록
-        max_workers: 병렬 I/O 작업자 스레드 수
-        as_pandas: True이면 Pandas DataFrame, False이면 PyArrow Table 반환
-    returns:
-        각 키에 대응하는 데이터 목록
+        on_complete: 키 하나를 다 읽을 때마다 `(완료 개수, 전체 개수)`로 호출된다.
+            여러 워커 스레드가 동시에 끝낼 수 있어 카운터 증가는 락으로 보호한다.
+            None(기본)이면 아무 것도 안 한다 — 오래 걸리는 대량 로드의 진행 상황을
+            로깅하고 싶을 때만 넘기면 된다.
     """
     if not keys:
         return []
+
+    total = len(keys)
+    completed = 0
+    lock = threading.Lock()
+
+    def _read(key: str) -> pd.DataFrame | pq.Table | None:
+        nonlocal completed
+        result = read_parquet(key, columns=columns, as_pandas=as_pandas, filters=filters)
+        if on_complete is not None:
+            with lock:
+                completed += 1
+                current = completed
+            on_complete(current, total)
+        return result
+
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        return list(pool.map(lambda key: read_parquet(key, columns=columns, as_pandas=as_pandas), keys))
+        return list(pool.map(_read, keys))
 
 
 def write_parquet(data: pd.DataFrame | pq.Table, key: str) -> None:
-    """Pandas DataFrame 또는 PyArrow Table을 Parquet 포맷으로 직렬화하여 S3에 저장한다.
-
-    args:
-        data: 저장할 DataFrame 또는 PyArrow Table
-        key: 저장할 대상 S3 키
-    """
+    """pandas DataFrame 또는 pyarrow Table을 parquet으로 직렬화해 S3에 저장한다."""
     buffer = io.BytesIO()
     if isinstance(data, pd.DataFrame):
         data.to_parquet(buffer, index=False)
@@ -190,38 +316,31 @@ def write_parquet(data: pd.DataFrame | pq.Table, key: str) -> None:
     put_object_bytes(key, buffer.getvalue())
 
 
-def read_json(key: str):
-    """S3에서 JSON 객체를 읽어 파싱된 dict 또는 list를 반환한다.
+def read_json(key: str, timeout_seconds: float | None = None):
+    """S3의 JSON 객체를 읽는다 (dict 또는 list — JSON 최상위 값 그대로). 키가 없으면 None.
 
     args:
-        key: 읽을 대상 S3 키
-    returns:
-        파싱된 JSON 데이터 (객체가 없으면 None)
+        timeout_seconds: `_client()` 참고.
     """
-    body = get_object_bytes(key)
+    body = get_object_bytes(key, timeout_seconds=timeout_seconds)
     if body is None:
         return None
     return json.loads(body)
 
 
 def write_json(key: str, data) -> None:
-    """Python 객체(dict 또는 list)를 JSON 문자열로 직렬화하여 S3에 저장한다.
-
-    args:
-        key: 저장할 대상 S3 키
-        data: 직렬화할 데이터 객체
-    """
+    """dict 또는 list를 JSON으로 직렬화해 S3에 저장한다."""
     put_object_bytes(key, json.dumps(data, ensure_ascii=False).encode("utf-8"))
 
 
 def list_keys(prefix: str, delimiter: str = "") -> list[str]:
-    """주어진 prefix 하위의 모든 S3 객체 키 목록을 나열한다.
+    """주어진 prefix 아래 모든 객체 키를 나열한다.
 
     args:
-        prefix: 검색할 S3 키 prefix
-        delimiter: 디렉터리 구분 기호 (기본값: 빈 문자열)
+        prefix: 나열할 키 prefix
+        delimiter: S3 폴더 구분자 (예: "/")
     returns:
-        prefix에 매칭되는 S3 객체 키 문자열 목록
+        prefix로 시작하는 모든 객체 키 목록
     """
     client = _client()
     paginator = client.get_paginator("list_objects_v2")
@@ -229,6 +348,17 @@ def list_keys(prefix: str, delimiter: str = "") -> list[str]:
         obj["Key"]
         for page in paginator.paginate(Bucket=_bucket(), Prefix=prefix, Delimiter=delimiter)
         for obj in page.get("Contents", [])
+    ]
+
+
+def list_common_prefixes(prefix: str, delimiter: str = "/") -> list[str]:
+    """주어진 prefix 아래의 공통 prefix(디렉터리) 목록을 반환한다."""
+    client = _client()
+    paginator = client.get_paginator("list_objects_v2")
+    return [
+        common_prefix["Prefix"]
+        for page in paginator.paginate(Bucket=_bucket(), Prefix=prefix, Delimiter=delimiter)
+        for common_prefix in page.get("CommonPrefixes", [])
     ]
 
 
@@ -266,32 +396,8 @@ def list_objects(prefix: str, delimiter: str = "") -> list[S3Object]:
     ]
 
 
-def list_common_prefixes(prefix: str, delimiter: str = "/") -> list[str]:
-    """주어진 prefix 하위의 공통 서브디렉터리(CommonPrefixes) 목록을 반환한다.
-
-    args:
-        prefix: 검색할 S3 키 prefix
-        delimiter: 디렉터리 구분 기호 (기본값: "/")
-    returns:
-        하위 디렉터리 prefix 문자열 목록
-    """
-    client = _client()
-    paginator = client.get_paginator("list_objects_v2")
-    return [
-        common_prefix["Prefix"]
-        for page in paginator.paginate(Bucket=_bucket(), Prefix=prefix, Delimiter=delimiter)
-        for common_prefix in page.get("CommonPrefixes", [])
-    ]
-
-
 def object_exists(key: str) -> bool:
-    """지정된 키의 S3 객체가 존재하는지 확인한다.
-
-    args:
-        key: 확인할 S3 키
-    returns:
-        객체가 존재하면 True, 없으면 False
-    """
+    """S3 객체가 존재하는지 확인한다."""
     try:
         _client().head_object(Bucket=_bucket(), Key=key)
         return True
@@ -302,25 +408,17 @@ def object_exists(key: str) -> bool:
 
 
 def delete_object(key: str) -> None:
-    """지정된 키의 단일 S3 객체를 삭제한다.
-
-    args:
-        key: 삭제할 대상 S3 키
-    """
+    """S3 객체를 삭제한다."""
     _client().delete_object(Bucket=_bucket(), Key=key)
 
 
 def delete_objects(keys: list[str]) -> None:
-    """여러 S3 객체를 1000개 단위 배치로 일괄 삭제한다.
-
-    args:
-        keys: 삭제할 대상 S3 키 목록
-    """
+    """여러 S3 객체를 일괄 삭제한다."""
     if not keys:
         return
     client = _client()
     bucket = _bucket()
-    # S3 delete_objects API는 한 번에 최대 1000개까지 지원
+    # delete_objects 한 번에 최대 1000개 삭제 가능
     for i in range(0, len(keys), 1000):
         batch = keys[i : i + 1000]
         client.delete_objects(Bucket=bucket, Delete={"Objects": [{"Key": k} for k in batch]})

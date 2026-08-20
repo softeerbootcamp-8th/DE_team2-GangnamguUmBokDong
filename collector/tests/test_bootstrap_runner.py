@@ -3,6 +3,7 @@
 from datetime import date, datetime
 
 import pyarrow as pa
+import pytest
 
 from bootstrap.config import BootstrapConfig
 from bootstrap.runner import group_by_window, load_date
@@ -12,6 +13,8 @@ from config.schema import Storage as StorageConfig
 from core.s3 import read_parquet
 from storage import read_archive_manifest, write_silver
 from tests.conftest import KST
+
+pytestmark = pytest.mark.usefixtures("_bucket")
 
 DAY = date(2026, 6, 1)
 
@@ -110,6 +113,21 @@ class TestLoadDate:
         assert manifest["dropped"] == 1
         assert manifest["column_issues"]["BIKE_ID"]["missing"] == 1
         assert "silver_signature" not in manifest
+
+    def test_manifest_records_station_map_snapshot(self):
+        """rackTotCnt·shared가 "실행한 날의 값"이라 출처를 되짚을 수 있어야 한다."""
+        stats = {"built_at": "2026-08-19T18:40:00+09:00", "api_stations": 2737,
+                 "history_stations": 2831}
+
+        load_date(_source_config(), _bootstrap_config(), DAY,
+                  _rows("2026-06-01 09:05:00"), station_map_stats=stats)
+
+        assert read_archive_manifest("t_source", DAY)["station_map"] == stats
+
+    def test_manifest_omits_station_map_when_not_joined(self):
+        load_date(_source_config(), _bootstrap_config(), DAY, _rows("2026-06-01 09:05:00"))
+
+        assert "station_map" not in read_archive_manifest("t_source", DAY)
 
     def test_skips_when_archive_already_exists(self):
         load_date(_source_config(), _bootstrap_config(), DAY, _rows("2026-06-01 09:05:00"))

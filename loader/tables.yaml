@@ -18,9 +18,10 @@ station_stock:
   transform: station_stock_from_silver
   conflict_cols:
     - sta_id
-    - observed_at
   update_cols:
+    - observed_at
     - parking_bike_tot_cnt
+  guard_col: observed_at
 
 # weather_current/weather_forecast는 gu(자치구) 대신 격자(nx, ny)를 조인 키로 쓴다.
 # gu는 표시용 파생 컬럼으로만 남는다(넓은 구에 여러 격자가 걸치는 문제를 gu 단위
@@ -62,6 +63,7 @@ weather_forecast:
     - humidity
     - wind_speed
     - base_dttm
+  expire_col: forecast_dttm
   guard_col: base_dttm
 
 weather_forecast_ultra:
@@ -81,6 +83,7 @@ weather_forecast_ultra:
     - humidity
     - wind_speed
     - base_dttm
+  expire_col: forecast_dttm
   guard_col: base_dttm
 
 cultural_events:
@@ -98,6 +101,7 @@ cultural_events:
     - is_free
     - lat
     - lon
+  expire_col: end_date
 
 cultural_events_performance:
   source_id: performance_event
@@ -114,6 +118,7 @@ cultural_events_performance:
     - is_free
     - lat
     - lon
+  expire_col: end_date
 
 forecast_points:
   source_id: ml_predictions
@@ -126,6 +131,7 @@ forecast_points:
     - predicted_return_cnt
     - batch_run_at
   reader: read_predictions
+  expire_col: predicted_dttm
 
 station_urgency:
   source_id: rebalance_urgency
@@ -136,5 +142,23 @@ station_urgency:
     - urgency_score
     - minutes_until_critical
     - action_type
+    - bike_qty
     - batch_run_at
   reader: read_urgency
+
+rebalance_routes:
+  source_id: rebalance_routes
+  transform: rebalance_routes_from_routes_batch
+  conflict_cols:
+    - route_id
+  update_cols: []
+  reader: read_routes
+
+rebalance_route_stops:
+  source_id: rebalance_route_stops
+  transform: rebalance_route_stops_from_route_stops_batch
+  conflict_cols:
+    - route_id
+    - visit_order
+  update_cols: []
+  reader: read_route_stops

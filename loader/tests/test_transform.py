@@ -2,12 +2,15 @@ from datetime import UTC, date, datetime
 
 import pandas as pd
 import pytest
+
 import transform
 from transform import (
     _parse_precip_str,
     cultural_events_from_silver,
     forecast_points_from_predictions,
     performance_events_from_silver,
+    rebalance_route_stops_from_route_stops_batch,
+    rebalance_routes_from_routes_batch,
     station_stock_from_silver,
     station_urgency_from_urgency_batch,
     stations_from_silver,
@@ -156,6 +159,49 @@ def test_cultural_events_from_silver_filters_ended_events():
     assert len(records) == 1
     assert records[0]["title"] == "여름 재즈 페스티벌"
     assert records[0]["end_date"] == date(2026, 8, 20)
+
+
+def test_cultural_events_from_silver_drops_rows_without_end_date():
+    """종료일을 파싱할 수 없는 행은 적재하지 않는다 — NULL end_date는 만료 정리의
+    `end_date < cutoff`에 걸리지 않아 영구히 남기 때문이다(#117)."""
+    df = pd.DataFrame(
+        [
+            {
+                "TITLE": "종료일 미상 전시",
+                "CODENAME": "전시",
+                "GUNAME": "강남구",
+                "PLACE": "코엑스",
+                "STRTDATE": "2026-08-01",
+                "END_DATE": "",
+                "IS_FREE": "Y",
+                "LAT": 37.5115,
+                "LOT": 127.0605,
+            }
+        ]
+    )
+
+    assert cultural_events_from_silver(df, today=date(2026, 8, 16)) == []
+
+
+def test_performance_events_from_silver_drops_rows_without_end_date():
+    df = pd.DataFrame(
+        [
+            {
+                "SVCID": "S002",
+                "SVCNM": "종료일 미상 공연",
+                "MINCLASSNM": "공연",
+                "AREANM": "강남구",
+                "PLACENM": "코엑스",
+                "SVCOPNBGNDT": "2026-08-01",
+                "SVCOPNENDDT": None,
+                "PAYATNM": "무료",
+                "Y": 37.5115,
+                "X": 127.0605,
+            }
+        ]
+    )
+
+    assert performance_events_from_silver(df, today=date(2026, 8, 16)) == []
 
 
 # UTC 2026-08-15 16:30 = KST 2026-08-16 01:30. UTC와 KST의 날짜(date)가 갈라지는
@@ -426,9 +472,12 @@ def test_station_urgency_from_urgency_batch_maps_columns():
         [
             {
                 "sta_id": "101",
+                "lat": 37.5172,
+                "lon": 127.0473,
                 "urgency_score": 48.7,
                 "minutes_until_critical": 0,
                 "action_type": "supply_needed",
+                "bike_qty": 10,
             }
         ]
     )
@@ -441,5 +490,44 @@ def test_station_urgency_from_urgency_batch_maps_columns():
         "urgency_score": 48.7,
         "minutes_until_critical": 0,
         "action_type": "supply_needed",
+        "bike_qty": 10,
         "batch_run_at": batch_run_at,
     }
+
+
+def test_rebalance_routes_from_routes_batch_converts_kst_proposed_at_to_utc():
+    df = pd.DataFrame(
+        [
+            {
+                "route_id": "r1",
+                "region": "세종로",
+                "status": "proposed",
+                "proposed_at": pd.Timestamp(2026, 8, 16, 14, 5),  # KST 벽시계
+            }
+        ]
+    )
+
+    [record] = rebalance_routes_from_routes_batch(df)
+
+    assert record == {
+        "route_id": "r1",
+        "region": "세종로",
+        "status": "proposed",
+        "proposed_at": datetime(2026, 8, 16, 5, 5, tzinfo=UTC),  # KST 14:05 -> UTC 05:05
+    }
+
+
+def test_rebalance_route_stops_from_route_stops_batch_maps_columns():
+    df = pd.DataFrame(
+        [
+            {"route_id": "r1", "visit_order": 1, "sta_id": "101", "action": "pickup", "bike_cnt": 8},
+            {"route_id": "r1", "visit_order": 2, "sta_id": "102", "action": "dropoff", "bike_cnt": 8},
+        ]
+    )
+
+    records = rebalance_route_stops_from_route_stops_batch(df)
+
+    assert records == [
+        {"route_id": "r1", "visit_order": 1, "sta_id": "101", "action": "pickup", "bike_cnt": 8},
+        {"route_id": "r1", "visit_order": 2, "sta_id": "102", "action": "dropoff", "bike_cnt": 8},
+    ]

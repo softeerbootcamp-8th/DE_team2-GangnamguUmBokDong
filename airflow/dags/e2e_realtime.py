@@ -16,6 +16,10 @@ baseline이 항상 nowcaster 추정치라 예전의 strict/fallback 두 갈래�
 """
 
 import pendulum
+from airflow import DAG
+from airflow.providers.standard.operators.empty import EmptyOperator
+from airflow.task.trigger_rule import TriggerRule
+
 from config.schedules import TIMEZONE
 from config.sources import (
     REALTIME_5MIN_SOURCES,
@@ -29,9 +33,8 @@ from orchestration.normalizer_task import (
     build_normalizer_task,
     build_station_master_enrichment_task,
 )
+from orchestration.routes_task import build_routes_task
 from orchestration.urgency_task import build_urgency_task
-
-from airflow import DAG
 
 with DAG(
     dag_id="e2e_realtime",
@@ -69,3 +72,9 @@ with DAG(
     load_station_urgency = build_db_loader_task(dag, "station_urgency")
     run_inference >> compute_urgency
     [compute_urgency, load_stations] >> load_station_urgency
+
+    compute_routes = build_routes_task(dag)
+    load_rebalance_routes = build_db_loader_task(dag, "rebalance_routes")
+    load_rebalance_route_stops = build_db_loader_task(dag, "rebalance_route_stops")
+    compute_urgency >> compute_routes >> load_rebalance_routes >> load_rebalance_route_stops
+    load_stations >> load_rebalance_route_stops

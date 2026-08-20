@@ -5,15 +5,51 @@ from __future__ import annotations
 import argparse
 import sys
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
-from config import TABLE_SPECS
 from core.db import get_connection
 from core.upsert import upsert
+
+from config import TABLE_SPECS, target_table_for
+from retention_config import DATE_TYPED_EXPIRE_TABLES, grace_for
+
+KST = ZoneInfo("Asia/Seoul")
+
+
+def _expire_cutoff(target_table: str, window_start: datetime):
+    """target_table의 만료 기준 시각(또는 날짜)을 계산한다. window_start에서
+    유예기간(retention_config.RETENTION_GRACE)만큼 뺀 시점보다 오래된 행이 삭제 대상이다."""
+    cutoff = window_start - grace_for(target_table)
+    return cutoff.date() if target_table in DATE_TYPED_EXPIRE_TABLES else cutoff
+
+
+def _delete_expired(conn, target_table: str, expire_col: str, cutoff) -> int:
+    """target_table에서 expire_col < cutoff인 행을 지우고 지운 행 수를 반환한다."""
+    with conn.cursor() as cur:
+        cur.execute(f"DELETE FROM {target_table} WHERE {expire_col} < %(cutoff)s", {"cutoff": cutoff})
+        return cur.rowcount
 
 
 def _only_known_stations(rows: list[dict], known_station_ids: set[str]) -> list[dict]:
     """stations FK가 존재하는 urgency row만 반환한다."""
     return [row for row in rows if row["sta_id"] in known_station_ids]
+
+
+def _retire_stale_proposed_routes(conn) -> None:
+    """이번 배치가 새 proposed 라우트를 넣기 전에, 아직 proposed인(=아무도 안
+    건드린) 예전 라우트를 지운다. compute_routes는 매 사이클 전체 권역의 수요를
+    다시 계산하므로, 지난 사이클의 proposed는 이번 사이클 결과로 완전히
+    대체되는 게 맞다 — 그대로 두면 아무도 안 건드린 예전 제안이 사이클마다
+    계속 쌓인다. dispatched/completed로 이미 넘어간 라우트는 운영자가 실제로
+    처리한 기록이라 안 건드린다. S3(routes_main.py가 매 사이클 써두는 parquet)에
+    "그때 뭘 제안했었는지"는 이미 영구히 남으므로, 아무도 안 건드린 proposed를
+    RDS에서 지워도 잃는 정보가 없다."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "DELETE FROM rebalance_route_stops "
+            "WHERE route_id IN (SELECT route_id FROM rebalance_routes WHERE status = 'proposed')"
+        )
+        cur.execute("DELETE FROM rebalance_routes WHERE status = 'proposed'")
 
 
 def run(table: str, window_start: datetime) -> None:
@@ -33,15 +69,7 @@ def run(table: str, window_start: datetime) -> None:
     else:
         rows = spec.transform(silver)
 
-    # 논리 spec 이름 → 물리 DB 테이블 이름 매핑
-    # 서로 다른 여러 데이터 소스가 단일 Gold 테이블로 통합 적재되는 경우를 처리한다:
-    # 1) 문화/공연 행사: cultural_event(문화행사)와 performance_event(공연행사) → cultural_events 테이블로 병합
-    # 2) 날씨 예보: weather_short_term_forecast(단기)와 weather_ultra_short_forecast(초단기) → weather_forecast 테이블로 병합
-    _TABLE_ALIASES = {
-        "cultural_events_performance": "cultural_events",
-        "weather_forecast_ultra": "weather_forecast",
-    }
-    target_table = _TABLE_ALIASES.get(table, table)
+    target_table = target_table_for(table)
 
     with get_connection() as conn:
         if table == "station_urgency" and rows:
@@ -54,10 +82,30 @@ def run(table: str, window_start: datetime) -> None:
             if excluded_count:
                 print(f"excluded {excluded_count} urgency rows absent from stations")
             rows = filtered_rows
+        if table == "rebalance_routes":
+            _retire_stale_proposed_routes(conn)
         upsert(conn, target_table, rows, spec.conflict_cols, spec.update_cols, guard_col=spec.guard_col)
+        if spec.expire_col:
+            cutoff = _expire_cutoff(target_table, window_start)
+            deleted = _delete_expired(conn, target_table, spec.expire_col, cutoff)
+            print(f"deleted {deleted} expired rows from {target_table} (expire_col={spec.expire_col}, cutoff={cutoff})")
         conn.commit()
 
     print(f"upserted {len(rows)} rows into {target_table}")
+
+
+def _parse_window_start(raw: str) -> datetime:
+    """--window-start를 파싱한다. 오프셋이 없으면 KST로 간주해 채운다.
+
+    naive datetime을 그대로 쓰면 DELETE 문의 cutoff가 psycopg를 거쳐 세션
+    TimeZone(컨테이너 기본 UTC)으로 해석돼, KST로 의도한 시각보다 9시간 미래가
+    기준이 된다. 그러면 아직 만료되지 않은 예보/예측 행까지 지워지므로
+    (대시보드가 읽는 바로 그 행들) 여기서 오프셋을 반드시 확정한다."""
+    parsed = datetime.fromisoformat(raw)
+    if parsed.tzinfo is None:
+        print(f"warning: --window-start에 오프셋이 없어 KST로 간주한다: {raw}", file=sys.stderr)
+        return parsed.replace(tzinfo=KST)
+    return parsed
 
 
 def main() -> int:
@@ -67,7 +115,7 @@ def main() -> int:
     parser.add_argument("--window-start", required=True, help="ISO8601 시각(KST), 예: 2026-08-16T14:05:00+09:00")
     args = parser.parse_args()
 
-    window_start = datetime.fromisoformat(args.window_start)
+    window_start = _parse_window_start(args.window_start)
 
     try:
         run(args.table, window_start)

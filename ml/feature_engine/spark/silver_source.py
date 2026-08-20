@@ -28,15 +28,17 @@ from . import config
 
 
 def _silver_glob(source_id: str) -> str:
-    """한 해 전체의 Silver 조각 파일을 한 번에 잡는 glob 패턴.
+    """전체 히스토리의 Silver 조각 파일을 한 번에 잡는 glob 패턴.
 
     `config.SILVER_ROOT` 아래에서 찾는다(테스트가 로컬 tmp_path로 monkeypatch하기
-    쉽도록 이 상수 하나로 루트를 분리해뒀다). `config.TRAIN_YEAR`로 연도만 좁히고
-    (그 외엔 전체 히스토리) `since` 필터는 각 read_*() 함수가 실제 timestamp 컬럼
-    기준으로 읽은 뒤에 건다 — glob 자체는 날짜 기준 partition pruning을 안 하므로,
-    연 단위보다 더 좁은 조회가 필요해지면 이 함수를 연/월까지 받도록 넓혀야 한다.
+    쉽도록 이 상수 하나로 루트를 분리해뒀다). **연도로 안 좁힌다(2026-08 변경)** —
+    학습기간이 `config.WINDOW_START`/`WINDOW_END` 기준 롤링 윈도우로 바뀌면서 한
+    해 안에 안 갇힌다(예: 2025-02~2026-08처럼 연도를 걸칠 수 있음). 대신 `since`
+    필터를 각 read_*() 함수가 실제 timestamp 컬럼 기준으로 건다 — glob 자체는
+    날짜 기준 partition pruning을 안 하므로 전체 히스토리를 나열하지만, Silver는
+    collector가 실제로 수집한 기간만큼만 있어 무한정 크지 않다.
     """
-    return f"{config.SILVER_ROOT}/{source_id}/dt={config.TRAIN_YEAR}-*/hh=*/*.parquet"
+    return f"{config.SILVER_ROOT}/{source_id}/dt=*/hh=*/*.parquet"
 
 
 def _rename(df: DataFrame, column_map: dict[str, str]) -> DataFrame:

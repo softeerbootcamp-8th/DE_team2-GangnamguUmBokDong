@@ -13,6 +13,8 @@ from core.s3 import read_parquet
 from storage import read_archive_manifest, write_silver
 from tests.conftest import KST
 
+pytestmark = pytest.mark.usefixtures("_bucket")
+
 DAY = date(2026, 8, 12)
 TODAY = date(2026, 8, 13)
 

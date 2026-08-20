@@ -7,6 +7,7 @@ from datetime import datetime
 import boto3
 import pyarrow as pa
 import pyarrow.parquet as pq
+import pytest
 
 from storage import (
     clear_bronze,
@@ -21,6 +22,8 @@ from storage import (
     write_silver,
 )
 from tests.conftest import KST, TEST_BUCKET
+
+pytestmark = pytest.mark.usefixtures("_bucket")
 
 WINDOW_START = datetime(2026, 8, 12, 14, 10, tzinfo=KST)
 

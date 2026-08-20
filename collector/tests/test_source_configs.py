@@ -16,6 +16,8 @@ from zoneinfo import ZoneInfo
 import httpx
 import pytest
 
+pytestmark = pytest.mark.usefixtures("_bucket")
+
 import config.loader as config_loader
 import pipeline
 from adapters import (  # noqa: F401 — @adapter 등록을 위한 import
@@ -83,6 +85,7 @@ class TestAllSourcesLoad:
 
         assert config.adapter_params["poi_start"] == 1
         assert config.adapter_params["poi_end"] == 121
+        assert config.adapter_params["concurrency"] == 4
 
     def test_population_realtime_declares_all_twelve_forecast_slots(self):
         """어댑터가 평탄화한 `FCST_n_*` 컬럼이 전부 선언돼 있어야 silver까지 살아 남는다."""

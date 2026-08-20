@@ -14,6 +14,8 @@ resolve되려면 cwd가 `ml/`이어야 하고, 환경은 `inference` 프로젝�
 
 from __future__ import annotations
 
+from airflow.task.trigger_rule import TriggerRule
+
 from config.schedules import INFERENCE_EXECUTION_TIMEOUT
 
 from orchestration.task_builder import REPO_ROOT, build_module_task
@@ -22,7 +24,13 @@ from orchestration.templates import KST_DATE, KST_HOUR, KST_MINUTE
 ML_DIR = str(REPO_ROOT / "ml")
 
 
-def build_inference_task(dag):
+def build_inference_task(dag, *, trigger_rule: str = TriggerRule.ALL_SUCCESS):
+    """`trigger_rule`은 realtime_5min.py가 normalizer 브랜치(strict/fallback) 뒤에
+    붙일 때 `NONE_FAILED_MIN_ONE_SUCCESS`로 덮어쓴다 — `run_normalizer_fallback`이
+    보통(strict 성공 시) SKIPPED로 끝나는데, 기본값 ALL_SUCCESS는 upstream이
+    SKIPPED면 이 태스크도 그대로 SKIPPED로 전파시켜 버려서 정상 경로에서 추론이
+    거의 항상 안 도는 사고가 난다(`realtime_5min.py` 모듈 docstring 참고).
+    """
     cmd = (
         "uv --project inference run python -m inference.predict_single "
         f"--all-stations --date {KST_DATE} --hour {KST_HOUR} --minute {KST_MINUTE} "
@@ -34,4 +42,5 @@ def build_inference_task(dag):
         ML_DIR,
         cmd,
         execution_timeout=INFERENCE_EXECUTION_TIMEOUT,
+        trigger_rule=trigger_rule,
     )

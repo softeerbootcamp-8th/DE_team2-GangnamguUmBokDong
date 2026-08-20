@@ -12,8 +12,23 @@ import yaml
 
 import reader
 import transform
+from retention_config import RETENTION_GRACE
 
 _TABLES_YAML_PATH = Path(__file__).parent / "tables.yaml"
+
+# 논리 spec 이름 → 물리 DB 테이블 이름 매핑
+# 서로 다른 여러 데이터 소스가 단일 Gold 테이블로 통합 적재되는 경우를 처리한다:
+# 1) 문화/공연 행사: cultural_event(문화행사)와 performance_event(공연행사) → cultural_events 테이블로 병합
+# 2) 날씨 예보: weather_short_term_forecast(단기)와 weather_ultra_short_forecast(초단기) → weather_forecast 테이블로 병합
+TABLE_ALIASES = {
+    "cultural_events_performance": "cultural_events",
+    "weather_forecast_ultra": "weather_forecast",
+}
+
+
+def target_table_for(table: str) -> str:
+    """논리 spec 이름을 실제 적재/정리 대상인 물리 테이블 이름으로 해소한다."""
+    return TABLE_ALIASES.get(table, table)
 
 
 def _read_silver_as_pandas(source_id: str, window_start: datetime) -> pd.DataFrame:
@@ -30,6 +45,11 @@ class TableSpec:
     conflict_cols: list[str]
     update_cols: list[str]
     reader: Callable[[datetime], pd.DataFrame] | None = None
+    expire_col: str | None = None
+    """만료 판정에 쓰는 컬럼(예: forecast_dttm, predicted_dttm, end_date). 지정된
+    테이블은 적재 직후 유예기간이 지난 행을 정리한다(loader/retention_config.py,
+    main.py의 _delete_expired 참고). None이면 정리 대상이 아니다(마스터 데이터나
+    최신 1건만 유지하는 테이블 등)."""
     guard_col: str | None = None
 
     def read(self, window_start: datetime) -> pd.DataFrame:
@@ -63,9 +83,26 @@ def _load_table_specs() -> dict[str, TableSpec]:
             conflict_cols=raw["conflict_cols"],
             update_cols=raw["update_cols"],
             reader=reader_fn,
+            expire_col=raw.get("expire_col"),
             guard_col=raw.get("guard_col"),
         )
     return specs
 
 
+def _validate_retention_config(specs: dict[str, TableSpec]) -> None:
+    """expire_col이 선언된 모든 스펙에 유예기간이 있는지 임포트 시점에 확인한다.
+
+    적재 시점(main.run)에 검사하면 upsert 뒤 commit 전에 터져 그 실행의 적재까지
+    통째로 롤백되므로, 설정 오류는 여기서 미리 잡는다."""
+    missing = sorted(
+        {target_table_for(name) for name, spec in specs.items() if spec.expire_col} - set(RETENTION_GRACE)
+    )
+    if missing:
+        raise ValueError(
+            f"tables.yaml에 expire_col이 선언된 테이블 {missing}의 유예기간이 없다. "
+            f"loader/retention_config.py의 RETENTION_GRACE에 추가하라."
+        )
+
+
 TABLE_SPECS: dict[str, TableSpec] = _load_table_specs()
+_validate_retention_config(TABLE_SPECS)

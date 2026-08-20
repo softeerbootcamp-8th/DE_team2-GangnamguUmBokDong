@@ -230,14 +230,16 @@ def cultural_events_from_silver(df: pd.DataFrame, today: date | None = None) -> 
         df: cultural_event Silver DataFrame
         today: 행사 유효성 검사용 기준 일자 (KST, 기본값: 오늘)
     returns:
-        cultural_events 테이블 적재용 레코드 목록 (종료된 행사 제외)
+        cultural_events 테이블 적재용 레코드 목록 (종료됐거나 종료일을 알 수 없는 행사 제외)
     """
     today = today or datetime.now(ZoneInfo("Asia/Seoul")).date()
     records = []
     for row in df.to_dict("records"):
         end_date = _parse_date(row["END_DATE"])
-        # 이미 종료된 행사는 제외
-        if end_date is not None and end_date < today:
+        # 이미 종료된 행사는 제외한다. 종료일을 파싱하지 못한 행(end_date=None)도 제외하는데,
+        # 적재하면 만료 정리(main._delete_expired)의 `end_date < cutoff` 조건에 NULL이
+        # 절대 걸리지 않아 영구히 쌓이기 때문이다(#117).
+        if end_date is None or end_date < today:
             continue
         title = row["TITLE"]
         place = row["PLACE"]
@@ -267,15 +269,16 @@ def performance_events_from_silver(df: pd.DataFrame, today: date | None = None) 
         df: performance_event Silver DataFrame
         today: 행사 유효성 검사용 기준 일자 (KST, 기본값: 오늘)
     returns:
-        cultural_events 테이블 적재용 레코드 목록 (종료된 행사 제외)
+        cultural_events 테이블 적재용 레코드 목록 (종료됐거나 종료일을 알 수 없는 행사 제외)
     """
     today = today or datetime.now(ZoneInfo("Asia/Seoul")).date()
     records = []
     unmapped_codes: set[str] = set()
     for row in df.to_dict("records"):
         end_date = _parse_date(row.get("EDATE"))
-        # 1. 이미 종료된 행사는 제외
-        if end_date is not None and end_date < today:
+        # 1. 이미 종료된 행사는 제외한다. 종료일 파싱 실패(end_date=None)도 같이 제외한다 —
+        #    NULL은 만료 정리의 `end_date < cutoff`에 안 걸려 영구히 남는다(#117).
+        if end_date is None or end_date < today:
             continue
         # 2. 제목이 없는 행은 건너뛴다 — 스키마 변경 이전 Silver 파티션을 백필로
         #    다시 읽으면 컬럼명이 전부 달라 title이 비고, event_id가 sha256("")로
@@ -335,6 +338,18 @@ def performance_events_from_silver(df: pd.DataFrame, today: date | None = None) 
 def forecast_points_from_predictions(df: pd.DataFrame, batch_run_at: datetime) -> list[dict]:
     """ML 추론 결과 DataFrame을 forecast_points 테이블 레코드 목록으로 변환한다.
 
+    각 행의 date/hour/minute는 이미 그 horizon의 목표 시각이다
+    (predict_demand_multi_hour_all_stations()가 target_ts = anchor_ts + (horizon-1)h로
+    계산해서 채워 넣는다) — horizon을 여기서 다시 더하지 않는다.
+
+    **2026-08 확정**: station_id("ST-101" 등, predict_single.py가 station_master
+    기준으로 채움)와 stations.sta_id(`stations_from_silver()`가 bike_station_realtime의
+    raw stationId를 그대로 씀)가 같은 값 공간인지 실제 샘플 데이터로 대조 완료 —
+    `ml/data/silver/bike_station_realtime/`의 실제 stationId는 이미 "ST-4"처럼
+    접두사가 붙어 있고(raw 자체가 이 형식), `ml/data/processed_v2/station_master.parquet`의
+    station_id와 전수 대조한 결과 realtime 샘플의 1,000개 stationId가 전부(100%)
+    station_master에 존재했다(불일치 0건) — 두 값 공간은 같다, FK/JOIN 누락 위험 없음.
+
     args:
         df: ML 추론 결과 DataFrame
         batch_run_at: 배치 실행 시각 (KST)
@@ -362,8 +377,9 @@ def station_urgency_from_urgency_batch(df: pd.DataFrame, batch_run_at: datetime)
     레코드 목록으로 변환한다.
 
     args:
-        df: rebalance가 S3에 쓴 urgency 결과 DataFrame(sta_id, urgency_score,
-            minutes_until_critical, action_type)
+        df: rebalance가 S3에 쓴 urgency 결과 DataFrame(sta_id, lat, lon, urgency_score,
+            minutes_until_critical, action_type, bike_qty — lat/lon은 routes.py의
+            권역 배정 전용이라 station_urgency 테이블에는 싣지 않는다)
         batch_run_at: 배치 실행 시각 (KST)
     returns:
         station_urgency 테이블 적재용 레코드 목록
@@ -376,7 +392,62 @@ def station_urgency_from_urgency_batch(df: pd.DataFrame, batch_run_at: datetime)
                 "urgency_score": float(row["urgency_score"]),
                 "minutes_until_critical": int(row["minutes_until_critical"]),
                 "action_type": row["action_type"],
+                "bike_qty": int(row["bike_qty"]),
                 "batch_run_at": batch_run_at,
+            }
+        )
+    return records
+
+
+def _kst_timestamp_to_utc(value) -> datetime:
+    """KST 벽시계 시각(naive pd.Timestamp/datetime)을 UTC datetime으로 변환한다
+    (_kst_to_utc/_kst_date_hm_to_utc와 같은 규칙)."""
+    naive_kst = pd.Timestamp(value).to_pydatetime().replace(tzinfo=UTC)
+    return naive_kst - _KST
+
+
+def rebalance_routes_from_routes_batch(df: pd.DataFrame) -> list[dict]:
+    """rebalance 배치(routes.compute_all)가 S3에 쓴 라우트 헤더 결과를
+    rebalance_routes 테이블 레코드 목록으로 변환한다. proposed_at이 데이터
+    자체에 실려 있어(forecast_points/station_urgency와 달리) batch_run_at을
+    별도 인자로 받지 않는다.
+
+    args:
+        df: rebalance가 S3에 쓴 라우트 결과 DataFrame(route_id, region, status, proposed_at)
+    returns:
+        rebalance_routes 테이블 적재용 레코드 목록
+    """
+    records = []
+    for row in df.to_dict("records"):
+        records.append(
+            {
+                "route_id": str(row["route_id"]),
+                "region": row["region"],
+                "status": row["status"],
+                "proposed_at": _kst_timestamp_to_utc(row["proposed_at"]),
+            }
+        )
+    return records
+
+
+def rebalance_route_stops_from_route_stops_batch(df: pd.DataFrame) -> list[dict]:
+    """rebalance 배치(routes.compute_all)가 S3에 쓴 라우트 스톱 결과를
+    rebalance_route_stops 테이블 레코드 목록으로 변환한다.
+
+    args:
+        df: rebalance가 S3에 쓴 스톱 결과 DataFrame(route_id, visit_order, sta_id, action, bike_cnt)
+    returns:
+        rebalance_route_stops 테이블 적재용 레코드 목록
+    """
+    records = []
+    for row in df.to_dict("records"):
+        records.append(
+            {
+                "route_id": str(row["route_id"]),
+                "visit_order": int(row["visit_order"]),
+                "sta_id": str(row["sta_id"]),
+                "action": row["action"],
+                "bike_cnt": int(row["bike_cnt"]),
             }
         )
     return records

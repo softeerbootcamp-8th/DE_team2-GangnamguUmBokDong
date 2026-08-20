@@ -50,8 +50,11 @@ SEED_EVENTS = [
 
 
 def seed() -> None:
-    """STATIONS를 골드 테이블에 채운다. 몇 번을 다시 실행해도 결과가 같도록,
-    대상 대여소의 기존 재고 이력·예측치를 먼저 지우고 새로 넣는다."""
+    """골드 테이블에 테스트용 STATIONS 데이터를 멱등하게 적재한다.
+
+    몇 번을 다시 실행해도 결과가 같도록 대상 대여소의 기존 최신 재고·예측치를
+    먼저 지우고 새로 넣는다.
+    """
     now = now_utc()
     sta_ids = [str(station["sta_id"]) for station in STATIONS]
 
@@ -60,8 +63,8 @@ def seed() -> None:
     urgency_rows = []
     for station in STATIONS:
         sta_id = str(station["sta_id"])
-        for minutes_ago, parking_bike_tot_cnt in station["stock_history"]:
-            stock_rows.append((sta_id, now - timedelta(minutes=minutes_ago), parking_bike_tot_cnt))
+        minutes_ago, parking_bike_tot_cnt = min(station["stock_history"], key=lambda stock: stock[0])
+        stock_rows.append((sta_id, now - timedelta(minutes=minutes_ago), parking_bike_tot_cnt))
 
         for hour, (predicted_rent_cnt, predicted_return_cnt) in enumerate(station["demand_profile"], start=1):
             forecast_rows.append(

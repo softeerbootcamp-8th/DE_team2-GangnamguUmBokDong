@@ -6,6 +6,7 @@
 # (rebalance/)가 계산해 loader가 sta_id 기준 최신 1건만 upsert한다(이유: #124 —
 # 계산은 매번 S3에서 새로 하고, 과거 배치 값을 읽는 소비자도 없어 이력을 RDS에
 # 남길 필요가 없다. 원본 이력은 rebalance/main.py가 S3에 이미 영구 저장한다).
+# bike_qty(실제로 옮겨야 할 대수)는 재배치 라우트 생성(#109)이 필요로 해서 추가됐다.
 set -euo pipefail
 
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_APP_DB" <<-'EOSQL'
@@ -15,6 +16,7 @@ CREATE TABLE IF NOT EXISTS station_urgency (
     urgency_score            DOUBLE PRECISION NOT NULL,
     minutes_until_critical   INTEGER NOT NULL,
     action_type              TEXT NOT NULL,
+    bike_qty                 INTEGER NOT NULL DEFAULT 0,
     batch_run_at             TIMESTAMPTZ NOT NULL
 );
 
@@ -46,5 +48,11 @@ BEGIN
     END IF;
 END
 $migration$;
+
+-- bike_qty가 추가되기 전(#109 이전) 볼륨에는 이 컬럼이 없다. CREATE TABLE IF NOT
+-- EXISTS는 기존 테이블에 컬럼을 더해주지 않으므로 별도로 채운다. DEFAULT 0은
+-- 컬럼 자체의 NOT NULL 제약을 만족시키기 위한 임시값일 뿐 — 다음 배치 upsert가
+-- 곧바로 실제 값으로 덮어쓴다.
+ALTER TABLE station_urgency ADD COLUMN IF NOT EXISTS bike_qty INTEGER NOT NULL DEFAULT 0;
 
 EOSQL

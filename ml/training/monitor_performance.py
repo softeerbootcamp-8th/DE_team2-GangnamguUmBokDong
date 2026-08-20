@@ -7,9 +7,10 @@
 순수 변동으로 오탐이 안 난다. 이 파일은 그 기준을 실제로 적용만 한다.
 
 **baseline**은 "이 모델이 마지막으로 학습됐을 때 테스트셋에서 낸 성능"
-(`models/{model_name}_metrics.json`, `train_common.train_target()`이 학습 시점에
-저장해둠)이다. 매달 이 값과 "최근 `config.MONITOR_LOOKBACK_MONTHS`개월 실측"을
-비교한다.
+(`{model_name}_metrics.json`, `train_common.train_target()`이 학습 시점에
+챔피언의 archive_prefix 밑에 저장해둠 — `ml_core.paths.read_champion_prefix()`로
+"지금 챔피언"이 가리키는 위치를 찾는다)이다. 매달 이 값과 "최근
+`config.MONITOR_LOOKBACK_MONTHS`개월 실측"을 비교한다.
 
 실행: `python -m training.monitor_performance` (ml/ 디렉토리에서, 대여/반납 둘 다 확인)
 """
@@ -17,12 +18,14 @@
 import json
 from datetime import date
 
+import mlflow
 import numpy as np
 import pandas as pd
 from core import s3 as s3_io
+from ml_core import mlflow_tracking
 from ml_core.metrics import poisson_deviance as _poisson_deviance
-from ml_core.model_contract import FEATURE_COLUMNS
-from ml_core.paths import model_json_key
+from ml_core.model_contract import RENTAL_FEATURE_COLUMNS, RETURN_FEATURE_COLUMNS
+from ml_core.paths import model_json_key, read_champion_prefix
 from ml_core.scoring import predict
 
 from . import config
@@ -31,6 +34,11 @@ MODEL_SPECS = [
     ("rental", "rental_count", "rental_exposure"),
     ("return", "return_count", None),
 ]
+_FEATURE_COLUMNS_BY_MODEL = {"rental": RENTAL_FEATURE_COLUMNS, "return": RETURN_FEATURE_COLUMNS}
+_TRAINING_TABLE_BY_MODEL = {
+    "rental": config.RENTAL_MULTI_HORIZON_FEATURES_TABLE_PARQUET,
+    "return": config.RETURN_MULTI_HORIZON_FEATURES_TABLE_PARQUET,
+}
 
 
 def _load_baseline_metrics(model_name: str) -> dict:
@@ -41,9 +49,11 @@ def _load_baseline_metrics(model_name: str) -> dict:
     returns:
         dict: train_target()이 반환했던 것과 같은 키의 metrics
     raises:
-        FileNotFoundError: 아직 한 번도 학습 안 해서 baseline이 없는 모델
+        FileNotFoundError: 아직 한 번도 승격된 적 없어 챔피언 포인터가 없거나
+            (`read_champion_prefix()`), 포인터는 있는데 metrics.json이 없을 때
     """
-    key = model_json_key(model_name, "metrics")
+    archive_prefix = read_champion_prefix(model_name)
+    key = model_json_key(model_name, "metrics", archive_prefix)
     data = s3_io.read_json(key)
     if data is None:
         raise FileNotFoundError(f"baseline metrics 없음: {key}")
@@ -116,10 +126,22 @@ def evaluate_recent_performance(
     # date_range로 이번에 볼 N개월 파티션만 받는다 — 그동안 쌓인 전체 히스토리를 매달
     # 실행할 때마다 다 받으면, 실행 비용이 "최근 N개월"이 아니라 "서비스 시작 이후
     # 전체 기간"에 비례해서 계속 커진다(s3_io.py 모듈 docstring 참고).
-    needed = sorted(set(FEATURE_COLUMNS) | {target_col, "date", "horizon"} | ({exposure_col} if exposure_col else set()))
-    df = s3_io.read_parquet(config.MULTI_HORIZON_FEATURES_TABLE_PARQUET, columns=needed, date_range=(start, end))
+    table_path = _TRAINING_TABLE_BY_MODEL[model_name]
+    feature_columns = _FEATURE_COLUMNS_BY_MODEL[model_name]
+    # "date"/"hour"도 넣어야 한다 — scoring.predict()가 마지막에
+    # `df[["station_no", "date", "hour"]]`로 식별 컬럼을 그대로 뽑아 쓴다(리뷰
+    # 지적: 예전엔 여기서 뺐다가 predict()에서 매번 KeyError로 죽었다). "date"는
+    # Spark 파티션 컬럼이라 파일엔 없지만 core.s3._read_parquet_by_dates()가
+    # columns=에 포함된 경우에만 복원한다(그 함수의 2026-08 수정 참고 — 포함 안
+    # 하면 그 복원 자체를 건너뛰므로, 여기서 넣는다고 불필요한 비용이 생기진
+    # 않는다). "hour"는 더 이상 모델 feature가 아니지만(minute이 대체) 파일
+    # 내용에는 여전히 있는 식별용 컬럼이라 feature_columns에 안 잡힌다.
+    needed = sorted(
+        set(feature_columns) | {target_col, "horizon", "date", "hour"} | ({exposure_col} if exposure_col else set())
+    )
+    df = s3_io.read_parquet(table_path, columns=needed, date_range=(start, end))
     if df is None:
-        raise FileNotFoundError(f"S3에 없음: {config.MULTI_HORIZON_FEATURES_TABLE_PARQUET}")
+        raise FileNotFoundError(f"S3에 없음: {table_path}")
     df = df[df["horizon"] == horizon].reset_index(drop=True)
     if df.empty:
         raise ValueError(
@@ -176,6 +198,44 @@ def decide_retrain(evaluation: dict) -> dict:
     return {**evaluation, "needs_retrain": len(reasons) > 0, "reasons": reasons}
 
 
+def _log_to_mlflow(result: dict, horizon: int) -> None:
+    """월별 성능 점검 결과를 MLflow에도 남긴다.
+
+    학습(`train_common.train_target()`)과 같은 서버, 다른 experiment
+    (`config.MLFLOW_MONITORING_EXPERIMENT_NAME`)에 점검마다 run 하나씩 쌓는다 —
+    "언제부터 드리프트가 시작됐는지"를 매달 콘솔 로그를 뒤져서 찾는 대신 MLflow UI의
+    지표 추이(deviance_relative_change/coverage_drift)로 바로 볼 수 있게 하려는
+    용도다. 이 로깅 자체는 재학습 필요 여부 판단(`decide_retrain()`)의 정확성과
+    무관한 부가 기능이라, MLflow 서버가 마침 안 떠 있어도(로컬 개발 등) 실제 점검
+    결과 출력/재학습 판단을 막지 않도록 실패를 삼키고 경고만 남긴다.
+    """
+    try:
+        mlflow_tracking.configure(config.MLFLOW_MONITORING_EXPERIMENT_NAME)
+        with mlflow.start_run(run_name=f"{result['model_name']}_h{horizon}_{result['period']['end']}"):
+            mlflow.log_params({
+                "model_name": result["model_name"],
+                "horizon": horizon,
+                "period_start": result["period"]["start"],
+                "period_end": result["period"]["end"],
+            })
+            mlflow.log_metrics({
+                "n_rows": result["n_rows"],
+                "baseline_deviance": result["baseline_deviance"],
+                "current_deviance": result["current_deviance"],
+                "deviance_relative_change": result["deviance_relative_change"],
+                "baseline_rmse": result["baseline_rmse"],
+                "current_rmse": result["current_rmse"],
+                "baseline_coverage": result["baseline_coverage"],
+                "current_coverage": result["current_coverage"],
+                "coverage_drift": result["coverage_drift"],
+                "needs_retrain": int(result["needs_retrain"]),
+            })
+            if result["reasons"]:
+                mlflow.log_dict({"reasons": result["reasons"]}, "reasons.json")
+    except Exception as exc:  # noqa: BLE001 — 부가 로깅이라 어떤 이유로 실패하든 점검 자체를 막으면 안 됨
+        print(f"[monitor_performance] MLflow 로깅 실패(무시하고 진행): {exc}")
+
+
 def check_all_models(as_of: date | None = None, horizon: int = 1) -> list[dict]:
     """대여/반납 챔피언 모델을 모두 확인한다.
 
@@ -188,7 +248,9 @@ def check_all_models(as_of: date | None = None, horizon: int = 1) -> list[dict]:
     results = []
     for model_name, target_col, exposure_col in MODEL_SPECS:
         evaluation = evaluate_recent_performance(model_name, target_col, exposure_col, as_of=as_of, horizon=horizon)
-        results.append(decide_retrain(evaluation))
+        result = decide_retrain(evaluation)
+        _log_to_mlflow(result, horizon)
+        results.append(result)
     return results
 
 
