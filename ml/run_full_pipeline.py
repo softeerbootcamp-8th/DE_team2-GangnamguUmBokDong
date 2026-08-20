@@ -56,6 +56,7 @@ ML_ROOT = Path(__file__).resolve().parent
 
 
 def _venv_python(folder: str) -> str:
+    """ML 하위 프로젝트의 가상환경 Python 실행 파일 경로를 반환한다."""
     return str(ML_ROOT / folder / ".venv" / "bin" / "python")
 
 
@@ -96,12 +97,14 @@ STAGE_ORDER = ["dataset", "training", "inference"]
 
 
 def run_stage(stage: str) -> None:
+    """지정한 로컬 파이프라인 단계의 명령들을 순서대로 실행한다."""
     for label, python_executable, args in STEPS[stage]:
         print(f"\n=== {label} ===", flush=True)
         subprocess.run([python_executable, *args], check=True)
 
 
 def main() -> None:
+    """CLI 옵션에 따라 전체 또는 단일 로컬 파이프라인 단계를 실행한다."""
     parser = argparse.ArgumentParser(description="feature_engine -> training -> inference 전체 실행 (로컬 개발용)")
     parser.add_argument(
         "--only", choices=STAGE_ORDER, default=None, help="이 단계만 실행 (미지정 시 전체 순서대로 실행)"

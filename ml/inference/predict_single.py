@@ -67,6 +67,11 @@ raw 스키마 자체(`fcstDate`/`fcstTime`/`TMP`/`PCP`)는 `loader/transform.py`
 얻는 게 적다. 대체 여부는 반환값의 `population_source`(`"provided"` 또는
 `"fallback"`)로 확인할 수 있다.
 
+운영 `realtime_5min` DAG는 현재 tick normalizer가 성공해야만 추론을 시작한다.
+아래의 최근 tick/profile fallback은 그 필수 단계를 우회하려는 장치가 아니라,
+직접 API 호출·수동 재실행과 horizon별 미래 예보 누락을 제한된 범위에서 처리하는
+서빙 방어선이다.
+
 한계: 정류소/격자 자체가 2025년에 데이터가 없었거나(신규 정류소 등) 프로필도
 없는 경우엔 fallback도 NaN이 된다. LightGBM은 결측을 네이티브로 처리하므로
 예측은 나오지만 정확도는 더 떨어진다.
@@ -755,8 +760,10 @@ def _weather_values(df: pd.DataFrame | None) -> dict[str, float] | None:
     valid = (
         np.isfinite(numeric["temp"])
         & np.isfinite(numeric["precip"])
-        & numeric["temp"].between(-50.0, 50.0)
-        & numeric["precip"].between(0.0, 500.0)
+        & numeric["temp"].between(silver_schema.WEATHER_TEMP_MIN, silver_schema.WEATHER_TEMP_MAX)
+        & numeric["precip"].between(
+            silver_schema.WEATHER_PRECIP_MIN, silver_schema.WEATHER_PRECIP_MAX
+        )
     )
     if not valid.any():
         return None
@@ -852,8 +859,10 @@ def _get_forecast_weather(target_ts: pd.Timestamp, issue_lookback_hours: float =
         valid = (
             np.isfinite(numeric["temp"])
             & np.isfinite(numeric["precip"])
-            & numeric["temp"].between(-50.0, 50.0)
-            & numeric["precip"].between(0.0, 500.0)
+            & numeric["temp"].between(silver_schema.WEATHER_TEMP_MIN, silver_schema.WEATHER_TEMP_MAX)
+            & numeric["precip"].between(
+                silver_schema.WEATHER_PRECIP_MIN, silver_schema.WEATHER_PRECIP_MAX
+            )
         )
         if not valid.any():
             continue
@@ -899,8 +908,10 @@ def _get_recent_population(target_ts: pd.Timestamp, lookback_hours: float = 1.0)
 
     `weather_ultra_short_live`/`bike_station_realtime`과 같은 5분 tick 소스라
     `_get_recent_weather()`/`_get_recent_bike_status()`와 동일한 패턴을 쓴다 —
-    target_ts를 5분 단위로 내림한 키가 있으면 그걸, 없으면(정규화 지연 등)
-    거슬러 올라가 가장 최근 값을 대신 쓴다. 원본과 달리 시각이 이미 S3 키
+    target_ts를 5분 단위로 내림한 키가 있으면 그걸, 없으면(직접 호출·수동 재실행
+    또는 미래 예보 일부 누락) 거슬러 올라가 최대 1시간 안의 최근 값을 대신 쓴다.
+    운영 DAG의 현재 tick은 normalizer 성공이 필수라 이 조회가 task 실패를 우회하지
+    않는다. 원본과 달리 시각이 이미 S3 키
     경로(dt=/hh=/HHMM)에 있어 파일 내용에 YMD/TT 컬럼이 없다 — 그래서 원본처럼
     "그 안에서 TT만 맞춰 거르는" 과정이 필요 없다.
 

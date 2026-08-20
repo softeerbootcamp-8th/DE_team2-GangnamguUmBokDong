@@ -8,7 +8,7 @@
         |                                                    |       |
         -> load_stations -> load_station_stock --------------|-------+-> load_forecast_points
                                                              |
-    collect_population_realtime -> run_normalizer -> population_normalized -┘
+    collect_population_realtime -> run_normalizer ----------------------┘
 
     weather_10min / weather_3h가 쓴 최신 Silver ------------┘ (추론기가 시점 기준 조회)
 
@@ -45,9 +45,9 @@ DAG 안에서 API 호출, 페이지네이션, S3 저장, 데이터 검증, 모�
 """
 
 import pendulum
-from airflow.providers.standard.operators.empty import EmptyOperator
-from airflow.task.trigger_rule import TriggerRule
+from airflow import DAG
 from airflow.timetables.trigger import CronTriggerTimetable
+
 from config.schedules import CATCHUP, MAX_ACTIVE_RUNS, REALTIME_5MIN_CRON, TIMEZONE
 from config.sources import REALTIME_5MIN_SOURCES, RENTAL_HISTORY_LOOKBACK_HOURS
 from orchestration.collector_task import (
@@ -59,8 +59,6 @@ from orchestration.inference_task import build_inference_task
 from orchestration.normalizer_task import build_normalizer_task
 from orchestration.routes_task import build_routes_task
 from orchestration.urgency_task import build_urgency_task
-
-from airflow import DAG
 
 with DAG(
     dag_id="realtime_5min",
@@ -76,11 +74,7 @@ with DAG(
     collector_tasks["bike_station_realtime"] >> load_stations >> load_station_stock
 
     run_normalizer = build_normalizer_task(dag)
-    population_normalized = EmptyOperator(
-        task_id="population_normalized",
-        trigger_rule=TriggerRule.ONE_SUCCESS,
-    )
-    collector_tasks["population_realtime"] >> run_normalizer >> population_normalized
+    collector_tasks["population_realtime"] >> run_normalizer
 
     run_inference = build_inference_task(dag)
     inference_inputs = [
@@ -88,7 +82,7 @@ with DAG(
         for source_id, task in collector_tasks.items()
         if source_id != "population_realtime"
     ]
-    [*inference_inputs, population_normalized] >> run_inference
+    [*inference_inputs, run_normalizer] >> run_inference
 
     load_forecast_points = build_db_loader_task(dag, "forecast_points")
     [run_inference, load_station_stock] >> load_forecast_points

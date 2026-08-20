@@ -81,31 +81,6 @@ def run_and_notify_on_failure(label: str, main_fn):
         raise
 
 
-def _validate_valid_test_days_dont_overlap_train() -> None:
-    """VALID_DAYS_OF_MONTH/TEST_DAYS_OF_MONTH에 TRAIN_DAY_DIVISOR의 배수가 섞여 있으면 바로 에러를 낸다.
-
-    **TRAIN_DAY_DIVISOR가 1(기본값, 날짜 다운샘플링 없음 — 1년 전체)이면 이
-    검증을 건너뛴다** — 모든 정수가 1의 배수라 이 규칙 그대로 적용하면 항상
-    "충돌"로 판정되지만, `_dates_for_split()`가 valid/test를 먼저 확정하고 그
-    나머지 중에서만 train 배수 조건을 보므로(아래 참고) divisor=1에서도 애초에
-    겹칠 수가 없다 — 이 함수가 막으려는 사고 자체가 구조적으로 불가능해졌다.
-
-    divisor>=2일 때는: train이 "TRAIN_DAY_DIVISOR의 배수인 날 중 valid/test가
-    아닌 날"이라, VALID/TEST_DAYS_OF_MONTH에 그 배수가 섞여 있으면 그 날짜가
-    온전히 valid/test로만 가야 할 의도와 다르게 뒤섞일 수 있어 미리 막는다.
-    """
-    if config.TRAIN_DAY_DIVISOR == 1:
-        return
-    conflicting = {
-        d for d in (*config.VALID_DAYS_OF_MONTH, *config.TEST_DAYS_OF_MONTH) if d % config.TRAIN_DAY_DIVISOR == 0
-    }
-    if conflicting:
-        raise ValueError(
-            f"VALID_DAYS_OF_MONTH/TEST_DAYS_OF_MONTH에 TRAIN_DAY_DIVISOR({config.TRAIN_DAY_DIVISOR})의 "
-            f"배수가 섞여 있음(train과 겹쳐 누출): {sorted(conflicting)}"
-        )
-
-
 def _dates_for_split(start: date, end: date) -> tuple[list[str], list[str], list[str]]:
     """purged day-of-month 규칙으로 train/valid/test 날짜를 나눈다.
 
@@ -309,7 +284,6 @@ def train_target(
     table_path = _TRAINING_TABLE_BY_MODEL[model_name]
     filters = [("horizon", "<=", config.MAX_TRAIN_HORIZON)]
 
-    _validate_valid_test_days_dont_overlap_train()
     train_dates, valid_dates, test_dates = _dates_for_split(config.TRAIN_WINDOW_START, config.TRAIN_WINDOW_END)
     if not train_dates or not valid_dates or not test_dates:
         raise ValueError(

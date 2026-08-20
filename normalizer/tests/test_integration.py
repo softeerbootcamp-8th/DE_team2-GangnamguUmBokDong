@@ -11,15 +11,16 @@ import json
 from datetime import datetime, timedelta
 
 import boto3
+import pyarrow as pa
+import pyarrow.parquet as pq
+import pytest
+from core.forecast import POPULATION_FORECAST_SLOT_COUNT
+
 import grid
 import main
 import merge
 import poi
-import pyarrow as pa
-import pyarrow.parquet as pq
-import pytest
 import storage
-
 from tests.conftest import KST, TEST_BUCKET
 
 # POI001("강남 MICE 관광특구")와 실제로 크게 겹치는 격자(약 97.9% 겹침, 이번 조사에서 확인).
@@ -83,7 +84,7 @@ def _seed_realtime_silver(*, with_forecast: bool = True) -> None:
         "FEMALE_PPLTN_RATE": 48.0,
         "FCST_YN": "Y" if with_forecast else "N",
     }
-    for slot in range(1, 13):
+    for slot in range(1, POPULATION_FORECAST_SLOT_COUNT + 1):
         stamp = WINDOW_START.replace(minute=0) + timedelta(hours=slot)
         row[f"FCST_{slot}_TIME"] = stamp.strftime("%Y-%m-%d %H:%M") if with_forecast else None
         row[f"FCST_{slot}_PPLTN_MIN"] = 3000 if with_forecast else None
@@ -152,7 +153,7 @@ class TestEndToEndRun:
 
         main.run(WINDOW_START)
 
-        for slot in range(1, 13):
+        for slot in range(1, POPULATION_FORECAST_SLOT_COUNT + 1):
             target = WINDOW_START.replace(minute=0) + timedelta(hours=slot)
             key = (
                 f"silver/living_population_normalized/dt={target:%Y-%m-%d}/"

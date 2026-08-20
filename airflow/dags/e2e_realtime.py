@@ -16,8 +16,8 @@ baseline이 항상 nowcaster 추정치라 예전의 strict/fallback 두 갈래�
 """
 
 import pendulum
-from airflow.providers.standard.operators.empty import EmptyOperator
-from airflow.task.trigger_rule import TriggerRule
+from airflow import DAG
+
 from config.schedules import TIMEZONE
 from config.sources import (
     REALTIME_5MIN_SOURCES,
@@ -33,8 +33,6 @@ from orchestration.normalizer_task import (
 )
 from orchestration.routes_task import build_routes_task
 from orchestration.urgency_task import build_urgency_task
-
-from airflow import DAG
 
 with DAG(
     dag_id="e2e_realtime",
@@ -55,11 +53,7 @@ with DAG(
     collector_tasks["bike_station_realtime"] >> load_stations >> load_station_stock
 
     run_normalizer = build_normalizer_task(dag)
-    population_normalized = EmptyOperator(
-        task_id="population_normalized",
-        trigger_rule=TriggerRule.ONE_SUCCESS,
-    )
-    collector_tasks["population_realtime"] >> run_normalizer >> population_normalized
+    collector_tasks["population_realtime"] >> run_normalizer
 
     run_inference = build_inference_task(dag)
     inference_inputs = [
@@ -67,7 +61,7 @@ with DAG(
         for source_id, task in collector_tasks.items()
         if source_id != "population_realtime"
     ]
-    [*inference_inputs, collect_weather, population_normalized, enrich_station_master] >> run_inference
+    [*inference_inputs, collect_weather, run_normalizer, enrich_station_master] >> run_inference
 
     load_forecast_points = build_db_loader_task(dag, "forecast_points")
     [run_inference, load_station_stock] >> load_forecast_points

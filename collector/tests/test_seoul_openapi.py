@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo
 
 import httpx
 import pytest
+
 from adapters.base import FetchErrorKind, Window, fetch_with_rounds
 from adapters.seoul_openapi import SeoulOpenApiAdapter
 
@@ -204,6 +205,7 @@ def test_population_fetch_uses_configured_poi_range_and_does_not_stop_at_gap():
             "service": "citydata_ppltn",
             "page_size": 1000,
             "root_key": "SeoulRtd.citydata_ppltn",
+            "root_key_literal": True,
             "poi_start": 117,
             "poi_end": 121,
         }
@@ -251,6 +253,7 @@ def test_population_fetch_requests_pois_concurrently_and_preserves_order():
             "service": "citydata_ppltn",
             "page_size": 1000,
             "root_key": "SeoulRtd.citydata_ppltn",
+            "root_key_literal": True,
             "poi_start": 1,
             "poi_end": 8,
             "concurrency": 4,
@@ -289,6 +292,7 @@ def test_population_fetch_honors_skip_under_concurrency():
             "service": "citydata_ppltn",
             "page_size": 1000,
             "root_key": "SeoulRtd.citydata_ppltn",
+            "root_key_literal": True,
             "poi_start": 1,
             "poi_end": 4,
             "concurrency": 2,
@@ -749,9 +753,36 @@ class TestProbePagination:
             )
         )
 
-        assert [result.key for result in results] == ["page-00003-00004"]
-        assert len(calls) == 1
+        assert [result.key for result in results if result.persist] == ["page-00003-00004"]
+        assert [result.expected_total for result in results if not result.persist] == [5]
+        assert len(calls) == 2
         assert calls[0].endswith("/3/4/")
+        assert calls[1].endswith("/7/8/")
+
+    def test_known_total_retry_collects_rows_appended_after_the_previous_round(self):
+        """retry 사이에 snapshot 뒤로 늘어난 행도 terminal 재탐색으로 수집한다."""
+        rows = [{"a": str(index)} for index in range(1, 8)]
+        calls = []
+        client = httpx.Client(
+            transport=httpx.MockTransport(_probe_handler(rows, 2, calls=calls))
+        )
+
+        results = list(
+            SeoulOpenApiAdapter.fetch(
+                _probe_config(page_size=2),
+                window=None,
+                client=client,
+                skip=frozenset({"page-00001-00002", "page-00005-00006"}),
+                expected_total=5,
+            )
+        )
+
+        assert [result.key for result in results if result.persist] == [
+            "page-00003-00004",
+            "page-00007-00008",
+        ]
+        assert [result.expected_total for result in results if not result.persist] == [7]
+        assert calls[-1].endswith("/9/10/")
 
     def test_probe_limit_fails_instead_of_silently_truncating(self):
         rows = [{"a": str(index)} for index in range(1, 6)]
@@ -780,7 +811,13 @@ class TestForecastFlatten:
     @staticmethod
     def _config():
         return _StubConfig(
-            {"service": "citydata_ppltn", "page_size": 1000, "root_key": "SeoulRtd.citydata_ppltn"}
+            {
+                "service": "citydata_ppltn",
+                "page_size": 1000,
+                "root_key": "SeoulRtd.citydata_ppltn",
+                "root_key_literal": True,
+                "flatten_forecast": True,
+            }
         )
 
     @staticmethod

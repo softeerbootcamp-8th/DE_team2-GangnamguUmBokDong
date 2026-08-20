@@ -13,18 +13,17 @@ import sys
 from collections.abc import Callable
 from datetime import date, datetime, timedelta, tzinfo
 
+# pyrefly: ignore [missing-import]
+import pyarrow as pa
+from core.forecast import POPULATION_FORECAST_SLOT_COUNT
+
 import grid
 import merge
 import poi
-
-# pyrefly: ignore [missing-import]
-import pyarrow as pa
 import storage
 
 # 실시간 도시데이터의 예측 시각 포맷(실측: "2026-08-19 22:00", KST 정시).
 _FORECAST_TIME_FORMAT = "%Y-%m-%d %H:%M"
-# 어댑터가 펼쳐 놓은 슬롯 수. 슬롯 번호는 "n시간 후"가 아니라 시각 오름차순 순번이다.
-_FORECAST_SLOTS = 12
 # 이보다 먼 예측은 쓰지 않는다. API가 간격을 바꿔도 미래로 무한히 번지지 않게 하는 상한.
 _MAX_HORIZON = timedelta(hours=12)
 
@@ -179,7 +178,7 @@ def _forecast_by_time(row: dict, tzinfo: tzinfo | None) -> dict[datetime, tuple[
         return {}
 
     forecasts: dict[datetime, tuple[float, float]] = {}
-    for slot in range(1, _FORECAST_SLOTS + 1):
+    for slot in range(1, POPULATION_FORECAST_SLOT_COUNT + 1):
         target = _parse_forecast_time(row.get(f"FCST_{slot}_TIME"), tzinfo)
         pop_min = row.get(f"FCST_{slot}_PPLTN_MIN")
         pop_max = row.get(f"FCST_{slot}_PPLTN_MAX")
@@ -269,12 +268,13 @@ def _baseline_cells(
 
 def _write_normalized(
     target: datetime,
+    source_window_start: datetime,
     cells_by_id: dict[str, merge.GridCell],
     overlap_areas: dict[str, list[tuple[str, float]]],
     snapshots_by_code: dict[str, merge.PoiSnapshot],
     merge_cell: Callable[[merge.GridCell, list[tuple[merge.PoiSnapshot, float]]], merge.MergedCell],
-) -> str:
-    """한 시각의 보정 결과를 그 시각의 tick 키에 쓰고 키를 돌려준다."""
+) -> str | None:
+    """한 시각의 보정 결과를 더 최신 세대를 보존하며 tick 키에 쓴다."""
     output_rows = [
         merge.round_output_row(
             merge_cell(cell, merge.bind_snapshots(overlap_areas.get(cell_id, []), snapshots_by_code))
@@ -282,7 +282,11 @@ def _write_normalized(
         for cell_id, cell in cells_by_id.items()
     ]
     table = pa.Table.from_pylist(output_rows, schema=_OUTPUT_SCHEMA)
-    return storage.write_normalized_silver(target, table)
+    return storage.write_normalized_silver(
+        target,
+        table,
+        source_window_start=source_window_start,
+    )
 
 
 def run(window_start: datetime) -> int:
@@ -337,25 +341,36 @@ def run(window_start: datetime) -> int:
 
     observed_snapshots = _build_poi_snapshots(poi_areas, realtime_table)
     written: dict[str, str] = {}
+    stale_generation_skipped: list[str] = []
     if window_start in cells_by_target:
-        written[window_start.isoformat()] = _write_normalized(
+        output_key = _write_normalized(
+            window_start,
             window_start,
             cells_by_target[window_start],
             overlap_areas,
             {snapshot.area_cd: snapshot for snapshot in observed_snapshots},
             merge.merge_cell,
         )
+        if output_key is None:
+            stale_generation_skipped.append(window_start.isoformat())
+        else:
+            written[window_start.isoformat()] = output_key
 
     for target in targets:
         if target not in cells_by_target:
             continue
-        written[target.isoformat()] = _write_normalized(
+        output_key = _write_normalized(
             target,
+            window_start,
             cells_by_target[target],
             overlap_areas,
             _build_forecast_snapshots(poi_areas, forecasts_by_code, target),
             merge.merge_cell_total_only,
         )
+        if output_key is None:
+            stale_generation_skipped.append(target.isoformat())
+        else:
+            written[target.isoformat()] = output_key
 
     storage.write_manifest(
         window_start,
@@ -367,6 +382,7 @@ def run(window_start: datetime) -> int:
             "forecast_horizons": len(targets),
             "written_keys": written,
             "skipped_targets": skipped,
+            "stale_generation_skipped_targets": stale_generation_skipped,
         },
     )
     return 0

@@ -1,6 +1,5 @@
 """train_common._dates_for_split()이 day-of-month 배수 기준으로 train/valid/test 날짜를
-정확히 나누고, 빈 구간이나 TRAIN_DAY_DIVISOR와 겹치는 VALID/TEST 설정을 조용히 통과시키지
-않고 바로 에러를 내는지 검증한다.
+정확히 나누고 평가일을 train에서 먼저 제외한 뒤 embargo를 적용하는지 검증한다.
 
 **2026-08 전면 개편**: 예전엔 이 함수(`_split()`)가 이미 로드된 DataFrame을 받아
 `day` 컬럼을 역산해 day-of-month를 구했다. 지금은 Spark의 `date=YYYY-MM-DD/` 파티션
@@ -28,16 +27,20 @@ from training import config
 from training.train_common import _dates_for_split
 
 
-def test_dates_for_split_rejects_valid_or_test_days_overlapping_train_divisor(monkeypatch):
-    """VALID/TEST에 TRAIN_DAY_DIVISOR의 배수가 섞이면 train과 겹쳐 누출이 생기므로 바로 에러여야 한다."""
+def test_dates_for_split_keeps_divisible_evaluation_day_out_of_train(monkeypatch):
+    """divisor의 배수인 평가일도 평가 split으로만 남아야 한다."""
     monkeypatch.setattr(config, "TRAIN_DAY_DIVISOR", 2)
     monkeypatch.setattr(config, "VALID_DAYS_OF_MONTH", frozenset({20}))
-    monkeypatch.setattr(config, "TEST_DAYS_OF_MONTH", frozenset({7}))
+    monkeypatch.setattr(config, "TEST_DAYS_OF_MONTH", frozenset({24}))
+    monkeypatch.setattr(config, "SPLIT_EMBARGO_DAYS", 1)
 
-    from training.train_common import _validate_valid_test_days_dont_overlap_train
+    train, valid, test = _dates_for_split(date(2026, 1, 1), date(2026, 1, 31))
 
-    with pytest.raises(ValueError, match="TRAIN_DAY_DIVISOR"):
-        _validate_valid_test_days_dont_overlap_train()
+    assert valid == ["2026-01-20"]
+    assert test == ["2026-01-24"]
+    assert "2026-01-20" not in train
+    assert "2026-01-24" not in train
+    assert {"2026-01-18", "2026-01-22", "2026-01-26"}.issubset(train)
 
 
 def test_dates_for_split_buckets_dates_by_train_day_divisor(monkeypatch):

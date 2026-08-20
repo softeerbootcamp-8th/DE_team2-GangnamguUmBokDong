@@ -6,6 +6,7 @@ from itertools import pairwise
 from airflow.providers.standard.operators.bash import BashOperator
 from airflow.task.trigger_rule import TriggerRule
 from airflow.timetables.trigger import CronTriggerTimetable
+
 from config.schedules import EXECUTION_TIMEOUT_OVERRIDES, REALTIME_5MIN_CRON, TIMEZONE
 from config.sources import REALTIME_5MIN_SOURCES, RENTAL_HISTORY_LOOKBACK_HOURS
 from dags.realtime_5min import dag
@@ -24,7 +25,6 @@ def test_expected_tasks_exist():
         "load_stations",
         "load_station_stock",
         "run_normalizer",
-        "population_normalized",
         "run_inference",
         "load_forecast_points",
         "compute_urgency",
@@ -62,11 +62,6 @@ def test_normalizer_is_a_single_task_after_population_collection():
     assert normalizer.trigger_rule == "all_success"
     assert not [t for t in dag.task_ids if t.startswith("run_normalizer_")]
 
-    normalized = dag.get_task("population_normalized")
-    assert normalized.upstream_task_ids == {"run_normalizer"}
-    assert normalized.trigger_rule == TriggerRule.ONE_SUCCESS
-
-
 def test_inference_waits_for_realtime_bikes_and_normalized_population():
     """날씨는 별도 DAG의 최신 Silver를 읽고, 이 DAG의 실시간 입력은 직접 기다린다."""
     run_inference = dag.get_task("run_inference")
@@ -75,7 +70,7 @@ def test_inference_waits_for_realtime_bikes_and_normalized_population():
     assert upstream_ids == {
         "collect_bike_rental_history",
         "collect_bike_station_realtime",
-        "population_normalized",
+        "run_normalizer",
     }
     assert "collect_population_realtime" not in upstream_ids
     assert "collect_weather_ultra_short_live" not in dag.task_ids

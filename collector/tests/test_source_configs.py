@@ -15,6 +15,7 @@ from zoneinfo import ZoneInfo
 
 import httpx
 import pytest
+from core.forecast import POPULATION_FORECAST_SLOT_COUNT
 
 pytestmark = pytest.mark.usefixtures("_bucket")
 
@@ -91,6 +92,7 @@ class TestAllSourcesLoad:
     @pytest.mark.parametrize(
         ("adapter_params", "message"),
         [
+            ({}, "adapter_params.page_size"),
             (
                 {
                     "service": "bikeList",
@@ -156,12 +158,14 @@ class TestAllSourcesLoad:
         assert config.adapter_params["poi_start"] == 1
         assert config.adapter_params["poi_end"] == 121
         assert config.adapter_params["concurrency"] == 4
+        assert config.adapter_params["root_key_literal"] is True
+        assert config.adapter_params["flatten_forecast"] is True
 
     def test_population_realtime_declares_all_twelve_forecast_slots(self):
         """어댑터가 평탄화한 `FCST_n_*` 컬럼이 전부 선언돼 있어야 silver까지 살아 남는다."""
         config = config_loader.load("population_realtime", base_dir=SOURCES_DIR)
 
-        for slot in range(1, 13):
+        for slot in range(1, POPULATION_FORECAST_SLOT_COUNT + 1):
             assert f"FCST_{slot}_TIME" in config.columns
             assert f"FCST_{slot}_CONGEST_LVL" in config.columns
             assert f"FCST_{slot}_PPLTN_MIN" in config.columns
@@ -181,7 +185,7 @@ class TestAllSourcesLoad:
         config = config_loader.load("population_realtime", base_dir=SOURCES_DIR)
         observed = config.columns["AREA_PPLTN_MIN"].range
 
-        for slot in range(1, 13):
+        for slot in range(1, POPULATION_FORECAST_SLOT_COUNT + 1):
             assert config.columns[f"FCST_{slot}_PPLTN_MIN"].range == observed
             assert config.columns[f"FCST_{slot}_PPLTN_MAX"].range == observed
             assert config.columns[f"FCST_{slot}_CONGEST_LVL"].enum == config.columns["AREA_CONGEST_LVL"].enum

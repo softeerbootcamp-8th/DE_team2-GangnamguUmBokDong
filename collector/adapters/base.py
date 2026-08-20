@@ -50,6 +50,7 @@ from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
     import httpx
+
     from config.schema import SourceConfig
 
 
@@ -261,10 +262,12 @@ def fetch_with_rounds(
             except StopIteration:
                 break
 
-            # expected_total은 첫 조각에만 실려 온다. 
-            # 한 번 채워지면 이후 라운드·백필에 그대로 되돌려주므로 여기서 덮어쓰지 않는다.
-            if expected_total is None and result.expected_total is not None:
-                expected_total = result.expected_total
+            # probe 소스는 재시도 중 snapshot이 늘었음을 종료 probe로 발견할 수 있다.
+            # 이미 확정한 하한보다 큰 total은 갱신하되, 더 작은 값으로 줄여 기존
+            # Bronze payload를 정상으로 오인하지 않는다(어댑터도 shrink를 TRANSIENT로
+            # 막는다).
+            if result.expected_total is not None:
+                expected_total = max(expected_total or 0, result.expected_total)
 
             if result.error is None and result.persist:
                 if result.payload is None:

@@ -10,7 +10,6 @@
 from __future__ import annotations
 
 from config.schedules import NORMALIZER_EXECUTION_TIMEOUT
-
 from orchestration.task_builder import REPO_ROOT, build_module_task
 from orchestration.templates import KST_WINDOW_START
 
@@ -18,6 +17,7 @@ NORMALIZER_DIR = str(REPO_ROOT / "normalizer")
 
 
 def build_normalizer_task(dag, task_id: str = "run_normalizer"):
+    """현재·미래 생활인구를 한 번에 보정하는 Airflow 태스크를 만든다."""
     cmd = f"uv run --frozen python main.py --window-start {KST_WINDOW_START}"
     return build_module_task(
         dag, task_id, NORMALIZER_DIR, cmd, execution_timeout=NORMALIZER_EXECUTION_TIMEOUT

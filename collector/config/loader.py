@@ -12,6 +12,8 @@ from pathlib import Path
 
 import yaml
 from pydantic import ValidationError
+
+from config.schema import SourceConfig
 from validation.registry import (
     get_row_policy_params_model,
     is_policy_registered,
@@ -19,8 +21,6 @@ from validation.registry import (
     policy_names,
     row_policy_names,
 )
-
-from config.schema import SourceConfig
 
 
 class ConfigError(ValueError):
@@ -62,8 +62,12 @@ def _check_adapter_params(config: SourceConfig) -> list[str]:
         return []
 
     errors: list[str] = []
+    for required in ("service", "root_key"):
+        value = params.get(required)
+        if not isinstance(value, str) or not value.strip():
+            errors.append(f"adapter_params.{required}: 비어있지 않은 문자열이 필수입니다.")
     page_size = params.get("page_size")
-    if params and (
+    if (
         not isinstance(page_size, int) or isinstance(page_size, bool) or page_size < 1
     ):
         errors.append("adapter_params.page_size: 1 이상의 정수여야 합니다.")
@@ -72,9 +76,17 @@ def _check_adapter_params(config: SourceConfig) -> list[str]:
     if pagination not in {"total", "probe"}:
         errors.append("adapter_params.pagination: 'total' 또는 'probe'여야 합니다.")
 
+    for option in ("root_key_literal", "flatten_forecast"):
+        if option in params and not isinstance(params[option], bool):
+            errors.append(f"adapter_params.{option}: boolean이어야 합니다.")
+
     if params.get("service") == "citydata_ppltn":
         if pagination != "total":
             errors.append("adapter_params.pagination: citydata_ppltn에는 probe를 사용할 수 없습니다.")
+        if params.get("root_key_literal") is not True:
+            errors.append("adapter_params.root_key_literal: citydata_ppltn에는 true가 필수입니다.")
+        if params.get("flatten_forecast") is not True:
+            errors.append("adapter_params.flatten_forecast: citydata_ppltn에는 true가 필수입니다.")
 
         poi_start = params.get("poi_start", 1)
         poi_end = params.get("poi_end")

@@ -172,9 +172,27 @@ def get_object_bytes(key: str, timeout_seconds: float | None = None) -> bytes | 
         raise
 
 
-def put_object_bytes(key: str, body: bytes) -> None:
-    """bytes를 S3 객체로 저장한다."""
-    _client().put_object(Bucket=_bucket(), Key=key, Body=body)
+def put_object_bytes(
+    key: str,
+    body: bytes,
+    *,
+    metadata: dict[str, str] | None = None,
+) -> None:
+    """bytes와 선택적인 S3 user metadata를 객체로 저장한다."""
+    kwargs = {"Bucket": _bucket(), "Key": key, "Body": body}
+    if metadata is not None:
+        kwargs["Metadata"] = metadata
+    _client().put_object(**kwargs)
+
+
+def get_object_metadata(key: str) -> dict[str, str] | None:
+    """S3 객체 본문을 받지 않고 user metadata만 조회한다. 키가 없으면 None."""
+    try:
+        return dict(_client().head_object(Bucket=_bucket(), Key=key).get("Metadata", {}))
+    except ClientError as exc:
+        if exc.response["Error"]["Code"] in {"404", "NoSuchKey"}:
+            return None
+        raise
 
 
 def _to_pandas_or_table(table: pq.Table, as_pandas: bool) -> pd.DataFrame | pq.Table:
@@ -419,14 +437,19 @@ def read_parquet_many(
         return list(pool.map(_read, keys))
 
 
-def write_parquet(data: pd.DataFrame | pq.Table, key: str) -> None:
-    """pandas DataFrame 또는 pyarrow Table을 parquet으로 직렬화해 S3에 저장한다."""
+def write_parquet(
+    data: pd.DataFrame | pq.Table,
+    key: str,
+    *,
+    metadata: dict[str, str] | None = None,
+) -> None:
+    """pandas/Arrow 데이터를 Parquet과 선택적인 S3 user metadata로 저장한다."""
     buffer = io.BytesIO()
     if isinstance(data, pd.DataFrame):
         data.to_parquet(buffer, index=False)
     else:
         pq.write_table(data, buffer)
-    put_object_bytes(key, buffer.getvalue())
+    put_object_bytes(key, buffer.getvalue(), metadata=metadata)
 
 
 def read_json(key: str, timeout_seconds: float | None = None):

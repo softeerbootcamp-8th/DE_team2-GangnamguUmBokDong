@@ -5,6 +5,10 @@ adapter_params:
   service: citydata_ppltn
   page_size: 1000
   root_key: SeoulRtd.citydata_ppltn
+  # 최상단 키 자체에 점이 들어가므로 경로 구분자로 해석하지 않는다.
+  root_key_literal: true
+  # FCST_PPLTN 중첩 배열을 Silver 검증용 FCST_n_* 스칼라 컬럼으로 펼친다.
+  flatten_forecast: true
   poi_start: 1
   poi_end: 121
   # 5분마다 POI 121개를 각각 호출하므로 4개씩 병렬 조회한다.

@@ -30,6 +30,7 @@ from datetime import timedelta
 from typing import TYPE_CHECKING
 
 import httpx
+from core.forecast import POPULATION_FORECAST_SLOT_COUNT
 
 from adapters.base import FetchErrorKind, FetchResult, adapter
 
@@ -103,7 +104,6 @@ _FCST_SLOT_FIELDS = ("FCST_TIME", "FCST_CONGEST_LVL", "FCST_PPLTN_MIN", "FCST_PP
 # 실측(2026-08-19 POI001): 1시간 간격 12개. 슬롯 번호는 "n시간 후"가 아니다 —
 # 20:55 관측의 첫 예측이 22:00이었다. 몇 시의 예측인지는 `FCST_n_TIME`이 말해주고,
 # 소비자(normalizer)는 슬롯 번호가 아니라 그 값으로 시각을 맞춘다.
-_FCST_MAX_SLOTS = 12
 
 
 def _flatten_forecast(row: dict) -> dict:
@@ -118,7 +118,10 @@ def _flatten_forecast(row: dict) -> dict:
         return row
 
     datable = [f for f in forecasts if isinstance(f, dict) and isinstance(f.get("FCST_TIME"), str)]
-    for slot, forecast in enumerate(sorted(datable, key=lambda f: f["FCST_TIME"])[:_FCST_MAX_SLOTS], start=1):
+    for slot, forecast in enumerate(
+        sorted(datable, key=lambda f: f["FCST_TIME"])[:POPULATION_FORECAST_SLOT_COUNT],
+        start=1,
+    ):
         for field in _FCST_SLOT_FIELDS:
             value = forecast.get(field)
             if value is not None:
@@ -388,6 +391,61 @@ def _fetch_probe_pages(
             )
             if outcome.error is FetchErrorKind.FATAL:
                 return
+
+        # 고정된 expected_total만 믿고 끝내면 재시도 사이에 뒤로 늘어난 행을 놓친다.
+        # 기존 범위 바로 다음 페이지부터 terminal까지 다시 탐색해 growth를 수집하고
+        # 실제 total을 상위 라운드에 갱신한다. 정적 snapshot이면 추가 호출 한 번으로
+        # INFO-200을 확인하고 끝난다.
+        page_start = page_count * page_size + 1
+        last_data_start: int | None = None
+        last_data_rows: int | None = None
+        while True:
+            page_number = ((page_start - 1) // page_size) + 1
+            key = _probe_page_key(page_start, page_size)
+            outcome = _fetch_probe_page(
+                client,
+                page_url(page_start, page_start + page_size - 1),
+                wrapper_key,
+            )
+            if outcome.error is not None:
+                yield FetchResult(
+                    key=key,
+                    payload=None,
+                    error=outcome.error,
+                    expected_total=None,
+                )
+                return
+            if outcome.terminal:
+                total = (
+                    expected_total
+                    if last_data_start is None or last_data_rows is None
+                    else last_data_start - 1 + last_data_rows
+                )
+                yield FetchResult(
+                    key=f"probe-end-{page_start:05d}",
+                    payload=None,
+                    error=None,
+                    expected_total=total,
+                    persist=False,
+                )
+                return
+            if page_number > max_probe_pages:
+                yield FetchResult(
+                    key=key,
+                    payload=None,
+                    error=FetchErrorKind.PERMANENT,
+                    expected_total=None,
+                )
+                return
+            yield FetchResult(
+                key=key,
+                payload=outcome.payload,
+                error=None,
+                expected_total=None,
+            )
+            last_data_start = page_start
+            last_data_rows = outcome.row_count
+            page_start += page_size
         return
 
     page_start = 1
@@ -485,6 +543,15 @@ class SeoulOpenApiAdapter:
     """서울 열린데이터광장 공용 페이지네이션 규약 어댑터."""
 
     @staticmethod
+    def _root_location(params: dict) -> tuple[str, str]:
+        """설정에 따라 응답 wrapper 키와 그 아래 row 경로를 분리한다."""
+        root_key = params["root_key"]
+        if params.get("root_key_literal", False):
+            return root_key, ""
+        wrapper_key, _, row_path = root_key.partition(".")
+        return wrapper_key, row_path
+
+    @staticmethod
     def planned_parts(config: SourceConfig, window) -> frozenset[str] | None:
         """요청 전에 전체 키를 아는 POI 소스의 조각 계획을 반환한다."""
         params = config.adapter_params
@@ -507,12 +574,7 @@ class SeoulOpenApiAdapter:
         service = params["service"]
         page_size = params["page_size"]
 
-        # . 기준으로 문자열을 쪼개서 앞부분만 떼어낸다.
-        # "SeoulRtd.citydata_ppltn" 처럼 마침표가 포함된 단일 키가 응답의 최상단에 존재할 수 있다.
-        if params["root_key"] in {"SeoulRtd.citydata_ppltn"}:
-            wrapper_key = params["root_key"]
-        else:
-            wrapper_key = params["root_key"].split(".", 1)[0]
+        wrapper_key, _ = SeoulOpenApiAdapter._root_location(params)
         
         path_suffix_template = params.get("path_suffix", "")
         suffix = ""
@@ -662,12 +724,8 @@ class SeoulOpenApiAdapter:
         """조각들을 순서대로 이어붙여 행 = 레코드 리스트로 만든다.
         네트워크를 타지 않는 순수 함수이다. bronze에서 다시 읽어 언제든 재호출된다.
         """
-        root_key = config.adapter_params["root_key"]
-        if root_key in {"SeoulRtd.citydata_ppltn"}:
-            wrapper_key = root_key
-            row_path = ""
-        else:
-            wrapper_key, _, row_path = root_key.partition(".")
+        params = config.adapter_params
+        wrapper_key, row_path = SeoulOpenApiAdapter._root_location(params)
 
         rows: list[dict] = []
         for chunk in chunks:
@@ -681,6 +739,6 @@ class SeoulOpenApiAdapter:
             if isinstance(node, list):
                 rows.extend(node)
 
-        if root_key in {"SeoulRtd.citydata_ppltn"}:
+        if params.get("flatten_forecast", False):
             return [_flatten_forecast(row) for row in rows if isinstance(row, dict)]
         return rows

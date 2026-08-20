@@ -111,6 +111,16 @@ def _path_exists(spark: SparkSession, path: str) -> bool:
     return bool(filesystem.exists(jpath))
 
 
+def _latest_glob_path(spark: SparkSession, path_pattern: str) -> str:
+    """Hadoop filesystem metadata만 조회해 glob과 일치하는 최신 경로를 반환한다."""
+    jpath = spark._jvm.org.apache.hadoop.fs.Path(path_pattern)
+    filesystem = jpath.getFileSystem(spark._jsc.hadoopConfiguration())
+    statuses = filesystem.globStatus(jpath)
+    if not statuses:
+        raise FileNotFoundError(f"경로와 일치하는 Parquet이 없습니다: {path_pattern}")
+    return max(str(status.getPath()) for status in statuses)
+
+
 def _validate_archive_schema(
     spark: SparkSession,
     source_id: str,
@@ -222,18 +232,16 @@ def _population_h_dng_cd() -> Column:
 def read_station_master(spark: SparkSession) -> DataFrame:
     """Silver `station_master_enriched`의 최신 snapshot을 우리 컬럼명으로 읽는다.
 
-    normalizer가 `dt=.../hh=.../HHMM.parquet`로 새 snapshot을 계속 쌓으므로 전체
-    prefix를 읽은 뒤 파일 경로가 가장 최신인 행만 남긴다. 날짜·시각 segment가
-    zero-padding된 키 계약이라 경로의 사전순 최대값이 최신 snapshot과 같다.
+    normalizer가 `dt=.../hh=.../HHMM.parquet`로 새 snapshot을 계속 쌓으므로 Hadoop
+    filesystem listing에서 최신 파일 하나를 먼저 고른 뒤 그것만 읽는다. 날짜·시각
+    segment가 zero-padding된 키 계약이라 경로의 사전순 최대값이 최신 snapshot과 같다.
 
     returns:
         DataFrame: station_id, station_no, station_name, capacity, lat, lon, grid_id
     """
     station_master_suffix = silver_schema.STATION_MASTER_ENRICHED_PREFIX.removeprefix("silver/")
-    path = f"{config.SILVER_ROOT}/{station_master_suffix}dt=*/hh=*/*.parquet"
-    df = spark.read.parquet(path).withColumn("_source_path", F.input_file_name())
-    latest_path = df.select(F.max("_source_path").alias("path")).first()["path"]
-    df = df.filter(F.col("_source_path") == latest_path).drop("_source_path")
+    path_pattern = f"{config.SILVER_ROOT}/{station_master_suffix}dt=*/hh=*/*.parquet"
+    df = spark.read.parquet(_latest_glob_path(spark, path_pattern))
     df = _rename(df, silver_schema.STATION_COLUMN_MAP)
     return df.select("station_id", "station_no", "station_name", "capacity", "lat", "lon", "grid_id")
 
@@ -432,10 +440,12 @@ def read_weather(
     valid = (
         F.col("temp").isNotNull()
         & ~F.isnan("temp")
-        & F.col("temp").between(-50.0, 50.0)
+        & F.col("temp").between(silver_schema.WEATHER_TEMP_MIN, silver_schema.WEATHER_TEMP_MAX)
         & F.col("precip").isNotNull()
         & ~F.isnan("precip")
-        & F.col("precip").between(0.0, 500.0)
+        & F.col("precip").between(
+            silver_schema.WEATHER_PRECIP_MIN, silver_schema.WEATHER_PRECIP_MAX
+        )
     )
     # tick별 전체 격자 평균만 만든다. 유효 행이 하나도 없는 tick은 빠지고,
     # build_merged_table의 과거 방향 forward-fill이 직전 유효 tick을 선택하므로

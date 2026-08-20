@@ -117,6 +117,13 @@ WEATHER_FORECAST_TIME_COLUMN = "fcstTime"
 # ml-integration-requests.md #11) — 다른 소스와 같은 3시간 격자를 잠정 가정한다.
 WEATHER_FORECAST_ISSUE_TICK_MINUTES = 180
 
+# Collector의 weather schema와 동일한 유효 범위. 학습과 추론이 이 상수를 함께
+# 써야 범위 밖 관측을 서로 다르게 받아들이는 train-serving skew가 생기지 않는다.
+WEATHER_TEMP_MIN = -50.0
+WEATHER_TEMP_MAX = 50.0
+WEATHER_PRECIP_MIN = 0.0
+WEATHER_PRECIP_MAX = 500.0
+
 
 def parse_kma_precip_text(value) -> float | None:
     """기상청 강수량 raw 값("강수없음"/"1.0mm 미만"/"30.0~50.0mm"/순수 숫자)을 float(mm)로 변환한다.

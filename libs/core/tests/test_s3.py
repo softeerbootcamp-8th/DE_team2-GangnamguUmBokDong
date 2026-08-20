@@ -3,6 +3,7 @@
 import pandas as pd
 import pyarrow as pa
 import pytest
+
 from core import s3
 
 
@@ -13,6 +14,19 @@ def test_get_object_bytes_missing_key_returns_none():
 def test_put_then_get_object_bytes_round_trip():
     s3.put_object_bytes("some/key.bin", b"hello world")
     assert s3.get_object_bytes("some/key.bin") == b"hello world"
+
+
+def test_put_then_get_object_metadata_without_reading_body():
+    s3.put_object_bytes(
+        "some/metadata.bin",
+        b"payload",
+        metadata={"source_window_start": "2026-08-20T10:05:00+09:00"},
+    )
+
+    assert s3.get_object_metadata("some/metadata.bin") == {
+        "source_window_start": "2026-08-20T10:05:00+09:00"
+    }
+    assert s3.get_object_metadata("some/missing.bin") is None
 
 
 def test_read_parquet_missing_key_returns_none():

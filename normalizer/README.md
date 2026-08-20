@@ -92,6 +92,11 @@ s3://<bucket>/
 붙이려면 격자 조인이 필요하므로, 하루 1회(`station_master` DAG) 미리 계산해
 `station_master_enriched` Silver로 굳혀 둔다.
 
+이 작업은 nowcast의 인구값이 아니라 정적인 `CELL_ID` geometry 목록만 사용한다.
+따라서 같은 시각에 도는 daily nowcaster와 경합해 당일 파일이 아직 없으면 미래 파일은
+제외한 최신 성공 nowcast를 사용한다. 실시간 인구 normalizer는 이 예외를 공유하지 않고
+대상 날짜의 exact nowcast가 없으면 계속 fail-closed한다.
+
 | 컬럼 | 타입 | 출처 | 결측 조건 |
 |---|---|---|---|
 | `station_id` | string | master `RNTLS_ID` | 없음(없는 행은 제외) |

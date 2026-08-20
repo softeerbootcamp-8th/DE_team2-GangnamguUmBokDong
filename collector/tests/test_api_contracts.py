@@ -3,10 +3,12 @@ from datetime import datetime, timedelta
 from itertools import pairwise
 from zoneinfo import ZoneInfo
 
-import adapters.kma_apihub
-import adapters.seoul_openapi  # noqa: F401
 import httpx
 import pytest
+from core.forecast import POPULATION_FORECAST_SLOT_COUNT
+
+import adapters.kma_apihub
+import adapters.seoul_openapi  # noqa: F401
 from adapters.base import Window, get_adapter
 from config import loader
 
@@ -104,7 +106,7 @@ def test_population_forecast_slots_are_hourly_and_in_the_future():
 
     row = rows[0]
     times = []
-    for slot in range(1, 13):
+    for slot in range(1, POPULATION_FORECAST_SLOT_COUNT + 1):
         raw = row.get(f"FCST_{slot}_TIME")
         assert raw is not None, f"슬롯 {slot}의 FCST_TIME이 없습니다: {sorted(row)}"
         times.append(datetime.strptime(raw, "%Y-%m-%d %H:%M").replace(tzinfo=KST))

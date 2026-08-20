@@ -8,13 +8,14 @@ import re
 import sys
 from datetime import datetime
 
-import grid
 import pyarrow as pa
-import storage
 from core.weather_grid import latlon_to_grid
 from pyproj import Transformer
 from shapely import STRtree
 from shapely.geometry import Point
+
+import grid
+import storage
 
 MIN_GRID_COVERAGE = 0.95
 STATION_NO_MIN = 1
@@ -186,13 +187,14 @@ def enrich_station_master(
 def run(window_start: datetime) -> int:
     """같은 window의 API master를 보강해 파티션 Silver와 manifest를 쓴다.
 
-    격자 목록은 nowcaster 추정치에서 얻는다 — 실측 원본은 관측일이 4~5일 늦어 그날의
-    파티션이 있다고 해서 그날 격자를 뜻하지 않는다(`storage.read_nowcast_grid` 참고).
+    격자 목록은 target date 이전 최신 nowcaster 추정치에서 얻는다. 인구값이 아닌
+    정적인 CELL_ID 목록만 쓰므로 당일 nowcaster와의 스케줄 경합은 이전 성공본으로
+    안전하게 피하고 미래 snapshot은 선택하지 않는다.
     """
     baseline_date = window_start.date()
 
     master_table = storage.read_station_master_silver(window_start)
-    grid_table = storage.read_nowcast_grid(baseline_date)
+    baseline_date, grid_table = storage.read_latest_nowcast_grid(baseline_date)
     realtime_table = storage.read_latest_bike_realtime_silver(window_start)
     output, metrics = enrich_station_master(master_table, grid_table, realtime_table)
     output_key = storage.write_enriched_station_master(window_start, output)
