@@ -36,7 +36,6 @@ def _write_parquet(path, df: pd.DataFrame) -> None:
 @pytest.fixture(autouse=True)
 def _silver_root(tmp_path, monkeypatch):
     monkeypatch.setattr(fe_config, "SILVER_ROOT", str(tmp_path / "silver"))
-    monkeypatch.setattr(fe_config, "TRAIN_YEAR", 2025)
     return tmp_path / "silver"
 
 

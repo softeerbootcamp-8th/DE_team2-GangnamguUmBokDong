@@ -30,6 +30,15 @@ import os
 
 from ml_core import common_config
 
+# --- 학습기간 롤링 윈도우 (Silver glob/공휴일 계산 범위 — silver_source.py,
+# build_merged_table.py) — 2026-08부터 고정 TRAIN_YEAR 대신 "오늘 기준 최근
+# TRAIN_LOOKBACK_MONTHS개월"로 매번 다시 계산한다(common_config.training_window()).
+# 매달 재학습 전에 feature_engine이 먼저 다시 도는데, 고정 연도면 다음 해로
+# 넘어갈 때마다 코드/환경변수를 수동으로 바꿔야 했다 — 이제 프로필의
+# TRAIN_LOOKBACK_MONTHS/TRAINING_SAFETY_MARGIN_DAYS 값만 바뀌면(재배포 없이,
+# S3 프로필 갱신만으로) 다음 실행부터 반영된다.
+WINDOW_START, WINDOW_END = common_config.training_window()
+
 # ml_core.s3_io가 boto3 쪽에서 쓰는 것과 같은 환경변수 — 기본값은 dev/MinIO의
 # 기본 버킷 이름("local-dev", dev/s3_client.py와 동일). 합성 데이터로 Spark
 # DataFrame을 직접 만들어 쓰는 테스트는 이 값을 몰라도 되므로(실제 S3 I/O를
@@ -54,10 +63,6 @@ RETURN_TARGETS_PARQUET = os.environ.get("RETURN_TARGETS_PARQUET", _s3a("processe
 STATION_STATUS_PARQUET = os.environ.get("STATION_STATUS_PARQUET", _s3a("processed_v2/station_status_2025.parquet"))
 WEATHER_PARQUET = os.environ.get("WEATHER_PARQUET", _s3a("processed_v2/weather_2025.parquet"))
 POPULATION_PARQUET = os.environ.get("POPULATION_PARQUET", _s3a("processed_v2/population_2025.parquet"))
-ANALYSIS_SUMMARY_JSON = os.environ.get("ANALYSIS_SUMMARY_JSON", _s3a("processed_v2/output/analysis_summary.json"))
-
-# --- 학습 대상 연도 (Silver glob을 이 연도로 좁히는 데 씀 — silver_source.py) ---
-TRAIN_YEAR = int(os.environ.get("TRAIN_YEAR", "2025"))
 
 # --- point-in-time censoring 파라미터 (src/config.py와 반드시 같은 값을 유지 — common_config.py에서 공유) ---
 ROLLING_TICK_MINUTES = common_config.ROLLING_TICK_MINUTES
@@ -69,10 +74,6 @@ ROLLING_EMBARGO_MINUTES = common_config.ROLLING_EMBARGO_MINUTES
 # 간격의 모든 T에 대해 예측 (build_targets.py의 future_rolling_counts()).
 TARGET_HORIZON_MINUTES = common_config.TARGET_HORIZON_MINUTES
 GRID_TICK_MINUTES = common_config.GRID_TICK_MINUTES
-
-# --- lag/rolling 피처 파라미터 (src/config.py와 동일 — common_config.py에서 공유) ---
-LAG_HOURS = common_config.LAG_HOURS
-ROLLING_WINDOWS = common_config.ROLLING_WINDOWS
 
 # --- 배치예측 horizon 개수 (common_config.py에서 공유 — build_multi_horizon_features.py 참고) ---
 HORIZON_COUNT = common_config.HORIZON_COUNT
@@ -96,10 +97,17 @@ OUTPUT_ROOT_KEY = f"{_OUTPUT_PREFIX}/{PARAM_COMBO_ID}"
 OUTPUT_ROOT = _s3a(OUTPUT_ROOT_KEY)
 ROLLING_RENTAL_FEATURES_PARQUET = f"{OUTPUT_ROOT}/rolling_rental_features_2025.parquet"
 MERGED_TABLE_PARQUET = f"{OUTPUT_ROOT}/station_hour_merged_2025.parquet"
-FEATURES_TABLE_PARQUET = f"{OUTPUT_ROOT}/station_hour_features_2025.parquet"
+# 순수 키(s3a:// 스킴 없음) 버전도 같이 둔다 — run_pipeline.py가 증분 실행 전
+# ml_core.s3_io(boto3)로 이 prefix 밑에 구버전 flat parquet이 섞여 있는지
+# 점검할 때 필요(Spark 리더/라이터는 FEATURES_TABLE_PARQUET(s3a://)를 그대로 씀).
+FEATURES_TABLE_KEY = f"{OUTPUT_ROOT_KEY}/station_hour_features_2025.parquet"
+FEATURES_TABLE_PARQUET = _s3a(FEATURES_TABLE_KEY)
 # FEATURES_TABLE_PARQUET의 각 행(T0)을 horizon=1..HORIZON_COUNT로 self-join한 학습 테이블
-# (build_multi_horizon_features.py) — libs/ml_core/paths.py의 같은 이름 상수와 동일 공식.
-MULTI_HORIZON_FEATURES_TABLE_PARQUET = f"{OUTPUT_ROOT}/station_hour_features_multihorizon_2025.parquet"
+# (build_multi_horizon_features.py). 대여/반납이 서로 다른 lag/타겟을 쓰는 완전히
+# 분리된 데이터셋이라 출력도 둘로 나뉜다 — libs/ml_core/paths.py의 같은 이름
+# 상수와 동일 공식.
+RENTAL_MULTI_HORIZON_FEATURES_TABLE_PARQUET = f"{OUTPUT_ROOT}/station_hour_features_multihorizon_rental_2025.parquet"
+RETURN_MULTI_HORIZON_FEATURES_TABLE_PARQUET = f"{OUTPUT_ROOT}/station_hour_features_multihorizon_return_2025.parquet"
 WATERMARK_PATH = f"{OUTPUT_ROOT_KEY}/_watermark.json"
 
 # --- 증분 재생성 시 얼마나 과거까지 다시 계산해서 겹치는 구간을 보정할지 (common_config.py에서 공유) ---

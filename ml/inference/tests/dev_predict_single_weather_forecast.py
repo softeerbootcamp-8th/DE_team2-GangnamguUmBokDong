@@ -1,0 +1,132 @@
+"""_resolve_live_weather()가 target_ts(예측 시점)가 anchor_ts(T0, "지금")보다
+미래일 때는 예보를, 그렇지 않을 때(또는 예보를 못 찾을 때)는 관측치를 쓰는지
+검증한다.
+
+2026-08: 예전엔 horizon과 무관하게 항상 `_get_recent_weather()`(관측, "지금 날씨"
+재사용)만 썼다 — target_ts가 anchor_ts보다 3시간(`_get_recent_weather`의 기본
+lookback_hours) 넘게 미래면 그 구간에 관측 데이터가 원천적으로 없어 ValueError로
+죽었다. `_get_forecast_weather()`(`weather_short_term_forecast`) 연동으로 그 구간을
+예보로 메운다 — collector의 예보 수집 브랜치가 아직 병합 전이라 실제 스키마는
+가정이므로(`silver_schema.py` 참고), 여기서는 "예보를 찾으면 그걸 쓰고 못 찾으면
+관측으로 폴백한다"는 계약만 검증한다(`_get_forecast_weather()` 내부 구현은 별도
+테스트에서 검증).
+"""
+
+import pandas as pd
+
+from inference import predict_single as ps
+
+
+def test_uses_observation_when_target_equals_anchor(monkeypatch):
+    """horizon=1(target_ts==anchor_ts)이면 예보를 아예 조회하지 않고 관측만 쓴다."""
+    anchor_ts = pd.Timestamp("2026-08-17 10:00:00")
+    forecast_calls = []
+    monkeypatch.setattr(ps, "_get_forecast_weather", lambda *a, **kw: forecast_calls.append(1) or None)
+    monkeypatch.setattr(ps, "_get_recent_weather", lambda target_ts, **kw: {"temp": 20.0, "precip": 0.0})
+
+    temp, precip = ps._resolve_live_weather(anchor_ts, anchor_ts, None, None)
+
+    assert not forecast_calls, "target_ts==anchor_ts인데 예보를 조회함"
+    assert (temp, precip) == (20.0, 0.0)
+
+
+def test_uses_observation_when_target_is_in_the_past(monkeypatch):
+    """target_ts가 anchor_ts보다 과거(수집 지연 재현)면 예보를 조회하지 않는다."""
+    anchor_ts = pd.Timestamp("2026-08-17 10:00:00")
+    target_ts = anchor_ts - pd.Timedelta(minutes=10)
+    forecast_calls = []
+    monkeypatch.setattr(ps, "_get_forecast_weather", lambda *a, **kw: forecast_calls.append(1) or None)
+    monkeypatch.setattr(ps, "_get_recent_weather", lambda target_ts, **kw: {"temp": 19.0, "precip": 0.5})
+
+    temp, precip = ps._resolve_live_weather(target_ts, anchor_ts, None, None)
+
+    assert not forecast_calls
+    assert (temp, precip) == (19.0, 0.5)
+
+
+def test_uses_forecast_when_target_is_in_the_future(monkeypatch):
+    """target_ts가 anchor_ts보다 미래(horizon>1)면 예보를 먼저 시도하고, 있으면 그걸 쓴다."""
+    anchor_ts = pd.Timestamp("2026-08-17 10:00:00")
+    target_ts = anchor_ts + pd.Timedelta(hours=5)
+    observation_calls = []
+    monkeypatch.setattr(ps, "_get_forecast_weather", lambda target_ts, **kw: {"temp": 25.0, "precip": 1.2})
+    monkeypatch.setattr(ps, "_get_recent_weather", lambda *a, **kw: observation_calls.append(1) or {})
+
+    temp, precip = ps._resolve_live_weather(target_ts, anchor_ts, None, None)
+
+    assert not observation_calls, "예보를 찾았는데 관측치도 조회함"
+    assert (temp, precip) == (25.0, 1.2)
+
+
+def test_falls_back_to_observation_when_forecast_missing(monkeypatch):
+    """미래 시각인데 예보를 못 찾으면(collector 미병합/수집 공백) 관측치(사실상 "지금
+    날씨" 재사용)로 폴백한다 — 조용히 저하되지만 크래시하지 않는다."""
+    anchor_ts = pd.Timestamp("2026-08-17 10:00:00")
+    target_ts = anchor_ts + pd.Timedelta(hours=5)
+    monkeypatch.setattr(ps, "_get_forecast_weather", lambda target_ts, **kw: None)
+    monkeypatch.setattr(ps, "_get_recent_weather", lambda target_ts, **kw: {"temp": 21.0, "precip": 0.0})
+
+    temp, precip = ps._resolve_live_weather(target_ts, anchor_ts, None, None)
+
+    assert (temp, precip) == (21.0, 0.0)
+
+
+def test_explicit_values_skip_both_lookups(monkeypatch):
+    """temp/precip을 직접 주면(테스트/디버깅용) 미래 시각이어도 조회 자체를 안 한다."""
+    anchor_ts = pd.Timestamp("2026-08-17 10:00:00")
+    target_ts = anchor_ts + pd.Timedelta(hours=5)
+    calls = []
+    monkeypatch.setattr(ps, "_get_forecast_weather", lambda *a, **kw: calls.append("forecast") or None)
+    monkeypatch.setattr(ps, "_get_recent_weather", lambda *a, **kw: calls.append("obs") or {})
+
+    temp, precip = ps._resolve_live_weather(target_ts, anchor_ts, 30.0, 2.0)
+
+    assert not calls
+    assert (temp, precip) == (30.0, 2.0)
+
+
+def _forecast_row(fcst_date: str, fcst_time: str, tmp: float, pcp) -> pd.DataFrame:
+    # 실제 기상청 raw 스키마 그대로: 타겟 시각은 fcstDate(YYYYMMDD)+fcstTime(HHMM)
+    # 두 컬럼으로 나뉘어 있고, PCP는 순수 숫자가 아니라 텍스트가 섞여 있다
+    # (loader/transform.py의 weather_forecast_from_silver()가 이미 이 스키마로 읽음).
+    return pd.DataFrame([{"fcstDate": fcst_date, "fcstTime": fcst_time, "TMP": tmp, "PCP": pcp}])
+
+
+def test_get_forecast_weather_picks_nearest_row_from_latest_issue_file(monkeypatch):
+    """가장 최근 발표 파일 안에서 target_ts와 가장 가까운 행을 고르고, PCP 텍스트를 mm로 파싱한다."""
+    target_ts = pd.Timestamp("2026-08-17 15:00:00")
+
+    def _fake_read_many(keys, columns=None):
+        # 최신 발표 파일(마지막 키)에 세 시각의 예보가 섞여 있고, target_ts(15:00)에
+        # 가장 가까운 건 다른 행이 아니라 15:00 정각 행이어야 한다.
+        latest = pd.concat([
+            _forecast_row("20260817", "1200", 20.0, "강수없음"),
+            _forecast_row("20260817", "1500", 24.0, "1.5mm"),
+            _forecast_row("20260817", "1800", 22.0, "1.0mm 미만"),
+        ])
+        return [None] * (len(keys) - 1) + [latest]
+
+    monkeypatch.setattr(ps.s3_io, "read_parquet_many", _fake_read_many)
+
+    result = ps._get_forecast_weather(target_ts)
+
+    assert result == {"temp": 24.0, "precip": 1.5}
+
+
+def test_get_forecast_weather_returns_none_when_no_files_found(monkeypatch):
+    target_ts = pd.Timestamp("2026-08-17 15:00:00")
+    monkeypatch.setattr(ps.s3_io, "read_parquet_many", lambda keys, columns=None: [None] * len(keys))
+
+    assert ps._get_forecast_weather(target_ts) is None
+
+
+def test_get_forecast_weather_returns_none_when_precip_unparseable(monkeypatch):
+    """PCP가 파싱 불가능한 값이면(빈 문자열 등) None을 돌려줘 관측치 fallback으로 넘어가게 한다."""
+    target_ts = pd.Timestamp("2026-08-17 15:00:00")
+
+    def _fake_read_many(keys, columns=None):
+        return [None] * (len(keys) - 1) + [_forecast_row("20260817", "1500", 24.0, None)]
+
+    monkeypatch.setattr(ps.s3_io, "read_parquet_many", _fake_read_many)
+
+    assert ps._get_forecast_weather(target_ts) is None
