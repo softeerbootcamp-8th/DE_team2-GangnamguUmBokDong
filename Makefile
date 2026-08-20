@@ -7,7 +7,7 @@ CI_INTEGRATION_PROJECTS := loader
 PLATFORM_COMPOSE := $(shell bash ops/compose/platform_args.sh)
 COMPOSE = docker compose $(if $(wildcard .env),--env-file .env,) -f ops/compose/docker-compose.yml $(PLATFORM_COMPOSE)
 
-.PHONY: sync-all sync-ci-unit lint test-gold-bootstrap test test-ci test-ci-unit test-ci-integration bootstrap up down logs ps seed
+.PHONY: sync-all sync-ci-unit lint test-gold-bootstrap test-gold-transition-available test test-ci test-ci-unit test-ci-integration bootstrap up down logs ps seed
 
 sync-all:
 	@for p in $(PROJECTS); do \
@@ -29,6 +29,9 @@ lint:
 
 test-gold-bootstrap:
 	bash ops/postgres/tests/test_bootstrap.sh
+
+test-gold-transition-available:
+	bash ops/gold/tests/run_transition_validation.sh
 
 test: test-gold-bootstrap
 	@for p in $(LOCAL_TEST_PROJECTS); do \

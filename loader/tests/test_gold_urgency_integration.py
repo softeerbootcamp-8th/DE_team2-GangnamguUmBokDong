@@ -81,7 +81,7 @@ def test_urgency_publish_replay_correction_rollback_stale_and_empty(
         bucket=_BUCKET,
     )
     anchor = datetime.now(UTC).replace(second=0, microsecond=0) - timedelta(minutes=30)
-    _insert_topology(gold_connection, anchor)
+    _insert_topology(gold_connection, store, anchor)
     station_dependency = load_dependencies(gold_connection, ("station",))[0]
     _put_stock_dependency(gold_connection, store, anchor, 0, current=1)
     _put_demand_dependency(
@@ -170,7 +170,11 @@ def test_urgency_publish_replay_correction_rollback_stale_and_empty(
     assert _urgency_rows(gold_connection) == corrected_rows
 
     empty_anchor = anchor + timedelta(minutes=10)
-    empty_station_dependency = _deactivate_station(gold_connection, empty_anchor)
+    empty_station_dependency = _deactivate_station(
+        gold_connection,
+        store,
+        empty_anchor,
+    )
     _put_stock_dependency(gold_connection, store, empty_anchor, 0, current=5)
     _put_demand_dependency(
         gold_connection,
@@ -456,7 +460,11 @@ def _upsert_state(cursor: Any, prepared: Any) -> None:
     )
 
 
-def _insert_topology(connection: Connection[Any], anchor: datetime) -> None:
+def _insert_topology(
+    connection: Connection[Any],
+    store: S3ImmutableObjectStore,
+    anchor: datetime,
+) -> None:
     """한 active station과 station dependency state를 clean DB에 만든다."""
     with connection.transaction(), connection.cursor() as cursor:
         cursor.execute(
@@ -512,53 +520,91 @@ def _insert_topology(connection: Connection[Any], anchor: datetime) -> None:
             """,
             (anchor - timedelta(hours=1), anchor - timedelta(minutes=5)),
         )
-        cursor.execute(
-            """
-            INSERT INTO gold_meta.publication_state (
-                publication_key,
-                logical_dttm,
-                revision_no,
-                manifest_uri,
-                artifact_set_sha256,
-                input_fingerprint_sha256,
-                published_row_cnt
-            ) VALUES ('station', %s, 0, %s, %s, %s, 1)
-            """,
-            (
-                anchor - timedelta(minutes=5),
-                f"s3://{_BUCKET}/station/publication-{'5' * 64}.json",
-                "6" * 64,
-                "7" * 64,
-            ),
-        )
+    _put_station_dependency(
+        connection,
+        store,
+        anchor - timedelta(minutes=5),
+    )
 
 
 def _deactivate_station(
     connection: Connection[Any],
+    store: S3ImmutableObjectStore,
     logical_dttm: datetime,
 ) -> Dependency:
     """Station을 inactive로 바꾸고 exact dependency state를 다음 revision으로 옮긴다."""
     with connection.transaction(), connection.cursor() as cursor:
         cursor.execute("UPDATE station SET is_active = false WHERE sta_id = 'ST-1'")
-        cursor.execute(
-            """
-            UPDATE gold_meta.publication_state
-               SET logical_dttm = %s,
-                   revision_no = 0,
-                   manifest_uri = %s,
-                   artifact_set_sha256 = %s,
-                   input_fingerprint_sha256 = %s,
-                   published_row_cnt = 1
-             WHERE publication_key = 'station'
-            """,
-            (
-                logical_dttm,
-                f"s3://{_BUCKET}/station/publication-{'8' * 64}.json",
-                "9" * 64,
-                "a" * 64,
-            ),
-        )
+    _put_station_dependency(connection, store, logical_dttm)
     return load_dependencies(connection, ("station",))[0]
+
+
+def _put_station_dependency(
+    connection: Connection[Any],
+    store: S3ImmutableObjectStore,
+    logical_dttm: datetime,
+) -> None:
+    """Station dependency state와 actual immutable manifest를 함께 기록한다."""
+    materials = materialize_publication(
+        store,
+        base_uri=_BASE_URI,
+        publication_key="station",
+        dependencies=tuple(
+            Dependency(
+                artifact_set_sha256=character * 64,
+                input_fingerprint_sha256=character * 64,
+                logical_dttm=logical_dttm - timedelta(hours=1),
+                manifest_uri=(
+                    f"s3://{_BUCKET}/{publication_key}/"
+                    f"publication-{character * 64}.json"
+                ),
+                publication_key=publication_key,
+                revision_no=0,
+            )
+            for publication_key, character in (
+                ("dispatch_center", "b"),
+                ("weather_grid", "c"),
+            )
+        ),
+        input_artifacts=(
+            InputArtifact(
+                byte_sha256="d" * 64,
+                role="bike_station_master_manifest",
+                uri=f"s3://{_BUCKET}/fixture/station-master-{'d' * 64}.json",
+            ),
+            InputArtifact(
+                byte_sha256="e" * 64,
+                role="station_realtime_window_set",
+                uri=f"s3://{_BUCKET}/fixture/station-window-{'e' * 64}.json",
+            ),
+        ),
+        parameters=(
+            Parameter("center_assignment_version", "integration-v1"),
+            Parameter("grid_conversion_version", "integration-v1"),
+            Parameter("station_policy_version", "integration-v1"),
+        ),
+        outputs=(
+            OutputObject(
+                role="station",
+                payload=parquet_bytes(
+                    pa.table({"sta_id": pa.array(["ST-1"], type=pa.string())})
+                ),
+                row_count=1,
+            ),
+        ),
+    )
+    prepared = build_prepared_publication(
+        base_uri=_BASE_URI,
+        publication_key="station",
+        logical_dttm=logical_dttm,
+        publisher_version="station-integration-v1",
+        revision_no=0,
+        target_row_counts={"station": 1},
+        materials=materials,
+    )
+    _store_prepared_manifest(store, prepared)
+    with connection.transaction(), connection.cursor() as cursor:
+        _upsert_state(cursor, prepared)
 
 
 def _advance_urgency_state_for_stale(
