@@ -3,12 +3,13 @@
 한다(`_stockout_from_status()` 참고, `predict_single.py` 모듈 docstring 참고).
 """
 
+import numpy as np
 import pandas as pd
 import pytest
 
 from inference import predict_single as ps
 
-_EMPTY_POPULATION = pd.DataFrame(columns=["pop_resd", "pop_long_foreign", "pop_short_foreign", "pop_total"])
+_EMPTY_POPULATION = pd.DataFrame(columns=["pop_total"])
 _EMPTY_BIKE_STATUS = pd.DataFrame(columns=["bike_count", "capacity", "stockout_flag"])
 _BIKE_STATUS_WITH_A = pd.DataFrame(
     {"bike_count": [0], "capacity": [10], "stockout_flag": [1]}, index=pd.Index(["A"], name="station_id")
@@ -19,8 +20,8 @@ _BIKE_STATUS_WITH_A = pd.DataFrame(
 def _reset_module_caches(monkeypatch):
     names = [
         "_history_by_station", "_rental_events_by_station", "_rental_events_coverage",
-        "_all_rental_events_sorted", "_station_profile", "_population_profile",
-        "_station_master", "_holidays",
+        "_all_rental_events_sorted", "_station_profile_station_index", "_station_profile_values",
+        "_population_profile", "_station_master", "_holidays_by_year",
     ]
     saved = {n: getattr(ps, n) for n in names}
     ps._rental_events_sorted_by_station = {}
@@ -44,16 +45,14 @@ def _set_rental_events(trips: pd.DataFrame) -> None:
     )
 
 
-def _set_history(station_id: str, hours, rental_counts, return_counts) -> None:
-    idx = pd.to_datetime(hours)
-    ps._history_by_station = {
-        station_id: pd.DataFrame({"rental_count": rental_counts, "return_count": return_counts}, index=idx)
-    }
+def _set_return_history(station_id: str, point, return_count: float = 0.0) -> None:
+    ps._history_by_station = {station_id: pd.DataFrame({"return_count": [return_count]}, index=[pd.Timestamp(point)])}
 
 
 def _set_station_master(station_ids: list[str]) -> None:
     ps._station_master = pd.DataFrame(
-        {"capacity": [10.0] * len(station_ids), "lat": [37.5] * len(station_ids), "lon": [127.0] * len(station_ids),
+        {"station_no": list(range(1, len(station_ids) + 1)),
+         "capacity": [10.0] * len(station_ids), "lat": [37.5] * len(station_ids), "lon": [127.0] * len(station_ids),
          "grid_id": ["G1"] * len(station_ids)},
         index=pd.Index(station_ids, name="station_id"),
     )
@@ -75,11 +74,12 @@ def _setup_single_station(station_id: str = "A") -> None:
         "end_dt": pd.Timestamp("2025-06-01 09:05:00"),
     }])
     _set_rental_events(trips)
-    _set_history(station_id, pd.date_range("2025-06-01 00:00", periods=200, freq="h"), [0] * 200, [0] * 200)
-    ps._station_profile = {}
+    _set_return_history(station_id, "2025-06-01 09:00:00")
+    ps._station_profile_station_index = {}
+    ps._station_profile_values = np.empty((0, 0, 0, 0, 0), dtype="float32")
     ps._population_profile = {}
     _set_station_master([station_id])
-    ps._holidays = set()
+    ps._holidays_by_year = {2025: set()}
 
 
 # --- 순수 로직: _stockout_from_status --------------------------------------------
@@ -118,7 +118,7 @@ def test_predict_rental_demand_reports_fallback_when_no_live_stockout_data(monke
     monkeypatch.setattr(ps, "predict", _fake_predict)
     monkeypatch.setattr(ps, "_get_recent_bike_status", lambda anchor_ts, lookback_hours=1.0: _EMPTY_BIKE_STATUS)
 
-    result = ps.predict_rental_demand(station_id="A", date="2025-06-01", hour=10, temp=20.0, precip=0.0, wind=1.0, humidity=50.0)
+    result = ps.predict_rental_demand(station_id="A", date="2025-06-01", hour=10, temp=20.0, precip=0.0)
 
     assert result["stockout_source"] == "fallback"
 
@@ -134,7 +134,7 @@ def test_predict_rental_demand_reports_provided_when_stockout_given_explicitly(m
     )
 
     result = ps.predict_rental_demand(
-        station_id="A", date="2025-06-01", hour=10, temp=20.0, precip=0.0, wind=1.0, humidity=50.0, stockout=True,
+        station_id="A", date="2025-06-01", hour=10, temp=20.0, precip=0.0, stockout=True,
     )
 
     assert result["stockout_source"] == "provided"
@@ -148,20 +148,21 @@ def test_predict_demand_multi_hour_all_stations_reports_fallback_per_station(mon
         for sid in ("A", "B")
     ])
     _set_rental_events(trips)
-    idx = pd.date_range("2025-06-01 00:00", periods=200, freq="h")
+    point = pd.Timestamp("2025-06-01 09:00:00")
     ps._history_by_station = {
-        sid: pd.DataFrame({"rental_count": [0] * 200, "return_count": [0] * 200}, index=idx) for sid in ("A", "B")
+        sid: pd.DataFrame({"return_count": [0.0]}, index=[point]) for sid in ("A", "B")
     }
-    ps._station_profile = {}
+    ps._station_profile_station_index = {}
+    ps._station_profile_values = np.empty((0, 0, 0, 0, 0), dtype="float32")
     ps._population_profile = {}
     _set_station_master(["A", "B"])
-    ps._holidays = set()
+    ps._holidays_by_year = {2025: set()}
     monkeypatch.setattr(ps, "predict", _fake_predict)
     # A만 실시간 현황에 있고 B는 없다.
     monkeypatch.setattr(ps, "_get_recent_bike_status", lambda anchor_ts, lookback_hours=1.0: _BIKE_STATUS_WITH_A)
 
     outcome = ps.predict_demand_multi_hour_all_stations(
-        date="2025-06-01", hour=10, temp=20.0, precip=0.0, wind=1.0, humidity=50.0,
+        date="2025-06-01", hour=10, temp=20.0, precip=0.0,
         station_ids=["A", "B"], n_hours=1,
     )
 

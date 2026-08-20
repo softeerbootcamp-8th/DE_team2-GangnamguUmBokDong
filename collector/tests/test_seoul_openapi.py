@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo
 
 import httpx
 import pytest
+
 from adapters.base import FetchErrorKind, Window
 from adapters.seoul_openapi import NaturalKeyCardinalityError, SeoulOpenApiAdapter
 
@@ -177,6 +178,22 @@ def test_fetch_yields_raw_response_unmodified():
     assert results[0].payload == raw
 
 
+@pytest.mark.parametrize("raw_total", ["invalid", -1, True, 1.5])
+def test_fetch_rejects_present_malformed_total(raw_total):
+    """total 기반 pagination은 malformed total을 unknown으로 축소하지 않는다."""
+    raw = _body(total=raw_total, rows=[{"a": "1"}])
+
+    def handler(request):
+        return httpx.Response(200, content=raw)
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    results = list(SeoulOpenApiAdapter.fetch(_config(), window=None, client=client))
+
+    assert len(results) == 1
+    assert results[0].payload is None
+    assert results[0].error is FetchErrorKind.PERMANENT
+
+
 class TestProbeUntilEmptyPagination:
     """페이지별 count가 전체가 아닌 bikeList의 탐색 계약을 검증한다."""
 
@@ -239,6 +256,25 @@ class TestProbeUntilEmptyPagination:
         )
 
         assert results[0].payload == first
+        assert results[-1].expected_total == 1
+        assert len(calls) == 2
+
+    def test_malformed_page_total_does_not_stop_probe(self):
+        """probe source는 신뢰하지 않는 page total 형식과 무관하게 sentinel까지 간다."""
+        first = _body(total="invalid", rows=[{"stationId": "ST-1"}])
+        empty = _body(total=-1, rows=[])
+        calls = []
+
+        def handler(request):
+            calls.append(str(request.url))
+            return httpx.Response(200, content=first if len(calls) == 1 else empty)
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        results = list(
+            SeoulOpenApiAdapter.fetch(_probe_config(), window=None, client=client)
+        )
+
+        assert [result.error for result in results] == [None, None]
         assert results[-1].expected_total == 1
         assert len(calls) == 2
 
