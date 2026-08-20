@@ -4,16 +4,16 @@
 
 이 문서는 [#155](https://github.com/softeerbootcamp-8th/DE_team2-GangnamguUmBokDong/issues/155)의
 검증 범위와 한계를 재현 가능한 형태로 고정한다. 구현 기준은
-`chore/gold-schema-postgis-redesign`의 최종 commit
-`6a5cbb931f58c7a57ff7e3683fb993c57512244e`이다. 물리 DDL과 데이터 계약은
+`chore/gold-schema-postgis-redesign`의 DDL과 #159에서 확정한 파생 publication 정책을 합친
+commit `eadf79f925eb64386d009af71fe36854d9e56dc5`이다. 물리 DDL과 데이터 계약은
 [target-schema.sql](target-schema.sql), [data-dictionary.md](data-dictionary.md),
 [source-target-mapping.md](source-target-mapping.md),
 [publication-contract-v1.md](publication-contract-v1.md)를 함께 사용한다.
 
-현재 전환 전체의 판정은 **PARTIAL/BLOCKED**다. 아래 전용 명령이 성공하면 현재 구현된
-범위의 회귀 증거는 모두 PASS지만, 파생 producer/publisher와 운영 권한 계약이 없으므로
-최초 publication 전체 체인이 완성됐다는 뜻은 아니다. 특히 직접 target에 넣은 fixture,
-monkeypatch, mock API로 통과한 테스트를 publication E2E 증거로 승격하지 않는다.
+현재 repository 안의 DDL, model/inference, source·derived publisher, CLI와 DAG 경계는
+**PASS**다. 운영 전환 전체는 승인 weather seed와 서비스별 권한 계약, 실제 scheduler와
+browser를 잇는 live 실행이 없으므로 **PARTIAL/BLOCKED**를 유지한다. 특히 직접 target에
+넣은 fixture, monkeypatch, mock API로 통과한 테스트를 publication E2E 증거로 승격하지 않는다.
 
 관련 작업은 상위 [#149](https://github.com/softeerbootcamp-8th/DE_team2-GangnamguUmBokDong/issues/149)와
 stacked PR [#156](https://github.com/softeerbootcamp-8th/DE_team2-GangnamguUmBokDong/pull/156) →
@@ -21,8 +21,8 @@ stacked PR [#156](https://github.com/softeerbootcamp-8th/DE_team2-GangnamguUmBok
 [#158](https://github.com/softeerbootcamp-8th/DE_team2-GangnamguUmBokDong/pull/158) →
 [#159](https://github.com/softeerbootcamp-8th/DE_team2-GangnamguUmBokDong/pull/159) →
 [#160](https://github.com/softeerbootcamp-8th/DE_team2-GangnamguUmBokDong/pull/160)에 있다.
-PR #159와 #160은 blocker가 해소될 때까지 Draft이며, 이 runbook도 merge나 배포 가능 판정을
-대신하지 않는다.
+PR #156부터 #160까지는 `develop`에 병합됐다. 이 runbook은 최종 stack을 다시 검증하지만
+운영 credential 승인이나 배포 가능 판정을 대신하지 않는다.
 
 ## 판정 기준
 
@@ -36,16 +36,16 @@ PR #159와 #160은 blocker가 해소될 때까지 Draft이며, 이 runbook도 me
 | --- | --- | --- | --- |
 | clean bootstrap, schema check, baseline 재적용 | PASS | 빈 PostGIS 16-3.5에 최종 DDL 적용, read-only checker, 두 번째 적용 exit 3과 기존 상태 불변 | 기존 DB migration, RDS 적용 |
 | DDL 제약, 공간 조회·GiST plan | PASS | transaction fixture의 정상·오류·Point·meter 거리·index plan 및 추가 edge SQL | publisher가 만든 실제 lineage |
-| 두 session lock 경쟁 | PASS | publication, topology/route, dispatch/stop advisory-lock 경쟁과 timeout/deadlock 부재 | 미구현 파생 publisher와 API의 장시간 부하 경쟁 |
+| 두 session lock 경쟁 | PASS | publication, topology/route, dispatch/stop advisory-lock 경쟁과 timeout/deadlock 부재 | 실제 scheduler와 API의 장시간 부하 경쟁 |
 | publication 공통 기반 | PASS | canonical bytes, immutable object, manifest-last, replay/stale/correction/EMPTY, 미래 시각, 원자 rollback | 실제 S3/RDS credential과 role ACL |
-| Collector authority와 source publisher | PASS | immutable source manifest fixture → 공통 publication 경계 → 실제 PostGIS target/state 경로 | 운영 API 응답의 완전성, 승인 전 weather seed, 신규 station 활성화 |
-| demand·urgency·route 파생 계산 | PARTIAL | expected set, 12 horizon, 반올림, EMPTY, route coverage/UUID/capacity의 순수 projection과 artifact readback | immutable upstream producer, Gold publication manifest, target/state mutation, CLI/DAG 실행 |
+| Collector authority와 source publisher | PASS | immutable source manifest fixture → 공통 publication 경계 → 실제 PostGIS target/state 경로 | 운영 API 응답의 완전성, 승인 weather seed를 사용한 최초 실행 |
+| model·inference와 demand·urgency·route | PASS | immutable pair release, plan-bound inference, 4-key finalize, actual manifest, PostGIS target/state, replay/correction/EMPTY/rollback, CLI·DAG wiring | 실제 S3 credential과 scheduler를 사용한 한 번의 live lineage |
 | API | PARTIAL | 실제 PostGIS에서 좌표·거리·freshness·404/409/503·route 전이를 조회 | source/derived publisher가 채운 target을 읽는 publication E2E |
 | Web | PARTIAL | mock API에서 stale clear, 404/503, polling race, weather와 event 상태 및 production build | 실제 API/DB와 연결한 browser E2E |
 | Airflow | PARTIAL | DAG import, dependency graph, allowlisted publisher CLI command wiring | scheduler가 source부터 target까지 실행한 task E2E |
 | publisher/API 최소 권한 | BLOCKED | `PUBLIC` revoke만 존재 | 서비스별 role·credential·GRANT/REVOKE 검증 |
-| weather seed와 station activation | BLOCKED | fixture seed와 inactive station 경계만 검증 | 승인 seed를 사용한 최초 게시와 신규·재활성 station의 활성화 |
-| full derived publication과 최초 전체 체인 | BLOCKED | 없음 | seed → source → demand → urgency → route → API의 하나의 lineage chain |
+| weather seed와 station activation | PARTIAL/BLOCKED | 13시간 weather·stock·model support를 같은 lock에서 검증하는 activation 통합 테스트 | 승인 seed 값으로 실행한 최초 activation |
+| 최초 전체 체인 | PARTIAL | producer/publisher별 실제 artifact·PostGIS 통합과 Airflow dependency graph | seed → source → inference → finalize → urgency → route → API를 한 scheduler run으로 실행한 lineage |
 
 ## A. 현재 한 명령으로 검증 가능한 범위
 
@@ -62,7 +62,7 @@ Make target은 [run_transition_validation.sh](../../ops/gold/tests/run_transitio
 실패하면 뒤 단계의 성공을 근거로 사용하지 않는다.
 
 1. 필요한 executable과 설치된 project environment를 확인하고, 최종 SSOT 파일이 commit
-   `6a5cbb931f58c7a57ff7e3683fb993c57512244e`의 blob과 같은지 검사한다.
+   `eadf79f925eb64386d009af71fe36854d9e56dc5`의 blob과 같은지 검사한다.
 2. [bootstrap guard 테스트](../../ops/postgres/tests/test_bootstrap.sh)로 marker 없는 기존
    `PG_VERSION` 경로의 exit 78, wrapper 실패 전파, schema checker fail-closed를 mock
    경계에서 확인한다.
@@ -81,13 +81,14 @@ Make target은 [run_transition_validation.sh](../../ops/gold/tests/run_transitio
 7. 같은 disposable container에서
    [target-schema-concurrency-validation.sh](target-schema-concurrency-validation.sh)를 실행해
    실제 두 session의 lock 직렬화와 no-timeout/no-deadlock을 확인한다.
-8. Core의 canonical byte·artifact·manifest·transaction 테스트, Collector의 immutable
-   source authority 테스트, Loader의 source publisher PostGIS 통합과 demand/urgency/route
-   projection 테스트를 실행한다.
-9. API 단위 테스트와 같은 disposable DB의 PostGIS 소비 통합 테스트를 실행한다.
-10. Airflow DAG import·publisher wiring focused 테스트를 실행한다.
-11. Web Vitest와 TypeScript/Vite production build를 실행한다.
-12. 시작 시 기록한 tracked status와 종료 status가 같은지 비교하고 `git diff --check`를
+8. Core의 canonical byte·artifact·manifest·transaction·inference/model 계약과 Collector의
+   immutable source authority 테스트를 실행한다.
+9. ML Core pair serving release, inference producer/CLI, model promotion 테스트를 실행한다.
+10. Loader의 source·derived publisher와 4-key serving plan PostGIS 통합, serving CLI를 실행한다.
+11. API 단위 테스트와 같은 disposable DB의 PostGIS 소비 통합 테스트를 실행한다.
+12. Airflow DAG import·publisher wiring·module environment isolation 테스트를 실행한다.
+13. Web Vitest와 TypeScript/Vite production build를 실행한다.
+14. 시작 시 기록한 tracked status와 종료 status가 같은지 비교하고 `git diff --check`를
     다시 실행한다.
 
 명령의 exit code가 0이고 모든 phase가 PASS일 때만 위 표의 PASS/PARTIAL 증거를 유효하게
@@ -102,15 +103,15 @@ disposable URL을 주므로 skip되어서는 안 된다. 예상하지 않은 ski
 - SSOT blob, shell syntax, bootstrap safety, clean DDL, read-only checker, SSOT validation,
   edge SQL, baseline 재적용 exit 3, schema 재검사와 3개 two-session concurrency contract:
   모두 PASS
-- Core 178, Collector 271, Loader 243, API 56, Airflow 58: Python 합계 806 passed,
-  skip/xfail/xpass 0
+- Core 302, Collector 302, ML Core 36, Inference 126, Training 21, Loader 277,
+  API 56, Airflow 54: Python 합계 1,174 passed, skip/xfail/xpass 0
 - Web: 24 tests passed, TypeScript/Vite production build PASS
 - 최종 tracked status와 `git diff --check`: PASS
 - runner 소유 container 잔존 수: 0; named volume 생성·삭제: 0
-- warm cache 실제 wall time: 약 61초
+- warm cache 실제 wall time: 약 2분 10초
 
-이 기록도 위 matrix의 PASS/PARTIAL 경계 안에서만 해석한다. 특히 Python 806 passed를 full
-publication E2E 806건으로 표현하지 않는다.
+이 기록도 위 matrix의 PASS/PARTIAL 경계 안에서만 해석한다. 특히 Python 1,174 passed를
+하나의 live publication E2E 1,174건으로 표현하지 않는다.
 
 ## 실행 안전 경계
 
@@ -133,7 +134,7 @@ publication E2E 806건으로 표현하지 않는다.
   `uv run --frozen`으로 사용하고 PostgreSQL client는 disposable container 안의 도구를
   사용한다.
 
-2026-08-20 KST warm cache 실측은 약 61초였다. 일반 warm 환경에서는 1~3분을 예상한다.
+2026-08-20 KST warm cache 실측은 약 2분 10초였다. 일반 warm 환경에서는 2~5분을 예상한다.
 image 또는 dependency가 cold인 환경은 network와 disk 속도에 따라 달라지므로 15~30분을
 확보한다. image pull과 dependency 준비 시간은 테스트 실행 시간과 분리해서 기록한다.
 
@@ -182,16 +183,17 @@ publication 시작점이나 실제 producer를 우회한다.
    증거이며 실제 외부 장애의 E2E 재현은 아니다. station activation을 monkeypatch로 연
    topology/route case와 dependency용 target을 직접 INSERT한 case도 activation/full-chain
    증거로 계산하지 않는다.
-7. demand·urgency·route 테스트는 canonical Parquet과 locked expected projection을 검증하지만
-   production producer, immutable success manifest, 공통 executor를 통한 target/state mutation이
-   없다. 따라서 결과가 모두 PASS해도 derived publication E2E는 PARTIAL이다.
+7. model/inference와 demand·urgency·route 통합 테스트는 immutable artifact·manifest와 공통
+   executor를 거쳐 실제 disposable PostGIS target/state를 바꾼다. 따라서 각 publication
+   경계의 test-level E2E 증거다. 다만 모든 source collector와 실제 scheduler, S3 credential,
+   API를 한 실행으로 잇지는 않으므로 live lineage E2E 증거는 아니다.
 
 ## C. BLOCKED 범위와 SSOT 결정 항목
 
 ### 서비스 role과 GRANT matrix
 
 [#151 blocker](https://github.com/softeerbootcamp-8th/DE_team2-GangnamguUmBokDong/issues/151#issuecomment-5346082689)에는
-`PUBLIC` revoke 이후 서비스별 권한 계약이 없다. 다음을 #129/PR #145의 SSOT에 먼저 확정해야
+`PUBLIC` revoke 이후 서비스별 권한 계약이 없다. 다음을 #129 보안 계약에 먼저 확정해야
 한다.
 
 1. publisher, API read, route operator에 사용할 login/group role 이름
@@ -214,50 +216,34 @@ API의 `gold_meta` 접근·일반 target write 거부, route operator의 제한�
 
 fixture의 `weather-grid-v1` 같은 값은 승인값이 아니므로 운영 manifest에 재사용하지 않는다.
 두 값을 SSOT에 확정한 뒤 immutable seed bytes를 만들고 `seed:weather_grid` publisher로 최초
-게시한다. 이후 동일 topology lock 안에서 weather 13시간과 demand model support가 준비된
-station만 활성화한다. 현재 신규·재활성 station은 의도적으로 inactive이며, activation과
-그 뒤 전체 source publication chain은 BLOCKED다.
+게시한다. 동일 topology lock 안에서 weather 13시간, current stock과 demand model support가
+준비된 station만 활성화하는 코드·PostGIS 경계는 검증됐다. 다만 승인 seed를 쓰는 최초 운영
+activation은 두 값이 정해질 때까지 BLOCKED다.
 
-### inference와 model immutable byte contract
+### 확정된 model·inference·urgency 계약
 
-[#153 blocker](https://github.com/softeerbootcamp-8th/DE_team2-GangnamguUmBokDong/issues/153#issuecomment-5348088645)에
-다음 actual-byte 계약이 없다.
+#159에서 이전 #153 blocker를 기존 코드 의미와 publication 원칙에 따라 확정했다.
 
-1. `inference_output`이 direct canonical Parquet인지 success manifest인지
-2. inference success manifest의 `schema_version`, exact key/order, status, logical time과
-   revision, output URI/SHA-256, expected/actual/failed count, model binding
-3. rental/return model manifest의 exact schema와 immutable champion bundle URI/SHA-256
-4. 각 모델 support ID artifact 또는 digest의 형식과 manifest 결합 방식
-5. champion discovery/current pointer, manifest-last, same-logical correction 규칙
+- model pair는 immutable artifact·support IdSet·effective serving contract를 한 release와
+  pointer-last CAS로 고정한다.
+- inference는 plan URI/SHA, 두 model manifest, station dependency와 expected IdSet을 소유하고
+  exact 7-column output을 manifest-last로 게시한다.
+- urgency history `01` … `05`는 oldest → newest(`t-25m` … `t-5m`), current stock은 별도 role,
+  `stock_window_count="6"`, `scoring_config_version="urgency-scoring-v1"`이다.
+- coordinated finalize와 demand·urgency·route publisher는 correction, stale, conditional EMPTY,
+  target/state rollback과 exact replay를 disposable PostGIS에서 검증한다.
 
-확정 뒤 rental/return model producer → immutable bundle/support → inference output
-manifest-last → demand publisher → PostGIS replay/stale/correction/EMPTY/rollback → CLI/Airflow
-순으로 구현하고 검증한다. 이 전에는 demand production publisher와 이를 전제로 한 station
-activation을 열지 않는다.
-
-### urgency history와 scoring config
-
-같은 [#153 blocker](https://github.com/softeerbootcamp-8th/DE_team2-GangnamguUmBokDong/issues/153#issuecomment-5348088645)에
-fingerprint bytes를 결정하는 다음 값이 없다.
-
-1. `stock_history_manifest_01` … `05`가 oldest → newest인지 newest → oldest인지
-2. `stock_window_count`가 과거 5개만 뜻하는지 현재 `stock_publication_manifest`를 포함한
-   6개인지, 그리고 parameter에 기록할 exact 값
-3. `scoring_config_version`의 exact 문자열과 그 버전이 가리키는 immutable config bytes
-
-확정 뒤 urgency producer/output manifest와 publisher를 구현하고, same-anchor dependency,
-correction invalidation, EMPTY, rollback을 실제 DB에서 검증한다. 그 다음에만 route
-producer/publisher, locked route coverage, header/stop 원자 게시와 derived DAG를 연결한다.
+따라서 이 항목들은 더 이상 SSOT blocker가 아니다. 운영 S3와 scheduler를 잇지 않은 한계는
+byte contract 부재가 아니라 live E2E 범위의 PARTIAL로 분류한다.
 
 ### blocker의 결과
 
 위 결정 전에는 다음 항목을 완료로 표시할 수 없다.
 
 - 승인 seed와 weather/demand coverage를 사용한 신규·재활성 station activation
-- demand, urgency, route의 production producer/publisher·CLI·Airflow 실행
 - publisher/API/route-operator role ACL 검증
 - grid/center → station/stock → demand/weather/event → urgency → route → API의 full
-  first-publication chain
+  first-publication live chain
 
 ## 실패 해석과 재개 절차
 
@@ -267,12 +253,12 @@ producer/publisher, locked route coverage, header/stop 원자 게시와 derived 
 | container 시작 또는 readiness | Docker daemon, image pull, local resource 문제 | runner가 exact container를 정리했는지 확인한 뒤 같은 명령을 재실행한다. 기존 Compose DB나 RDS로 대체하지 않는다. |
 | bootstrap/schema/reapply | 최종 DDL, wrapper 또는 fail-fast 회귀 | 해당 phase 로그와 exit code를 보존하고 빈 disposable DB에서만 재현한다. 재적용의 기대 exit 3을 성공으로 바꾸지 않는다. |
 | edge SQL 또는 concurrency | 제약·공간·lock 순서 회귀 | 실패 assertion/session을 확인하고 SSOT와 구현을 수정한 뒤 전체 전용 명령을 처음부터 다시 실행한다. timeout을 무조건 늘려 숨기지 않는다. |
-| Core/Collector/Loader | byte contract, source authority, mutation 원자성 또는 projection 회귀 | 출력된 focused pytest node를 먼저 재현하고 수정한 뒤 전체 명령을 재실행한다. 기존 test 삭제·skip/xfail 추가는 금지한다. |
+| Core/Collector/ML/Inference/Loader | byte contract, source authority, model pair, inference 또는 mutation 원자성 회귀 | 출력된 focused pytest node를 먼저 재현하고 수정한 뒤 전체 명령을 재실행한다. 기존 test 삭제·skip/xfail 추가는 금지한다. |
 | API | 소비 SQL/freshness/error mapping 회귀 또는 직접 fixture 불일치 | API 단위를 수정하고 같은 final DDL의 새 disposable DB로 재실행한다. 직접 fixture PASS를 publisher E2E로 기록하지 않는다. |
-| Airflow | DAG import/dependency/CLI wiring 회귀 | task graph와 allowlist를 수정하되 blocked derived CLI를 가짜로 연결하지 않는다. |
+| Airflow | DAG import/dependency/CLI wiring 회귀 | task graph와 allowlist를 production CLI/XCom 계약에 맞게 수정한다. |
 | Web | DTO/state/race/type/build 회귀 | focused Vitest와 build를 수정한 뒤 전체 명령을 재실행한다. mock PASS를 live E2E로 기록하지 않는다. |
 | 예상하지 않은 skip/xfail | disposable DB 주입 또는 test discovery가 깨짐 | PASS로 기록하지 말고 runner 환경·node selection을 고친 뒤 재실행한다. |
 
-SSOT 결정이 내려오면 해당 이슈에 exact 값과 문서 commit을 연결한다. 위 순서대로 구현과
-격리 통합 테스트를 추가한 후 이 matrix에서 해당 행만 BLOCKED → PARTIAL → PASS로 이동한다.
-구조·key·상태·nullable 또는 byte contract를 추정해 blocker를 우회하지 않는다.
+남은 role/GRANT와 weather seed 결정이 내려오면 해당 이슈에 exact 값과 문서 commit을
+연결한다. 승인값을 사용한 격리 통합 테스트를 추가한 후 해당 행만 BLOCKED → PARTIAL →
+PASS로 이동한다. 구조·key·상태·nullable 또는 byte contract를 추정해 blocker를 우회하지 않는다.

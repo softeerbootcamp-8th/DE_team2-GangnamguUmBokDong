@@ -5,7 +5,7 @@ umask 077
 
 readonly REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 readonly POSTGIS_IMAGE="postgis/postgis:16-3.5"
-readonly SSOT_COMMIT="6a5cbb931f58c7a57ff7e3683fb993c57512244e"
+readonly SSOT_COMMIT="eadf79f925eb64386d009af71fe36854d9e56dc5"
 readonly -a SSOT_FILES=(
     "docs/gold/target-schema.sql"
     "docs/gold/data-dictionary.md"
@@ -190,6 +190,21 @@ apply_target_schema() {
         --file /tmp/gold-transition-contracts/target-schema.sql
 }
 
+reset_integration_database() {
+    # package 통합 테스트 사이의 target/state/object-store fixture를 완전히 격리한다.
+    docker exec \
+        --env "PGPASSWORD=${POSTGRES_PASSWORD}" \
+        "${container_id}" \
+        dropdb --if-exists --force \
+        --username "${POSTGRES_USER}" "${INTEGRATION_DATABASE}"
+    docker exec \
+        --env "PGPASSWORD=${POSTGRES_PASSWORD}" \
+        "${container_id}" \
+        createdb --username "${POSTGRES_USER}" "${INTEGRATION_DATABASE}"
+    apply_target_schema "${INTEGRATION_DATABASE}"
+    run_schema_check "${INTEGRATION_DATABASE}"
+}
+
 run_schema_check() {
     # 서비스 시작 전 read-only schema checker를 컨테이너 내부에서 재사용한다.
     local database_name=$1
@@ -240,6 +255,13 @@ run_core_tests() (
         tests/test_gold_publication_exports.py \
         tests/test_gold_publication_storage.py \
         tests/test_gold_publication_transaction.py \
+        tests/test_db.py \
+        tests/test_inference_catalog.py \
+        tests/test_inference_snapshot.py \
+        tests/test_model_snapshot.py \
+        tests/test_s3.py \
+        tests/test_scoring_config_contract.py \
+        tests/test_source_snapshot_io.py \
         tests/test_source_snapshot.py
 )
 
@@ -258,10 +280,44 @@ run_collector_tests() (
         tests/test_storage.py
 )
 
+run_ml_core_tests() (
+    # 고정된 model pair release와 scoring artifact 경계를 검증한다.
+    cd "${REPO_ROOT}/libs/ml_core"
+    run_pytest_no_skips "ml-core" uv run --frozen pytest -q \
+        tests/dev_pinned_scoring.py \
+        tests/dev_serving_release.py
+)
+
+run_inference_tests() (
+    # plan-bound inference producer, CLI와 runtime projection을 검증한다.
+    cd "${REPO_ROOT}/ml/inference"
+    run_pytest_no_skips "inference" uv run --frozen pytest -q \
+        tests/dev_config.py \
+        tests/dev_predict_common.py \
+        tests/dev_predict_single_api_contract.py \
+        tests/dev_predict_single_multi_horizon.py \
+        tests/dev_predict_single_population_normalized.py \
+        tests/dev_predict_single_rental_censoring.py \
+        tests/dev_predict_single_station_master.py \
+        tests/dev_predict_single_station_profile.py \
+        tests/dev_predict_single_stockout_source.py \
+        tests/dev_predict_single_weather_forecast.py \
+        tests/dev_publication.py \
+        tests/dev_publication_cli.py
+)
+
+run_training_tests() (
+    # immutable model pair promotion과 pointer-last 경계를 검증한다.
+    cd "${REPO_ROOT}/ml/training"
+    run_pytest_no_skips "training" uv run --frozen pytest -q \
+        tests/dev_promotion.py
+)
+
 run_loader_tests() (
     # source/derived publisher와 실제 PostGIS 원자성 테스트만 실행한다.
+    local integration_test
     cd "${REPO_ROOT}/loader"
-    run_pytest_no_skips "loader" \
+    run_pytest_no_skips "loader-source" \
         env GOLD_PUBLICATION_TEST_DATABASE_URL="${integration_database_url}" \
         uv run --frozen pytest -q \
         tests/gold \
@@ -275,7 +331,20 @@ run_loader_tests() (
         tests/test_gold_versioning.py \
         tests/test_gold_weather_forecast_integration.py \
         tests/test_gold_weather_grid.py \
-        tests/test_main.py
+        tests/test_main.py \
+        tests/test_predictions_key_contract.py \
+        tests/test_serving_cli.py
+
+    for integration_test in \
+        tests/test_gold_demand_integration.py \
+        tests/test_gold_serving_plan_integration.py \
+        tests/test_gold_urgency_integration.py \
+        tests/test_gold_rebalance_route_integration.py; do
+        reset_integration_database
+        run_pytest_no_skips "loader-${integration_test##*/}" \
+            env GOLD_PUBLICATION_TEST_DATABASE_URL="${integration_database_url}" \
+            uv run --frozen pytest -q "${integration_test}"
+    done
 )
 
 run_api_tests() (
@@ -298,6 +367,7 @@ run_airflow_tests() (
         AIRFLOW__CORE__LOAD_EXAMPLES=false \
         uv run --frozen pytest -q \
         tests/test_dag_imports.py \
+        tests/test_compose_runtime.py \
         tests/test_daily_population_and_events.py \
         tests/test_realtime_5min.py \
         tests/test_task_builders.py \
@@ -330,10 +400,10 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 cat <<'EOF'
-[gold-transition] PARTIAL 전환 검증을 시작합니다.
-[gold-transition] 확정된 DDL·publication 계약과 현재 구현된 경로만 검증합니다.
-[gold-transition] DB role/GRANT 및 파생 inference·urgency 입력 계약 blocker가 남아 있어
-[gold-transition] full E2E·운영 readiness 검증으로 표방하지 않습니다.
+[gold-transition] Gold 전환 통합 검증을 시작합니다.
+[gold-transition] 확정된 DDL·model/inference/publication 계약과 production 경계를 검증합니다.
+[gold-transition] 운영 role/GRANT와 승인 weather seed는 별도 정책 입력이 필요하므로
+[gold-transition] 실제 credential·scheduler·browser를 포함한 운영 E2E로 표방하지 않습니다.
 EOF
 
 begin_step "caller DB 환경 격리 및 필수 도구 확인"
@@ -465,10 +535,21 @@ run_core_tests
 begin_step "Collector authority focused tests"
 run_collector_tests
 
+begin_step "ML serving release focused tests"
+run_ml_core_tests
+
+begin_step "inference producer focused tests"
+run_inference_tests
+
+begin_step "model promotion focused tests"
+run_training_tests
+
 begin_step "source·derived Loader focused tests"
+reset_integration_database
 run_loader_tests
 
 begin_step "API Gold/PostGIS focused tests"
+reset_integration_database
 run_api_tests
 
 begin_step "Airflow publication DAG focused tests"
@@ -490,9 +571,9 @@ if [[ "${final_tracked_status}" != "${initial_tracked_status}" ]]; then
     fail "검증 실행 중 tracked worktree가 변경되었습니다."
 fi
 
-current_step="PARTIAL 검증 완료"
+current_step="전환 통합 검증 완료"
 cat <<'EOF'
-[gold-transition] PARTIAL 검증 완료: 현재 구현 가능한 clean DDL, 재실행,
-[gold-transition] stale·correction·EMPTY·원자성·동시성 및 소비자 focused test를 통과했습니다.
-[gold-transition] 이 결과는 unresolved contract와 운영 권한을 포함한 full E2E가 아닙니다.
+[gold-transition] 검증 완료: clean DDL, model/inference, source·derived publication,
+[gold-transition] stale·correction·EMPTY·원자성·동시성 및 소비자 경계를 통과했습니다.
+[gold-transition] 이 결과는 운영 credential·scheduler·browser를 포함한 live E2E가 아닙니다.
 EOF
