@@ -102,6 +102,28 @@ def test_train_target_ends_run_as_finished_on_success(monkeypatch):
     assert saved_profile["ROLLING_EMBARGO_MINUTES"] == 55
 
 
+def test_deferred_valid_dataset_keeps_full_streaming_validation(monkeypatch):
+    """저메모리 모드는 native valid를 생략해도 전체 valid 평가와 고정 round를 보존한다."""
+    _seed_return_table()
+    monkeypatch.setattr(config, "LGB_DEFER_VALID_DATASET", True)
+
+    metrics = train_target(
+        "return_count",
+        "return",
+        models_prefix="models/test/deferred-valid",
+    )
+
+    assert metrics["train_row_count"] == 8
+    assert metrics["valid_row_count"] == 8
+    assert metrics["test_row_count"] == 8
+    assert 1 <= metrics["best_iteration"] <= config.LGB_NUM_BOOST_ROUND
+    assert metrics["requested_num_boost_round"] == config.LGB_NUM_BOOST_ROUND
+    assert metrics["early_stopping_used"] is False
+    run = _latest_run(config.MLFLOW_EXPERIMENT_NAME)
+    assert run.info.status == "FINISHED"
+    assert run.data.params["lgb_defer_valid_dataset"] == "True"
+
+
 def test_train_target_ends_run_as_failed_on_exception(monkeypatch):
     _seed_return_table()
     monkeypatch.setattr(
