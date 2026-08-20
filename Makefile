@@ -7,7 +7,7 @@ CI_INTEGRATION_PROJECTS := loader
 PLATFORM_COMPOSE := $(shell bash ops/compose/platform_args.sh)
 COMPOSE = docker compose $(if $(wildcard .env),--env-file .env,) -f ops/compose/docker-compose.yml $(PLATFORM_COMPOSE)
 
-.PHONY: sync-all sync-ci-unit lint test-gold-bootstrap test-gold-transition-available test test-ci test-ci-unit test-ci-integration bootstrap up down logs ps seed
+.PHONY: sync-all sync-ci-unit lint test-gold-bootstrap test-gold-transition-available test test-ci test-ci-unit test-ci-integration bootstrap up down logs ps seed training-smoke
 
 sync-all:
 	@for p in $(PROJECTS); do \
@@ -115,3 +115,6 @@ seed:
 	@echo "[gold-postgis] make seed는 weather grid seed_version/effective_dttm SSOT 확정 전이라 비활성화되었습니다." >&2
 	@echo "[gold-postgis] 승인된 값으로 loader/gold_cli.py의 seed:dispatch_center, seed:weather_grid를 명시적으로 실행하세요." >&2
 	@false
+
+training-smoke:
+	bash ops/training_smoke.sh
