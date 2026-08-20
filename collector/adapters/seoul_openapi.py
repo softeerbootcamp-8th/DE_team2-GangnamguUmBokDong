@@ -139,14 +139,18 @@ def _page_rows(body: dict, wrapper_key: str, row_path: str) -> list | None:
 
 
 def _optional_nonnegative_int(value: object) -> int | None:
-    """응답 메타를 음수가 아닌 정수로 읽고 없거나 잘못됐으면 None을 반환한다."""
-    if value is None or isinstance(value, bool):
+    """응답 메타를 음수가 아닌 정수로 읽고 malformed 값을 거부한다."""
+    if value is None:
         return None
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):
-        return None
-    return parsed if parsed >= 0 else None
+    if type(value) is int:
+        parsed = value
+    elif type(value) is str and value.strip().isdigit():
+        parsed = int(value.strip())
+    else:
+        raise ValueError("list_total_count는 음수가 아닌 정수여야 합니다")
+    if parsed < 0:
+        raise ValueError("list_total_count는 음수가 아닌 정수여야 합니다")
+    return parsed
 
 
 def _fetch_page(
@@ -154,6 +158,8 @@ def _fetch_page(
     url: str,
     wrapper_key: str,
     row_path: str,
+    *,
+    ignore_total: bool = False,
 ) -> _PageOutcome:
     """페이지 하나를 받아 실패 범주까지 판정한다."""
     result = _request_json(client, url)
@@ -191,9 +197,19 @@ def _fetch_page(
             terminal=False,
             error=FetchErrorKind.PERMANENT,
         )
+    try:
+        total = None if ignore_total else _optional_nonnegative_int(raw_total)
+    except ValueError:
+        return _PageOutcome(
+            payload=None,
+            total=None,
+            row_count=None,
+            terminal=False,
+            error=FetchErrorKind.PERMANENT,
+        )
     return _PageOutcome(
         payload=content,
-        total=_optional_nonnegative_int(raw_total),
+        total=total,
         row_count=len(rows) if rows is not None else 0,
         terminal=terminal,
         error=None,
@@ -265,6 +281,7 @@ def _probe_until_empty(
             page_url(page_start, page_end),
             wrapper_key,
             row_path,
+            ignore_total=True,
         )
         if outcome.error is not None:
             yield FetchResult(
