@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
+from airflow import DAG
 from airflow.providers.standard.operators.bash import BashOperator
 from airflow.task.trigger_rule import TriggerRule
-from config.schedules import DB_LOADER_EXECUTION_TIMEOUT
 
-from airflow import DAG
+from config.schedules import DB_LOADER_EXECUTION_TIMEOUT
 from orchestration.task_builder import REPO_ROOT, build_module_task
 from orchestration.templates import KST_WINDOW_START
 
@@ -14,9 +14,6 @@ GOLD_PUBLISHER_DIR = str(REPO_ROOT / "loader")
 
 _SOURCE_PUBLICATIONS = frozenset(
     {
-        "station-release",
-        "station-master-correction",
-        "weather-forecast",
         "event:cultural_event",
         "event:performance_event",
     }

@@ -11,6 +11,7 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
       POSTGRES_APP_DB: ${POSTGRES_APP_DB:-app}
       POSTGRES_AIRFLOW_DB: ${POSTGRES_AIRFLOW_DB:-airflow}
+      POSTGRES_MLFLOW_DB: ${POSTGRES_MLFLOW_DB:-mlflow}
     ports:
       - "${POSTGRES_PORT:-5432}:5432"
     volumes:
@@ -29,6 +30,7 @@ services:
           pg_isready -h 127.0.0.1 -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_APP_DB:-app}
       interval: 5s
       timeout: 5s
+      start_period: 60s
       retries: 10
 
   # 기존 볼륨에는 DDL을 재적용하지 않는다. 새 볼륨의 원자적 baseline 적용 후에도
@@ -81,6 +83,32 @@ services:
       exit 0;
       "
 
+  mlflow:
+    build:
+      context: ../..
+      dockerfile: ops/compose/Dockerfile.mlflow
+    environment:
+      MLFLOW_S3_ENDPOINT_URL: http://minio:9000
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    # --serve-artifacts로 이 서버가 S3 업로드/다운로드를 대신 중계한다 — 그래서
+    # feature_engine(EMR)/training(로컬)/inference(어디든) 클라이언트는 S3 자격증명
+    # 없이 MLFLOW_TRACKING_URI 하나만으로 파라미터/지표/아티팩트를 전부 기록할 수 있다.
+    command: >
+      mlflow server
+      --host 0.0.0.0
+      --port 5000
+      --backend-store-uri postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_MLFLOW_DB:-mlflow}
+      --artifacts-destination s3://${S3_BUCKET:-local-dev}/mlflow-artifacts
+      --serve-artifacts
+    ports:
+      - "${MLFLOW_PORT:-5000}:5000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_started
+
   airflow-init:
     build:
       context: ../..
@@ -105,6 +133,7 @@ services:
       S3_ENDPOINT_URL: http://minio:9000
     volumes:
       - ../..:/workspace
+      - airflow-module-venvs:/opt/venvs/modules
     depends_on:
       postgres-schema-check:
         condition: service_completed_successfully
@@ -133,6 +162,7 @@ services:
       - "${AIRFLOW_WEBSERVER_PORT:-8080}:8080"
     volumes:
       - ../..:/workspace
+      - airflow-module-venvs:/opt/venvs/modules
     depends_on:
       postgres:
         condition: service_healthy
@@ -161,6 +191,7 @@ services:
       S3_ENDPOINT_URL: http://minio:9000
     volumes:
       - ../..:/workspace
+      - airflow-module-venvs:/opt/venvs/modules
     depends_on:
       postgres:
         condition: service_healthy
@@ -186,6 +217,7 @@ services:
       AIRFLOW__API__BASE_URL: http://localhost:${AIRFLOW_WEBSERVER_PORT:-8080}
     volumes:
       - ../..:/workspace
+      - airflow-module-venvs:/opt/venvs/modules
     depends_on:
       postgres:
         condition: service_healthy
@@ -227,4 +259,5 @@ services:
 volumes:
   postgres-data:
   minio-data:
+  airflow-module-venvs:
   web-node-modules:

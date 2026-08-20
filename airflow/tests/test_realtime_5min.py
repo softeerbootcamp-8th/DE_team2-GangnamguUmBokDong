@@ -1,16 +1,19 @@
-"""5분 핵심 파이프라인 DAG의 구성과 의존성을 검증한다."""
+"""5분 coordinated serving DAG의 task 집합과 의존성을 검증한다."""
 
 from datetime import timedelta
 from itertools import pairwise
 
 from airflow.providers.standard.operators.bash import BashOperator
+from airflow.task.trigger_rule import TriggerRule
 from airflow.timetables.trigger import CronTriggerTimetable
+
 from config.schedules import EXECUTION_TIMEOUT_OVERRIDES, REALTIME_5MIN_CRON, TIMEZONE
 from config.sources import REALTIME_5MIN_SOURCES, RENTAL_HISTORY_LOOKBACK_HOURS
 from dags.realtime_5min import dag
 
 
-def test_schedule_and_run_policy():
+def test_schedule_and_run_policy() -> None:
+    """5분 cron과 single active run을 유지한다."""
     assert isinstance(dag.timetable, CronTriggerTimetable)
     assert REALTIME_5MIN_CRON == "*/5 * * * *"
     assert TIMEZONE == "Asia/Seoul"
@@ -18,123 +21,92 @@ def test_schedule_and_run_policy():
     assert dag.max_active_runs == 1
 
 
-def test_expected_tasks_exist():
+def test_only_coordinated_serving_tasks_exist() -> None:
+    """Legacy compute/loader/station standalone task가 DAG에 남지 않는다."""
     expected = (
-        {f"collect_{s}" for s in REALTIME_5MIN_SOURCES}
+        {f"collect_{source}" for source in REALTIME_5MIN_SOURCES}
         | {
-            "publish_station_release",
-            "run_normalizer_strict",
-            "run_normalizer_fallback",
-            "population_normalized",
+            "run_normalizer",
+            "prepare_serving_plan",
             "run_inference",
-            "load_forecast_points",
-            "compute_urgency",
-            "load_station_urgency",
-            "compute_routes",
-            "load_rebalance_routes",
-            "load_rebalance_route_stops",
+            "finalize_serving_release",
+            "publish_station_urgency",
+            "publish_rebalance_route",
         }
         | {
-            # 대여이력 과거 시간대 재조회. 상수를 올리면 태스크가 따라 늘어난다.
-            f"collect_bike_rental_history_replay_{h}h"
-            for h in range(1, RENTAL_HISTORY_LOOKBACK_HOURS + 1)
+            f"collect_bike_rental_history_replay_{hour}h"
+            for hour in range(1, RENTAL_HISTORY_LOOKBACK_HOURS + 1)
         }
     )
     assert set(dag.task_ids) == expected
+    assert not {
+        "publish_station_release",
+        "load_forecast_points",
+        "compute_urgency",
+        "load_station_urgency",
+        "compute_routes",
+        "load_rebalance_routes",
+        "load_rebalance_route_stops",
+    }.intersection(dag.task_ids)
 
 
-def test_station_release_depends_on_bike_station_realtime():
-    collect = dag.get_task("collect_bike_station_realtime")
-    publish = dag.get_task("publish_station_release")
-
-    assert publish.task_id in {t.task_id for t in collect.downstream_list}
-    assert "--publication station-release" in publish.bash_command
+def test_prepare_waits_only_for_current_station_realtime() -> None:
+    """Plan source 준비가 population/rental 계산 input에 불필요하게 직렬화되지 않는다."""
+    prepare = dag.get_task("prepare_serving_plan")
+    assert prepare.upstream_task_ids == {"collect_bike_station_realtime"}
 
 
-def test_normalizer_strict_then_fallback():
-    collect_population = dag.get_task("collect_population_realtime")
-    strict = dag.get_task("run_normalizer_strict")
-    fallback = dag.get_task("run_normalizer_fallback")
-
-    assert strict.task_id in {t.task_id for t in collect_population.downstream_list}
-    assert fallback.task_id in {t.task_id for t in strict.downstream_list}
-    assert fallback.trigger_rule == "all_failed"
-    assert "--baseline-date-mode latest" in fallback.bash_command
-    assert "--baseline-date-mode strict" in strict.bash_command
-
-
-def test_inference_waits_for_realtime_bikes_and_normalized_population():
-    """날씨는 별도 DAG의 최신 Silver를 읽고, 이 DAG의 실시간 입력은 직접 기다린다."""
-    run_inference = dag.get_task("run_inference")
-    upstream_ids = {t.task_id for t in run_inference.upstream_list}
-
-    assert upstream_ids == {
+def test_inference_waits_for_plan_normalizer_and_rental_input() -> None:
+    """Plan 준비와 실제 inference 계산 input이 inference 합류점에서 만난다."""
+    inference = dag.get_task("run_inference")
+    assert inference.upstream_task_ids == {
+        "prepare_serving_plan",
         "collect_bike_rental_history",
-        "collect_bike_station_realtime",
-        "population_normalized",
+        "run_normalizer",
     }
-    assert "collect_population_realtime" not in upstream_ids
+    assert dag.get_task("run_normalizer").upstream_task_ids == {
+        "collect_population_realtime"
+    }
+    assert inference.trigger_rule == TriggerRule.ALL_SUCCESS
+    assert "collect_population_realtime" not in inference.upstream_task_ids
     assert "collect_weather_ultra_short_live" not in dag.task_ids
 
 
-def test_inference_then_load_forecast_points():
-    run_inference = dag.get_task("run_inference")
-    load_forecast_points = dag.get_task("load_forecast_points")
-    assert load_forecast_points.task_id in {
-        t.task_id for t in run_inference.downstream_list
+def test_derived_publication_is_one_strict_chain() -> None:
+    """Inference 뒤 4-key final·urgency·route가 정확한 ref 순서로 실행된다."""
+    assert dag.get_task("finalize_serving_release").upstream_task_ids == {
+        "run_inference"
     }
-    assert load_forecast_points.upstream_task_ids == {
+    assert dag.get_task("publish_station_urgency").upstream_task_ids == {
+        "finalize_serving_release"
+    }
+    assert dag.get_task("publish_rebalance_route").upstream_task_ids == {
+        "publish_station_urgency"
+    }
+
+
+def test_json_tasks_use_bash_env_contract() -> None:
+    """Production task는 append_env와 JSON output processor를 사용한다."""
+    for task_id in (
+        "prepare_serving_plan",
         "run_inference",
-        "publish_station_release",
-    }
+        "finalize_serving_release",
+        "publish_station_urgency",
+        "publish_rebalance_route",
+    ):
+        task = dag.get_task(task_id)
+        assert isinstance(task, BashOperator)
+        assert task.append_env is True
+        assert callable(task.output_processor)
+    assert dag.get_task("finalize_serving_release").retries == 0
+    assert dag.get_task("publish_station_urgency").retries == 0
+    assert dag.get_task("publish_rebalance_route").retries == 0
 
 
-def test_inference_then_compute_urgency_then_load_station_urgency():
-    """urgency_score 계산(rebalance)은 S3(재고 이력·예측 결과)만 읽어서 RDS 적재
-    (station publication/load_forecast_points)를 기다릴 필요가 없다. 단, urgency loader는
-    station FK가 준비된 뒤 실행돼야 한다."""
-    run_inference = dag.get_task("run_inference")
-    compute_urgency = dag.get_task("compute_urgency")
-    load_station_urgency = dag.get_task("load_station_urgency")
-
-    assert compute_urgency.task_id in {t.task_id for t in run_inference.downstream_list}
-    assert {t.task_id for t in compute_urgency.upstream_list} == {"run_inference"}
-    assert load_station_urgency.task_id in {
-        t.task_id for t in compute_urgency.downstream_list
-    }
-    assert {t.task_id for t in load_station_urgency.upstream_list} == {
-        "compute_urgency",
-        "publish_station_release",
-    }
-
-
-def test_compute_urgency_then_compute_routes_then_load_rebalance_tables_sequentially():
-    """라우트 생성(rebalance/routes.py)도 urgency와 마찬가지로 S3만 읽는다(dispatched
-    넷팅을 위한 좁은 RDS 조회 하나 제외) — compute_urgency에만 의존하고
-    load_station_urgency와는 독립적으로 실행된다(이유: #109). rebalance_route_stops는
-    rebalance_routes(route_id FK)·stations(sta_id FK) 둘 다를 참조하므로,
-    load_rebalance_routes와 station publication이 끝난 뒤에만 실행돼야 한다 —
-    병렬로 두면 stops가 routes보다 먼저 끝나 FK 위반이 날 수 있다."""
-    compute_urgency = dag.get_task("compute_urgency")
-    compute_routes = dag.get_task("compute_routes")
-    load_rebalance_routes = dag.get_task("load_rebalance_routes")
-    load_rebalance_route_stops = dag.get_task("load_rebalance_route_stops")
-
-    assert compute_routes.task_id in {
-        t.task_id for t in compute_urgency.downstream_list
-    }
-    assert {t.task_id for t in compute_routes.upstream_list} == {"compute_urgency"}
-    assert {t.task_id for t in load_rebalance_routes.upstream_list} == {
-        "compute_routes"
-    }
-    assert {t.task_id for t in load_rebalance_route_stops.upstream_list} == {
-        "load_rebalance_routes",
-        "publish_station_release",
-    }
-
-
-def test_collector_task_execution_contract():
+def test_collector_task_execution_contract() -> None:
+    """현재 station collector의 retry·timeout·window 계약을 유지한다."""
     task = dag.get_task("collect_bike_station_realtime")
+
     assert isinstance(task, BashOperator)
     assert task.retries == 2
     assert task.retry_delay == timedelta(seconds=30)
@@ -142,90 +114,74 @@ def test_collector_task_execution_contract():
     assert "--source bike_station_realtime" in task.bash_command
     assert "--window-start" in task.bash_command
     assert "astimezone" in task.bash_command
-    assert task.bash_command.startswith("env -u VIRTUAL_ENV -u UV_PROJECT_ENVIRONMENT ")
+    assert task.bash_command.startswith(
+        "env -u VIRTUAL_ENV UV_PROJECT_ENVIRONMENT=/opt/venvs/modules/collector "
+    )
 
 
-def test_living_population_grid_timeout_override_not_used_in_this_dag():
-    """living_population_grid는 daily DAG 소관이라 이 DAG에는 없다."""
+def test_living_population_grid_timeout_override_not_used() -> None:
+    """Daily 전용 grid source와 timeout override가 realtime DAG에 섞이지 않는다."""
     assert "collect_living_population_grid" not in dag.task_ids
     assert EXECUTION_TIMEOUT_OVERRIDES["living_population_grid"] == timedelta(
         seconds=1200
     )
 
 
-# ---------------------------------------------------------------------------
-# bike_rental_history 시간대 재조회 (A2)
-#
-# tbCycleRentData는 `RENT_DT`(대여 시각) 기준으로 한 시간치를 주지만, 목록에는
-# **반납이 완료된 기록만** 나타나고 정렬도 `RTN_DT` 오름차순이다. 그래서 대여 시간대가
-# 끝난 뒤에 반납된 기록은 그 시간대를 마지막으로 조회하는 윈도우 이후에 등장한다.
-#
-# 현행은 시간대 H를 `T ∈ [H:05, H+1:00]` 윈도우만 조회하므로 그 뒤 반납분을 영구히
-# 놓친다. 실측(2026-08-18): 03/08/12/18/21시 합계 10,538/42,902 = 24.6% 누락.
-# backfill은 실패한 조각만 재시도하므로(pipeline.py:197) 이걸 회수하지 못한다.
-#
-# 그래서 매 tick에서 과거 시간대를 `--force`로 다시 수집한다. 각 호출은 독립된
-# manifest 윈도우라 어댑터·조각 키·expected_total·재시도 로직이 전부 그대로다.
-# ---------------------------------------------------------------------------
-
-
-def _replay_tasks():
+def _replay_tasks() -> list[BashOperator]:
+    """설정된 lookback 수만큼 rental replay task를 반환한다."""
     return [
-        dag.get_task(f"collect_bike_rental_history_replay_{h}h")
-        for h in range(1, RENTAL_HISTORY_LOOKBACK_HOURS + 1)
+        dag.get_task(f"collect_bike_rental_history_replay_{hour}h")
+        for hour in range(1, RENTAL_HISTORY_LOOKBACK_HOURS + 1)
     ]
 
 
-def test_lookback_is_one_hour():
-    """실측 회수율: +1h이면 누락의 86.7~90.2%, +2h이면 98.0~100%.
-    요청 수는 시간대당 12 x (L+1)회이므로 L=1은 현행의 2배다."""
+def test_lookback_is_one_hour() -> None:
+    """현행 API 비용과 late-return 회수율에 맞춘 1시간 lookback을 고정한다."""
     assert RENTAL_HISTORY_LOOKBACK_HOURS == 1
 
 
-def test_replay_tasks_exist_for_each_lookback_hour():
-    assert [t.task_id for t in _replay_tasks()] == [
-        f"collect_bike_rental_history_replay_{h}h"
-        for h in range(1, RENTAL_HISTORY_LOOKBACK_HOURS + 1)
+def test_replay_tasks_exist_for_each_lookback_hour() -> None:
+    """Lookback 설정 변경 시 DAG replay task 수가 함께 변한다."""
+    assert [task.task_id for task in _replay_tasks()] == [
+        f"collect_bike_rental_history_replay_{hour}h"
+        for hour in range(1, RENTAL_HISTORY_LOOKBACK_HOURS + 1)
     ]
 
 
-def test_replay_uses_force_because_backfill_cannot_recover_late_returns():
-    """--backfill은 실패한 조각만 채운다. 여기서 놓치는 것은 실패가 아니라
-    '그때는 아직 존재하지 않았던 데이터'라서 윈도우 전체를 다시 받아야 한다."""
+def test_replay_uses_force_for_late_returns() -> None:
+    """늦은 반납은 실패 backfill이 아니라 whole-window force replay로 회수한다."""
     for task in _replay_tasks():
         assert "--force" in task.bash_command
         assert "--backfill" not in task.bash_command
         assert "--source bike_rental_history" in task.bash_command
 
 
-def test_replay_window_start_is_shifted_back_by_whole_hours():
-    """window_start를 H시간 앞으로 당기면 path_suffix의 window_last도 같이 당겨져
-    그 시간대를 조회하고, silver도 그 시간대의 dt/hh 파티션에 쓰인다."""
+def test_replay_window_start_is_shifted_by_whole_hours() -> None:
+    """각 replay가 원래 Silver hour partition을 다시 채우도록 시간을 이동한다."""
     for hours, task in enumerate(_replay_tasks(), start=1):
         assert f"timedelta(hours={hours})" in task.bash_command
         assert "astimezone" in task.bash_command
 
 
-def test_replay_runs_sequentially_to_cap_api_concurrency():
-    """한 tick에 이 소스 호출이 여러 개 뜨는데, 각 호출이 페이지를 concurrency만큼
-    병렬로 받는다(bike_rental_history.yaml: 4). 동시에 띄우면 같은 API에 대한 동시
-    요청이 배수로 늘어나므로 사슬로 묶어 4로 고정한다."""
+def test_replay_runs_sequentially_to_cap_api_concurrency() -> None:
+    """현재 수집과 replay를 직렬화해 API page 동시 요청 수를 제한한다."""
     chain = [dag.get_task("collect_bike_rental_history"), *_replay_tasks()]
+
     for upstream, downstream in pairwise(chain):
-        assert downstream.task_id in {t.task_id for t in upstream.downstream_list}
+        assert downstream.task_id in upstream.downstream_task_ids
 
 
-def test_replay_failure_does_not_block_inference():
-    """재조회는 과거 시간대를 보강하는 일이라 실패해도 현재 tick의 추론을 막으면 안 된다."""
+def test_replay_failure_does_not_block_inference() -> None:
+    """과거 window 보강 실패는 current serving inference를 막지 않는다."""
     for task in _replay_tasks():
-        assert task.trigger_rule == "all_done"
-        downstream = {t.task_id for t in task.downstream_list}
-        assert "run_inference" not in downstream
+        assert task.trigger_rule == TriggerRule.ALL_DONE
+        assert "run_inference" not in task.downstream_task_ids
 
 
-def test_inference_still_waits_only_for_the_current_window_collection():
-    run_inference = dag.get_task("run_inference")
-    upstream = {t.task_id for t in run_inference.upstream_list}
+def test_inference_waits_only_for_current_rental_collection() -> None:
+    """Inference 입력에는 current rental collector만 직접 연결한다."""
+    upstream = dag.get_task("run_inference").upstream_task_ids
+
     assert "collect_bike_rental_history" in upstream
     for task in _replay_tasks():
         assert task.task_id not in upstream

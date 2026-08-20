@@ -5,16 +5,58 @@ from __future__ import annotations
 import math
 import re
 import unicodedata
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import pyarrow as pa
-from core.gold_publication import ContractViolation
+from core.gold_publication import (
+    ContractViolation,
+    ImmutableObjectStore,
+    InputArtifact,
+    Parameter,
+    PreparedPublication,
+    VerifiedPublicationEvidence,
+    build_id_set,
+    parse_id_set,
+    validate_id_set_parameter,
+)
+from core.inference_snapshot import (
+    InferenceSnapshotManifest,
+    InferenceSnapshotStatus,
+    ModelManifestRef,
+    inference_output_input_artifact,
+    parse_inference_output_parquet,
+    parse_inference_snapshot_manifest,
+    validate_model_manifest_binding,
+)
+from core.model_snapshot import (
+    IdSetArtifactRef,
+    ModelSnapshotManifest,
+    model_manifest_input_artifact,
+    parse_model_snapshot_manifest,
+)
+from psycopg import Connection, Cursor
+from psycopg.pq import TransactionStatus
+from psycopg.rows import tuple_row
 
-from .common import parquet_bytes, read_parquet_bytes
+from .common import (
+    OutputObject,
+    PublicationExecution,
+    build_prepared_publication,
+    materialize_publication,
+    parquet_bytes,
+    publish_verified,
+    read_parquet_bytes,
+)
+from .state import load_dependencies
+from .versioning import PublicationCandidate, allocate_revision
 
 HORIZON_COUNT = 12
 POSTGRES_INTEGER_MAX = 2_147_483_647
+DEMAND_PUBLISHER_VERSION = "gold-demand-publisher-v1"
+ROUNDING_MODE = "roundTiesToEven"
 _STATION_ID = re.compile(r"ST-[0-9]+\Z")
 _DEMAND_FORECAST_SCHEMA = pa.schema(
     (
@@ -25,6 +67,49 @@ _DEMAND_FORECAST_SCHEMA = pa.schema(
         pa.field("predicted_rtn_cnt", pa.int32(), nullable=False),
     )
 )
+
+
+@dataclass(frozen=True, slots=True)
+class DemandInferenceSnapshot:
+    """검증된 inference authority와 transitive model·ID·예측 bytes를 묶는다."""
+
+    manifest: InferenceSnapshotManifest
+    inference_input: InputArtifact
+    rental_model_input: InputArtifact
+    return_model_input: InputArtifact
+    rental_support_sta_ids: tuple[str, ...]
+    return_support_sta_ids: tuple[str, ...]
+    expected_sta_ids: tuple[str, ...]
+    predictions: tuple[DemandPredictionRecord, ...]
+
+    def __post_init__(self) -> None:
+        """Snapshot field가 exact typed contract와 canonical station 집합인지 검증한다."""
+        if type(self.manifest) is not InferenceSnapshotManifest:
+            raise ContractViolation(
+                "demand inference manifest type이 올바르지 않습니다."
+            )
+        for value, role in (
+            (self.inference_input, "inference_output"),
+            (self.rental_model_input, "rental_model_manifest"),
+            (self.return_model_input, "return_model_manifest"),
+        ):
+            if type(value) is not InputArtifact or value.role != role:
+                raise ContractViolation(
+                    f"demand inference input role이 잘못됐습니다: expected={role}"
+                )
+        for values, name in (
+            (self.rental_support_sta_ids, "rental support"),
+            (self.return_support_sta_ids, "return support"),
+            (self.expected_sta_ids, "inference expected"),
+        ):
+            if values != _station_id_set(values, name):
+                raise ContractViolation(f"{name} ID가 canonical 순서가 아닙니다.")
+        if type(self.predictions) is not tuple or any(
+            type(record) is not DemandPredictionRecord for record in self.predictions
+        ):
+            raise ContractViolation(
+                "inference predictions는 DemandPredictionRecord tuple이어야 합니다."
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -260,6 +345,582 @@ def demand_records_from_parquet(
         expected_base_dttm=expected_base_dttm,
     )
     return records
+
+
+def publish_station_demand_forecast(
+    connection: Connection[Any],
+    object_store: ImmutableObjectStore,
+    *,
+    inference_manifest_uri: str,
+    inference_manifest_sha256: str,
+    object_base_uri: str,
+    publisher_version: str = DEMAND_PUBLISHER_VERSION,
+) -> PublicationExecution:
+    """완전한 inference snapshot을 최신 Gold demand projection으로 원자 게시한다.
+
+    Inference authority manifest bytes와 manifest가 pin한 output, 두 model manifest,
+    세 ID set을 exact URI·SHA로 읽는다. Gold dependency와 기대 station 집합은
+    topology shared lock 안에서 다시 증명한 뒤 전체 projection과 state를 같은
+    transaction에서 reconcile한다.
+    """
+    snapshot = _read_inference_snapshot(
+        object_store,
+        inference_manifest_uri=inference_manifest_uri,
+        inference_manifest_sha256=inference_manifest_sha256,
+    )
+    dependencies = load_dependencies(connection, ("station",))
+    if dependencies != (snapshot.manifest.station_dependency,):
+        raise ContractViolation(
+            "inference station dependency가 현재 Gold station state와 다릅니다."
+        )
+    active_sta_ids = _load_active_station_ids(connection)
+    projection = _projection_from_snapshot(snapshot, active_sta_ids=active_sta_ids)
+    outputs = (
+        ()
+        if not projection.records
+        else (
+            OutputObject(
+                role="station_demand_forecast",
+                payload=demand_records_to_parquet(
+                    projection.records,
+                    expected_sta_ids=projection.expected_sta_ids,
+                ),
+                row_count=len(projection.records),
+            ),
+        )
+    )
+    expected_ids = build_id_set(projection.expected_sta_ids)
+    materials = materialize_publication(
+        object_store,
+        base_uri=object_base_uri,
+        publication_key="station_demand_forecast",
+        dependencies=dependencies,
+        input_artifacts=(
+            snapshot.inference_input,
+            snapshot.rental_model_input,
+            snapshot.return_model_input,
+        ),
+        parameters=(
+            Parameter("expected_sta_id_sha256", expected_ids.sha256),
+            Parameter("horizon_count", str(HORIZON_COUNT)),
+            Parameter("rounding_mode", ROUNDING_MODE),
+        ),
+        outputs=outputs,
+    )
+    revision_no = allocate_revision(
+        connection,
+        PublicationCandidate(
+            publication_key="station_demand_forecast",
+            logical_dttm=snapshot.manifest.logical_dttm,
+            artifact_set_sha256=materials.artifact_set.sha256,
+            input_fingerprint_sha256=materials.input_fingerprint.sha256,
+            published_row_cnt=len(projection.records),
+        ),
+    )
+    prepared = build_prepared_publication(
+        base_uri=object_base_uri,
+        publication_key="station_demand_forecast",
+        logical_dttm=snapshot.manifest.logical_dttm,
+        publisher_version=publisher_version,
+        revision_no=revision_no,
+        target_row_counts={"station_demand_forecast": len(projection.records)},
+        materials=materials,
+        conditional_empty_candidate=not projection.records,
+    )
+
+    def validate_staging(
+        publication: PreparedPublication,
+        payloads: Mapping[str, bytes],
+    ) -> Mapping[str, tuple[datetime, ...]]:
+        """Verifier actual manifest bytes와 transitive bytes로 projection을 재구성한다."""
+        if publication.manifest.publication_key != "station_demand_forecast":
+            raise ContractViolation("demand prepared publication key가 다릅니다.")
+        verified = _read_inference_snapshot_from_verified_inputs(
+            object_store,
+            inference_input=snapshot.inference_input,
+            rental_model_input=snapshot.rental_model_input,
+            return_model_input=snapshot.return_model_input,
+            payloads=payloads,
+        )
+        expected = _projection_from_snapshot(
+            verified,
+            active_sta_ids=active_sta_ids,
+        )
+        _validate_demand_artifact(publication, payloads, expected)
+        return {"base_dttm": tuple(record.base_dttm for record in expected.records)}
+
+    def validate_locked(
+        cursor: Cursor[tuple[Any, ...]],
+        evidence: tuple[VerifiedPublicationEvidence, ...],
+    ) -> None:
+        """Publication lock 안에서 station dependency·교집합·12 horizon을 재증명한다."""
+        item = _require_demand_evidence(evidence)
+        locked_active = _active_station_ids_locked(cursor)
+        locked_projection = _projection_from_snapshot(
+            snapshot,
+            active_sta_ids=locked_active,
+        )
+        if locked_projection != projection:
+            raise ContractViolation(
+                "demand staging 이후 active·model support projection이 바뀌었습니다."
+            )
+        validate_id_set_parameter(
+            "station_demand_forecast",
+            item.input_fingerprint,
+            build_id_set(locked_projection.expected_sta_ids),
+        )
+
+    def validate_conditional_empty(
+        cursor: Cursor[tuple[Any, ...]],
+        evidence: VerifiedPublicationEvidence,
+    ) -> bool:
+        """EMPTY가 lock 안 active·두 model support 교집합 0개인지 증명한다."""
+        if evidence.manifest.publication_key != "station_demand_forecast":
+            raise ContractViolation("demand EMPTY evidence key가 다릅니다.")
+        locked_projection = _projection_from_snapshot(
+            snapshot,
+            active_sta_ids=_active_station_ids_locked(cursor),
+        )
+        validate_id_set_parameter(
+            "station_demand_forecast",
+            evidence.input_fingerprint,
+            build_id_set(locked_projection.expected_sta_ids),
+        )
+        return not locked_projection.records
+
+    def mutate_targets(
+        cursor: Cursor[tuple[Any, ...]],
+        evidence: tuple[VerifiedPublicationEvidence, ...],
+    ) -> None:
+        """검증된 demand 전체 projection을 claim과 같은 transaction에서 교체한다."""
+        _require_demand_evidence(evidence)
+        _reconcile_demand_records(cursor, projection.records)
+
+    return publish_verified(
+        connection,
+        ((prepared, validate_staging),),
+        object_store,
+        mutate_targets,
+        validate_locked=validate_locked,
+        validate_conditional_empty=validate_conditional_empty,
+    )
+
+
+def demand_predictions_from_inference_parquet(
+    payload: bytes,
+    *,
+    expected_base_dttm: datetime,
+    expected_sta_ids: tuple[str, ...],
+) -> tuple[DemandPredictionRecord, ...]:
+    """Core exact authority Parquet을 Gold typed prediction으로 변환한다."""
+    base = _utc_dttm(expected_base_dttm, "inference expected base_dttm")
+    expected = build_id_set(_station_id_set(expected_sta_ids, "inference expected"))
+    table = parse_inference_output_parquet(
+        payload,
+        logical_dttm=base,
+        expected_sta_ids=expected,
+    )
+    return tuple(
+        DemandPredictionRecord(
+            base_dttm=base,
+            station_id=row["station_id"],
+            horizon=row["horizon"],
+            target_dttm=_add_hours(
+                base,
+                row["horizon"] - 1,
+                "inference target",
+            ),
+            rental_pred_mean=row["rental_pred_mean"],
+            return_pred_mean=row["return_pred_mean"],
+        )
+        for row in table.to_pylist()
+    )
+
+
+def _read_inference_snapshot(
+    object_store: ImmutableObjectStore,
+    *,
+    inference_manifest_uri: str,
+    inference_manifest_sha256: str,
+) -> DemandInferenceSnapshot:
+    """URI·SHA로 actual inference manifest와 모든 transitive authority를 읽는다."""
+    payload = object_store.read_bytes(
+        inference_manifest_uri,
+        inference_manifest_sha256,
+        require_canonical_json=True,
+    )
+    manifest = parse_inference_snapshot_manifest(payload)
+    inference_input = inference_output_input_artifact(
+        manifest,
+        inference_manifest_uri,
+    )
+    if inference_input.byte_sha256 != inference_manifest_sha256:
+        raise ContractViolation(
+            "inference manifest argument SHA가 canonical actual bytes와 다릅니다."
+        )
+    rental_payload = object_store.read_bytes(
+        manifest.rental_model_manifest.uri,
+        manifest.rental_model_manifest.byte_sha256,
+        require_canonical_json=True,
+    )
+    return_payload = object_store.read_bytes(
+        manifest.return_model_manifest.uri,
+        manifest.return_model_manifest.byte_sha256,
+        require_canonical_json=True,
+    )
+    return _build_inference_snapshot(
+        object_store,
+        manifest=manifest,
+        inference_input=inference_input,
+        rental_model_payload=rental_payload,
+        return_model_payload=return_payload,
+    )
+
+
+def _read_inference_snapshot_from_verified_inputs(
+    object_store: ImmutableObjectStore,
+    *,
+    inference_input: InputArtifact,
+    rental_model_input: InputArtifact,
+    return_model_input: InputArtifact,
+    payloads: Mapping[str, bytes],
+) -> DemandInferenceSnapshot:
+    """공통 verifier가 읽은 세 manifest actual bytes에서 snapshot을 다시 만든다."""
+    try:
+        inference_payload = payloads[inference_input.uri]
+        rental_payload = payloads[rental_model_input.uri]
+        return_payload = payloads[return_model_input.uri]
+    except KeyError as exc:
+        raise ContractViolation(
+            "demand verifier payload에 필수 manifest bytes가 없습니다."
+        ) from exc
+    manifest = parse_inference_snapshot_manifest(inference_payload)
+    actual_inference_input = inference_output_input_artifact(
+        manifest,
+        inference_input.uri,
+    )
+    if actual_inference_input != inference_input:
+        raise ContractViolation(
+            "verified inference manifest bytes가 fingerprint input과 다릅니다."
+        )
+    snapshot = _build_inference_snapshot(
+        object_store,
+        manifest=manifest,
+        inference_input=actual_inference_input,
+        rental_model_payload=rental_payload,
+        return_model_payload=return_payload,
+    )
+    if (
+        snapshot.rental_model_input != rental_model_input
+        or snapshot.return_model_input != return_model_input
+    ):
+        raise ContractViolation(
+            "verified model manifest bytes가 fingerprint input과 다릅니다."
+        )
+    return snapshot
+
+
+def _build_inference_snapshot(
+    object_store: ImmutableObjectStore,
+    *,
+    manifest: InferenceSnapshotManifest,
+    inference_input: InputArtifact,
+    rental_model_payload: bytes,
+    return_model_payload: bytes,
+) -> DemandInferenceSnapshot:
+    """Actual model·ID·output bytes를 manifest reference와 결합한다."""
+    rental_model, rental_input, rental_support = _model_snapshot_from_payload(
+        object_store,
+        manifest.rental_model_manifest,
+        rental_model_payload,
+    )
+    return_model, return_input, return_support = _model_snapshot_from_payload(
+        object_store,
+        manifest.return_model_manifest,
+        return_model_payload,
+    )
+    del rental_model, return_model
+    expected_ids = _read_id_set_artifact(
+        object_store,
+        manifest.expected_sta_ids,
+        "inference expected",
+    )
+    if manifest.status is InferenceSnapshotStatus.EMPTY:
+        predictions: tuple[DemandPredictionRecord, ...] = ()
+    else:
+        if manifest.output is None:
+            raise ContractViolation("SUCCEEDED inference output reference가 없습니다.")
+        output_payload = object_store.read_bytes(
+            manifest.output.uri,
+            manifest.output.byte_sha256,
+        )
+        table = read_parquet_bytes(output_payload)
+        if table.num_rows != manifest.output.row_count:
+            raise ContractViolation(
+                "inference output actual row count가 manifest와 다릅니다."
+            )
+        predictions = demand_predictions_from_inference_parquet(
+            output_payload,
+            expected_base_dttm=manifest.logical_dttm,
+            expected_sta_ids=expected_ids,
+        )
+    if len(predictions) != manifest.counts.actual_row_count:
+        raise ContractViolation(
+            "inference prediction actual row count가 manifest counts와 다릅니다."
+        )
+    actual_station_ids = _station_id_set(
+        tuple({record.station_id for record in predictions}),
+        "inference actual station",
+    )
+    if len(actual_station_ids) != manifest.counts.actual_station_count:
+        raise ContractViolation(
+            "inference actual station count가 manifest counts와 다릅니다."
+        )
+    return DemandInferenceSnapshot(
+        manifest=manifest,
+        inference_input=inference_input,
+        rental_model_input=rental_input,
+        return_model_input=return_input,
+        rental_support_sta_ids=rental_support,
+        return_support_sta_ids=return_support,
+        expected_sta_ids=expected_ids,
+        predictions=predictions,
+    )
+
+
+def _model_snapshot_from_payload(
+    object_store: ImmutableObjectStore,
+    reference: ModelManifestRef,
+    payload: bytes,
+) -> tuple[ModelSnapshotManifest, InputArtifact, tuple[str, ...]]:
+    """Model manifest actual bytes와 support ID set actual bytes를 검증한다."""
+    manifest = parse_model_snapshot_manifest(payload)
+    validate_model_manifest_binding(reference, manifest)
+    input_artifact = model_manifest_input_artifact(manifest, reference.uri)
+    if input_artifact.byte_sha256 != reference.byte_sha256:
+        raise ContractViolation(
+            "model manifest actual bytes가 inference reference와 다릅니다."
+        )
+    support_ids = _read_id_set_artifact(
+        object_store,
+        manifest.support_sta_ids,
+        f"{manifest.model_kind.value} model support",
+    )
+    return manifest, input_artifact, support_ids
+
+
+def _read_id_set_artifact(
+    object_store: ImmutableObjectStore,
+    reference: IdSetArtifactRef,
+    label: str,
+) -> tuple[str, ...]:
+    """Content-addressed ID set actual bytes를 ref schema·count·SHA와 결합한다."""
+    payload = object_store.read_bytes(
+        reference.uri,
+        reference.byte_sha256,
+        require_canonical_json=True,
+    )
+    id_set = parse_id_set(payload)
+    if (
+        id_set.schema_version != reference.schema_version
+        or id_set.sha256 != reference.byte_sha256
+        or len(id_set.ids) != reference.id_count
+    ):
+        raise ContractViolation(f"{label} ID set actual bytes가 reference와 다릅니다.")
+    values = _station_id_set(id_set.ids, label)
+    if values != id_set.ids:
+        raise ContractViolation(f"{label} ID set이 canonical station 순서가 아닙니다.")
+    return values
+
+
+def _projection_from_snapshot(
+    snapshot: DemandInferenceSnapshot,
+    *,
+    active_sta_ids: tuple[str, ...],
+) -> DemandProjection:
+    """Verified inference와 actual active topology로 complete projection을 만든다."""
+    projection = build_demand_projection(
+        snapshot.predictions,
+        base_dttm=snapshot.manifest.logical_dttm,
+        active_station_ids=active_sta_ids,
+        rental_model_station_ids=snapshot.rental_support_sta_ids,
+        return_model_station_ids=snapshot.return_support_sta_ids,
+    )
+    if projection.expected_sta_ids != snapshot.expected_sta_ids:
+        raise ContractViolation(
+            "inference expected ID set이 active·두 model support 교집합과 다릅니다."
+        )
+    return projection
+
+
+def _validate_demand_artifact(
+    publication: PreparedPublication,
+    payloads: Mapping[str, bytes],
+    projection: DemandProjection,
+) -> None:
+    """Gold output actual Parquet 또는 EMPTY가 projection과 정확히 같은지 검증한다."""
+    artifacts = publication.manifest.artifacts
+    if not projection.records:
+        if artifacts:
+            raise ContractViolation(
+                "EMPTY demand publication에 output artifact가 있습니다."
+            )
+        return
+    if len(artifacts) != 1 or artifacts[0].role != "station_demand_forecast":
+        raise ContractViolation(
+            "nonempty demand publication에 exact output artifact 하나가 필요합니다."
+        )
+    actual = demand_records_from_parquet(
+        payloads[artifacts[0].uri],
+        expected_base_dttm=projection.base_dttm,
+        expected_sta_ids=projection.expected_sta_ids,
+    )
+    if actual != projection.records:
+        raise ContractViolation(
+            "demand output Parquet이 inference projection과 다릅니다."
+        )
+
+
+def _load_active_station_ids(connection: Connection[Any]) -> tuple[str, ...]:
+    """Transaction 밖의 짧은 read로 현재 active Gold station ID를 읽는다."""
+    if connection.info.transaction_status is not TransactionStatus.IDLE:
+        raise ContractViolation(
+            "active station loader는 transaction이 시작되지 않은 연결이 필요합니다."
+        )
+    with connection.transaction(), connection.cursor(row_factory=tuple_row) as cursor:
+        return _active_station_ids_locked(cursor)
+
+
+def _active_station_ids_locked(
+    cursor: Cursor[tuple[Any, ...]],
+) -> tuple[str, ...]:
+    """Topology shared lock transaction에서 active station ID를 canonical 순서로 읽는다."""
+    cursor.execute(
+        """
+        SELECT sta_id
+          FROM station
+         WHERE is_active
+         ORDER BY sta_id COLLATE "C"
+        """
+    )
+    values = tuple(row[0] for row in cursor.fetchall())
+    canonical = _station_id_set(values, "active station")
+    if canonical != values:
+        raise ContractViolation(
+            "DB active station ID가 canonical UTF-8 순서가 아닙니다."
+        )
+    return values
+
+
+def _require_demand_evidence(
+    evidence: tuple[VerifiedPublicationEvidence, ...],
+) -> VerifiedPublicationEvidence:
+    """Callback evidence가 demand publication 정확히 하나인지 검증한다."""
+    if (
+        len(evidence) != 1
+        or evidence[0].manifest.publication_key != "station_demand_forecast"
+    ):
+        raise ContractViolation("demand publication evidence key가 잘못됐습니다.")
+    return evidence[0]
+
+
+def _reconcile_demand_records(
+    cursor: Cursor[tuple[Any, ...]],
+    records: tuple[DemandForecastRecord, ...],
+) -> None:
+    """Temp staging을 거쳐 demand projection 전체를 upsert·delete·readback한다."""
+    cursor.execute(
+        """
+        CREATE TEMP TABLE gold_demand_staging (
+            base_dttm TIMESTAMPTZ NOT NULL,
+            sta_id TEXT NOT NULL,
+            predicted_dttm TIMESTAMPTZ NOT NULL,
+            predicted_rent_cnt INTEGER NOT NULL,
+            predicted_rtn_cnt INTEGER NOT NULL,
+            PRIMARY KEY (sta_id, predicted_dttm)
+        ) ON COMMIT DROP
+        """
+    )
+    if records:
+        cursor.executemany(
+            """
+            INSERT INTO gold_demand_staging (
+                base_dttm,
+                sta_id,
+                predicted_dttm,
+                predicted_rent_cnt,
+                predicted_rtn_cnt
+            ) VALUES (%s, %s, %s, %s, %s)
+            """,
+            [
+                (
+                    record.base_dttm,
+                    record.sta_id,
+                    record.predicted_dttm,
+                    record.predicted_rent_cnt,
+                    record.predicted_rtn_cnt,
+                )
+                for record in records
+            ],
+        )
+        cursor.execute(
+            """
+            INSERT INTO station_demand_forecast AS current_demand (
+                base_dttm,
+                sta_id,
+                predicted_dttm,
+                predicted_rent_cnt,
+                predicted_rtn_cnt
+            )
+            SELECT base_dttm,
+                   sta_id,
+                   predicted_dttm,
+                   predicted_rent_cnt,
+                   predicted_rtn_cnt
+              FROM gold_demand_staging
+             ORDER BY sta_id COLLATE "C", predicted_dttm
+            ON CONFLICT (sta_id, predicted_dttm) DO UPDATE
+            SET base_dttm = EXCLUDED.base_dttm,
+                predicted_rent_cnt = EXCLUDED.predicted_rent_cnt,
+                predicted_rtn_cnt = EXCLUDED.predicted_rtn_cnt
+            WHERE ROW(
+                current_demand.base_dttm,
+                current_demand.predicted_rent_cnt,
+                current_demand.predicted_rtn_cnt
+            ) IS DISTINCT FROM ROW(
+                EXCLUDED.base_dttm,
+                EXCLUDED.predicted_rent_cnt,
+                EXCLUDED.predicted_rtn_cnt
+            )
+            """
+        )
+    cursor.execute(
+        """
+        DELETE FROM station_demand_forecast AS current_demand
+         WHERE NOT EXISTS (
+                   SELECT 1
+                     FROM gold_demand_staging AS staging
+                    WHERE staging.sta_id = current_demand.sta_id
+                      AND staging.predicted_dttm = current_demand.predicted_dttm
+               )
+        """
+    )
+    cursor.execute(
+        """
+        SELECT base_dttm,
+               sta_id,
+               predicted_dttm,
+               predicted_rent_cnt,
+               predicted_rtn_cnt
+          FROM station_demand_forecast
+         ORDER BY sta_id COLLATE "C", predicted_dttm
+        """
+    )
+    actual = tuple(DemandForecastRecord(*row) for row in cursor.fetchall())
+    if actual != records:
+        raise ContractViolation(
+            "station_demand_forecast full reconcile readback이 staging과 다릅니다."
+        )
 
 
 def _validate_record_snapshot(

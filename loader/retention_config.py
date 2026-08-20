@@ -2,9 +2,7 @@
 
 from datetime import timedelta
 
-RETENTION_GRACE: dict[str, timedelta] = {
-    "forecast_points": timedelta(hours=2),
-}
+RETENTION_GRACE: dict[str, timedelta] = {}
 
 # 원천 weather/event projection은 publication publisher가 원자 reconcile하므로, 이
 # 레거시 loader에는 DATE 기반 retention 대상이 남아 있지 않다.

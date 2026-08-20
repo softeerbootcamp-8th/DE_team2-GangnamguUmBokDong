@@ -6,7 +6,12 @@ adapter_params:
   service: bikeList
   page_size: 1000
   root_key: rentBikeStatus.row
+  # bikeList의 list_total_count는 전체 건수가 아니라 현재 페이지 행 수다.
+  # 응답 total을 무시하고 빈 페이지(INFO-200)까지 순차 탐색한다.
   pagination: probe_until_empty
+  # API 이상으로 빈 페이지가 영원히 오지 않아도 10,000행을 조용히 넘기지 않고
+  # 명시적으로 실패한다. 현재 운영 대여소 약 2,736곳에는 충분한 여유다.
+  max_probe_pages: 10
 
 natural_key: [stationId]
 

@@ -1053,8 +1053,12 @@ def _station_staging_validator(
     object_store: ImmutableObjectStore,
     *,
     expected_current_records: tuple[StationRecord, ...],
+    activation_ready_station_ids: tuple[str, ...] = (),
+    validate_current_target: bool = True,
 ) -> Any:
     """actual station input·output을 DB geography로 재구성하는 validator를 만든다."""
+    if type(validate_current_target) is not bool:
+        raise ContractViolation("validate_current_target은 bool이어야 합니다.")
 
     def validate_staging(
         publication: PreparedPublication,
@@ -1063,7 +1067,8 @@ def _station_staging_validator(
         """sealed station bytes를 direct·nested immutable input에서 재검증한다."""
         if publication.manifest.publication_key != "station":
             raise ContractViolation("station staging publication key가 다릅니다.")
-        _validate_db_station_short(connection, expected_current_records)
+        if validate_current_target:
+            _validate_db_station_short(connection, expected_current_records)
         inputs = _station_inputs_from_fingerprint(publication.input_fingerprint)
         _, projection = _project_station_with_connection(
             connection,
@@ -1071,6 +1076,7 @@ def _station_staging_validator(
             inputs=inputs,
             direct_payloads=payloads,
             relocation_approval=_approval_from_inputs(inputs, payloads),
+            activation_ready_station_ids=activation_ready_station_ids,
         )
         validate_station_conditional_inputs(
             publication.input_fingerprint,
@@ -1112,8 +1118,11 @@ def _stock_staging_validator(
     object_store: ImmutableObjectStore,
     *,
     expected_current_records: tuple[StationStockRecord, ...],
+    validate_current_target: bool = True,
 ) -> Any:
     """actual realtime manifest·Silver와 stock output을 대조하는 validator를 만든다."""
+    if type(validate_current_target) is not bool:
+        raise ContractViolation("validate_current_target은 bool이어야 합니다.")
 
     def validate_staging(
         publication: PreparedPublication,
@@ -1122,7 +1131,8 @@ def _stock_staging_validator(
         """stock output의 candidate·schema·row 전체를 재검증한다."""
         if publication.manifest.publication_key != "station_stock":
             raise ContractViolation("stock staging publication key가 다릅니다.")
-        _validate_db_stock_short(connection, expected_current_records)
+        if validate_current_target:
+            _validate_db_stock_short(connection, expected_current_records)
         manifest_input = _input_by_role(
             publication.input_fingerprint,
             "bike_station_realtime_manifest",
@@ -1186,6 +1196,8 @@ def _locked_station_projection(
     cursor: Cursor[tuple[Any, ...]],
     object_store: ImmutableObjectStore,
     evidence: VerifiedPublicationEvidence,
+    *,
+    activation_ready_station_ids: tuple[str, ...] = (),
 ) -> StationProjection:
     """topology lock 안 actual fingerprint에서 station projection을 다시 만든다."""
     inputs = _station_inputs_from_fingerprint(evidence.input_fingerprint)
@@ -1199,6 +1211,7 @@ def _locked_station_projection(
         topology=topology,
         relocation_approval=approval,
         distance_meters=_postgis_distance(cursor),
+        activation_ready_station_ids=activation_ready_station_ids,
     )
     validate_station_conditional_inputs(
         evidence.input_fingerprint,
@@ -1253,6 +1266,7 @@ def _project_station_with_connection(
     direct_payloads: Mapping[str, bytes],
     relocation_approval: StationRelocationApproval | None,
     expected_topology: _TopologySnapshot | None = None,
+    activation_ready_station_ids: tuple[str, ...] = (),
 ) -> tuple[_TopologySnapshot, StationProjection]:
     """짧은 read transaction의 PostGIS 거리로 station projection을 만든다."""
     if connection.info.transaction_status is not TransactionStatus.IDLE:
@@ -1270,6 +1284,7 @@ def _project_station_with_connection(
             topology=topology,
             relocation_approval=relocation_approval,
             distance_meters=_postgis_distance(cursor),
+            activation_ready_station_ids=activation_ready_station_ids,
         )
     return topology, projection
 
@@ -1282,6 +1297,7 @@ def _project_station(
     topology: _TopologySnapshot,
     relocation_approval: StationRelocationApproval | None,
     distance_meters: Any,
+    activation_ready_station_ids: tuple[str, ...] = (),
 ) -> StationProjection:
     """actual direct·nested bytes를 typed station projection으로 변환한다."""
     master_snapshot = _master_snapshot(
@@ -1305,7 +1321,7 @@ def _project_station(
         previous_records=previous_records,
         weather_grid_ids=topology.weather_grid_ids,
         dispatch_centers=topology.dispatch_centers,
-        activation_ready_station_ids=(),
+        activation_ready_station_ids=activation_ready_station_ids,
         relocation_approval=relocation_approval,
         distance_meters=distance_meters,
     )

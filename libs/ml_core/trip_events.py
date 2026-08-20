@@ -9,9 +9,9 @@ censoring 계산을 위해 최근 트립을 조회하는 것이 **같은 크로�
 """
 
 import pandas as pd
+from core import s3 as s3_io
 
 from . import paths
-from core import s3 as s3_io
 
 
 def normalize_station_no(series: pd.Series) -> pd.Series:

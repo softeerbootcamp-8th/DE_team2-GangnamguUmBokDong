@@ -73,6 +73,10 @@ MutationCallback = Callable[
     [Cursor[tuple[Any, ...]], tuple[VerifiedPublicationEvidence, ...]],
     None,
 ]
+ReplayTargetValidator = Callable[
+    [Cursor[tuple[Any, ...]], tuple[VerifiedPublicationEvidence, ...]],
+    None,
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,7 +115,13 @@ def required_lock_scope(publication_keys: Iterable[str]) -> LockScope:
     scopes: set[LockScope] = set()
     for key in keys:
         get_publication_spec(key)
-        scopes.add(_LOCK_SCOPE_BY_KEY[key])
+        try:
+            scope = _LOCK_SCOPE_BY_KEY[key]
+        except KeyError as exc:
+            raise ContractViolation(
+                f"publication key의 lock scope가 등록되지 않았습니다: {key}"
+            ) from exc
+        scopes.add(scope)
 
     if LockScope.TOPOLOGY_EXCLUSIVE in scopes:
         return LockScope.TOPOLOGY_EXCLUSIVE
@@ -129,6 +139,8 @@ def execute_publication(
     *,
     validate_locked: LockedValidator | None = None,
     validate_conditional_empty: ConditionalEmptyValidator | None = None,
+    allow_mixed_replay: bool = False,
+    validate_replay_targets_locked: ReplayTargetValidator | None = None,
 ) -> PublicationResult:
     """검증된 publication의 target 변경과 state claim을 한 transaction으로 실행한다.
 
@@ -138,6 +150,8 @@ def execute_publication(
         mutate_targets: 같은 cursor로 target projection을 변경하는 callback
         validate_locked: 모든 lock 뒤 dependency 외 table별 불변식을 검증하는 callback
         validate_conditional_empty: 조건부 EMPTY 근거를 lock 안에서 증명하는 callback
+        allow_mixed_replay: publish와 exact replay 혼합 실행을 허용할지 여부
+        validate_replay_targets_locked: 혼합 실행의 replay target을 lock 안에서 검증하는 callback
     returns:
         stale, exact replay 또는 published 결과와 정렬된 publication key
     raises:
@@ -155,6 +169,16 @@ def execute_publication(
     ordered = _prepare_publications(issued_publications)
     if not callable(mutate_targets):
         raise ContractViolation("mutate_targets callback이 필요합니다.")
+    if type(allow_mixed_replay) is not bool:
+        raise ContractViolation("allow_mixed_replay는 bool이어야 합니다.")
+    if allow_mixed_replay and not callable(validate_replay_targets_locked):
+        raise ContractViolation(
+            "mixed replay 실행에는 locked replay target validator가 필요합니다."
+        )
+    if not allow_mixed_replay and validate_replay_targets_locked is not None:
+        raise ContractViolation(
+            "locked replay target validator는 mixed replay opt-in에서만 허용됩니다."
+        )
 
     if connection.info.transaction_status is not TransactionStatus.IDLE:
         raise PublicationTransactionError(
@@ -181,20 +205,54 @@ def execute_publication(
             _classify(item.manifest, states.get(item.manifest.publication_key))
             for item in ordered
         )
-        outcome = _single_outcome(decisions)
-        if outcome is not PublicationOutcome.PUBLISHED:
+        outcome = _execution_outcome(
+            decisions,
+            allow_mixed_replay=allow_mixed_replay,
+        )
+        if outcome is PublicationOutcome.STALE or (
+            outcome is PublicationOutcome.EXACT_REPLAY and not allow_mixed_replay
+        ):
             return PublicationResult(outcome, publication_keys)
+
+        published_keys = frozenset(
+            item.manifest.publication_key
+            for item, decision in zip(ordered, decisions, strict=True)
+            if decision is PublicationOutcome.PUBLISHED
+        )
+        replayed_keys = frozenset(
+            item.manifest.publication_key
+            for item, decision in zip(ordered, decisions, strict=True)
+            if decision is PublicationOutcome.EXACT_REPLAY
+        )
 
         _validate_dependencies(ordered, states)
         if validate_locked is not None:
             validate_locked(cursor, ordered)
-        ordered = _prepare_publications(issued_publications)
+        if replayed_keys:
+            assert validate_replay_targets_locked is not None
+            replayed = tuple(
+                item
+                for item in _prepare_publications(issued_publications)
+                if item.manifest.publication_key in replayed_keys
+            )
+            validate_replay_targets_locked(cursor, replayed)
+        if outcome is PublicationOutcome.EXACT_REPLAY:
+            return PublicationResult(outcome, publication_keys)
+        ordered = tuple(
+            item
+            for item in _prepare_publications(issued_publications)
+            if item.manifest.publication_key in published_keys
+        )
         _validate_empty_publications(
             cursor,
             ordered,
             validate_conditional_empty,
         )
-        ordered = _prepare_publications(issued_publications)
+        ordered = tuple(
+            item
+            for item in _prepare_publications(issued_publications)
+            if item.manifest.publication_key in published_keys
+        )
         _claim_publications(cursor, ordered)
         mutate_targets(cursor, ordered)
 
@@ -365,17 +423,24 @@ def _classify(
     return PublicationOutcome.EXACT_REPLAY
 
 
-def _single_outcome(
+def _execution_outcome(
     decisions: tuple[PublicationOutcome, ...],
+    *,
+    allow_mixed_replay: bool,
 ) -> PublicationOutcome:
-    """multi-key transaction의 모든 판정이 같지 않으면 hard fail한다."""
+    """기본은 단일 판정만, opt-in은 publish+replay 조합만 허용한다."""
     unique = set(decisions)
-    if len(unique) != 1:
-        raise PublicationConflictError(
-            "multi-key publication의 stale/replay/publish 판정이 섞여 있습니다: "
-            f"{sorted(unique)}"
-        )
-    return decisions[0]
+    if len(unique) == 1:
+        return decisions[0]
+    if allow_mixed_replay and unique == {
+        PublicationOutcome.PUBLISHED,
+        PublicationOutcome.EXACT_REPLAY,
+    }:
+        return PublicationOutcome.PUBLISHED
+    raise PublicationConflictError(
+        "multi-key publication의 stale/replay/publish 판정이 섞여 있습니다: "
+        f"{sorted(unique)}"
+    )
 
 
 def _validate_dependencies(

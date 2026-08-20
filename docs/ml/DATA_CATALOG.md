@@ -6,6 +6,12 @@
 [training/DESIGN.md](training/DESIGN.md), 왜 그렇게 했는지는
 [history.md](history.md)를 참고.
 
+> 아래 `data/...` 경로와 용량은 과거 로컬 원본/분석 자산의 inventory다. 현재
+> feature_engine은 이 파일을 직접 읽지 않고, bootstrap/collector가 일별 S3
+> Archive에 적재한 historical fact를 읽는다(최신 station dimension만 Silver).
+> 표의 “사용”은 해당 원천의 정보가 현행 학습에 들어간다는 뜻이지 로컬 경로를
+> runtime에서 읽는다는 뜻이 아니다.
+
 ## 0. 전체 데이터 지도
 
 | 소스 | 위치 | 기간 | 파이프라인 사용 여부 |
@@ -207,7 +213,7 @@ overflow가 실제로 관측됨. 반납이 거치대 상태와 무관하게 항�
 
 **격자 ID 규칙**: `다사52255325` 형태, 행정안전부 국가지점번호 체계와 동일 —
 좌표 역산 공식은 [feature_engine/DESIGN.md](feature_engine/DESIGN.md) 0.3절,
-[grid.py](feature_engine/grid.py) 참고.
+`grid.py`(옛 pandas 1차정제 코드 — 지금은 삭제됨) 참고.
 
 **마스킹 규칙**: 집계값이 **3 이하면 K-익명성 처리로 `"*"`** — KT 자체 EDA
 기준 전체의 약 5%. 파이프라인은 이를 2로 대체 (KT 예시 코드와 동일).
@@ -334,8 +340,23 @@ center_lat` 5컬럼, 34행뿐 — **격자가 자치구(區) 단위로만 뭉쳐
 | 재고 스냅샷 (2025년) | 22,556,913행 | `station_status_2025.parquet` 22,556,913행 (그대로) |
 | 날씨 관측 (2025년) | 8,761행 × 37컬럼 | `weather_2025.parquet` 8,760행 × 5컬럼 |
 | 생활인구 250m (2025년, 3종 합) | 약 1.89억 행 / 45GB | `population_2025.parquet` 19,826,084행 / 301MB |
-| **최종 병합 테이블** | — | `station_hour_merged_2025.parquet` **22,618,320행** / 417MB |
-| **최종 feature 테이블** | — | `station_hour_features_2025.parquet` **22,618,320행 × 42열** / 769MB |
+| **최종 병합 테이블**(당시, 시간 단위 그리드) | — | `station_hour_merged_2025.parquet` **22,618,320행** / 417MB |
+| **최종 feature 테이블**(당시, 시간 단위 그리드, 42개 피처) | — | `station_hour_features_2025.parquet` **22,618,320행 × 42열** / 769MB |
+
+**(2026-08 갱신) 위 마지막 두 행은 지금 파이프라인과 안 맞는다** — 그리드가
+시간 단위에서 설정 가능한 model tick으로 바뀌었고(기본 g20/r20/a20,
+선택 가능 g/r=`{5,10,15,20,30,60}`, formal training anchor 별도),
+피처도 42개에서 12개 안팎(`libs/ml_core/common_config.py`의
+`BASE_FEATURE_COLUMNS` + lag 1개)으로 대폭 줄었으며, 최종 산출물도 테이블
+1개가 아니라 **대여/반납 각각의 multi-horizon 테이블 2개**다
+(`feature_engine/README.md`의 "산출물" 절 참고) — horizon 1~12를 self-join으로
+펼치므로 기본 20분 anchor에서도 2025년 전체 기준 각각 약 8억 행까지
+커진다(실측, `training/DESIGN.md` §9). g5/r5/a5는 이보다 더 크고,
+g5/r5/a20은 5분 base 산출물을 만들되 multi-horizon 학습 행은 20분으로
+제한한다. 정확한 현재 규모는 이 표를 갱신하는 대신 실제 파이프라인을 돌려
+`.count()`로 확인하거나, 학습 시 MLflow에 로깅되는 `train_rows`/`valid_rows`/
+`test_rows` 파라미터로 확인할 것 — 그때그때 실측치라 여기 고정 숫자로
+박아두면 금방 또 stale해진다.
 
 ---
 
