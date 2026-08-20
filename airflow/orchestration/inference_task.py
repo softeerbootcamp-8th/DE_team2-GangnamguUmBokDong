@@ -5,8 +5,8 @@ from __future__ import annotations
 import json
 
 from airflow.task.trigger_rule import TriggerRule
-
 from config.schedules import INFERENCE_EXECUTION_TIMEOUT
+
 from orchestration.serving_task import xcom_ref
 from orchestration.task_builder import REPO_ROOT, build_module_task
 
@@ -31,4 +31,5 @@ def build_inference_task(dag, *, plan_task_id: str = "prepare_serving_plan"):
             "PLAN_SHA256": xcom_ref(plan_task_id, "plan", "byte_sha256"),
         },
         output_processor=json.loads,
+        uv_environment_name="ml-inference",
     )

@@ -51,8 +51,16 @@ def _reset_module_caches(monkeypatch):
     ]
     saved = {n: getattr(ps, n) for n in names}
     ps._rental_events_sorted_by_station = {}
-    monkeypatch.setattr(ps, "_get_recent_population", lambda target_ts, lookback_hours=3: _EMPTY_POPULATION)
-    monkeypatch.setattr(ps, "_get_recent_bike_status", lambda anchor_ts, lookback_hours=1.0: _EMPTY_BIKE_STATUS)
+    monkeypatch.setattr(
+        ps,
+        "_get_recent_population",
+        lambda target_ts, lookback_hours=3: _EMPTY_POPULATION,
+    )
+    monkeypatch.setattr(
+        ps,
+        "_get_recent_bike_status",
+        lambda anchor_ts, lookback_hours=1.0: _EMPTY_BIKE_STATUS,
+    )
     yield
     for n, v in saved.items():
         setattr(ps, n, v)
@@ -61,9 +69,13 @@ def _reset_module_caches(monkeypatch):
 
 def _set_rental_events(trips: pd.DataFrame) -> None:
     ps._rental_events_by_station = {
-        sid: g[["station_id", "start_dt", "end_dt"]].reset_index(drop=True) for sid, g in trips.groupby("station_id")
+        sid: g[["station_id", "start_dt", "end_dt"]].reset_index(drop=True)
+        for sid, g in trips.groupby("station_id")
     }
-    ps._rental_events_coverage = (pd.Timestamp("2025-01-01"), pd.Timestamp("2025-12-31 23:59:59"))
+    ps._rental_events_coverage = (
+        pd.Timestamp("2025-01-01"),
+        pd.Timestamp("2025-12-31 23:59:59"),
+    )
     order = trips["start_dt"].to_numpy().argsort(kind="mergesort")
     ps._all_rental_events_sorted = (
         trips["station_id"].to_numpy()[order],
@@ -75,30 +87,42 @@ def _set_rental_events(trips: pd.DataFrame) -> None:
 def _set_return_history(station_id: str, point, return_count: float = 0.0) -> None:
     """`_get_history_by_station()`이 캐시하는 형태 그대로 — 정확히 [target_ts-1시간]
     시점 하나만 담은 1행 DataFrame."""
-    ps._history_by_station = {station_id: pd.DataFrame({"return_count": [return_count]}, index=[pd.Timestamp(point)])}
+    ps._history_by_station = {
+        station_id: pd.DataFrame(
+            {"return_count": [return_count]}, index=[pd.Timestamp(point)]
+        )
+    }
 
 
 def _set_station_master(station_ids: list[str]) -> None:
     ps._station_master = pd.DataFrame(
-        {"station_no": list(range(1, len(station_ids) + 1)),
-         "capacity": [10.0] * len(station_ids), "lat": [37.5] * len(station_ids), "lon": [127.0] * len(station_ids),
-         "grid_id": ["G1"] * len(station_ids)},
+        {
+            "station_no": list(range(1, len(station_ids) + 1)),
+            "capacity": [10.0] * len(station_ids),
+            "lat": [37.5] * len(station_ids),
+            "lon": [127.0] * len(station_ids),
+            "grid_id": ["G1"] * len(station_ids),
+        },
         index=pd.Index(station_ids, name="station_id"),
     )
 
 
-def _fake_predict(df: pd.DataFrame, model_name: str, exposure_col: str | None = None) -> pd.DataFrame:
+def _fake_predict(
+    df: pd.DataFrame, model_name: str, exposure_col: str | None = None
+) -> pd.DataFrame:
     """ml_core.scoring.predict() 대역 — 실제 학습된 booster 파일 없이 배치 조립/실패
     처리 로직만 검증하려고 항상 고정값을 낸다."""
-    return pd.DataFrame({
-        "station_id": df["station_id"].to_numpy(),
-        "date": df["date"].to_numpy(),
-        "hour": df["hour"].to_numpy(),
-        "pred_mean": 1.0,
-        "pred_p10": 0.5,
-        "pred_p50": 1.0,
-        "pred_p90": 1.5,
-    })
+    return pd.DataFrame(
+        {
+            "station_id": df["station_id"].to_numpy(),
+            "date": df["date"].to_numpy(),
+            "hour": df["hour"].to_numpy(),
+            "pred_mean": 1.0,
+            "pred_p10": 0.5,
+            "pred_p50": 1.0,
+            "pred_p90": 1.5,
+        }
+    )
 
 
 # --- 1. tick 단위 시각 지정 ---------------------------------------------------
@@ -106,9 +130,15 @@ def _fake_predict(df: pd.DataFrame, model_name: str, exposure_col: str | None = 
 
 def test_target_timestamp_combines_date_hour_minute():
     """20분 모델 grid와 무관하게 운영 5분 앵커를 정확히 보존한다."""
-    assert ps._target_timestamp("2025-06-01", 17, 5) == pd.Timestamp("2025-06-01 17:05:00")
-    assert ps._target_timestamp("2025-06-01", 17, 55) == pd.Timestamp("2025-06-01 17:55:00")
-    assert ps._target_timestamp("2025-06-01", 17) == pd.Timestamp("2025-06-01 17:00:00")  # minute 기본값 0
+    assert ps._target_timestamp("2025-06-01", 17, 5) == pd.Timestamp(
+        "2025-06-01 17:05:00"
+    )
+    assert ps._target_timestamp("2025-06-01", 17, 55) == pd.Timestamp(
+        "2025-06-01 17:55:00"
+    )
+    assert ps._target_timestamp("2025-06-01", 17) == pd.Timestamp(
+        "2025-06-01 17:00:00"
+    )  # minute 기본값 0
 
 
 @pytest.mark.parametrize("hour,minute", [(24, 0), (-1, 0), (17, 7), (17, 60), (17, -5)])
@@ -132,10 +162,16 @@ def test_lag_rolling_features_differ_by_minute_within_same_hour():
     ps._station_profile_station_index = {}
     ps._station_profile_values = np.empty((0, 0, 0, 0, 0), dtype="float32")
 
-    out_1700, fb_1700 = ps._lag_rolling_features("A", 1, pd.Timestamp("2025-06-01 17:00:00"))
-    out_1705, fb_1705 = ps._lag_rolling_features("A", 1, pd.Timestamp("2025-06-01 17:05:00"))
+    out_1700, fb_1700 = ps._lag_rolling_features(
+        "A", 1, pd.Timestamp("2025-06-01 17:00:00")
+    )
+    out_1705, fb_1705 = ps._lag_rolling_features(
+        "A", 1, pd.Timestamp("2025-06-01 17:05:00")
+    )
 
-    assert not ({"rental_lag_1h"} & set(fb_1700 + fb_1705))  # 둘 다 fallback 없이 계산됨
+    assert not (
+        {"rental_lag_1h"} & set(fb_1700 + fb_1705)
+    )  # 둘 다 fallback 없이 계산됨
     assert out_1700["rental_lag_1h"] != out_1705["rental_lag_1h"]
 
 
@@ -152,8 +188,14 @@ def test_build_feature_record_honors_minute():
     _set_station_master(["A"])
 
     record, fallback, population_fallback = ps._build_feature_record(
-        station_id="A", date="2025-06-01", hour=17, minute=5,
-        temp=20.0, precip=0.0, population=3000.0, stockout=False,
+        station_id="A",
+        date="2025-06-01",
+        hour=17,
+        minute=5,
+        temp=20.0,
+        precip=0.0,
+        population=3000.0,
+        stockout=False,
     )
 
     target_ts = pd.Timestamp("2025-06-01 17:05:00")
@@ -168,8 +210,14 @@ def test_build_feature_record_rejects_invalid_minute():
     _set_station_master(["A"])
     with pytest.raises(ValueError):
         ps._build_feature_record(
-            station_id="A", date="2025-06-01", hour=17, minute=7,  # SERVING_TICK_MINUTES 배수 아님
-            temp=20.0, precip=0.0, population=3000.0, stockout=False,
+            station_id="A",
+            date="2025-06-01",
+            hour=17,
+            minute=7,  # SERVING_TICK_MINUTES 배수 아님
+            temp=20.0,
+            precip=0.0,
+            population=3000.0,
+            stockout=False,
         )
 
 
@@ -190,13 +238,19 @@ def test_predict_demand_multi_hour_all_stations_reports_failed_stations(monkeypa
     monkeypatch.setattr(ps, "predict", _fake_predict)
 
     outcome = ps.predict_demand_multi_hour_all_stations(
-        date="2025-06-01", hour=10, temp=20.0, precip=0.0,
-        station_ids=["A", "MISSING"], n_hours=1,
+        date="2025-06-01",
+        hour=10,
+        temp=20.0,
+        precip=0.0,
+        station_ids=["A", "MISSING"],
+        n_hours=1,
     )
 
     assert outcome["expected_count"] == 2
     assert outcome["actual_count"] == 1
-    assert outcome["actual_count"] < outcome["expected_count"]  # partial 여부를 이 비교만으로 알 수 있음
+    assert (
+        outcome["actual_count"] < outcome["expected_count"]
+    )  # partial 여부를 이 비교만으로 알 수 있음
     assert [r["station_id"] for r in outcome["results"]] == ["A"]
     assert [f["station_id"] for f in outcome["failed"]] == ["MISSING"]
     assert "알 수 없는 station_id" in outcome["failed"][0]["error"]
@@ -214,8 +268,12 @@ def test_predict_demand_multi_hour_all_stations_no_failures_when_all_known(monke
     monkeypatch.setattr(ps, "predict", _fake_predict)
 
     outcome = ps.predict_demand_multi_hour_all_stations(
-        date="2025-06-01", hour=10, temp=20.0, precip=0.0,
-        station_ids=["A"], n_hours=1,
+        date="2025-06-01",
+        hour=10,
+        temp=20.0,
+        precip=0.0,
+        station_ids=["A"],
+        n_hours=1,
     )
 
     assert outcome["failed"] == []
@@ -244,13 +302,19 @@ def test_predict_demand_multi_hour_all_stations_isolates_malformed_master_row(
     ps._population_profile = {}
     _set_station_master(["A", "BROKEN"])
     if column == "station_no":
-        ps._station_master["station_no"] = ps._station_master["station_no"].astype(object)
+        ps._station_master["station_no"] = ps._station_master["station_no"].astype(
+            object
+        )
     ps._station_master.loc["BROKEN", column] = bad_value
     monkeypatch.setattr(ps, "predict", _fake_predict)
 
     outcome = ps.predict_demand_multi_hour_all_stations(
-        date="2025-06-01", hour=10, temp=20.0, precip=0.0,
-        station_ids=["A", "BROKEN"], n_hours=1,
+        date="2025-06-01",
+        hour=10,
+        temp=20.0,
+        precip=0.0,
+        station_ids=["A", "BROKEN"],
+        n_hours=1,
     )
 
     assert outcome["expected_count"] == 2
@@ -260,27 +324,68 @@ def test_predict_demand_multi_hour_all_stations_isolates_malformed_master_row(
     assert column in outcome["failed"][0]["error"]
 
 
-def test_default_all_stations_reports_malformed_station_no_instead_of_omitting_it(monkeypatch):
-    """기본 station 선택도 파싱 불가 station_no를 조용히 필터링하지 않고 failed로 남긴다."""
+def test_default_all_stations_uses_active_trained_servable_intersection(monkeypatch):
+    """운영 기본 목록은 현재 active·학습됨·유효 master 교집합만 expected로 센다."""
     trips = pd.DataFrame([_trip("A", "2025-06-01 09:00:00", "2025-06-01 09:05:00")])
     _set_rental_events(trips)
     _set_return_history("A", "2025-06-01 09:00:00")
     ps._station_profile_station_index = {}
     ps._station_profile_values = np.empty((0, 0, 0, 0, 0), dtype="float32")
     ps._population_profile = {}
-    _set_station_master(["A", "BROKEN"])
-    ps._station_master["station_no"] = ps._station_master["station_no"].astype(object)
-    ps._station_master.loc["BROKEN", "station_no"] = "broken"
-    monkeypatch.setattr(ps, "load_station_dtype", lambda model_name: pd.CategoricalDtype(categories=[1]))
+    _set_station_master(["A", "INACTIVE", "BROKEN", "UNTRAINED"])
+    ps._station_master.loc["BROKEN", "capacity"] = np.nan
+    monkeypatch.setattr(
+        ps,
+        "_get_recent_bike_status",
+        lambda anchor_ts, lookback_hours=1.0: pd.DataFrame(
+            {
+                "bike_count": [3, 2, 1],
+                "capacity": [10, 10, 10],
+                "stockout_flag": [0, 0, 0],
+            },
+            index=pd.Index(["A", "BROKEN", "UNTRAINED"], name="station_id"),
+        ),
+    )
+    monkeypatch.setattr(
+        ps,
+        "load_station_dtype",
+        lambda model_name: pd.CategoricalDtype(
+            categories=[1, 2, 3, 4] if model_name == "rental" else [1, 2, 3]
+        ),
+    )
     monkeypatch.setattr(ps, "predict", _fake_predict)
 
     outcome = ps.predict_demand_multi_hour_all_stations(
         date="2025-06-01", hour=10, temp=20.0, precip=0.0, n_hours=1
     )
 
-    assert outcome["expected_count"] == 2
-    assert outcome["actual_count"] == 1
-    assert [failure["station_id"] for failure in outcome["failed"]] == ["BROKEN"]
+    assert outcome["expected_count"] == outcome["actual_count"] == 1
+    assert [row["station_id"] for row in outcome["results"]] == ["A"]
+    assert outcome["failed"] == []
+    assert {row["station_id"] for row in outcome["excluded"]} == {
+        "BROKEN",
+        "INACTIVE",
+        "UNTRAINED",
+    }
+    reasons = {row["station_id"]: row["reason"] for row in outcome["excluded"]}
+    assert "서빙 불가능한 master" in reasons["BROKEN"]
+    assert reasons["INACTIVE"] == "현재 anchor tick에 비활성"
+    assert reasons["UNTRAINED"] == "학습된 station category에 없음"
+
+
+def test_default_all_stations_requires_exact_current_active_snapshot(monkeypatch):
+    """운영 기본 목록은 현재 tick active snapshot 부재 시 과거 목록으로 진행하지 않는다."""
+    _set_station_master(["A"])
+    monkeypatch.setattr(
+        ps, "load_station_dtype", lambda model_name: pd.CategoricalDtype(categories=[1])
+    )
+
+    with pytest.raises(
+        ValueError, match="현재 anchor tick의 bike_station_realtime이 없음"
+    ):
+        ps.predict_demand_multi_hour_all_stations(
+            date="2025-06-01", hour=10, temp=20.0, precip=0.0, n_hours=1
+        )
 
 
 def test_all_stations_releases_rental_boosters_before_return_scoring(monkeypatch):
@@ -300,16 +405,29 @@ def test_all_stations_releases_rental_boosters_before_return_scoring(monkeypatch
         return _fake_predict(df, model_name, exposure_col)
 
     monkeypatch.setattr(ps, "predict", _record_predict)
-    monkeypatch.setattr(ps.scoring_io.load_boosters, "cache_clear", lambda: events.append("cache_clear"))
+    monkeypatch.setattr(
+        ps.scoring_io.load_boosters, "cache_clear", lambda: events.append("cache_clear")
+    )
     monkeypatch.setattr(ps.gc, "collect", lambda: events.append("gc"))
 
     for _ in range(2):
         ps.predict_demand_multi_hour_all_stations(
-            date="2025-06-01", hour=10, temp=20.0, precip=0.0,
-            station_ids=["A"], n_hours=1,
+            date="2025-06-01",
+            hour=10,
+            temp=20.0,
+            precip=0.0,
+            station_ids=["A"],
+            n_hours=1,
         )
 
-    expected_cycle = ["predict:rental", "cache_clear", "gc", "predict:return", "cache_clear", "gc"]
+    expected_cycle = [
+        "predict:rental",
+        "cache_clear",
+        "gc",
+        "predict:return",
+        "cache_clear",
+        "gc",
+    ]
     assert events == expected_cycle * 2
 
 
@@ -330,15 +448,28 @@ def test_multi_hour_releases_rental_boosters_before_return_scoring(monkeypatch):
         return _fake_predict(df, model_name, exposure_col)
 
     monkeypatch.setattr(ps, "predict", _record_predict)
-    monkeypatch.setattr(ps.scoring_io.load_boosters, "cache_clear", lambda: events.append("cache_clear"))
+    monkeypatch.setattr(
+        ps.scoring_io.load_boosters, "cache_clear", lambda: events.append("cache_clear")
+    )
     monkeypatch.setattr(ps.gc, "collect", lambda: events.append("gc"))
 
     ps.predict_demand_multi_hour(
-        station_id="A", date="2025-06-01", hour=10,
-        temp=20.0, precip=0.0, n_hours=1,
+        station_id="A",
+        date="2025-06-01",
+        hour=10,
+        temp=20.0,
+        precip=0.0,
+        n_hours=1,
     )
 
-    assert events == ["predict:rental", "cache_clear", "gc", "predict:return", "cache_clear", "gc"]
+    assert events == [
+        "predict:rental",
+        "cache_clear",
+        "gc",
+        "predict:return",
+        "cache_clear",
+        "gc",
+    ]
 
 
 def test_public_single_apis_release_boosters_after_each_score(monkeypatch):
@@ -356,7 +487,9 @@ def test_public_single_apis_release_boosters_after_each_score(monkeypatch):
         return _fake_predict(df, model_name, exposure_col)
 
     monkeypatch.setattr(ps, "predict", _record_predict)
-    monkeypatch.setattr(ps.scoring_io.load_boosters, "cache_clear", lambda: events.append("cache_clear"))
+    monkeypatch.setattr(
+        ps.scoring_io.load_boosters, "cache_clear", lambda: events.append("cache_clear")
+    )
     monkeypatch.setattr(ps.gc, "collect", lambda: events.append("gc"))
 
     ps.predict_rental_demand(
@@ -366,14 +499,23 @@ def test_public_single_apis_release_boosters_after_each_score(monkeypatch):
         "A", "2025-06-01", 10, temp=20.0, precip=0.0, population=100.0
     )
 
-    assert events == ["predict:rental", "cache_clear", "gc", "predict:return", "cache_clear", "gc"]
+    assert events == [
+        "predict:rental",
+        "cache_clear",
+        "gc",
+        "predict:return",
+        "cache_clear",
+        "gc",
+    ]
 
 
 def test_single_station_cli_saves_to_s3(monkeypatch):
     """단일 정류소 CLI 실행 시 single_prediction_key 경로로 parquet이 저장되는지 검증한다."""
     from core import s3 as s3_io
 
-    trips = pd.DataFrame([_trip("ST-100", "2025-06-01 09:00:00", "2025-06-01 09:05:00")])
+    trips = pd.DataFrame(
+        [_trip("ST-100", "2025-06-01 09:00:00", "2025-06-01 09:05:00")]
+    )
     _set_rental_events(trips)
     _set_return_history("ST-100", "2025-06-01 09:00:00")
     ps._station_profile_station_index = {}
@@ -383,15 +525,23 @@ def test_single_station_cli_saves_to_s3(monkeypatch):
     monkeypatch.setattr(ps, "predict", _fake_predict)
 
     saved_calls = []
-    monkeypatch.setattr(s3_io, "write_parquet", lambda df, key: saved_calls.append((df, key)))
+    monkeypatch.setattr(
+        s3_io, "write_parquet", lambda df, key: saved_calls.append((df, key))
+    )
 
     argv = [
-        "--station-id", "ST-100",
-        "--date", "2025-06-01",
-        "--hour", "10",
-        "--minute", "0",
-        "--temp", "20.0",
-        "--precip", "0.0",
+        "--station-id",
+        "ST-100",
+        "--date",
+        "2025-06-01",
+        "--hour",
+        "10",
+        "--minute",
+        "0",
+        "--temp",
+        "20.0",
+        "--precip",
+        "0.0",
         "--stockout",
     ]
 
@@ -409,26 +559,65 @@ def test_single_station_cli_saves_to_s3(monkeypatch):
 def _fake_all_stations_outcome(expected: int, actual: int) -> dict:
     results = [
         {
-            "station_id": f"S{i}", "date": "2025-06-01", "hour": 10, "minute": 0, "horizon": 1,
-            "rental": {"pred_mean": 1.0, "pred_p10": 0.5, "pred_p50": 1.0, "pred_p90": 1.5, "lag_data_freshness": 1.0},
-            "return": {"pred_mean": 1.0, "pred_p10": 0.5, "pred_p50": 1.0, "pred_p90": 1.5},
-            "population_source": "provided", "stockout_source": "provided",
+            "station_id": f"S{i}",
+            "date": "2025-06-01",
+            "hour": 10,
+            "minute": 0,
+            "horizon": 1,
+            "rental": {
+                "pred_mean": 1.0,
+                "pred_p10": 0.5,
+                "pred_p50": 1.0,
+                "pred_p90": 1.5,
+                "lag_data_freshness": 1.0,
+            },
+            "return": {
+                "pred_mean": 1.0,
+                "pred_p10": 0.5,
+                "pred_p50": 1.0,
+                "pred_p90": 1.5,
+            },
+            "population_source": "provided",
+            "stockout_source": "provided",
         }
         for i in range(actual)
     ]
-    failed = [{"station_id": f"F{i}", "error": "boom"} for i in range(expected - actual)]
-    return {"results": results, "failed": failed, "expected_count": expected, "actual_count": actual}
+    failed = [
+        {"station_id": f"F{i}", "error": "boom"} for i in range(expected - actual)
+    ]
+    return {
+        "results": results,
+        "failed": failed,
+        "expected_count": expected,
+        "actual_count": actual,
+    }
 
 
 def _run_all_stations_cli(monkeypatch, outcome: dict) -> tuple[int, list, list]:
     from core import s3 as s3_io
 
-    monkeypatch.setattr(ps, "predict_demand_multi_hour_all_stations", lambda **kwargs: outcome)
+    monkeypatch.setattr(
+        ps, "predict_demand_multi_hour_all_stations", lambda **kwargs: outcome
+    )
     parquet_calls, json_calls = [], []
-    monkeypatch.setattr(s3_io, "write_parquet", lambda df, key: parquet_calls.append((df, key)))
-    monkeypatch.setattr(s3_io, "write_json", lambda key, data: json_calls.append((key, data)))
+    monkeypatch.setattr(
+        s3_io, "write_parquet", lambda df, key: parquet_calls.append((df, key))
+    )
+    monkeypatch.setattr(
+        s3_io, "write_json", lambda key, data: json_calls.append((key, data))
+    )
 
-    argv = ["--all-stations", "--date", "2025-06-01", "--hour", "10", "--temp", "20.0", "--precip", "0.0"]
+    argv = [
+        "--all-stations",
+        "--date",
+        "2025-06-01",
+        "--hour",
+        "10",
+        "--temp",
+        "20.0",
+        "--precip",
+        "0.0",
+    ]
     try:
         ps.main(argv)
         code = 0
@@ -438,7 +627,9 @@ def _run_all_stations_cli(monkeypatch, outcome: dict) -> tuple[int, list, list]:
 
 
 def test_all_stations_cli_exits_zero_on_full_success(monkeypatch):
-    code, parquet_calls, json_calls = _run_all_stations_cli(monkeypatch, _fake_all_stations_outcome(3, 3))
+    code, parquet_calls, json_calls = _run_all_stations_cli(
+        monkeypatch, _fake_all_stations_outcome(3, 3)
+    )
 
     assert code == 0
     assert len(parquet_calls) == 1  # 성공 결과는 항상 저장
@@ -446,9 +637,13 @@ def test_all_stations_cli_exits_zero_on_full_success(monkeypatch):
     assert json_calls[0][1] == []  # 이전 partial 실행의 stale sidecar를 명시적으로 정리
 
 
-def test_all_stations_cli_exits_one_on_partial_failure_and_writes_diagnostics(monkeypatch):
+def test_all_stations_cli_exits_one_on_partial_failure_and_writes_diagnostics(
+    monkeypatch,
+):
     """부분 결과는 parquet/sidecar로 진단 가능하게 남기되 downstream 적재를 막는다."""
-    code, parquet_calls, json_calls = _run_all_stations_cli(monkeypatch, _fake_all_stations_outcome(3, 2))
+    code, parquet_calls, json_calls = _run_all_stations_cli(
+        monkeypatch, _fake_all_stations_outcome(3, 2)
+    )
 
     assert code == 1
     assert len(parquet_calls) == 1
@@ -459,7 +654,9 @@ def test_all_stations_cli_exits_one_on_partial_failure_and_writes_diagnostics(mo
 
 def test_all_stations_cli_exits_one_on_total_failure(monkeypatch):
     """완전 실패는 기존 정상 parquet을 빈 결과로 덮어쓰지 않고 exit 1로 막는다."""
-    code, parquet_calls, json_calls = _run_all_stations_cli(monkeypatch, _fake_all_stations_outcome(3, 0))
+    code, parquet_calls, json_calls = _run_all_stations_cli(
+        monkeypatch, _fake_all_stations_outcome(3, 0)
+    )
 
     assert code == 1
     assert parquet_calls == []
@@ -468,7 +665,9 @@ def test_all_stations_cli_exits_one_on_total_failure(monkeypatch):
 
 def test_all_stations_cli_treats_zero_expected_and_zero_actual_as_failure(monkeypatch):
     """기본 후보 계산이 비어도 '0건 완전 성공'으로 통과하거나 기존 결과를 지우지 않는다."""
-    code, parquet_calls, json_calls = _run_all_stations_cli(monkeypatch, _fake_all_stations_outcome(0, 0))
+    code, parquet_calls, json_calls = _run_all_stations_cli(
+        monkeypatch, _fake_all_stations_outcome(0, 0)
+    )
 
     assert code == 1
     assert parquet_calls == []
@@ -479,7 +678,9 @@ def test_single_station_multi_hour_cli_saves_to_s3(monkeypatch):
     """단일 정류소 다중 시간대(n_hours>1) CLI 실행 시 S3 저장 검증."""
     from core import s3 as s3_io
 
-    trips = pd.DataFrame([_trip("ST-100", "2025-06-01 09:00:00", "2025-06-01 09:05:00")])
+    trips = pd.DataFrame(
+        [_trip("ST-100", "2025-06-01 09:00:00", "2025-06-01 09:05:00")]
+    )
     _set_rental_events(trips)
     _set_return_history("ST-100", "2025-06-01 09:00:00")
     ps._station_profile_station_index = {}
@@ -489,17 +690,26 @@ def test_single_station_multi_hour_cli_saves_to_s3(monkeypatch):
     monkeypatch.setattr(ps, "predict", _fake_predict)
 
     saved_calls = []
-    monkeypatch.setattr(s3_io, "write_parquet", lambda df, key: saved_calls.append((df, key)))
+    monkeypatch.setattr(
+        s3_io, "write_parquet", lambda df, key: saved_calls.append((df, key))
+    )
 
     argv = [
-        "--station-id", "ST-100",
-        "--date", "2025-06-01",
-        "--hour", "10",
-        "--minute", "0",
-        "--temp", "20.0",
-        "--precip", "0.0",
+        "--station-id",
+        "ST-100",
+        "--date",
+        "2025-06-01",
+        "--hour",
+        "10",
+        "--minute",
+        "0",
+        "--temp",
+        "20.0",
+        "--precip",
+        "0.0",
         "--stockout",
-        "--n-hours", "3",
+        "--n-hours",
+        "3",
     ]
 
     try:

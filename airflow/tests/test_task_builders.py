@@ -7,7 +7,6 @@ import jinja2
 import pytest
 from airflow.sdk.execution_time import macros
 from airflow.task.trigger_rule import TriggerRule
-
 from callbacks.task_callbacks import on_failure_callback, on_success_callback
 from orchestration.collector_task import (
     COLLECTOR_DIR,
@@ -32,7 +31,7 @@ from orchestration.serving_task import (
     build_finalize_serving_task,
     build_prepare_serving_task,
 )
-from orchestration.task_builder import REPO_ROOT
+from orchestration.task_builder import REPO_ROOT, build_module_task
 from orchestration.templates import (
     KST_WINDOW_START,
     kst_date_days_ago,
@@ -63,7 +62,9 @@ def test_collector_task_uses_kst_window_and_own_project_environment(dag) -> None
     """Collector wrapper가 frozen project와 KST 5분 window 계약을 유지한다."""
     task = build_collector_task(dag, "bike_station_realtime")
 
-    assert task.bash_command.startswith("env -u VIRTUAL_ENV -u UV_PROJECT_ENVIRONMENT ")
+    assert task.bash_command.startswith(
+        "env -u VIRTUAL_ENV UV_PROJECT_ENVIRONMENT=/opt/venvs/modules/collector "
+    )
     assert (
         "uv run --frozen python main.py --source bike_station_realtime"
         in task.bash_command
@@ -71,6 +72,18 @@ def test_collector_task_uses_kst_window_and_own_project_environment(dag) -> None
     assert "astimezone" in task.bash_command
     assert "// 5" in task.bash_command
     assert task.cwd == COLLECTOR_DIR
+
+
+def test_module_task_rejects_unsafe_environment_name(dag) -> None:
+    """모듈 환경 이름이 고정 volume 경로를 벗어나지 못하게 한다."""
+    with pytest.raises(ValueError, match="lowercase"):
+        build_module_task(
+            dag,
+            "unsafe_environment",
+            COLLECTOR_DIR,
+            "true",
+            uv_environment_name="../collector",
+        )
 
 
 def test_normalizer_task_contract(dag) -> None:
@@ -123,6 +136,9 @@ def test_inference_task_consumes_only_plan_ref_json(dag) -> None:
 
     assert task.cwd == ML_DIR
     assert task.cwd.endswith("/ml")
+    assert task.bash_command.startswith(
+        "env -u VIRTUAL_ENV UV_PROJECT_ENVIRONMENT=/opt/venvs/modules/ml-inference "
+    )
     assert "--frozen python -m inference.publication_cli" in task.bash_command
     assert "predict_single" not in task.bash_command
     assert task.env == {
@@ -162,6 +178,9 @@ def test_finalize_task_uses_exact_refs_and_disables_single_task_retry(dag) -> No
     assert "ti.xcom_pull" not in task.bash_command
     assert task.retries == 0
     assert callable(task.output_processor)
+    assert task.bash_command.startswith(
+        "env -u VIRTUAL_ENV UV_PROJECT_ENVIRONMENT=/opt/venvs/modules/loader "
+    )
 
 
 def test_urgency_and_route_use_release_refs_without_legacy_compute(dag) -> None:
@@ -174,6 +193,10 @@ def test_urgency_and_route_use_release_refs_without_legacy_compute(dag) -> None:
     assert "uv run --frozen python serving_cli.py route" in route.bash_command
     assert "rebalance" not in urgency.cwd
     assert urgency.retries == route.retries == 0
+    for task in (urgency, route):
+        assert task.bash_command.startswith(
+            "env -u VIRTUAL_ENV UV_PROJECT_ENVIRONMENT=/opt/venvs/modules/loader "
+        )
     assert urgency.env == {
         "STATION_URI": "{{ ti.xcom_pull(task_ids='final_x')['station']['uri'] }}",
         "STATION_SHA256": (

@@ -11,19 +11,7 @@ from datetime import UTC, datetime
 
 import pandas as pd
 from ml_core import silver_schema
-
-from reader import _predictions_key, _silver_key
-
-
-def test_silver_key_matches_ml_core_convention():
-    samples = [
-        datetime(2026, 8, 16, 14, 5, tzinfo=UTC),
-        datetime(2026, 1, 1, 0, 0, tzinfo=UTC),
-        datetime(2026, 12, 31, 23, 55, tzinfo=UTC),
-    ]
-    for window_start in samples:
-        expected = silver_schema.silver_key("bike_station_realtime", pd.Timestamp(window_start))
-        assert _silver_key("bike_station_realtime", window_start) == expected
+from reader import _predictions_key
 
 
 def test_predictions_key_matches_ml_core_convention():

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import io
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 # pyrefly: ignore [missing-import]
 import pyarrow as pa
@@ -18,6 +18,13 @@ from core.s3 import (
     list_keys,
     write_json,
     write_parquet,
+)
+from core.source_snapshot_io import (
+    SourceSnapshotNotFoundError,
+    SourceSnapshotReadError,
+    read_exact_source_snapshot,
+    read_latest_source_snapshot,
+    read_partial_source_snapshot,
 )
 
 GRID_SOURCE_ID = "living_population_grid"
@@ -49,7 +56,9 @@ def _silver_date_prefix(source_id: str, baseline_date: date) -> str:
 
 def _nowcast_key(target_date: date) -> str:
     """해당 일자의 nowcaster 추정치 parquet S3 키를 반환한다(`nowcaster/storage.py`와 같은 규칙)."""
-    return f"{_silver_date_prefix(GRID_SOURCE_ID, target_date)}hh=00/{_NOWCAST_FILENAME}"
+    return (
+        f"{_silver_date_prefix(GRID_SOURCE_ID, target_date)}hh=00/{_NOWCAST_FILENAME}"
+    )
 
 
 def read_nowcast_grid(target_date: date) -> pa.Table:
@@ -124,34 +133,56 @@ def read_realtime_silver(window_start: datetime) -> pa.Table:
     raises:
         PartitionNotFoundError: 해당 시각의 파일이 없을 때
     """
-    key = _silver_key(REALTIME_SOURCE_ID, window_start)
-    body = get_object_bytes(key)
-    if body is None:
-        raise PartitionNotFoundError(f"{REALTIME_SOURCE_ID} silver 파일 없음: {key}")
-    return pq.read_table(io.BytesIO(body))
+    return _read_exact_collector_snapshot(
+        REALTIME_SOURCE_ID,
+        window_start,
+        allow_partial=True,
+    )
 
 
 def read_station_master_silver(window_start: datetime) -> pa.Table:
     """Collector가 같은 window에 쓴 대여소 master Silver를 읽는다."""
-    key = _silver_key(STATION_MASTER_SOURCE_ID, window_start)
-    body = get_object_bytes(key)
-    if body is None:
-        raise PartitionNotFoundError(f"{STATION_MASTER_SOURCE_ID} silver 파일 없음: {key}")
-    return pq.read_table(io.BytesIO(body))
+    return _read_exact_collector_snapshot(STATION_MASTER_SOURCE_ID, window_start)
 
 
 def read_latest_bike_realtime_silver(window_start: datetime) -> pa.Table | None:
-    """window 시각 이전의 최신 실시간 대여소 Silver를 읽는다."""
-    cutoff = _silver_key(BIKE_REALTIME_SOURCE_ID, window_start)
-    keys = [
-        key
-        for key in list_keys(f"silver/{BIKE_REALTIME_SOURCE_ID}/")
-        if key.endswith(".parquet") and key <= cutoff
-    ]
-    if not keys:
+    """window 시각 이전 24시간의 최신 authoritative 대여소 Silver를 읽는다."""
+    try:
+        snapshot = read_latest_source_snapshot(
+            BIKE_REALTIME_SOURCE_ID,
+            window_start,
+            lookback=timedelta(hours=24),
+        )
+    except SourceSnapshotNotFoundError:
         return None
-    body = get_object_bytes(max(keys))
-    return pq.read_table(io.BytesIO(body)) if body else None
+    except SourceSnapshotReadError as exc:
+        raise PartitionNotFoundError(str(exc)) from exc
+    return snapshot.table
+
+
+def _read_exact_collector_snapshot(
+    source_id: str,
+    window_start: datetime,
+    *,
+    allow_partial: bool = False,
+) -> pa.Table:
+    """Collector authority가 가리키는 exact-window Parquet을 읽는다."""
+    try:
+        snapshot = read_exact_source_snapshot(source_id, window_start)
+    except SourceSnapshotNotFoundError as exc:
+        if allow_partial:
+            try:
+                return read_partial_source_snapshot(source_id, window_start)
+            except SourceSnapshotReadError as partial_exc:
+                raise PartitionNotFoundError(str(partial_exc)) from partial_exc
+        raise PartitionNotFoundError(str(exc)) from exc
+    except SourceSnapshotReadError as exc:
+        raise PartitionNotFoundError(str(exc)) from exc
+    if snapshot.table is None:
+        raise PartitionNotFoundError(
+            f"{source_id} exact source snapshot이 EMPTY입니다: {window_start.isoformat()}"
+        )
+    return snapshot.table
 
 
 def write_normalized_silver(
@@ -184,7 +215,9 @@ def write_normalized_silver(
             try:
                 existing_generation = datetime.fromisoformat(raw_generation)
             except ValueError as exc:
-                raise ValueError(f"정규화 세대 metadata가 잘못됐습니다: key={key}") from exc
+                raise ValueError(
+                    f"정규화 세대 metadata가 잘못됐습니다: key={key}"
+                ) from exc
             if existing_generation > generation:
                 return None
 

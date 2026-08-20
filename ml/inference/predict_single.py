@@ -87,9 +87,11 @@ raw 스키마 자체(`fcstDate`/`fcstTime`/`TMP`/`PCP`)는 `loader/transform.py`
 
 import gc
 import io
+import re
 import sys
 import threading
 from collections.abc import Iterator, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from contextvars import ContextVar
 from functools import wraps
@@ -97,6 +99,11 @@ from functools import wraps
 import numpy as np
 import pandas as pd
 from core import s3 as s3_io
+from core.source_snapshot_io import (
+    SourceSnapshotNotFoundError,
+    SourceSnapshotReadError,
+    read_exact_source_snapshot,
+)
 from ml_core import scoring as scoring_io
 from ml_core import silver_schema
 from ml_core.day_index import day_index
@@ -120,8 +127,15 @@ from . import config
 # 두 모델 컬럼의 합집합 하나로 한 번에 한다(겹치는 공통 컬럼의 dtype 값은 동일하므로
 # merge 시 충돌 없음).
 _ALL_FEATURE_COLUMNS = sorted(set(RENTAL_FEATURE_COLUMNS) | set(RETURN_FEATURE_COLUMNS))
-_COMBINED_FEATURE_COLUMN_DTYPES = {**RENTAL_FEATURE_COLUMN_DTYPES, **RETURN_FEATURE_COLUMN_DTYPES}
+_COMBINED_FEATURE_COLUMN_DTYPES = {
+    **RENTAL_FEATURE_COLUMN_DTYPES,
+    **RETURN_FEATURE_COLUMN_DTYPES,
+}
 _MAX_FORECAST_DISTANCE = pd.Timedelta(minutes=35)
+_COLLECTOR_LOGICAL_KEY = re.compile(
+    r"silver/(?P<source>[a-z][a-z0-9_]*)/dt=(?P<date>\d{4}-\d{2}-\d{2})/"
+    r"hh=(?P<hour>\d{2})/(?P<minute>\d{4})\.parquet\Z"
+)
 
 # return_lag_1h(정확히 1시간 전 1개 값)와 rental_lag_1h의 censored window
 # ([T-100분, T-40분))를 둘 다 커버하는 여유 — Silver rental을 raw로 fetch할 때
@@ -130,11 +144,17 @@ _RENTAL_LOOKBACK_HOURS = 3
 
 _history_by_station: dict[str, pd.DataFrame] | None = None
 _rental_events_by_station: dict[str, pd.DataFrame] | None = None
-_rental_events_sorted_by_station: dict[str, tuple] = {}  # station_id -> (start_dt 정렬된 numpy 배열, 그 순서로 정렬된 end_dt 배열) — _rental_visible_at() 캐시
-_all_rental_events_sorted: tuple | None = None  # (station_id 배열, start_dt로 정렬된 배열, 같은 순서의 end_dt 배열) — 전체 정류소 통합, _rental_visible_batch_all_stations() 캐시
+_rental_events_sorted_by_station: dict[
+    str, tuple
+] = {}  # station_id -> (start_dt 정렬된 numpy 배열, 그 순서로 정렬된 end_dt 배열) — _rental_visible_at() 캐시
+_all_rental_events_sorted: tuple | None = (
+    None  # (station_id 배열, start_dt로 정렬된 배열, 같은 순서의 end_dt 배열) — 전체 정류소 통합, _rental_visible_batch_all_stations() 캐시
+)
 _rental_events_coverage: tuple[pd.Timestamp, pd.Timestamp] | None = None
 _STATION_PROFILE_STAT_COLS = ("rental_mean", "rental_std", "return_mean", "return_std")
-_STATION_PROFILE_STAT_INDEX = {name: i for i, name in enumerate(_STATION_PROFILE_STAT_COLS)}
+_STATION_PROFILE_STAT_INDEX = {
+    name: i for i, name in enumerate(_STATION_PROFILE_STAT_COLS)
+}
 # station_no -> station 축 인덱스, 그리고 (station, model minute//tick, dow,
 # month-1, stat) dense 배열 — dict[tuple, dict[str,float]] 대신 쓰는 이유는
 # _get_station_profile() 참고.
@@ -143,8 +163,12 @@ _station_profile_values: np.ndarray | None = None
 _population_profile: dict[tuple[str, int, int], dict[str, float]] | None = None
 _station_master: pd.DataFrame | None = None
 _holidays_by_year: dict[int, set[str]] = {}
-_raw_rental_trips: pd.DataFrame | None = None  # station_id/end_station_id 매칭까지 끝난 원본 트립
-_recent_population_by_ts: dict[pd.Timestamp, pd.DataFrame] = {}  # _get_recent_population() 캐시 — target_ts별로 한 번만 S3에서 읽는다
+_raw_rental_trips: pd.DataFrame | None = (
+    None  # station_id/end_station_id 매칭까지 끝난 원본 트립
+)
+_recent_population_by_ts: dict[
+    pd.Timestamp, pd.DataFrame
+] = {}  # _get_recent_population() 캐시 — target_ts별로 한 번만 S3에서 읽는다
 _PINNED_STATION_PROFILE: ContextVar[tuple[dict[int, int], np.ndarray] | None] = (
     ContextVar(
         "inference_pinned_station_profile",
@@ -248,7 +272,50 @@ def authority_inference_run(
         _PREDICTION_RUN_LOCK.release()
 
 
-def _fetch_recent_rental_trips(anchor_ts: pd.Timestamp, lookback_hours: int) -> pd.DataFrame:
+def _read_authoritative_collector_many(
+    logical_keys: list[str],
+    columns: list[str] | None = None,
+) -> list[pd.DataFrame | None]:
+    """옛 logical Silver key 목록을 authority manifest 기반 snapshot으로 해석한다.
+
+    ``silver_schema``의 key builder는 저장 객체의 실제 위치가 아니라 source와 KST
+    logical window를 결정적으로 표현하는 주소로만 쓴다. 실제 bytes는 Collector가
+    발행한 최신 correction manifest가 가리키는 content-addressed Parquet에서 읽는다.
+    """
+
+    def _read(logical_key: str) -> pd.DataFrame | None:
+        """논리 key 하나의 최신 authoritative correction을 읽는다."""
+        match = _COLLECTOR_LOGICAL_KEY.fullmatch(logical_key)
+        if match is None or match.group("hour") != match.group("minute")[:2]:
+            raise ValueError(
+                f"Collector logical Silver key 형식이 잘못됐습니다: {logical_key}"
+            )
+        logical = pd.Timestamp(
+            f"{match.group('date')} {match.group('minute')[:2]}:{match.group('minute')[2:]}"
+        ).tz_localize("Asia/Seoul")
+        try:
+            snapshot = read_exact_source_snapshot(
+                match.group("source"),
+                logical.to_pydatetime(),
+                columns=columns,
+            )
+        except SourceSnapshotNotFoundError:
+            return None
+        except SourceSnapshotReadError as exc:
+            raise ValueError(
+                f"Collector source snapshot 계약 위반: logical_key={logical_key}, error={exc}"
+            ) from exc
+        return None if snapshot.table is None else snapshot.table.to_pandas()
+
+    if not logical_keys:
+        return []
+    with ThreadPoolExecutor(max_workers=min(16, len(logical_keys))) as pool:
+        return list(pool.map(_read, logical_keys))
+
+
+def _fetch_recent_rental_trips(
+    anchor_ts: pd.Timestamp, lookback_hours: int
+) -> pd.DataFrame:
     """anchor_ts 기준 최근 lookback_hours시간 동안의 Silver `bike_rental_history` 트립 원본을 읽어온다.
 
     `silver_schema.rental_tick_keys()`로 필요한 5분 tick 키를 결정적으로 만들고
@@ -275,8 +342,12 @@ def _fetch_recent_rental_trips(anchor_ts: pd.Timestamp, lookback_hours: int) -> 
             "ST-"형식 — station_no 크로스워크 불필요, `_resolve_rental_stations()` 참고)
     """
     keys = silver_schema.rental_tick_keys(anchor_ts, lookback_hours)
-    raws = s3_io.read_parquet_many(keys)
-    frames = [raw.rename(columns=silver_schema.RENTAL_COLUMN_MAP) for raw in raws if raw is not None and not raw.empty]
+    raws = _read_authoritative_collector_many(keys)
+    frames = [
+        raw.rename(columns=silver_schema.RENTAL_COLUMN_MAP)
+        for raw in raws
+        if raw is not None and not raw.empty
+    ]
     if not frames:
         return pd.DataFrame(columns=["start_dt", "end_dt", "start_st", "end_st"])
     trips = pd.concat(frames, ignore_index=True)
@@ -306,7 +377,9 @@ def _resolve_rental_stations(trips: pd.DataFrame) -> pd.DataFrame:
         pd.DataFrame: 원본 컬럼 + station_id(대여 정류소), end_station_id(반납 정류소)
     """
     if trips.empty:
-        return trips.assign(station_id=pd.Series(dtype=str), end_station_id=pd.Series(dtype=str))
+        return trips.assign(
+            station_id=pd.Series(dtype=str), end_station_id=pd.Series(dtype=str)
+        )
 
     known_ids = _get_station_master().index
     trips = trips[trips["start_st"].isin(known_ids)].copy()
@@ -364,7 +437,9 @@ def _get_history_by_station(anchor_ts: pd.Timestamp) -> dict[str, pd.DataFrame]:
         end_dts = np.sort(g["end_dt"].to_numpy())
         lo = np.searchsorted(end_dts, np.datetime64(point), side="left")
         hi = np.searchsorted(end_dts, np.datetime64(window_end), side="left")
-        _history_by_station[sid] = pd.DataFrame({"return_count": [float(hi - lo)]}, index=[point])
+        _history_by_station[sid] = pd.DataFrame(
+            {"return_count": [float(hi - lo)]}, index=[point]
+        )
 
     return _history_by_station
 
@@ -384,16 +459,23 @@ def _get_rental_events_by_station(anchor_ts: pd.Timestamp) -> dict[str, pd.DataF
     global _rental_events_by_station, _rental_events_coverage, _all_rental_events_sorted
     if _rental_events_by_station is None:
         raw = _get_raw_rental_trips(anchor_ts)
-        trips = raw.dropna(subset=["station_id"])[["station_id", "start_dt", "end_dt"]].reset_index(drop=True)
+        trips = raw.dropna(subset=["station_id"])[
+            ["station_id", "start_dt", "end_dt"]
+        ].reset_index(drop=True)
         if trips.empty:
             _rental_events_coverage = None
             _rental_events_by_station = {}
-            _all_rental_events_sorted = (np.array([]), np.array([], dtype="datetime64[ns]"), np.array([], dtype="datetime64[ns]"))
+            _all_rental_events_sorted = (
+                np.array([]),
+                np.array([], dtype="datetime64[ns]"),
+                np.array([], dtype="datetime64[ns]"),
+            )
             return _rental_events_by_station
 
         _rental_events_coverage = (trips["start_dt"].min(), trips["start_dt"].max())
         _rental_events_by_station = {
-            sid: g.reset_index(drop=True) for sid, g in trips.groupby("station_id", sort=False)
+            sid: g.reset_index(drop=True)
+            for sid, g in trips.groupby("station_id", sort=False)
         }
         # 전체 정류소를 한 번에 다루는 배치 경로(_rental_visible_batch_all_stations())용 —
         # 트립을 station 무관하게 start_dt 기준으로 한 번만 정렬해둔다. 같은 load를
@@ -446,7 +528,10 @@ def _rental_visible_at(station_id: str, anchors: list[pd.Timestamp]) -> pd.Serie
     sorted_arrays = _rental_events_sorted_by_station.get(station_id)
     if sorted_arrays is None:
         order = events["start_dt"].to_numpy().argsort(kind="mergesort")
-        sorted_arrays = (events["start_dt"].to_numpy()[order], events["end_dt"].to_numpy()[order])
+        sorted_arrays = (
+            events["start_dt"].to_numpy()[order],
+            events["end_dt"].to_numpy()[order],
+        )
         _rental_events_sorted_by_station[station_id] = sorted_arrays
     starts_sorted, ends_sorted = sorted_arrays
 
@@ -497,7 +582,9 @@ def _rental_visible_batch_all_stations(
         dict[pd.Timestamp, pd.Series]: anchor -> (station_id로 인덱싱된 카운트,
             커버리지 밖이면 NaN) — `_rental_visible_at()`과 같은 규약
     """
-    events_by_station = _get_rental_events_by_station(max(anchors))  # _all_rental_events_sorted 캐시를 이 호출이 채워둠
+    events_by_station = _get_rental_events_by_station(
+        max(anchors)
+    )  # _all_rental_events_sorted 캐시를 이 호출이 채워둠
     sids_arr, starts_sorted, ends_sorted = _all_rental_events_sorted
     coverage = _rental_events_coverage
     station_index = pd.Index(station_ids, name="station_id")
@@ -527,7 +614,12 @@ def _rental_visible_batch_all_stations(
             slice_sids = sids_arr[lo:hi]
             slice_ends = ends_sorted[lo:hi]
             visible = ~pd.isna(slice_ends) & (slice_ends <= np.datetime64(ts))
-            counts = pd.Series(slice_sids[visible]).value_counts().reindex(station_index, fill_value=0.0).astype(float)
+            counts = (
+                pd.Series(slice_sids[visible])
+                .value_counts()
+                .reindex(station_index, fill_value=0.0)
+                .astype(float)
+            )
         counts[~has_any_trip] = np.nan
         out[ts] = counts
     return out
@@ -561,10 +653,14 @@ def _get_station_master() -> pd.DataFrame:
         master = raw.rename(columns=silver_schema.STATION_COLUMN_MAP)
         if "grid_id" not in master:
             raise ValueError("보강 station master에 grid_id 컬럼이 없음")
-        valid_grid = master["grid_id"].notna() & master["grid_id"].astype(str).str.strip().ne("")
+        valid_grid = master["grid_id"].notna() & master["grid_id"].astype(
+            str
+        ).str.strip().ne("")
         grid_coverage = float(valid_grid.mean())
         if grid_coverage < 0.95:
-            raise ValueError(f"보강 station master의 grid_id 매핑률이 기준 미달: {grid_coverage:.3%}")
+            raise ValueError(
+                f"보강 station master의 grid_id 매핑률이 기준 미달: {grid_coverage:.3%}"
+            )
         master = master.set_index("station_id")
         # 행 전체를 한 번에 astype(int)하면 깨진 station_no 하나가 전체 배치를
         # 중단한다. 형 변환과 유효성 검사는 `_validated_station_row()`에서 station별로
@@ -573,7 +669,9 @@ def _get_station_master() -> pd.DataFrame:
     return _station_master
 
 
-def _validated_station_row(station_id: str, station_row: pd.Series | pd.DataFrame) -> pd.Series:
+def _validated_station_row(
+    station_id: str, station_row: pd.Series | pd.DataFrame
+) -> pd.Series:
     """정류소 마스터 한 행을 검증하고 모델 입력용 숫자 타입으로 정규화한다.
 
     보강 마스터는 전체 grid_id 커버리지 게이트를 이미 통과했더라도 소수의 결측
@@ -590,7 +688,9 @@ def _validated_station_row(station_id: str, station_row: pd.Series | pd.DataFram
         ValueError: 필수 값이 결측·비수치·비정수·허용 좌표 범위 밖일 때
     """
     if isinstance(station_row, pd.DataFrame):
-        raise TypeError(f"station master에 station_id가 중복됨: station_id={station_id!r}")
+        raise TypeError(
+            f"station master에 station_id가 중복됨: station_id={station_id!r}"
+        )
 
     normalized = station_row.copy()
 
@@ -619,18 +719,26 @@ def _validated_station_row(station_id: str, station_row: pd.Series | pd.DataFram
     latitude = _finite_number("lat")
     longitude = _finite_number("lon")
     if not 36.5 <= latitude <= 38.5:
-        raise ValueError(f"station master의 lat 값이 서울 좌표 범위 밖임: station_id={station_id!r}")
+        raise ValueError(
+            f"station master의 lat 값이 서울 좌표 범위 밖임: station_id={station_id!r}"
+        )
     if not 125.5 <= longitude <= 128.5:
-        raise ValueError(f"station master의 lon 값이 서울 좌표 범위 밖임: station_id={station_id!r}")
+        raise ValueError(
+            f"station master의 lon 값이 서울 좌표 범위 밖임: station_id={station_id!r}"
+        )
     normalized["lat"] = latitude
     normalized["lon"] = longitude
 
     try:
         grid_id = normalized["grid_id"]
     except KeyError as exc:
-        raise ValueError(f"station master의 grid_id 값이 없음: station_id={station_id!r}") from exc
+        raise ValueError(
+            f"station master의 grid_id 값이 없음: station_id={station_id!r}"
+        ) from exc
     if pd.isna(grid_id) or not str(grid_id).strip():
-        raise ValueError(f"station master의 grid_id 값이 유효하지 않음: station_id={station_id!r}")
+        raise ValueError(
+            f"station master의 grid_id 값이 유효하지 않음: station_id={station_id!r}"
+        )
     normalized["grid_id"] = str(grid_id).strip()
     return normalized
 
@@ -652,7 +760,9 @@ def _get_holidays(year: int) -> set[str]:
     return _holidays_by_year[year]
 
 
-def _build_station_profile_arrays(df: pd.DataFrame) -> tuple[dict[int, int], np.ndarray]:
+def _build_station_profile_arrays(
+    df: pd.DataFrame,
+) -> tuple[dict[int, int], np.ndarray]:
     """station_hourly_profile 행들을 (station_no -> 축 인덱스) dict + dense numpy 배열로 압축한다.
 
     예전엔 (station_no, minute, dow, month) 튜플을 key로, {rental_mean, ...} dict를
@@ -697,7 +807,9 @@ def _build_station_profile_arrays(df: pd.DataFrame) -> tuple[dict[int, int], np.
     invalid_station_no = station_no_values.isna() | (station_no_values % 1 != 0)
     if invalid_station_no.any():
         sample = df.loc[invalid_station_no, "station_no"].head(5).tolist()
-        raise ValueError(f"station profile station_no가 정수가 아닙니다: sample={sample}")
+        raise ValueError(
+            f"station profile station_no가 정수가 아닙니다: sample={sample}"
+        )
     invalid_minute = (
         ~minute_values.between(0, 1439)
         | minute_values.isna()
@@ -710,35 +822,51 @@ def _build_station_profile_arrays(df: pd.DataFrame) -> tuple[dict[int, int], np.
             f"GRID_TICK_MINUTES={config.GRID_TICK_MINUTES}, sample={sample}"
         )
     invalid_dow = ~dow_values.between(0, 6) | dow_values.isna() | (dow_values % 1 != 0)
-    invalid_month = ~month_values.between(1, 12) | month_values.isna() | (month_values % 1 != 0)
+    invalid_month = (
+        ~month_values.between(1, 12) | month_values.isna() | (month_values % 1 != 0)
+    )
     if invalid_dow.any() or invalid_month.any():
-        sample = df.loc[invalid_dow | invalid_month, ["dow", "month"]].head(5).to_dict("records")
-        raise ValueError(f"station profile dow/month 범위가 잘못되었습니다: sample={sample}")
+        sample = (
+            df.loc[invalid_dow | invalid_month, ["dow", "month"]]
+            .head(5)
+            .to_dict("records")
+        )
+        raise ValueError(
+            f"station profile dow/month 범위가 잘못되었습니다: sample={sample}"
+        )
 
-    normalized_key = pd.DataFrame({
-        "station_no": station_no_values,
-        "minute": minute_values,
-        "dow": dow_values,
-        "month": month_values,
-    })
+    normalized_key = pd.DataFrame(
+        {
+            "station_no": station_no_values,
+            "minute": minute_values,
+            "dow": dow_values,
+            "month": month_values,
+        }
+    )
     duplicated = normalized_key.duplicated(subset=logical_key, keep=False)
     if duplicated.any():
         sample = df.loc[duplicated, logical_key].head(5).to_dict("records")
-        raise ValueError(f"station profile logical key가 중복되었습니다: sample={sample}")
+        raise ValueError(
+            f"station profile logical key가 중복되었습니다: sample={sample}"
+        )
 
     station_nos = sorted(station_no_values.astype("int64").unique().tolist())
     station_index = {station_no: i for i, station_no in enumerate(station_nos)}
     n_minute_buckets = 1440 // config.GRID_TICK_MINUTES
 
     values = np.full(
-        (len(station_nos), n_minute_buckets, 7, 12, len(_STATION_PROFILE_STAT_COLS)), np.nan, dtype="float32"
+        (len(station_nos), n_minute_buckets, 7, 12, len(_STATION_PROFILE_STAT_COLS)),
+        np.nan,
+        dtype="float32",
     )
     station_idx = station_no_values.map(station_index).to_numpy()
     minute_idx = minute_values.to_numpy(dtype="int64") // config.GRID_TICK_MINUTES
     dow_idx = dow_values.to_numpy(dtype="int64")
     month_idx = month_values.to_numpy(dtype="int64") - 1
     for stat_idx, col in enumerate(_STATION_PROFILE_STAT_COLS):
-        values[station_idx, minute_idx, dow_idx, month_idx, stat_idx] = df[col].to_numpy()
+        values[station_idx, minute_idx, dow_idx, month_idx, stat_idx] = df[
+            col
+        ].to_numpy()
 
     return station_index, values
 
@@ -762,8 +890,12 @@ def _get_station_profile() -> tuple[dict[int, int], np.ndarray]:
     if _station_profile_values is None:
         df = s3_io.read_parquet(config.STATION_HOURLY_PROFILE_PARQUET)
         if df is None:
-            raise FileNotFoundError(f"S3에 없음: {config.STATION_HOURLY_PROFILE_PARQUET}")
-        _station_profile_station_index, _station_profile_values = _build_station_profile_arrays(df)
+            raise FileNotFoundError(
+                f"S3에 없음: {config.STATION_HOURLY_PROFILE_PARQUET}"
+            )
+        _station_profile_station_index, _station_profile_values = (
+            _build_station_profile_arrays(df)
+        )
     return _station_profile_station_index, _station_profile_values
 
 
@@ -816,9 +948,12 @@ def _get_population_profile() -> dict[tuple[str, int, int], dict[str, float]]:
     if _population_profile is None:
         df = s3_io.read_parquet(config.POPULATION_HOURLY_PROFILE_PARQUET)
         if df is None:
-            raise FileNotFoundError(f"S3에 없음: {config.POPULATION_HOURLY_PROFILE_PARQUET}")
+            raise FileNotFoundError(
+                f"S3에 없음: {config.POPULATION_HOURLY_PROFILE_PARQUET}"
+            )
         _population_profile = {
-            (r.grid_id, r.hour, r.dow): {"pop_total_mean": r.pop_total_mean} for r in df.itertuples()
+            (r.grid_id, r.hour, r.dow): {"pop_total_mean": r.pop_total_mean}
+            for r in df.itertuples()
         }
     return _population_profile
 
@@ -863,7 +998,9 @@ def _weather_values(df: pd.DataFrame | None) -> dict[str, float] | None:
     valid = (
         np.isfinite(numeric["temp"])
         & np.isfinite(numeric["precip"])
-        & numeric["temp"].between(silver_schema.WEATHER_TEMP_MIN, silver_schema.WEATHER_TEMP_MAX)
+        & numeric["temp"].between(
+            silver_schema.WEATHER_TEMP_MIN, silver_schema.WEATHER_TEMP_MAX
+        )
         & numeric["precip"].between(
             silver_schema.WEATHER_PRECIP_MIN, silver_schema.WEATHER_PRECIP_MAX
         )
@@ -897,14 +1034,20 @@ def _get_recent_weather(
         ValueError: target_ts부터 lookback_hours시간 전까지 전부 데이터가 없을 때
     """
     keys = silver_schema.weather_tick_keys(target_ts, lookback_hours)
-    for df in reversed(s3_io.read_parquet_many(keys)):  # target_ts에 가장 가까운 것부터
+    for df in reversed(
+        _read_authoritative_collector_many(keys)
+    ):  # target_ts에 가장 가까운 것부터
         weather = _weather_values(df)
         if weather is not None:
             return weather
-    raise ValueError(f"최근 {lookback_hours}시간 안에 날씨 데이터가 없습니다(target_ts={target_ts})")
+    raise ValueError(
+        f"최근 {lookback_hours}시간 안에 날씨 데이터가 없습니다(target_ts={target_ts})"
+    )
 
 
-def _get_forecast_weather(target_ts: pd.Timestamp, issue_lookback_hours: float = 24.0) -> dict[str, float] | None:
+def _get_forecast_weather(
+    target_ts: pd.Timestamp, issue_lookback_hours: float = 24.0
+) -> dict[str, float] | None:
     """target_ts(미래) 시각의 예보(`weather_short_term_forecast`)를 찾는다.
 
     관측 소스와 달리 파일 하나에 미래 여러 시각의 예보가 여러 행으로 들어있다 —
@@ -930,12 +1073,23 @@ def _get_forecast_weather(target_ts: pd.Timestamp, issue_lookback_hours: float =
             관측치 fallback으로 넘어감)
     """
     keys = silver_schema.weather_forecast_issue_keys(target_ts, issue_lookback_hours)
-    date_col, time_col = silver_schema.WEATHER_FORECAST_DATE_COLUMN, silver_schema.WEATHER_FORECAST_TIME_COLUMN
-    for df in reversed(s3_io.read_parquet_many(keys)):  # 가장 최근 발표 파일부터
-        if df is None or df.empty or date_col not in df.columns or time_col not in df.columns:
+    date_col, time_col = (
+        silver_schema.WEATHER_FORECAST_DATE_COLUMN,
+        silver_schema.WEATHER_FORECAST_TIME_COLUMN,
+    )
+    for df in reversed(
+        _read_authoritative_collector_many(keys)
+    ):  # 가장 최근 발표 파일부터
+        if (
+            df is None
+            or df.empty
+            or date_col not in df.columns
+            or time_col not in df.columns
+        ):
             continue
         fcst_ts = pd.to_datetime(
-            df[date_col].astype(str).str.zfill(8) + df[time_col].astype(str).str.zfill(4),
+            df[date_col].astype(str).str.zfill(8)
+            + df[time_col].astype(str).str.zfill(4),
             format="%Y%m%d%H%M",
             errors="coerce",
         )
@@ -953,16 +1107,21 @@ def _get_forecast_weather(target_ts: pd.Timestamp, issue_lookback_hours: float =
         )
         if "temp" not in nearest.columns or "PCP" not in nearest.columns:
             continue
-        numeric = pd.DataFrame({
-            "temp": pd.to_numeric(nearest["temp"], errors="coerce"),
-            "precip": pd.to_numeric(
-                nearest["PCP"].map(silver_schema.parse_kma_precip_text), errors="coerce"
-            ),
-        })
+        numeric = pd.DataFrame(
+            {
+                "temp": pd.to_numeric(nearest["temp"], errors="coerce"),
+                "precip": pd.to_numeric(
+                    nearest["PCP"].map(silver_schema.parse_kma_precip_text),
+                    errors="coerce",
+                ),
+            }
+        )
         valid = (
             np.isfinite(numeric["temp"])
             & np.isfinite(numeric["precip"])
-            & numeric["temp"].between(silver_schema.WEATHER_TEMP_MIN, silver_schema.WEATHER_TEMP_MAX)
+            & numeric["temp"].between(
+                silver_schema.WEATHER_TEMP_MIN, silver_schema.WEATHER_TEMP_MAX
+            )
             & numeric["precip"].between(
                 silver_schema.WEATHER_PRECIP_MIN, silver_schema.WEATHER_PRECIP_MAX
             )
@@ -974,7 +1133,9 @@ def _get_forecast_weather(target_ts: pd.Timestamp, issue_lookback_hours: float =
     return None
 
 
-def _get_recent_bike_status(anchor_ts: pd.Timestamp, lookback_hours: float = 1.0) -> pd.DataFrame:
+def _get_recent_bike_status(
+    anchor_ts: pd.Timestamp, lookback_hours: float = 1.0
+) -> pd.DataFrame:
     """가장 최근 5분 tick의 Silver 실시간 대여소 현황을 읽는다(전체 정류소가 한 파일에 있음).
 
     args:
@@ -986,16 +1147,19 @@ def _get_recent_bike_status(anchor_ts: pd.Timestamp, lookback_hours: float = 1.0
             정보 없음으로 처리)
     """
     keys = silver_schema.bike_realtime_tick_keys(anchor_ts, lookback_hours)
-    for key in reversed(keys):
-        df = s3_io.read_parquet(key)
+    for df in reversed(_read_authoritative_collector_many(keys)):
         if df is not None and not df.empty:
             df = df.rename(columns=silver_schema.BIKE_REALTIME_COLUMN_MAP)
             df["stockout_flag"] = (df["bike_count"] <= 0).astype(int)
-            return df.set_index("station_id")[["bike_count", "capacity", "stockout_flag"]]
+            return df.set_index("station_id")[
+                ["bike_count", "capacity", "stockout_flag"]
+            ]
     return pd.DataFrame(columns=["bike_count", "capacity", "stockout_flag"])
 
 
-def _get_recent_population(target_ts: pd.Timestamp, lookback_hours: float = 1.0) -> pd.DataFrame:
+def _get_recent_population(
+    target_ts: pd.Timestamp, lookback_hours: float = 1.0
+) -> pd.DataFrame:
     """target_ts 시각(또는 그 근처)의 `living_population_normalized`(정규화된 생활인구) 스냅샷을 읽는다(격자별).
 
     **원본이 아니라 정규화된 소스를 쓴다**: `living_population_grid`(원본, 하루
@@ -1050,7 +1214,10 @@ def _get_recent_population(target_ts: pd.Timestamp, lookback_hours: float = 1.0)
 
 
 def _lag_rolling_features(
-    station_id: str, station_no: int, target_ts: pd.Timestamp, skip_rental_recent: bool = False
+    station_id: str,
+    station_no: int,
+    target_ts: pd.Timestamp,
+    skip_rental_recent: bool = False,
 ) -> tuple[dict[str, float], list[str]]:
     """실시간 히스토리에서 lag_1h(대여/반납 각 1개)를 계산하되, 없는 값은 station 평소 패턴(profile)으로 대체한다.
 
@@ -1090,7 +1257,9 @@ def _lag_rolling_features(
     out["return_lag_1h"] = return_val
 
     if skip_rental_recent:
-        out["rental_lag_1h"] = np.nan  # 호출부(predict_demand_multi_hour)가 곧 실제 값으로 덮어씀
+        out["rental_lag_1h"] = (
+            np.nan
+        )  # 호출부(predict_demand_multi_hour)가 곧 실제 값으로 덮어씀
     else:
         _censored_rental_recent(station_id, station_no, target_ts, out, fallback_fields)
 
@@ -1098,7 +1267,11 @@ def _lag_rolling_features(
 
 
 def _censored_rental_recent(
-    station_id: str, station_no: int, target_ts: pd.Timestamp, out: dict[str, float], fallback_fields: list[str]
+    station_id: str,
+    station_no: int,
+    target_ts: pd.Timestamp,
+    out: dict[str, float],
+    fallback_fields: list[str],
 ) -> None:
     """대여의 rental_lag_1h를 point-in-time censored 값으로 채운다.
 
@@ -1144,7 +1317,9 @@ def _target_timestamp(date: str, hour: int, minute: int = 0) -> pd.Timestamp:
     if not (0 <= hour <= 23):
         raise ValueError(f"hour는 0~23 사이여야 함: {hour}")
     if not (0 <= minute < 60) or minute % config.SERVING_TICK_MINUTES != 0:
-        raise ValueError(f"minute은 0~59 사이의 {config.SERVING_TICK_MINUTES}분 배수여야 함: {minute}")
+        raise ValueError(
+            f"minute은 0~59 사이의 {config.SERVING_TICK_MINUTES}분 배수여야 함: {minute}"
+        )
     return pd.Timestamp(date) + pd.Timedelta(hours=hour, minutes=minute)
 
 
@@ -1203,7 +1378,9 @@ def _build_target_time_fields(
     fields = {
         "station_id": station_id,  # 모델 feature는 아니지만 출력 식별용으로 그대로 둔다
         "station_no": int(station_row["station_no"]),
-        "capacity": int(station_row["capacity"]),  # 거치대 수 — 항상 정수(model_contract 참고)
+        "capacity": int(
+            station_row["capacity"]
+        ),  # 거치대 수 — 항상 정수(model_contract 참고)
         "lat": float(station_row["lat"]),
         "lon": float(station_row["lon"]),
         "temp": temp,
@@ -1253,7 +1430,9 @@ def _build_feature_record(
     """
     master = _get_station_master()
     if station_id not in master.index:
-        raise ValueError(f"알 수 없는 station_id: {station_id!r} (최신 보강 station master에 없음)")
+        raise ValueError(
+            f"알 수 없는 station_id: {station_id!r} (최신 보강 station master에 없음)"
+        )
     station_row = _validated_station_row(station_id, master.loc[station_id])
 
     if not (1 <= horizon <= config.HORIZON_COUNT):
@@ -1263,15 +1442,27 @@ def _build_feature_record(
     target_ts = anchor_ts + pd.Timedelta(hours=horizon - 1)
 
     lag_features, fallback_fields = _lag_rolling_features(
-        station_id, int(station_row["station_no"]), anchor_ts, skip_rental_recent=skip_rental_recent
+        station_id,
+        int(station_row["station_no"]),
+        anchor_ts,
+        skip_rental_recent=skip_rental_recent,
     )
     target_fields, population_fallback = _build_target_time_fields(
-        station_id, station_row, target_ts, temp, precip, population, stockout, horizon,
+        station_id,
+        station_row,
+        target_ts,
+        temp,
+        precip,
+        population,
+        stockout,
+        horizon,
     )
     record = {**target_fields, **lag_features}
 
     missing = [c for c in _ALL_FEATURE_COLUMNS if c not in record]
-    assert not missing, f"feature 누락: {missing}"  # RENTAL/RETURN_FEATURE_COLUMNS와 안 맞으면 여기서 바로 발견됨
+    assert not missing, (
+        f"feature 누락: {missing}"
+    )  # RENTAL/RETURN_FEATURE_COLUMNS와 안 맞으면 여기서 바로 발견됨
 
     return record, fallback_fields, population_fallback
 
@@ -1316,8 +1507,16 @@ def _build_feature_row(
             범위를 벗어날 때(`_build_feature_record()` 참고)
     """
     record, fallback_fields, population_fallback = _build_feature_record(
-        station_id, date, hour, temp, precip, population, stockout, skip_rental_recent,
-        minute=minute, horizon=horizon,
+        station_id,
+        date,
+        hour,
+        temp,
+        precip,
+        population,
+        stockout,
+        skip_rental_recent,
+        minute=minute,
+        horizon=horizon,
     )
     df = pd.DataFrame([record])
     df.attrs["fallback_fields"] = fallback_fields
@@ -1369,7 +1568,9 @@ def _predict_at(model_name: str, exposure_col: str | None, **kwargs) -> dict:
         "pred_p50": float(row["pred_p50"]),
         "pred_p90": float(row["pred_p90"]),
         "lag_fallback_used": fallback_fields,
-        "lag_data_freshness": round(1 - len(fallback_fields) / N_LAG_ROLLING_FEATURES, 3),
+        "lag_data_freshness": round(
+            1 - len(fallback_fields) / N_LAG_ROLLING_FEATURES, 3
+        ),
         "population_source": "fallback" if population_fallback else "provided",
     }
 
@@ -1380,7 +1581,9 @@ def _release_booster_cache() -> None:
     gc.collect()
 
 
-def _resolve_weather_for_horizon(value: float | Sequence[float], h: int, n_hours: int, name: str) -> float:
+def _resolve_weather_for_horizon(
+    value: float | Sequence[float], h: int, n_hours: int, name: str
+) -> float:
     """날씨 인자가 스칼라(전체 horizon 재사용)인지 길이 n_hours 시퀀스(horizon별 예보)인지
     판별해 h번째(1-based) horizon에 적용할 값을 꺼낸다.
 
@@ -1399,7 +1602,9 @@ def _resolve_weather_for_horizon(value: float | Sequence[float], h: int, n_hours
     """
     if isinstance(value, (list, tuple, np.ndarray, pd.Series)):
         if len(value) != n_hours:
-            raise ValueError(f"{name}이 배열이면 길이가 n_hours({n_hours})와 같아야 함: {len(value)}")
+            raise ValueError(
+                f"{name}이 배열이면 길이가 n_hours({n_hours})와 같아야 함: {len(value)}"
+            )
         return float(value[h - 1])
     return float(value)
 
@@ -1429,7 +1634,9 @@ def _rental_recent_batch(
         tuple[pd.DataFrame, dict[str, list[str]]]: (index=station_id, columns=rental_lag_1h,
             station_id -> profile fallback을 쓴 항목 이름 목록)
     """
-    combined = pd.DataFrame(_rental_visible_batch_all_stations(station_ids, [anchor_ts]))
+    combined = pd.DataFrame(
+        _rental_visible_batch_all_stations(station_ids, [anchor_ts])
+    )
 
     station_index = pd.Index(station_ids, name="station_id")
     out = pd.DataFrame(index=station_index)
@@ -1438,7 +1645,9 @@ def _rental_recent_batch(
     lag1_vals = combined[anchor_ts].copy()
     missing = lag1_vals.isna()
     for sid in station_index[missing]:
-        lag1_vals.loc[sid] = _profile_stat(station_no_by_id[sid], anchor_ts, "rental_mean")
+        lag1_vals.loc[sid] = _profile_stat(
+            station_no_by_id[sid], anchor_ts, "rental_mean"
+        )
         fallback[sid].append("rental_lag_1h")
     out["rental_lag_1h"] = lag1_vals
 
@@ -1495,24 +1704,45 @@ def predict_demand_multi_hour(
     """
     master = _get_station_master()
     if station_id not in master.index:
-        raise ValueError(f"알 수 없는 station_id: {station_id!r} (최신 보강 station master에 없음)")
+        raise ValueError(
+            f"알 수 없는 station_id: {station_id!r} (최신 보강 station master에 없음)"
+        )
     station_row = _validated_station_row(station_id, master.loc[station_id])
     if not (1 <= n_hours <= config.HORIZON_COUNT):
         raise ValueError(f"n_hours는 1~{config.HORIZON_COUNT} 사이여야 함: {n_hours}")
 
     anchor_ts = _target_timestamp(date, hour, minute)
-    lag_features, lag_fallback_fields = _lag_rolling_features(station_id, int(station_row["station_no"]), anchor_ts)
-    stockout, stockout_fallback = _resolve_live_stockout(station_id, anchor_ts, stockout)
+    lag_features, lag_fallback_fields = _lag_rolling_features(
+        station_id, int(station_row["station_no"]), anchor_ts
+    )
+    stockout, stockout_fallback = _resolve_live_stockout(
+        station_id, anchor_ts, stockout
+    )
 
     records = []
     population_fallbacks = []
     for h in range(1, n_hours + 1):
         target_ts = anchor_ts + pd.Timedelta(hours=h - 1)
-        h_temp = None if temp is None else _resolve_weather_for_horizon(temp, h, n_hours, "temp")
-        h_precip = None if precip is None else _resolve_weather_for_horizon(precip, h, n_hours, "precip")
+        h_temp = (
+            None
+            if temp is None
+            else _resolve_weather_for_horizon(temp, h, n_hours, "temp")
+        )
+        h_precip = (
+            None
+            if precip is None
+            else _resolve_weather_for_horizon(precip, h, n_hours, "precip")
+        )
         h_temp, h_precip = _resolve_live_weather(target_ts, anchor_ts, h_temp, h_precip)
         target_fields, population_fallback = _build_target_time_fields(
-            station_id, station_row, target_ts, h_temp, h_precip, population, stockout, h,
+            station_id,
+            station_row,
+            target_ts,
+            h_temp,
+            h_precip,
+            population,
+            stockout,
+            h,
         )
         record = {**target_fields, **lag_features}
         missing = [c for c in _ALL_FEATURE_COLUMNS if c not in record]
@@ -1521,7 +1751,9 @@ def predict_demand_multi_hour(
         population_fallbacks.append(population_fallback)
 
     batch_df = pd.DataFrame(records).astype(_COMBINED_FEATURE_COLUMN_DTYPES)
-    batch_df["rental_exposure"] = batch_df["rental_exposure"].astype(RENTAL_EXPOSURE_DTYPE)
+    batch_df["rental_exposure"] = batch_df["rental_exposure"].astype(
+        RENTAL_EXPOSURE_DTYPE
+    )
     try:
         rental_batch = predict(batch_df, "rental", exposure_col="rental_exposure")
     finally:
@@ -1534,29 +1766,35 @@ def predict_demand_multi_hour(
     results = []
     for i, record in enumerate(records):
         rr, rt = rental_batch.iloc[i], return_batch.iloc[i]
-        results.append({
-            "station_id": station_id,
-            "date": record["date"],
-            "hour": int(record["hour"]),
-            "minute": minute,
-            "horizon": int(record["horizon"]),
-            "rental": {
-                "pred_mean": float(rr["pred_mean"]),
-                "pred_p10": float(rr["pred_p10"]),
-                "pred_p50": float(rr["pred_p50"]),
-                "pred_p90": float(rr["pred_p90"]),
-                "lag_fallback_used": lag_fallback_fields,
-                "lag_data_freshness": round(1 - len(lag_fallback_fields) / N_LAG_ROLLING_FEATURES, 3),
-            },
-            "return": {
-                "pred_mean": float(rt["pred_mean"]),
-                "pred_p10": float(rt["pred_p10"]),
-                "pred_p50": float(rt["pred_p50"]),
-                "pred_p90": float(rt["pred_p90"]),
-            },
-            "population_source": "fallback" if population_fallbacks[i] else "provided",
-            "stockout_source": "fallback" if stockout_fallback else "provided",
-        })
+        results.append(
+            {
+                "station_id": station_id,
+                "date": record["date"],
+                "hour": int(record["hour"]),
+                "minute": minute,
+                "horizon": int(record["horizon"]),
+                "rental": {
+                    "pred_mean": float(rr["pred_mean"]),
+                    "pred_p10": float(rr["pred_p10"]),
+                    "pred_p50": float(rr["pred_p50"]),
+                    "pred_p90": float(rr["pred_p90"]),
+                    "lag_fallback_used": lag_fallback_fields,
+                    "lag_data_freshness": round(
+                        1 - len(lag_fallback_fields) / N_LAG_ROLLING_FEATURES, 3
+                    ),
+                },
+                "return": {
+                    "pred_mean": float(rt["pred_mean"]),
+                    "pred_p10": float(rt["pred_p10"]),
+                    "pred_p50": float(rt["pred_p50"]),
+                    "pred_p90": float(rt["pred_p90"]),
+                },
+                "population_source": "fallback"
+                if population_fallbacks[i]
+                else "provided",
+                "stockout_source": "fallback" if stockout_fallback else "provided",
+            }
+        )
 
     return results
 
@@ -1599,7 +1837,9 @@ def predict_demand_multi_hour_all_stations(
             전체가 공유하는 값이라 station마다 다시 조회하지 않고 horizon당 한 번만 조회)
         minute: `predict_rental_demand()` 참고 — 0~59 중 `config.SERVING_TICK_MINUTES`의
             배수 (기본값 0), T0의 운영 앵커
-        station_ids: None이면 학습된 모델이 실제로 아는 정류소 전체(아래 참고)
+        station_ids: None이면 현재 anchor tick의 실시간 현황에 존재하고, 학습된
+            모델이 알며, 최신 보강 master의 필수 필드가 유효한 정류소 전체.
+            명시적으로 주면 운영 active-set 필터 없이 요청 목록 자체를 검증한다
         stockout: 전체 n_hours·전체 정류소에 공통 적용할 값을 직접 줄 때만 사용.
             None(기본값)이면 Silver `bike_station_realtime`에서 anchor_ts(T0) 기준으로
             전체 정류소를 한 번에 조회해 정류소별 실제 재고 현황을 반영한다
@@ -1615,6 +1855,9 @@ def predict_demand_multi_hour_all_stations(
                 station_master 조회/lag_rolling 계산이 예외로 실패해 그 station의
                 모든 horizon을 건너뛴 항목(원인 포함) — lag/rolling이 station당
                 한 번만 계산되므로 실패도 station 단위다,
+            "excluded": [{station_id, reason}, ...] — station_ids=None인 운영 배치에서
+                현재 비활성·미학습·master 필드 불량이라 serving surface 밖으로 분류한
+                항목. 이들은 expected_count에 포함하지 않는다,
             "expected_count": len(station_ids) * n_hours,
             "actual_count": len(results),
         }
@@ -1626,27 +1869,102 @@ def predict_demand_multi_hour_all_stations(
         ValueError: n_hours가 1~HORIZON_COUNT 밖이거나 날씨 시퀀스 길이가 n_hours와
             다를 때(station_id 관련 오류는 station 단위로 격리돼 "failed"에 쌓인다)
     """
-    master = _get_station_master()
-    if station_ids is None:
-        # 최신 보강 station master(2,977개)에는 2025년에 트립이 없어 학습 데이터/
-        # station_hourly_profile에 아예 없는 정류소가 395개 섞여 있다 — 그 395개는
-        # fallback도 없어 매번 NaN + "Mean of empty slice" 경고만 내면서 시간을
-        # 낭비한다. 모델이 실제로 학습한 카테고리(load_station_dtype)만 쓴다 —
-        # 어차피 학습 안 된 station_id는 예측 자체가 의미 없다. load_station_dtype()의
-        # 카테고리는 이제 station_no(정수)라 station_master로 station_id(텍스트)로
-        # 되돌려야 이 함수 나머지 부분(전부 station_id 기준)이 그대로 동작한다.
-        trained_station_nos = set(load_station_dtype("rental").categories)
-        station_nos = pd.to_numeric(master["station_no"], errors="coerce")
-        integral_station_nos = station_nos.notna() & np.isfinite(station_nos) & (station_nos % 1 == 0)
-        trained = integral_station_nos & station_nos.isin(trained_station_nos)
-        # 깨진 station_no는 모델 카테고리와 비교할 수 없지만, 조용히 목록에서
-        # 사라지게 두면 완결성 검사가 누락을 알 수 없다. 후보에 포함해 아래
-        # station별 검증에서 명시적인 failed로 기록한다.
-        station_ids = sorted(master.index[trained | ~integral_station_nos])
     if not (1 <= n_hours <= config.HORIZON_COUNT):
         raise ValueError(f"n_hours는 1~{config.HORIZON_COUNT} 사이여야 함: {n_hours}")
 
     anchor_ts = _target_timestamp(date, hour, minute)
+    master = _get_station_master()
+    use_default_serving_surface = station_ids is None
+    excluded: list[dict[str, str]] = []
+
+    # 운영 all-stations 모집단은 현재 collector tick에 실제로 존재하는 정류소다.
+    # master 전체는 폐쇄·휴업 정류소도 보존하는 식별자 차원이므로 이를 그대로
+    # 후보로 쓰면 capacity가 없는 비활성 정류소 때문에 매 5분 DAG가 partial로
+    # 실패한다. exact tick이 없을 때 과거 active-set으로 조용히 서빙하지 않도록
+    # 기본 호출만 lookback=0으로 fail-closed한다. 명시 station 호출은 기존처럼
+    # 최대 1시간 재고 fallback을 허용한다.
+    bike_status = (
+        _get_recent_bike_status(
+            anchor_ts,
+            lookback_hours=0.0 if use_default_serving_surface else 1.0,
+        )
+        if use_default_serving_surface or stockout is None
+        else None
+    )
+
+    if use_default_serving_surface:
+        if bike_status is None or bike_status.empty:
+            raise ValueError(
+                f"현재 anchor tick의 bike_station_realtime이 없음: {anchor_ts}"
+            )
+        bike_status = bike_status.copy()
+        raw_active_ids = bike_status.index.to_series(
+            index=range(len(bike_status.index))
+        )
+        invalid_active_ids = raw_active_ids.isna() | raw_active_ids.map(
+            lambda value: type(value) is not str or not value or value != value.strip()
+        )
+        if invalid_active_ids.any():
+            raise ValueError(
+                "현재 bike_station_realtime에 유효하지 않은 station_id가 있음"
+            )
+        bike_status.index = pd.Index(
+            raw_active_ids.tolist(), name=bike_status.index.name
+        )
+        if bike_status.index.has_duplicates:
+            duplicates = sorted(set(bike_status.index[bike_status.index.duplicated()]))
+            raise ValueError(
+                f"현재 bike_station_realtime에 station_id 중복: {duplicates[:10]}"
+            )
+        active_station_ids = set(bike_status.index)
+        trained_station_nos = set(load_station_dtype("rental").categories) & set(
+            load_station_dtype("return").categories
+        )
+        selected_station_ids: list[str] = []
+
+        # active source를 기준으로 순회해야 master에 아직 없는 신규 정류소와 학습에
+        # 없던 정류소도 '제외'로 관측 가능하다. expected_count는 실제로 서빙 가능한
+        # 교집합만 세어 정상적인 비활성 정류소를 partial failure로 오인하지 않는다.
+        for sid in sorted(active_station_ids):
+            if sid not in master.index:
+                excluded.append({"station_id": sid, "reason": "latest master에 없음"})
+                continue
+            try:
+                station_row = _validated_station_row(sid, master.loc[sid])
+            except Exception as exc:  # noqa: BLE001 — 제외 사유에 station 문맥을 보존한다.
+                excluded.append(
+                    {
+                        "station_id": sid,
+                        "reason": f"서빙 불가능한 master: {type(exc).__name__}: {exc}",
+                    }
+                )
+                continue
+            if station_row["station_no"] not in trained_station_nos:
+                excluded.append(
+                    {"station_id": sid, "reason": "학습된 station category에 없음"}
+                )
+                continue
+            selected_station_ids.append(sid)
+
+        # 학습됐지만 현재 realtime snapshot에 없는 정류소는 폐쇄/휴업 가능성이 있는
+        # 비활성 식별자다. 결과 수에는 넣지 않되 운영 가시성을 위해 사유를 남긴다.
+        station_nos = pd.to_numeric(master["station_no"], errors="coerce")
+        integral_station_nos = (
+            station_nos.notna() & np.isfinite(station_nos) & (station_nos % 1 == 0)
+        )
+        trained_master_ids = set(
+            master.index[
+                integral_station_nos & station_nos.isin(trained_station_nos)
+            ].astype(str)
+        )
+        for sid in sorted(trained_master_ids - active_station_ids):
+            excluded.append({"station_id": sid, "reason": "현재 anchor tick에 비활성"})
+        station_ids = selected_station_ids
+        if station_ids:
+            # 운영 배치는 어느 station에서든 lag fallback이 필요할 수 있다. profile
+            # 배포 누락을 수천 station별 실패 로그로 늦게 발견하지 말고 한 번에 막는다.
+            _get_station_profile()
+
     failed: list[dict] = []
 
     # 1) station별 lag/rolling(anchor_ts 기준, horizon과 무관 — 한 번만 계산). 실패하면
@@ -1659,17 +1977,28 @@ def predict_demand_multi_hour_all_stations(
     for sid in station_ids:
         try:
             if sid not in master.index:
-                raise ValueError(f"알 수 없는 station_id: {sid!r} (최신 보강 station master에 없음)")
+                raise ValueError(
+                    f"알 수 없는 station_id: {sid!r} (최신 보강 station master에 없음)"
+                )
             station_row = _validated_station_row(sid, master.loc[sid])
             lag_features, fb = _lag_rolling_features(
                 sid, station_row["station_no"], anchor_ts, skip_rental_recent=True
             )
         except Exception as exc:  # noqa: BLE001 — 정류소 하나 실패로 전체 배치가 죽으면 안 됨(로그로 원인 남김)
-            print(f"[predict_demand_multi_hour_all_stations] SKIP station={sid} — {type(exc).__name__}: {exc}", file=sys.stderr)
-            failed.append({
-                "station_id": sid, "date": date, "hour": hour, "minute": minute,
-                "n_hours_skipped": n_hours, "error": f"{type(exc).__name__}: {exc}",
-            })
+            print(
+                f"[predict_demand_multi_hour_all_stations] SKIP station={sid} — {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+            failed.append(
+                {
+                    "station_id": sid,
+                    "date": date,
+                    "hour": hour,
+                    "minute": minute,
+                    "n_hours_skipped": n_hours,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
             continue
         base_lag_features[sid] = lag_features
         base_fallback[sid] = fb
@@ -1678,20 +2007,30 @@ def predict_demand_multi_hour_all_stations(
 
     expected_count = len(station_ids) * n_hours
     if not alive_station_ids:
-        return {"results": [], "failed": failed, "expected_count": expected_count, "actual_count": 0}
+        return {
+            "results": [],
+            "failed": failed,
+            "excluded": excluded,
+            "expected_count": expected_count,
+            "actual_count": 0,
+        }
 
     # 2) rental_lag_1h는 살아남은 정류소 전체를 anchor_ts 기준 한 번에 벡터화한다
     #    (history.md 24번 항목 — anchor 축으로 뒤집는 최적화, horizon과 무관하므로
     #    이것도 한 번만).
     station_no_by_id = {sid: row["station_no"] for sid, row in station_rows.items()}
-    rental_recent_df, rental_fallback_by_station = _rental_recent_batch(alive_station_ids, station_no_by_id, anchor_ts)
+    rental_recent_df, rental_fallback_by_station = _rental_recent_batch(
+        alive_station_ids, station_no_by_id, anchor_ts
+    )
     for sid in alive_station_ids:
-        base_lag_features[sid] = {**base_lag_features[sid], **rental_recent_df.loc[sid].to_dict()}
+        base_lag_features[sid] = {
+            **base_lag_features[sid],
+            **rental_recent_df.loc[sid].to_dict(),
+        }
         base_fallback[sid] = base_fallback[sid] + rental_fallback_by_station[sid]
 
-    # stockout을 직접 안 주면 anchor_ts 기준 전체 정류소 재고 현황을 한 번에 조회해
-    # (station마다 다시 조회하지 않음 — 설계 원칙 6번) 정류소별로 lookup만 한다.
-    bike_status = None if stockout is not None else _get_recent_bike_status(anchor_ts)
+    # stockout을 직접 안 주면 위에서 anchor_ts 기준 전체 정류소 현황을 한 번만
+    # 조회해(station마다 다시 조회하지 않음) 정류소별로 lookup한다.
 
     # 3) horizon마다 날씨/캘린더/타겟만 새로 만들어 station×horizon 전체를 한 번에 모은다.
     all_records: list[dict] = []
@@ -1701,13 +2040,30 @@ def predict_demand_multi_hour_all_stations(
     stockout_fallback_by_row: list[bool] = []
     for h in range(1, n_hours + 1):
         target_ts = anchor_ts + pd.Timedelta(hours=h - 1)
-        t_temp = None if temp is None else _resolve_weather_for_horizon(temp, h, n_hours, "temp")
-        t_precip = None if precip is None else _resolve_weather_for_horizon(precip, h, n_hours, "precip")
+        t_temp = (
+            None
+            if temp is None
+            else _resolve_weather_for_horizon(temp, h, n_hours, "temp")
+        )
+        t_precip = (
+            None
+            if precip is None
+            else _resolve_weather_for_horizon(precip, h, n_hours, "precip")
+        )
         t_temp, t_precip = _resolve_live_weather(target_ts, anchor_ts, t_temp, t_precip)
         for sid in alive_station_ids:
-            sid_stockout, sid_stockout_fallback = _stockout_from_status(sid, bike_status, stockout)
+            sid_stockout, sid_stockout_fallback = _stockout_from_status(
+                sid, bike_status, stockout
+            )
             target_fields, population_fallback = _build_target_time_fields(
-                sid, station_rows[sid], target_ts, t_temp, t_precip, None, sid_stockout, h,
+                sid,
+                station_rows[sid],
+                target_ts,
+                t_temp,
+                t_precip,
+                None,
+                sid_stockout,
+                h,
             )
             all_records.append({**target_fields, **base_lag_features[sid]})
             row_stations.append(sid)
@@ -1720,7 +2076,9 @@ def predict_demand_multi_hour_all_stations(
     # dict를 다 모은 뒤 DataFrame 생성/dtype 캐스팅/predict()를 딱 한 번만 한다 —
     # 정류소×horizon마다 반복하면 그 자체가 병목이었다(history.md 23번 항목).
     batch_df = pd.DataFrame(all_records).astype(_COMBINED_FEATURE_COLUMN_DTYPES)
-    batch_df["rental_exposure"] = batch_df["rental_exposure"].astype(RENTAL_EXPOSURE_DTYPE)
+    batch_df["rental_exposure"] = batch_df["rental_exposure"].astype(
+        RENTAL_EXPOSURE_DTYPE
+    )
     try:
         rental_batch = predict(batch_df, "rental", exposure_col="rental_exposure")
     finally:
@@ -1739,36 +2097,52 @@ def predict_demand_multi_hour_all_stations(
         sid = row_stations[i]
         rr, rt = rental_batch.iloc[i], return_batch.iloc[i]
         fb = base_fallback[sid]
-        results.append({
-            "station_id": sid,
-            "date": record["date"],
-            "hour": int(record["hour"]),
-            "minute": minute,
-            "horizon": row_horizons[i],
-            "rental": {
-                "pred_mean": float(rr["pred_mean"]), "pred_p10": float(rr["pred_p10"]),
-                "pred_p50": float(rr["pred_p50"]), "pred_p90": float(rr["pred_p90"]),
-                "lag_fallback_used": fb,
-                "lag_data_freshness": round(1 - len(fb) / N_LAG_ROLLING_FEATURES, 3),
-            },
-            "return": {
-                "pred_mean": float(rt["pred_mean"]), "pred_p10": float(rt["pred_p10"]),
-                "pred_p50": float(rt["pred_p50"]), "pred_p90": float(rt["pred_p90"]),
-            },
-            "population_source": "fallback" if population_fallback_by_row[i] else "provided",
-            "stockout_source": "fallback" if stockout_fallback_by_row[i] else "provided",
-        })
+        results.append(
+            {
+                "station_id": sid,
+                "date": record["date"],
+                "hour": int(record["hour"]),
+                "minute": minute,
+                "horizon": row_horizons[i],
+                "rental": {
+                    "pred_mean": float(rr["pred_mean"]),
+                    "pred_p10": float(rr["pred_p10"]),
+                    "pred_p50": float(rr["pred_p50"]),
+                    "pred_p90": float(rr["pred_p90"]),
+                    "lag_fallback_used": fb,
+                    "lag_data_freshness": round(
+                        1 - len(fb) / N_LAG_ROLLING_FEATURES, 3
+                    ),
+                },
+                "return": {
+                    "pred_mean": float(rt["pred_mean"]),
+                    "pred_p10": float(rt["pred_p10"]),
+                    "pred_p50": float(rt["pred_p50"]),
+                    "pred_p90": float(rt["pred_p90"]),
+                },
+                "population_source": "fallback"
+                if population_fallback_by_row[i]
+                else "provided",
+                "stockout_source": "fallback"
+                if stockout_fallback_by_row[i]
+                else "provided",
+            }
+        )
 
     return {
         "results": results,
         "failed": failed,
+        "excluded": excluded,
         "expected_count": expected_count,
         "actual_count": len(results),
     }
 
 
 def _resolve_live_weather(
-    target_ts: pd.Timestamp, anchor_ts: pd.Timestamp, temp: float | None, precip: float | None
+    target_ts: pd.Timestamp,
+    anchor_ts: pd.Timestamp,
+    temp: float | None,
+    precip: float | None,
 ) -> tuple[float, float]:
     """둘 중 하나라도 None이면 Silver 날씨로 나머지도 같이 채운다.
 
@@ -1798,7 +2172,9 @@ def _resolve_live_weather(
     return temp, precip
 
 
-def _stockout_from_status(station_id: str, status: pd.DataFrame | None, stockout: bool | None) -> tuple[bool, bool]:
+def _stockout_from_status(
+    station_id: str, status: pd.DataFrame | None, stockout: bool | None
+) -> tuple[bool, bool]:
     """이미 조회해둔 재고 현황(status)에서 station_id의 stockout 여부를 찾는다.
 
     조회 자체는 하지 않는다 — `predict_demand_multi_hour_all_stations()`처럼
@@ -1826,7 +2202,9 @@ def _stockout_from_status(station_id: str, status: pd.DataFrame | None, stockout
     return False, True  # 재고 정보 자체가 없으면 "품절 아님"으로 보수적 기본값
 
 
-def _resolve_live_stockout(station_id: str, anchor_ts: pd.Timestamp, stockout: bool | None) -> tuple[bool, bool]:
+def _resolve_live_stockout(
+    station_id: str, anchor_ts: pd.Timestamp, stockout: bool | None
+) -> tuple[bool, bool]:
     """stockout이 None이면 anchor_ts 기준 Silver 실시간 재고 현황을 그 자리에서 조회해 대체한다.
 
     returns:
@@ -1884,7 +2262,9 @@ def predict_rental_demand(
     anchor_ts = _target_timestamp(date, hour, minute)
     target_ts = anchor_ts + pd.Timedelta(hours=horizon - 1)
     temp, precip = _resolve_live_weather(target_ts, anchor_ts, temp, precip)
-    stockout, stockout_fallback = _resolve_live_stockout(station_id, anchor_ts, stockout)
+    stockout, stockout_fallback = _resolve_live_stockout(
+        station_id, anchor_ts, stockout
+    )
     result = _predict_at(
         "rental",
         "rental_exposure",
@@ -1954,7 +2334,7 @@ def predict_return_demand(
 
 
 def _parse_weather_arg(raw: str) -> float | list[float]:
-    """"20.5" 같은 스칼라 또는 "20,21,21.5,..." 같은 콤마구분 배열을 파싱한다.
+    """ "20.5" 같은 스칼라 또는 "20,21,21.5,..." 같은 콤마구분 배열을 파싱한다.
 
     배열이면 `predict_demand_multi_hour[_all_stations]()`가 길이를 `--n-hours`와
     대조해 검증한다(`_resolve_weather_for_horizon()` 참고) — 여기서는 파싱만 한다.
@@ -1970,53 +2350,82 @@ def main(argv: list[str] | None = None) -> None:
     import json
 
     parser = argparse.ArgumentParser(description="단일 시점 대여/반납 수요 예측")
-    parser.add_argument("--station-id", default=None, help="--all-stations와 동시 사용 불가")
     parser.add_argument(
-        "--all-stations", action="store_true",
+        "--station-id", default=None, help="--all-stations와 동시 사용 불가"
+    )
+    parser.add_argument(
+        "--all-stations",
+        action="store_true",
         help="최신 보강 station master의 전체 정류소를 한 번에 예측(인구는 정류소별 자동 대체, "
         "날씨는 전체 공통) — --n-hours와 함께 쓰면 horizon=1..n_hours를 재귀 없이 한 번에 예측",
     )
     parser.add_argument("--date", required=True, help="YYYY-MM-DD")
     parser.add_argument("--hour", type=int, required=True)
     parser.add_argument(
-        "--minute", type=int, default=0,
+        "--minute",
+        type=int,
+        default=0,
         help="0~59 중 SERVING_TICK_MINUTES의 배수 (기본값 0 — 정시). 모델 학습 "
         "grid가 20분이어도 운영 요청은 5분 간격으로 받는다.",
     )
     parser.add_argument(
-        "--horizon", type=int, default=1,
+        "--horizon",
+        type=int,
+        default=1,
         help="--n-hours를 안 쓸 때(단발 예측) 몇 시간 뒤를 예측할지 (1~HORIZON_COUNT, 기본값 1)",
     )
     parser.add_argument(
-        "--temp", type=_parse_weather_arg, default=None,
+        "--temp",
+        type=_parse_weather_arg,
+        default=None,
         help="기온(°C) — 스칼라(전체 horizon 재사용) 또는 --n-hours와 길이가 같은 콤마구분 배열(예: 20,21,21.5). "
         "생략하면 미래 시각은 Silver `weather_short_term_forecast`(예보), 그 외엔 "
         "`weather_ultra_short_live`(관측)에서 실시간 조회(운영 시 실제 호출 방식)",
     )
-    parser.add_argument("--precip", type=_parse_weather_arg, default=None, help="강수량(mm) — --temp와 동일 형식·기본값")
     parser.add_argument(
-        "--population", type=float, default=None,
+        "--precip",
+        type=_parse_weather_arg,
+        default=None,
+        help="강수량(mm) — --temp와 동일 형식·기본값",
+    )
+    parser.add_argument(
+        "--population",
+        type=float,
+        default=None,
         help="생략하면 Silver 실시간 인구를 먼저 시도하고, 없으면 격자 평소 인구로 대체(--all-stations는 항상 자동 대체)",
     )
     stockout_group = parser.add_mutually_exclusive_group()
     stockout_group.add_argument(
-        "--stockout", dest="stockout", action="store_true", default=None,
+        "--stockout",
+        dest="stockout",
+        action="store_true",
+        default=None,
         help="재고 없음으로 강제 고정. 생략하면 Silver `bike_station_realtime`에서 실시간 조회",
     )
-    stockout_group.add_argument("--no-stockout", dest="stockout", action="store_false", help="재고 있음으로 강제 고정")
+    stockout_group.add_argument(
+        "--no-stockout",
+        dest="stockout",
+        action="store_false",
+        help="재고 있음으로 강제 고정",
+    )
     parser.add_argument(
-        "--n-hours", type=int, default=1,
+        "--n-hours",
+        type=int,
+        default=1,
         help="1보다 크면 horizon=1..n_hours를 한 번에 예측한다(predict_demand_multi_hour — "
         "lag/rolling은 T0 기준 한 번만 계산, 재귀 없음)",
     )
     parser.add_argument(
-        "--out", default=None,
+        "--out",
+        default=None,
         help="결과 저장 S3 키(parquet). 미지정시 기본 S3 경로(단일: single_prediction_key, 전체: predictions_key)",
     )
     args = parser.parse_args(argv)
 
     if bool(args.station_id) == bool(args.all_stations):
-        raise SystemExit("--station-id와 --all-stations 중 정확히 하나만 지정해야 합니다.")
+        raise SystemExit(
+            "--station-id와 --all-stations 중 정확히 하나만 지정해야 합니다."
+        )
 
     if args.all_stations:
         import time
@@ -2024,32 +2433,52 @@ def main(argv: list[str] | None = None) -> None:
         start = time.perf_counter()
 
         def _progress(done: int, total: int) -> None:
-            print(f"  {done}/{total} 시간대 완료 ({time.perf_counter() - start:.1f}s)", flush=True)
+            print(
+                f"  {done}/{total} 시간대 완료 ({time.perf_counter() - start:.1f}s)",
+                flush=True,
+            )
 
         outcome = predict_demand_multi_hour_all_stations(
-            date=args.date, hour=args.hour, minute=args.minute, temp=args.temp, precip=args.precip,
-            stockout=args.stockout, n_hours=args.n_hours, on_progress=_progress,
+            date=args.date,
+            hour=args.hour,
+            minute=args.minute,
+            temp=args.temp,
+            precip=args.precip,
+            stockout=args.stockout,
+            n_hours=args.n_hours,
+            on_progress=_progress,
         )
         elapsed = time.perf_counter() - start
         result, failed = outcome["results"], outcome["failed"]
+        excluded = outcome.get("excluded", [])
         print(
             f"전체 {outcome['expected_count']:,}건 기대 / {outcome['actual_count']:,}건 성공"
-            f"({len(failed):,}건 실패), {elapsed:.1f}초 소요"
+            f"({len(failed):,}건 실패, {len(excluded):,}개 정류소 serving surface 제외), "
+            f"{elapsed:.1f}초 소요"
         )
 
         rows = []
         for r in result:
-            rows.append({
-                "station_id": r["station_id"], "date": r["date"], "hour": r["hour"], "minute": r["minute"],
-                "horizon": r["horizon"],
-                "rental_pred_mean": r["rental"]["pred_mean"], "rental_pred_p10": r["rental"]["pred_p10"],
-                "rental_pred_p50": r["rental"]["pred_p50"], "rental_pred_p90": r["rental"]["pred_p90"],
-                "return_pred_mean": r["return"]["pred_mean"], "return_pred_p10": r["return"]["pred_p10"],
-                "return_pred_p50": r["return"]["pred_p50"], "return_pred_p90": r["return"]["pred_p90"],
-                "lag_data_freshness": r["rental"]["lag_data_freshness"],
-                "population_source": r["population_source"],
-                "stockout_source": r["stockout_source"],
-            })
+            rows.append(
+                {
+                    "station_id": r["station_id"],
+                    "date": r["date"],
+                    "hour": r["hour"],
+                    "minute": r["minute"],
+                    "horizon": r["horizon"],
+                    "rental_pred_mean": r["rental"]["pred_mean"],
+                    "rental_pred_p10": r["rental"]["pred_p10"],
+                    "rental_pred_p50": r["rental"]["pred_p50"],
+                    "rental_pred_p90": r["rental"]["pred_p90"],
+                    "return_pred_mean": r["return"]["pred_mean"],
+                    "return_pred_p10": r["return"]["pred_p10"],
+                    "return_pred_p50": r["return"]["pred_p50"],
+                    "return_pred_p90": r["return"]["pred_p90"],
+                    "lag_data_freshness": r["rental"]["lag_data_freshness"],
+                    "population_source": r["population_source"],
+                    "stockout_source": r["stockout_source"],
+                }
+            )
         out_df = pd.DataFrame(rows)
         window_start = _target_timestamp(args.date, args.hour, args.minute)
         out_path = args.out or silver_schema.predictions_key(window_start)
@@ -2095,23 +2524,36 @@ def main(argv: list[str] | None = None) -> None:
         "population": args.population,
     }
     window_start = _target_timestamp(args.date, args.hour, args.minute)
-    out_path = args.out or silver_schema.single_prediction_key(args.station_id, window_start)
+    out_path = args.out or silver_schema.single_prediction_key(
+        args.station_id, window_start
+    )
 
     if args.n_hours > 1:
-        result = predict_demand_multi_hour(**common, stockout=args.stockout, n_hours=args.n_hours)
+        result = predict_demand_multi_hour(
+            **common, stockout=args.stockout, n_hours=args.n_hours
+        )
         rows = []
         for r in result:
-            rows.append({
-                "station_id": r["station_id"], "date": r["date"], "hour": r["hour"], "minute": r["minute"],
-                "horizon": r["horizon"],
-                "rental_pred_mean": r["rental"]["pred_mean"], "rental_pred_p10": r["rental"]["pred_p10"],
-                "rental_pred_p50": r["rental"]["pred_p50"], "rental_pred_p90": r["rental"]["pred_p90"],
-                "return_pred_mean": r["return"]["pred_mean"], "return_pred_p10": r["return"]["pred_p10"],
-                "return_pred_p50": r["return"]["pred_p50"], "return_pred_p90": r["return"]["pred_p90"],
-                "lag_data_freshness": r["rental"]["lag_data_freshness"],
-                "population_source": r["population_source"],
-                "stockout_source": r["stockout_source"],
-            })
+            rows.append(
+                {
+                    "station_id": r["station_id"],
+                    "date": r["date"],
+                    "hour": r["hour"],
+                    "minute": r["minute"],
+                    "horizon": r["horizon"],
+                    "rental_pred_mean": r["rental"]["pred_mean"],
+                    "rental_pred_p10": r["rental"]["pred_p10"],
+                    "rental_pred_p50": r["rental"]["pred_p50"],
+                    "rental_pred_p90": r["rental"]["pred_p90"],
+                    "return_pred_mean": r["return"]["pred_mean"],
+                    "return_pred_p10": r["return"]["pred_p10"],
+                    "return_pred_p50": r["return"]["pred_p50"],
+                    "return_pred_p90": r["return"]["pred_p90"],
+                    "lag_data_freshness": r["rental"]["lag_data_freshness"],
+                    "population_source": r["population_source"],
+                    "stockout_source": r["stockout_source"],
+                }
+            )
         out_df = pd.DataFrame(rows)
         s3_io.write_parquet(out_df, out_path)
         print(f"결과 저장: {out_path}", file=sys.stderr)
@@ -2124,24 +2566,26 @@ def main(argv: list[str] | None = None) -> None:
         "rental": rental_res,
         "return": return_res,
     }
-    rows = [{
-        "station_id": rental_res["station_id"],
-        "date": rental_res["date"],
-        "hour": rental_res["hour"],
-        "minute": rental_res["minute"],
-        "horizon": rental_res["horizon"],
-        "rental_pred_mean": rental_res["pred_mean"],
-        "rental_pred_p10": rental_res["pred_p10"],
-        "rental_pred_p50": rental_res["pred_p50"],
-        "rental_pred_p90": rental_res["pred_p90"],
-        "return_pred_mean": return_res["pred_mean"],
-        "return_pred_p10": return_res["pred_p10"],
-        "return_pred_p50": return_res["pred_p50"],
-        "return_pred_p90": return_res["pred_p90"],
-        "lag_data_freshness": rental_res["lag_data_freshness"],
-        "population_source": rental_res["population_source"],
-        "stockout_source": rental_res["stockout_source"],
-    }]
+    rows = [
+        {
+            "station_id": rental_res["station_id"],
+            "date": rental_res["date"],
+            "hour": rental_res["hour"],
+            "minute": rental_res["minute"],
+            "horizon": rental_res["horizon"],
+            "rental_pred_mean": rental_res["pred_mean"],
+            "rental_pred_p10": rental_res["pred_p10"],
+            "rental_pred_p50": rental_res["pred_p50"],
+            "rental_pred_p90": rental_res["pred_p90"],
+            "return_pred_mean": return_res["pred_mean"],
+            "return_pred_p10": return_res["pred_p10"],
+            "return_pred_p50": return_res["pred_p50"],
+            "return_pred_p90": return_res["pred_p90"],
+            "lag_data_freshness": rental_res["lag_data_freshness"],
+            "population_source": rental_res["population_source"],
+            "stockout_source": rental_res["stockout_source"],
+        }
+    ]
     out_df = pd.DataFrame(rows)
     s3_io.write_parquet(out_df, out_path)
     print(f"결과 저장: {out_path}", file=sys.stderr)
