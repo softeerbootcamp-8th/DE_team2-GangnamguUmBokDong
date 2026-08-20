@@ -30,6 +30,8 @@ bash -n "${SCHEMA_CHECK}"
 grep -Fq 'command: ["postgres"]' "${COMPOSE_FILE}" || fail "custom entrypoint가 postgres 명령을 명시하지 않았습니다."
 grep -Fq 'pg_isready -h 127.0.0.1' "${COMPOSE_FILE}" || fail "healthcheck가 init용 Unix socket을 제외하지 않았습니다."
 grep -Fq '.gold-postgis-target-schema-129' "${COMPOSE_FILE}" || fail "healthcheck가 baseline marker를 확인하지 않았습니다."
+[[ "$(grep -Fc 'platform: ${POSTGRES_PLATFORM:-linux/amd64}' "${COMPOSE_FILE}")" -eq 2 ]] ||
+    fail "두 PostGIS 서비스가 Apple Silicon용 amd64 플랫폼 계약을 공유하지 않습니다."
 
 mkdir -p "${TEMP_DIR}/empty" "${TEMP_DIR}/legacy" "${TEMP_DIR}/ready"
 printf '16\n' >"${TEMP_DIR}/legacy/PG_VERSION"

@@ -35,6 +35,23 @@ make logs    # 로그 확인
 make ps      # 상태 확인
 ```
 
+### Apple Silicon에서 PostGIS 실행
+
+로컬 Compose가 사용하는 `postgis/postgis:16-3.5` 이미지는 `linux/amd64`만
+배포됩니다. M1/M2/M3/M4 Mac의 Docker Linux VM은 기본 `linux/arm64`이므로 플랫폼을
+명시하지 않으면 `no matching manifest for linux/arm64/v8` 오류가 발생합니다.
+
+Compose는 `postgres`와 `postgres-schema-check`에만
+`POSTGRES_PLATFORM`(기본 `linux/amd64`)을 적용합니다. 따라서 Apple Silicon에서도
+기존과 동일하게 `make bootstrap` 또는 `make up`을 실행하면 됩니다. Docker Desktop의
+x86_64/amd64 에뮬레이션(Rosetta) 옵션은 활성화하는 것을 권장합니다.
+
+이 설정은 로컬 개발용 PostGIS 컨테이너에만 적용됩니다. 운영 AWS의 RDS에는 해당
+이미지를 사용하지 않으며, MinIO·Airflow·Node 이미지는 각 호스트 아키텍처의 native
+이미지를 계속 사용합니다. 현재 PostGIS 이미지가 arm64 manifest를 제공하지 않으므로
+`POSTGRES_PLATFORM`은 기본값에서 바꾸지 않습니다. 향후 multi-arch PostGIS 이미지로
+교체할 때 이미지와 platform을 함께 검증합니다.
+
 ### Gold PostGIS baseline과 기존 볼륨
 
 로컬 PostgreSQL은 `postgis/postgis:16-3.5`를 사용하며, **새 `postgres-data` 볼륨을
