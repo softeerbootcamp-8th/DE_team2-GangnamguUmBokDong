@@ -6,7 +6,7 @@ CI_INTEGRATION_PROJECTS := loader
 
 COMPOSE = docker compose $(if $(wildcard .env),--env-file .env,) -f ops/compose/docker-compose.yml
 
-.PHONY: sync-all sync-ci-unit lint test test-ci test-ci-unit test-ci-integration bootstrap up down logs ps seed
+.PHONY: sync-all sync-ci-unit lint test-gold-bootstrap test test-ci test-ci-unit test-ci-integration bootstrap up down logs ps seed
 
 sync-all:
 	@for p in $(PROJECTS); do \
@@ -26,7 +26,10 @@ lint:
 		(cd $$p && uvx ruff check .) || exit 1; \
 	done
 
-test:
+test-gold-bootstrap:
+	bash ops/postgres/tests/test_bootstrap.sh
+
+test: test-gold-bootstrap
 	@for p in $(LOCAL_TEST_PROJECTS); do \
 		echo "==> $$p"; \
 		(cd $$p && uv run --with pytest pytest -q); \
@@ -48,7 +51,7 @@ test-ci:
 	@$(COMPOSE) exec -T airflow-scheduler \
 		sh -lc 'cd /workspace/airflow && uv run pytest -q'
 
-test-ci-unit:
+test-ci-unit: test-gold-bootstrap
 	@for p in $(CI_UNIT_PROJECTS); do \
 		echo "==> $$p"; \
 		(cd $$p && uv run --with pytest pytest -q); \
@@ -71,8 +74,27 @@ bootstrap:
 	./ops/bootstrap/bootstrap.sh
 
 up:
+	@$(COMPOSE) up -d --build postgres postgres-schema-check || { \
+		$(COMPOSE) logs --no-color postgres postgres-schema-check; \
+		exit 1; \
+	}
+	@$(COMPOSE) wait postgres-schema-check >/dev/null 2>&1 || true
+	@schema_check_id="$$( $(COMPOSE) ps --all --quiet postgres-schema-check)"; \
+	if [ -z "$$schema_check_id" ]; then \
+		echo "[gold-postgis] schema-check 컨테이너를 찾을 수 없습니다." >&2; \
+		exit 1; \
+	fi; \
+	if ! schema_check_state="$$(docker inspect --format '{{.State.Status}}:{{.State.ExitCode}}' "$$schema_check_id")"; then \
+		echo "[gold-postgis] schema-check 컨테이너 상태를 읽을 수 없습니다." >&2; \
+		exit 1; \
+	fi; \
+	if [ "$$schema_check_state" != "exited:0" ]; then \
+		echo "[gold-postgis] schema-check 실패: $$schema_check_state" >&2; \
+		$(COMPOSE) logs --no-color postgres postgres-schema-check; \
+		exit 1; \
+	fi
 	@$(COMPOSE) up -d --build || { \
-		$(COMPOSE) logs --no-color airflow-init postgres-schema-init; \
+		$(COMPOSE) logs --no-color postgres postgres-schema-check airflow-init; \
 		exit 1; \
 	}
 
@@ -86,4 +108,5 @@ ps:
 	$(COMPOSE) ps
 
 seed:
-	cd apps/api && uv run python seed_gold.py
+	@echo "[gold-postgis] make seed는 비활성화되었습니다. 후속 #152 fixture/source publisher 경로를 사용하세요." >&2
+	@false

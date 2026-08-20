@@ -2,7 +2,10 @@ name: de-team2-gangnamguumbokdong
 
 services:
   postgres:
-    image: postgres:16
+    image: postgis/postgis:16-3.5
+    entrypoint: ["bash", "/usr/local/bin/gold-postgis-entrypoint.sh"]
+    # Compose에서 entrypoint를 덮으면 이미지의 기본 CMD가 비워지므로 명시한다.
+    command: ["postgres"]
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
@@ -13,31 +16,37 @@ services:
       - "${POSTGRES_PORT:-5432}:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
-      - ../postgres/init:/docker-entrypoint-initdb.d
+      - ../postgres/init/001_create_databases.sh:/docker-entrypoint-initdb.d/001_create_databases.sh:ro
+      - ../postgres/init/002_gold_schema.sh:/docker-entrypoint-initdb.d/002_gold_schema.sh:ro
+      - ../postgres/entrypoint.sh:/usr/local/bin/gold-postgis-entrypoint.sh:ro
+      - ../../docs/gold/target-schema.sql:/opt/gold/target-schema.sql:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
+      # 공식 entrypoint의 init용 임시 서버는 Unix socket만 열기 때문에 TCP와
+      # baseline 성공 marker를 함께 확인해야 전체 init 완료 전 green이 되지 않는다.
+      test:
+        - CMD-SHELL
+        - >-
+          test -f /var/lib/postgresql/data/.gold-postgis-target-schema-129 &&
+          pg_isready -h 127.0.0.1 -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_APP_DB:-app}
       interval: 5s
       timeout: 5s
+      start_period: 60s
       retries: 10
 
-  # docker-entrypoint-initdb.d는 postgres-data 볼륨을 처음 만들 때만 실행된다.
-  # 이미 존재하는 로컬 볼륨에도 새 Gold 테이블을 반영하도록, idempotent한
-  # 002_gold_schema.sh를 Compose 기동마다 한 번 더 적용한다.
-  postgres-schema-init:
-    image: postgres:16
+  # 기존 볼륨에는 DDL을 재적용하지 않는다. 새 볼륨의 원자적 baseline 적용 후에도
+  # SSOT의 핵심 객체가 모두 있는지 읽기 전용으로 확인한 뒤 소비자를 시작한다.
+  postgres-schema-check:
+    image: postgis/postgis:16-3.5
     environment:
       PGHOST: postgres
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
       PGPASSWORD: ${POSTGRES_PASSWORD:-postgres}
       POSTGRES_APP_DB: ${POSTGRES_APP_DB:-app}
+      POSTGRES_AIRFLOW_DB: ${POSTGRES_AIRFLOW_DB:-airflow}
     volumes:
-      - ../postgres/init:/docker-entrypoint-initdb.d:ro
-    command:
-      - bash
-      - -c
-      - >-
-        /docker-entrypoint-initdb.d/002_gold_schema.sh &&
-        /docker-entrypoint-initdb.d/003_station_urgency.sh
+      - ../postgres/check_gold_schema.sh:/opt/gold/check_gold_schema.sh:ro
+      - ../postgres/check_gold_schema.sql:/opt/gold/check_gold_schema.sql:ro
+    command: ["bash", "/opt/gold/check_gold_schema.sh"]
     depends_on:
       postgres:
         condition: service_healthy
@@ -125,7 +134,7 @@ services:
     volumes:
       - ../..:/workspace
     depends_on:
-      postgres-schema-init:
+      postgres-schema-check:
         condition: service_completed_successfully
 
   airflow-webserver:
@@ -226,7 +235,7 @@ services:
     volumes:
       - ../..:/workspace
     depends_on:
-      postgres-schema-init:
+      postgres-schema-check:
         condition: service_completed_successfully
 
   web:
