@@ -44,11 +44,13 @@ import httpx
 from adapters.base import FetchErrorKind, FetchResult, adapter, classify_http_status
 
 if TYPE_CHECKING:
-    from adapters.base import Window
     from config.schema import SourceConfig
+
+    from adapters.base import Window
 
 _BASE_URL = "https://apihub.kma.go.kr/api/typ02/openApi/VilageFcstInfoService_2.0"
 _NUM_OF_ROWS = 1000  # 격자 하나당 한 시각의 관측·예보 항목 수를 넉넉히 덮는 상한
+_EXPECTED_GRID_COUNT = 34
 
 
 def _api_key() -> str:
@@ -64,41 +66,43 @@ def _classify_result_code(code: str | None) -> FetchErrorKind | None:
         return None  # NORMAL_SERVICE (성공)
     if code in {"03", "04", "05", "22"}:
         # 03: 데이터 없음(미발표), 04: HTTP 에러, 05: 연결 실패, 22: 제한 초과
-        return FetchErrorKind.TRANSIENT 
+        return FetchErrorKind.TRANSIENT
     if code in {"20", "21", "30", "31", "32", "33"}:
         # 20, 21, 30, 31, 32, 33: 인증/권한 에러
-        return FetchErrorKind.FATAL 
-  
-    return FetchErrorKind.PERMANENT 
+        return FetchErrorKind.FATAL
+
+    return FetchErrorKind.PERMANENT
 
 
 def _adjust_base_time(dt: datetime, rule: str | None) -> datetime:
     """기상청 API가 허용하는 가장 최근의 base_time으로 내림한다."""
     if not rule:
         return dt
-        
+
     if rule == "hourly":
         # 매시 정각 (초단기실황. 매시 40분 발표. 예: 14:40 -> 14:00, 14:39 -> 13:00)
         eval_dt = dt if dt.minute >= 40 else dt - timedelta(hours=1)
         return eval_dt.replace(minute=0, second=0, microsecond=0)
-        
+
     if rule == "half_hourly":
         # 매시 30분 (초단기예보. 예: 14:20 -> 13:30, 14:40 -> 14:30)
         if dt.minute < 30:
             return (dt - timedelta(hours=1)).replace(minute=30, second=0, microsecond=0)
         return dt.replace(minute=30, second=0, microsecond=0)
-        
+
     if rule == "vilage_fcst":
         # 단기예보: 02:00, 05:00, 08:00, 11:00, 14:00, 17:00, 20:00, 23:00
         # API 발표는 기준시간 + 10분부터 이루어지므로, 현재 10분 미만이면 한 턴 앞당겨야 함
         eval_dt = dt if dt.minute >= 10 else dt - timedelta(hours=1)
         if eval_dt.hour < 2:
-            return (eval_dt - timedelta(days=1)).replace(hour=23, minute=0, second=0, microsecond=0)
-        
+            return (eval_dt - timedelta(days=1)).replace(
+                hour=23, minute=0, second=0, microsecond=0
+            )
+
         k = (eval_dt.hour - 2) // 3
         base_hour = 2 + 3 * k
         return eval_dt.replace(hour=base_hour, minute=0, second=0, microsecond=0)
-        
+
     raise ValueError(f"알 수 없는 time_rule: {rule}")
 
 
@@ -130,6 +134,36 @@ def _merge_pages(bodies: list[dict], root_key: str) -> bytes:
 @adapter("kma_apihub")
 class KmaApiHubAdapter:
     """기상청 API 허브 공용 격자 반복 어댑터."""
+
+    @staticmethod
+    def planned_parts(
+        config: SourceConfig,
+        window: Window,
+    ) -> frozenset[str]:
+        """Deadline 전에 config의 exact 34-grid 요청 계획을 고정한다.
+
+        KMA는 응답에서 전체 조각 수를 주지 않는다. 따라서 iterator가 deadline으로
+        첫 미방문 grid 전에 끊겨도 누락을 기록하려면 fetch를 시작하기 전에 전체 key를
+        만들어야 한다. 중복 grid는 34개처럼 보여도 한 번만 호출되므로 hard fail한다.
+        """
+        del window
+        grids = config.adapter_params.get("grids")
+        if type(grids) is not list or len(grids) != _EXPECTED_GRID_COUNT:
+            raise ValueError("KMA source의 grids는 정확히 34개여야 합니다")
+
+        keys: list[str] = []
+        for grid in grids:
+            if (
+                type(grid) not in {list, tuple}
+                or len(grid) != 2
+                or type(grid[0]) is not int
+                or type(grid[1]) is not int
+            ):
+                raise ValueError("KMA grid는 정확히 두 builtin integer여야 합니다")
+            keys.append(f"grid-{grid[0]:03d}x{grid[1]:03d}")
+        if len(set(keys)) != _EXPECTED_GRID_COUNT:
+            raise ValueError("KMA source의 34개 grid는 중복될 수 없습니다")
+        return frozenset(keys)
 
     @staticmethod
     def fetch(
@@ -172,18 +206,27 @@ class KmaApiHubAdapter:
                 try:
                     response = client.get(url)
                 except httpx.RequestError:
-                    yield FetchResult(key=key, payload=None, error=FetchErrorKind.TRANSIENT, expected_total=None)
+                    yield FetchResult(
+                        key=key,
+                        payload=None,
+                        error=FetchErrorKind.TRANSIENT,
+                        expected_total=None,
+                    )
                     grid_failed = True
                     break
 
                 category = classify_http_status(response.status_code)
                 if category is FetchErrorKind.FATAL:
                     # HTTP 레벨의 인증키 오류 등 확정적 원인인 경우, 즉시 중단.
-                    yield FetchResult(key=key, payload=None, error=category, expected_total=None)
+                    yield FetchResult(
+                        key=key, payload=None, error=category, expected_total=None
+                    )
                     return
                 elif category is not None:
                     # HTTP 상태 5xx (TRANSIENT) 또는 4xx (PERMANENT)
-                    yield FetchResult(key=key, payload=None, error=category, expected_total=None)
+                    yield FetchResult(
+                        key=key, payload=None, error=category, expected_total=None
+                    )
                     grid_failed = True
                     break
 
@@ -192,25 +235,41 @@ class KmaApiHubAdapter:
                     body = json.loads(response.content)
                     if not isinstance(body, dict):
                         raise TypeError("응답이 JSON 객체가 아님")
-                    result_code = body.get("response", {}).get("header", {}).get("resultCode")
+                    result_code = (
+                        body.get("response", {}).get("header", {}).get("resultCode")
+                    )
                 except (json.JSONDecodeError, TypeError):
-                    yield FetchResult(key=key, payload=None, error=FetchErrorKind.TRANSIENT, expected_total=None)
+                    yield FetchResult(
+                        key=key,
+                        payload=None,
+                        error=FetchErrorKind.TRANSIENT,
+                        expected_total=None,
+                    )
                     grid_failed = True
                     break
 
                 api_category = _classify_result_code(result_code)
                 if api_category is not None:
                     if api_category is FetchErrorKind.FATAL:
-                        yield FetchResult(key=key, payload=None, error=api_category, expected_total=None)
+                        yield FetchResult(
+                            key=key,
+                            payload=None,
+                            error=api_category,
+                            expected_total=None,
+                        )
                         return
-                    yield FetchResult(key=key, payload=None, error=api_category, expected_total=None)
+                    yield FetchResult(
+                        key=key, payload=None, error=api_category, expected_total=None
+                    )
                     grid_failed = True
                     break
 
                 page_bodies.append(body)
                 if page_no == 1:
                     first_page_raw = response.content
-                    total_count = body.get("response", {}).get("body", {}).get("totalCount")
+                    total_count = (
+                        body.get("response", {}).get("body", {}).get("totalCount")
+                    )
                     if isinstance(total_count, int) and total_count > _NUM_OF_ROWS:
                         total_pages = math.ceil(total_count / _NUM_OF_ROWS)
 
@@ -219,7 +278,11 @@ class KmaApiHubAdapter:
             if grid_failed:
                 continue
 
-            payload = first_page_raw if len(page_bodies) == 1 else _merge_pages(page_bodies, root_key)
+            payload = (
+                first_page_raw
+                if len(page_bodies) == 1
+                else _merge_pages(page_bodies, root_key)
+            )
             yield FetchResult(key=key, payload=payload, error=None, expected_total=None)
 
     @staticmethod
@@ -235,7 +298,11 @@ class KmaApiHubAdapter:
             body = json.loads(chunk)
             for item in _extract(body, root_key):
                 group_key = tuple(
-                    sorted((k, v) for k, v in item.items() if k not in (key_field, value_field))
+                    sorted(
+                        (k, v)
+                        for k, v in item.items()
+                        if k not in (key_field, value_field)
+                    )
                 )
                 if group_key not in groups:
                     groups[group_key] = dict(group_key)

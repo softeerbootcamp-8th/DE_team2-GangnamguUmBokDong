@@ -1,18 +1,27 @@
 """manifest 스키마와 읽기 쓰기, 상태 어휘.
 
-한 번의 실행이 무엇을 했고 어디까지 갔는지를 남긴다. 
+한 번의 실행이 무엇을 했고 어디까지 갔는지를 남긴다.
 실제 S3 접근은 storage.py에 위임하고, 이 모듈은 dict ↔ 모델 변환과 상태 어휘만 담당한다.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum, IntEnum
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, BeforeValidator, ConfigDict, PlainSerializer
-
 import storage
+from core.source_snapshot import (
+    SourceSnapshotContractError,
+    SourceSnapshotCounts,
+    SourceSnapshotManifest,
+    SourceSnapshotStatus,
+    build_source_snapshot_manifest,
+    parse_source_snapshot_manifest,
+    same_source_snapshot_content,
+)
+from pydantic import BaseModel, BeforeValidator, ConfigDict, PlainSerializer
 
 
 class RunStatus(str, Enum):
@@ -106,7 +115,7 @@ class ColumnIssueCount(BaseModel):
 
 class Manifest(BaseModel):
     """한 번의 실행이 남기는 실행 기록 전체.
-    
+
     source_id: 소스 ID
     window_start: 윈도우 시작 시간
     window_end: 윈도우 종료 시간
@@ -114,7 +123,7 @@ class Manifest(BaseModel):
     stage: 실행 단계
     failure_reason: 실패 이유
     attempt: 재시도 횟수
-    revision: 수정 횟수
+    revision: authoritative source correction ordinal
     started_at: 시작 시간
     ended_at: 종료 시간
     duration_ms: 실행 시간
@@ -153,6 +162,14 @@ class Manifest(BaseModel):
     config_version: str
 
 
+@dataclass(frozen=True, slots=True)
+class PublishedSourceSnapshot:
+    """마지막 기록까지 검증한 authority manifest와 exact URI를 묶는다."""
+
+    manifest: SourceSnapshotManifest
+    manifest_uri: str
+
+
 def load(source_id: str, window_start: datetime) -> Manifest | None:
     """해당 윈도우의 manifest를 읽어 모델로 변환한다. 없으면 None을 반환한다."""
 
@@ -166,6 +183,139 @@ def save(manifest: Manifest) -> None:
     storage.write_manifest(
         manifest.source_id, manifest.window_start, manifest.model_dump(mode="json")
     )
+
+
+def load_source_snapshots(
+    source_id: str,
+    logical_dttm: datetime,
+) -> tuple[PublishedSourceSnapshot, ...]:
+    """논리 source window의 immutable manifest revision chain을 검증해 읽는다."""
+    snapshots: list[PublishedSourceSnapshot] = []
+    for uri, payload in storage.list_source_snapshot_manifest_payloads(
+        source_id, logical_dttm
+    ):
+        parsed = parse_source_snapshot_manifest(payload)
+        if parsed.source_id != source_id or parsed.logical_dttm != logical_dttm:
+            raise SourceSnapshotContractError(
+                "source snapshot manifest의 source/logical identity가 경로와 다릅니다."
+            )
+        expected_uri = storage.source_snapshot_manifest_uri(
+            source_id, logical_dttm, parsed.revision_no
+        )
+        if uri != expected_uri:
+            raise SourceSnapshotContractError(
+                "source snapshot manifest revision URI가 canonical 경로와 다릅니다."
+            )
+        snapshots.append(PublishedSourceSnapshot(parsed, uri))
+
+    snapshots.sort(key=lambda item: item.manifest.revision_no)
+    revisions = tuple(item.manifest.revision_no for item in snapshots)
+    if revisions != tuple(range(len(snapshots))):
+        raise SourceSnapshotContractError(
+            "source snapshot revision은 0부터 빈틈없이 증가해야 합니다."
+        )
+    return tuple(snapshots)
+
+
+def publish_source_snapshot(
+    *,
+    source_id: str,
+    logical_dttm: datetime,
+    status: SourceSnapshotStatus,
+    config_version: str,
+    silver: storage.ImmutableSilverArtifact | None,
+    counts: Counts,
+    planned_parts: tuple[str, ...],
+    completed_parts: tuple[str, ...],
+) -> PublishedSourceSnapshot:
+    """Output 완성 뒤 source snapshot revision을 결정해 manifest를 마지막 기록한다.
+
+    최초 authoritative 결과는 revision 0이다. 직전 결과와 status, Silver checksum,
+    count, plan, config가 모두 같으면 같은 revision의 exact replay이며, 하나라도 달라진
+    correction은 다음 revision을 사용한다. PARTIAL/FAILED는 이 함수의 status 타입으로
+    표현할 수 없어 authority manifest를 열 수 없다.
+    """
+    prepared = prepare_source_snapshot(
+        source_id=source_id,
+        logical_dttm=logical_dttm,
+        status=status,
+        config_version=config_version,
+        silver=silver,
+        counts=counts,
+        planned_parts=planned_parts,
+        completed_parts=completed_parts,
+    )
+    return finalize_source_snapshot(prepared)
+
+
+def prepare_source_snapshot(
+    *,
+    source_id: str,
+    logical_dttm: datetime,
+    status: SourceSnapshotStatus,
+    config_version: str,
+    silver: storage.ImmutableSilverArtifact | None,
+    counts: Counts,
+    planned_parts: tuple[str, ...],
+    completed_parts: tuple[str, ...],
+) -> PublishedSourceSnapshot:
+    """Output identity를 검증하고 쓸 authority revision을 부작용 없이 준비한다."""
+    if type(counts) is not Counts:
+        raise SourceSnapshotContractError("counts는 collector Counts여야 합니다.")
+    typed_counts = SourceSnapshotCounts(
+        expected=counts.expected,
+        fetched=counts.fetched,
+        kept=counts.kept,
+        repaired=counts.repaired,
+        dropped=counts.dropped,
+    )
+    revisions = load_source_snapshots(source_id, logical_dttm)
+    candidate_revision = 0 if not revisions else revisions[-1].manifest.revision_no + 1
+    candidate = build_source_snapshot_manifest(
+        source_id=source_id,
+        logical_dttm=logical_dttm,
+        revision_no=candidate_revision,
+        status=status,
+        config_version=config_version,
+        silver_uri=None if silver is None else silver.uri,
+        silver_byte_sha256=None if silver is None else silver.byte_sha256,
+        counts=typed_counts,
+        planned_parts=planned_parts,
+        completed_parts=completed_parts,
+    )
+
+    if revisions and same_source_snapshot_content(revisions[-1].manifest, candidate):
+        candidate = revisions[-1].manifest
+
+    return PublishedSourceSnapshot(
+        candidate,
+        storage.source_snapshot_manifest_uri(
+            source_id, logical_dttm, candidate.revision_no
+        ),
+    )
+
+
+def finalize_source_snapshot(
+    prepared: PublishedSourceSnapshot,
+) -> PublishedSourceSnapshot:
+    """준비한 authority manifest를 last put-once/readback으로 확정한다."""
+    if type(prepared) is not PublishedSourceSnapshot:
+        raise SourceSnapshotContractError(
+            "prepared snapshot은 PublishedSourceSnapshot이어야 합니다."
+        )
+    candidate = prepared.manifest
+
+    manifest_uri = storage.write_source_snapshot_manifest(
+        candidate.source_id,
+        candidate.logical_dttm,
+        candidate.revision_no,
+        candidate.canonical_bytes,
+    )
+    if manifest_uri != prepared.manifest_uri:
+        raise SourceSnapshotContractError(
+            "준비한 source snapshot manifest URI와 기록 URI가 다릅니다."
+        )
+    return PublishedSourceSnapshot(candidate, manifest_uri)
 
 
 class RetryMarker(BaseModel):
@@ -191,10 +341,12 @@ def save_retry_marker(marker: RetryMarker) -> None:
 def load_retry_markers(source_id: str) -> list[RetryMarker]:
     """해당 소스에 쌓인 retry marker를 모두 읽어 모델로 변환한다."""
 
-    return [RetryMarker.model_validate(d) for d in storage.list_retry_markers(source_id)]
+    return [
+        RetryMarker.model_validate(d) for d in storage.list_retry_markers(source_id)
+    ]
 
 
 def clear_retry_marker(source_id: str, window_start: datetime) -> None:
     """해당 윈도우의 retry marker를 큐에서 제거한다."""
-    
+
     storage.delete_retry_marker(source_id, window_start)

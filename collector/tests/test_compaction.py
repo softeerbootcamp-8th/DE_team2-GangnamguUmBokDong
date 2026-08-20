@@ -4,12 +4,11 @@ S3를 타는 통합 경로는 test_compaction_run.py에서 따로 본다. 여기
 계산되는 부분만 다룬다.
 """
 
-from datetime import datetime, timedelta
+from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import pyarrow as pa
 import pytest
-
 from compaction import (
     RECOVERY_DAYS,
     archive_schema,
@@ -18,7 +17,14 @@ from compaction import (
     silver_signature,
     window_start_from_key,
 )
-from config.schema import Backfill, ColumnSpec, Policies, Quality, Schedule, SourceConfig
+from config.schema import (
+    Backfill,
+    ColumnSpec,
+    Policies,
+    Quality,
+    Schedule,
+    SourceConfig,
+)
 from config.schema import Storage as StorageConfig
 from core.s3 import S3Object
 
@@ -31,11 +37,17 @@ def _config(**overrides):
         "description": "테스트 소스",
         "adapter": "t_adapter",
         "schedule": Schedule(interval="5m"),
-        "storage": StorageConfig(bronze_format="json", silver_format="parquet", partition=("dt", "hh")),
-        "quality": Quality(max_drop_ratio=0.5, max_missing_ratio=0.0, allow_empty=False),
+        "storage": StorageConfig(
+            bronze_format="json", silver_format="parquet", partition=("dt", "hh")
+        ),
+        "quality": Quality(
+            max_drop_ratio=0.5, max_missing_ratio=0.0, allow_empty=False
+        ),
         "policies": Policies(
-            required_missing="drop_row", required_outlier="drop_row",
-            optional_missing="keep_null", optional_outlier="set_null",
+            required_missing="drop_row",
+            required_outlier="drop_row",
+            optional_missing="keep_null",
+            optional_outlier="set_null",
         ),
         "columns": {},
         "config_version": "v1",
@@ -45,7 +57,9 @@ def _config(**overrides):
 
 
 def _obj(key, size=100, minute=0):
-    return S3Object(key=key, size=size, last_modified=datetime(2026, 8, 12, 4, minute, tzinfo=KST))
+    return S3Object(
+        key=key, size=size, last_modified=datetime(2026, 8, 12, 4, minute, tzinfo=KST)
+    )
 
 
 class TestWindowStartFromKey:
@@ -61,25 +75,50 @@ class TestWindowStartFromKey:
 
         assert window_start_from_key(key) == "2026-08-12T00:00:00+09:00"
 
+    def test_parses_content_addressed_immutable_key(self) -> None:
+        """Content-addressed key에서도 legacy와 같은 minute를 복원한다."""
+        checksum = "a" * 64
+        key = f"silver/test_source/dt=2026-08-12/hh=14/1410/sha256={checksum}.parquet"
+
+        assert window_start_from_key(key) == "2026-08-12T14:10:00+09:00"
+
     def test_uses_filename_not_hh_partition(self):
         """hh=는 시 단위라 분을 잃는다. 파일명 HHMM이 진짜 시각이다."""
         key = "silver/test_source/dt=2026-08-12/hh=23/2355.parquet"
 
         assert window_start_from_key(key) == "2026-08-12T23:55:00+09:00"
 
+    def test_rejects_mismatched_hour_partition(self) -> None:
+        """Partition hour와 파일 minute의 hour가 다르면 거부한다."""
+        key = "silver/test_source/dt=2026-08-12/hh=13/1410.parquet"
+
+        with pytest.raises(ValueError, match="partition"):
+            window_start_from_key(key)
+
+    def test_rejects_noncanonical_immutable_checksum(self) -> None:
+        """Lowercase 64자 SHA-256이 아닌 immutable key를 거부한다."""
+        key = "silver/test_source/dt=2026-08-12/hh=14/1410/sha256=ABC.parquet"
+
+        with pytest.raises(ValueError):
+            window_start_from_key(key)
+
     def test_rejects_unparseable_key(self):
         with pytest.raises(ValueError):
-            window_start_from_key("silver/test_source/dt=2026-08-12/hh=14/nowcast.parquet")
+            window_start_from_key(
+                "silver/test_source/dt=2026-08-12/hh=14/nowcast.parquet"
+            )
 
 
 class TestArchiveSchema:
     """yaml의 types[0]이 실효 타입이다 — _try_cast가 선언 순서대로 첫 성공을 채택하므로."""
 
     def test_single_declared_type_maps_directly(self):
-        config = _config(columns={
-            "a": ColumnSpec(types=("float",)),
-            "b": ColumnSpec(types=("int",)),
-        })
+        config = _config(
+            columns={
+                "a": ColumnSpec(types=("float",)),
+                "b": ColumnSpec(types=("int",)),
+            }
+        )
 
         schema = archive_schema(config)
 
@@ -110,10 +149,12 @@ class TestArchiveSchema:
         assert schema.field("_source_kind").type == pa.string()
 
     def test_column_order_follows_yaml(self):
-        config = _config(columns={
-            "z": ColumnSpec(types=("str",)),
-            "a": ColumnSpec(types=("str",)),
-        })
+        config = _config(
+            columns={
+                "z": ColumnSpec(types=("str",)),
+                "a": ColumnSpec(types=("str",)),
+            }
+        )
 
         assert archive_schema(config).names[:2] == ["z", "a"]
 

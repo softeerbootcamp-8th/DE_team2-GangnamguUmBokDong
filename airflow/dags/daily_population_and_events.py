@@ -1,11 +1,10 @@
-"""1일 주기: living_population_grid collector -> nowcasting 추정,
-cultural_event collector -> cultural_events 적재. 두 브랜치는 서로 독립.
+"""1일 주기 생활인구 추정과 source-scoped event publication DAG.
+
+생활인구와 두 행사 source 브랜치는 서로 독립이다.
 """
 
 import pendulum
-from airflow import DAG
 from airflow.timetables.trigger import CronTriggerTimetable
-
 from config.schedules import CATCHUP, DAILY_CRON, MAX_ACTIVE_RUNS, TIMEZONE
 from config.sources import (
     DAILY_EVENT_SOURCE,
@@ -13,8 +12,10 @@ from config.sources import (
     PERFORMANCE_EVENT_SOURCE,
 )
 from orchestration.collector_task import build_collector_task
-from orchestration.db_loader_task import build_db_loader_task
+from orchestration.gold_publisher_task import build_gold_publisher_task
 from orchestration.nowcasting_task import build_nowcasting_task
+
+from airflow import DAG
 
 with DAG(
     dag_id="daily_population_and_events",
@@ -29,9 +30,9 @@ with DAG(
     collect_population >> run_nowcasting
 
     collect_events = build_collector_task(dag, DAILY_EVENT_SOURCE)
-    load_events = build_db_loader_task(dag, "cultural_events")
-    collect_events >> load_events
+    publish_events = build_gold_publisher_task(dag, "event:cultural_event")
+    collect_events >> publish_events
 
     collect_performance = build_collector_task(dag, PERFORMANCE_EVENT_SOURCE)
-    load_performance = build_db_loader_task(dag, "cultural_events_performance")
-    collect_performance >> load_performance
+    publish_performance = build_gold_publisher_task(dag, "event:performance_event")
+    collect_performance >> publish_performance
