@@ -9,8 +9,10 @@ import io
 import json
 import os
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+from contextvars import Context, ContextVar, copy_context
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -20,6 +22,81 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from botocore.config import Config as BotoConfig
 from botocore.exceptions import ClientError
+
+
+class S3InputDriftError(RuntimeError):
+    """한 capture 구간에서 같은 S3 key가 서로 다른 상태로 관측됐다."""
+
+
+@dataclass(frozen=True, slots=True)
+class CapturedS3Object:
+    """계산이 실제로 읽은 S3 object key와 그 exact bytes다."""
+
+    key: str
+    payload: bytes
+
+
+class S3ReadCapture:
+    """동시 multipart GET까지 한 inference run의 object 관측을 모은다."""
+
+    def __init__(self) -> None:
+        """빈 thread-safe observation map을 만든다."""
+        self._lock = threading.Lock()
+        self._observations: dict[str, bytes | None] = {}
+
+    def record(self, key: str, payload: bytes | None) -> None:
+        """같은 key의 반복 관측이 exact same bytes 또는 같은 missing인지 확인한다."""
+        if type(key) is not str or not key:
+            raise TypeError("capture할 S3 key는 non-empty string이어야 합니다.")
+        if payload is not None and type(payload) is not bytes:
+            raise TypeError("capture할 S3 payload는 bytes 또는 None이어야 합니다.")
+        with self._lock:
+            if key in self._observations and self._observations[key] != payload:
+                raise S3InputDriftError(
+                    f"같은 S3 key가 inference run 중 변경됐습니다: {key}"
+                )
+            self._observations[key] = payload
+
+    @property
+    def objects(self) -> tuple[CapturedS3Object, ...]:
+        """존재한 object만 key UTF-8 byte 순으로 정렬해 반환한다."""
+        with self._lock:
+            values = tuple(self._observations.items())
+        return tuple(
+            CapturedS3Object(key=key, payload=payload)
+            for key, payload in sorted(values, key=lambda item: item[0].encode("utf-8"))
+            if payload is not None
+        )
+
+
+_ACTIVE_READ_CAPTURE: ContextVar[S3ReadCapture | None] = ContextVar(
+    "core_s3_active_read_capture",
+    default=None,
+)
+
+
+@contextmanager
+def capture_object_reads() -> Iterator[S3ReadCapture]:
+    """현재 context와 ``read_parquet_many`` worker가 읽는 exact object bytes를 모은다.
+
+    Capture는 의도적으로 중첩할 수 없다. Authority producer가 계산 경계를 한 번만
+    열어야 model/release preflight bytes와 실제 non-model 계산 input이 섞이지 않는다.
+    """
+    if _ACTIVE_READ_CAPTURE.get() is not None:
+        raise RuntimeError("S3 object read capture는 중첩할 수 없습니다.")
+    capture = S3ReadCapture()
+    token = _ACTIVE_READ_CAPTURE.set(capture)
+    try:
+        yield capture
+    finally:
+        _ACTIVE_READ_CAPTURE.reset(token)
+
+
+def _record_object_read(key: str, payload: bytes | None) -> None:
+    """활성 capture가 있을 때만 S3 GET 결과를 기록한다."""
+    capture = _ACTIVE_READ_CAPTURE.get()
+    if capture is not None:
+        capture.record(key, payload)
 
 
 def _client(timeout_seconds: float | None = None):
@@ -36,7 +113,9 @@ def _client(timeout_seconds: float | None = None):
     config = None
     if timeout_seconds is not None:
         config = BotoConfig(
-            connect_timeout=timeout_seconds, read_timeout=timeout_seconds, retries={"max_attempts": 1}
+            connect_timeout=timeout_seconds,
+            read_timeout=timeout_seconds,
+            retries={"max_attempts": 1},
         )
     return boto3.client(
         "s3",
@@ -66,9 +145,16 @@ def get_object_bytes(key: str, timeout_seconds: float | None = None) -> bytes | 
             엔드포인트 자체가 응답하지 않으면 그대로 던진다 — 호출부가 폴백을 결정한다.
     """
     try:
-        return _client(timeout_seconds).get_object(Bucket=_bucket(), Key=key)["Body"].read()
+        payload = (
+            _client(timeout_seconds)
+            .get_object(Bucket=_bucket(), Key=key)["Body"]
+            .read()
+        )
+        _record_object_read(key, payload)
+        return payload
     except ClientError as exc:
         if exc.response["Error"]["Code"] == "NoSuchKey":
+            _record_object_read(key, None)
             return None
         raise
 
@@ -135,13 +221,26 @@ def read_parquet(
     if date_range is not None and dates is not None:
         raise ValueError("date_range와 dates는 동시에 지정할 수 없습니다.")
     if date_range is not None:
-        date_strs = [day.strftime("%Y-%m-%d") for day in pd.date_range(date_range[0], date_range[1], freq="D")]
+        date_strs = [
+            day.strftime("%Y-%m-%d")
+            for day in pd.date_range(date_range[0], date_range[1], freq="D")
+        ]
         return _read_parquet_by_dates(
-            key, date_strs, columns=columns, as_pandas=as_pandas, filters=filters, on_complete=on_complete
+            key,
+            date_strs,
+            columns=columns,
+            as_pandas=as_pandas,
+            filters=filters,
+            on_complete=on_complete,
         )
     if dates is not None:
         return _read_parquet_by_dates(
-            key, dates, columns=columns, as_pandas=as_pandas, filters=filters, on_complete=on_complete
+            key,
+            dates,
+            columns=columns,
+            as_pandas=as_pandas,
+            filters=filters,
+            on_complete=on_complete,
         )
 
     body = get_object_bytes(key)
@@ -162,7 +261,13 @@ def read_parquet(
     # 참조를 끊어서(del) 가비지 컬렉션이 즉시 회수할 수 있게 한다.
     tables = [
         t
-        for t in read_parquet_many(part_keys, columns=columns, as_pandas=False, filters=filters, on_complete=on_complete)
+        for t in read_parquet_many(
+            part_keys,
+            columns=columns,
+            as_pandas=False,
+            filters=filters,
+            on_complete=on_complete,
+        )
         if t is not None
     ]
     if not tables:
@@ -216,7 +321,11 @@ def _read_parquet_by_dates(
     with ThreadPoolExecutor(max_workers=16) as pool:
         keys_by_date = list(
             pool.map(
-                lambda date_str: sorted(k for k in list_keys(f"{prefix}date={date_str}/") if k.endswith(".parquet")),
+                lambda date_str: sorted(
+                    k
+                    for k in list_keys(f"{prefix}date={date_str}/")
+                    if k.endswith(".parquet")
+                ),
                 date_strs,
             )
         )
@@ -250,7 +359,13 @@ def _read_parquet_by_dates(
     tables = []
     for date_str, table in zip(
         key_dates,
-        read_parquet_many(part_keys, columns=file_columns, as_pandas=False, filters=filters, on_complete=on_complete),
+        read_parquet_many(
+            part_keys,
+            columns=file_columns,
+            as_pandas=False,
+            filters=filters,
+            on_complete=on_complete,
+        ),
     ):
         if table is None or table.num_rows == 0:
             continue
@@ -294,7 +409,9 @@ def read_parquet_many(
 
     def _read(key: str) -> pd.DataFrame | pq.Table | None:
         nonlocal completed
-        result = read_parquet(key, columns=columns, as_pandas=as_pandas, filters=filters)
+        result = read_parquet(
+            key, columns=columns, as_pandas=as_pandas, filters=filters
+        )
         if on_complete is not None:
             with lock:
                 completed += 1
@@ -302,8 +419,18 @@ def read_parquet_many(
             on_complete(current, total)
         return result
 
+    # ContextVar는 새 worker thread로 자동 전파되지 않는다. 각 작업에 현재 context의
+    # 독립 copy를 넘기되, 그 안의 S3ReadCapture 객체는 같은 thread-safe recorder를
+    # 가리키게 해서 multipart GET도 authority run 하나에 빠짐없이 포함한다.
+    contexts = [copy_context() for _ in keys]
+
+    def _read_in_context(item: tuple[Context, str]) -> pd.DataFrame | pq.Table | None:
+        """복사한 caller context 안에서 단일 parquet key를 읽는다."""
+        context, key = item
+        return context.run(_read, key)
+
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        return list(pool.map(_read, keys))
+        return list(pool.map(_read_in_context, zip(contexts, keys)))
 
 
 def write_parquet(data: pd.DataFrame | pq.Table, key: str) -> None:
@@ -346,7 +473,9 @@ def list_keys(prefix: str, delimiter: str = "") -> list[str]:
     paginator = client.get_paginator("list_objects_v2")
     return [
         obj["Key"]
-        for page in paginator.paginate(Bucket=_bucket(), Prefix=prefix, Delimiter=delimiter)
+        for page in paginator.paginate(
+            Bucket=_bucket(), Prefix=prefix, Delimiter=delimiter
+        )
         for obj in page.get("Contents", [])
     ]
 
@@ -357,7 +486,9 @@ def list_common_prefixes(prefix: str, delimiter: str = "/") -> list[str]:
     paginator = client.get_paginator("list_objects_v2")
     return [
         common_prefix["Prefix"]
-        for page in paginator.paginate(Bucket=_bucket(), Prefix=prefix, Delimiter=delimiter)
+        for page in paginator.paginate(
+            Bucket=_bucket(), Prefix=prefix, Delimiter=delimiter
+        )
         for common_prefix in page.get("CommonPrefixes", [])
     ]
 
@@ -391,7 +522,9 @@ def list_objects(prefix: str, delimiter: str = "") -> list[S3Object]:
     paginator = client.get_paginator("list_objects_v2")
     return [
         S3Object(key=obj["Key"], size=obj["Size"], last_modified=obj["LastModified"])
-        for page in paginator.paginate(Bucket=_bucket(), Prefix=prefix, Delimiter=delimiter)
+        for page in paginator.paginate(
+            Bucket=_bucket(), Prefix=prefix, Delimiter=delimiter
+        )
         for obj in page.get("Contents", [])
     ]
 
@@ -421,4 +554,6 @@ def delete_objects(keys: list[str]) -> None:
     # delete_objects 한 번에 최대 1000개 삭제 가능
     for i in range(0, len(keys), 1000):
         batch = keys[i : i + 1000]
-        client.delete_objects(Bucket=bucket, Delete={"Objects": [{"Key": k} for k in batch]})
+        client.delete_objects(
+            Bucket=bucket, Delete={"Objects": [{"Key": k} for k in batch]}
+        )
