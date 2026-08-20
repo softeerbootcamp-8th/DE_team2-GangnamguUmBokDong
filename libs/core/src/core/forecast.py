@@ -1,4 +1,9 @@
+"""수요 예측 후처리와 실시간 인구 예보의 공용 계약을 제공한다."""
+
 from core.scoring_config import SUPPLY_LOW_STOCK_RATIO
+
+POPULATION_FORECAST_SLOT_COUNT = 12
+"""서울 실시간 도시데이터가 제공하는 생활인구 예측 슬롯 수."""
 
 
 def enrich_forecast_points(current_stock: int, hold_cnt: int, raw_points: list[dict]) -> list[dict]:

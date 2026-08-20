@@ -23,7 +23,7 @@ from pathlib import Path
 
 from core import s3 as s3_io
 
-from . import common_config
+from . import common_config, profile_contract
 
 # 로컬 subprocess로 형제 패키지의 venv 실행파일을 찾을 때만 쓰는 로컬 경로
 # 개념(예: training/scripts/monthly_retrain_check.py가 feature_engine/training의
@@ -42,6 +42,8 @@ FEATURE_PARAM_COMBO_ID = os.environ.get(
     "FEATURE_PARAM_COMBO_ID",
     f"w{common_config.ROLLING_WINDOW_MINUTES}_e{common_config.ROLLING_EMBARGO_MINUTES}_t{common_config.ROLLING_TICK_MINUTES}",
 )
+# custom FEATURE_PARAM_COMBO_ID는 자동 w/e/t 격리를 우회하므로 서로 다른 base
+# 조합에 재사용하면 안 된다. 최종 학습 anchor는 아래 별도 namespace로 격리한다.
 # feature_engine의 2차 정제 산출물 위치 — dev/S3_DATA_CATALOG.md의
 # `processed/features/` prefix를 따른다. 파라미터 조합마다 결과가 달라지므로
 # 조합 ID를 키에 넣어 서로 안 덮어쓰게 한다.
@@ -116,19 +118,66 @@ def champion_pointer_key(model_name: str) -> str:
     return f"{MODELS_PREFIX}/champion/{model_name}.json"
 
 
-PROFILES_PREFIX = "profiles"
+SERVING_RELEASE_PREFIX = f"{MODELS_PREFIX}/serving-release"
+"""Pair serving release의 immutable manifest와 mutable pointer 공통 prefix다."""
+
+MODEL_SNAPSHOT_PREFIX = f"{MODELS_PREFIX}/snapshots"
+"""Content-addressed model snapshot artifact와 manifest의 공통 prefix다."""
 
 
-def profile_path(name: str) -> str:
-    """하이퍼파라미터 프로필(임베고/tick/LGB 파라미터 등)의 S3 키.
+def model_snapshot_artifact_key(
+    model_name: str,
+    role: str,
+    byte_sha256: str,
+    extension: str,
+) -> str:
+    """Model snapshot이 소유하는 content-addressed artifact 키를 만든다."""
+    return (
+        f"{MODEL_SNAPSHOT_PREFIX}/{model_name}/artifacts/{role}/"
+        f"sha256={byte_sha256}.{extension}"
+    )
 
-    feature_engine/training/inference가 각자 다른 서버에 배포되므로, 프로필을
-    저장소에 커밋된 로컬 JSON으로 두면 값 하나 바꿀 때마다 세 곳 다 코드 배포가
-    필요해진다 — 대신 공유 S3에 두고 `common_config._load_profile()`이 매 프로세스
-    시작 시 여기서 읽는다(`ML_PROFILE` 환경변수로 이름만 맞추면 세 서비스가 항상
-    같은 값을 봄). `ml_core.profile_registry.push_profile()`이 이 키에 쓴다.
-    """
-    return f"{PROFILES_PREFIX}/{name}.json"
+
+def model_snapshot_manifest_key(model_name: str, byte_sha256: str) -> str:
+    """Model snapshot manifest의 content-addressed S3 상대 키를 만든다."""
+    return (
+        f"{MODEL_SNAPSHOT_PREFIX}/{model_name}/manifests/"
+        f"sha256={byte_sha256}.json"
+    )
+
+
+def model_support_id_set_key(model_name: str, byte_sha256: str) -> str:
+    """Model support Gold ID set의 content-addressed S3 상대 키를 만든다."""
+    return (
+        f"{MODEL_SNAPSHOT_PREFIX}/{model_name}/support/"
+        f"sha256={byte_sha256}.json"
+    )
+
+
+def serving_release_manifest_key(byte_sha256: str) -> str:
+    """Content-addressed serving release manifest의 S3 상대 키를 만든다."""
+    return f"{SERVING_RELEASE_PREFIX}/manifests/sha256={byte_sha256}.json"
+
+
+def serving_release_artifact_key(
+    role: str,
+    byte_sha256: str,
+    extension: str,
+) -> str:
+    """Serving release가 직접 소유하는 content-addressed artifact 키를 만든다."""
+    return (
+        f"{SERVING_RELEASE_PREFIX}/artifacts/{role}/"
+        f"sha256={byte_sha256}.{extension}"
+    )
+
+
+def serving_release_pointer_key() -> str:
+    """현재 pair serving release를 가리키는 단일 mutable pointer 키를 반환한다."""
+    return f"{SERVING_RELEASE_PREFIX}/current.json"
+
+
+PROFILES_PREFIX = profile_contract.PROFILES_PREFIX
+profile_path = profile_contract.profile_path
 
 
 @cache
@@ -226,19 +275,24 @@ POPULATION_PARQUET = f"{PROCESSED_V2_PREFIX}/population_2025.parquet"
 # 같은 값이어야 한다(위 모듈 docstring 참고) ---
 MERGED_TABLE_PARQUET = f"{FEATURE_ENGINEERING_OUTPUT_DIR}/station_hour_merged_2025.parquet"
 FEATURES_TABLE_PARQUET = f"{FEATURE_ENGINEERING_OUTPUT_DIR}/station_hour_features_2025.parquet"
-# FEATURES_TABLE_PARQUET의 각 행(T0, 20분 tick)을 horizon=1..HORIZON_COUNT만큼 self-join해
-# "T0의 lag + T0+(horizon-1)시간의 날씨/캘린더/타겟"으로 조합한 학습 테이블
-# (build_multi_horizon_features.py) — 대여/반납이 서로 다른 lag/타겟을 쓰는 완전히
-# 분리된 데이터셋이라 출력도 둘로 나뉜다. training이 이제 이 테이블들만 읽는다.
+# FEATURES_TABLE_PARQUET의 각 행(T0, 모델 tick)을 horizon=1..HORIZON_COUNT만큼
+# self-join한 학습 테이블. base feature/profile은 w/e/t 조합에서 재사용하고 최종
+# multi-horizon 결과만 실제 학습 anchor별 namespace로 격리한다.
+_TRAINING_ANCHOR_OUTPUT_DIR = (
+    f"{FEATURE_ENGINEERING_OUTPUT_DIR}/training_anchor_a{common_config.TRAIN_ANCHOR_TICK_MINUTES}"
+)
 RENTAL_MULTI_HORIZON_FEATURES_TABLE_PARQUET = (
-    f"{FEATURE_ENGINEERING_OUTPUT_DIR}/station_hour_features_multihorizon_rental_2025.parquet"
+    f"{_TRAINING_ANCHOR_OUTPUT_DIR}/station_hour_features_multihorizon_rental_2025.parquet"
 )
 RETURN_MULTI_HORIZON_FEATURES_TABLE_PARQUET = (
-    f"{FEATURE_ENGINEERING_OUTPUT_DIR}/station_hour_features_multihorizon_return_2025.parquet"
+    f"{_TRAINING_ANCHOR_OUTPUT_DIR}/station_hour_features_multihorizon_return_2025.parquet"
 )
 ROLLING_RENTAL_FEATURES_PARQUET = f"{FEATURE_ENGINEERING_OUTPUT_DIR}/rolling_rental_features_2025.parquet"
 
-# --- inference가 만드는 fallback 프로필(위 MERGED_TABLE_PARQUET/POPULATION_PARQUET
-# 기반) — 파라미터 조합과 무관하게 챔피언 경로 하나만 씀 ---
-STATION_HOURLY_PROFILE_PARQUET = f"{PROCESSED_V2_PREFIX}/station_hourly_profile.parquet"
+# --- inference가 만드는 fallback 프로필 ---
+# station profile은 위 MERGED_TABLE_PARQUET의 모델 tick별 통계이므로 feature
+# 파라미터 조합(예: t5/t20)과 반드시 같이 격리한다. 공용 processed_v2 키 하나를 쓰면
+# A/B 빌드가 서로 덮어써 모델 grid와 profile grid가 조용히 갈라진다.
+STATION_HOURLY_PROFILE_PARQUET = f"{FEATURE_ENGINEERING_OUTPUT_DIR}/station_hourly_profile.parquet"
+# population profile은 원본 시간별 population에서 만들며 모델 grid와 무관하다.
 POPULATION_HOURLY_PROFILE_PARQUET = f"{PROCESSED_V2_PREFIX}/population_hourly_profile.parquet"

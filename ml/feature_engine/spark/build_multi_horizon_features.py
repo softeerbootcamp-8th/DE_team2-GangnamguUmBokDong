@@ -20,10 +20,11 @@ horizon=1이면 anchor_ts==target_ts라 원본 테이블의 해당 행과 완전
 반납 쪽을 시작한다 — 이 self-join 자체가 원본의 최대 HORIZON_COUNT배 행 수로
 불어나므로(아래 "규모" 참고), 두 개를 동시에 메모리에 띄우지 않기 위함이다.
 
-**`date`를 target_ts 쪽에서 가져오는 이유**: `training/train_common._split()`이 `date`로
-train/valid/test 경계를 가른다. 라벨(타겟 이벤트)이 실제로 언제 일어났는지를 기준으로 잘라야
-walk-forward 검증이 안전하다 — anchor_ts 기준으로 자르면 horizon이 큰 행의 라벨이 다음
-split으로 새는 누출이 생긴다.
+**`date`를 target_ts 쪽에서 가져오는 이유**: `training/train_common._dates_for_split()`이
+`date`로 train/valid/test 경계를 가른다. 라벨(타겟 이벤트)이 실제로 언제 일어났는지를
+기준으로 나누고, 같은 anchor가 target 날짜 경계를 넘어 두 split에 들어가는 문제는
+training의 `SPLIT_EMBARGO_DAYS` purge로 막는다. anchor_ts 날짜만으로 자르면 horizon이
+큰 행의 라벨이 다음 split으로 새는 더 직접적인 누출이 생긴다.
 
 **station 활성 구간 밖 처리**: target_ts에 해당하는 행이 그리드에 없으면(station 비활성
 구간이거나, 아직 관측되지 않은 미래라 증분 파이프라인이 그 시점까지 못 만들었을 때) inner
@@ -33,12 +34,15 @@ join으로 그 (anchor, horizon) 조합 자체가 자연히 빠진다 — build_
 파이프라인에 붙일 때도 이 성질 덕분에 "target이 아직 없으면 그냥 빠지고, 다음 증분 때
 채워짐"이 자동으로 성립한다.
 
-**규모**: T0을 원본과 동일하게 tick 전체로 유지하므로 이 테이블은 원본의 최대
-HORIZON_COUNT배 행 수가 된다 — 로컬 `local[*]`로 전체 연도를 처리하는 건 비현실적이고
-EMR 대상이다(로컬 검증은 짧은 기간의 합성 데이터로만).
+**규모**: T0은 `TRAIN_ANCHOR_TICK_MINUTES` 간격으로 선택한다. 기본 20분 base
+grid에서는 anchor도 20분이고, 5분 base grid에서는 a5(전체) 또는 a20(thinning)처럼
+명시할 수 있다. 결과는 선택된 anchor 행의 최대 HORIZON_COUNT배이므로 전체 연도는
+여전히 EMR 대상이다(로컬 검증은 짧은 기간의 합성 데이터로만).
 """
 
 from __future__ import annotations
+
+from datetime import datetime, timedelta
 
 from ml_core import common_config
 from pyspark.sql import DataFrame, SparkSession
@@ -59,7 +63,7 @@ _COMMON_TARGET_COLUMNS = [
     *(c for c in common_config.BASE_FEATURE_COLUMNS if c != "horizon"),
     "hour_ts",  # self-join 키(target_ts) — _shift_for_horizon()이 소모하고 버림
     "hour",  # 더 이상 모델 feature 아님(minute이 대체) — scoring.predict() 출력/CLI 식별용
-    "date",  # train_common._split()의 train/valid/test 경계 판정용 — 모델 feature 아님
+    "date",  # train_common._dates_for_split()의 train/valid/test 경계 판정용 — 모델 feature 아님
 ]
 
 # station_id(텍스트)는 이 테이블에 아예 안 담는다 — horizon self-join으로 원본의
@@ -144,12 +148,13 @@ def build_multi_horizon_features(
 
 
 def _anchor_input(features: DataFrame) -> DataFrame | None:
-    """환경변수로 지정된 anchor 밀도 축소 옵션을 적용한 anchor 후보 DataFrame을 만든다.
+    """학습 계약과 선택적 날짜 범위에 맞는 anchor 후보 DataFrame을 만든다.
 
-    로컬에서 좁은 기간만 학습할 때(디스크/시간 제약) anchor 쪽만 좁히기 위한
-    옵션 — 미지정 시(EMR 전체 빌드 등) None을 반환해 build_multi_horizon_features()가
-    features_df 전체를 anchor로 쓰게 한다. target 쪽은 항상 features 전체를 그대로
-    써서 anchor 끝 근처 horizon이 범위를 벗어나지 않게 한다.
+    실제 밀도는 effective profile의 `TRAIN_ANCHOR_TICK_MINUTES`가 단일 소스다.
+    이전에 사용하던 `MULTI_HORIZON_ANCHOR_TICK_MINUTES`와
+    `MULTI_HORIZON_ANCHOR_HOURLY_ONLY`는 common_config가 검증된 환경변수 별칭으로
+    해석한다. 날짜 since/until은 로컬 디버깅용으로 유지한다. target 쪽은 항상
+    features 전체를 써서 anchor 끝 근처 horizon이 범위를 벗어나지 않게 한다.
     """
     import os
 
@@ -159,15 +164,12 @@ def _anchor_input(features: DataFrame) -> DataFrame | None:
     # 행 수가 된다 — 실측(2025-11 한 달, station ~2,977개, 5분 tick 시절)으로 2.6억
     # 행이 나와 로컬 학습 머신(RAM 18GB)에서 판다스로 못 읽었다(pd.read_parquet가
     # 출력도 없이 OOM kill됨). EMR처럼 그 규모를 받아낼 수 있는 환경이 아니면(로컬
-    # 1회성 검증 등) 이 옵션으로 anchor를 성기게 줄인다 — target_ts/타겟 라벨은
-    # 그대로 원본 tick 값이라 서빙 정밀도와는 무관(서빙은 predict_single.py가
-    # 라이브로 계산).
-    anchor_hourly_only = os.environ.get("MULTI_HORIZON_ANCHOR_HOURLY_ONLY") == "1"
-    # 정각(60분)보다 촘촘하되 tick 전체보다는 성긴 임의 간격으로 anchor를 뽑고
-    # 싶을 때 — MULTI_HORIZON_ANCHOR_HOURLY_ONLY=1은 사실 이 값의 60분짜리 특수
-    # 케이스와 같다(둘 다 켜져 있으면 이 값이 우선).
-    anchor_tick_minutes = os.environ.get("MULTI_HORIZON_ANCHOR_TICK_MINUTES")
-    if not (anchor_since or anchor_until or anchor_hourly_only or anchor_tick_minutes):
+    # 1회성 검증 등) 이 옵션으로 anchor를 성기게 줄인다. target_ts/타겟 라벨은
+    # 원본 grid 값을 유지하지만, 학습에서 보게 되는 minute 분포 자체는 달라진다.
+    # 따라서 g5/a20 같은 thinning의 5분 추론 성능은 공통 g5 test mart에서 a5와
+    # 별도로 비교해야 하며 코드 동작만으로 동등하다고 간주하지 않는다.
+    anchor_tick_minutes = config.TRAIN_ANCHOR_TICK_MINUTES
+    if not (anchor_since or anchor_until) and anchor_tick_minutes == config.GRID_TICK_MINUTES:
         return None
 
     anchor_input = features
@@ -175,19 +177,37 @@ def _anchor_input(features: DataFrame) -> DataFrame | None:
         anchor_input = anchor_input.filter(F.col("hour_ts") >= F.lit(anchor_since))
     if anchor_until:
         anchor_input = anchor_input.filter(F.col("hour_ts") < F.lit(anchor_until))
-    if anchor_tick_minutes:
-        tick = int(anchor_tick_minutes)
-        anchor_input = anchor_input.filter((F.hour(F.col("hour_ts")) * 60 + F.minute(F.col("hour_ts"))) % tick == 0)
-    elif anchor_hourly_only:
-        anchor_input = anchor_input.filter(F.minute(F.col("hour_ts")) == 0)
+    if anchor_tick_minutes != config.GRID_TICK_MINUTES:
+        minute_of_day = F.hour(F.col("hour_ts")) * 60 + F.minute(F.col("hour_ts"))
+        anchor_input = anchor_input.filter(minute_of_day % anchor_tick_minutes == 0)
     return anchor_input
+
+
+def _features_in_training_window(features: DataFrame) -> DataFrame:
+    """tick feature를 config의 inclusive 날짜 window 안으로 제한한다.
+
+    `run_pipeline`이 같은 경계를 적용하지만, 과거 rolling 실행의 파티션이나 수동
+    생성 파일이 입력 경로에 남아 있어도 최종 multi-horizon 학습 테이블에 섞이지
+    않게 소비 지점에서 한 번 더 방어한다.
+    """
+    since = config.WINDOW_START.strftime("%Y-%m-%d 00:00:00")
+    complete_through = (
+        datetime.combine(config.WINDOW_END + timedelta(days=1), datetime.min.time())
+        - timedelta(minutes=config.TARGET_HORIZON_MINUTES)
+    ).strftime("%Y-%m-%d %H:%M:%S")
+    return features.filter(
+        (F.col("hour_ts") >= F.lit(since))
+        & (F.col("hour_ts") <= F.lit(complete_through))
+    )
 
 
 def _run_cli() -> None:
     from .spark_session import get_spark
 
     spark = get_spark()
-    features = spark.read.parquet(config.FEATURES_TABLE_PARQUET)
+    features = _features_in_training_window(
+        spark.read.parquet(config.FEATURES_TABLE_PARQUET)
+    )
     anchor_input = _anchor_input(features)
 
     # 대여를 끝까지 만들어 S3에 쓰고 나서 반납을 시작한다 — 두 self-join 결과

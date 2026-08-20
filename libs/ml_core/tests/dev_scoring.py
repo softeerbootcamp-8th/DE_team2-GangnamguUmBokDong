@@ -7,8 +7,9 @@
 import pytest
 from core import s3 as s3_io
 
-from ml_core import model_contract, scoring
-from ml_core.paths import read_champion_prefix, write_champion_pointer
+from ml_core import common_config, model_contract, scoring
+from ml_core.paths import model_json_key, read_champion_prefix, write_champion_pointer
+from ml_core.serving_contract import ServingProfileContractError
 
 
 @pytest.fixture(autouse=True)
@@ -16,10 +17,19 @@ def _clear_caches():
     read_champion_prefix.cache_clear()
     scoring.load_boosters.cache_clear()
     scoring.load_conformal_correction.cache_clear()
+    scoring.validate_champion_serving_contract.cache_clear()
     yield
     read_champion_prefix.cache_clear()
     scoring.load_boosters.cache_clear()
     scoring.load_conformal_correction.cache_clear()
+    scoring.validate_champion_serving_contract.cache_clear()
+
+
+def _write_profile(model_name: str, archive_prefix: str, profile: dict | None = None) -> dict:
+    """테스트 아카이브에 effective profile을 저장하고 그 값을 반환한다."""
+    payload = profile or common_config.effective_profile()
+    s3_io.write_json(model_json_key(model_name, "profile", archive_prefix), payload)
+    return payload
 
 
 def test_load_conformal_correction_and_station_dtype_use_same_cached_archive_prefix():
@@ -55,3 +65,44 @@ def test_load_station_dtype_with_explicit_prefix_bypasses_champion_pointer():
     dtype = model_contract.load_station_dtype("rental", models_prefix=experiment_prefix)
 
     assert list(dtype.categories) == ["ST-A"]
+
+
+def test_load_boosters_fails_closed_before_download_when_champion_profile_differs(monkeypatch):
+    """현재 feature 계산과 챔피언 학습 계약이 다르면 booster를 읽기 전에 실패한다."""
+    archive_prefix = "models/archive/dt=2026-08-18/incompatible"
+    write_champion_pointer("rental", archive_prefix)
+    profile = common_config.effective_profile()
+    profile["ROLLING_WINDOW_MINUTES"] += 5
+    _write_profile("rental", archive_prefix, profile)
+
+    downloads = []
+    monkeypatch.setattr(scoring.model_io, "download_and_load_booster", downloads.append)
+
+    with pytest.raises(ServingProfileContractError, match="ROLLING_WINDOW_MINUTES"):
+        scoring.load_boosters("rental")
+
+    assert downloads == []
+
+
+def test_load_boosters_allows_training_only_profile_differences(monkeypatch):
+    """학습 기간과 LGB 파라미터 차이는 서빙 feature 의미를 바꾸지 않는다."""
+    archive_prefix = "models/archive/dt=2026-08-18/training-tuned"
+    write_champion_pointer("return", archive_prefix)
+    profile = common_config.effective_profile()
+    profile["TRAIN_LOOKBACK_MONTHS"] = 3
+    profile["LGB_PARAMS_COMMON"] = {**profile["LGB_PARAMS_COMMON"], "num_leaves": 127}
+    _write_profile("return", archive_prefix, profile)
+
+    monkeypatch.setattr(scoring.model_io, "download_and_load_booster", lambda key: key)
+
+    boosters = scoring.load_boosters("return")
+
+    assert set(boosters) == set(scoring.BOOSTER_SUFFIXES)
+
+
+def test_validate_champion_contract_fails_when_profile_artifact_is_missing():
+    """기존 모델이라도 계약을 증명할 profile.json이 없으면 추론하지 않는다."""
+    write_champion_pointer("rental", "models/archive/dt=2026-08-18/no-profile")
+
+    with pytest.raises(ServingProfileContractError, match="effective profile이 없습니다"):
+        scoring.validate_champion_serving_contract("rental")

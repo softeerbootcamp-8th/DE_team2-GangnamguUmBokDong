@@ -16,8 +16,10 @@ S3에 쌓인다 — MLflow 서버가 아티팩트 저장소를 이미 S3로 프�
 import mlflow
 from core import s3 as s3_io
 
-from . import mlflow_tracking
-from .paths import PROFILES_PREFIX, profile_path
+from . import mlflow_tracking, profile_contract
+
+PROFILES_PREFIX = profile_contract.PROFILES_PREFIX
+profile_path = profile_contract.profile_path
 
 PROFILE_MANAGEMENT_EXPERIMENT_NAME = "bike-demand-profiles"
 
@@ -46,6 +48,9 @@ def push_profile(name: str, profile: dict) -> None:
         profile: `libs/ml_core/common_config.py`의 `_DEFAULT_PROFILE`과 같은 키 집합을
             갖는 dict(임베고/tick/LGB 파라미터/TRAIN_LOOKBACK_MONTHS 등)
     """
+    if name == profile_contract.BUILTIN_PROFILE_NAME:
+        raise ValueError(f"'{name}'은 예약된 내장 프로필 이름이라 S3에 등록할 수 없습니다")
+    profile_contract.merge_and_validate_profile(profile, name)
     s3_io.write_json(profile_path(name), profile)
     mlflow_tracking.configure(PROFILE_MANAGEMENT_EXPERIMENT_NAME)
     with mlflow.start_run(run_name=name):
@@ -57,8 +62,8 @@ def fetch_profile(name: str) -> dict | None:
     """지금 S3에 저장된 프로필 원문을 읽는다(수정 전 확인, `push_profile()`과 짝).
 
     returns:
-        dict | None: 없으면 None(`common_config._load_profile()`은 이 경우 내장
-            기본값으로 폴백한다)
+        dict | None: 없으면 None. 명시적으로 선택된 런타임 프로필은 이 경우
+            `common_config._load_profile()`에서 실패한다.
     """
     return s3_io.read_json(profile_path(name))
 

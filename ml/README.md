@@ -1,9 +1,24 @@
 # 따릉이 수요예측 — LightGBM 대여/반납 파이프라인
 
-collector가 S3(MinIO) Silver 레이어에 쌓은 원본(대여이력, 정류소, 날씨, 250m
-생활인구)을 station×20분tick 단위로 병합하고, lag feature를 붙여 대여/반납을
-완전히 분리된 LightGBM 모델(Poisson+exposure, quantile P10/50/90)로
-학습·추론하는 파이프라인.
+collector/nowcaster가 S3(MinIO)의 일별 Archive에 확정한 과거 fact(대여이력,
+정류소 재고, 날씨, 250m 생활인구)와 최신 Silver 정류소 dimension을 설정된
+station×tick 단위로 병합하고, lag feature를 붙여 대여/반납을 완전히 분리된
+LightGBM 모델(Poisson+exposure, quantile P10/50/90)로 학습·추론하는 파이프라인.
+
+## 시간 해상도 계약
+
+- 기본은 **g20/r20/a20**다. base feature/target grid(`GRID_TICK_MINUTES`, g),
+  rolling 계산 grid(`ROLLING_TICK_MINUTES`, r), multi-horizon 학습 anchor
+  (`TRAIN_ANCHOR_TICK_MINUTES`, a)를 모두 20분으로 둔다.
+- g/r은 같은 값을 사용하며 `{5, 10, 15, 20, 30, 60}`분 중 선택할 수
+  있다. a를 생략하면 g와 같고, 명시하면 g 이상이면서 g의 배수이고
+  1시간과 1일을 나누는 값이어야 한다.
+- 온라인 서빙은 모델 grid와 별개로 **5분 고정**이다. 모델은 5분
+  배수 시각에서 추론하고, 실시간 피처는 요청 시각 기준으로 계산한다.
+
+후속 A/B 비교의 표준 조합은 A=`g20/r20/a20`(기본),
+B=`g5/r5/a20`(5분 base feature+20분 간격으로 선별한 학습),
+C=`g5/r5/a5`(5분 전체 학습)이다. 세 조합 모두 서빙은 5분으로 고정한다.
 
 ## 폴더 구조
 
@@ -14,10 +29,10 @@ collector가 S3(MinIO) Silver 레이어에 쌓은 원본(대여이력, 정류소
 | 폴더 | 역할 | 실행 환경 |
 |---|---|---|
 | **[../libs/ml_core/](../libs/ml_core/README.md)** | 세 인스턴스가 공유하는 파라미터·경로·핵심 알고리즘(censoring 로직, 모델 계약, 채점 함수). `ml/`과 별도로 관리되는 독립 라이브러리(`<repo-root>/libs/ml_core/`) — 아래 세 폴더가 각자 editable 의존성으로 참조 | 어디든(가벼운 순수 로직) |
-| **[feature_engine/](feature_engine/README.md)** | station×20분tick feature 테이블 생성(Spark, EMR/로컬 `local[*]` 단일 노드), Silver를 직접 읽어 대여/반납 multi-horizon 테이블 2개를 만든다 — **본 서비스 코드는 `spark/`뿐**(옛 pandas 1차/2차정제는 전부 삭제됨) | `feature_engine/.venv`(uv, Python 3.11)/EMR |
+| **[feature_engine/](feature_engine/README.md)** | 설정된 station×tick feature 테이블 생성(Spark, EMR/로컬 `local[*]` 단일 노드), 과거 fact는 Archive에서 읽고 최신 station dimension만 Silver에서 읽어 대여/반납 multi-horizon 테이블 2개를 만든다 — **본 서비스 코드는 `spark/`뿐**(옛 pandas 1차/2차정제는 전부 삭제됨) | `feature_engine/.venv`(uv, Python 3.11)/EMR |
 | **[training/](training/README.md)** | feature 테이블로 LightGBM 대여/반납 모델 학습, 챔피언 승격, 성능 모니터링 — [MLflow](../docs/ml/MLFLOW_SETUP.md)로 실험 추적 | `training/.venv`(uv) |
 | **[inference/](inference/README.md)** | 학습된 모델로 배치 조회 + 단일/다중 시점 예측 | `inference/.venv`(uv) |
-| **data/** | 로컬 개발용 샘플 원본(`dev/seed_s3_from_local.py`가 이걸 Silver 스키마로 MinIO에 시딩) — 실제 원본은 collector가 S3 Silver에 직접 쌓는다, 로컬 파일시스템 폴백 없음 | — |
+| **data/** | 로컬 개발용 샘플 원본과 bootstrap 입력 — 운영 feature_engine은 S3 Archive/Silver만 읽으며 로컬 파일시스템으로 fallback하지 않는다 | — |
 
 각 폴더의 실행 방법은 그 폴더의 `README.md`, 설계 배경은 `DESIGN.md`를 참고.
 
@@ -80,8 +95,8 @@ Spark 관련 테스트는 반드시 `feature_engine/.venv`(uv, Python 3.11)로 �
 
 ## 결과 요약
 
-**(2026-08) 아래 고정 수치는 지웠다** — 시간 단위 그리드 시절(20분 tick 전환,
-피처 축소, multi-horizon 분리 전) 마지막 측정값이라 지금 스키마와 안 맞고,
+**(2026-08) 아래 고정 수치는 지웠다** — 현재 configurable grid/anchor 계약,
+피처 축소, multi-horizon 분리 전 측정값이라 지금 스키마와 안 맞고,
 계속 갱신하며 여기 박아두면 금방 또 stale해진다. 지금은 학습마다
 [MLflow](../docs/ml/MLFLOW_SETUP.md)(`bike-demand-training` experiment)에
 `poisson_deviance_test`/`rmse_test`/`pinball_test_q{10,50,90}`/

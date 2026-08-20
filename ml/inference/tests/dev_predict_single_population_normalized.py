@@ -61,8 +61,7 @@ def test_returns_target_tick_value_when_present(monkeypatch):
 
 
 def test_falls_back_to_earlier_tick_when_exact_tick_missing(monkeypatch):
-    """정규화가 아직 안 끝난 경우(target_ts 키 없음) — 거슬러 올라가 가장 최근
-    값을 대신 쓴다(_get_recent_weather()와 동일한 패턴)."""
+    """직접 호출·미래 예보 누락이면 제한된 lookback 안의 최근 값을 대신 쓴다."""
     target_ts = pd.Timestamp("2026-08-17 10:00:00")
 
     def _fake_read_many(keys, columns=None):

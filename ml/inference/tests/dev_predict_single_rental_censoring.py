@@ -134,7 +134,7 @@ def test_rental_recent_fallback_when_target_outside_coverage():
     _set_profile(
         {
             (STATION_NO, minute, dow, m): {"rental_mean": 7.0, "rental_std": 1.5, "return_mean": 3.0, "return_std": 0.5}
-            for minute in range(0, 1440, 20)
+            for minute in range(0, 1440, config.GRID_TICK_MINUTES)
             for dow in range(7)
             for m in range(1, 13)
         }
@@ -168,7 +168,7 @@ def test_return_lag_1h_falls_back_to_profile_when_missing():
     _set_profile(
         {
             (STATION_NO, minute, dow, m): {"rental_mean": 0.0, "rental_std": 0.0, "return_mean": 9.0, "return_std": 2.0}
-            for minute in range(0, 1440, 20)
+            for minute in range(0, 1440, config.GRID_TICK_MINUTES)
             for dow in range(7)
             for m in range(1, 13)
         }

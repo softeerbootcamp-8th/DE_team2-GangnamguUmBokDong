@@ -1,7 +1,9 @@
 """core.s3의 S3 왕복(read/write)을 moto로 검증한다."""
 
 import pandas as pd
+import pyarrow as pa
 import pytest
+
 from core import s3
 
 
@@ -12,6 +14,19 @@ def test_get_object_bytes_missing_key_returns_none():
 def test_put_then_get_object_bytes_round_trip():
     s3.put_object_bytes("some/key.bin", b"hello world")
     assert s3.get_object_bytes("some/key.bin") == b"hello world"
+
+
+def test_put_then_get_object_metadata_without_reading_body():
+    s3.put_object_bytes(
+        "some/metadata.bin",
+        b"payload",
+        metadata={"source_window_start": "2026-08-20T10:05:00+09:00"},
+    )
+
+    assert s3.get_object_metadata("some/metadata.bin") == {
+        "source_window_start": "2026-08-20T10:05:00+09:00"
+    }
+    assert s3.get_object_metadata("some/missing.bin") is None
 
 
 def test_read_parquet_missing_key_returns_none():
@@ -50,6 +65,101 @@ def test_read_parquet_reads_spark_style_multi_part_directory():
     result = s3.read_parquet("out/table.parquet")
 
     assert sorted(result["a"].tolist()) == [1, 2, 3, 4]
+
+
+def test_read_parquet_safely_promotes_compatible_multi_part_schemas():
+    """증분 재생성 전후 part의 숫자 폭이 달라도 값 손실 없는 공통 타입이면 읽는다."""
+    s3.write_parquet(pa.table({"capacity": pa.array([10], type=pa.int16())}), "mixed/part-00000.parquet")
+    s3.write_parquet(pa.table({"capacity": pa.array([20.5], type=pa.float32())}), "mixed/part-00001.parquet")
+
+    result = s3.read_parquet("mixed")
+
+    assert result["capacity"].dtype.name == "float32"
+    assert result["capacity"].tolist() == [10.0, 20.5]
+
+
+def test_read_parquet_projects_added_column_and_fills_old_part_with_typed_null():
+    """요청 컬럼이 옛 part에 없어도 나머지 part에서 타입을 얻어 NULL로 보충한다."""
+    old = pa.table({"station_no": pa.array([1], type=pa.int16())})
+    new = pa.table({
+        "station_no": pa.array([2], type=pa.int16()),
+        "new_feature": pa.array([1.5], type=pa.float32()),
+    })
+    s3.write_parquet(old, "additive/part-00000.parquet")
+    s3.write_parquet(new, "additive/part-00001.parquet")
+
+    result = s3.read_parquet("additive", columns=["new_feature", "station_no"])
+
+    assert list(result.columns) == ["new_feature", "station_no"]
+    assert result["new_feature"].dtype.name == "float32"
+    assert pd.isna(result.loc[0, "new_feature"])
+    assert result.loc[1, "new_feature"] == 1.5
+
+
+def test_read_parquet_rejects_requested_column_missing_from_every_part():
+    """projection 호환 처리가 모든 part에 없는 오타 컬럼을 빈 결과로 숨기지 않는다."""
+    s3.write_parquet(pa.table({"station_no": [1]}), "missing/part-00000.parquet")
+    s3.write_parquet(pa.table({"station_no": [2]}), "missing/part-00001.parquet")
+
+    with pytest.raises(s3.ParquetSchemaMismatchError, match="어떤 Parquet part에도 없습니다"):
+        s3.read_parquet("missing", columns=["unknown_feature"])
+
+
+def test_read_parquet_rejects_incompatible_multi_part_schemas():
+    """서로 다른 논리 타입을 문자열 등으로 임의 변환해 조용히 섞지 않는다."""
+    s3.write_parquet(pa.table({"station_no": pa.array([1], type=pa.int16())}), "bad/part-00000.parquet")
+    s3.write_parquet(pa.table({"station_no": pa.array(["ST-1"], type=pa.string())}), "bad/part-00001.parquet")
+
+    with pytest.raises(s3.ParquetSchemaMismatchError, match="안전한 공통 타입"):
+        s3.read_parquet("bad")
+
+
+def test_concat_compatible_tables_rejects_precision_loss():
+    """공통 타입이 존재해도 실제 정숫값을 float로 정확히 표현할 수 없으면 실패한다."""
+    too_large_for_float64 = 2**53 + 1
+    integer = pa.table({"value": pa.array([too_large_for_float64], type=pa.int64())})
+    floating = pa.table({"value": pa.array([1.5], type=pa.float64())})
+
+    with pytest.raises(s3.ParquetSchemaMismatchError, match="무손실 변환"):
+        s3.concat_compatible_tables([integer, floating])
+
+
+def test_concat_compatible_tables_unions_columns_and_normalizes_order():
+    """컬럼 추가와 순서 변화는 첫 등장 순서의 union schema 및 typed NULL로 맞춘다."""
+    old = pa.table({"station_no": [1], "capacity": [10]})
+    new = pa.table({"capacity": [20], "minute": [5], "station_no": [2]})
+
+    result = s3.concat_compatible_tables([old, new])
+
+    assert result.column_names == ["station_no", "capacity", "minute"]
+    assert result["station_no"].to_pylist() == [1, 2]
+    assert result["minute"].to_pylist() == [None, 5]
+
+
+def test_concat_compatible_tables_promotes_null_field_to_declared_type():
+    """전량 결측 part의 Arrow null 타입은 실제 값이 있는 part의 선언 타입으로 맞춘다."""
+    null_only = pa.table({"precip": pa.array([None], type=pa.null())})
+    typed = pa.table({"precip": pa.array([1.5], type=pa.float32())})
+
+    result = s3.concat_compatible_tables([null_only, typed])
+
+    assert result.schema.field("precip").type == pa.float32()
+    assert result["precip"].to_pylist() == [None, 1.5]
+
+
+def test_concat_compatible_tables_exact_schema_uses_fast_path(monkeypatch):
+    """정상 대용량 경로는 schema unify/cast 없이 기존 zero-copy concat을 유지한다."""
+    first = pa.table({"station_no": pa.array([1], type=pa.int16())})
+    second = pa.table({"station_no": pa.array([2], type=pa.int16())})
+
+    def _unexpected_unify(*_args, **_kwargs):
+        raise AssertionError("동일 스키마에서 unify_schemas를 호출하면 안 됨")
+
+    monkeypatch.setattr(s3.pa, "unify_schemas", _unexpected_unify)
+
+    result = s3.concat_compatible_tables([first, second])
+
+    assert result["station_no"].to_pylist() == [1, 2]
 
 
 def test_read_parquet_as_pandas_false_returns_pyarrow_table():
@@ -125,6 +235,20 @@ def test_read_parquet_date_range_as_pandas_false_returns_pyarrow_table():
     result = s3.read_parquet("mh4", as_pandas=False, date_range=("2025-11-01", "2025-11-01"))
 
     assert result.to_pandas()["a"].tolist() == [1]
+
+
+def test_read_parquet_dates_safely_promotes_partition_schema_drift():
+    """date= 파티션을 가로질러도 공용 안전 결합 규칙과 date 복원이 함께 적용된다."""
+    first = pa.table({"horizon": pa.array([1], type=pa.int8())})
+    second = pa.table({"horizon": pa.array([12], type=pa.int16())})
+    s3.write_parquet(first, "mh4b/date=2025-11-01/part-00000.parquet")
+    s3.write_parquet(second, "mh4b/date=2025-11-02/part-00000.parquet")
+
+    result = s3.read_parquet("mh4b", dates=["2025-11-01", "2025-11-02"])
+
+    assert result["horizon"].dtype.name == "int16"
+    assert result["horizon"].tolist() == [1, 12]
+    assert result["date"].tolist() == ["2025-11-01", "2025-11-02"]
 
 
 def test_read_parquet_dates_reads_only_the_listed_discontinuous_dates():

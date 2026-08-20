@@ -20,6 +20,11 @@ uv sync   # pyproject.toml/uv.lock 기준 .venv 생성 — pandas/numpy + ml_cor
 `training`이 먼저 모델을 학습·승격해둬야 한다([training/README.md](../training/README.md)).
 로컬 개발은 `.env`의 S3 자격증명으로 MinIO(`make up`)를 거친다.
 
+추론은 챔피언 booster를 로드하기 전에 모델 옆 effective profile의 서빙 피처
+계약과 현재 `common_config`를 비교한다. rolling/window/embargo, target horizon,
+grid, horizon 수가 다르거나 profile 아티팩트가 없으면 잘못된 의미의 피처로
+조용히 예측하지 않고 즉시 실패한다.
+
 **단일 시점 예측을 쓰려면 추가로 fallback 프로필 2개를 한 번 만들어야 한다**
 (`feature_engine`이 만든 병합 테이블/생활인구 테이블이 먼저 S3에 있어야 함):
 
@@ -28,6 +33,12 @@ cd ml
 ./inference/.venv/bin/python -m inference.build_station_profile      # -> station_hourly_profile.parquet: 정류소×minute×dow×월별 대여/반납 평균/표준편차(lag fallback)
 ./inference/.venv/bin/python -m inference.build_population_profile   # -> population_hourly_profile.parquet: 격자×hour×dow별 평균 인구(인구 fallback, 월은 안 나눔 — 계절 변동이 작아서)
 ```
+
+station profile은 활성 모델의 `FEATURE_ENGINEERING_OUTPUT_DIR` 아래에 저장되므로
+서로 다른 grid의 모델이 fallback을 덮어쓰지 않는다. 추론 시 profile의 minute
+간격이 현재 모델 `GRID_TICK_MINUTES`와 다르거나 logical key가 중복되어 있으면
+잘못된 값을 조용히 쓰지 않고 즉시 실패한다. 모델 grid를 바꾼 경우 같은 프로필로
+`build_station_profile`도 다시 실행해야 한다.
 
 ## 배치 조회 CLI (백테스트 전용)
 
@@ -59,8 +70,13 @@ predict_rental_demand(
 #     'population_source': 'provided', 'stockout_source': 'provided'}
 ```
 
-`minute`은 `GRID_TICK_MINUTES`(기본 20)의 배수만 유효하다 — 정시로만 고정하면
-그 사이 tick을 요청할 수 없다. `horizon`(1~`HORIZON_COUNT`, 기본 12)은
+`minute`은 모델 학습 grid와 별도인 운영 계약 `SERVING_TICK_MINUTES=5`의 배수만
+유효하다. 모델 feature/target grid가 기본 20분이거나 비교용 5~60분 설정이어도
+00/05/10/.../55분에 호출할 수 있고, `minute=7`처럼 운영 주기에 없는 값은
+거부한다. 실시간 point-in-time 피처는 요청한 5분 시각을 그대로 사용한다. 다만
+실시간 lag가 없어 station profile로 fallback할 때만 같은 날의 직전 모델 anchor로
+내림한다(예: 20분 grid에서 17:05/10/15 -> 17:00).
+`horizon`(1~`HORIZON_COUNT`, 기본 12)은
 "몇 시간 뒤를 물을지"를 그대로 모델 feature로 넘긴다(아래 "여러 horizon
 한 번에" 참고) — `predict_return_demand()`는 시그니처가 같지만 `stockout`이
 없다(반납은 거치대 상태와 무관하게 항상 성공해서 exposure 보정이 필요 없음).

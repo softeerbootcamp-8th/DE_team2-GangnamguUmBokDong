@@ -18,16 +18,44 @@ import numpy as np
 import pandas as pd
 from core import s3 as s3_io
 
-from . import metrics, model_io
+from . import common_config, metrics, model_io
 from .model_contract import (
     RENTAL_FEATURE_COLUMNS,
     RETURN_FEATURE_COLUMNS,
     load_station_dtype,
 )
 from .paths import model_json_key, model_key, read_champion_prefix
+from .serving_contract import (
+    assert_serving_profiles_compatible,
+    load_model_profile,
+)
 
 BOOSTER_SUFFIXES = ["poisson", "q10", "q50", "q90"]
 _FEATURE_COLUMNS_BY_MODEL = {"rental": RENTAL_FEATURE_COLUMNS, "return": RETURN_FEATURE_COLUMNS}
+
+
+@cache
+def validate_champion_serving_contract(model_name: str) -> dict[str, object]:
+    """챔피언 아티팩트와 현재 프로세스의 서빙 피처 계약이 같은지 검증한다.
+
+    검증 결과를 모델별로 캐시해 요청마다 S3의 profile.json을 다시 읽지 않는다.
+    챔피언 승격 시 ``training.promotion.promote_challenger()``가 booster/보정값과
+    함께 이 캐시도 비운다.
+
+    returns:
+        dict[str, object]: 검증된 챔피언의 서빙 피처 계약
+    raises:
+        ServingProfileContractError: 프로필 아티팩트가 없거나 현재 서빙 설정과
+            호환되지 않을 때
+    """
+    archive_prefix = read_champion_prefix(model_name)
+    champion_profile = load_model_profile(model_name, archive_prefix)
+    return assert_serving_profiles_compatible(
+        common_config.effective_profile(),
+        champion_profile,
+        expected_source="현재 서빙",
+        actual_source=f"{model_name} 챔피언({archive_prefix})",
+    )
 
 
 @cache
@@ -57,6 +85,7 @@ def load_boosters(model_name: str) -> dict[str, lgb.Booster]:
         dict[str, lgb.Booster]: {"poisson": ..., "q10": ..., "q50": ..., "q90": ...}
     """
     archive_prefix = read_champion_prefix(model_name)
+    validate_champion_serving_contract(model_name)
     return {
         suffix: model_io.download_and_load_booster(model_key(model_name, suffix, archive_prefix))
         for suffix in BOOSTER_SUFFIXES
@@ -99,6 +128,9 @@ def predict(df: pd.DataFrame, model_name: str, exposure_col: str | None = None) 
     returns:
         pd.DataFrame: station_no, date, hour, pred_mean, pred_p10, pred_p50, pred_p90
     """
+    # station_categories나 booster를 읽기 전에 profile 계약부터 확인한다. 모델은
+    # 정상 파일이어도 현재 feature 계산 의미가 다르면 예측값을 내서는 안 된다.
+    validate_champion_serving_contract(model_name)
     station_dtype = load_station_dtype(model_name)
     X = df[_FEATURE_COLUMNS_BY_MODEL[model_name]].copy()
     X["station_no"] = X["station_no"].astype(station_dtype)

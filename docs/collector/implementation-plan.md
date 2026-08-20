@@ -140,7 +140,8 @@ class FetchResult:
     key: str                        # 조각 식별 키 (page-00001-01000 · grid-060x127)
     payload: RawChunk | None        # 성공 시 원본 응답
     error: FetchErrorKind | None    # 실패 시 TRANSIENT | PERMANENT | FATAL
-    expected_total: int | None      # 소스가 알려주는 전체 행 수 (첫 조각에만)
+    expected_total: int | None      # 소스가 알려주거나 probe로 확정한 전체 행 수
+    persist: bool = True            # False면 expected_total 전용 메타데이터 결과
 
 
 class Adapter(Protocol):
@@ -167,10 +168,12 @@ class Adapter(Protocol):
 `skip`은 **이미 확보한 조각 키**다. 라운드 재순회와 백필이 같은 인자를 쓴다. 어댑터는
 해당 키의 호출을 건너뛴다.
 
-`expected_total`은 서울 API가 첫 페이지를 skip해도 계획을 세울 수 있게 하는 힌트다.
-라운드 0에서 어댑터가 `list_total_count`를 실어 보내면 pipeline이 기억했다가 다음
-라운드·백필에 되돌려준다. 이 값이 그대로 manifest의 `counts.expected`가 되어 완결도
-계산에 쓰인다. 기상청처럼 전체 행 수를 알 수 없는 소스는 `None`이다.
+`expected_total`은 서울 API가 성공 페이지를 skip해도 계획을 세울 수 있게 하는 힌트다.
+일반 페이지는 라운드 0의 `list_total_count`, `pagination: probe`는 빈 종료 페이지의
+위치와 직전 페이지 row 수로 계산한다. probe 종료 응답은 원본 데이터가 아니므로
+`persist=False`로 expected만 전달하고 bronze에는 쓰지 않는다. pipeline이 이 값을
+기억했다가 다음 라운드·백필에 되돌려주며, manifest의 `counts.expected`와 완결도 계산에
+쓴다. 기상청처럼 전체 행 수를 알 수 없는 소스는 `None`이다.
 
 **어댑터가 예외 대신 값으로 실패를 알리는 이유**는 라운드 루프가 어댑터 밖에 있기
 때문이다. 예외로 올리면 첫 실패에서 이터레이터가 끊겨 나머지 조각을 시도할 수 없다.
@@ -196,7 +199,9 @@ class Adapter(Protocol):
 **어댑터가 공통으로 처리할 것**
 
 - **응답 코드 검사**: 서울 API는 HTTP 200으로 응답하면서 본문에 에러 코드를 담는다. `rentBikeStatus.RESULT.CODE`가 `INFO-000`이 아니면 실패로 처리한다.
-- **페이지네이션**: 서울 API는 `list_total_count`와 `{시작}/{끝}` 인덱스로 순회한다. 한 번에 최대 1,000건.
+- **페이지네이션**: 서울 API 기본 모드는 `list_total_count`와 `{시작}/{끝}` 인덱스로
+  순회한다. `bikeList`는 total이 현재 페이지 행 수이므로 설정으로 켠 probe 모드가
+  빈 페이지까지 순차 탐색한다. 한 번에 최대 1,000건.
 - **반복 호출**: 기상청은 격자(`nx`, `ny`)마다 별도 호출이 필요하다. 서울 전역을 커버할 격자 목록은 `adapter_params.grids`에 둔다.
 - **재시도**: 호출 단위로 짧은 백오프 2회. 그 위에 조각 집합 단위 라운드가 얹히므로 백오프 횟수는 줄여 잡는다([8절](#8-부분-실패와-백필)).
 - **실패 범주 판정**: HTTP 상태와 응답 본문 코드를 `TRANSIENT` · `PERMANENT` · `FATAL` 중 하나로 매핑한다. 서울 API의 `RESULT.CODE`처럼 제공처마다 다른 규약이 여기서 흡수된다.
@@ -215,6 +220,8 @@ adapter_params:
   service: bikeList
   page_size: 1000
   root_key: rentBikeStatus.row      # 응답에서 행 배열을 꺼낼 경로
+  pagination: probe                 # list_total_count 대신 빈 페이지로 종료 판정
+  max_probe_pages: 10               # 10,000행 뒤에도 끝이 없으면 실패
 
 schedule:
   interval: 5m                      # 문서화·window 계산용 (실제 스케줄러는 Airflow)
@@ -500,7 +507,7 @@ def drop_if_issue_count_exceeds(
 
 | 필드 | 의미 |
 | --- | --- |
-| `counts.expected` | 소스가 알려준 전체 행 수. 서울은 `list_total_count`, 기상청은 `null` |
+| `counts.expected` | 전체 행 수. 서울 기본 모드는 `list_total_count`, probe는 탐색한 실제 끝, 기상청은 `null` |
 | `missing.parts` | 끝내 받지 못한 조각 키 목록. 백필이 이 목록을 지목해 채운다 |
 | `missing.rows` | 누락 행 수(`expected - fetched`). `expected`가 `null`이면 `null` |
 | `missing.basis` | `rows`(행 기준) 또는 `parts`(조각 기준). 기상청은 `parts` |

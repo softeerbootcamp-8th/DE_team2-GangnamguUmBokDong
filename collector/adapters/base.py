@@ -27,9 +27,10 @@
 범위, 제로 패딩), 기상청 `grid-060x127`(격자 좌표).
 
 ## expected_total
-알 수 있는 소스만 채운다. 서울은 첫 페이지의 `list_total_count`, 기상청은 `None`이다.
-pipeline이 이 값을 기억했다가 다음 라운드와 백필에 되돌려주므로, 첫 페이지를 skip해도
-계획을 세울 수 있다.
+알 수 있는 소스만 채운다. 일반 서울 API는 첫 페이지의 `list_total_count`, 기상청은
+`None`이다. `pagination: probe_until_empty`인 서울 API는 빈 종료 페이지를 확인한 뒤
+실제 row 위치로 계산한다. 종료 응답도 Bronze part로 보존해 source snapshot이 완결성
+증거를 가지며, pipeline은 해당 값을 다음 라운드와 백필에 되돌려준다.
 
 ## planned_parts
 요청 전에 전체 조각 키를 아는 어댑터만 제공한다. row 수와 별개인 요청 계획이며,
@@ -76,6 +77,8 @@ class FetchResult:
     payload: 성공 시 원본 응답
     error: 실패 시 범주 (TRANSIENT, PERMANENT, FATAL)
     expected_total: 전체 행 수 (알 수 있는 소스의 첫 조각에만)
+    persist: payload를 bronze 조각으로 저장할지 여부. False는 페이지 탐색 종료처럼
+        expected_total만 전달하는 메타데이터 결과에만 사용한다.
 
     에러 시 예외를 던지지 않고 종류를 적어서 반환한다.
     파이프라인이 멈추지 않고 계속 진행하여 재시도 전략을 짤 수 있도록 하기 위함.
@@ -85,6 +88,7 @@ class FetchResult:
     payload: bytes | None
     error: FetchErrorKind | None   
     expected_total: int | None
+    persist: bool = True
 
 
 class Adapter(Protocol):
@@ -257,18 +261,27 @@ def fetch_with_rounds(
             except StopIteration:
                 break
 
-            # expected_total은 첫 조각에만 실려 온다. 
-            # 한 번 채워지면 이후 라운드·백필에 그대로 되돌려주므로 여기서 덮어쓰지 않는다.
-            if expected_total is None and result.expected_total is not None:
-                expected_total = result.expected_total
+            # probe 소스는 재시도 중 snapshot이 늘었음을 종료 probe로 발견할 수 있다.
+            # 이미 확정한 하한보다 큰 total은 갱신하되, 더 작은 값으로 줄여 기존
+            # Bronze payload를 정상으로 오인하지 않는다(어댑터도 shrink를 TRANSIENT로
+            # 막는다).
+            if result.expected_total is not None:
+                expected_total = max(expected_total or 0, result.expected_total)
 
-            if result.error is None:
+            if result.error is None and result.persist:
+                if result.payload is None:
+                    raise ValueError("저장할 성공 조각의 payload는 None일 수 없습니다")
                 collected[result.key] = result.payload
 
                 # (3) 스트리밍 저장
                 # on_chunk 콜백 함수(pipeline이 즉시 bronze에 쓴다)
                 if on_chunk is not None:
                     on_chunk(result.key, result.payload)
+            elif result.error is None:
+                # probe 종료 신호처럼 expected_total만 전달하는 메타데이터 결과다.
+                # bronze part·완결도 조각 수에 포함하면 빈 종료 페이지가 실제 데이터
+                # 페이지처럼 보이고 다음 라운드의 skip에도 섞이므로 저장하지 않는다.
+                continue
             elif result.error is FetchErrorKind.FATAL:
                 # 모든 조각이 같은 인증키를 쓰므로 하나가 FATAL이면 나머지도 잘못되었을 것이므로,
                 # 라운드를 더 돌 이유가 없어 즉시 전체를 접는다.

@@ -34,10 +34,10 @@ uv run python dev/seed_s3_from_local.py --start-date 2025-01-01 --end-date 2025-
 ```
 
 `libs/ml_core/paths.py`(각 폴더가 editable 의존성으로 참조하는 공유 라이브러리)가
-Spark 산출물 S3 키(`processed_v2/spark/{FEATURE_PARAM_COMBO_ID}/...`)를
+Spark 산출물 S3 키(`processed/features/{FEATURE_PARAM_COMBO_ID}/...`)를
 `feature_engine/spark/config.py`와 정확히 같은 공식으로 계산하므로, dataset 단계가
 쓴 파일을 training/inference가 그대로 읽는다(파라미터 조합을 바꾸려면
-`FEATURE_ENGINEERING_OUTPUT_ROOT`/`FEATURE_PARAM_COMBO_ID` 환경변수를 두 쪽 다 같이
+`FEATURE_ENGINEERING_OUTPUT_PREFIX`/`FEATURE_PARAM_COMBO_ID` 환경변수를 두 쪽 다 같이
 설정할 것 — [feature_engine/README.md](feature_engine/README.md) 참고).
 
 실행(이 스크립트 자체는 stdlib만 써서 임의의 python3로 실행 가능 — 각 단계는
@@ -56,6 +56,7 @@ ML_ROOT = Path(__file__).resolve().parent
 
 
 def _venv_python(folder: str) -> str:
+    """ML 하위 프로젝트의 가상환경 Python 실행 파일 경로를 반환한다."""
     return str(ML_ROOT / folder / ".venv" / "bin" / "python")
 
 
@@ -96,12 +97,14 @@ STAGE_ORDER = ["dataset", "training", "inference"]
 
 
 def run_stage(stage: str) -> None:
+    """지정한 로컬 파이프라인 단계의 명령들을 순서대로 실행한다."""
     for label, python_executable, args in STEPS[stage]:
         print(f"\n=== {label} ===", flush=True)
         subprocess.run([python_executable, *args], check=True)
 
 
 def main() -> None:
+    """CLI 옵션에 따라 전체 또는 단일 로컬 파이프라인 단계를 실행한다."""
     parser = argparse.ArgumentParser(description="feature_engine -> training -> inference 전체 실행 (로컬 개발용)")
     parser.add_argument(
         "--only", choices=STAGE_ORDER, default=None, help="이 단계만 실행 (미지정 시 전체 순서대로 실행)"
