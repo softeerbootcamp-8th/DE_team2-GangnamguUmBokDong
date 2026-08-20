@@ -11,7 +11,7 @@ VALID_YAML = """\
 source_id: test_source
 description: 테스트 소스
 adapter: seoul_openapi
-adapter_params: {}
+adapter_params: {service: bikeList, page_size: 1000, root_key: rentBikeStatus.row}
 schedule:
   interval: 5m
 storage:

@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
+import re
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import httpx
 import pytest
-
-from adapters.base import FetchErrorKind, Window
+from adapters.base import FetchErrorKind, Window, fetch_with_rounds
 from adapters.seoul_openapi import NaturalKeyCardinalityError, SeoulOpenApiAdapter
 
 KST = ZoneInfo("Asia/Seoul")
@@ -34,17 +34,36 @@ def _config(page_size=2):
     )
 
 
-def _probe_config(page_size=2, natural_key=("stationId",)):
-    """빈 페이지까지 탐색하는 bikeList 설정을 만든다."""
+def _probe_config(
+    page_size=2,
+    max_probe_pages=10,
+    natural_key=("stationId",),
+):
+    """bikeList의 행 수 기반 probe pagination 설정을 만든다."""
     return _StubConfig(
         {
             "service": "bikeList",
             "page_size": page_size,
             "root_key": "rentBikeStatus.row",
             "pagination": "probe_until_empty",
+            "max_probe_pages": max_probe_pages,
         },
         natural_key=natural_key,
     )
+
+
+class _ProbeRoundConfig(_StubConfig):
+    """라운드 테스트에 fetch budget까지 제공하는 최소 설정 더블."""
+
+    def effective_fetch_budget(self):
+        """테스트 중 만료되지 않는 fetch budget을 반환한다."""
+        return timedelta(hours=1)
+
+
+def _probe_round_config(page_size=2, max_probe_pages=10):
+    """probe 설정과 fetch budget을 함께 가진 라운드 테스트 설정을 만든다."""
+    config = _probe_config(page_size, max_probe_pages)
+    return _ProbeRoundConfig(config.adapter_params, natural_key=config.natural_key)
 
 
 def _body(code="INFO-000", total=3, rows=None):
@@ -57,6 +76,34 @@ def _body(code="INFO-000", total=3, rows=None):
             }
         }
     ).encode()
+
+
+def _empty_body():
+    """페이지 범위를 넘겼을 때의 서울 API 최상단 INFO-200 응답을 만든다."""
+    return json.dumps(
+        {"CODE": "INFO-200", "MESSAGE": "해당하는 데이터가 없습니다."}
+    ).encode()
+
+
+def _probe_handler(rows, page_size, *, calls=None, fail_once=None, raw_total=None):
+    """현재 페이지 행 수를 total로 주고 끝에서 INFO-200을 주는 bikeList를 흉내낸다."""
+    attempts: dict[int, int] = {}
+
+    def handler(request):
+        url = str(request.url)
+        if calls is not None:
+            calls.append(url)
+        start, end = (int(value) for value in re.search(r"/(\d+)/(\d+)/", url).groups())
+        attempts[start] = attempts.get(start, 0) + 1
+        if fail_once == start and attempts[start] == 1:
+            return httpx.Response(500, content=b"temporary")
+        page_rows = rows[start - 1 : end]
+        if not page_rows:
+            return httpx.Response(200, content=_empty_body())
+        page_total = len(page_rows) if raw_total is None else raw_total
+        return httpx.Response(200, content=_body(total=page_total, rows=page_rows))
+
+    return handler
 
 
 @pytest.fixture(autouse=True)
@@ -363,6 +410,7 @@ def test_population_fetch_uses_configured_poi_range_and_does_not_stop_at_gap():
             "service": "citydata_ppltn",
             "page_size": 1000,
             "root_key": "SeoulRtd.citydata_ppltn",
+            "root_key_literal": True,
             "poi_start": 117,
             "poi_end": 121,
         }
@@ -410,6 +458,7 @@ def test_population_fetch_requests_pois_concurrently_and_preserves_order():
             "service": "citydata_ppltn",
             "page_size": 1000,
             "root_key": "SeoulRtd.citydata_ppltn",
+            "root_key_literal": True,
             "poi_start": 1,
             "poi_end": 8,
             "concurrency": 4,
@@ -450,6 +499,7 @@ def test_population_fetch_honors_skip_under_concurrency():
             "service": "citydata_ppltn",
             "page_size": 1000,
             "root_key": "SeoulRtd.citydata_ppltn",
+            "root_key_literal": True,
             "poi_start": 1,
             "poi_end": 4,
             "concurrency": 2,
@@ -843,3 +893,348 @@ class TestTopLevelResultCode:
         )
 
         assert results[0].error is FetchErrorKind.FATAL
+
+
+class TestProbePagination:
+    """전체 건수가 아닌 페이지 크기를 주는 bikeList 전용 탐색 계약을 검증한다."""
+
+    def test_ignores_page_sized_total_and_stops_only_after_empty_probe(self):
+        rows = [{"stationId": f"ST-{index}"} for index in range(1, 6)]
+        calls = []
+        client = httpx.Client(
+            transport=httpx.MockTransport(_probe_handler(rows, 2, calls=calls))
+        )
+
+        results = list(
+            SeoulOpenApiAdapter.fetch(
+                _probe_config(page_size=2), window=None, client=client
+            )
+        )
+
+        data_results = [result for result in results if result.expected_total is None]
+        terminal = [result for result in results if result.expected_total is not None]
+        assert [result.key for result in data_results] == [
+            "page-00001-00002",
+            "page-00003-00004",
+            "page-00005-00006",
+        ]
+        assert len(terminal) == 1
+        assert terminal[0].key == "page-00007-00008"
+        assert terminal[0].expected_total == 5
+        assert terminal[0].payload is not None
+        assert len(calls) == 4
+        assert calls[-1].endswith("/7/8/")
+        assert (
+            SeoulOpenApiAdapter.normalize(
+                [result.payload for result in data_results], _probe_config(page_size=2)
+            )
+            == rows
+        )
+
+    def test_exact_page_multiple_uses_terminal_position_as_total(self):
+        rows = [{"stationId": f"ST-{index}"} for index in range(1, 5)]
+        client = httpx.Client(transport=httpx.MockTransport(_probe_handler(rows, 2)))
+
+        results = list(
+            SeoulOpenApiAdapter.fetch(
+                _probe_config(page_size=2), window=None, client=client
+            )
+        )
+
+        assert [
+            result.expected_total
+            for result in results
+            if result.expected_total is not None
+        ] == [4]
+        assert [result.key for result in results if result.expected_total is None] == [
+            "page-00001-00002",
+            "page-00003-00004",
+        ]
+
+    def test_does_not_parse_or_trust_list_total_count(self):
+        rows = [{"stationId": "ST-1"}]
+        client = httpx.Client(
+            transport=httpx.MockTransport(
+                _probe_handler(rows, 2, raw_total="not-an-integer")
+            )
+        )
+
+        results = list(
+            SeoulOpenApiAdapter.fetch(
+                _probe_config(page_size=2), window=None, client=client
+            )
+        )
+
+        assert [
+            result.expected_total
+            for result in results
+            if result.expected_total is not None
+        ] == [1]
+        assert [result.error for result in results] == [None, None]
+
+    def test_transient_last_data_page_is_retried_and_total_is_recovered(self):
+        rows = [{"stationId": f"ST-{index}"} for index in range(1, 6)]
+        calls = []
+        client = httpx.Client(
+            transport=httpx.MockTransport(
+                _probe_handler(rows, 2, calls=calls, fail_once=5)
+            )
+        )
+
+        result = fetch_with_rounds(
+            SeoulOpenApiAdapter.fetch,
+            _probe_round_config(page_size=2),
+            window=None,
+            client=client,
+            sleep_fn=lambda _seconds: None,
+        )
+
+        assert sorted(result.chunks) == [
+            "page-00001-00002",
+            "page-00003-00004",
+            "page-00005-00006",
+            "page-00007-00008",
+        ]
+        assert result.missing == {}
+        assert result.expected_total == 5
+        assert sum("/5/6/" in call for call in calls) == 2
+
+    def test_transient_terminal_probe_recovers_total_without_rewriting_skipped_pages(
+        self,
+    ):
+        rows = [{"stationId": f"ST-{index}"} for index in range(1, 5)]
+        calls = []
+        client = httpx.Client(
+            transport=httpx.MockTransport(
+                _probe_handler(rows, 2, calls=calls, fail_once=5)
+            )
+        )
+
+        result = fetch_with_rounds(
+            SeoulOpenApiAdapter.fetch,
+            _probe_round_config(page_size=2),
+            window=None,
+            client=client,
+            sleep_fn=lambda _seconds: None,
+        )
+
+        assert sorted(result.chunks) == [
+            "page-00001-00002",
+            "page-00003-00004",
+            "page-00005-00006",
+        ]
+        assert result.missing == {}
+        assert result.expected_total == 4
+        # 3~4 페이지의 두 번째 호출은 payload 재수집이 아니라 종료 위치 복구용이다.
+        assert sum("/3/4/" in call for call in calls) == 2
+
+    def test_terminal_recovery_rejects_shrunk_snapshot_behind_skipped_parts(self):
+        """skipped Bronze보다 축소된 snapshot의 terminal을 새 total로 확정하지 않는다."""
+        # 직전 라운드에는 1~4가 data page로 저장됐지만 terminal만 실패한 상태다.
+        # 재시도 시 snapshot이 2행으로 줄면 /5/6과 복구용 /3/4가 모두 terminal이다.
+        # 기존 4행 payload에 expected=2를 붙이면 혼합 snapshot이므로 transient여야 한다.
+        rows = [{"stationId": "ST-1"}, {"stationId": "ST-2"}]
+        client = httpx.Client(transport=httpx.MockTransport(_probe_handler(rows, 2)))
+
+        results = list(
+            SeoulOpenApiAdapter.fetch(
+                _probe_config(page_size=2),
+                window=None,
+                client=client,
+                skip=frozenset({"page-00001-00002", "page-00003-00004"}),
+            )
+        )
+
+        assert len(results) == 1
+        assert results[0].key == "page-00005-00006"
+        assert results[0].error is FetchErrorKind.TRANSIENT
+        assert results[0].expected_total is None
+        assert results[0].payload is None
+
+    def test_known_total_retries_only_missing_fixed_width_page(self):
+        rows = [{"stationId": f"ST-{index}"} for index in range(1, 6)]
+        calls = []
+        client = httpx.Client(
+            transport=httpx.MockTransport(_probe_handler(rows, 2, calls=calls))
+        )
+
+        results = list(
+            SeoulOpenApiAdapter.fetch(
+                _probe_config(page_size=2),
+                window=None,
+                client=client,
+                skip=frozenset({"page-00001-00002", "page-00005-00006"}),
+                expected_total=5,
+            )
+        )
+
+        assert [result.key for result in results if result.expected_total is None] == [
+            "page-00003-00004"
+        ]
+        assert [
+            result.expected_total
+            for result in results
+            if result.expected_total is not None
+        ] == [5]
+        assert len(calls) == 2
+        assert calls[0].endswith("/3/4/")
+        assert calls[1].endswith("/7/8/")
+
+    def test_known_total_retry_collects_rows_appended_after_the_previous_round(self):
+        """retry 사이에 snapshot 뒤로 늘어난 행도 terminal 재탐색으로 수집한다."""
+        rows = [{"stationId": f"ST-{index}"} for index in range(1, 8)]
+        calls = []
+        client = httpx.Client(
+            transport=httpx.MockTransport(_probe_handler(rows, 2, calls=calls))
+        )
+
+        results = list(
+            SeoulOpenApiAdapter.fetch(
+                _probe_config(page_size=2),
+                window=None,
+                client=client,
+                skip=frozenset({"page-00001-00002", "page-00005-00006"}),
+                expected_total=5,
+            )
+        )
+
+        assert [result.key for result in results if result.expected_total is None] == [
+            "page-00003-00004",
+            "page-00007-00008",
+        ]
+        assert [
+            result.expected_total
+            for result in results
+            if result.expected_total is not None
+        ] == [7]
+        assert calls[-1].endswith("/9/10/")
+
+    def test_probe_limit_fails_instead_of_silently_truncating(self):
+        rows = [{"stationId": f"ST-{index}"} for index in range(1, 6)]
+        client = httpx.Client(transport=httpx.MockTransport(_probe_handler(rows, 2)))
+
+        results = list(
+            SeoulOpenApiAdapter.fetch(
+                _probe_config(page_size=2, max_probe_pages=2),
+                window=None,
+                client=client,
+            )
+        )
+
+        assert [result.key for result in results[:2]] == [
+            "page-00001-00002",
+            "page-00003-00004",
+        ]
+        assert results[-1].key == "page-00005-00006"
+        assert results[-1].error is FetchErrorKind.PERMANENT
+        assert results[-1].payload is None
+
+
+class TestForecastFlatten:
+    """citydata_ppltn의 `FCST_PPLTN` 중첩 배열이 슬롯 컬럼으로 펼쳐지는지 확인한다."""
+
+    @staticmethod
+    def _config():
+        return _StubConfig(
+            {
+                "service": "citydata_ppltn",
+                "page_size": 1000,
+                "root_key": "SeoulRtd.citydata_ppltn",
+                "root_key_literal": True,
+                "flatten_forecast": True,
+            }
+        )
+
+    @staticmethod
+    def _chunk(row: dict) -> bytes:
+        return json.dumps({"SeoulRtd.citydata_ppltn": [row]}).encode()
+
+    @staticmethod
+    def _forecast(hour: int, pop: int) -> dict:
+        return {
+            "FCST_TIME": f"2026-08-19 {hour:02d}:00",
+            "FCST_CONGEST_LVL": "여유",
+            "FCST_PPLTN_MIN": str(pop),
+            "FCST_PPLTN_MAX": str(pop + 500),
+        }
+
+    def test_twelve_slots_become_flat_columns(self):
+        row = {
+            "AREA_CD": "POI001",
+            "FCST_YN": "Y",
+            "FCST_PPLTN": [self._forecast(10 + i, 1000 * i) for i in range(12)],
+        }
+        rows = SeoulOpenApiAdapter.normalize([self._chunk(row)], self._config())
+
+        assert len(rows) == 1
+        assert rows[0]["FCST_1_TIME"] == "2026-08-19 10:00"
+        assert rows[0]["FCST_1_PPLTN_MIN"] == "0"
+        assert rows[0]["FCST_12_TIME"] == "2026-08-19 21:00"
+        assert rows[0]["FCST_12_PPLTN_MAX"] == "11500"
+        assert rows[0]["FCST_12_CONGEST_LVL"] == "여유"
+
+    def test_nested_key_is_removed_so_parquet_only_sees_scalars(self):
+        row = {"AREA_CD": "POI001", "FCST_PPLTN": [self._forecast(10, 100)]}
+        rows = SeoulOpenApiAdapter.normalize([self._chunk(row)], self._config())
+
+        assert "FCST_PPLTN" not in rows[0]
+        assert all(not isinstance(v, (list, dict)) for v in rows[0].values())
+
+    def test_slots_are_numbered_by_time_not_response_order(self):
+        row = {
+            "AREA_CD": "POI001",
+            "FCST_PPLTN": [
+                self._forecast(15, 300),
+                self._forecast(13, 100),
+                self._forecast(14, 200),
+            ],
+        }
+        rows = SeoulOpenApiAdapter.normalize([self._chunk(row)], self._config())
+
+        assert rows[0]["FCST_1_TIME"] == "2026-08-19 13:00"
+        assert rows[0]["FCST_2_TIME"] == "2026-08-19 14:00"
+        assert rows[0]["FCST_3_TIME"] == "2026-08-19 15:00"
+
+    def test_short_array_leaves_remaining_slots_absent(self):
+        row = {
+            "AREA_CD": "POI001",
+            "FCST_PPLTN": [self._forecast(10 + i, 100) for i in range(5)],
+        }
+        rows = SeoulOpenApiAdapter.normalize([self._chunk(row)], self._config())
+
+        assert rows[0]["FCST_5_TIME"] == "2026-08-19 14:00"
+        assert not [
+            k for k in rows[0] if k.startswith(("FCST_6_", "FCST_7_", "FCST_12_"))
+        ]
+
+    def test_missing_forecast_array_keeps_other_columns(self):
+        row = {"AREA_CD": "POI001", "FCST_YN": "N", "AREA_PPLTN_MIN": "100"}
+        rows = SeoulOpenApiAdapter.normalize([self._chunk(row)], self._config())
+
+        assert rows[0] == {"AREA_CD": "POI001", "FCST_YN": "N", "AREA_PPLTN_MIN": "100"}
+
+    def test_entries_without_time_are_dropped(self):
+        row = {
+            "AREA_CD": "POI001",
+            "FCST_PPLTN": [{"FCST_PPLTN_MIN": "100"}, self._forecast(11, 200)],
+        }
+        rows = SeoulOpenApiAdapter.normalize([self._chunk(row)], self._config())
+
+        assert rows[0]["FCST_1_TIME"] == "2026-08-19 11:00"
+        assert "FCST_2_TIME" not in rows[0]
+
+    def test_other_sources_are_untouched(self):
+        config = _StubConfig(
+            {"service": "bikeList", "page_size": 1000, "root_key": "rentBikeStatus.row"}
+        )
+        chunk = json.dumps(
+            {
+                "rentBikeStatus": {
+                    "row": [{"stationId": "ST-1", "FCST_PPLTN": [{"x": 1}]}]
+                }
+            }
+        ).encode()
+
+        rows = SeoulOpenApiAdapter.normalize([chunk], config)
+
+        assert rows[0]["FCST_PPLTN"] == [{"x": 1}]

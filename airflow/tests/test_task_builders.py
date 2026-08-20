@@ -26,7 +26,9 @@ def test_repo_root_resolves_to_repository_root():
 
 def test_collector_task_uses_kst_window_start_and_own_project_environment(dag):
     task = build_collector_task(dag, "bike_station_realtime")
-    assert task.bash_command.startswith("env -u VIRTUAL_ENV -u UV_PROJECT_ENVIRONMENT ")
+    assert task.bash_command.startswith(
+        "env -u VIRTUAL_ENV UV_PROJECT_ENVIRONMENT=/opt/venvs/modules/collector "
+    )
     assert (
         "uv run --frozen python main.py --source bike_station_realtime"
         in task.bash_command
@@ -36,16 +38,19 @@ def test_collector_task_uses_kst_window_start_and_own_project_environment(dag):
 
 
 def test_normalizer_task_cwd_and_flags(dag):
-    task = build_normalizer_task(dag, "run_normalizer_strict", "strict")
+    task = build_normalizer_task(dag)
+    assert task.task_id == "run_normalizer"
     assert task.cwd == NORMALIZER_DIR
-    assert "--baseline-date-mode strict" in task.bash_command
+    assert "python main.py --window-start" in task.bash_command
+    # baseline은 항상 nowcaster 추정치라 모드 선택 인자가 없다.
+    assert "--baseline-date-mode" not in task.bash_command
 
 
 def test_station_master_enrichment_task_contract(dag):
     task = build_station_master_enrichment_task(dag)
     assert task.cwd == NORMALIZER_DIR
     assert "python station_master.py" in task.bash_command
-    assert "--baseline-date-mode latest" in task.bash_command
+    assert "--baseline-date-mode" not in task.bash_command
     assert "astimezone" in task.bash_command
 
 
@@ -66,10 +71,22 @@ def test_inference_task_cwd_is_ml_not_ml_inference(dag):
         "uv --project inference run python -m inference.predict_single"
         in task.bash_command
     )
+    assert task.bash_command.startswith(
+        "env -u VIRTUAL_ENV UV_PROJECT_ENVIRONMENT=/opt/venvs/modules/ml-inference "
+    )
     assert "--all-stations" in task.bash_command
     assert "--n-hours 12" in task.bash_command
     assert "// 5" in task.bash_command
     assert ".replace(" in task.bash_command
+
+
+def test_inference_task_requires_all_direct_inputs_to_succeed(dag):
+    """normalizer 분기는 DAG 합류점이 처리하므로 추론 자체는 필수 입력 전체를 기다린다."""
+    from airflow.task.trigger_rule import TriggerRule
+
+    task = build_inference_task(dag)
+
+    assert task.trigger_rule == TriggerRule.ALL_SUCCESS
 
 
 def test_urgency_task_cwd_and_flags(dag):
@@ -78,6 +95,9 @@ def test_urgency_task_cwd_and_flags(dag):
     task = build_urgency_task(dag)
     assert task.cwd == REBALANCE_DIR
     assert task.cwd.endswith("/rebalance")
+    assert task.bash_command.startswith(
+        "env -u VIRTUAL_ENV UV_PROJECT_ENVIRONMENT=/opt/venvs/modules/rebalance "
+    )
     assert "uv run --frozen python main.py" in task.bash_command
     assert "--date" in task.bash_command
     assert "--hour" in task.bash_command
@@ -99,7 +119,7 @@ def test_all_pipeline_tasks_floor_manual_run_to_same_five_minute_window(dag):
     """수동 trigger의 19:33도 모든 모듈에서 동일하게 19:30으로 내림한다."""
     tasks = [
         build_collector_task(dag, "bike_station_realtime"),
-        build_normalizer_task(dag, "normalize", "strict"),
+        build_normalizer_task(dag, "normalize"),
         build_inference_task(dag),
         build_gold_publisher_task(dag, "station-release"),
         build_db_loader_task(dag, "forecast_points"),

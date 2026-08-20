@@ -1,7 +1,7 @@
 [project]
 name = "feature_engine"
 version = "0.1.0"
-description = "station x 5분tick feature 테이블 생성(2차정제, Spark) — 본 서비스 코드는 spark/뿐"
+description = "station x 모델 tick feature 테이블 생성(2차정제, Spark) — 본 서비스 코드는 spark/뿐"
 requires-python = "==3.11.*"
 dependencies = [
     "pyspark==3.5.3",

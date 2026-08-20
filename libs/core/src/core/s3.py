@@ -22,6 +22,105 @@ from botocore.config import Config as BotoConfig
 from botocore.exceptions import ClientError
 
 
+class ParquetSchemaMismatchError(ValueError):
+    """여러 Parquet 조각의 스키마를 무손실로 통일할 수 없을 때 발생한다."""
+
+
+def concat_compatible_tables(
+    tables: list[pa.Table], required_columns: list[str] | None = None
+) -> pa.Table:
+    """호환 가능한 Parquet 스키마 변화만 안전하게 승격해 테이블을 결합한다.
+
+    Spark가 날짜 파티션을 증분 덮어쓰는 동안 구버전과 신버전 part가 잠시 공존할 수
+    있다. 이때 정수 폭, float 폭, 전량 NULL 컬럼처럼 논리적 의미는 같지만 물리 타입만
+    다른 스키마는 Arrow의 공통 상위 타입으로 맞춘 뒤 결합한다. 모든 캐스트에는
+    ``safe=True``를 사용하므로 overflow, float 정밀도 손실, 소수 절삭은 허용하지
+    않는다.
+
+    새 컬럼이 추가된 part와 아직 그 컬럼이 없는 part는 공통 스키마의 정확한 타입으로
+    NULL을 채운다. 반대로 string/int처럼 공통 논리 타입이 없는 경우는 어느 한쪽을
+    문자열 등으로 임의 변환하지 않고, 스키마를 함께 표시한 명시적 예외로 중단한다.
+
+    args:
+        tables: 같은 논리 테이블을 구성하는 하나 이상의 Arrow Table
+        required_columns: 지정하면 결합 후 이 컬럼들이 모두 존재하는지 확인하고
+            요청 순서로 선택한다. 어떤 part에도 없는 컬럼은 명시적으로 실패한다.
+    returns:
+        컬럼 순서와 타입이 하나의 공통 스키마로 정렬된 결합 테이블
+    raises:
+        ValueError: 빈 목록이 전달됐을 때
+        ParquetSchemaMismatchError: 안전한 공통 타입으로 변환할 수 없을 때
+    """
+    if not tables:
+        raise ValueError("결합할 Parquet 테이블이 없습니다.")
+
+    first_schema = tables[0].schema
+    if all(table.schema.equals(first_schema, check_metadata=True) for table in tables[1:]):
+        # 학습 정상 경로는 대부분 모든 part 스키마가 이미 같다. 수억 행을 읽을 때
+        # 매 컬럼 cast/Table 재조립을 거치지 않도록 기존 zero-copy 결합 성능을 보존한다.
+        combined = pa.concat_tables(tables)
+        return _select_required_columns(combined, required_columns) if required_columns is not None else combined
+
+    schemas = []
+    for index, table in enumerate(tables):
+        if len(table.column_names) != len(set(table.column_names)):
+            raise ParquetSchemaMismatchError(
+                f"Parquet part[{index}]에 중복 컬럼명이 있어 이름 기준으로 안전하게 결합할 수 없습니다: "
+                f"columns={table.column_names}"
+            )
+        schemas.append(table.schema)
+
+    try:
+        common_schema = pa.unify_schemas(schemas, promote_options="permissive")
+    except (pa.ArrowInvalid, pa.ArrowTypeError, pa.ArrowNotImplementedError) as exc:
+        schema_summary = "; ".join(f"part[{i}]={schema.remove_metadata()}" for i, schema in enumerate(schemas))
+        raise ParquetSchemaMismatchError(
+            f"Parquet part 스키마에 안전한 공통 타입이 없습니다: {schema_summary}"
+        ) from exc
+
+    conformed: list[pa.Table] = []
+    for index, table in enumerate(tables):
+        columns: list[pa.Array | pa.ChunkedArray] = []
+        for field in common_schema:
+            field_index = table.schema.get_field_index(field.name)
+            if field_index == -1:
+                columns.append(pa.nulls(table.num_rows, type=field.type))
+                continue
+
+            source = table.column(field_index)
+            try:
+                casted = source.cast(field.type, safe=True)
+                # Arrow 버전에 따라 safe int→float cast의 정밀도 검사가 달라질 수
+                # 있으므로 왕복해서 실제 값이 같은지도 직접 확인한다. 예를 들어
+                # 2**53+1은 float64로 반올림되므로 이 검사에서 거부된다.
+                if pa.types.is_integer(source.type) and pa.types.is_floating(field.type):
+                    restored = casted.cast(source.type, safe=True)
+                    if not source.equals(restored):
+                        raise pa.ArrowInvalid("int→float 변환 후 원래 정숫값으로 왕복되지 않음")
+                columns.append(casted)
+            except (pa.ArrowInvalid, pa.ArrowTypeError, pa.ArrowNotImplementedError) as exc:
+                raise ParquetSchemaMismatchError(
+                    f"Parquet part[{index}] 컬럼 '{field.name}'을 공통 타입으로 무손실 변환할 수 없습니다: "
+                    f"source={source.type}, target={field.type}"
+                ) from exc
+
+        conformed.append(pa.Table.from_arrays(columns, schema=common_schema))
+
+    combined = pa.concat_tables(conformed)
+    return _select_required_columns(combined, required_columns) if required_columns is not None else combined
+
+
+def _select_required_columns(table: pa.Table, columns: list[str]) -> pa.Table:
+    """요청 컬럼을 순서대로 선택하고 전체 part에 없는 컬럼은 명시적으로 거부한다."""
+    missing = [column for column in columns if column not in table.column_names]
+    if missing:
+        raise ParquetSchemaMismatchError(
+            f"요청한 컬럼이 어떤 Parquet part에도 없습니다: missing={missing}, "
+            f"available={table.column_names}. 서로 다른 스키마 세대인지 확인하세요."
+        )
+    return table.select(columns)
+
+
 def _client(timeout_seconds: float | None = None):
     """S3 호환 클라이언트를 생성한다.
 
@@ -73,9 +172,27 @@ def get_object_bytes(key: str, timeout_seconds: float | None = None) -> bytes | 
         raise
 
 
-def put_object_bytes(key: str, body: bytes) -> None:
-    """bytes를 S3 객체로 저장한다."""
-    _client().put_object(Bucket=_bucket(), Key=key, Body=body)
+def put_object_bytes(
+    key: str,
+    body: bytes,
+    *,
+    metadata: dict[str, str] | None = None,
+) -> None:
+    """bytes와 선택적인 S3 user metadata를 객체로 저장한다."""
+    kwargs = {"Bucket": _bucket(), "Key": key, "Body": body}
+    if metadata is not None:
+        kwargs["Metadata"] = metadata
+    _client().put_object(**kwargs)
+
+
+def get_object_metadata(key: str) -> dict[str, str] | None:
+    """S3 객체 본문을 받지 않고 user metadata만 조회한다. 키가 없으면 None."""
+    try:
+        return dict(_client().head_object(Bucket=_bucket(), Key=key).get("Metadata", {}))
+    except ClientError as exc:
+        if exc.response["Error"]["Code"] in {"404", "NoSuchKey"}:
+            return None
+        raise
 
 
 def _to_pandas_or_table(table: pq.Table, as_pandas: bool) -> pd.DataFrame | pq.Table:
@@ -102,6 +219,7 @@ def read_parquet(
     dates: list[str] | None = None,
     filters: list[tuple] | None = None,
     on_complete: Callable[[int, int], None] | None = None,
+    _allow_missing_columns: bool = False,
 ) -> pd.DataFrame | pq.Table | None:
     """S3의 parquet을 pandas DataFrame 또는 pyarrow Table로 읽는다 — 파일 1개짜리 객체와 다중 파트 "디렉터리" 둘 다 지원한다.
 
@@ -146,7 +264,17 @@ def read_parquet(
 
     body = get_object_bytes(key)
     if body is not None:
-        table = pq.read_table(io.BytesIO(body), columns=columns, filters=filters)
+        source = io.BytesIO(body)
+        file_columns = columns
+        if _allow_missing_columns and columns is not None:
+            # 다중 part 결합 중에는 새 컬럼이 아직 없는 옛 part도 읽어야 한다.
+            # 전체 컬럼을 읽으면 station_no 하나만 스캔하는 학습 사전 단계에서
+            # 수십 배 메모리를 쓰므로, 이 파일에 실제로 존재하는 요청 컬럼만 읽고
+            # concat_compatible_tables()가 나중에 정확한 타입의 NULL을 보충한다.
+            available = set(pq.read_schema(source).names)
+            source.seek(0)
+            file_columns = [column for column in columns if column in available]
+        table = pq.read_table(source, columns=file_columns, filters=filters)
         return _to_pandas_or_table(table, as_pandas)
 
     prefix = key if key.endswith("/") else f"{key}/"
@@ -167,7 +295,7 @@ def read_parquet(
     ]
     if not tables:
         return None
-    combined = pa.concat_tables(tables)
+    combined = concat_compatible_tables(tables, required_columns=columns)
     del tables
 
     return _to_pandas_or_table(combined, as_pandas)
@@ -261,11 +389,8 @@ def _read_parquet_by_dates(
 
     if not tables:
         return None
-    combined = pa.concat_tables(tables)
+    combined = concat_compatible_tables(tables, required_columns=columns)
     del tables
-
-    if columns is not None:
-        combined = combined.select(columns)
     return _to_pandas_or_table(combined, as_pandas)
 
 
@@ -294,7 +419,13 @@ def read_parquet_many(
 
     def _read(key: str) -> pd.DataFrame | pq.Table | None:
         nonlocal completed
-        result = read_parquet(key, columns=columns, as_pandas=as_pandas, filters=filters)
+        result = read_parquet(
+            key,
+            columns=columns,
+            as_pandas=as_pandas,
+            filters=filters,
+            _allow_missing_columns=True,
+        )
         if on_complete is not None:
             with lock:
                 completed += 1
@@ -306,14 +437,19 @@ def read_parquet_many(
         return list(pool.map(_read, keys))
 
 
-def write_parquet(data: pd.DataFrame | pq.Table, key: str) -> None:
-    """pandas DataFrame 또는 pyarrow Table을 parquet으로 직렬화해 S3에 저장한다."""
+def write_parquet(
+    data: pd.DataFrame | pq.Table,
+    key: str,
+    *,
+    metadata: dict[str, str] | None = None,
+) -> None:
+    """pandas/Arrow 데이터를 Parquet과 선택적인 S3 user metadata로 저장한다."""
     buffer = io.BytesIO()
     if isinstance(data, pd.DataFrame):
         data.to_parquet(buffer, index=False)
     else:
         pq.write_table(data, buffer)
-    put_object_bytes(key, buffer.getvalue())
+    put_object_bytes(key, buffer.getvalue(), metadata=metadata)
 
 
 def read_json(key: str, timeout_seconds: float | None = None):

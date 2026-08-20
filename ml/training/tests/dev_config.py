@@ -2,7 +2,11 @@
 
 from datetime import date, timedelta
 
+import pytest
+
+from training import config
 from training.config import (
+    SPLIT_EMBARGO_DAYS,
     TEST_DAYS_OF_MONTH,
     TRAIN_WINDOW_END,
     TRAIN_WINDOW_START,
@@ -27,6 +31,18 @@ def test_safety_cutoff_defaults_to_today():
 
 def test_valid_and_test_days_of_month_do_not_overlap():
     assert not (VALID_DAYS_OF_MONTH & TEST_DAYS_OF_MONTH)
+
+
+def test_split_embargo_covers_cross_day_multi_horizon_rows():
+    assert SPLIT_EMBARGO_DAYS >= 1
+
+
+def test_unimplemented_sample_fraction_env_is_rejected(monkeypatch):
+    """값을 적용하지 않는 가짜 sample fraction dial을 조용히 허용하면 안 된다."""
+    monkeypatch.setenv("TRAIN_SAMPLE_FRAC", "0.5")
+
+    with pytest.raises(ValueError, match="TRAIN_DAY_DIVISOR"):
+        config._reject_unsupported_sample_frac_env()
 
 
 def test_train_window_is_rolling_and_ends_at_safety_cutoff():

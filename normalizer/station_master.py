@@ -4,25 +4,31 @@ from __future__ import annotations
 
 import argparse
 import math
+import re
 import sys
 from datetime import datetime
 
-import grid
 import pyarrow as pa
-import storage
 from core.weather_grid import latlon_to_grid
 from pyproj import Transformer
 from shapely import STRtree
 from shapely.geometry import Point
 
+import grid
+import storage
+
 MIN_GRID_COVERAGE = 0.95
+STATION_NO_MIN = 1
+STATION_NO_MAX = 32_767
+
+_STATION_ID_PATTERN = re.compile(r"^ST-([0-9]+)$")
 
 _TO_EPSG5179 = Transformer.from_crs("EPSG:4326", "EPSG:5179", always_xy=True)
 
 _OUTPUT_SCHEMA = pa.schema(
     [
         ("station_id", pa.string()),
-        ("station_no", pa.string()),
+        ("station_no", pa.int16()),
         ("station_name", pa.string()),
         ("capacity", pa.int64()),
         ("lat", pa.float64()),
@@ -53,6 +59,33 @@ def _valid_wgs84(lat: object, lon: object) -> bool:
         and 36.5 <= latitude <= 38.5
         and 125.5 <= longitude <= 128.5
     )
+
+
+def _station_no(station_id: str) -> int:
+    """`ST-<숫자>` station_id에서 모델용 int16 정류소 번호를 추출한다.
+
+    `bike_station_master.ADDR2`는 실제 데이터에서 정류소 번호와 한글 상세주소가
+    섞여 있으므로 모델의 범주 키로 사용할 수 없다. 정류소 식별자인 `RNTLS_ID`의
+    숫자 suffix만 허용하고, Spark `ShortType` 및 모델 스키마와 같은 양의 int16
+    범위를 벗어나면 보강 snapshot 전체를 fail-closed한다.
+
+    raises:
+        ValueError: station_id 형식이 잘못됐거나 숫자 suffix가 양의 int16 범위 밖일 때
+    """
+    match = _STATION_ID_PATTERN.fullmatch(station_id)
+    if match is None:
+        raise ValueError(
+            "bike_station_master RNTLS_ID는 'ST-<숫자>' 형식이어야 합니다: "
+            f"{station_id!r}"
+        )
+    station_no = int(match.group(1))
+    if not STATION_NO_MIN <= station_no <= STATION_NO_MAX:
+        raise ValueError(
+            "bike_station_master RNTLS_ID 숫자 suffix가 모델 int16 범위 밖입니다: "
+            f"station_id={station_id!r}, station_no={station_no}, "
+            f"allowed={STATION_NO_MIN}..{STATION_NO_MAX}"
+        )
+    return station_no
 
 
 def _realtime_by_station(table: pa.Table | None) -> dict[str, dict]:
@@ -124,7 +157,7 @@ def enrich_station_master(
         capacity_value = _number(live.get("rackTotCnt"))
         rows_by_station[station_id] = {
             "station_id": station_id,
-            "station_no": str(raw["ADDR2"]) if raw.get("ADDR2") is not None else None,
+            "station_no": _station_no(station_id),
             "station_name": live.get("stationName") or raw.get("ADDR1") or raw.get("ADDR2"),
             "capacity": int(capacity_value) if capacity_value is not None else None,
             "lat": latitude,
@@ -151,21 +184,17 @@ def enrich_station_master(
     }
 
 
-def run(window_start: datetime, baseline_date_mode: str) -> int:
-    """같은 window의 API master를 보강해 파티션 Silver와 manifest를 쓴다."""
-    if baseline_date_mode == "strict":
-        baseline_date = window_start.date()
-        if not storage.partition_exists(storage.GRID_SOURCE_ID, baseline_date):
-            raise storage.PartitionNotFoundError(
-                f"living_population_grid의 dt={baseline_date:%Y-%m-%d} 파티션이 없음(strict 모드)"
-            )
-    else:
-        baseline_date = storage.find_latest_partition_date_on_or_before(
-            storage.GRID_SOURCE_ID, window_start.date()
-        )
+def run(window_start: datetime) -> int:
+    """같은 window의 API master를 보강해 파티션 Silver와 manifest를 쓴다.
+
+    격자 목록은 target date 이전 최신 nowcaster 추정치에서 얻는다. 인구값이 아닌
+    정적인 CELL_ID 목록만 쓰므로 당일 nowcaster와의 스케줄 경합은 이전 성공본으로
+    안전하게 피하고 미래 snapshot은 선택하지 않는다.
+    """
+    baseline_date = window_start.date()
 
     master_table = storage.read_station_master_silver(window_start)
-    grid_table = storage.read_grid_silver(baseline_date)
+    baseline_date, grid_table = storage.read_latest_nowcast_grid(baseline_date)
     realtime_table = storage.read_latest_bike_realtime_silver(window_start)
     output, metrics = enrich_station_master(master_table, grid_table, realtime_table)
     output_key = storage.write_enriched_station_master(window_start, output)
@@ -174,7 +203,6 @@ def run(window_start: datetime, baseline_date_mode: str) -> int:
         {
             "source_id": storage.ENRICHED_STATION_MASTER_SOURCE_ID,
             "baseline_date": baseline_date.isoformat(),
-            "baseline_date_mode": baseline_date_mode,
             "output_key": output_key,
             **metrics,
         },
@@ -192,11 +220,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """CLI 인자를 파싱한다."""
     parser = argparse.ArgumentParser(prog="station_master.py")
     parser.add_argument("--window-start", required=True, help="ISO8601, KST 오프셋(+09:00) 포함")
-    parser.add_argument(
-        "--baseline-date-mode",
-        choices=["strict", "latest"],
-        default="latest",
-    )
     return parser.parse_args(argv)
 
 
@@ -204,7 +227,7 @@ def main(argv: list[str] | None = None) -> int:
     """CLI 실행 오류를 Airflow가 감지할 수 있는 종료 코드로 바꾼다."""
     args = parse_args(argv)
     try:
-        return run(datetime.fromisoformat(args.window_start), args.baseline_date_mode)
+        return run(datetime.fromisoformat(args.window_start))
     except (storage.PartitionNotFoundError, ValueError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1

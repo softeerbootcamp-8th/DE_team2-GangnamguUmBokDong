@@ -30,7 +30,44 @@ from __future__ import annotations
 
 from ml_core import common_config
 from ml_core.paths import read_champion_prefix, write_champion_pointer
-from ml_core.scoring import load_boosters, load_conformal_correction
+from ml_core.scoring import (
+    load_boosters,
+    load_conformal_correction,
+    validate_champion_serving_contract,
+)
+from ml_core.serving_contract import (
+    assert_serving_profiles_compatible,
+    load_model_profile,
+)
+
+_MODEL_NAMES = {"rental", "return"}
+
+
+class ChampionAlreadyExistsError(RuntimeError):
+    """부트스트랩이 기존 챔피언을 덮어쓰려 할 때 발생한다."""
+
+
+def ensure_champion_absent(model_name: str) -> None:
+    """지정 모델에 챔피언 포인터가 아직 없는지 검증한다.
+
+    최초 학습 CLI가 `--promote-if-no-champion`으로 긴 학습을 시작하기 전에 빠르게
+    확인할 때 쓴다. 실제 포인터 쓰기 직전에는 `bootstrap_challenger()`가 다시
+    확인하므로, 이 사전 검사는 주로 불필요한 재학습 비용을 막는 역할이다.
+
+    raises:
+        ValueError: 지원하지 않는 모델 이름일 때
+        ChampionAlreadyExistsError: 이미 챔피언 포인터가 있을 때
+    """
+    if model_name not in _MODEL_NAMES:
+        raise ValueError(f"알 수 없는 모델 이름입니다: {model_name}")
+    try:
+        existing_prefix = read_champion_prefix(model_name)
+    except FileNotFoundError:
+        return
+    raise ChampionAlreadyExistsError(
+        f"{model_name} 챔피언이 이미 존재합니다: {existing_prefix}. "
+        "부트스트랩은 기존 챔피언을 덮어쓰지 않습니다"
+    )
 
 
 def should_promote(challenger_metrics: dict, champion_metrics: dict | None) -> tuple[bool, list[str]]:
@@ -67,7 +104,12 @@ def should_promote(challenger_metrics: dict, champion_metrics: dict | None) -> t
     return deviance_ok and coverage_ok, reasons
 
 
-def promote_challenger(model_name: str, archive_prefix: str) -> dict:
+def promote_challenger(
+    model_name: str,
+    archive_prefix: str,
+    *,
+    require_no_champion: bool = False,
+) -> dict:
     """model_name의 챔피언이 archive_prefix를 가리키도록 포인터를 원자적으로 전환한다.
 
     더 이상 archive 밑의 파일을 챔피언 자리로 복사하지 않는다(모듈 docstring
@@ -75,9 +117,9 @@ def promote_challenger(model_name: str, archive_prefix: str) -> dict:
 
     **2026-08**: `write_champion_pointer()` 자신은 캐시를 안 비운다(그 함수
     docstring 참고 — `read_champion_prefix()`만 비우면 `load_boosters()`/
-    `load_conformal_correction()`은 옛 값에 머물러 셋이 서로 다른 archive를
-    가리키는 불일치가 생긴다, 실측 확인됨). 셋 다 아는 유일한 지점이 여기라서,
-    포인터를 쓴 직후 세 캐시를 한꺼번에 비운다 — "학습해봤더니 구려서 같은
+    `load_conformal_correction()`은 옛 값에 머물러 서로 다른 archive를
+    가리키는 불일치가 생긴다, 실측 확인됨). 관련 로더를 다 아는 지점이 여기라서,
+    포인터를 쓴 직후 포인터·booster·보정값·프로필 검증 캐시를 함께 비운다 — "학습해봤더니 구려서 같은
     프로세스 안에서 재학습→재승격"을 반복하는 코드가 있다면, 재승격 직후
     다음 채점부터 booster/correction/station_categories가 전부 새 archive
     하나로 일관되게 나온다.
@@ -86,11 +128,63 @@ def promote_challenger(model_name: str, archive_prefix: str) -> dict:
         model_name: "rental" 또는 "return"
         archive_prefix: 이번에 승격할 학습 결과가 있는 아카이브 prefix
             (`ml_core.paths.archive_models_prefix()`가 만든 값)
+        require_no_champion: True면 계약 검증 후 포인터 쓰기 직전에 기존 챔피언
+            존재 여부를 확인해 부트스트랩이 기존 포인터를 덮어쓰지 않게 함
     returns:
         dict: `write_champion_pointer()`가 실제로 기록한 포인터 내용(로그/알림용)
+    raises:
+        ChampionAlreadyExistsError: require_no_champion인데 이미 챔피언이 있을 때
+        ServingProfileContractError: 챌린저 프로필이 없거나 현재 서빙/반대 모델
+            챔피언의 피처 계약과 다를 때
     """
+    if model_name not in _MODEL_NAMES:
+        raise ValueError(f"알 수 없는 모델 이름입니다: {model_name}")
+
+    challenger_profile = load_model_profile(model_name, archive_prefix)
+    assert_serving_profiles_compatible(
+        common_config.effective_profile(),
+        challenger_profile,
+        expected_source="현재 서빙",
+        actual_source=f"{model_name} 챌린저({archive_prefix})",
+    )
+
+    # 대여/반납은 한 실시간 feature row를 공유한다. 다른 모델이 이미 챔피언이면
+    # 그 계약과도 같아야 한쪽 포인터만 먼저 바뀌는 순차 승격이 안전하다. 최초
+    # 부트스트랩에서는 다른 챔피언이 아직 없는 것이 정상이라 비교를 생략한다.
+    other_model_name = "return" if model_name == "rental" else "rental"
+    try:
+        other_archive_prefix = read_champion_prefix(other_model_name)
+    except FileNotFoundError:
+        other_archive_prefix = None
+    if other_archive_prefix is not None:
+        other_profile = load_model_profile(other_model_name, other_archive_prefix)
+        assert_serving_profiles_compatible(
+            other_profile,
+            challenger_profile,
+            expected_source=f"{other_model_name} 챔피언({other_archive_prefix})",
+            actual_source=f"{model_name} 챌린저({archive_prefix})",
+        )
+
+    if require_no_champion:
+        # 긴 학습을 시작하기 전 엔트리포인트에서도 한 번 확인하지만, 그 뒤 다른
+        # 프로세스가 먼저 부트스트랩했을 수 있으므로 실제 PUT 직전에 다시 본다.
+        read_champion_prefix.cache_clear()
+        ensure_champion_absent(model_name)
+
     record = write_champion_pointer(model_name, archive_prefix)
     read_champion_prefix.cache_clear()
     load_boosters.cache_clear()
     load_conformal_correction.cache_clear()
+    validate_champion_serving_contract.cache_clear()
     return record
+
+
+def bootstrap_challenger(model_name: str, archive_prefix: str) -> dict:
+    """챔피언이 없을 때만 계약 검증을 통과한 첫 아카이브를 승격한다.
+
+    일반 재학습의 지표 비교를 우회할 수 있는 최초 배포 전용 진입점이다. 내부적으로
+    `promote_challenger()`를 그대로 거치므로 현재 서빙 및 반대 모델 챔피언과의
+    effective profile 계약 검증은 생략되지 않는다.
+    """
+    ensure_champion_absent(model_name)
+    return promote_challenger(model_name, archive_prefix, require_no_champion=True)
