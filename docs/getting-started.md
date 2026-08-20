@@ -35,6 +35,10 @@ make logs    # 로그 확인
 make ps      # 상태 확인
 ```
 
+전체 realtime 파이프라인을 로컬 Airflow에서 시각적으로 확인하려면 스택 기동 후
+`make e2e-smoke`를 실행합니다. Fixture 범위와 UI 확인 방법은
+[로컬 Airflow E2E smoke](airflow/local-e2e.md)를 참고하세요.
+
 ### Apple Silicon에서 PostGIS 실행
 
 로컬 Compose가 사용하는 `postgis/postgis:16-3.5` 이미지는 `linux/amd64`만
