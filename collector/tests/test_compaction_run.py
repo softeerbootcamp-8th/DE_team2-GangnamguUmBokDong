@@ -2,9 +2,12 @@
 
 from datetime import date, datetime, timedelta
 
-import manifest as manifest_module
 import pyarrow as pa
 import pytest
+from core.s3 import put_object_bytes, read_parquet
+from core.source_snapshot import SourceSnapshotStatus
+
+import manifest as manifest_module
 import storage
 from compaction import RECOVERY_DAYS, compact_date, compact_range, target_dates
 from config.schema import (
@@ -17,8 +20,6 @@ from config.schema import (
 )
 from config.schema import Compaction as CompactionConfig
 from config.schema import Storage as StorageConfig
-from core.s3 import put_object_bytes, read_parquet
-from core.source_snapshot import SourceSnapshotStatus
 from manifest import Artifacts, Counts, Manifest, RunStatus, Stage
 from storage import read_archive_manifest, write_silver
 from tests.conftest import KST
@@ -332,6 +333,26 @@ class TestSourceSnapshotAuthority:
         assert corrected.rows == 0
         assert archive.num_rows == 0
         assert archive_manifest["found_windows"] == 1
+
+    def test_zero_completed_authority_regression_preserves_previous_archive(
+        self, monkeypatch
+    ) -> None:
+        """authority discovery가 0 completed로 퇴행하면 기존 archive를 보존한다."""
+        config = _config()
+        _publish_succeeded(5, [1, 2])
+        first = compact_date(config, DAY, today=TODAY)
+        previous_manifest = read_archive_manifest("t_source", DAY)
+        monkeypatch.setattr(storage, "list_source_snapshot_windows", lambda *_: [])
+
+        regressed = compact_date(config, DAY, today=TODAY)
+
+        archive = read_parquet(
+            "archive/t_source/dt=2026-08-12.parquet", as_pandas=False
+        )
+        assert first.rows == 2
+        assert regressed.status == "skipped"
+        assert archive.column("cnt").to_pylist() == [1, 2]
+        assert read_archive_manifest("t_source", DAY) == previous_manifest
 
     @pytest.mark.parametrize(
         "status", [RunStatus.PARTIAL, RunStatus.FAILED, RunStatus.EMPTY]
