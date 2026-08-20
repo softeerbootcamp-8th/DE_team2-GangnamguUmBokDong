@@ -34,10 +34,10 @@ uv run python dev/seed_s3_from_local.py --start-date 2025-01-01 --end-date 2025-
 ```
 
 `libs/ml_core/paths.py`(각 폴더가 editable 의존성으로 참조하는 공유 라이브러리)가
-Spark 산출물 S3 키(`processed_v2/spark/{FEATURE_PARAM_COMBO_ID}/...`)를
+Spark 산출물 S3 키(`processed/features/{FEATURE_PARAM_COMBO_ID}/...`)를
 `feature_engine/spark/config.py`와 정확히 같은 공식으로 계산하므로, dataset 단계가
 쓴 파일을 training/inference가 그대로 읽는다(파라미터 조합을 바꾸려면
-`FEATURE_ENGINEERING_OUTPUT_ROOT`/`FEATURE_PARAM_COMBO_ID` 환경변수를 두 쪽 다 같이
+`FEATURE_ENGINEERING_OUTPUT_PREFIX`/`FEATURE_PARAM_COMBO_ID` 환경변수를 두 쪽 다 같이
 설정할 것 — [feature_engine/README.md](feature_engine/README.md) 참고).
 
 실행(이 스크립트 자체는 stdlib만 써서 임의의 python3로 실행 가능 — 각 단계는

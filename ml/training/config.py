@@ -63,17 +63,14 @@ def unique_archive_date(as_of: date | None = None) -> str:
 # LightGBM이 1년 전체를 못 받았기 때문(history.md 18번 항목).
 #
 # **2026-08 실측 + 이후 정책 변경**: 대여/반납 분리 + lag 1개로 줄인 뒤에도(피처
-# 축소 이후) 당시 20분 tick·1년 전체 multi-horizon 테이블이 8억 행이라 로컬
-# (RAM 18GB)에서 pandas로 한 번에 못 읽어서(에러 메시지도 없이 SIGKILL), 한때
+# 축소 이후) 1년 전체 multi-horizon 테이블을 로컬 RAM 18GB에서 pandas로 한 번에
+# 못 읽어서(에러 메시지도 없이 SIGKILL), 한때
 # day-of-month 배수로 날짜 자체를 줄이는(`TRAIN_DAY_DIVISOR`, 기본 2=짝수날만)
-# 임시 조치를 도입했었다. 이후 **학습·추론 모두 5분 tick 앵커 밀도를 유지**하는
-# 운영 계약이 확정되면서(minute 단위 서빙 요청을 실제로 커버해야 함 — 시간
-# 단위로 앵커를 줄이면 모델이 그 minute 값들을 아예 학습에서 못 봄), 날짜를
-# 솎아내는 방식으로 메모리를 줄이는 건 기본값에서 뺐다** — `TRAIN_DAY_DIVISOR`
-# 기본값을 다시 1(=날짜 필터 없음, 전체 윈도우 사용)로 되돌렸다. 대신 실제 메모리
-# 문제는 `lazy_train_dataset.py`의 날짜 파티션 단위 스트리밍 학습으로 푼다 —
-# 그게 어려운 특수 상황(예: 로컬에서 급하게 뭔가 검증)에서만 `TRAIN_DAY_DIVISOR`를
-# 다시 2, 3, 5로 올리는 임시 dial로 남겨둔다.
+# 임시 조치를 도입했었다. 현재는 날짜·계절·기상 다양성을 보존하고 시간축 중복만
+# 줄이도록 `TRAIN_ANCHOR_TICK_MINUTES`가 학습 밀도를 명시한다(기본 g20/r20/a20,
+# 비교용 g5/r5/a5 또는 g5/r5/a20 등; 서빙은 모두 5분 고정). 따라서 날짜를
+# 솎는 `TRAIN_DAY_DIVISOR` 기본값은
+# 1(=전체 윈도우)이며, 로컬 긴급 검증처럼 불가피할 때만 임시 dial로 사용한다.
 #
 # train은 **`TRAIN_DAY_DIVISOR`의 배수인 날 중 VALID/TEST 및 그 embargo 구간으로
 # 안 뽑힌 날**

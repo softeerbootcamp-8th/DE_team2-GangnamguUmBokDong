@@ -14,6 +14,7 @@ from datetime import date
 
 import pandas as pd
 import pytest
+from ml_core import paths as core_paths
 
 pyspark = pytest.importorskip("pyspark")
 
@@ -23,11 +24,22 @@ from feature_engine.spark.build_multi_horizon_features import (
     RENTAL_TARGET_COLUMNS,
     RETURN_ANCHOR_COLUMNS,
     RETURN_TARGET_COLUMNS,
+    _anchor_input,
     _features_in_training_window,
     build_multi_horizon_features,
 )
 
 _DAY_INDEX_EPOCH = pd.Timestamp("2000-01-01")
+
+
+def test_multi_horizon_output_paths_match_shared_contract():
+    """Spark writer와 training reader가 같은 anchor별 S3 키를 가리켜야 한다."""
+    assert fe_config.RENTAL_MULTI_HORIZON_FEATURES_TABLE_PARQUET == (
+        f"s3a://{fe_config.S3_BUCKET}/{core_paths.RENTAL_MULTI_HORIZON_FEATURES_TABLE_PARQUET}"
+    )
+    assert fe_config.RETURN_MULTI_HORIZON_FEATURES_TABLE_PARQUET == (
+        f"s3a://{fe_config.S3_BUCKET}/{core_paths.RETURN_MULTI_HORIZON_FEATURES_TABLE_PARQUET}"
+    )
 
 
 def _synthetic_features_table(n_hours: int = 20) -> pd.DataFrame:
@@ -149,3 +161,29 @@ def test_training_window_filter_excludes_newer_partitions(spark, monkeypatch):
     got = _features_in_training_window(source).orderBy("hour_ts").toPandas()
 
     assert got["value"].tolist() == [1, 2]
+
+
+def test_anchor_input_returns_none_when_training_anchor_matches_grid(spark, monkeypatch):
+    """thinning 없는 기본 계약은 불필요한 Spark filter를 만들지 않아야 한다."""
+    monkeypatch.setattr(fe_config, "GRID_TICK_MINUTES", 20)
+    monkeypatch.setattr(fe_config, "TRAIN_ANCHOR_TICK_MINUTES", 20)
+    monkeypatch.delenv("MULTI_HORIZON_ANCHOR_SINCE", raising=False)
+    monkeypatch.delenv("MULTI_HORIZON_ANCHOR_UNTIL", raising=False)
+    features = spark.createDataFrame(pd.DataFrame({"hour_ts": pd.to_datetime(["2025-06-01 00:00:00"])}))
+
+    assert _anchor_input(features) is None
+
+
+def test_anchor_input_thins_five_minute_grid_to_twenty_minute_anchors(spark, monkeypatch):
+    """g5/a20 hybrid는 target 원본을 바꾸지 않고 anchor 후보만 00/20/40분으로 줄인다."""
+    monkeypatch.setattr(fe_config, "GRID_TICK_MINUTES", 5)
+    monkeypatch.setattr(fe_config, "TRAIN_ANCHOR_TICK_MINUTES", 20)
+    monkeypatch.delenv("MULTI_HORIZON_ANCHOR_SINCE", raising=False)
+    monkeypatch.delenv("MULTI_HORIZON_ANCHOR_UNTIL", raising=False)
+    features = spark.createDataFrame(
+        pd.DataFrame({"hour_ts": pd.date_range("2025-06-01 00:00:00", periods=12, freq="5min")})
+    )
+
+    got = _anchor_input(features).orderBy("hour_ts").toPandas()
+
+    assert got["hour_ts"].dt.strftime("%H:%M").tolist() == ["00:00", "00:20", "00:40"]

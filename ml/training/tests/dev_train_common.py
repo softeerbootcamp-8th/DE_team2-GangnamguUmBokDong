@@ -12,7 +12,7 @@ train은 `config.TRAIN_DAY_DIVISOR`의 배수인 날 중 valid/test가 아닌 �
 1 — 사실상 전체 날짜, 다운샘플링 없음), valid/test는 `config.VALID_DAYS_OF_MONTH`/
 `TEST_DAYS_OF_MONTH`만 쓴다 — divisor는 로컬 RAM이 부족해 날짜 자체를 임시로
 줄여야 할 때만 2, 3, 5로 올리는 dial이다(`training/config.py` 참고, 기본
-정책은 5분 tick 밀도를 유지한 채 1년 전체 사용).
+정책은 프로필의 `TRAIN_ANCHOR_TICK_MINUTES` 밀도로 1년 전체 날짜를 사용).
 
 같은 anchor에서 만들어진 horizon 행이 자정을 넘어 서로 다른 target `date`
 파티션으로 갈릴 수 있으므로, 평가일 전후 `SPLIT_EMBARGO_DAYS`는 train에서

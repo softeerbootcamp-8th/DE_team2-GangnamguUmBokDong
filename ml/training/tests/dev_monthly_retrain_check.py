@@ -18,7 +18,7 @@
 import pytest
 from botocore.exceptions import EndpointConnectionError
 from core import s3 as s3_io
-from ml_core import common_config, scoring
+from ml_core import common_config, profile_contract, scoring
 from ml_core.paths import model_json_key, read_champion_prefix, write_champion_pointer
 from ml_core.serving_contract import ServingProfileContractError
 
@@ -212,6 +212,86 @@ def test_validate_candidate_contract_applies_attempt_env_before_comparing(monkey
             "changed-window",
             {"ROLLING_WINDOW_MINUTES": str(common_config.ROLLING_WINDOW_MINUTES + 5)},
         )
+
+
+def test_validate_candidate_contract_resolves_anchor_from_effective_grid(monkeypatch):
+    """grid env만 바꾼 후보는 subprocess와 동일하게 anchor도 새 grid를 따라야 한다."""
+    from training.scripts import monthly_retrain_check as mrc
+
+    candidate = common_config.effective_profile()
+    monkeypatch.setattr(common_config, "_load_profile", lambda profile_name: candidate.copy())
+    captured = {}
+
+    def _capture(expected_profile, actual_profile, **_kwargs):
+        captured.update(actual_profile)
+
+    monkeypatch.setattr(mrc, "assert_serving_profiles_compatible", _capture)
+
+    mrc._validate_candidate_serving_contract(
+        "grid-five",
+        {
+            "GRID_TICK_MINUTES": "5",
+            "ROLLING_TICK_MINUTES": "5",
+        },
+    )
+
+    assert captured["GRID_TICK_MINUTES"] == 5
+    assert captured["TRAIN_ANCHOR_TICK_MINUTES"] == 5
+
+
+def test_validate_candidate_contract_preserves_explicit_hybrid_anchor(monkeypatch):
+    """grid env와 canonical anchor를 함께 주면 g5/a20 hybrid가 preflight에 보존돼야 한다."""
+    from training.scripts import monthly_retrain_check as mrc
+
+    candidate = common_config.effective_profile()
+    monkeypatch.setattr(common_config, "_load_profile", lambda profile_name: candidate.copy())
+    captured = {}
+
+    def _capture(expected_profile, actual_profile, **_kwargs):
+        captured.update(actual_profile)
+
+    monkeypatch.setattr(mrc, "assert_serving_profiles_compatible", _capture)
+
+    mrc._validate_candidate_serving_contract(
+        "hybrid",
+        {
+            "GRID_TICK_MINUTES": "5",
+            "ROLLING_TICK_MINUTES": "5",
+            "TRAIN_ANCHOR_TICK_MINUTES": "20",
+        },
+    )
+
+    assert captured["GRID_TICK_MINUTES"] == 5
+    assert captured["TRAIN_ANCHOR_TICK_MINUTES"] == 20
+
+
+def test_validate_candidate_contract_keeps_profile_hybrid_anchor_with_redundant_grid_env(monkeypatch):
+    """원격 g5/a20 후보는 redundant g5 환경변수를 상속해도 a5로 축소되면 안 된다."""
+    from training.scripts import monthly_retrain_check as mrc
+
+    candidate = profile_contract.merge_and_validate_profile(
+        {
+            "GRID_TICK_MINUTES": 5,
+            "ROLLING_TICK_MINUTES": 5,
+            "TRAIN_ANCHOR_TICK_MINUTES": 20,
+        },
+        "hybrid",
+    )
+    monkeypatch.setattr(common_config, "_load_profile", lambda profile_name: candidate.copy())
+    captured = {}
+
+    def _capture(expected_profile, actual_profile, **_kwargs):
+        captured.update(actual_profile)
+
+    monkeypatch.setattr(mrc, "assert_serving_profiles_compatible", _capture)
+
+    mrc._validate_candidate_serving_contract(
+        "hybrid",
+        {"GRID_TICK_MINUTES": "5", "ROLLING_TICK_MINUTES": "5"},
+    )
+
+    assert captured["GRID_TICK_MINUTES"] == 5
+    assert captured["TRAIN_ANCHOR_TICK_MINUTES"] == 20
 
 
 def test_validate_candidate_contract_wraps_s3_failure_for_candidate_skip(monkeypatch):

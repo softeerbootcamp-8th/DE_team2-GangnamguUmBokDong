@@ -1,10 +1,9 @@
 """predict_single.py의 두 가지 API 계약을 검증한다 (PR 리뷰에서 지적된 문제 재발 방지).
 
-1. **tick 단위 시각 지정** — 공개 API가 `date`+`hour`만 받으면 그 시간 안의 5분
-   tick(예: 17:00/17:05/.../17:55) 요청을 전부 정시 기준으로
-   뭉개 계산하게 된다(feature_engine의 학습 그리드가 그 tick 단위인데 서빙
-   인터페이스가 그 정밀도를 못 받는 문제). `minute` 인자가 실제로 target_ts/lag
-   앵커에 반영되는지 확인한다.
+1. **tick 단위 시각 지정** — 공개 API가 `date`+`hour`만 받으면 운영의 5분 요청
+   (예: 17:00/17:05/.../17:55)을 전부 정시 기준으로 뭉개 계산하게 된다. 모델
+   학습 grid는 기본 20분이어도 실시간 point-in-time 피처는 요청 시각을 정확히
+   써야 하므로, `minute` 인자가 target_ts/lag 앵커에 반영되는지 확인한다.
 2. **배치 실패의 완결성 계약** — `predict_demand_multi_hour_all_stations()`가 일부
    station 실패를 조용히 skip하면 downstream(Gold 적재 등)이 "전체 성공"과
    "일부 누락"을 구분할 수 없다. 반환값에 실패 station 목록/기대·실제 건수가
@@ -106,13 +105,15 @@ def _fake_predict(df: pd.DataFrame, model_name: str, exposure_col: str | None = 
 
 
 def test_target_timestamp_combines_date_hour_minute():
+    """20분 모델 grid와 무관하게 운영 5분 앵커를 정확히 보존한다."""
     assert ps._target_timestamp("2025-06-01", 17, 5) == pd.Timestamp("2025-06-01 17:05:00")
+    assert ps._target_timestamp("2025-06-01", 17, 55) == pd.Timestamp("2025-06-01 17:55:00")
     assert ps._target_timestamp("2025-06-01", 17) == pd.Timestamp("2025-06-01 17:00:00")  # minute 기본값 0
 
 
 @pytest.mark.parametrize("hour,minute", [(24, 0), (-1, 0), (17, 7), (17, 60), (17, -5)])
-def test_target_timestamp_rejects_out_of_range(hour, minute):
-    """hour는 0~23, minute은 GRID_TICK_MINUTES의 배수(0~59)여야 한다."""
+def test_target_timestamp_rejects_invalid_serving_tick_or_range(hour, minute):
+    """hour는 0~23, minute은 SERVING_TICK_MINUTES의 배수(0~59)여야 한다."""
     with pytest.raises(ValueError):
         ps._target_timestamp("2025-06-01", hour, minute)
 
@@ -167,7 +168,7 @@ def test_build_feature_record_rejects_invalid_minute():
     _set_station_master(["A"])
     with pytest.raises(ValueError):
         ps._build_feature_record(
-            station_id="A", date="2025-06-01", hour=17, minute=7,  # GRID_TICK_MINUTES 배수 아님
+            station_id="A", date="2025-06-01", hour=17, minute=7,  # SERVING_TICK_MINUTES 배수 아님
             temp=20.0, precip=0.0, population=3000.0, stockout=False,
         )
 

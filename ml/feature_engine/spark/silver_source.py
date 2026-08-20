@@ -383,7 +383,7 @@ def read_weather(
     `_window_start`가 있으면 우선하고 없으면 물리 관측시각으로 fallback한다. 같은
     baseTime을 여러 collection tick에서 수정한 행을 observation time 하나로 collapse
     하면 최신값이 과거로 역전파되므로, collector의 각 availability tick을 보존한다.
-    5분 feature grid로의 과거 방향 forward-fill은 `build_merged_table.py`가 inference와
+    설정된 model grid로의 과거 방향 forward-fill은 `build_merged_table.py`가 inference와
     같은 최대 3시간 freshness 계약으로 담당한다.
 
     args:

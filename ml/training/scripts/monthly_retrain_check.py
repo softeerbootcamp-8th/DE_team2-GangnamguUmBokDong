@@ -54,7 +54,7 @@ import subprocess
 import sys
 
 from core import s3 as s3_io
-from ml_core import common_config
+from ml_core import common_config, profile_contract
 from ml_core.paths import (
     ML_ROOT,
     archive_models_prefix,
@@ -226,12 +226,31 @@ def _validate_candidate_serving_contract(profile_name: str, env_overrides: dict[
             피처 계약과 다를 때
     """
     try:
-        candidate_profile = common_config._load_profile(profile_name)
+        loaded_profile = common_config._load_profile(profile_name)
+        candidate_profile = loaded_profile.copy()
         subprocess_env = _monthly_subprocess_env(profile_name, env_overrides)
         for key in SERVING_FEATURE_PROFILE_KEYS:
+            if key == "TRAIN_ANCHOR_TICK_MINUTES":
+                continue
             raw_value = subprocess_env.get(key)
             if raw_value is not None:
                 candidate_profile[key] = int(raw_value)
+        candidate_profile["TRAIN_ANCHOR_TICK_MINUTES"] = common_config._resolved_train_anchor_tick(
+            loaded_profile,
+            int(candidate_profile["GRID_TICK_MINUTES"]),
+            env=subprocess_env,
+        )
+        profile_contract.validate_model_grid_contract(
+            int(candidate_profile["GRID_TICK_MINUTES"]),
+            int(candidate_profile["ROLLING_TICK_MINUTES"]),
+            int(candidate_profile["TARGET_HORIZON_MINUTES"]),
+            f"후보 {profile_name}",
+        )
+        profile_contract.validate_train_anchor_contract(
+            int(candidate_profile["GRID_TICK_MINUTES"]),
+            int(candidate_profile["TRAIN_ANCHOR_TICK_MINUTES"]),
+            f"후보 {profile_name}",
+        )
     # 한 후보의 S3/파싱 실패는 다음 후보로 격리하되 KeyboardInterrupt/SystemExit은
     # Exception 바깥이라 정상적으로 전파한다.
     except Exception as exc:

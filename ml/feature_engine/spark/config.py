@@ -79,6 +79,7 @@ ROLLING_EMBARGO_MINUTES = common_config.ROLLING_EMBARGO_MINUTES
 # 간격의 모든 T에 대해 예측 (build_targets.py의 future_rolling_counts()).
 TARGET_HORIZON_MINUTES = common_config.TARGET_HORIZON_MINUTES
 GRID_TICK_MINUTES = common_config.GRID_TICK_MINUTES
+TRAIN_ANCHOR_TICK_MINUTES = common_config.TRAIN_ANCHOR_TICK_MINUTES
 
 # --- 배치예측 horizon 개수 (common_config.py에서 공유 — build_multi_horizon_features.py 참고) ---
 HORIZON_COUNT = common_config.HORIZON_COUNT
@@ -93,6 +94,9 @@ PARAM_COMBO_ID = os.environ.get(
     "FEATURE_PARAM_COMBO_ID",
     f"w{ROLLING_WINDOW_MINUTES}_e{ROLLING_EMBARGO_MINUTES}_t{ROLLING_TICK_MINUTES}",
 )
+# FEATURE_PARAM_COMBO_ID를 직접 지정하면 자동 w/e/t 격리를 우회한다. 서로 다른
+# base 조합에 같은 custom ID를 재사용하지 않을 책임은 호출자에게 있다. anchor
+# 밀도는 아래 training_anchor_aN namespace가 별도로 격리한다.
 # libs/ml_core/paths.py의 FEATURE_ENGINEERING_OUTPUT_DIR과 동일 공식
 # ("processed/features/{조합ID}") — dev/S3_DATA_CATALOG.md의 prefix를 따른다.
 _OUTPUT_PREFIX = os.environ.get("FEATURE_ENGINEERING_OUTPUT_PREFIX", "processed/features")
@@ -107,12 +111,17 @@ MERGED_TABLE_PARQUET = f"{OUTPUT_ROOT}/station_hour_merged_2025.parquet"
 # 점검할 때 필요(Spark 리더/라이터는 FEATURES_TABLE_PARQUET(s3a://)를 그대로 씀).
 FEATURES_TABLE_KEY = f"{OUTPUT_ROOT_KEY}/station_hour_features_2025.parquet"
 FEATURES_TABLE_PARQUET = _s3a(FEATURES_TABLE_KEY)
-# FEATURES_TABLE_PARQUET의 각 행(T0)을 horizon=1..HORIZON_COUNT로 self-join한 학습 테이블
-# (build_multi_horizon_features.py). 대여/반납이 서로 다른 lag/타겟을 쓰는 완전히
-# 분리된 데이터셋이라 출력도 둘로 나뉜다 — libs/ml_core/paths.py의 같은 이름
-# 상수와 동일 공식.
-RENTAL_MULTI_HORIZON_FEATURES_TABLE_PARQUET = f"{OUTPUT_ROOT}/station_hour_features_multihorizon_rental_2025.parquet"
-RETURN_MULTI_HORIZON_FEATURES_TABLE_PARQUET = f"{OUTPUT_ROOT}/station_hour_features_multihorizon_return_2025.parquet"
+# FEATURES_TABLE_PARQUET의 각 행(T0)을 horizon=1..HORIZON_COUNT로 self-join한 학습
+# 테이블(build_multi_horizon_features.py). base feature는 anchor 밀도와 무관해
+# OUTPUT_ROOT에서 재사용하고, 최종 학습 테이블만 a5/a20처럼 별도 namespace에 둬
+# 같은 grid의 A/B 결과가 서로 덮어쓰이지 않게 한다. libs/ml_core/paths.py와 동일 공식.
+_TRAINING_ANCHOR_OUTPUT_ROOT = f"{OUTPUT_ROOT}/training_anchor_a{TRAIN_ANCHOR_TICK_MINUTES}"
+RENTAL_MULTI_HORIZON_FEATURES_TABLE_PARQUET = (
+    f"{_TRAINING_ANCHOR_OUTPUT_ROOT}/station_hour_features_multihorizon_rental_2025.parquet"
+)
+RETURN_MULTI_HORIZON_FEATURES_TABLE_PARQUET = (
+    f"{_TRAINING_ANCHOR_OUTPUT_ROOT}/station_hour_features_multihorizon_return_2025.parquet"
+)
 WATERMARK_PATH = f"{OUTPUT_ROOT_KEY}/_watermark.json"
 
 # --- 증분 재생성 시 얼마나 과거까지 다시 계산해서 겹치는 구간을 보정할지 (common_config.py에서 공유) ---

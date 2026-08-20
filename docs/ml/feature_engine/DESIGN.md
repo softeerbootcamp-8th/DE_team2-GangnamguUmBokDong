@@ -17,7 +17,7 @@
 테스트로 검증된 그대로), 파일 경로는 전부 `feature_engine/spark/` 기준으로
 읽을 것 — pandas 파일명이 나오면 그 로직이 지금은 어느 Spark 모듈에
 대응하는지 [feature_engine/README.md](../../../ml/feature_engine/README.md)의
-표를 참고. 5분 tick/피처 목록 등 구체적인 수치는 이후 세션에서 피처 축소와
+표를 참고. tick/피처 목록 등 구체적인 수치는 이후 세션에서 피처 축소와
 프로필화로 또 한 번 바뀌었다 — 이 문서에서 그 변경을 반영한 부분은
 "(2026-08 갱신)"으로 표시해뒀고, 나머지(그리드 설계 이유, dtype 다운캐스트
 근거, Spark 포팅 함정 등 인과관계 설명)는 여전히 유효하다.
@@ -70,23 +70,32 @@ self-test 검증). 그 외 주의점: 집계는 "그 시간대에 가장 오래 
 모든 원본 인코딩은 cp949(`data/raw*`)이고, 이미 UTF-8로 디코딩된
 `data/processed/utf8_*`만 예외 — 놓치면 한글 컬럼명이 깨진다.
 
-**0.5 최종 병합 테이블 및 검증**(당시 시간 단위 그리드 기준, 이후 §1에서 tick
-단위 그리드로 전환 — 지금은 5분): 2,582개 활성 정류소 × 8,760시간 = 22,618,320행. `rental_count`/
+**0.5 최종 병합 테이블 및 검증**(당시 시간 단위 그리드 기준, 이후 §1에서
+설정 가능한 tick 그리드로 전환): 2,582개 활성 정류소 × 8,760시간 = 22,618,320행. `rental_count`/
 `return_count` 합계가 원본 트립 집계와 정확히 일치, 재고 스냅샷 매칭률 98.91%,
 생활인구 매칭률(pop_total>0) 99.69% — station 수(2,582)가 기존 EDA의
 전체 정류소 수(2,835)보다 적은 건 "2025년 트립 1건 이상"만 포함해서다(정상).
 
-## 1. 그리드 — station × 5분 tick
+## 1. 그리드 — station × 설정된 model tick
 
 `build_merged_table.py`가 만드는 그리드의 각 행은 `(station_id, hour_ts)`이고
-`hour_ts`는 `GRID_TICK_MINUTES`(운영 계약 **5분**, 단일 소스는
-`libs/ml_core/profile_contract.py`) 단위 tick이다(컬럼명은 하위 호환을 위해 그대로 유지 — 항상
-정시라고 가정하면 안 됨). 두 가지 이유가 겹쳐서 시간 단위가 아니라 tick
-그리드를 쓰게 됐다:
+`hour_ts`는 `GRID_TICK_MINUTES` 단위 tick이다(컬럼명은 하위 호환을 위해
+그대로 유지 — 항상 정시라고 가정하면 안 됨). 기본 계약은
+`GRID_TICK_MINUTES=20`, `ROLLING_TICK_MINUTES=20`,
+`TRAIN_ANCHOR_TICK_MINUTES=20`인 **g20/r20/a20**이다. g/r은 같은 값이어야
+하며 `{5, 10, 15, 20, 30, 60}`분 중 선택할 수 있다. multi-horizon 단계는
+base grid의 일부만 학습 행으로 남기는 별도 anchor 간격(a)을 지원한다. a를
+생략하면 g와 같고, 명시하면 g 이상인 배수이면서 1시간과 1일을 나눠야 한다.
 
-- **임의 시각 예측**: "3시 40분 기준 앞으로 1시간" 같은 예측을 하려면 타겟/그리드
-  자체가 그 해상도를 가져야 한다. `build_targets.py`의 `future_rolling_counts()`가
-  "[T, T+1시간) 시작 건수"를 tick마다 계산하는 sparse step function을 만든다.
+온라인 서빙은 이 model grid와 별개로 5분 고정이다. 따라서 기본 20분 모델도
+00/05/10/15… 시점에 추론하며, 실시간 피처는 요청 시각 기준으로 계산한다.
+두 가지 이유가 겹쳐서 단일 시간 단위가 아니라 설정 가능한 tick 그리드를 쓴다:
+
+- **학습 anchor별 라벨**: 선택한 base grid의 각 T에 대해
+  `build_targets.py`의 `future_rolling_counts()`가 "[T, T+1시간) 시작 건수"를
+  sparse step function으로 만든다. 5분 서빙이 곧 5분 학습 grid를 요구한다는
+  뜻은 아니다. 기본 g20 모델은 학습에 없던 05/10/15분에도 일반화해 예측하며,
+  그 성능은 공통 5분 test mart에서 별도로 검증한다.
 - **station 생애주기**: `station_status`(재고 스냅샷)에 실제 관측이 있는 시간만
   tick으로 펼쳐서 그리드로 쓴다 — 폐쇄/휴업 구간은 그리드에 아예 안 들어가서
   "서비스 없음"이 "수요 0"으로 잘못 학습되지 않는다.
@@ -97,7 +106,7 @@ sparse 타겟/rolling 카운트를 그리드의 특정 tick에서 조회하려�
 
 ## 2. lag/rolling — 시간 기준(gap-aware), tick 밀도 무관
 
-그리드가 tick 단위(시간당 여러 행, 현재 5분=시간당 12행)가 되면서
+그리드가 tick 단위(시간당 여러 행, 기본 20분=시간당 3행)가 되면서
 "N번째 이전 행 == N시간 전"이 더 이상 성립하지 않는다(예전 시간 단위
 그리드에서는 항상 dense해서 성립했음). 그래서:
 
@@ -189,7 +198,8 @@ Silver(`silver/station/`, `silver/bike_rental_history/`,
 이제 그 중간 산출물이 놓이는 S3 키 prefix 이름으로만 남음).
 
 날씨 중간 산출물은 시간별 최신값 하나가 아니라 실제 collection tick별 유효 서울
-격자 평균을 보존한다. 병합 단계는 weather만 `lead`/`sequence`로 5분 tick에 먼저
+격자 평균을 보존한다. 병합 단계는 weather만 `lead`/`sequence`로 설정된 model
+grid tick에 먼저
 펼쳐 다음 관측 직전 또는 최대 3시간까지 과거 방향으로 채운 뒤 station grid와
 exact join한다. 최신 tick을 같은 시간 전체에 붙이지 않으므로 미래 관측 누수가
 없고, 최대 3시간 lookback하는 inference와 freshness 경계도 같다. window 첫 tick을
@@ -198,8 +208,9 @@ exact join한다. 최신 tick을 같은 시간 전체에 붙이지 않으므로 
 
 또한 최종 산출물이 테이블 1개(`station_hour_features_2025.parquet`)가
 아니라 **대여/반납 각각의 multi-horizon 테이블 2개**다 —
-`build_multi_horizon_features.py`가 tick 단위 테이블(horizon=1)의 각 행을
-"지금(anchor_ts)"으로 놓고 horizon=1..`HORIZON_COUNT`(기본 12, 1시간
+`build_multi_horizon_features.py`가 base tick 테이블(horizon=1)에서
+`TRAIN_ANCHOR_TICK_MINUTES`에 맞는 행을 "지금(anchor_ts)"으로 놓고
+horizon=1..`HORIZON_COUNT`(기본 12, 1시간
 단위)만큼 self-join해 확장한다: lag(`rental_lag_1h`/`return_lag_1h`)는
 anchor_ts 기준으로 고정하고, 날씨/인구/캘린더/타겟 카운트는 그 미래
 target_ts(anchor_ts+(horizon-1)시간) 기준 실제 값을 쓴다 — 별도 모델을
@@ -208,3 +219,9 @@ horizon마다 두거나 예측을 재귀적으로 다음 입력에 먹이는 대
 상대방의 lag를 안 보므로 이 self-join과 결과 테이블 모두 완전히 분리해서
 순차로 만든다(원본의 최대 `HORIZON_COUNT`배 행 수로 불어나는 무거운
 연산이라, 둘을 동시에 메모리에 안 띄우려는 목적도 있음).
+
+해상도 A/B의 표준 arm은 A=g20/r20/a20, B=g5/r5/a20,
+C=g5/r5/a5다. A와 B의 공통 00/20/40분 anchor는 feature/label parity를 먼저
+확인하고, 실제 정확도 비교는 세 모델을 동일한 독립 5분 test mart에서 평가한다.
+각 arm이 자기 anchor 밀도로 만든 test 지표끼리 직접 비교하면 표본이 달라
+결론을 낼 수 없다.

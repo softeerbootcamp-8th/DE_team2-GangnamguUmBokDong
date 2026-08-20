@@ -1,13 +1,13 @@
 # Point-in-Time 대여 카운트 (Train-Serving Skew 대응)
 
-**(2026-08 갱신 — "5분"이 두 가지 다른 의미로 섞여 있던 걸 분리한다)**
-이 문서 전체에서 "5분"은 두 가지를 가리킨다: ① 서빙(추론) 갱신 주기,
-② 학습 feature grid와 rolling 계산의 tick 간격. 현재 운영 계약은 둘 다
-**5분**이다(Airflow `realtime_5min` DAG가 `predict_single.py --all-stations`를
-5분마다 호출하고, `GRID_TICK_MINUTES`/`ROLLING_TICK_MINUTES`도 5분으로
-검증한다). rolling 폭은 60분, 현재 embargo는 40분이다. 정확한 기본값의 단일
-소스는 `libs/ml_core/profile_contract.py`이며 원격 프로필도 5분 tick 계약을
-벗어나면 로딩 단계에서 실패한다.
+**(2026-08 갱신 — 서로 다른 세 가지 간격을 분리한다)** 운영 추론 호출 주기는
+`SERVING_TICK_MINUTES=5`로 고정이다. 과거 feature/target과 rolling을 계산하는
+모델 grid는 기본 20분(`GRID_TICK_MINUTES`/`ROLLING_TICK_MINUTES`)이고, 실제 학습
+행 밀도는 `TRAIN_ANCHOR_TICK_MINUTES`가 정한다(기본 g20/r20/a20, 비교용
+g5/r5/a5 또는 g5/r5/a20 등). g/r은 같은 값으로
+`{5, 10, 15, 20, 30, 60}`분을 지원한다. rolling 폭은 60분, 현재 embargo는
+40분이다. 정확한 기본값과 허용
+조합의 단일 소스는 `libs/ml_core/profile_contract.py`다.
 
 이 문서는 실시간 서빙 롤링 피처에서 발생하는 **우측 절단
 (right-censoring) train-serving skew**를 다룬다. 핵심 로직(`ml_core/rolling_window_features.py`,
@@ -66,7 +66,8 @@ offset으로 다루고 있다 ([training/DESIGN.md](training/DESIGN.md) 2절). �
 ```
 
 현재 기본값: `width=60분, embargo=40분` — "40분 전부터 1시간 40분 전까지"를
-본다. 5분 틱(`tick=5분`)마다 이 값을 다시 계산해 서빙 갱신 주기를 맞춘다.
+본다. 배치 학습 피처는 설정된 model grid(기본 20분)에서 계산하고, 서빙은
+각 5분 요청 시각에서 같은 윈도우 정의를 직접 계산한다.
 
 **실측 효과 비교** (2025-06 데이터 기준, 전체 트립 대비 그 순간 관측 가능한 비율):
 
@@ -143,23 +144,24 @@ MLflow 지표로 확인한다. 폭을 넓혀 표본을 늘리고 최신 구간(�
 추린다 (`build_targets.py`의 `_normalize_station_no()` 재사용 — 로직 중복을 피함).
 
 **`build_rolling_rental_features()`**: `censored_rolling_counts()`로 모든
-station의 point-in-time 카운트를 5분 틱 grid에서 계산한다.
+station의 point-in-time 카운트를 `ROLLING_TICK_MINUTES` grid(기본 20분)에서
+계산한다.
 
-- **스코프**: 2025년, 로컬 파일 기준 (S3/Spark는 후속 과제 — 지금은
-  `data/parquet/`에서 직접 읽는 로컬 배치 스크립트)
-- **출력**: `data/processed_v2/rolling_rental_features_2025.parquet` —
-  `station_id, tick, count` (sparse step function, **46,930,933행**, 2,580개 정류소)
-- **실측 완료율**: 2절 표 참고 (88.2%)
+- **소스**: 날짜별 Archive `bike_rental_history`; station 매칭은
+  `silver_source.read_rental_trips()`가 담당하고 누락 partition은 fail-closed한다.
+- **출력**: S3의 profile-scoped rolling feature 경로 —
+  `station_id, tick, count` sparse step function.
+- **과거 실측**: 로컬 2025 데이터의 5분 실험은 46,930,933행/2,580개 정류소였고,
+  당시 완료율은 2절 표의 88.2%였다. 이는 현행 기본 20분 산출물 크기가 아니다.
 
 **브루트포스 교차검증**: 임의의 (station, 시각) 4개를 골라 "trips를 직접
 필터링해서 센 값"과 `lookup_count_at_ticks()` 조회값을 대조해 전부 일치함을
 확인했다 — 위에서 언급한 `merge_asof` 정렬 버그를 여기서 처음 잡아냈다.
 
-**dense grid는 안 만든다** — station×5분틱 전체 조합(2,580개 정류소 ×
-105,120틱(2025년) ≈ 2.71억 행)을 미리 채우는 대신, 아래 4-2절처럼 실제로
-필요한 **시간 단위** 그리드의 tick에서만 `lookup_count_at_ticks()`로 조회한다
-(5분 단위 모델을 학습하기로 하면 그때는 이 방식대로 시간 단위 대신 5분 단위
-grid를 만들면 된다 — 7절 참고).
+**dense rolling grid는 안 만든다** — 과거 5분 예시의 station×tick 전체 조합은
+2,580개 정류소 × 105,120틱 ≈ 2.71억 행이다. 이를 미리 채우지 않고 sparse
+step function을 만든 뒤, 실제 base feature grid(g20 또는 선택한 g5 등)의
+tick에서 `lookup_count_at_ticks()`로 조회한다.
 
 ---
 
@@ -285,8 +287,9 @@ cd ml
 
 ## 7. 다음 단계 후보 (2026-08 기준 갱신)
 
-1. ~~실제로 5분 단위 LightGBM 모델을 학습하기로 하면...~~ **완료** — 학습과
-   추론 모두 5분 tick(`GRID_TICK_MINUTES`) 계약을 사용한다.
+1. 기본 g20/r20/a20 모델과 g5/r5/a5 또는 g5/r5/a20 모델을 동일한 공통 5분 test set에서
+   비교해 학습 비용 대비 5분 추론 성능을 검증한다. 현재 코드는 각 조합을 재현하고
+   산출물을 격리하지만, 정확도 우열 자체는 별도 평가 대상이다.
 2. `count_visible_in_window()`를 실제 서빙 모듈에서 import하거나 로직을
    포팅 — `predict_single.py`는 여전히 "실시간 서빙을 흉내내는 배치/CLI"이지
    상시 구동 서버가 아니다(§6 "실시간 트립 카운트 스토어" 참고, 이 저장소엔

@@ -55,18 +55,22 @@ def test_load_profile_uses_builtin_default_without_querying_s3(monkeypatch):
     profile = common_config._load_profile()
 
     assert common_config._selected_profile_name() == common_config.BUILTIN_PROFILE_NAME
-    assert profile == common_config._DEFAULT_PROFILE
-    assert profile["GRID_TICK_MINUTES"] == 5
+    assert profile == {
+        **common_config._DEFAULT_PROFILE,
+        "TRAIN_ANCHOR_TICK_MINUTES": 20,
+    }
+    assert profile["GRID_TICK_MINUTES"] == 20
+    assert profile["TRAIN_ANCHOR_TICK_MINUTES"] == 20
 
 
 def test_load_profile_does_not_let_stale_s3_default_override_implicit_builtin(monkeypatch):
     s3_io.write_json(
         "profiles/default.json",
-        {**common_config._DEFAULT_PROFILE, "GRID_TICK_MINUTES": 20, "ROLLING_TICK_MINUTES": 20},
+        {**common_config._DEFAULT_PROFILE, "GRID_TICK_MINUTES": 5, "ROLLING_TICK_MINUTES": 5},
     )
     monkeypatch.delenv("ML_PROFILE", raising=False)
 
-    assert common_config._load_profile()["GRID_TICK_MINUTES"] == 5
+    assert common_config._load_profile()["GRID_TICK_MINUTES"] == 20
 
 
 def test_load_profile_fails_when_explicit_s3_profile_is_missing(monkeypatch):
@@ -124,13 +128,93 @@ def test_load_profile_propagates_explicit_s3_failure(monkeypatch):
         common_config._load_profile()
 
 
-def test_load_profile_rejects_non_five_minute_profile(monkeypatch):
-    invalid = {**common_config._DEFAULT_PROFILE, "GRID_TICK_MINUTES": 20, "ROLLING_TICK_MINUTES": 20}
-    s3_io.write_json("profiles/old-20min.json", invalid)
-    monkeypatch.setenv("ML_PROFILE", "old-20min")
+def test_load_profile_accepts_explicit_five_minute_experiment(monkeypatch):
+    experimental = {**common_config._DEFAULT_PROFILE, "GRID_TICK_MINUTES": 5, "ROLLING_TICK_MINUTES": 5}
+    s3_io.write_json("profiles/five-minute-experiment.json", experimental)
+    monkeypatch.setenv("ML_PROFILE", "five-minute-experiment")
 
-    with pytest.raises(ValueError, match=r"운영 계약\(5분\)"):
+    profile = common_config._load_profile()
+
+    assert profile["GRID_TICK_MINUTES"] == 5
+    assert profile["ROLLING_TICK_MINUTES"] == 5
+
+
+@pytest.mark.parametrize("tick_minutes", [5, 10, 15, 20, 30, 60])
+def test_profile_accepts_supported_model_grids(tick_minutes):
+    """한 시간과 하루를 나누는 5분 배수 model grid는 비교 프로필로 사용할 수 있다."""
+    profile = profile_contract.merge_and_validate_profile(
+        {
+            "GRID_TICK_MINUTES": tick_minutes,
+            "ROLLING_TICK_MINUTES": tick_minutes,
+        },
+        f"grid-{tick_minutes}",
+    )
+
+    assert profile["GRID_TICK_MINUTES"] == tick_minutes
+    assert profile["TRAIN_ANCHOR_TICK_MINUTES"] == tick_minutes
+
+
+def test_load_profile_rejects_unsupported_model_grid(monkeypatch):
+    invalid = {**common_config._DEFAULT_PROFILE, "GRID_TICK_MINUTES": 25, "ROLLING_TICK_MINUTES": 25}
+    s3_io.write_json("profiles/unsupported-grid.json", invalid)
+    monkeypatch.setenv("ML_PROFILE", "unsupported-grid")
+
+    with pytest.raises(ValueError, match="지원하는 모델 grid"):
         common_config._load_profile()
+
+
+def test_load_profile_rejects_mismatched_grid_and_rolling_ticks(monkeypatch):
+    invalid = {**common_config._DEFAULT_PROFILE, "GRID_TICK_MINUTES": 5, "ROLLING_TICK_MINUTES": 20}
+    s3_io.write_json("profiles/mismatched-grid.json", invalid)
+    monkeypatch.setenv("ML_PROFILE", "mismatched-grid")
+
+    with pytest.raises(ValueError, match="같아야 합니다"):
+        common_config._load_profile()
+
+
+def test_profile_rejects_grid_that_does_not_divide_target_horizon():
+    invalid = {
+        **common_config._DEFAULT_PROFILE,
+        "TARGET_HORIZON_MINUTES": 50,
+    }
+
+    with pytest.raises(ValueError, match="타겟 구간"):
+        profile_contract.validate_profile(invalid, "invalid-horizon")
+
+
+def test_profile_accepts_five_minute_grid_with_twenty_minute_training_anchor():
+    """5분 base feature를 유지하면서 20분마다 학습하는 hybrid 계약을 허용한다."""
+    profile = profile_contract.merge_and_validate_profile(
+        {
+            "GRID_TICK_MINUTES": 5,
+            "ROLLING_TICK_MINUTES": 5,
+            "TRAIN_ANCHOR_TICK_MINUTES": 20,
+        },
+        "hybrid",
+    )
+
+    assert profile["TRAIN_ANCHOR_TICK_MINUTES"] == 20
+
+
+@pytest.mark.parametrize(
+    ("grid_tick", "anchor_tick"),
+    [
+        (20, 10),
+        (20, 30),
+        (15, 20),
+        (5, 25),
+    ],
+)
+def test_profile_rejects_incompatible_training_anchor(grid_tick, anchor_tick):
+    """학습 anchor는 base grid의 성긴 부분집합이며 매시간 같은 위상을 가져야 한다."""
+    overrides = {
+        "GRID_TICK_MINUTES": grid_tick,
+        "ROLLING_TICK_MINUTES": grid_tick,
+        "TRAIN_ANCHOR_TICK_MINUTES": anchor_tick,
+    }
+
+    with pytest.raises(ValueError, match="TRAIN_ANCHOR_TICK_MINUTES"):
+        profile_contract.merge_and_validate_profile(overrides, "invalid-anchor")
 
 
 def test_load_profile_rejects_reserved_profile_name_metadata(monkeypatch):
@@ -174,7 +258,127 @@ def test_effective_profile_includes_environment_overrides_in_fresh_process():
 
     assert snapshot["ROLLING_EMBARGO_MINUTES"] == 55
     assert snapshot["LGB_PARAMS_COMMON"]["num_leaves"] == 7
+    assert snapshot["GRID_TICK_MINUTES"] == 20
+    assert snapshot["TRAIN_ANCHOR_TICK_MINUTES"] == 20
+
+
+def test_effective_profile_preserves_explicit_five_minute_grid_overrides():
+    """5분 A/B 실험은 grid와 rolling을 함께 override하면 아티팩트에 그대로 남아야 한다."""
+    env = _fresh_process_env(
+        GRID_TICK_MINUTES="5",
+        ROLLING_TICK_MINUTES="5",
+    )
+    env.pop("ML_PROFILE", None)
+    code = (
+        "import json; from ml_core import common_config; "
+        "print(json.dumps(common_config.effective_profile()))"
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    snapshot = json.loads(result.stdout)
+
     assert snapshot["GRID_TICK_MINUTES"] == 5
+    assert snapshot["ROLLING_TICK_MINUTES"] == 5
+    assert snapshot["TRAIN_ANCHOR_TICK_MINUTES"] == 5
+
+
+def test_effective_profile_preserves_explicit_hybrid_training_anchor():
+    """canonical anchor override는 5분 base grid 위 20분 thinning으로 기록돼야 한다."""
+    env = _fresh_process_env(
+        GRID_TICK_MINUTES="5",
+        ROLLING_TICK_MINUTES="5",
+        TRAIN_ANCHOR_TICK_MINUTES="20",
+    )
+    env.pop("ML_PROFILE", None)
+    code = (
+        "import json; from ml_core import common_config; "
+        "print(json.dumps(common_config.effective_profile()))"
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    snapshot = json.loads(result.stdout)
+
+    assert snapshot["GRID_TICK_MINUTES"] == 5
+    assert snapshot["TRAIN_ANCHOR_TICK_MINUTES"] == 20
+
+
+def test_redundant_grid_environment_preserves_explicit_hybrid_profile_anchor():
+    """명시적 g5/a20 프로필은 redundant GRID/ROLLING=5 환경에서도 a20을 유지해야 한다."""
+    profile = profile_contract.merge_and_validate_profile(
+        {
+            "GRID_TICK_MINUTES": 5,
+            "ROLLING_TICK_MINUTES": 5,
+            "TRAIN_ANCHOR_TICK_MINUTES": 20,
+        },
+        "hybrid",
+    )
+
+    resolved = common_config._resolved_train_anchor_tick(
+        profile,
+        grid_tick=5,
+        env={"GRID_TICK_MINUTES": "5", "ROLLING_TICK_MINUTES": "5"},
+    )
+
+    assert resolved == 20
+
+
+@pytest.mark.parametrize(
+    ("legacy_env", "expected"),
+    [
+        ({"MULTI_HORIZON_ANCHOR_TICK_MINUTES": "60"}, 60),
+        ({"MULTI_HORIZON_ANCHOR_HOURLY_ONLY": "1"}, 60),
+    ],
+)
+def test_legacy_anchor_environment_aliases_are_materialized(legacy_env, expected):
+    """기존 anchor 환경변수도 검증 후 canonical effective profile로 기록한다."""
+    env = _fresh_process_env(**legacy_env)
+    env.pop("ML_PROFILE", None)
+    code = (
+        "import json; from ml_core import common_config; "
+        "print(json.dumps(common_config.effective_profile()))"
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+    assert json.loads(result.stdout)["TRAIN_ANCHOR_TICK_MINUTES"] == expected
+
+
+def test_conflicting_anchor_environment_aliases_fail_closed():
+    """canonical/legacy 환경변수가 서로 다른 학습 밀도를 요구하면 import가 실패해야 한다."""
+    env = _fresh_process_env(
+        TRAIN_ANCHOR_TICK_MINUTES="20",
+        MULTI_HORIZON_ANCHOR_TICK_MINUTES="60",
+    )
+    env.pop("ML_PROFILE", None)
+
+    result = subprocess.run(
+        [sys.executable, "-c", "from ml_core import common_config"],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+    assert result.returncode != 0
+    assert "서로 충돌" in result.stderr
 
 
 def test_profile_registry_import_does_not_require_valid_runtime_profile():

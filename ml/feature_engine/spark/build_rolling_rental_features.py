@@ -40,7 +40,7 @@ def build_rolling_rental_features(
     since: str | None = None,
     until: str | None = None,
 ) -> DataFrame:
-    """station별 point-in-time 대여 카운트를 5분 틱 grid에서 계산한다 (호출부가 저장 여부/방식을 결정).
+    """station별 point-in-time 대여 카운트를 모델 tick grid에서 계산한다.
 
     args:
         spark: SparkSession

@@ -1,7 +1,7 @@
 # feature_engine — 실행 방법
 
 collector/nowcaster가 S3(MinIO)의 일별 Archive에 확정한 원본(대여이력, 정류소 재고,
-날씨, 250m 생활인구)을 station×5분 tick 단위로 병합하고 lag/rolling feature를
+날씨, 250m 생활인구)을 station×모델 tick(기본 20분) 단위로 병합하고 lag/rolling feature를
 붙여, `training/`이 바로 학습할 수 있는 대여/반납 multi-horizon feature 테이블
 2개를 만든다.
 
@@ -30,10 +30,9 @@ legacy pandas 폴더는 저장소에서 완전히 삭제됐다.
 전체를 평균낸다. ASOS bootstrap은 mapping의 `_window_start`가 날짜 자정이므로
 `baseDate+baseTime` 물리 관측시각을 쓰며, 메타 없는 legacy도 두 값 중 가능한 시각으로
 fallback한다. 병합할 때 작은 weather
-테이블만 5분 grid로 과거 방향 forward-fill하고, 다음 관측 전·최대 3시간까지만
-exact join한다. 그래서 08:00 행은 08:00에 알 수 있던 값, 08:50 행은 직전 값,
-08:55 행은 08:55에 새로 도착한 값을 쓰며 미래 tick이 같은 시간의 과거 행으로
-역전파되지 않는다. 최초 window 시작점에도 같은 fallback을 적용하려고 weather
+테이블만 모델 grid로 과거 방향 forward-fill하고, 다음 관측 전·최대 3시간까지만
+exact join한다. 각 모델 tick은 그 시점까지 도착한 최신 관측만 쓰므로 미래 관측이
+같은 시간의 과거 행으로 역전파되지 않는다. 최초 window 시작점에도 같은 fallback을 적용하려고 weather
 중간 산출물만 시작점 이전 3시간 source context를 보존한다.
 
 ## 세팅
@@ -77,8 +76,8 @@ Archive에 2026년 행이 이미 있어도 위 최초 빌드의 최종 시계열
 들어간다. 유일한 예외는 첫 2025 target tick의 as-of 조회에 필요한 weather 중간
 산출물의 2024-12-31 21:00 이후 context이며, 최종 feature 행 범위에는 포함되지 않는다.
 타겟은 `[T,T+60분)` 전체가 이 경계 안에서 완결된 기준시각만 사용하므로, 2026년
-outcome 없이는 정답을 완성할 수 없는 12월 31일 23:05~23:55 tick은 조용히 0으로
-잘라 넣지 않고 제외한다(마지막 완결 tick은 23:00).
+outcome 없이는 정답을 완성할 수 없는 12월 31일 23:00 이후 tick은 조용히 0으로
+잘라 넣지 않고 제외한다(기본 20분 grid와 5분 실험 grid 모두 마지막 완결 tick은 23:00).
 
 Archive reader는 glob이 아니라 경계가 닿는 날짜의 flat 파일 목록을 직접 만든다.
 weather는 첫 tick의 최대 3시간 전 context부터, rental target은 앞쪽
@@ -102,8 +101,11 @@ target이 `[2025-02-13, 2025-02-18)`이고 lookback=24시간, safety=7일이면 
 덮어쓸 걱정 없이 `ROLLING_EMBARGO_MINUTES=45 ./feature_engine/.venv/bin/python -m feature_engine.spark.run_pipeline`처럼
 환경변수만 바꿔 실행하면 된다(또는 `ML_PROFILE=embargo45`로 S3 프로필째 교체 —
 [ml_core README](../../libs/ml_core/README.md)). `ML_PROFILE` 미지정 시 쓰는 내장
-`builtin-default` 값: **5분 tick**(`GRID_TICK_MINUTES`/`ROLLING_TICK_MINUTES`), 60분 rolling
-window, 40분 embargo, horizon 1~12(`HORIZON_COUNT`).
+`builtin-default` 값: **20분 모델 tick**(`GRID_TICK_MINUTES`/`ROLLING_TICK_MINUTES`),
+**20분 학습 anchor**(`TRAIN_ANCHOR_TICK_MINUTES`), 60분 rolling window, 40분
+embargo, horizon 1~12(`HORIZON_COUNT`). 운영 추론 호출은 이 학습 grid와 별개로
+5분 주기다. A/B 검증에서는 g5/a5 또는 g5/a20처럼 base grid와 실제 학습 anchor를
+프로필로 명시하며, effective 값은 모델 artifact profile에 기록된다.
 
 `station_master_enriched`는 2025년 당시 snapshot이 존재한다고 보장할 수 없는
 serving용 current dimension이라 명시적 2025 window에서도 최신 snapshot을 사용한다.
@@ -133,19 +135,22 @@ cd ml
 | 키 | 만드는 단계 | 내용 |
 |---|---|---|
 | `processed_v2/station_master.parquet` 등 | `run_pipeline.py`의 `_refresh_primary_tables()` | Archive fact/current Silver master를 재집계한 중간 산출물 |
-| `{OUTPUT_ROOT}/station_hour_merged_2025.parquet` | `run_pipeline.py` | station×5분 tick 병합 테이블 |
+| `{OUTPUT_ROOT}/station_hour_merged_2025.parquet` | `run_pipeline.py` | station×모델 tick(기본 20분) 병합 테이블 |
 | `{OUTPUT_ROOT}/rolling_rental_features_2025.parquet` | `run_pipeline.py` | point-in-time censored 대여 카운트(sparse) |
 | `{OUTPUT_ROOT}/station_hour_features_2025.parquet` | `run_pipeline.py` | tick 단위 feature 테이블(horizon=1 전용, 중간 산출물) |
-| `{OUTPUT_ROOT}/station_hour_features_multihorizon_rental_2025.parquet` | `build_multi_horizon_features.py` | **최종 대여 학습 테이블** — `training.train_rental_model`이 읽는 입력 |
-| `{OUTPUT_ROOT}/station_hour_features_multihorizon_return_2025.parquet` | `build_multi_horizon_features.py` | **최종 반납 학습 테이블** — `training.train_return_model`이 읽는 입력 |
+| `{OUTPUT_ROOT}/training_anchor_a{N}/station_hour_features_multihorizon_rental_2025.parquet` | `build_multi_horizon_features.py` | **최종 대여 학습 테이블** — `training.train_rental_model`이 읽는 입력 |
+| `{OUTPUT_ROOT}/training_anchor_a{N}/station_hour_features_multihorizon_return_2025.parquet` | `build_multi_horizon_features.py` | **최종 반납 학습 테이블** — `training.train_return_model`이 읽는 입력 |
 
 `OUTPUT_ROOT`는 `{FEATURE_ENGINEERING_OUTPUT_PREFIX}/{FEATURE_PARAM_COMBO_ID}`
-(파라미터 조합마다 분리). `training`/`inference`는 `ml_core.paths`를 통해 이
+(base grid/rolling 파라미터 조합마다 분리). 최종 multi-horizon 테이블은 그 아래
+`training_anchor_a{TRAIN_ANCHOR_TICK_MINUTES}`로 한 번 더 분리되므로 같은 g5 base
+feature를 재사용하는 a5/a20 실험이 서로 덮어쓰지 않는다. `training`/`inference`는 `ml_core.paths`를 통해 이
 경로를 그대로 읽는다 — `libs/ml_core/paths.py`가 `feature_engine/spark/config.py`와
-정확히 같은 공식(`FEATURE_ENGINEERING_OUTPUT_ROOT`/`FEATURE_PARAM_COMBO_ID`
+정확히 같은 공식(`FEATURE_ENGINEERING_OUTPUT_PREFIX`/`FEATURE_PARAM_COMBO_ID`
 환경변수 포함)으로 계산하므로 별도 복사/심링크가 필요 없다. 다른 파라미터
 조합으로 실험할 때는 두 환경변수를 Spark 실행/training·inference 실행 양쪽에
-같은 값으로 설정할 것.
+같은 값으로 설정할 것. `FEATURE_PARAM_COMBO_ID`를 직접 지정하면 자동 w/e/t 이름을
+우회하므로, 서로 다른 base 조합에 같은 ID를 재사용하지 않을 책임은 호출자에게 있다.
 
 ## 피처 스키마
 

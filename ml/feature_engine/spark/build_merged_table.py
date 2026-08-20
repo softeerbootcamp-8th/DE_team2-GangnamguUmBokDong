@@ -1,11 +1,10 @@
-"""모든 소스를 station x tick(5분 간격) 기준으로 병합해 최종 feature 테이블의 입력을 만든다 (PySpark 포팅).
+"""모든 소스를 station x 모델 tick 기준으로 병합해 최종 feature 테이블의 입력을 만든다.
 
-**그리드가 시간(hour) 단위에서 5분 tick 단위로 바뀌었다** — `src/build_merged_table.py`
-(pandas)와 동일한 이유: "3시 40분 기준으로 앞으로 1시간"처럼 임의의 5분 단위 기준
-시각에서 예측하려면 그리드 자체가 그 해상도여야 한다(타겟은 이미
-`build_targets.py`에서 5분 tick sparse step function으로 바뀜). `hour_ts` 컬럼명은
-그대로 두지만(다른 파일들과의 접점이 많아 이름을 바꾸지 않음) 이제 5분 단위로도
-값을 가진다.
+기본 모델 설계는 `GRID_TICK_MINUTES=20`이므로 00/20/40분 anchor에서 feature와
+60분 target을 만든다. 다른 grid와의 A/B 검증은 GRID/ROLLING tick을 같은 지원값으로
+둔 별도 프로필로 같은 코드를 실행한다. 운영 추론 호출 주기(고정 5분)는 이 과거 학습
+테이블의 행 간격과 별개다. `hour_ts` 컬럼명은 다른 파일들과의 접점이 많아
+그대로 유지한다.
 
 `src/build_merged_table.py`(pandas, 로컬 검증용)와 **의도적으로 다른 부분이 하나
 있다** — station 활성 구간(그리드) 정의:
@@ -32,8 +31,8 @@ step function이라, 그리드의 각 (station, tick)에 대해 `lookup_count_at
 (그리드/날씨/인구처럼 "그 시점 이후 데이터만 있으면 되는" 소스와 다름).
 
 날씨는 실제 수집 tick별 서울 평균을 보존한 뒤, 각 관측을 다음 관측 직전 또는
-최대 3시간까지만 5분 grid로 과거 방향 forward-fill해 exact join한다. 따라서 같은
-시간 안의 08:55 관측이 08:00~08:50 행에 역전파되지 않는다. 생활인구만 원본의
+최대 3시간까지만 모델 grid로 과거 방향 forward-fill해 exact join한다. 따라서 미래
+관측이 앞선 모델 tick에 역전파되지 않는다. 생활인구만 원본의
 시간 단위 값을 정시로 내려서 그 시간의 tick들과 join한다.
 
 **메모리(dtype 최적화)**: `src/build_merged_table.py`의 `NATIVE_COLUMN_DTYPES`
@@ -54,6 +53,8 @@ from pyspark.sql.types import ByteType, FloatType, ShortType
 
 from . import config
 from .rolling_window_features import (
+    _ceil_to_seconds,
+    _floor_to_seconds,
     _seconds_to_ntz,
     _unix_seconds_ntz,
     lookup_count_at_ticks,
@@ -115,7 +116,7 @@ def _holidays_for_train_year() -> set[str]:
 def _expand_hourly_to_ticks(status: DataFrame, tick_minutes: int, spark: SparkSession) -> DataFrame:
     """station_status(시간 단위)를 tick_minutes 간격으로 펼친다 — 그리드 정의 + forward-fill을 동시에 한다.
 
-    station_status는 원본이 시간 단위(0~23시간대)뿐이라, 5분 tick 그리드를 만들려면
+    station_status는 원본이 시간 단위(0~23시간대)뿐이라, 모델 tick 그리드를 만들려면
     각 시간 관측을 그 시간에 속한 모든 tick으로 복제해야 한다(값은 그 시간 동안
     유지된다고 forward-fill). station_status에 실제 관측이 있는 시간만 이렇게
     펼쳐지므로, 이 결과 자체가 곧 "station 활성 구간" 그리드가 된다.
@@ -164,27 +165,58 @@ def _forward_fill_weather_to_ticks(
     if max_staleness_hours <= 0:
         raise ValueError("max_staleness_hours는 양수여야 합니다")
 
-    tick_interval = F.expr(f"INTERVAL {tick_minutes} MINUTES")
-    stale_interval = F.expr(f"INTERVAL {max_staleness_hours} HOURS")
+    tick_seconds = tick_minutes * 60
+    stale_seconds = max_staleness_hours * 60 * 60
     ordered = weather.withColumn(
         "_next_weather_ts",
         F.lead("hour_ts").over(Window.orderBy("hour_ts")),
     )
-    expires_at = F.col("hour_ts") + stale_interval
-    before_next = F.col("_next_weather_ts") - tick_interval
-    fill_through = F.when(
-        F.col("_next_weather_ts").isNull(),
-        expires_at,
-    ).otherwise(F.least(before_next, expires_at))
-    expanded = ordered.withColumn("_fill_through", fill_through).filter(
-        F.col("_fill_through") >= F.col("hour_ts")
+    with_seconds = (
+        ordered.withColumn("_weather_ts_seconds", _unix_seconds_ntz(F.col("hour_ts")))
+        .withColumn("_next_weather_ts_seconds", _unix_seconds_ntz(F.col("_next_weather_ts")))
+        .withColumn(
+            "_first_grid_tick_seconds",
+            _ceil_to_seconds(F.col("_weather_ts_seconds"), tick_seconds),
+        )
+        .withColumn(
+            "_last_fresh_tick_seconds",
+            _floor_to_seconds(F.col("_weather_ts_seconds") + F.lit(stale_seconds), tick_seconds),
+        )
     )
+    # next observation은 그 시각부터 유효하므로 `t < next_ts`를 만족하는 마지막
+    # 전역 정렬 grid tick은 ceil(next/tick)-tick이다. source revision이 모델
+    # grid보다 촘촘해도 각 grid tick 직전의 최신 관측 하나만 정확히 살아남는다.
+    last_before_next = (
+        _ceil_to_seconds(F.col("_next_weather_ts_seconds"), tick_seconds) - F.lit(tick_seconds)
+    )
+    expanded = with_seconds.withColumn(
+        "_last_grid_tick_seconds",
+        F.when(
+            F.col("_next_weather_ts_seconds").isNull(),
+            F.col("_last_fresh_tick_seconds"),
+        ).otherwise(F.least(last_before_next, F.col("_last_fresh_tick_seconds"))),
+    ).filter(F.col("_first_grid_tick_seconds") <= F.col("_last_grid_tick_seconds"))
     expanded = expanded.withColumn(
-        "_weather_tick",
-        F.explode(F.sequence(F.col("hour_ts"), F.col("_fill_through"), tick_interval)),
-    )
+        "_weather_tick_seconds",
+        F.explode(
+            F.sequence(
+                F.col("_first_grid_tick_seconds"),
+                F.col("_last_grid_tick_seconds"),
+                F.lit(tick_seconds),
+            )
+        ),
+    ).withColumn("_weather_tick", _seconds_to_ntz("_weather_tick_seconds"))
     return (
-        expanded.drop("hour_ts", "_next_weather_ts", "_fill_through")
+        expanded.drop(
+            "hour_ts",
+            "_next_weather_ts",
+            "_weather_ts_seconds",
+            "_next_weather_ts_seconds",
+            "_first_grid_tick_seconds",
+            "_last_fresh_tick_seconds",
+            "_last_grid_tick_seconds",
+            "_weather_tick_seconds",
+        )
         .withColumnRenamed("_weather_tick", "hour_ts")
     )
 
@@ -289,9 +321,8 @@ def build_merged_table(
     df = df.withColumn("day", F.datediff(F.col("hour_ts"), F.lit(DAY_INDEX_EPOCH.isoformat())))
     df = df.withColumn("hour", F.hour("hour_ts"))  # 더 이상 모델 feature 아님 — 출력/CLI 식별용
     # minute = 자정 기준 경과분(hour*60+분, ml_core.minute_of_day와 동일 공식) — hour
-    # 대신 쓰는 실제 모델 feature. 그리드가 5분 tick이라 hour만 쓰면 같은 시간
-    # 안의 17:00/17:05/.../17:55가 모델에 전부 같은 값으로 보이는데, minute은 그
-    # 구분을 그대로 담는다.
+    # 대신 쓰는 실제 모델 feature. 기본 20분 grid의 17:00/17:20/17:40(또는 5분
+    # 비교 프로필의 더 촘촘한 tick)을 구분한다.
     df = df.withColumn("minute", F.hour("hour_ts") * 60 + F.minute("hour_ts"))
     df = df.withColumn("dow", F.weekday("hour_ts"))  # Monday=0 ... Sunday=6, pandas .dt.dayofweek와 동일
     # 주말 + 공휴일을 is_holiday 하나로 통합 — 과거의 is_weekend/is_next_day_off/

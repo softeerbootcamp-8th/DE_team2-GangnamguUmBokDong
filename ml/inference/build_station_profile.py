@@ -5,10 +5,9 @@ feature를 결측(NaN) 대신 "그 정류소가 이 달 이 요일 이 시각에
 였는지"로 채우기 위한 fallback 테이블이다.
 
 **hour가 아니라 minute(자정 기준 경과분, ml_core.minute_of_day)으로 묶는다** —
-hour로 묶으면 표본이 늘어 보이지만(그 달의 그 요일 4~5일 x 시간당 5분 tick 12개 =
-48~60개), rental_count/return_count 자체가 TARGET_HORIZON_MINUTES(60분)짜리
-미래 방향 롤링 합이라 인접한 tick들(예: 17:00/17:05)은 창이 55분이나 겹쳐
-사실상 거의 같은 값을 반복해서 보는 것에 가깝다 — "추가
+hour로 묶으면 표본이 늘어 보이지만, rental_count/return_count 자체가
+TARGET_HORIZON_MINUTES(60분)짜리 미래 방향 롤링 합이라 인접한 모델 tick들의
+창이 많이 겹쳐 사실상 거의 같은 값을 반복해서 보는 것에 가깝다 — "추가
 표본"처럼 보이지만 독립적인 정보는 거의 안 늘어난다. 반면 모델이 실제로 보는
 feature(common_config.BASE_FEATURE_COLUMNS)는 hour가 아니라 minute이라, hour로
 뭉친 fallback은 모델이 학습한 tick 단위 구분과 어긋난 값을 돌려주게 된다.

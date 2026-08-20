@@ -10,6 +10,12 @@
 에서 읽고, 온라인 5분 추론만 최신 `silver/`를 읽는 것이다. collector의 CSV/API
 bootstrap도 과거 원천을 archive에 적재한다.
 
+최초 챔피언의 기본 해상도는 **g20/r20/a20 학습 + 5분 서빙**이다. g/r은
+`{5, 10, 15, 20, 30, 60}`분 중 같은 값을 사용할 수 있고, formal
+`TRAIN_ANCHOR_TICK_MINUTES`는 생략 시 g와 같다. anchor를 별도로 지정하면
+g 이상인 배수이면서 1시간과 1일을 나눠야 한다. 아래 기본 실행은 별도
+override 없이 g20/r20/a20을 사용한다.
+
 `feature_engine.spark.silver_source`는 historical fact(트립/재고/날씨/인구)를
 날짜별 Archive에서 읽고 누락 날짜를 fail-closed한다. 최신
 `station_master_enriched`만 historical snapshot이 없는 current dimension으로
@@ -53,8 +59,10 @@ unset TRAIN_WINDOW_START TRAIN_WINDOW_END
 
 두 window 변수는 반드시 쌍으로 지정한다. feature 생성과 학습이 같은 값을 받아야
 하며, 종료일은 inclusive다. Spark 단계는 2026년 이후 시계열이 archive에 있어도
-2025년 범위 밖 행을 제외하고, `[T,T+60분)` 라벨이 완결되지 않는 마지막 55분도
-학습 테이블에서 제외해야 한다. `station_master_enriched`만 historical snapshot이
+2025년 범위 밖 행을 제외하고, 마지막 날짜에 23:00을 넘는 anchor(기본 grid의
+23:20/23:40)처럼 `[T,T+60분)` 라벨이 완결되지 않는 행도 학습 테이블에서
+제외해야 한다.
+`station_master_enriched`만 historical snapshot이
 보장되지 않는 current dimension이라 최신 Silver snapshot을 사용한다.
 
 `--promote-if-no-champion`은 해당 모델의 챔피언 포인터가 없을 때만 정상 promotion
@@ -78,18 +86,19 @@ TRAIN_DAY_DIVISOR=2 ./training/.venv/bin/python -m training.train_rental_model -
 검증하지 못하게 하므로 둘 다 전체 설정보다 품질 위험이 있다.
 
 `TRAIN_SAMPLE_FRAC`/`VALID_SAMPLE_FRAC`/`TEST_SAMPLE_FRAC`는 구현되지 않은 과거
-설정이라 사용하면 즉시 오류가 난다. multi-horizon anchor 간격을 늘리는 옵션도
-학습 시각 분포와 `minute` feature의 분포를 바꾸므로 “서빙 정밀도와 무관한” 축소가
-아니다. 운영 최초 모델의 기본 절차로 권장하지 않는다.
+설정이라 사용하면 즉시 오류가 난다. multi-horizon anchor 간격은 이제
+`TRAIN_ANCHOR_TICK_MINUTES`로 명시하는 정식 계약이다. 다만 anchor 변경은 학습
+시각과 `minute` 분포를 바꾸는 모델 설계 변경이므로 단순 OOM 우회로 취급하지
+않고 별도 프로필과 공통 5분 평가셋으로 검증한다.
 
 현재 lazy loader도 완전히 메모리 상수는 아니다. feature 행렬은 날짜 청크로 읽지만,
 각 split의 사전 스캔에서 `label + date (+ exposure)`를 하나의 pandas DataFrame으로
-읽는다. 전체 5분/12 horizon 규모에서 이 1차원 계열들이 메모리 한계를 넘으면 날짜별
+읽는다. 선택한 grid/anchor와 12 horizon 규모에서 이 1차원 계열들이 메모리 한계를 넘으면 날짜별
 prepass/메타데이터 집계로 재설계해야 한다. 이번 구현의 남은 명시적 한계다.
 
 ## 과거 자원 실측(참고 전용)
 
-아래 값은 현재 5분 full-year 계약 이전, 2025년 11월 일부와 과거 anchor 축소 실험에서
+아래 값은 현행 configurable grid/anchor 계약 이전, 2025년 11월 일부와 과거 anchor 실험에서
 얻은 수치다. 현행 용량 산정값이 아니라 상대적인 증가 폭을 이해하는 참고 자료다.
 
 | 과거 anchor 밀도 | 한 달 학습 행 수 | 당시 peak RAM | 당시 대여 모델 학습 시간 |
@@ -97,6 +106,11 @@ prepass/메타데이터 집계로 재설계해야 한다. 이번 구현의 남�
 | 정각(60분) | 약 2,197만 | 약 3GB(비정밀) | 수 분 |
 | 20분 | 약 6,592만 | 약 10.14GB | 약 60분 |
 | 5분 | 약 2.6억 이상 | 18GB 로컬 머신에서 OOM | 미완료 |
+
+후속 해상도 검증은 A=g20/r20/a20, B=g5/r5/a20,
+C=g5/r5/a5로 분리한다. A/B의 공통 20분 anchor parity를 먼저 확인하고 세 모델을
+동일한 독립 5분 test mart에서 평가한다. 각 arm의 자체 밀도 test 지표끼리는
+비교하지 않으며, 실험 산출물은 별도 프로필/경로에 저장하고 자동 승격하지 않는다.
 
 실제 2025 전체 실행 전에는 대상 머신에서 작은 날짜 범위로 smoke test하고, Spark
 shuffle/스토리지와 학습 peak RSS를 관찰한다. 현재 training은 분산 LightGBM worker

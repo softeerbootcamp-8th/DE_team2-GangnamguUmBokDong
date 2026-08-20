@@ -487,6 +487,35 @@ def test_weather_forward_fill_never_uses_a_future_collection_tick(spark):
     assert (before_new_tick["temp"] == 10.0).all()
 
 
+def test_weather_forward_fill_resamples_five_minute_revisions_to_twenty_minute_grid(spark):
+    """20분 grid tick은 그 시각까지 도착한 가장 최신 5분 관측만 사용해야 한다."""
+    weather = spark.createDataFrame(
+        [
+            (pd.Timestamp(f"2025-06-01 08:{minute:02d}:00").to_pydatetime(), float(minute), 0.0)
+            for minute in (5, 10, 15, 25, 30)
+        ],
+        ["hour_ts", "temp", "precip"],
+    )
+
+    expanded = (
+        _forward_fill_weather_to_ticks(
+            weather,
+            tick_minutes=20,
+            max_staleness_hours=3,
+        )
+        .filter("hour_ts < '2025-06-01 09:00:00'")
+        .toPandas()
+        .set_index("hour_ts")
+    )
+
+    assert expanded.index.tolist() == [
+        pd.Timestamp("2025-06-01 08:20:00"),
+        pd.Timestamp("2025-06-01 08:40:00"),
+    ]
+    assert expanded.loc[pd.Timestamp("2025-06-01 08:20:00"), "temp"] == pytest.approx(15.0)
+    assert expanded.loc[pd.Timestamp("2025-06-01 08:40:00"), "temp"] == pytest.approx(30.0)
+
+
 def test_weather_context_includes_exact_three_hour_stale_boundary_only(spark):
     """window 첫 tick은 정확히 3시간 전 관측을 쓰되 3시간 5분 뒤에는 쓰지 않는다."""
     since = "2025-01-01 00:00:00"

@@ -4,6 +4,11 @@
 달라도 서빙 피처의 의미를 바꾸지 않는 값도 들어 있다. 이 모듈은 그중 피처 값과
 타깃의 의미를 직접 바꾸는 키만 추려 비교한다. 따라서 학습 전용 설정 차이는
 허용하면서, 같은 컬럼 이름이 서로 다른 의미를 갖는 train-serve skew는 막는다.
+
+`TRAIN_ANCHOR_TICK_MINUTES`는 입력 피처 의미 자체는 바꾸지 않지만 현재 학습
+metrics가 각 모델 자신의 anchor 행에서 계산돼 서로 다른 밀도끼리 직접 비교할 수
+없다. 공통 5분 evaluator가 생기기 전에는 자동 승격과 runtime을 같은 anchor 계약으로
+묶어 잘못된 교차 비교를 fail-closed한다.
 """
 
 from __future__ import annotations
@@ -20,6 +25,7 @@ SERVING_FEATURE_PROFILE_KEYS = (
     "ROLLING_EMBARGO_MINUTES",
     "TARGET_HORIZON_MINUTES",
     "GRID_TICK_MINUTES",
+    "TRAIN_ANCHOR_TICK_MINUTES",
     "HORIZON_COUNT",
 )
 

@@ -124,8 +124,9 @@ _all_rental_events_sorted: tuple | None = None  # (station_id 배열, start_dt�
 _rental_events_coverage: tuple[pd.Timestamp, pd.Timestamp] | None = None
 _STATION_PROFILE_STAT_COLS = ("rental_mean", "rental_std", "return_mean", "return_std")
 _STATION_PROFILE_STAT_INDEX = {name: i for i, name in enumerate(_STATION_PROFILE_STAT_COLS)}
-# station_no -> station 축 인덱스, 그리고 (station, minute//tick, dow, month-1, stat) dense
-# 배열 — dict[tuple, dict[str,float]] 대신 쓰는 이유는 _get_station_profile() 참고.
+# station_no -> station 축 인덱스, 그리고 (station, model minute//tick, dow,
+# month-1, stat) dense 배열 — dict[tuple, dict[str,float]] 대신 쓰는 이유는
+# _get_station_profile() 참고.
 _station_profile_station_index: dict[int, int] | None = None
 _station_profile_values: np.ndarray | None = None
 _population_profile: dict[tuple[str, int, int], dict[str, float]] | None = None
@@ -551,17 +552,18 @@ def _build_station_profile_arrays(df: pd.DataFrame) -> tuple[dict[int, int], np.
     """station_hourly_profile 행들을 (station_no -> 축 인덱스) dict + dense numpy 배열로 압축한다.
 
     예전엔 (station_no, minute, dow, month) 튜플을 key로, {rental_mean, ...} dict를
-    value로 갖는 파이썬 dict를 그대로 캐시했다 — 정류소 약 수천 개 x 288tick(5분
-    간격) x 7요일 x 12개월 = 수천만 개 항목이라, dict-of-dict 하나당 파이썬 객체
+    value로 갖는 파이썬 dict를 그대로 캐시했다 — 정류소 약 수천 개 x
+    (1440/모델 tick) x 7요일 x 12개월 조합이라, dict-of-dict 하나당 파이썬 객체
     오버헤드(키 튜플 + 값 dict, 항목당 수백 바이트)만으로 프로세스당 수 GB를
     먹었다(리뷰 지적). minute/dow/month는 전부 값의 범위가 좁고 촘촘해서(tick
-    간격으로 나누면 288개, dow 7개, month 12개) 해시 테이블이 필요 없다 — station마다
+    간격으로 나누면 촘촘한 인덱스, dow 7개, month 12개) 해시 테이블이 필요 없다 — station마다
     dense numpy 배열 한 칸을 두면 항목당 파이썬 객체 오버헤드 없이 float32 4개만
-    쓴다(약 1GB 수준으로 축소). station_no만 정수값 자체가 넓게 흩어져 있어(정류소
-    자체는 수천 개뿐) 그것만 작은 dict로 따로 0-based 인덱스로 압축한다.
+    쓴다(5분 grid는 약 1GB, 기본 20분 grid는 그 약 1/4). station_no만 정수값
+    자체가 넓게 흩어져 있어(정류소 자체는 수천 개뿐) 그것만 작은 dict로 따로
+    0-based 인덱스로 압축한다.
 
     hour가 아니라 minute(자정 기준 경과분)으로 묶는 이유: rental_count/return_count
-    자체가 60분짜리 미래 방향 롤링 합이라 인접한 5분 tick끼리는 55분이나 겹쳐서
+    자체가 60분짜리 미래 방향 롤링 합이라 인접한 모델 tick끼리 창이 많이 겹쳐
     거의 같은 값을 반복해서 보는 셈이다 — hour로 묶어 표본을 늘려도 독립적인 정보는
     별로 안 늘고, 오히려 모델이 실제로 구분하는 tick 단위(minute, BASE_FEATURE_COLUMNS
     참고)와 다른 값을 fallback으로 주게 된다(build_station_profile.py 모듈 docstring
@@ -577,18 +579,60 @@ def _build_station_profile_arrays(df: pd.DataFrame) -> tuple[dict[int, int], np.
             minute은 GRID_TICK_MINUTES의 배수라고 가정한다(업스트림 grid 집계 결과이므로).
     returns:
         (station_no -> station 축 인덱스 dict, shape (n_station, 1440//tick, 7, 12, 4) float32 배열)
+    raises:
+        ValueError: profile key 차원 값이 범위를 벗어나거나 minute이 활성 모델
+            grid에 맞지 않거나 logical key가 중복되어 dense 배열 한 칸을 여러
+            행이 덮어쓸 수 있을 때
     """
-    station_nos = sorted(df["station_no"].unique().tolist())
+    logical_key = ["station_no", "minute", "dow", "month"]
+    station_no_values = pd.to_numeric(df["station_no"], errors="coerce")
+    minute_values = pd.to_numeric(df["minute"], errors="coerce")
+    dow_values = pd.to_numeric(df["dow"], errors="coerce")
+    month_values = pd.to_numeric(df["month"], errors="coerce")
+
+    invalid_station_no = station_no_values.isna() | (station_no_values % 1 != 0)
+    if invalid_station_no.any():
+        sample = df.loc[invalid_station_no, "station_no"].head(5).tolist()
+        raise ValueError(f"station profile station_no가 정수가 아닙니다: sample={sample}")
+    invalid_minute = (
+        ~minute_values.between(0, 1439)
+        | minute_values.isna()
+        | (minute_values % config.GRID_TICK_MINUTES != 0)
+    )
+    if invalid_minute.any():
+        sample = df.loc[invalid_minute, "minute"].head(5).tolist()
+        raise ValueError(
+            "station profile minute이 활성 모델 grid와 맞지 않습니다: "
+            f"GRID_TICK_MINUTES={config.GRID_TICK_MINUTES}, sample={sample}"
+        )
+    invalid_dow = ~dow_values.between(0, 6) | dow_values.isna() | (dow_values % 1 != 0)
+    invalid_month = ~month_values.between(1, 12) | month_values.isna() | (month_values % 1 != 0)
+    if invalid_dow.any() or invalid_month.any():
+        sample = df.loc[invalid_dow | invalid_month, ["dow", "month"]].head(5).to_dict("records")
+        raise ValueError(f"station profile dow/month 범위가 잘못되었습니다: sample={sample}")
+
+    normalized_key = pd.DataFrame({
+        "station_no": station_no_values,
+        "minute": minute_values,
+        "dow": dow_values,
+        "month": month_values,
+    })
+    duplicated = normalized_key.duplicated(subset=logical_key, keep=False)
+    if duplicated.any():
+        sample = df.loc[duplicated, logical_key].head(5).to_dict("records")
+        raise ValueError(f"station profile logical key가 중복되었습니다: sample={sample}")
+
+    station_nos = sorted(station_no_values.astype("int64").unique().tolist())
     station_index = {station_no: i for i, station_no in enumerate(station_nos)}
     n_minute_buckets = 1440 // config.GRID_TICK_MINUTES
 
     values = np.full(
         (len(station_nos), n_minute_buckets, 7, 12, len(_STATION_PROFILE_STAT_COLS)), np.nan, dtype="float32"
     )
-    station_idx = df["station_no"].map(station_index).to_numpy()
-    minute_idx = df["minute"].to_numpy() // config.GRID_TICK_MINUTES
-    dow_idx = df["dow"].to_numpy()
-    month_idx = df["month"].to_numpy() - 1
+    station_idx = station_no_values.map(station_index).to_numpy()
+    minute_idx = minute_values.to_numpy(dtype="int64") // config.GRID_TICK_MINUTES
+    dow_idx = dow_values.to_numpy(dtype="int64")
+    month_idx = month_values.to_numpy(dtype="int64") - 1
     for stat_idx, col in enumerate(_STATION_PROFILE_STAT_COLS):
         values[station_idx, minute_idx, dow_idx, month_idx, stat_idx] = df[col].to_numpy()
 
@@ -618,22 +662,35 @@ def _get_station_profile() -> tuple[dict[int, int], np.ndarray]:
 def _profile_stat(station_no: int, ts: pd.Timestamp, stat_key: str) -> float:
     """특정 시각(ts)의 (minute, dow, month)에 해당하는 station 평소 패턴 통계값을 조회한다.
 
+    운영 요청은 5분 간격이고 station profile은 base 모델 grid(기본 20분,
+    비교 프로필은 5~60분)의 모든 tick에 존재한다. 요청 시각이 실제 학습 anchor
+    사이면 같은 날의 직전 anchor로 내림한다(예: g5/a20의 17:05/10/15 ->
+    17:00). 실시간 point-in-time lag 계산은 정확한
+    요청 시각을 그대로 쓰며, 이 정렬은 실시간 히스토리가 없어 과거 평균 profile을
+    fallback으로 쓸 때만 적용한다. 미래 anchor나 검증되지 않은 보간값을 쓰지 않아
+    profile fallback도 모델이 실제 학습한 값의 분포 안에 남긴다.
+
     args:
         station_no: 정류소 일련번호(station_master 크로스워크로 얻은 정수)
         ts: 조회할 시각 (minute_of_day/dayofweek/month를 사용 — month으로 계절성 반영)
         stat_key: "rental_mean" / "rental_std" / "return_mean" / "return_std" 중 하나
     returns:
-        float: 프로필 값. 해당 station의 프로필이 아예 없거나 ts가 grid tick 경계에
-            있지 않으면(예전 dict 기반 구현도 이 경우 항상 miss였음) NaN
+        float: 직전 학습 anchor의 프로필 값. 해당 station 또는 조합의 프로필이
+            없으면 NaN
     """
     station_index, values = _get_station_profile()
     row = station_index.get(station_no)
     if row is None:
         return np.nan
     minute = minute_of_day(ts)
-    if minute % config.GRID_TICK_MINUTES != 0:
-        return np.nan
-    return values[row, minute // config.GRID_TICK_MINUTES, ts.dayofweek, ts.month - 1, _STATION_PROFILE_STAT_INDEX[stat_key]]
+    profile_minute = minute - minute % config.TRAIN_ANCHOR_TICK_MINUTES
+    return values[
+        row,
+        profile_minute // config.GRID_TICK_MINUTES,
+        ts.dayofweek,
+        ts.month - 1,
+        _STATION_PROFILE_STAT_INDEX[stat_key],
+    ]
 
 
 def _get_population_profile() -> dict[tuple[str, int, int], dict[str, float]]:
@@ -955,24 +1012,25 @@ def _censored_rental_recent(
 def _target_timestamp(date: str, hour: int, minute: int = 0) -> pd.Timestamp:
     """date+hour+minute을 target_ts로 조합한다.
 
-    `minute`은 반드시 `config.GRID_TICK_MINUTES`의 배수여야 한다 — 그보다 더 잘게
-    쪼갠 시각을 요청해도 학습 데이터(feature_engine의 같은 tick 그리드)에 대응하는
-    tick이 없어서 lag 앵커가 의미를 잃는다.
+    `minute`은 모델 학습 grid와 무관하게 운영 호출 주기인
+    `config.SERVING_TICK_MINUTES`의 배수여야 한다. 5~60분 모델 grid 중 어느 것을
+    선택해도 5분마다 호출할 수 있지만, 실제 운영 계약에 없는 임의 시각(예:
+    17:07)은 거부한다.
 
     args:
         date: "YYYY-MM-DD"
         hour: 0~23
-        minute: 0~59 중 GRID_TICK_MINUTES의 배수 (기본값 0 — 정시)
+        minute: 0~59 중 SERVING_TICK_MINUTES의 배수 (기본값 0 — 정시)
     returns:
         pd.Timestamp: date+hour+minute을 합친 시각
     raises:
-        ValueError: hour가 0~23 밖이거나 minute이 0~59 밖이거나 GRID_TICK_MINUTES의
+        ValueError: hour가 0~23 밖이거나 minute이 0~59 밖이거나 SERVING_TICK_MINUTES의
             배수가 아닐 때
     """
     if not (0 <= hour <= 23):
         raise ValueError(f"hour는 0~23 사이여야 함: {hour}")
-    if not (0 <= minute < 60) or minute % config.GRID_TICK_MINUTES != 0:
-        raise ValueError(f"minute은 0~59 사이의 {config.GRID_TICK_MINUTES}분 배수여야 함: {minute}")
+    if not (0 <= minute < 60) or minute % config.SERVING_TICK_MINUTES != 0:
+        raise ValueError(f"minute은 0~59 사이의 {config.SERVING_TICK_MINUTES}분 배수여야 함: {minute}")
     return pd.Timestamp(date) + pd.Timedelta(hours=hour, minutes=minute)
 
 
@@ -1129,10 +1187,9 @@ def _build_feature_row(
         stockout: 그 시각 대여 가능한 자전거가 없었는지 여부
         skip_rental_recent: `_lag_rolling_features()` 참고 — True면 rental_lag_1h를
             비싼 실시간 조회 없이 NaN으로 두고, 호출부가 바로 덮어쓸 걸 전제한다
-        minute: 0~59 중 `config.GRID_TICK_MINUTES`의 배수 (기본값 0 — 정시).
-            학습 그리드가 이 tick 간격이라 이 값에 따라 lag 앵커가 실제로
-            달라진다(`_target_timestamp()` 참고) — 정시로만 고정하면 tick 단위
-            요청을 전부 정시 기준으로 뭉개서 계산하게 된다.
+        minute: 0~59 중 `config.SERVING_TICK_MINUTES`의 배수 (기본값 0 — 정시).
+            모델 학습 grid가 20분이어도 point-in-time lag는 이 요청 시각을 정확히
+            사용한다(`_target_timestamp()` 참고).
         horizon: 몇 시간 뒤를 예측할지(1~HORIZON_COUNT, 기본값 1). lag는
             date+hour+minute("지금") 기준으로 고정하고, 날씨/캘린더/타겟만
             horizon만큼 미래로 이동한다(`_build_feature_record()` 참고).
@@ -1305,8 +1362,8 @@ def predict_demand_multi_hour(
             Silver `weather_forecast`에서 매 horizon의 target_ts 기준으로 실시간 조회
         population: 생활인구 합계(pop_total). None이면 매 horizon target_ts 기준
             격자 평소 인구(hour, dow 기준이라 horizon마다 달라짐)로 자동 대체
-        minute: `predict_rental_demand()` 참고 — 0~59 중 `config.GRID_TICK_MINUTES`의
-            배수 (기본값 0), T0의 tick 앵커
+        minute: `predict_rental_demand()` 참고 — 0~59 중 `config.SERVING_TICK_MINUTES`의
+            배수 (기본값 0), T0의 운영 앵커
         stockout: 전체 horizon 공통 재고 없음으로 가정할지 (대여 exposure 보정). None이면
             Silver `bike_station_realtime`에서 anchor_ts(T0) 기준 실시간 조회
         n_hours: 몇 개 horizon(1~HORIZON_COUNT)을 예측할지 (1이면 predict_rental/return_demand와 동일)
@@ -1424,8 +1481,8 @@ def predict_demand_multi_hour_all_stations(
             길이 n_hours 시퀀스(horizon별, 전체 정류소 공통). None이면 Silver
             `weather_forecast`에서 매 horizon의 target_ts 기준으로 실시간 조회(서울
             전체가 공유하는 값이라 station마다 다시 조회하지 않고 horizon당 한 번만 조회)
-        minute: `predict_rental_demand()` 참고 — 0~59 중 `config.GRID_TICK_MINUTES`의
-            배수 (기본값 0), T0의 tick 앵커
+        minute: `predict_rental_demand()` 참고 — 0~59 중 `config.SERVING_TICK_MINUTES`의
+            배수 (기본값 0), T0의 운영 앵커
         station_ids: None이면 학습된 모델이 실제로 아는 정류소 전체(아래 참고)
         stockout: 전체 n_hours·전체 정류소에 공통 적용할 값을 직접 줄 때만 사용.
             None(기본값)이면 Silver `bike_station_realtime`에서 anchor_ts(T0) 기준으로
@@ -1690,10 +1747,9 @@ def predict_rental_demand(
         population: 그 정류소가 속한 250m 격자의 생활인구 합계(pop_total). None이면
             Silver `living_population_normalized`에서 실시간 조회를 먼저 시도하고,
             그마저 없으면 그 격자의 평소 인구(hour, dow 기준)로 자동 대체된다
-        minute: 0~59 중 `config.GRID_TICK_MINUTES`의 배수 (기본값 0) —
-            feature_engine의 학습 그리드가 이 tick 간격이라, 이 값을 안 주면 그
-            tick 사이 시점 요청이 전부 정시 기준으로 계산돼 lag가 실제 시각과
-            어긋난다.
+        minute: 0~59 중 `config.SERVING_TICK_MINUTES`의 배수 (기본값 0) —
+            모델 학습 grid가 20분이어도 point-in-time lag와 실시간 입력은 이 요청
+            시각을 정확히 사용한다.
         horizon: 몇 시간 뒤를 예측할지(1~HORIZON_COUNT, 기본값 1). 여러 horizon을
             한 번에 물어보려면(재귀 없이, predict()도 한 번만 호출) 이 함수를 반복
             호출하는 대신 `predict_demand_multi_hour()`를 쓸 것.
@@ -1751,7 +1807,7 @@ def predict_return_demand(
         population: 그 정류소가 속한 250m 격자의 생활인구 합계(pop_total). None이면
             Silver `living_population_normalized`에서 실시간 조회를 먼저 시도하고,
             그마저 없으면 그 격자의 평소 인구(hour, dow 기준)로 자동 대체된다
-        minute: `predict_rental_demand()` 참고 — 0~59 중 `config.GRID_TICK_MINUTES`의
+        minute: `predict_rental_demand()` 참고 — 0~59 중 `config.SERVING_TICK_MINUTES`의
             배수 (기본값 0)
         horizon: `predict_rental_demand()` 참고 — 1~HORIZON_COUNT (기본값 1)
     returns:
@@ -1806,8 +1862,8 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--hour", type=int, required=True)
     parser.add_argument(
         "--minute", type=int, default=0,
-        help="0~59 중 GRID_TICK_MINUTES의 배수 (기본값 0 — 정시). 학습 그리드가 이 "
-        "tick 간격이라 정시로만 고정하면 그 사이 시점을 요청할 수 없다.",
+        help="0~59 중 SERVING_TICK_MINUTES의 배수 (기본값 0 — 정시). 모델 학습 "
+        "grid가 20분이어도 운영 요청은 5분 간격으로 받는다.",
     )
     parser.add_argument(
         "--horizon", type=int, default=1,

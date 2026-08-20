@@ -3,6 +3,17 @@
 실행 방법은 [README.md](../../../ml/training/README.md), 결정의 배경/시행착오는 [history.md](../history.md)를
 참고. 이 문서는 "지금 코드가 왜 이렇게 짜여 있는지"에 집중한다.
 
+현재 시간 해상도 기본 계약은 **g20/r20/a20 학습 + 5분 서빙**이다. g/r은
+`{5, 10, 15, 20, 30, 60}`분 중 같은 값을 쓰고, formal
+`TRAIN_ANCHOR_TICK_MINUTES`(a)는 생략 시 g와 같으며 명시 시 g 이상인
+배수이면서 1시간과 1일을 나눠야 한다. 모델 grid/anchor는 학습 데이터의
+해상도이고 `SERVING_TICK_MINUTES=5`는 별도 고정 계약이다.
+
+해상도 비교는 A=g20/r20/a20, B=g5/r5/a20, C=g5/r5/a5 세 arm으로 한다.
+A와 B의 공통 20분 anchor는 feature/label parity를 확인하고, 정확도는 세 모델
+모두 같은 독립 5분 test mart에서 평가한다. 각 arm의 자체 test split 지표는
+행 집합이 다르므로 서로 직접 비교하지 않는다.
+
 ## 1. 왜 학습은 Spark가 아니라 로컬 LightGBM인가
 
 `feature_engine`은 Spark로 분산 처리하지만(EMR, 데이터 규모가 히스토리 길이에
@@ -180,12 +191,12 @@ station_categories는 옛 버전인 식으로 섞인 모델을 읽을 수 있었
 
 multi-horizon 테이블은 원본 tick 테이블의 최대 `HORIZON_COUNT`배 행 수라
 ("horizon을 feature로" 설계, [feature_engine/DESIGN.md](../feature_engine/DESIGN.md) §7 참고),
-과거 20분 tick·full horizon·2025년 전체 기준으로도 실측 8억 행대까지 커졌다 — 통째로 하나의
+과거 20분 base/anchor·full horizon·2025년 전체 기준으로도 실측 8억 행대까지 커졌다 — 통째로 하나의
 pandas DataFrame(float64/int64 컬럼 13개)으로 읽으면 원본만 수십GB라 로컬(RAM 18GB)
-에서 반복적으로 OOM이 났다. 현재 운영 계약인 앵커 tick 밀도(5분)와
-horizon(`HORIZON_COUNT` 전체)은 줄이지 않는 게 확정 정책이라(§ 아래 참고), 예전처럼
-`TRAIN_DAY_DIVISOR`로 날짜 자체를 솎아내 메모리를 줄이는 건 기본값에서 뺐다 —
-대신 `train_common.py`가 더 이상 데이터를 한 번에 로드하지 않고,
+에서 반복적으로 OOM이 났다. 기본은 20분 anchor이며 필요하면 formal 설정으로
+5분 base/anchor도 선택할 수 있다. 어느 해상도든 날짜·계절·기상 다양성과
+`HORIZON_COUNT` 전체를 우선 보존하므로 `TRAIN_DAY_DIVISOR`로 날짜를
+솎아내는 방식은 기본값에서 뺐다. 대신 `train_common.py`가 데이터를 한 번에 로드하지 않고,
 **`lazy_train_dataset.py`가 날짜 파티션(`date=YYYY-MM-DD/`) 단위로 S3를 지연
 조회**한다.
 

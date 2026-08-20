@@ -64,11 +64,41 @@ S3 아카이브 prefix(`{MODELS_ARCHIVE_PREFIX}/dt={MODEL_ARCHIVE_DATE}/{ML_PROF
 | 변수 | 기본값 | 설명 |
 |---|---|---|
 | `MODEL_ARCHIVE_DATE` | 오늘(KST) | 아카이브 경로의 날짜 조각 |
-| `ML_PROFILE` | 미지정(`builtin-default`) | 미지정 시 S3를 조회하지 않는 내장 5분 프로필. 원격 프로필은 이름을 명시하며, **feature_engine이 이 피처마트를 만들 때 쓴 프로필과 같아야 한다** |
+| `ML_PROFILE` | 미지정(`builtin-default`) | 미지정 시 S3를 조회하지 않는 내장 g20/r20/a20 프로필. 원격 프로필은 이름을 명시하며, **feature_engine이 이 피처마트를 만들 때 쓴 프로필과 같아야 한다** |
+| `GRID_TICK_MINUTES` / `ROLLING_TICK_MINUTES` | `20` / `20` | base feature/target grid와 rolling 계산 grid. 두 값은 같아야 하며 `5, 10, 15, 20, 30, 60` 중 하나 |
+| `TRAIN_ANCHOR_TICK_MINUTES` | `GRID_TICK_MINUTES`와 같음 | multi-horizon 학습 행을 남기는 anchor 간격. base grid 이상인 배수이면서 1시간과 1일을 나눠야 한다 |
 | `TRAIN_WINDOW_START` / `TRAIN_WINDOW_END` | 미지정(rolling) | 둘 다 `YYYY-MM-DD`로 지정하면 inclusive 고정 학습 구간. 최초 챔피언은 `2025-01-01` / `2025-12-31` 사용 |
 | `TRAIN_DAY_DIVISOR` | `1` | 기본은 모든 안전한 train 날짜 사용. 로컬 검증에서만 2, 3, 5로 올려 날짜를 줄이는 비상 dial |
 | `MAX_TRAIN_HORIZON` | 제한 없음(`HORIZON_COUNT`) | 읽는 시점에 `horizon <= 이 값`으로도 한 번 더 줄인다 — 그래도 OOM이면 낮출 것(단, 그 이상 horizon 예측 품질은 검증 안 됨) |
 | `SPLIT_EMBARGO_DAYS` | horizon/target에서 계산(현재 `1`) | 같은 anchor가 train/valid/test에 걸치지 않도록 평가일 앞뒤에서 purge할 날짜 수. 계산된 최소값보다 낮출 수 없음 |
+
+`SERVING_TICK_MINUTES`는 위 학습 설정과 별개인 5분 고정 코드 계약이며 환경변수
+dial이 아니다. 따라서 기본 모델은 **g20/r20/a20으로 학습하고 5분마다 추론**한다.
+`TRAIN_ANCHOR_TICK_MINUTES`를 생략하면 override된 base grid를 따라가므로,
+g5/r5/a5를 원하면 g/r만 5로 설정해도 된다. g5/r5/a20처럼 base feature는 5분으로
+만들되 학습 행만 20분 anchor로 줄이려면 a를 명시한다.
+
+후속 A/B 실험은 다음 세 조합을 고정해 비교한다.
+
+| arm | base/rolling/training | 목적 |
+|---|---|---|
+| A | g20/r20/a20 | 기존 모델 설계이자 기본값 |
+| B | g5/r5/a20 | 5분 base feature가 공통 20분 anchor의 값에 영향을 주는지 확인 |
+| C | g5/r5/a5 | 모든 5분 anchor를 학습했을 때 off-grid 성능 이득과 자원 비용 확인 |
+
+세 arm 모두 같은 독립 5분 test mart에서 평가해야 하며, 각자 다른 밀도의 자체
+test 지표를 직접 비교하면 안 된다. A와 B의 공통 00/20/40분 anchor는 key,
+feature, label parity도 먼저 검증한다. 실험 산출물은 서로 다른 프로필/경로로
+격리하고 현재 챔피언에 자동 승격하지 않는다. 현재 primary 중간 테이블 일부는
+`processed_v2/` 공용 경로를 쓰므로 서로 다른 arm의 feature build를 병렬로
+실행하지 말고 순차 실행한다.
+
+base feature 산출물은 `w{window}_e{embargo}_t{grid}` namespace를 사용하고,
+multi-horizon 학습 테이블만 그 아래
+`training_anchor_a{TRAIN_ANCHOR_TICK_MINUTES}`로 추가 격리된다. 따라서
+g5/r5/a5와 g5/r5/a20은 base feature를 재사용하되 학습 테이블은 덮어쓰지 않는다.
+`FEATURE_PARAM_COMBO_ID`를 직접 지정하면 자동 base-grid 격리를 우회하므로,
+서로 다른 g/r 조합에 같은 custom ID를 재사용하면 안 된다.
 
 OOM이면 먼저 전체 horizon을 유지한 채 train 날짜를 결정적으로 줄인다. 예를 들어
 `TRAIN_DAY_DIVISOR=2`는 평가/embargo 날짜를 제외한 매월 짝수 날짜만 학습에 쓴다.

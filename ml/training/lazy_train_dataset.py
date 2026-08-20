@@ -1,12 +1,13 @@
 """날짜 파티션 단위로 S3를 지연 조회하는 LightGBM 학습 데이터 계층.
 
-**왜 필요한가**: multi-horizon feature 테이블은 과거 20분 tick·full horizon·1년
-실측만으로도 약 8억 행(13개 feature 컬럼)이었다. 현재 운영 계약인 5분 tick은
-그보다 더 조밀하므로, 하나의 pandas DataFrame으로 통째로 읽으면(예전
-`train_common.load_training_table()`이 하던 방식) 원본만 수십GB라 로컬(RAM 18GB)에서
-반복적으로 OOM이 났다. 앵커 tick 밀도(5분)와 horizon(12 전체)은 줄이지 않기로
-확정됐으므로(`training/config.py` TRAIN_DAY_DIVISOR/MAX_TRAIN_HORIZON 주석 참고),
-유일한 근본 해결책은 그 DataFrame을 애초에 통째로 만들지 않는 것이다.
+**왜 필요한가**: multi-horizon feature 테이블은 20분 base/anchor
+grid·full horizon·1년 실측만으로도 약 8억 행(13개 feature 컬럼)이었다.
+5분 base 또는 anchor를 선택하면 조합에 따라 이보다 더 조밀해진다. 하나의
+pandas DataFrame으로 통째로 읽으면(예전 `train_common.load_training_table()`이
+하던 방식) 원본만 수십GB라 로컬(RAM 18GB)에서 반복적으로 OOM이 났다.
+기본 g20/r20/a20이나 선택적 g5/r5/a20·g5/r5/a5 어느 경우에도 전체 날짜와
+horizon 12개를 가능한 보존하려면, 근본 해결책은 그 DataFrame을 애초에 통째로
+만들지 않는 것이다(`training/config.py` 주석 참고).
 
 **설계 — LightGBM `lgb.Sequence` 두 단계 접근 패턴을 그대로 이용**(직접 재현해
 검증, 코드 작성 전 확인):

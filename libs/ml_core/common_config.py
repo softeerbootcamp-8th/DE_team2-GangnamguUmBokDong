@@ -37,6 +37,7 @@ pandas/pyarrow를 무조건 import한다 — 이 파일은 위에서 말한 "pan
 
 import json
 import os
+from collections.abc import Mapping
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -50,7 +51,9 @@ from . import profile_contract
 # 이름을 분리해, 오래된 원격 객체가 코드에 고정된 운영 기본값을 암묵적으로 덮어쓰지
 # 못하게 한다. 원격 프로필을 쓰려면 반드시 `ML_PROFILE=<name>`을 명시해야 한다.
 BUILTIN_PROFILE_NAME = profile_contract.BUILTIN_PROFILE_NAME
-REQUIRED_GRID_TICK_MINUTES = profile_contract.REQUIRED_GRID_TICK_MINUTES
+SERVING_TICK_MINUTES = profile_contract.SERVING_TICK_MINUTES
+DEFAULT_MODEL_GRID_TICK_MINUTES = profile_contract.DEFAULT_MODEL_GRID_TICK_MINUTES
+SUPPORTED_MODEL_GRID_TICK_MINUTES = profile_contract.SUPPORTED_MODEL_GRID_TICK_MINUTES
 _DEFAULT_PROFILE = profile_contract.DEFAULT_PROFILE
 
 
@@ -119,7 +122,7 @@ def _load_profile(name: str | None = None) -> dict:
     raises:
         FileNotFoundError: 명시한 S3 프로필이 없을 때
         TypeError: 프로필 구조가 잘못됐을 때
-        ValueError: 예약 메타데이터나 5분 grid 계약이 잘못됐을 때
+        ValueError: 예약 메타데이터나 모델 학습 grid 계약이 잘못됐을 때
     """
     name = name or _selected_profile_name()
     if name == BUILTIN_PROFILE_NAME:
@@ -259,8 +262,75 @@ def _float_env(name: str, default: float) -> float:
     return float(os.environ.get(name, default))
 
 
+def _resolved_train_anchor_tick(
+    profile: Mapping[str, object],
+    grid_tick: int,
+    env: Mapping[str, str] | None = None,
+) -> int:
+    """프로필과 canonical/legacy 환경변수에서 실제 학습 anchor 간격을 결정한다.
+
+    `TRAIN_ANCHOR_TICK_MINUTES`가 정식 설정이다. 기존 로컬 실행에서 쓰던
+    `MULTI_HORIZON_ANCHOR_TICK_MINUTES`와
+    `MULTI_HORIZON_ANCHOR_HOURLY_ONLY=1`도 환경변수 override 별칭으로 받지만,
+    둘 이상의 별칭이 서로 다른 값을 요구하면 조용히 우선순위를 정하지 않고
+    실패한다.
+
+    args:
+        profile: 현재 선택된 병합 프로필
+        grid_tick: 환경변수까지 반영된 feature/target base grid 간격
+        env: 해석할 환경변수 mapping. None이면 현재 프로세스 환경
+    returns:
+        int: 실제 multi-horizon 학습 anchor 간격(분)
+    raises:
+        ValueError: 환경변수가 정수가 아니거나 legacy 별칭끼리 충돌할 때
+    """
+    source_env = os.environ if env is None else env
+    candidates: dict[str, int] = {}
+    for env_name in ("TRAIN_ANCHOR_TICK_MINUTES", "MULTI_HORIZON_ANCHOR_TICK_MINUTES"):
+        raw_value = source_env.get(env_name)
+        if raw_value is None:
+            continue
+        try:
+            candidates[env_name] = int(raw_value)
+        except ValueError as exc:
+            raise ValueError(f"{env_name}는 정수여야 합니다: {raw_value!r}") from exc
+
+    hourly_raw = source_env.get("MULTI_HORIZON_ANCHOR_HOURLY_ONLY")
+    if hourly_raw is not None:
+        if hourly_raw not in {"0", "1"}:
+            raise ValueError("MULTI_HORIZON_ANCHOR_HOURLY_ONLY는 0 또는 1이어야 합니다")
+        if hourly_raw == "1":
+            candidates["MULTI_HORIZON_ANCHOR_HOURLY_ONLY"] = 60
+
+    requested_values = set(candidates.values())
+    if len(requested_values) > 1:
+        details = ", ".join(f"{key}={value}" for key, value in candidates.items())
+        raise ValueError(f"학습 anchor 환경변수가 서로 충돌합니다: {details}")
+    if requested_values:
+        return requested_values.pop()
+
+    # thinning이 없던 프로필(a==g)에서 개별 GRID/ROLLING 환경변수로 base grid를
+    # 바꾸면 anchor도 새 effective grid를 따라간다. 반면 프로필이 명시적으로
+    # g5/a20 같은 hybrid를 담고 있으면 redundant GRID=5 env가 있어도 a20을
+    # 보존해야 한다. 새 grid와 호환되지 않으면 아래 contract validation이 막는다.
+    if "GRID_TICK_MINUTES" in source_env or "ROLLING_TICK_MINUTES" in source_env:
+        try:
+            profile_grid_tick = int(profile["GRID_TICK_MINUTES"])
+            profile_anchor_tick = int(profile["TRAIN_ANCHOR_TICK_MINUTES"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("프로필의 GRID_TICK_MINUTES/TRAIN_ANCHOR_TICK_MINUTES는 정수여야 합니다") from exc
+        if profile_anchor_tick == profile_grid_tick:
+            return grid_tick
+        return profile_anchor_tick
+
+    try:
+        return int(profile["TRAIN_ANCHOR_TICK_MINUTES"])
+    except (TypeError, ValueError) as exc:
+        raise ValueError("TRAIN_ANCHOR_TICK_MINUTES는 정수여야 합니다") from exc
+
+
 # --- point-in-time censoring 파라미터 (REALTIME_FEATURES.md) ---
-# "5분 단위"는 서빙 갱신 주기일 뿐 윈도우 폭이 아니다. 실제 feature:
+# tick 간격은 윈도우 폭이 아니다. 실제 feature:
 # "[T-embargo-window, T-embargo) 구간에 시작되고 end_dt<=T인 대여 수".
 ROLLING_TICK_MINUTES = _int_env("ROLLING_TICK_MINUTES", _PROFILE["ROLLING_TICK_MINUTES"])
 ROLLING_WINDOW_MINUTES = _int_env("ROLLING_WINDOW_MINUTES", _PROFILE["ROLLING_WINDOW_MINUTES"])
@@ -268,17 +338,26 @@ ROLLING_EMBARGO_MINUTES = _int_env("ROLLING_EMBARGO_MINUTES", _PROFILE["ROLLING_
 
 # --- 타겟(예측 대상) 정의 ---
 # "기준 시각 T로부터 앞으로 TARGET_HORIZON_MINUTES분 동안 일어날 이벤트 수"를
-# GRID_TICK_MINUTES 간격의 모든 T에 대해 예측한다 (build_targets.py의
-# future_rolling_counts()). GRID_TICK_MINUTES는 ROLLING_TICK_MINUTES와 값은
-# 같지만(둘 다 5분) 의미가 다르다 — 하나는 "입력 피처 갱신 주기", 하나는
-# "타겟/전체 그리드 간격"이라 나중에 독립적으로 바꿀 수 있게 따로 뺀다.
+# GRID_TICK_MINUTES 간격의 모든 T에 대해 라벨을 만든다(build_targets.py의
+# future_rolling_counts()). 기본 모델은 원래 설계대로 20분 grid를 쓰고,
+# 한 시간을 나누는 5분 배수 grid도 비교 프로필로 허용한다. 둘은 운영 호출 주기인
+# SERVING_TICK_MINUTES=5와 별개의 계약이다. GRID_TICK_MINUTES와
+# ROLLING_TICK_MINUTES는 의미는 다르지만 같은 모델 anchor에서 맞물려야 하므로
+# 현재 지원 조합에서는 같은 값을 강제한다.
 TARGET_HORIZON_MINUTES = _int_env("TARGET_HORIZON_MINUTES", _PROFILE["TARGET_HORIZON_MINUTES"])
 GRID_TICK_MINUTES = _int_env("GRID_TICK_MINUTES", _PROFILE["GRID_TICK_MINUTES"])
-if ROLLING_TICK_MINUTES != REQUIRED_GRID_TICK_MINUTES or GRID_TICK_MINUTES != REQUIRED_GRID_TICK_MINUTES:
-    raise ValueError(
-        "ROLLING_TICK_MINUTES와 GRID_TICK_MINUTES는 운영 계약에 따라 모두 "
-        f"{REQUIRED_GRID_TICK_MINUTES}여야 합니다: rolling={ROLLING_TICK_MINUTES}, grid={GRID_TICK_MINUTES}"
-    )
+profile_contract.validate_model_grid_contract(
+    GRID_TICK_MINUTES,
+    ROLLING_TICK_MINUTES,
+    TARGET_HORIZON_MINUTES,
+    f"{PROFILE_NAME}+환경변수",
+)
+TRAIN_ANCHOR_TICK_MINUTES = _resolved_train_anchor_tick(_PROFILE, GRID_TICK_MINUTES)
+profile_contract.validate_train_anchor_contract(
+    GRID_TICK_MINUTES,
+    TRAIN_ANCHOR_TICK_MINUTES,
+    f"{PROFILE_NAME}+환경변수",
+)
 
 # --- 배치예측 horizon(몇 시간 뒤까지 한 번에 예측하는지) ---
 # lag/rolling(직전 실적)은 항상 "지금(T0)" 기준으로 고정하고, horizon(1..HORIZON_COUNT)을
@@ -306,10 +385,10 @@ HORIZON_COUNT = _int_env("HORIZON_COUNT", _PROFILE["HORIZON_COUNT"])
 #   encoding이 pandas Categorical로 안 살아나 매번 object dtype 문자열 배열을
 #   통째로 만드는 비용을 원천적으로 피한다(정수 컬럼은 그 디코딩 자체가 없음).
 # - `hour`(0~23) 대신 `minute`(자정 기준 경과분 0~1439, ml_core.minute_of_day) 하나로
-#   시각을 나타낸다 — 그리드 자체가 5분 tick인데 hour만 쓰면 같은 시간 안의
-#   17:00/17:05/17:10 등이 모델에 전부 같은 값으로 보인다. minute은 그 tick 구분을
-#   그대로 담으면서 hour가 주던 정보(시간대별 패턴)도 당연히 포함한다. `hour`는
-#   출력/CLI 조회 등 식별 용도로는 계속 남아있지만 더 이상 모델 feature가 아니다.
+#   시각을 나타낸다 — 20분 기본 grid의 17:00/17:20/17:40(또는 다른 지원 grid의
+#   tick)을 모델이 구분하면서 hour가 주던 시간대 정보도 포함한다.
+#   `hour`는 출력/CLI 조회 등 식별 용도로는 계속 남아있지만 더 이상 모델 feature가
+#   아니다.
 BASE_FEATURE_COLUMNS = [
     "station_no",
     "capacity",
@@ -426,6 +505,7 @@ def effective_profile() -> dict:
         "ROLLING_EMBARGO_MINUTES": ROLLING_EMBARGO_MINUTES,
         "TARGET_HORIZON_MINUTES": TARGET_HORIZON_MINUTES,
         "GRID_TICK_MINUTES": GRID_TICK_MINUTES,
+        "TRAIN_ANCHOR_TICK_MINUTES": TRAIN_ANCHOR_TICK_MINUTES,
         "HORIZON_COUNT": HORIZON_COUNT,
         "LGB_PARAMS_COMMON": dict(LGB_PARAMS_COMMON),
         "LGB_NUM_BOOST_ROUND": LGB_NUM_BOOST_ROUND,

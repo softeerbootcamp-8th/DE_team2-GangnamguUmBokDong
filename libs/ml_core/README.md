@@ -41,13 +41,17 @@ README 참고) 그 컨벤션을 따르는 한 그대로 동작한다. `cd ml`을
 ## 프로필 시스템
 
 `ML_PROFILE`을 생략하면 코드에 고정된 `builtin-default` 프로필을 사용한다. 이
-기본값은 학습·추론 모두 5분 grid이며 S3를 조회하지 않으므로, 오래된
+기본값은 원래 모델 설계인 20분 feature/target/rolling grid와 20분 학습 anchor이며
+S3를 조회하지 않으므로, 오래된
 `profiles/default.json`이 새 코드의 기본 동작을 암묵적으로 덮어쓸 수 없다.
+운영 추론 호출 주기는 이 모델 grid와 분리된 고정 5분 계약이다.
 
 다른 파라미터 조합(window/embargo/LightGBM 하이퍼파라미터 등)을 쓰려면 S3의
 `profiles/{ML_PROFILE}.json`에 등록하고 이름을 명시한다. 명시한 프로필이 없거나
-조회/파싱에 실패하면 내장값으로 폴백하지 않고 즉시 실패한다. grid/tick은 운영
-계약상 5분으로 고정되며 원격 프로필도 이 값을 바꿀 수 없다.
+조회/파싱에 실패하면 내장값으로 폴백하지 않고 즉시 실패한다. 모델 grid는 기본
+20분이며 5/10/15/20/30/60분을 지원한다. `GRID_TICK_MINUTES`와
+`ROLLING_TICK_MINUTES`는 같은 값이어야 하고 하루 및 target 구간을 정확히
+나누어야 한다.
 
 ```bash
 cd ml
@@ -56,14 +60,20 @@ ML_PROFILE=embargo45 ./feature_engine/.venv/bin/python -m feature_engine.spark.r
 
 개별 환경변수(예: `ROLLING_EMBARGO_MINUTES=45`)는 프로필 값 위에 추가로
 덮어쓸 수 있다 — 우선순위는 **개별 환경변수 > 명시한 S3 프로필**. 단,
-`GRID_TICK_MINUTES`와 `ROLLING_TICK_MINUTES`를 5가 아닌 값으로 덮어쓰면 설정
-검증에서 실패한다. 프로필 등록은 `ml_core.scripts.push_profile`을 사용한다.
+학습 grid를 바꾸려면 `GRID_TICK_MINUTES`와 `ROLLING_TICK_MINUTES`를 함께
+설정해야 한다. 학습 행만 더 성기게 쓰려면 `TRAIN_ANCHOR_TICK_MINUTES`를 base
+grid 이상의 배수로 지정한다(예: g5/a20). anchor를 생략하면 effective grid와 같은
+값이 materialize되어 thinning하지 않는다. 한쪽 tick만 바꾸거나 호환되지 않는
+간격을 쓰면 설정 검증에서 실패한다. 프로필 등록은
+`ml_core.scripts.push_profile`을 사용한다.
 
 학습 아티팩트의 `{model_name}_profile.json`에는 원본 프로필이 아니라 개별
-환경변수 override까지 반영한 effective profile이 저장된다. 추론은 booster를
-읽기 전에 rolling/grid/horizon 등 서빙 피처 의미를 정하는 키가 현재 프로세스와
-같은지 검증하고, 다르면 예측값을 내지 않는다. 학습 기간과 LightGBM 튜닝값처럼
-서빙 피처 의미를 바꾸지 않는 키 차이는 허용한다(`serving_contract.py` 참고).
+환경변수 override까지 반영한 effective profile이 저장된다. 여기에는 실제
+`TRAIN_ANCHOR_TICK_MINUTES`도 항상 포함된다. 추론은 booster를 읽기 전에
+rolling/grid/horizon/anchor 계약이 현재 프로세스와 같은지 검증하고, 다르면
+예측값을 내지 않는다. 공통 5분 evaluator가 생기기 전에는 서로 다른 anchor에서
+측정한 metrics를 자동 승격에서 직접 비교하지 않기 위한 보수적인 제한이다. 학습
+기간과 LightGBM 튜닝값 차이는 허용한다(`serving_contract.py` 참고).
 
 학습 날짜 범위는 `common_config.training_window()`가 feature_engine과 training에
 동일하게 제공한다. `TRAIN_WINDOW_START`/`TRAIN_WINDOW_END`를 함께 `YYYY-MM-DD`로

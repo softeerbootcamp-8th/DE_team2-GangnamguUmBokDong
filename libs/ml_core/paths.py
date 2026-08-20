@@ -42,6 +42,8 @@ FEATURE_PARAM_COMBO_ID = os.environ.get(
     "FEATURE_PARAM_COMBO_ID",
     f"w{common_config.ROLLING_WINDOW_MINUTES}_e{common_config.ROLLING_EMBARGO_MINUTES}_t{common_config.ROLLING_TICK_MINUTES}",
 )
+# custom FEATURE_PARAM_COMBO_ID는 자동 w/e/t 격리를 우회하므로 서로 다른 base
+# 조합에 재사용하면 안 된다. 최종 학습 anchor는 아래 별도 namespace로 격리한다.
 # feature_engine의 2차 정제 산출물 위치 — dev/S3_DATA_CATALOG.md의
 # `processed/features/` prefix를 따른다. 파라미터 조합마다 결과가 달라지므로
 # 조합 ID를 키에 넣어 서로 안 덮어쓰게 한다.
@@ -215,19 +217,24 @@ POPULATION_PARQUET = f"{PROCESSED_V2_PREFIX}/population_2025.parquet"
 # 같은 값이어야 한다(위 모듈 docstring 참고) ---
 MERGED_TABLE_PARQUET = f"{FEATURE_ENGINEERING_OUTPUT_DIR}/station_hour_merged_2025.parquet"
 FEATURES_TABLE_PARQUET = f"{FEATURE_ENGINEERING_OUTPUT_DIR}/station_hour_features_2025.parquet"
-# FEATURES_TABLE_PARQUET의 각 행(T0, 5분 tick)을 horizon=1..HORIZON_COUNT만큼 self-join해
-# "T0의 lag + T0+(horizon-1)시간의 날씨/캘린더/타겟"으로 조합한 학습 테이블
-# (build_multi_horizon_features.py) — 대여/반납이 서로 다른 lag/타겟을 쓰는 완전히
-# 분리된 데이터셋이라 출력도 둘로 나뉜다. training이 이제 이 테이블들만 읽는다.
+# FEATURES_TABLE_PARQUET의 각 행(T0, 모델 tick)을 horizon=1..HORIZON_COUNT만큼
+# self-join한 학습 테이블. base feature/profile은 w/e/t 조합에서 재사용하고 최종
+# multi-horizon 결과만 실제 학습 anchor별 namespace로 격리한다.
+_TRAINING_ANCHOR_OUTPUT_DIR = (
+    f"{FEATURE_ENGINEERING_OUTPUT_DIR}/training_anchor_a{common_config.TRAIN_ANCHOR_TICK_MINUTES}"
+)
 RENTAL_MULTI_HORIZON_FEATURES_TABLE_PARQUET = (
-    f"{FEATURE_ENGINEERING_OUTPUT_DIR}/station_hour_features_multihorizon_rental_2025.parquet"
+    f"{_TRAINING_ANCHOR_OUTPUT_DIR}/station_hour_features_multihorizon_rental_2025.parquet"
 )
 RETURN_MULTI_HORIZON_FEATURES_TABLE_PARQUET = (
-    f"{FEATURE_ENGINEERING_OUTPUT_DIR}/station_hour_features_multihorizon_return_2025.parquet"
+    f"{_TRAINING_ANCHOR_OUTPUT_DIR}/station_hour_features_multihorizon_return_2025.parquet"
 )
 ROLLING_RENTAL_FEATURES_PARQUET = f"{FEATURE_ENGINEERING_OUTPUT_DIR}/rolling_rental_features_2025.parquet"
 
-# --- inference가 만드는 fallback 프로필(위 MERGED_TABLE_PARQUET/POPULATION_PARQUET
-# 기반) — 파라미터 조합과 무관하게 챔피언 경로 하나만 씀 ---
-STATION_HOURLY_PROFILE_PARQUET = f"{PROCESSED_V2_PREFIX}/station_hourly_profile.parquet"
+# --- inference가 만드는 fallback 프로필 ---
+# station profile은 위 MERGED_TABLE_PARQUET의 모델 tick별 통계이므로 feature
+# 파라미터 조합(예: t5/t20)과 반드시 같이 격리한다. 공용 processed_v2 키 하나를 쓰면
+# A/B 빌드가 서로 덮어써 모델 grid와 profile grid가 조용히 갈라진다.
+STATION_HOURLY_PROFILE_PARQUET = f"{FEATURE_ENGINEERING_OUTPUT_DIR}/station_hourly_profile.parquet"
+# population profile은 원본 시간별 population에서 만들며 모델 grid와 무관하다.
 POPULATION_HOURLY_PROFILE_PARQUET = f"{PROCESSED_V2_PREFIX}/population_hourly_profile.parquet"
