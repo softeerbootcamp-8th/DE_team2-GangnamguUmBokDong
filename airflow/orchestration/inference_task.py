@@ -8,15 +8,15 @@ run_full_pipeline.py는 로컬 데모 전용이라고 자체 docstring에 명시
 `cd ml && uv --project inference run python -m inference.predict_single ...`.
 `inference` 패키지가 `ml/inference/`에 있어 `-m inference.predict_single`이
 resolve되려면 cwd가 `ml/`이어야 하고, 환경은 `inference` 프로젝트의 것을 써야 하므로
-`uv --project inference run` 명령어로 실행한다. (로컬 Mac과 Docker(Linux) 환경을
-오갈 때, 심볼릭 링크 등 가상환경이 깨져도 uv가 자동으로 감지해 복구해 준다.)
+`uv --project inference run` 명령어로 실행한다. Docker에서는 host bind mount의
+``ml/inference/.venv``를 쓰지 않고 전용 named volume 환경을 사용한다.
 """
 
 from __future__ import annotations
 
 from airflow.task.trigger_rule import TriggerRule
-
 from config.schedules import INFERENCE_EXECUTION_TIMEOUT
+
 from orchestration.task_builder import REPO_ROOT, build_module_task
 from orchestration.templates import KST_DATE, KST_HOUR, KST_MINUTE
 
@@ -42,4 +42,5 @@ def build_inference_task(dag):
         cmd,
         execution_timeout=INFERENCE_EXECUTION_TIMEOUT,
         trigger_rule=TriggerRule.ALL_SUCCESS,
+        uv_environment_name="ml-inference",
     )
