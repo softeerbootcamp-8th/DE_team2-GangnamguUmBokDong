@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -13,41 +13,40 @@ import boto3
 from core.db import get_connection
 from core.gold_publication import S3ImmutableObjectStore
 from core.gold_publication.errors import ContractViolation
+
 from gold.dispatch_center import (
     load_dispatch_center_seed,
     publish_dispatch_center,
 )
 from gold.event import publish_cultural_event, publish_performance_event
 from gold.source_catalog import S3SourceSnapshotCatalog
-from gold.station_release import (
-    publish_station_master_correction,
-    publish_station_realtime_release,
-)
-from gold.weather_forecast import publish_weather_forecast
 from gold.weather_grid import load_weather_grid_seed, publish_weather_grid
 
-_PUBLICATIONS = (
+_ACTIVE_PUBLICATIONS = (
     "event:cultural_event",
     "event:performance_event",
     "seed:dispatch_center",
     "seed:weather_grid",
+)
+_RETIRED_PUBLICATIONS = (
     "station-master-correction",
     "station-release",
     "weather-forecast",
 )
+_PUBLICATIONS = (*_ACTIVE_PUBLICATIONS, *_RETIRED_PUBLICATIONS)
 _ROOT = Path(__file__).resolve().parent.parent
-_WEATHER_SHORT_LOOKBACK = timedelta(hours=24)
-_WEATHER_ULTRA_LOOKBACK = timedelta(hours=6)
 
 
 def run(
     publication: str,
     window_start: datetime,
-    *,
-    relocation_approval_uri: str | None = None,
-    relocation_approval_sha256: str | None = None,
 ) -> str:
     """선택한 원천 publication을 actual S3 authority와 PostGIS에 게시한다."""
+    if publication in _RETIRED_PUBLICATIONS:
+        raise ContractViolation(
+            f"{publication} standalone authority는 retired되었습니다. "
+            "serving_cli.py prepare/finalize coordinated chain을 사용하세요."
+        )
     if publication not in _PUBLICATIONS:
         raise ContractViolation(f"지원하지 않는 Gold publication입니다: {publication}")
     logical = _utc_dttm(window_start)
@@ -62,12 +61,6 @@ def run(
         bucket=bucket,
     )
     object_base_uri = f"s3://{bucket}/gold_publication"
-    relocation_payload = _read_optional_relocation_approval(
-        object_store,
-        relocation_approval_uri,
-        relocation_approval_sha256,
-    )
-
     with get_connection() as connection:
         if publication == "seed:dispatch_center":
             seed = load_dispatch_center_seed(_ROOT)
@@ -104,7 +97,7 @@ def run(
                 source_catalog=source_catalog,
                 object_base_uri=object_base_uri,
             )
-        elif publication == "event:performance_event":
+        else:
             result = publish_performance_event(
                 connection,
                 object_store,
@@ -116,99 +109,7 @@ def run(
                 stadium_asset_path=_ROOT / "loader/assets/stadium_coords.json",
                 object_base_uri=object_base_uri,
             )
-        elif publication == "weather-forecast":
-            short = source_catalog.latest_at_or_before(
-                "weather_short_term_forecast",
-                logical,
-                lookback=_WEATHER_SHORT_LOOKBACK,
-            )
-            ultra = source_catalog.latest_at_or_before(
-                "weather_ultra_short_forecast",
-                logical,
-                lookback=_WEATHER_ULTRA_LOOKBACK,
-            )
-            result = publish_weather_forecast(
-                connection,
-                object_store,
-                short_term_artifact=short,
-                ultra_short_artifact=ultra,
-                source_catalog=source_catalog,
-                scheduled_anchor=logical,
-                short_term_lookback=_WEATHER_SHORT_LOOKBACK,
-                ultra_short_lookback=_WEATHER_ULTRA_LOOKBACK,
-                object_base_uri=object_base_uri,
-            )
-        elif publication == "station-release":
-            master_lookback = _lookback_from_env("GOLD_STATION_MASTER_LOOKBACK_HOURS")
-            realtime_lookback = _lookback_from_env(
-                "GOLD_STATION_REALTIME_LOOKBACK_HOURS"
-            )
-            result = publish_station_realtime_release(
-                connection,
-                object_store,
-                master_artifact=source_catalog.latest_at_or_before(
-                    "bike_station_master",
-                    logical,
-                    lookback=master_lookback,
-                ),
-                realtime_candidate=source_catalog.exact_window(
-                    "bike_station_realtime",
-                    logical,
-                ),
-                source_catalog=source_catalog,
-                object_base_uri=object_base_uri,
-                master_lookback=master_lookback,
-                realtime_lookback=realtime_lookback,
-                relocation_approval_payload=relocation_payload,
-            )
-        else:
-            realtime_lookback = _lookback_from_env(
-                "GOLD_STATION_REALTIME_LOOKBACK_HOURS"
-            )
-            result = publish_station_master_correction(
-                connection,
-                object_store,
-                master_artifact=source_catalog.exact_window(
-                    "bike_station_master",
-                    logical,
-                ),
-                source_catalog=source_catalog,
-                object_base_uri=object_base_uri,
-                realtime_lookback=realtime_lookback,
-                relocation_approval_payload=relocation_payload,
-            )
     return result.result.outcome.value
-
-
-def _read_optional_relocation_approval(
-    object_store: S3ImmutableObjectStore,
-    uri: str | None,
-    byte_sha256: str | None,
-) -> bytes | None:
-    """선택적 relocation approval을 URI·SHA가 모두 있을 때만 exact-read한다."""
-    if (uri is None) != (byte_sha256 is None):
-        raise ContractViolation(
-            "relocation approval URI와 SHA-256은 함께 지정해야 합니다."
-        )
-    if uri is None or byte_sha256 is None:
-        return None
-    return object_store.read_bytes(
-        uri,
-        byte_sha256,
-        require_canonical_json=True,
-    )
-
-
-def _lookback_from_env(name: str) -> timedelta:
-    """명시적 환경변수의 양수 hour를 bounded source lookback으로 바꾼다."""
-    raw = _required_env(name)
-    try:
-        hours = int(raw)
-    except ValueError as exc:
-        raise ContractViolation(f"{name}은 양의 integer hour여야 합니다.") from exc
-    if hours <= 0 or str(hours) != raw:
-        raise ContractViolation(f"{name}은 canonical 양의 integer hour여야 합니다.")
-    return timedelta(hours=hours)
 
 
 def _required_env(name: str) -> str:
@@ -251,16 +152,9 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Gold source publication을 실행한다.")
     parser.add_argument("--publication", required=True, choices=_PUBLICATIONS)
     parser.add_argument("--window-start", required=True)
-    parser.add_argument("--relocation-approval-uri")
-    parser.add_argument("--relocation-approval-sha256")
     args = parser.parse_args()
     try:
-        outcome = run(
-            args.publication,
-            _parse_window_start(args.window_start),
-            relocation_approval_uri=args.relocation_approval_uri,
-            relocation_approval_sha256=args.relocation_approval_sha256,
-        )
+        outcome = run(args.publication, _parse_window_start(args.window_start))
     except Exception as exc:  # noqa: BLE001 - CLI 경계에서 nonzero로 변환한다.
         print(f"Gold publisher failed: {exc}", file=sys.stderr)
         return 1

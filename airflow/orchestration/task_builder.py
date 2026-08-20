@@ -10,7 +10,9 @@ bind mount된 호스트 ``.venv``를 macOS와 Linux 컨테이너가 서로 덮�
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 from airflow.providers.standard.operators.bash import BashOperator
 from airflow.task.trigger_rule import TriggerRule
@@ -38,6 +40,8 @@ def build_module_task(
     retry_delay=DEFAULT_RETRY_DELAY,
     execution_timeout=DEFAULT_EXECUTION_TIMEOUT,
     trigger_rule: str = TriggerRule.ALL_SUCCESS,
+    env: dict[str, str] | None = None,
+    output_processor: Callable[[str], Any] | None = None,
     uv_environment_name: str | None = None,
 ) -> BashOperator:
     """독립 uv 환경을 사용하는 모듈 CLI 태스크를 만든다.
@@ -56,18 +60,24 @@ def build_module_task(
             "uv_environment_name은 lowercase 영숫자와 하이픈만 허용합니다."
         )
     project_environment = f"{_MODULE_UV_ENV_ROOT}/{environment_name}"
-    return BashOperator(
-        task_id=task_id,
-        bash_command=(
+    arguments: dict[str, Any] = {
+        "task_id": task_id,
+        "bash_command": (
             "env -u VIRTUAL_ENV "
             f"UV_PROJECT_ENVIRONMENT={project_environment} {bash_command}"
         ),
-        cwd=module_dir,
-        retries=retries,
-        retry_delay=retry_delay,
-        execution_timeout=execution_timeout,
-        trigger_rule=trigger_rule,
-        on_success_callback=on_success_callback,
-        on_failure_callback=on_failure_callback,
-        dag=dag,
-    )
+        "cwd": module_dir,
+        "retries": retries,
+        "retry_delay": retry_delay,
+        "execution_timeout": execution_timeout,
+        "trigger_rule": trigger_rule,
+        "append_env": True,
+        "on_success_callback": on_success_callback,
+        "on_failure_callback": on_failure_callback,
+        "dag": dag,
+    }
+    if env is not None:
+        arguments["env"] = env
+    if output_processor is not None:
+        arguments["output_processor"] = output_processor
+    return BashOperator(**arguments)

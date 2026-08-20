@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from typing import Any
 
+import core.gold_publication as gold_publication_module
+import gold.common as common_module
 import pyarrow as pa
 import pytest
 from core.gold_publication import (
@@ -12,6 +15,7 @@ from core.gold_publication import (
     InputArtifact,
     Parameter,
     PublicationOutcome,
+    PublicationResult,
     sha256_hex,
     verify_publication_evidence,
 )
@@ -34,6 +38,7 @@ from gold.common import (
     parquet_bytes,
     parse_json_mapping,
     parse_yaml_mapping,
+    publish_verified,
     read_parquet_bytes,
     read_source_snapshot_payload,
     source_snapshot_parquet,
@@ -86,6 +91,62 @@ class MemoryStore:
         self.objects[uri] = payload
         self.write_log.append(uri)
         return ImmutablePutOutcome.CREATED
+
+
+def test_publish_verified_forwards_mixed_replay_opt_in(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """공통 wrapper가 mixed flag와 locked replay validator를 core에 그대로 넘긴다."""
+    verified = object()
+    expected = PublicationResult(
+        PublicationOutcome.PUBLISHED,
+        ("event:cultural_event",),
+    )
+    captured: dict[str, object] = {}
+
+    def verify(*_args: Any, **_kwargs: Any) -> object:
+        """Wrapper 검증 단계를 opaque sentinel evidence로 바꾼다."""
+        return verified
+
+    def execute(
+        _connection: Any,
+        evidence: object,
+        _mutate: Any,
+        **kwargs: object,
+    ) -> PublicationResult:
+        """Core executor에 전달된 evidence와 opt-in keyword를 기록한다."""
+        captured["evidence"] = evidence
+        captured.update(kwargs)
+        return expected
+
+    def locked(*_args: Any) -> None:
+        """테스트용 locked validator다."""
+
+    def replay(*_args: Any) -> None:
+        """테스트용 replay target validator다."""
+
+    monkeypatch.setattr(
+        gold_publication_module,
+        "verify_publication_evidence",
+        verify,
+    )
+    monkeypatch.setattr(common_module, "execute_publication", execute)
+
+    result = publish_verified(
+        object(),  # type: ignore[arg-type]
+        ((object(), object()),),  # type: ignore[arg-type]
+        object(),  # type: ignore[arg-type]
+        object(),  # type: ignore[arg-type]
+        validate_locked=locked,  # type: ignore[arg-type]
+        allow_mixed_replay=True,
+        validate_replay_targets_locked=replay,  # type: ignore[arg-type]
+    )
+
+    assert result.result is expected
+    assert captured["evidence"] == (verified,)
+    assert captured["allow_mixed_replay"] is True
+    assert captured["validate_locked"] is locked
+    assert captured["validate_replay_targets_locked"] is replay
 
 
 def test_strict_yaml_and_json_reject_duplicate_keys() -> None:

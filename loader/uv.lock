@@ -400,6 +400,7 @@ source = { virtual = "." }
 dependencies = [
     { name = "boto3" },
     { name = "core" },
+    { name = "ml-core" },
     { name = "pandas" },
     { name = "psycopg", extra = ["binary"] },
     { name = "pyarrow" },
@@ -409,7 +410,6 @@ dependencies = [
 
 [package.dev-dependencies]
 dev = [
-    { name = "ml-core" },
     { name = "moto", extra = ["s3"] },
     { name = "pytest" },
 ]
@@ -418,6 +418,7 @@ dev = [
 requires-dist = [
     { name = "boto3", specifier = "==1.43.69" },
     { name = "core", editable = "../libs/core" },
+    { name = "ml-core", editable = "../libs/ml_core" },
     { name = "pandas", specifier = ">=2.2.0,<3.0.0" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.1.0" },
     { name = "pyarrow", specifier = ">=25.0.1" },
@@ -427,7 +428,6 @@ requires-dist = [
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "ml-core", editable = "../libs/ml_core" },
     { name = "moto", extras = ["s3"], specifier = ">=5.2.2" },
     { name = "pytest", specifier = ">=9.1.1" },
 ]

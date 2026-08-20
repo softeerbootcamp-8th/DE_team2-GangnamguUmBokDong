@@ -1,9 +1,10 @@
 """core.s3의 S3 왕복(read/write)을 moto로 검증한다."""
 
+import io
+
 import pandas as pd
 import pyarrow as pa
 import pytest
-
 from core import s3
 
 
@@ -65,6 +66,38 @@ def test_read_parquet_reads_spark_style_multi_part_directory():
     result = s3.read_parquet("out/table.parquet")
 
     assert sorted(result["a"].tolist()) == [1, 2, 3, 4]
+
+
+def test_capture_object_reads_includes_parallel_multipart_bytes():
+    """ContextVar를 worker로 전파해 실제 part bytes를 같은 capture에 모은다."""
+    s3.write_parquet(pd.DataFrame({"a": [1]}), "captured/part-00000.parquet")
+    s3.write_parquet(pd.DataFrame({"a": [2]}), "captured/part-00001.parquet")
+
+    with s3.capture_object_reads() as capture:
+        result = s3.read_parquet("captured")
+
+    assert sorted(result["a"].tolist()) == [1, 2]
+    assert [item.key for item in capture.objects] == [
+        "captured/part-00000.parquet",
+        "captured/part-00001.parquet",
+    ]
+    assert all(item.payload for item in capture.objects)
+
+
+def test_capture_object_reads_rejects_same_key_drift(monkeypatch):
+    """한 run 안에서 같은 mutable source key가 바뀌면 조용히 섞지 않는다."""
+    payloads = iter((b"before", b"after"))
+
+    class _Client:
+        def get_object(self, **_kwargs):
+            return {"Body": io.BytesIO(next(payloads))}
+
+    monkeypatch.setattr(s3, "_client", lambda _timeout=None: _Client())
+
+    with s3.capture_object_reads():
+        assert s3.get_object_bytes("mutable.bin") == b"before"
+        with pytest.raises(s3.S3InputDriftError, match="run 중 변경"):
+            s3.get_object_bytes("mutable.bin")
 
 
 def test_read_parquet_safely_promotes_compatible_multi_part_schemas():

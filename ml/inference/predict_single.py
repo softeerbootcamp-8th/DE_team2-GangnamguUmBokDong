@@ -86,10 +86,15 @@ raw 스키마 자체(`fcstDate`/`fcstTime`/`TMP`/`PCP`)는 `loader/transform.py`
 """
 
 import gc
+import io
 import re
 import sys
-from collections.abc import Sequence
+import threading
+from collections.abc import Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+from contextvars import ContextVar
+from functools import wraps
 
 import numpy as np
 import pandas as pd
@@ -113,6 +118,7 @@ from ml_core.model_contract import (
     load_station_dtype,
 )
 from ml_core.scoring import predict
+from ml_core.serving_release import VerifiedStationProfile
 
 from . import config
 
@@ -163,6 +169,13 @@ _raw_rental_trips: pd.DataFrame | None = (
 _recent_population_by_ts: dict[
     pd.Timestamp, pd.DataFrame
 ] = {}  # _get_recent_population() 캐시 — target_ts별로 한 번만 S3에서 읽는다
+_PINNED_STATION_PROFILE: ContextVar[tuple[dict[int, int], np.ndarray] | None] = (
+    ContextVar(
+        "inference_pinned_station_profile",
+        default=None,
+    )
+)
+_PREDICTION_RUN_LOCK = threading.RLock()
 
 # 이 모듈의 실시간 캐시는 "프로세스 생애주기 동안 딱 한 번"만 채워진다(기존과 동일한
 # 철학) — 실제 서빙은 5분마다 새 프로세스(cron/배치 실행)로 도는 걸 전제라, 프로세스
@@ -171,6 +184,92 @@ _recent_population_by_ts: dict[
 # 등) 최초 1번만 S3에서 읽는다.
 
 N_LAG_ROLLING_FEATURES = 2  # rental_lag_1h + return_lag_1h
+
+
+def _serialize_prediction_run(function):
+    """Global mutable-source cache를 공유하는 public prediction run을 직렬화한다."""
+
+    @wraps(function)
+    def wrapped(*args, **kwargs):
+        """동일 process의 다른 prediction run이 cache를 바꾸지 못하게 한다."""
+        with _PREDICTION_RUN_LOCK:
+            return function(*args, **kwargs)
+
+    return wrapped
+
+
+def _clear_runtime_caches() -> None:
+    """Authority run 전후에 mutable S3에서 파생된 모듈 전역 캐시를 모두 비운다."""
+    global _all_rental_events_sorted
+    global _history_by_station
+    global _population_profile
+    global _raw_rental_trips
+    global _rental_events_by_station
+    global _rental_events_coverage
+    global _station_master
+    global _station_profile_station_index
+    global _station_profile_values
+
+    _history_by_station = None
+    _rental_events_by_station = None
+    _rental_events_sorted_by_station.clear()
+    _all_rental_events_sorted = None
+    _rental_events_coverage = None
+    _station_profile_station_index = None
+    _station_profile_values = None
+    _population_profile = None
+    _station_master = None
+    _holidays_by_year.clear()
+    _raw_rental_trips = None
+    _recent_population_by_ts.clear()
+
+
+@contextmanager
+def authority_inference_run(
+    station_profile: VerifiedStationProfile,
+) -> Iterator[None]:
+    """Pinned station profile을 쓰는 격리된 authority 계산 cache 경계를 연다.
+
+    Legacy 단일/모니터링 API는 기존 process cache를 유지한다. Publication만 이
+    경계를 사용해 이전 호출의 mutable-source cache를 재사용하지 않고 release가
+    검증한 station profile exact bytes를 전 run에 강제한다. Public prediction
+    entrypoint와 같은 reentrant lock을 공유해 legacy run과 cache가 섞이지 않는다.
+    """
+    if type(station_profile) is not VerifiedStationProfile:
+        raise TypeError("station_profile은 exact VerifiedStationProfile이어야 합니다.")
+    if station_profile.grid_tick_minutes != config.GRID_TICK_MINUTES:
+        raise ValueError(
+            "pinned station profile grid와 runtime model grid가 다릅니다: "
+            f"pinned={station_profile.grid_tick_minutes}, "
+            f"runtime={config.GRID_TICK_MINUTES}"
+        )
+    if not _PREDICTION_RUN_LOCK.acquire(blocking=False):
+        raise RuntimeError(
+            "같은 process에서 다른 prediction run과 authority run을 동시에 실행할 수 없습니다."
+        )
+    token = None
+    try:
+        profile = pd.read_parquet(io.BytesIO(station_profile.payload))
+        pinned_profile = _build_station_profile_arrays(profile)
+        observed_minutes = tuple(
+            sorted(pd.to_numeric(profile["minute"], errors="raise").unique().tolist())
+        )
+        if (
+            len(profile) != station_profile.row_count
+            or tuple(sorted(pinned_profile[0])) != station_profile.station_nos
+            or observed_minutes != station_profile.minute_values
+        ):
+            raise ValueError(
+                "verified station profile metadata와 runtime parsed profile이 다릅니다."
+            )
+        _clear_runtime_caches()
+        token = _PINNED_STATION_PROFILE.set(pinned_profile)
+        yield
+    finally:
+        _clear_runtime_caches()
+        if token is not None:
+            _PINNED_STATION_PROFILE.reset(token)
+        _PREDICTION_RUN_LOCK.release()
 
 
 def _read_authoritative_collector_many(
@@ -783,6 +882,10 @@ def _get_station_profile() -> tuple[dict[int, int], np.ndarray]:
     returns:
         (station_no -> station 축 인덱스 dict, dense 배열) — `_profile_stat()` 참고
     """
+    pinned = _PINNED_STATION_PROFILE.get()
+    if pinned is not None:
+        return pinned
+
     global _station_profile_station_index, _station_profile_values
     if _station_profile_values is None:
         df = s3_io.read_parquet(config.STATION_HOURLY_PROFILE_PARQUET)
@@ -1551,6 +1654,7 @@ def _rental_recent_batch(
     return out, fallback
 
 
+@_serialize_prediction_run
 def predict_demand_multi_hour(
     station_id: str,
     date: str,
@@ -1695,6 +1799,7 @@ def predict_demand_multi_hour(
     return results
 
 
+@_serialize_prediction_run
 def predict_demand_multi_hour_all_stations(
     date: str,
     hour: int,
@@ -2110,6 +2215,7 @@ def _resolve_live_stockout(
     return _stockout_from_status(station_id, _get_recent_bike_status(anchor_ts), None)
 
 
+@_serialize_prediction_run
 def predict_rental_demand(
     station_id: str,
     date: str,
@@ -2176,6 +2282,7 @@ def predict_rental_demand(
     return result
 
 
+@_serialize_prediction_run
 def predict_return_demand(
     station_id: str,
     date: str,

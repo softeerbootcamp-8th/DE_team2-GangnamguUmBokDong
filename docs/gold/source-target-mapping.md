@@ -514,6 +514,14 @@ publication state로 판정하고 부분 upsert는 금지한다. 예측 이력�
   S3 realtime 좌표가 null이면 station history를 버리므로 목표 계약과 다르다
   ([urgency.py](../../rebalance/urgency.py#L214-L265),
   [reader.py](../../rebalance/reader.py#L58-L83)).
+- 재고 입력은 기존 `read_recent_stock(anchor, lookback_minutes=25)`의 시간 의미를 그대로
+  고정한다. `stock_history_manifest_01..05`는 각각 anchor-25·20·15·10·5분의
+  authoritative source snapshot이고 oldest→newest 순서다. 현재 anchor는 이미 commit된
+  `stock_publication_manifest`가 소유한다. `stock_window_count="6"`은 과거 5개와 현재
+  1개를 합친 전체 계산 window 수이며, `scoring_config_version`은
+  `urgency-scoring-v1`이다. source snapshot 전체가 완전하다면 신규 station이 과거 일부
+  window에 없을 수는 있지만, 과거 window manifest 자체의 누락·PARTIAL·순서 교환은
+  허용하지 않는다.
 - 기대 집합은 `active station ∩ anchor와 정확히 같은 current stock ID ∩ 성공 prediction
   support ID`다. 모든 기대 ID가 한 번씩 만들어졌는지 확인한 뒤 최신 projection 전체를
   교체한다.

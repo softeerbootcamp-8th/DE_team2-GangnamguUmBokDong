@@ -8,9 +8,10 @@ from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
+import yaml
+
 import reader
 import transform
-import yaml
 from retention_config import RETENTION_GRACE
 
 _TABLES_YAML_PATH = Path(__file__).parent / "tables.yaml"
@@ -36,6 +37,25 @@ RETIRED_SOURCE_IDS: frozenset[str] = frozenset(
         "performance_event",
     }
 )
+RETIRED_DERIVED_TABLES: frozenset[str] = frozenset(
+    {
+        "forecast_points",
+        "rebalance_route",
+        "rebalance_route_stop",
+        "station_urgency",
+        "station_demand_forecast",
+        "rebalance_routes",
+        "rebalance_route_stops",
+    }
+)
+RETIRED_DERIVED_SOURCE_IDS: frozenset[str] = frozenset(
+    {
+        "ml_predictions",
+        "rebalance_urgency",
+        "rebalance_routes",
+        "rebalance_route_stops",
+    }
+)
 
 
 class RetiredSourceGoldPathError(ValueError):
@@ -44,10 +64,15 @@ class RetiredSourceGoldPathError(ValueError):
 
 def target_table_for(table: str) -> str:
     """파생 스펙 이름을 Gold 적재 대상으로 해소하고 폐기 경로를 거부한다."""
-    if table in RETIRED_SOURCE_TABLES or table in RETIRED_SOURCE_IDS:
+    if (
+        table in RETIRED_SOURCE_TABLES
+        or table in RETIRED_SOURCE_IDS
+        or table in RETIRED_DERIVED_TABLES
+        or table in RETIRED_DERIVED_SOURCE_IDS
+    ):
         raise RetiredSourceGoldPathError(
             f"{table!r}의 legacy Silver-to-Gold 적재 권한은 폐기되었다. "
-            "검증된 immutable manifest를 소비하는 source publication publisher를 사용하라."
+            "검증된 immutable manifest를 소비하는 publication publisher를 사용하라."
         )
     return table
 
@@ -83,12 +108,16 @@ class TableSpec:
 def _load_table_specs() -> dict[str, TableSpec]:
     """tables.yaml을 읽어 TableSpec 레지스트리 딕셔너리를 생성한다."""
     raw_specs = yaml.safe_load(_TABLES_YAML_PATH.read_text(encoding="utf-8"))
-    retired_tables = sorted(set(raw_specs) & RETIRED_SOURCE_TABLES)
+    if type(raw_specs) is not dict:
+        raise ValueError("tables.yaml root는 exact mapping이어야 한다.")
+    retired_tables = sorted(
+        set(raw_specs) & (RETIRED_SOURCE_TABLES | RETIRED_DERIVED_TABLES)
+    )
     retired_sources = sorted(
         {
             raw["source_id"]
             for raw in raw_specs.values()
-            if raw["source_id"] in RETIRED_SOURCE_IDS
+            if raw["source_id"] in RETIRED_SOURCE_IDS | RETIRED_DERIVED_SOURCE_IDS
         }
     )
     if retired_tables or retired_sources:

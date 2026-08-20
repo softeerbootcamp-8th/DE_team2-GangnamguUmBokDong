@@ -11,7 +11,16 @@ train-serve skew와 같은 종류의 사고(두 경로가 조용히 다른 값�
 `RENTAL_FEATURE_COLUMNS`/`RETURN_FEATURE_COLUMNS` 포함).
 """
 
+from __future__ import annotations
+
+import json
+import math
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass
 from functools import cache
+from types import MappingProxyType
 
 import lightgbm as lgb
 import numpy as np
@@ -23,6 +32,7 @@ from .model_contract import (
     RENTAL_FEATURE_COLUMNS,
     RETURN_FEATURE_COLUMNS,
     load_station_dtype,
+    station_dtype_from_payload,
 )
 from .paths import model_json_key, model_key, read_champion_prefix
 from .serving_contract import (
@@ -32,6 +42,123 @@ from .serving_contract import (
 
 BOOSTER_SUFFIXES = ["poisson", "q10", "q50", "q90"]
 _FEATURE_COLUMNS_BY_MODEL = {"rental": RENTAL_FEATURE_COLUMNS, "return": RETURN_FEATURE_COLUMNS}
+
+
+@dataclass(frozen=True, slots=True)
+class PinnedScoringModel:
+    """한 model snapshot에서 메모리로 로드한 exact scoring artifact다."""
+
+    boosters: Mapping[str, lgb.Booster]
+    conformal_correction: float
+    station_dtype: pd.CategoricalDtype
+
+    def __post_init__(self) -> None:
+        """Booster role 집합, correction과 category dtype을 검증하고 mapping을 고정한다."""
+        if not isinstance(self.boosters, Mapping):
+            raise TypeError("pinned boosters는 mapping이어야 합니다.")
+        values = dict(self.boosters)
+        if set(values) != set(BOOSTER_SUFFIXES):
+            raise ValueError(
+                "pinned boosters는 poisson/q10/q50/q90을 정확히 가져야 합니다."
+            )
+        object.__setattr__(self, "boosters", MappingProxyType(values))
+        correction = self.conformal_correction
+        if (
+            type(correction) not in {int, float}
+            or not math.isfinite(correction)
+            or correction < 0
+        ):
+            raise ValueError(
+                "pinned conformal correction은 finite nonnegative number여야 합니다."
+            )
+        object.__setattr__(self, "conformal_correction", float(correction))
+        if type(self.station_dtype) is not pd.CategoricalDtype:
+            raise TypeError(
+                "pinned station dtype은 exact CategoricalDtype이어야 합니다."
+            )
+
+
+_PINNED_SCORING_MODELS: ContextVar[Mapping[str, PinnedScoringModel] | None] = (
+    ContextVar(
+        "ml_core_pinned_scoring_models",
+        default=None,
+    )
+)
+
+
+def build_pinned_scoring_model(
+    artifact_payloads: Mapping[str, bytes],
+) -> PinnedScoringModel:
+    """검증된 model snapshot payload를 legacy pointer 없이 메모리 scorer로 로드한다."""
+    if not isinstance(artifact_payloads, Mapping):
+        raise TypeError("model artifact payloads는 mapping이어야 합니다.")
+    required = {
+        "booster_poisson",
+        "booster_q10",
+        "booster_q50",
+        "booster_q90",
+        "conformal_correction",
+        "station_categories",
+    }
+    missing = required.difference(artifact_payloads)
+    if missing:
+        raise ValueError(f"pinned scoring artifact가 누락됐습니다: {sorted(missing)}")
+    payloads: dict[str, bytes] = {}
+    for role in required:
+        payload = artifact_payloads[role]
+        if type(payload) is not bytes:
+            raise TypeError(f"pinned scoring artifact {role}은 bytes여야 합니다.")
+        payloads[role] = payload
+
+    boosters: dict[str, lgb.Booster] = {}
+    for suffix in BOOSTER_SUFFIXES:
+        role = f"booster_{suffix}"
+        try:
+            model_text = payloads[role].decode("utf-8")
+            boosters[suffix] = lgb.Booster(model_str=model_text)
+        except (
+            UnicodeDecodeError,
+            TypeError,
+            ValueError,
+            lgb.basic.LightGBMError,
+        ) as exc:
+            raise ValueError(
+                f"pinned LightGBM artifact를 읽을 수 없습니다: {role}"
+            ) from exc
+
+    try:
+        correction_document = json.loads(payloads["conformal_correction"])
+        correction = correction_document["correction"]
+    except (UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise ValueError(
+            "pinned conformal_correction JSON을 읽을 수 없습니다."
+        ) from exc
+    return PinnedScoringModel(
+        boosters=boosters,
+        conformal_correction=correction,
+        station_dtype=station_dtype_from_payload(payloads["station_categories"]),
+    )
+
+
+@contextmanager
+def use_pinned_scoring_models(
+    models: Mapping[str, PinnedScoringModel],
+) -> Iterator[None]:
+    """현재 run의 rental/return scorer를 exact pinned snapshot 쌍으로 제한한다."""
+    if _PINNED_SCORING_MODELS.get() is not None:
+        raise RuntimeError("pinned scoring context는 중첩할 수 없습니다.")
+    if not isinstance(models, Mapping) or set(models) != {"rental", "return"}:
+        raise ValueError(
+            "pinned scoring models는 rental/return을 정확히 가져야 합니다."
+        )
+    frozen = MappingProxyType(dict(models))
+    if any(type(value) is not PinnedScoringModel for value in frozen.values()):
+        raise TypeError("pinned scoring model은 exact PinnedScoringModel이어야 합니다.")
+    token = _PINNED_SCORING_MODELS.set(frozen)
+    try:
+        yield
+    finally:
+        _PINNED_SCORING_MODELS.reset(token)
 
 
 @cache
@@ -128,15 +255,26 @@ def predict(df: pd.DataFrame, model_name: str, exposure_col: str | None = None) 
     returns:
         pd.DataFrame: station_no, date, hour, pred_mean, pred_p10, pred_p50, pred_p90
     """
-    # station_categories나 booster를 읽기 전에 profile 계약부터 확인한다. 모델은
-    # 정상 파일이어도 현재 feature 계산 의미가 다르면 예측값을 내서는 안 된다.
-    validate_champion_serving_contract(model_name)
-    station_dtype = load_station_dtype(model_name)
+    pinned_models = _PINNED_SCORING_MODELS.get()
+    pinned = None if pinned_models is None else pinned_models.get(model_name)
+    if pinned_models is not None and pinned is None:
+        raise ValueError(f"pinned scoring context에 model이 없습니다: {model_name}")
+
+    if pinned is None:
+        # Legacy offline/monitor 경로는 기존 champion profile 검증과 lazy load를
+        # 유지한다. Authority 경로는 이미 pinned release 계약을 검증했으므로 이
+        # branch에 들어오지 않아 run 도중 mutable champion pointer를 다시 읽지 않는다.
+        validate_champion_serving_contract(model_name)
+        station_dtype = load_station_dtype(model_name)
+        boosters = load_boosters(model_name)
+        correction = load_conformal_correction(model_name)
+    else:
+        station_dtype = pinned.station_dtype
+        boosters = pinned.boosters
+        correction = pinned.conformal_correction
+
     X = df[_FEATURE_COLUMNS_BY_MODEL[model_name]].copy()
     X["station_no"] = X["station_no"].astype(station_dtype)
-
-    boosters = load_boosters(model_name)
-    correction = load_conformal_correction(model_name)
 
     exposure = df[exposure_col].to_numpy() if exposure_col is not None else np.ones(len(df))
 
