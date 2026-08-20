@@ -201,6 +201,11 @@ def _select_required_columns(table: pa.Table, columns: list[str]) -> pa.Table:
 def _client(timeout_seconds: float | None = None):
     """S3 호환 클라이언트를 생성한다.
 
+    `S3_ENDPOINT_URL`이 있으면 MinIO 등 S3 호환 스토리지로 보고 환경변수의 자격증명을
+    명시적으로 넘긴다(로컬 개발 경로 — 기존 동작 그대로). 없으면 실제 AWS S3로 보고
+    자격증명을 boto3 credential chain에 맡긴다: 자격증명 인자를 명시하면 boto3가 EC2
+    instance profile이나 EMR 실행 역할을 **아예 조회하지 않아** 운영에서 전부 403이 된다.
+
     args:
         timeout_seconds: 지정하면 connect/read timeout을 이 값으로 두고 재시도를
             끈다(`retries={"max_attempts": 1}`) — 기본(None)은 boto3 기본 재시도
@@ -214,13 +219,16 @@ def _client(timeout_seconds: float | None = None):
         config = BotoConfig(
             connect_timeout=timeout_seconds, read_timeout=timeout_seconds, retries={"max_attempts": 1}
         )
-    return boto3.client(
-        "s3",
-        endpoint_url=os.environ.get("S3_ENDPOINT_URL") or None,
-        aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID", "minioadmin"),
-        aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY", "minioadmin"),
-        config=config,
-    )
+    endpoint_url = os.environ.get("S3_ENDPOINT_URL") or None
+    if endpoint_url:
+        return boto3.client(
+            "s3",
+            endpoint_url=endpoint_url,
+            aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID", "minioadmin"),
+            aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY", "minioadmin"),
+            config=config,
+        )
+    return boto3.client("s3", config=config)
 
 
 def _bucket() -> str:

@@ -386,3 +386,62 @@ def test_delete_objects(n):
     s3.delete_objects(keys)
 
     assert all(s3.get_object_bytes(key) is None for key in keys)
+
+
+class _CapturingBoto3:
+    """`boto3.client()`에 실제로 넘어간 kwargs를 잡아두는 스텁."""
+
+    def __init__(self):
+        self.kwargs: dict | None = None
+
+    def client(self, service_name, **kwargs):
+        self.kwargs = kwargs
+        return object()
+
+
+@pytest.mark.parametrize("endpoint", [None, ""])
+def test_client_without_endpoint_delegates_credentials_to_boto3_chain(monkeypatch, endpoint):
+    # 자격증명을 명시적으로 넘기면 boto3가 EC2 instance profile / EMR 실행 역할을 아예
+    # 조회하지 않는다 — 운영에서 전부 403이 되므로 인자 자체가 없어야 한다.
+    # 운영 compose는 S3_ENDPOINT_URL을 빈 문자열로 두므로 ""도 "없음"으로 취급해야 한다.
+    fake = _CapturingBoto3()
+    monkeypatch.setattr(s3, "boto3", fake)
+    if endpoint is None:
+        monkeypatch.delenv("S3_ENDPOINT_URL", raising=False)
+    else:
+        monkeypatch.setenv("S3_ENDPOINT_URL", endpoint)
+
+    s3._client()
+
+    assert "aws_access_key_id" not in fake.kwargs
+    assert "aws_secret_access_key" not in fake.kwargs
+    assert "endpoint_url" not in fake.kwargs
+
+
+def test_client_with_endpoint_passes_explicit_credentials(monkeypatch):
+    # 로컬 MinIO 경로는 기존 동작 그대로 유지되어야 한다.
+    fake = _CapturingBoto3()
+    monkeypatch.setattr(s3, "boto3", fake)
+    monkeypatch.setenv("S3_ENDPOINT_URL", "http://minio:9000")
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "local-key")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "local-secret")
+
+    s3._client()
+
+    assert fake.kwargs["endpoint_url"] == "http://minio:9000"
+    assert fake.kwargs["aws_access_key_id"] == "local-key"
+    assert fake.kwargs["aws_secret_access_key"] == "local-secret"
+
+
+def test_client_with_endpoint_falls_back_to_minioadmin(monkeypatch):
+    # .env를 셸에 로드하지 않고 모듈을 직접 실행하던 개발 경로를 깨뜨리지 않는다.
+    fake = _CapturingBoto3()
+    monkeypatch.setattr(s3, "boto3", fake)
+    monkeypatch.setenv("S3_ENDPOINT_URL", "http://localhost:9000")
+    monkeypatch.delenv("AWS_ACCESS_KEY_ID", raising=False)
+    monkeypatch.delenv("AWS_SECRET_ACCESS_KEY", raising=False)
+
+    s3._client()
+
+    assert fake.kwargs["aws_access_key_id"] == "minioadmin"
+    assert fake.kwargs["aws_secret_access_key"] == "minioadmin"
