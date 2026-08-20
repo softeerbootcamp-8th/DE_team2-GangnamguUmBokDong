@@ -26,6 +26,7 @@ from feature_engine.spark.build_multi_horizon_features import (
     RETURN_TARGET_COLUMNS,
     _anchor_input,
     _features_in_training_window,
+    _write_date_partitioned,
     build_multi_horizon_features,
 )
 
@@ -161,6 +162,33 @@ def test_training_window_filter_excludes_newer_partitions(spark, monkeypatch):
     got = _features_in_training_window(source).orderBy("hour_ts").toPandas()
 
     assert got["value"].tolist() == [1, 2]
+
+
+def test_date_partitioned_writer_creates_one_data_file_per_date(spark, tmp_path):
+    """여러 입력 partition이 있어도 날짜별 Parquet data file은 하나만 만든다."""
+    output_path = tmp_path / "multi-horizon.parquet"
+    source = spark.createDataFrame(
+        [
+            ("2025-06-01", station_no, horizon)
+            for station_no in range(8)
+            for horizon in range(1, 4)
+        ]
+        + [
+            ("2025-06-02", station_no, horizon)
+            for station_no in range(8)
+            for horizon in range(1, 4)
+        ],
+        ["date", "station_no", "horizon"],
+    ).repartition(6)
+
+    _write_date_partitioned(source, str(output_path))
+
+    files_by_date = {
+        date_dir.name: list(date_dir.glob("part-*.parquet"))
+        for date_dir in output_path.glob("date=*")
+    }
+    assert set(files_by_date) == {"date=2025-06-01", "date=2025-06-02"}
+    assert all(len(files) == 1 for files in files_by_date.values())
 
 
 def test_anchor_input_returns_none_when_training_anchor_matches_grid(spark, monkeypatch):
