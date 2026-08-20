@@ -1,0 +1,10 @@
+# MLflow tracking 서버 이미지 — backend store(postgres)/artifact store(S3 호환
+# minio)에 붙어 feature_engine/training/inference 세 인스턴스가 공통으로 실험을
+# 기록하는 서버(docker-compose.yml의 mlflow 서비스). `--serve-artifacts`로 띄우므로
+# 클라이언트(각 인스턴스)는 MLFLOW_TRACKING_URI만 알면 되고, S3 자격증명은 이
+# 컨테이너만 가지고 있으면 된다(artifact 업로드가 클라이언트 대신 이 서버를 거쳐 감).
+FROM python:3.11-slim
+
+RUN pip install --no-cache-dir mlflow psycopg2-binary boto3
+
+EXPOSE 5000

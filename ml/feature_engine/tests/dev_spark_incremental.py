@@ -24,11 +24,12 @@ Silver 조각 파일(`bike_station_realtime`/`bike_rental_history`/
 로직(경로에서 시각 역추출, station_id 직접 매칭 등)까지 이 테스트가 같이 검증한다.
 """
 
-import json
+from datetime import date
 from pathlib import Path
 
 import pandas as pd
 import pytest
+from core import s3 as s3_io
 
 pyspark = pytest.importorskip("pyspark")
 
@@ -41,7 +42,9 @@ from feature_engine.spark.build_rolling_rental_features import (
     build_rolling_rental_features,
 )
 from feature_engine.spark.run_pipeline import (
+    _incremental_since,
     _refresh_primary_tables,
+    _reject_if_legacy_flat_layout,
     _run_incremental,
 )
 from feature_engine.spark.watermark import read_watermark, write_watermark
@@ -126,23 +129,23 @@ def synthetic_environment(spark, tmp_path, monkeypatch):
         pd.DataFrame(trip_rows),
     )
 
-    # 2025-01-15(수요일 — 주말이 아님)를 공휴일로 넣어서, is_next_day_off/is_prev_day_off의
-    # "휴일" 분기가 "주말" 분기와 뒤섞이지 않고 독립적으로 검증되게 한다(아래
-    # test_next_and_prev_day_off_match_pandas_reference 참고).
-    summary_path = tmp_path / "analysis_summary.json"
-    summary_path.write_text(json.dumps({"holidays_2025": ["2025-01-15"]}), encoding="utf-8")
-
     output_root = str(tmp_path / "output")
 
     monkeypatch.setattr(fe_config, "SILVER_ROOT", str(silver_root))
-    monkeypatch.setattr(fe_config, "TRAIN_YEAR", 2025)
+    # 예전엔 TRAIN_YEAR=2025로 Silver glob 자체를 연도로 좁혔다 — 지금은 glob이 연도와
+    # 무관하고(_silver_glob() 참고) 대신 _refresh_primary_tables()에 넘기는 since(=
+    # config.WINDOW_START)로 좁힌다. 실제 "오늘" 기준으로 계산되는 WINDOW_START(기본
+    # 12개월 전)는 이 fixture의 테스트 데이터(2025-01-01~약 01-26)보다 나중일 수 있어
+    # 그대로 두면 _run_incremental() 내부의 _refresh_primary_tables() 호출이 테스트
+    # 데이터를 전부 걸러낸다 — 데이터 범위를 확실히 덮는 고정 윈도우로 monkeypatch.
+    monkeypatch.setattr(fe_config, "WINDOW_START", date(2025, 1, 1))
+    monkeypatch.setattr(fe_config, "WINDOW_END", date(2025, 12, 31))
     monkeypatch.setattr(fe_config, "STATION_MASTER_PARQUET", str(tmp_path / "station_master.parquet"))
     monkeypatch.setattr(fe_config, "TARGETS_PARQUET", str(tmp_path / "targets.parquet"))
     monkeypatch.setattr(fe_config, "RETURN_TARGETS_PARQUET", str(tmp_path / "return_targets.parquet"))
     monkeypatch.setattr(fe_config, "STATION_STATUS_PARQUET", str(tmp_path / "status.parquet"))
     monkeypatch.setattr(fe_config, "WEATHER_PARQUET", str(tmp_path / "weather.parquet"))
     monkeypatch.setattr(fe_config, "POPULATION_PARQUET", str(tmp_path / "population.parquet"))
-    monkeypatch.setattr(fe_config, "ANALYSIS_SUMMARY_JSON", str(summary_path))
     monkeypatch.setattr(fe_config, "OUTPUT_ROOT", output_root)
     monkeypatch.setattr(fe_config, "ROLLING_RENTAL_FEATURES_PARQUET", output_root + "/rolling.parquet")
     monkeypatch.setattr(fe_config, "MERGED_TABLE_PARQUET", output_root + "/merged.parquet")
@@ -161,13 +164,7 @@ def synthetic_environment(spark, tmp_path, monkeypatch):
     return {"watermark_cutoff": watermark_cutoff}
 
 
-COMPARE_COLS = [
-    "hour_ts",
-    "rental_lag_1h", "rental_lag_24h", "rental_lag_168h",
-    "rental_roll_mean_3h", "rental_roll_std_3h", "rental_roll_mean_24h", "rental_roll_std_24h",
-    "return_lag_1h", "return_lag_24h", "return_lag_168h",
-    "return_roll_mean_3h", "return_roll_std_3h", "return_roll_mean_24h", "return_roll_std_24h",
-]
+COMPARE_COLS = ["hour_ts", "rental_lag_1h", "return_lag_1h"]
 
 
 def test_incremental_append_matches_full_rebuild(spark, synthetic_environment, tmp_path):
@@ -214,6 +211,61 @@ def test_incremental_append_matches_full_rebuild(spark, synthetic_environment, t
     pd.testing.assert_frame_equal(got_new, expected_new, check_dtype=False, check_exact=False, rtol=1e-9)
 
 
+def test_incremental_does_not_corrupt_lag_at_the_recompute_boundary(spark, synthetic_environment, tmp_path):
+    """회귀 재현 — 증분 재계산이 실제로 덮어쓰는 날짜 파티션 중 **가장 이른 tick**
+    (재계산 구간의 자정 경계, `since_dt`)이 이미 정상값으로 발행돼 있던 걸 NULL/
+    과소값으로 덮어쓰면 안 된다.
+
+    `build_features()`의 lag는 "hour_ts - 1시간" self-join이라, 재계산에 쓰는
+    DataFrame이 `since_dt`부터만 있으면 그 첫 tick은 이전 시간대 데이터를 못 봐서
+    lag가 NULL이 된다(`rental_lag_1h`은 rolling 창(window+embargo)이 짧게 잘려
+    과소집계). 이 tick은 "새로 생기는 데이터"가 아니라 **이전 실행에서 이미 정상
+    값으로 발행됐던** 파티션이라, 매 증분 실행마다 이 결함으로 덮어써지면 회귀가
+    영구 반복된다 — `test_incremental_append_matches_full_rebuild`는 워터마크
+    "이후"(새 데이터)만 비교해서 이 경계는 잡지 못한다.
+    """
+    watermark_cutoff = synthetic_environment["watermark_cutoff"]
+    since_dt = _incremental_since(watermark_cutoff.to_pydatetime())
+
+    # (A) 기준값 — 전체 재계산 기준으로 since_dt 당일의 lag.
+    full_rolling_path = str(tmp_path / "full_rolling_boundary.parquet")
+    build_rolling_rental_features(spark, output_path=full_rolling_path)
+    full_merged = build_merged_table(spark)
+    full_features = build_features(spark, full_merged, rolling_parquet_path=full_rolling_path)
+    since_dt_ts = pd.Timestamp(since_dt)
+    expected_boundary = (
+        full_features.filter(F.col("hour_ts") == F.lit(since_dt_ts))
+        .select(*COMPARE_COLS)
+        .toPandas()
+    )
+    assert len(expected_boundary) > 0  # 이 테스트 데이터 범위 안에 실제로 존재하는 tick이어야 의미가 있음
+    assert expected_boundary["rental_lag_1h"].notna().all()
+    assert expected_boundary["return_lag_1h"].notna().all()
+
+    # 기존 피처마트(챔피언 산출물) — since_dt 당일도 이미 "정상값으로" 써져 있던 상태.
+    existing = full_features.filter(F.col("hour_ts") <= F.lit(watermark_cutoff))
+    existing.write.mode("overwrite").partitionBy("date").parquet(fe_config.FEATURES_TABLE_PARQUET)
+    write_watermark(fe_config.WATERMARK_PATH, watermark_cutoff.isoformat(), {})
+
+    # (B) 증분 실행 — since_dt 날짜 파티션이 덮어써진다.
+    _run_incremental(spark, {"max_hour_ts": watermark_cutoff.isoformat()})
+
+    got_boundary = (
+        spark.read.parquet(fe_config.FEATURES_TABLE_PARQUET)
+        .filter(F.col("hour_ts") == F.lit(since_dt_ts))
+        .select(*COMPARE_COLS)
+        .toPandas()
+    )
+
+    assert got_boundary["rental_lag_1h"].notna().all(), "증분 재계산이 경계 tick의 rental_lag_1h를 NULL로 덮어씀"
+    assert got_boundary["return_lag_1h"].notna().all(), "증분 재계산이 경계 tick의 return_lag_1h를 NULL로 덮어씀"
+    pd.testing.assert_frame_equal(
+        got_boundary.sort_values("hour_ts").reset_index(drop=True),
+        expected_boundary.sort_values("hour_ts").reset_index(drop=True),
+        check_dtype=False, check_exact=False, rtol=1e-9,
+    )
+
+
 def test_incremental_corrects_rental_count_for_late_arriving_trip(spark, synthetic_environment, tmp_path):
     """반납이 뒤늦게 완료돼 트립이 나중에야 Silver에 나타나도, 이미 발행된 과거 날짜의
     rental_count가 다음 증분 실행에서 사후 보정되는지 확인한다.
@@ -244,7 +296,7 @@ def test_incremental_corrects_rental_count_for_late_arriving_trip(spark, synthet
     late_start = start + pd.Timedelta(hours=WATERMARK_OFFSET_HOURS - 32)
     before = (
         spark.read.parquet(fe_config.FEATURES_TABLE_PARQUET)
-        .filter((F.col("station_id") == "A") & (F.col("hour_ts") == F.lit(late_start)))
+        .filter((F.col("station_no") == 1) & (F.col("hour_ts") == F.lit(late_start)))
         .select("rental_count")
         .collect()[0][0]
     )
@@ -269,7 +321,7 @@ def test_incremental_corrects_rental_count_for_late_arriving_trip(spark, synthet
 
     after = (
         spark.read.parquet(fe_config.FEATURES_TABLE_PARQUET)
-        .filter((F.col("station_id") == "A") & (F.col("hour_ts") == F.lit(late_start)))
+        .filter((F.col("station_no") == 1) & (F.col("hour_ts") == F.lit(late_start)))
         .select("rental_count")
         .collect()[0][0]
     )
@@ -277,36 +329,34 @@ def test_incremental_corrects_rental_count_for_late_arriving_trip(spark, synthet
     assert after == before + 1
 
 
-def test_next_and_prev_day_off_match_pandas_reference(spark, synthetic_environment):
-    """build_merged_table()의 is_next_day_off/is_prev_day_off(Spark)가 pandas로 손계산한
-    기대값과 정확히 같은지 확인한다 — inference/predict_single.py의
-    `_build_target_time_fields()`가 쓰는 것과 정확히 같은 공식
-    (`(dow+1)%7>=5`/`(dow+6)%7>=5` OR 휴일 멤버십)을 pandas로 재현해서 대조한다.
-    이 컬럼은 이번에 신규 추가됐는데 기존 회귀 테스트(COMPARE_COLS)엔 lag/rolling만
-    있어서 값 자체를 검증하는 테스트가 따로 없었다 — 이 테스트가 그 공백을 메운다.
+def test_is_holiday_matches_pandas_reference_and_includes_real_holiday(spark, synthetic_environment):
+    """build_merged_table()의 is_holiday(Spark)가 pandas로 손계산한 기대값과 정확히
+    같은지 확인한다 — inference/predict_single.py의 `_build_target_time_fields()`가
+    쓰는 것과 정확히 같은 공식(주말 OR 공휴일 멤버십)을 pandas로 재현해서 대조한다.
 
-    fixture의 공휴일(2025-01-15, 수요일)이 주말이 아니므로, "휴일 분기"가 "주말
-    분기"와 뒤섞이지 않고 독립적으로 검증된다(아래 마지막 assert).
+    2025-01-01(신정, 수요일 — 주말이 아님)이 fixture 데이터 범위(2025-01-01~01-26) 안에
+    있으므로, "휴일 분기"가 "주말 분기"와 뒤섞이지 않고 독립적으로 검증된다(아래
+    마지막 assert) — `holidays` 패키지(ml_core.holidays_kr)가 실제로 계산한 값을
+    그대로 참조한다(더 이상 analysis_summary.json 같은 고정 목록이 아님).
     """
+    from ml_core.holidays_kr import korean_holidays
+
     merged = build_merged_table(spark)
-    got = merged.select("hour_ts", "is_next_day_off", "is_prev_day_off").toPandas()
+    got = merged.select("hour_ts", "is_holiday").toPandas()
     got = got.sort_values("hour_ts").reset_index(drop=True)
 
-    holidays = {"2025-01-15"}
+    holidays = korean_holidays([2024, 2025, 2026])
     hour_ts = pd.to_datetime(got["hour_ts"])
     dow = hour_ts.dt.dayofweek
-    next_date = (hour_ts + pd.Timedelta(days=1)).dt.strftime("%Y-%m-%d")
-    prev_date = (hour_ts - pd.Timedelta(days=1)).dt.strftime("%Y-%m-%d")
-    expected_next = (next_date.isin(holidays) | (((dow + 1) % 7) >= 5)).astype(int)
-    expected_prev = (prev_date.isin(holidays) | (((dow + 6) % 7) >= 5)).astype(int)
+    date_str = hour_ts.dt.strftime("%Y-%m-%d")
+    expected = (date_str.isin(holidays) | (dow >= 5)).astype(int)
 
-    assert (got["is_next_day_off"].to_numpy() == expected_next.to_numpy()).all()
-    assert (got["is_prev_day_off"].to_numpy() == expected_prev.to_numpy()).all()
+    assert (got["is_holiday"].to_numpy() == expected.to_numpy()).all()
 
-    # 2025-01-14(화, 평일)의 다음날은 공휴일(01-15, 수)이지만 주말은 아니다 —
-    # is_next_day_off가 "주말이 아닌데도" 1이어야 휴일 분기가 실제로 동작한 것.
-    jan14 = got[hour_ts.dt.strftime("%Y-%m-%d") == "2025-01-14"]
-    assert (jan14["is_next_day_off"] == 1).all() and len(jan14) > 0
+    # 2025-01-01(수, 평일)은 주말이 아니지만 신정이라 is_holiday=1이어야 한다 —
+    # 주말이 아닌데도 1이어야 공휴일 분기가 실제로 동작한 것.
+    jan1 = got[hour_ts.dt.strftime("%Y-%m-%d") == "2025-01-01"]
+    assert len(jan1) > 0 and (jan1["is_holiday"] == 1).all()
 
 
 def test_incremental_is_noop_when_no_new_data(spark, synthetic_environment, tmp_path):
@@ -327,3 +377,41 @@ def test_incremental_is_noop_when_no_new_data(spark, synthetic_environment, tmp_
     after_count = spark.read.parquet(fe_config.FEATURES_TABLE_PARQUET).count()
 
     assert before_count == after_count == N_HOURS * TICKS_PER_HOUR
+
+
+# --- 구버전 flat parquet(append 시절 잔재) 감지 회귀 테스트 ---
+# `_reject_if_legacy_flat_layout()`는 plain boto3(ml_core.s3_io)로 FEATURES_TABLE_KEY
+# prefix를 직접 조회한다 — 위 테스트들과 달리 Spark가 아니라 conftest.py의
+# moto 목 S3(_mock_bucket, autouse)를 그대로 쓰면 되므로 synthetic_environment
+# 픽스처(로컬 tmp_path 기반 Silver/Spark 산출물) 없이도 독립적으로 검증할 수 있다.
+
+
+def test_reject_if_legacy_flat_layout_passes_when_prefix_is_empty():
+    _reject_if_legacy_flat_layout()  # 첫 실행 전(아무 파일도 없음)에는 그냥 통과해야 함
+
+
+def test_reject_if_legacy_flat_layout_passes_when_only_partitioned_files_exist():
+    prefix = fe_config.FEATURES_TABLE_KEY
+    s3_io.put_object_bytes(f"{prefix}/date=2025-01-01/part-0000.parquet", b"dummy")
+
+    _reject_if_legacy_flat_layout()  # date= 파티션 파일만 있으면 통과해야 함
+
+
+def test_reject_if_legacy_flat_layout_raises_when_flat_file_exists():
+    prefix = fe_config.FEATURES_TABLE_KEY
+    # date= 파티션 없이 prefix 바로 밑에 있는 파일 — append 모드로 쓰던 시절의 흔적.
+    s3_io.put_object_bytes(f"{prefix}/part-0000.parquet", b"dummy")
+
+    with pytest.raises(RuntimeError, match="구버전 flat parquet"):
+        _reject_if_legacy_flat_layout()
+
+
+def test_reject_if_legacy_flat_layout_raises_even_when_partitioned_files_also_exist():
+    """구버전 flat 파일과 신버전 date= 파티션 파일이 섞여 있어도(가장 위험한 상태 —
+    이미 일부는 증분으로 갱신됐지만 나머지는 여전히 구버전인 경우) 걸려야 한다."""
+    prefix = fe_config.FEATURES_TABLE_KEY
+    s3_io.put_object_bytes(f"{prefix}/date=2025-01-01/part-0000.parquet", b"dummy")
+    s3_io.put_object_bytes(f"{prefix}/part-legacy.parquet", b"dummy")
+
+    with pytest.raises(RuntimeError, match="구버전 flat parquet"):
+        _reject_if_legacy_flat_layout()

@@ -39,10 +39,9 @@ def fetch_all(query: str, params: Sequence[Any] | None = None) -> list[dict]:
     returns:
         컬럼명을 키로 하는 딕셔너리 레코드 목록
     """
-    with get_connection() as conn:
-        with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute(query, params)
-            return cur.fetchall()
+    with get_connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(query, params)
+        return cur.fetchall()
 
 
 def fetch_one(query: str, params: Sequence[Any] | None = None) -> dict | None:
@@ -54,7 +53,6 @@ def fetch_one(query: str, params: Sequence[Any] | None = None) -> dict | None:
     returns:
         단일 딕셔너리 레코드 (결과가 없으면 None)
     """
-    with get_connection() as conn:
-        with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute(query, params)
-            return cur.fetchone()
+    with get_connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(query, params)
+        return cur.fetchone()

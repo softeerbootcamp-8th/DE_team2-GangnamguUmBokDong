@@ -17,7 +17,11 @@ s3_io._bucket()`가 읽음)로 정해지고, 이 파일은 그 버킷 "안"에�
 """
 
 import os
+from datetime import UTC, datetime
+from functools import cache
 from pathlib import Path
+
+from core import s3 as s3_io
 
 from . import common_config
 
@@ -54,10 +58,10 @@ TRAIN_MONTHS = [f"{TRAIN_YEAR % 100:02d}{m:02d}" for m in range(1, 13)]
 RENTAL_PARQUET_DIR = os.environ.get("RENTAL_PARQUET_DIR", "parquet")
 
 # training이 만들고(학습), inference가 읽는(서빙) 모델 아티팩트 — dev/
-# S3_DATA_CATALOG.md에 정의된 `models/` prefix를 그대로 쓴다. 이제 학습은 항상
-# 아래 아카이브 prefix에 쓰고, 챌린저가 챔피언을 이길 때만(training/promotion.py)
-# 이 prefix로 파일명 그대로 복사된다 — 이 prefix에 직접 학습 결과를 쓰는 코드
-# 경로는 없다.
+# S3_DATA_CATALOG.md에 정의된 `models/` prefix를 그대로 쓴다. 학습은 항상 아래
+# 아카이브 prefix에 쓴다 — 이 prefix에 booster/JSON을 직접 쓰는 코드 경로는
+# 없다. 대신 `champion/{model_name}.json` 포인터가 "지금 챔피언은 어느
+# archive_prefix인지"를 가리키고(아래 참고), 실제 파일은 항상 archive에만 있다.
 MODELS_PREFIX = os.environ.get("MODELS_PREFIX", "models")
 
 # 학습한 모든 모델(챔피언이 됐는지와 무관하게)을 보존하는 아카이브 — 날짜/프로필별로
@@ -71,7 +75,8 @@ def archive_models_prefix(date: str, profile_name: str) -> str:
     이 prefix를 `train_common.train_target(..., models_prefix=...)`에 그대로
     넘기면, `model_key`/`model_json_key`가 만드는 파일명(예: "rental_poisson.txt")
     자체는 챔피언 경로와 완전히 동일하게 유지되고 위치만 여기로 바뀐다 — 나중에
-    챔피언으로 승격할 때 파일명을 그대로 복사만 하면 되는 이유다.
+    챔피언으로 승격할 때는 이 경로를 `write_champion_pointer()`로 가리키기만
+    하면 된다(파일 복사 없음, 아래 참고).
 
     args:
         date: "YYYY-MM-DD" — 학습을 실행한 날짜
@@ -83,21 +88,126 @@ def archive_models_prefix(date: str, profile_name: str) -> str:
 
 
 def model_key(model_name: str, suffix: str, models_prefix: str | None = None) -> str:
-    """모델 아티팩트 하나의 S3 키를 만든다 (예: model_key("rental", "poisson") -> "models/rental_poisson.txt").
+    """모델 아티팩트 하나의 S3 키를 만든다 (예: model_key("rental", "poisson", archive_prefix) -> "{archive_prefix}/rental_poisson.txt").
 
     args:
         model_name: "rental" 또는 "return"
         suffix: "poisson"/"q10"/"q50"/"q90"
-        models_prefix: None이면 챔피언 prefix(MODELS_PREFIX) — 하이퍼파라미터 스윕 등
-            실험 실행은 자신만의 prefix(예: "models/experiments/{run_id}")를 넘겨서
-            챔피언 아티팩트를 덮어쓰지 않는다.
+        models_prefix: None이면 정적 MODELS_PREFIX를 그대로 쓴다 — 이제 챔피언
+            아티팩트는 여기 없으므로(위 MODELS_PREFIX 설명 참고), "지금 챔피언"을
+            읽고 싶으면 호출부가 먼저 `read_champion_prefix(model_name)`으로
+            archive_prefix를 구해 명시적으로 넘겨야 한다. 하이퍼파라미터 스윕 등
+            실험 실행도 마찬가지로 자신만의 prefix(예: "models/experiments/{run_id}")를
+            명시적으로 넘긴다.
     """
     return f"{models_prefix or MODELS_PREFIX}/{model_name}_{suffix}.txt"
 
 
 def model_json_key(model_name: str, kind: str, models_prefix: str | None = None) -> str:
-    """모델 부속 JSON(conformal_correction/station_categories/metrics)의 S3 키를 만든다."""
+    """모델 부속 JSON(conformal_correction/station_categories/metrics)의 S3 키를 만든다.
+
+    args: model_key() 참고 — models_prefix=None의 의미가 동일하다.
+    """
     return f"{models_prefix or MODELS_PREFIX}/{model_name}_{kind}.json"
+
+
+def champion_pointer_key(model_name: str) -> str:
+    """model_name(rental/return)의 챔피언 포인터 위치."""
+    return f"{MODELS_PREFIX}/champion/{model_name}.json"
+
+
+PROFILES_PREFIX = "profiles"
+
+
+def profile_path(name: str) -> str:
+    """하이퍼파라미터 프로필(임베고/tick/LGB 파라미터 등)의 S3 키.
+
+    feature_engine/training/inference가 각자 다른 서버에 배포되므로, 프로필을
+    저장소에 커밋된 로컬 JSON으로 두면 값 하나 바꿀 때마다 세 곳 다 코드 배포가
+    필요해진다 — 대신 공유 S3에 두고 `common_config._load_profile()`이 매 프로세스
+    시작 시 여기서 읽는다(`ML_PROFILE` 환경변수로 이름만 맞추면 세 서비스가 항상
+    같은 값을 봄). `ml_core.profile_registry.push_profile()`이 이 키에 쓴다.
+    """
+    return f"{PROFILES_PREFIX}/{name}.json"
+
+
+@cache
+def read_champion_prefix(model_name: str) -> str:
+    """지금 챔피언이 가리키는 archive_prefix를 읽는다.
+
+    **왜 파일 복사가 아니라 포인터인가**: 예전엔 승격할 때 archive의 파일 8개
+    (booster 4개 + station_categories/conformal_correction/metrics/profile)를
+    챔피언 prefix로 하나씩 복사했다 — S3는 여러 키에 걸친 트랜잭션을 지원하지
+    않으므로, 복사가 절반쯤 끝난 순간 inference가 실행되면 booster는 새
+    버전인데 station_categories는 옛 버전인 식으로 섞인 모델을 읽을 수 있었다
+    (station_id 카테고리 코드가 학습 시점의 정렬 순서에 의존하므로, 이렇게
+    섞이면 성능 저하가 아니라 엉뚱한 정류소에 대한 예측이 조용히 나간다).
+    archive 자체는 학습이 끝난 뒤 다시 안 바뀌는 immutable 산출물이므로, "지금
+    챔피언이 어느 archive_prefix인지"를 가리키는 포인터 객체 하나만 원자적으로
+    바꾸면 파일을 복사할 필요가 아예 없다 — 단일 키에 대한 PUT은 원자적이라,
+    어느 시점에 이 함수를 부르든 완전히 예전 archive_prefix 또는 완전히 새
+    archive_prefix 둘 중 하나만 보이고 중간 상태는 존재하지 않는다.
+
+    **`@cache`가 필요한 이유(프로세스 "내" 일관성 — 프로세스 "간"이 아님)**: 이
+    함수는 여러 모듈(`ml_core.scoring`의 `load_boosters()`/`load_conformal_correction()`,
+    `ml_core.model_contract`의 `load_station_dtype()`)이 같은 import로 나눠
+    부른다. 캐시가 없으면 한 프로세스 안에서도 이 셋을 부르는 시점 사이에
+    승격이 끼어들 경우 서로 다른 archive_prefix를 읽어버릴 수 있다 — 이 함수를
+    `@cache`로 감싸면 이 프로세스가 사는 동안 최초 호출 시점의 값 하나로
+    고정되어, 그 프로세스 안에서 booster/correction/station_categories가
+    항상 같은 archive_prefix에서 나온다. 다른 프로세스(다음 5분 주기 inference 등)가
+    승격 이후 새 값을 보는 것은 정상이고 문제없다 — 막아야 하는 건 프로세스
+    "하나"가 자기 안에서 신/구 버전을 섞어 쓰는 경우뿐이다.
+
+    **"학습해봤더니 구려서 같은 프로세스 안에서 재학습→재승격을 반복"하는
+    코드는 어떻게 되나(2026-08)**: `training.promotion.promote_challenger()`가
+    승격할 때 이 캐시와 `ml_core.scoring`의 `load_boosters()`/
+    `load_conformal_correction()` 캐시까지 셋을 한꺼번에 비운다 — 그래야 재승격
+    직후 다음 채점부터는 새 archive를 보면서도, 셋 중 일부만 새 값을 보고
+    나머지는 옛 값에 머무는 불일치가 안 생긴다(`promote_challenger()` docstring
+    참고). 이 함수를 `write_champion_pointer()`로 직접 부르기만 하고
+    `promote_challenger()`를 안 거치면(테스트 외) 이 캐시가 안 비워진다 —
+    `read_champion_prefix.cache_clear()`를 직접 불러야 한다.
+
+    args:
+        model_name: "rental" 또는 "return"
+    returns:
+        str: 챔피언이 가리키는 archive_prefix
+    raises:
+        FileNotFoundError: 아직 한 번도 승격된 적 없음(포인터 자체가 없음)
+    """
+    pointer = s3_io.read_json(champion_pointer_key(model_name))
+    if pointer is None:
+        raise FileNotFoundError(f"챔피언 포인터 없음: {champion_pointer_key(model_name)} (아직 승격된 적 없음)")
+    return pointer["archive_prefix"]
+
+
+def write_champion_pointer(model_name: str, archive_prefix: str) -> dict:
+    """model_name의 챔피언이 archive_prefix를 가리키도록 원자적으로 전환한다.
+
+    더 이상 archive 파일을 챔피언 자리로 복사하지 않는다(`read_champion_prefix()`
+    docstring 참고) — 포인터 하나만 바꾸면 승격이 끝난다.
+
+    **이 함수 자신은 캐시를 안 비운다 — 일부러다.** `read_champion_prefix()`뿐
+    아니라 `ml_core.scoring.load_boosters()`/`load_conformal_correction()`도
+    같은 archive_prefix를 각자 따로 캐시하는데, 이 함수는 `paths.py`에 있어서
+    `scoring.py`(순환 import 방지로 이 모듈을 모름)의 캐시까지는 못 비운다. 여기서
+    `read_champion_prefix`만 비우면 셋 중 하나만 새 값을 보고 나머지 둘은 옛
+    값을 유지하는 **불일치**가 생긴다(실측 확인됨, 2026-08) — 그게 바로 이
+    캐시 설계가 막으려던 문제 그 자체다. 그래서 세 캐시를 전부 아는 유일한
+    지점인 `training.promotion.promote_challenger()`(이 함수의 유일한 실제
+    호출부)가 셋을 한꺼번에 비운다 — 이 함수를 단독으로(테스트 외에) 호출하는
+    코드는 없어야 한다.
+
+    args:
+        model_name: "rental" 또는 "return"
+        archive_prefix: 새로 챔피언이 될 archive_prefix(`archive_models_prefix()`가 만든 값)
+    returns:
+        dict: 실제로 기록된 포인터 내용
+    """
+    record = {"archive_prefix": archive_prefix, "promoted_at": datetime.now(UTC).isoformat()}
+    s3_io.write_json(champion_pointer_key(model_name), record)
+    return record
 
 
 # --- feature_engine 1차 정제 산출물 (이번 phase는 "이미 어딘가 있다"고
@@ -116,27 +226,19 @@ POPULATION_PARQUET = f"{PROCESSED_V2_PREFIX}/population_2025.parquet"
 # 같은 값이어야 한다(위 모듈 docstring 참고) ---
 MERGED_TABLE_PARQUET = f"{FEATURE_ENGINEERING_OUTPUT_DIR}/station_hour_merged_2025.parquet"
 FEATURES_TABLE_PARQUET = f"{FEATURE_ENGINEERING_OUTPUT_DIR}/station_hour_features_2025.parquet"
-# FEATURES_TABLE_PARQUET의 각 행(T0, 5분 tick)을 horizon=1..HORIZON_COUNT만큼 self-join해
-# "T0의 lag/rolling + T0+(horizon-1)시간의 날씨/캘린더/타겟"으로 조합한 학습 테이블
-# (build_multi_horizon_features.py) — training이 이제 이 테이블만 읽는다.
-MULTI_HORIZON_FEATURES_TABLE_PARQUET = f"{FEATURE_ENGINEERING_OUTPUT_DIR}/station_hour_features_multihorizon_2025.parquet"
+# FEATURES_TABLE_PARQUET의 각 행(T0, 20분 tick)을 horizon=1..HORIZON_COUNT만큼 self-join해
+# "T0의 lag + T0+(horizon-1)시간의 날씨/캘린더/타겟"으로 조합한 학습 테이블
+# (build_multi_horizon_features.py) — 대여/반납이 서로 다른 lag/타겟을 쓰는 완전히
+# 분리된 데이터셋이라 출력도 둘로 나뉜다. training이 이제 이 테이블들만 읽는다.
+RENTAL_MULTI_HORIZON_FEATURES_TABLE_PARQUET = (
+    f"{FEATURE_ENGINEERING_OUTPUT_DIR}/station_hour_features_multihorizon_rental_2025.parquet"
+)
+RETURN_MULTI_HORIZON_FEATURES_TABLE_PARQUET = (
+    f"{FEATURE_ENGINEERING_OUTPUT_DIR}/station_hour_features_multihorizon_return_2025.parquet"
+)
 ROLLING_RENTAL_FEATURES_PARQUET = f"{FEATURE_ENGINEERING_OUTPUT_DIR}/rolling_rental_features_2025.parquet"
 
 # --- inference가 만드는 fallback 프로필(위 MERGED_TABLE_PARQUET/POPULATION_PARQUET
 # 기반) — 파라미터 조합과 무관하게 챔피언 경로 하나만 씀 ---
 STATION_HOURLY_PROFILE_PARQUET = f"{PROCESSED_V2_PREFIX}/station_hourly_profile.parquet"
 POPULATION_HOURLY_PROFILE_PARQUET = f"{PROCESSED_V2_PREFIX}/population_hourly_profile.parquet"
-
-# 1차 정제 산출물(원본 CSV -> parquet) — analysis_summary.json은 feature_engine(공휴일
-# 목록 재사용)과 inference(predict_single.py가 서빙 시점의 is_holiday 계산)가 같이 읽는다.
-ANALYSIS_SUMMARY_JSON = f"{PROCESSED_V2_PREFIX}/output/analysis_summary.json"
-
-
-def load_holidays_2025() -> set[str]:
-    """analysis_summary.json의 holidays_2025 목록을 'YYYY-MM-DD' 문자열 set으로 반환한다."""
-    from core import s3 as s3_io
-
-    summary = s3_io.read_json(ANALYSIS_SUMMARY_JSON)
-    if summary is None:
-        raise FileNotFoundError(f"S3에 없음: {ANALYSIS_SUMMARY_JSON}")
-    return set(summary["holidays_2025"])
