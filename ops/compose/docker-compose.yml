@@ -3,9 +3,6 @@ name: de-team2-gangnamguumbokdong
 services:
   postgres:
     image: postgis/postgis:16-3.5
-    # 공식 PostGIS 16-3.5 이미지는 linux/amd64만 배포한다. Apple Silicon에서는
-    # Docker Desktop의 x86_64 에뮬레이션으로 실행하고, AWS/RDS 운영에는 쓰지 않는다.
-    platform: ${POSTGRES_PLATFORM:-linux/amd64}
     entrypoint: ["bash", "/usr/local/bin/gold-postgis-entrypoint.sh"]
     # Compose에서 entrypoint를 덮으면 이미지의 기본 CMD가 비워지므로 명시한다.
     command: ["postgres"]
@@ -40,7 +37,6 @@ services:
   # SSOT의 핵심 객체가 모두 있는지 읽기 전용으로 확인한 뒤 소비자를 시작한다.
   postgres-schema-check:
     image: postgis/postgis:16-3.5
-    platform: ${POSTGRES_PLATFORM:-linux/amd64}
     environment:
       PGHOST: postgres
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
