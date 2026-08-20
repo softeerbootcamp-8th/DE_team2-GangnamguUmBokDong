@@ -118,6 +118,64 @@ def champion_pointer_key(model_name: str) -> str:
     return f"{MODELS_PREFIX}/champion/{model_name}.json"
 
 
+SERVING_RELEASE_PREFIX = f"{MODELS_PREFIX}/serving-release"
+"""Pair serving release의 immutable manifest와 mutable pointer 공통 prefix다."""
+
+MODEL_SNAPSHOT_PREFIX = f"{MODELS_PREFIX}/snapshots"
+"""Content-addressed model snapshot artifact와 manifest의 공통 prefix다."""
+
+
+def model_snapshot_artifact_key(
+    model_name: str,
+    role: str,
+    byte_sha256: str,
+    extension: str,
+) -> str:
+    """Model snapshot이 소유하는 content-addressed artifact 키를 만든다."""
+    return (
+        f"{MODEL_SNAPSHOT_PREFIX}/{model_name}/artifacts/{role}/"
+        f"sha256={byte_sha256}.{extension}"
+    )
+
+
+def model_snapshot_manifest_key(model_name: str, byte_sha256: str) -> str:
+    """Model snapshot manifest의 content-addressed S3 상대 키를 만든다."""
+    return (
+        f"{MODEL_SNAPSHOT_PREFIX}/{model_name}/manifests/"
+        f"sha256={byte_sha256}.json"
+    )
+
+
+def model_support_id_set_key(model_name: str, byte_sha256: str) -> str:
+    """Model support Gold ID set의 content-addressed S3 상대 키를 만든다."""
+    return (
+        f"{MODEL_SNAPSHOT_PREFIX}/{model_name}/support/"
+        f"sha256={byte_sha256}.json"
+    )
+
+
+def serving_release_manifest_key(byte_sha256: str) -> str:
+    """Content-addressed serving release manifest의 S3 상대 키를 만든다."""
+    return f"{SERVING_RELEASE_PREFIX}/manifests/sha256={byte_sha256}.json"
+
+
+def serving_release_artifact_key(
+    role: str,
+    byte_sha256: str,
+    extension: str,
+) -> str:
+    """Serving release가 직접 소유하는 content-addressed artifact 키를 만든다."""
+    return (
+        f"{SERVING_RELEASE_PREFIX}/artifacts/{role}/"
+        f"sha256={byte_sha256}.{extension}"
+    )
+
+
+def serving_release_pointer_key() -> str:
+    """현재 pair serving release를 가리키는 단일 mutable pointer 키를 반환한다."""
+    return f"{SERVING_RELEASE_PREFIX}/current.json"
+
+
 PROFILES_PREFIX = profile_contract.PROFILES_PREFIX
 profile_path = profile_contract.profile_path
 
