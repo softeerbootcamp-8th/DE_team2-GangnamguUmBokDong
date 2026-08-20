@@ -9,6 +9,7 @@ dependencies = [
     "pandas",
     "pyarrow",
     "scikit-learn",
+    "mlflow-skinny>=2.14",
     "ml_core",
 ]
 

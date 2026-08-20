@@ -111,7 +111,13 @@ def required_lock_scope(publication_keys: Iterable[str]) -> LockScope:
     scopes: set[LockScope] = set()
     for key in keys:
         get_publication_spec(key)
-        scopes.add(_LOCK_SCOPE_BY_KEY[key])
+        try:
+            scope = _LOCK_SCOPE_BY_KEY[key]
+        except KeyError as exc:
+            raise ContractViolation(
+                f"publication key의 lock scope가 등록되지 않았습니다: {key}"
+            ) from exc
+        scopes.add(scope)
 
     if LockScope.TOPOLOGY_EXCLUSIVE in scopes:
         return LockScope.TOPOLOGY_EXCLUSIVE

@@ -6,8 +6,9 @@
 공유한다 — 서빙 경로와 모니터링/평가 경로가 각자 채점 로직을 따로 구현하면
 train-serve skew와 같은 종류의 사고(두 경로가 조용히 다른 값을 냄)가 날 수 있다.
 
-입력 DataFrame은 반드시 `feature_engine`의 `build_features.build_features()`를 거친
-스키마여야 한다(`ml_core.model_contract.FEATURE_COLUMNS` 포함).
+입력 DataFrame은 반드시 `feature_engine`의 `build_features.build_rental_features()`/
+`build_return_features()`를 거친 스키마여야 한다(`ml_core.model_contract`의
+`RENTAL_FEATURE_COLUMNS`/`RETURN_FEATURE_COLUMNS` 포함).
 """
 
 from functools import cache
@@ -15,49 +16,67 @@ from functools import cache
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
-
 from core import s3 as s3_io
 
 from . import metrics, model_io
-from .model_contract import FEATURE_COLUMNS, load_station_dtype
-from .paths import model_json_key, model_key
+from .model_contract import (
+    RENTAL_FEATURE_COLUMNS,
+    RETURN_FEATURE_COLUMNS,
+    load_station_dtype,
+)
+from .paths import model_json_key, model_key, read_champion_prefix
 
 BOOSTER_SUFFIXES = ["poisson", "q10", "q50", "q90"]
+_FEATURE_COLUMNS_BY_MODEL = {"rental": RENTAL_FEATURE_COLUMNS, "return": RETURN_FEATURE_COLUMNS}
 
 
 @cache
 def load_boosters(model_name: str) -> dict[str, lgb.Booster]:
-    """model_name의 booster 4개(poisson, q10, q50, q90)를 S3에서 로드한다.
+    """model_name의 booster 4개(poisson, q10, q50, q90)를 챔피언 archive에서 로드한다.
 
-    `lru_cache`로 프로세스당 model_name 하나에 한 번만 S3에서 읽는다 —
+    `read_champion_prefix()`로 "지금 챔피언이 가리키는 archive_prefix"를 구한 뒤
+    거기서 읽는다 — booster를 챔피언 자리로 따로 복사해두지 않는다(그 이유는
+    `read_champion_prefix()` docstring 참고: 파일 여러 개를 복사하면 승격 도중
+    inference가 신/구 버전을 섞어 읽을 수 있어서, archive를 immutable하게 두고
+    포인터만 원자적으로 바꾸는 방식으로 바꿨다).
+
+    `@cache`로 프로세스당 model_name 하나에 한 번만 S3에서 읽는다 —
     `predict()`가 배치/단일 조회 어느 경로든 호출마다 이걸 다시 읽고 있어서,
     같은 프로세스에서 반복 호출(예: 여러 정류소×여러 시간대 예측)이 많을 때
     불필요한 S3 GET이 병목이 됐다. **가정**: 이 프로세스가 살아있는 동안
-    챔피언 모델 파일이 안 바뀐다 — 지금 이 함수를 부르는 곳(배치/단일 시점
-    예측, 모니터링, 베이스라인 비교) 중 "같은 프로세스 안에서 재학습 후
-    바로 다시 채점"하는 코드는 없어서 안전하다. 그런 코드를 나중에 추가한다면
-    `load_boosters.cache_clear()`로 캐시를 비울 것.
+    챔피언이 안 바뀐다 — 지금 이 함수를 부르는 곳(배치/단일 시점 예측,
+    모니터링) 중 "같은 프로세스 안에서 재학습 후 바로 다시 채점"하는 코드는
+    없어서 안전하다. `read_champion_prefix()`도 같은 프로세스 안에서 이
+    함수·`load_conformal_correction()`·`load_station_dtype()`이 전부 같은
+    archive_prefix를 보도록 캐시를 공유한다(그 함수 docstring 참고). 그런
+    코드를 나중에 추가한다면 `load_boosters.cache_clear()`로 캐시를 비울 것.
 
     args:
         model_name: "rental" 또는 "return"
     returns:
         dict[str, lgb.Booster]: {"poisson": ..., "q10": ..., "q50": ..., "q90": ...}
     """
-    return {suffix: model_io.download_and_load_booster(model_key(model_name, suffix)) for suffix in BOOSTER_SUFFIXES}
+    archive_prefix = read_champion_prefix(model_name)
+    return {
+        suffix: model_io.download_and_load_booster(model_key(model_name, suffix, archive_prefix))
+        for suffix in BOOSTER_SUFFIXES
+    }
 
 
 @cache
 def load_conformal_correction(model_name: str) -> float:
-    """학습 시 저장해둔 split-conformal 보정값을 S3에서 불러온다.
+    """학습 시 저장해둔 split-conformal 보정값을 챔피언 archive에서 불러온다.
 
-    `load_boosters()`와 같은 이유로 캐시한다(위 docstring 참고).
+    `load_boosters()`와 같은 이유로 `read_champion_prefix()`를 거치고, 같은
+    이유로 캐시한다(위 docstring 참고).
 
     args:
         model_name: "rental" 또는 "return"
     returns:
         float: P10/P90 구간에 적용할 보정값 (training/train_common._conformal_correction 참고)
     """
-    key = model_json_key(model_name, "conformal_correction")
+    archive_prefix = read_champion_prefix(model_name)
+    key = model_json_key(model_name, "conformal_correction", archive_prefix)
     data = s3_io.read_json(key)
     if data is None:
         raise FileNotFoundError(f"conformal_correction 없음: {key}")
@@ -68,16 +87,21 @@ def predict(df: pd.DataFrame, model_name: str, exposure_col: str | None = None) 
     """station×tick feature 행마다 point(poisson) + quantile(P10/50/90, conformal 보정 적용) 예측.
 
     args:
-        df: feature_engine의 build_features.build_features()와 동일한 스키마의 DataFrame
-            (station_id, date, hour, ml_core.model_contract.FEATURE_COLUMNS 포함)
+        df: feature_engine의 build_features.build_rental_features()/build_return_features()와
+            동일한 스키마의 DataFrame (station_no, date, hour + model_name에 맞는
+            RENTAL_FEATURE_COLUMNS/RETURN_FEATURE_COLUMNS 포함) — feature_engine의
+            multi-horizon 테이블엔 station_id(텍스트)가 아예 없다(용량 절감,
+            build_multi_horizon_features.py 모듈 docstring 참고) — 사람이 보는
+            station_id가 필요한 호출부는 station_master로 직접 join해서 붙일 것
+            (`inference/predict_common.py` 참고)
         model_name: "rental" 또는 "return"
         exposure_col: Poisson exposure 컬럼명. None이면 exposure=1로 간주 (반납 모델)
     returns:
-        pd.DataFrame: station_id, date, hour, pred_mean, pred_p10, pred_p50, pred_p90
+        pd.DataFrame: station_no, date, hour, pred_mean, pred_p10, pred_p50, pred_p90
     """
     station_dtype = load_station_dtype(model_name)
-    X = df[FEATURE_COLUMNS].copy()
-    X["station_id"] = X["station_id"].astype(station_dtype)
+    X = df[_FEATURE_COLUMNS_BY_MODEL[model_name]].copy()
+    X["station_no"] = X["station_no"].astype(station_dtype)
 
     boosters = load_boosters(model_name)
     correction = load_conformal_correction(model_name)
@@ -89,7 +113,7 @@ def predict(df: pd.DataFrame, model_name: str, exposure_col: str | None = None) 
     pred_p50 = np.clip(boosters["q50"].predict(X), 0, None)  # count는 음수가 될 수 없음
     pred_p90 = boosters["q90"].predict(X) + correction
 
-    out = df[["station_id", "date", "hour"]].copy()
+    out = df[["station_no", "date", "hour"]].copy()
     out["pred_mean"] = pred_mean
     out["pred_p10"] = pred_p10
     out["pred_p50"] = pred_p50

@@ -11,6 +11,9 @@ from typing import Any
 
 import psycopg
 import pytest
+from psycopg import Connection, Cursor
+
+import core.gold_publication.transaction as transaction_module
 from core.gold_publication.canonical import parse_canonical_json, sha256_hex
 from core.gold_publication.contract import (
     Artifact,
@@ -46,7 +49,6 @@ from core.gold_publication.transaction import (
     execute_publication,
     required_lock_scope,
 )
-from psycopg import Connection, Cursor
 
 _DATABASE_URL = os.environ.get("GOLD_PUBLICATION_TEST_DATABASE_URL")
 _PUBLIC_TABLES = (
@@ -150,6 +152,16 @@ def test_required_lock_scope_follows_topology_route_order() -> None:
         required_lock_scope(["rebalance_route", "station"])
         is LockScope.TOPOLOGY_EXCLUSIVE
     )
+
+
+def test_required_lock_scope_reports_missing_registry_mapping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """등록된 publication key의 lock scope 누락을 계약 오류로 보고한다."""
+    monkeypatch.delitem(transaction_module._LOCK_SCOPE_BY_KEY, "station")
+
+    with pytest.raises(ContractViolation, match="lock scope가 등록되지 않았습니다"):
+        required_lock_scope(["station"])
 
 
 def test_executor_rejects_unverified_prepared_before_database_access() -> None:

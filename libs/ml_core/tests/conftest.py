@@ -8,6 +8,8 @@ import boto3
 import pytest
 from moto import mock_aws
 
+from ml_core import mlflow_tracking
+
 TEST_BUCKET = "test-bucket"
 
 
@@ -24,3 +26,15 @@ def _bucket():
     with mock_aws():
         boto3.client("s3", region_name="us-east-1").create_bucket(Bucket=TEST_BUCKET)
         yield
+
+
+@pytest.fixture(autouse=True)
+def _no_real_mlflow_server(monkeypatch):
+    """`ml/training/tests/conftest.py`와 같은 이유 — 기본값(http://localhost:5000)이
+    로컬 개발 중엔 실제로 떠 있을 수 있어(ops/compose의 mlflow 서비스), 아무 설정
+    없이 테스트를 돌리면 실수로 진짜 서버에 run이 쌓일 수 있다(예:
+    `profile_registry.push_profile()`을 부르는 테스트). 존재하지 않는 포트로
+    가리켜 막는다 — 실제 동작을 검증하는 테스트는 자기 fixture에서 로컬 파일
+    경로로 다시 덮어써서 쓴다.
+    """
+    monkeypatch.setattr(mlflow_tracking, "MLFLOW_TRACKING_URI", "http://localhost:0")

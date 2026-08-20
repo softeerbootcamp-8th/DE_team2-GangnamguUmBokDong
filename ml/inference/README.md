@@ -1,15 +1,14 @@
 # inference — 실행 방법
 
-학습이 끝난 모델(`training/models/*.txt`)로 예측을 실행하는 두 가지 경로를
-제공한다. 이 프로젝트엔 실시간 서빙 API가 없다 — 둘 다 배치/함수 호출로
-예측을 확인하는 용도다.
+학습이 끝난 모델(S3 아카이브 또는 챔피언, `training/README.md` 참고)로 예측을
+실행하는 두 가지 경로를 제공한다.
 
 | 경로 | 언제 쓰나 | 입력 |
 |---|---|---|
-| **배치 조회** (`predict_common.py` + `predict_{rental,return}_demand.py`) | 이미 만들어둔 2025년 feature 테이블에서 특정 station/기간을 조회 (백테스트, 결과 확인) | station_id, 날짜/시간 범위 |
-| **단일 시점 예측** (`predict_single.py`) | 날짜/시각/날씨/(선택)인구 값을 직접 넣어서 그 시점 하나를 예측 (실서비스 연동 대상) | station_id, date, hour, 날씨 4종, 인구(선택) |
+| **배치 조회** (`predict_common.py` + `predict_{rental,return}_demand.py`) | 이미 만들어둔 feature 테이블에서 특정 station/기간을 조회 (백테스트, 결과 확인 전용) | station_id, 날짜/시간 범위 |
+| **단일/다중 시점 예측** (`predict_single.py`) | 날짜/시각/horizon/날씨/(선택)인구 값을 직접 넣어서 예측 (**실제 운영 진입점**, Airflow `realtime_5min` DAG가 5분마다 `--all-stations`로 호출) | station_id(또는 전체), date, hour, minute, horizon, 날씨(선택), 인구(선택) |
 
-설계 배경은 [DESIGN.md](DESIGN.md) 참고.
+설계 배경은 [DESIGN.md](../../docs/ml/inference/DESIGN.md) 참고.
 
 ## 세팅
 
@@ -18,135 +17,127 @@ cd ml/inference
 uv sync   # pyproject.toml/uv.lock 기준 .venv 생성 — pandas/numpy + ml_core(editable) 포함
 ```
 
-`training`이 먼저 모델을 학습해둬야 한다 ([training/README.md](../training/README.md)):
-`training/models/{rental,return}_{poisson,q10,q50,q90}.txt`,
-`{rental,return}_station_categories.json`, `{rental,return}_conformal_correction.json`.
+`training`이 먼저 모델을 학습·승격해둬야 한다([training/README.md](../training/README.md)).
+로컬 개발은 `.env`의 S3 자격증명으로 MinIO(`make up`)를 거친다.
 
 **단일 시점 예측을 쓰려면 추가로 fallback 프로필 2개를 한 번 만들어야 한다**
-(`feature_engine`이 만든 `station_hour_merged_2025.parquet`/`population_2025.parquet`이
-먼저 있어야 함):
+(`feature_engine`이 만든 병합 테이블/생활인구 테이블이 먼저 S3에 있어야 함):
 
 ```bash
 cd ml
-./inference/.venv/bin/python -m inference.build_station_profile      # -> station_hourly_profile.parquet (대여/반납 fallback)
-./inference/.venv/bin/python -m inference.build_population_profile   # -> population_hourly_profile.parquet (인구 fallback)
+./inference/.venv/bin/python -m inference.build_station_profile      # -> station_hourly_profile.parquet: 정류소×minute×dow×월별 대여/반납 평균/표준편차(lag fallback)
+./inference/.venv/bin/python -m inference.build_population_profile   # -> population_hourly_profile.parquet: 격자×hour×dow별 평균 인구(인구 fallback, 월은 안 나눔 — 계절 변동이 작아서)
 ```
 
-## 배치 조회 CLI
+## 배치 조회 CLI (백테스트 전용)
 
 ```bash
-# 기본값: 2025-12(테스트 기간) 전체 정류소
-./inference/.venv/bin/python -m inference.predict_rental_demand
-
-# 특정 정류소 + 특정 기간 (2025년 범위 내, YYYY-MM-DD)
+# 특정 정류소 + 특정 기간
 ./inference/.venv/bin/python -m inference.predict_rental_demand --station-id ST-2000 --start-date 2025-06-01 --end-date 2025-06-07
-
-# 특정 정류소의 특정 시각 하나만
-./inference/.venv/bin/python -m inference.predict_rental_demand --station-id ST-2000 --start-date 2025-06-01 --end-date 2025-06-01 --hour 8
 
 # 반납 모델도 옵션은 동일 (exposure 없음)
 ./inference/.venv/bin/python -m inference.predict_return_demand --station-id ST-2000 --start-date 2025-06-01 --end-date 2025-06-01
 ```
 
-| 인자 | 기본값 | 설명 |
-|---|---|---|
-| `--station-id` | 없음(전체) | 정류소 ID. `station_master.parquet`에서 확인 |
-| `--start-date`, `--end-date` | 테스트 기간(2025-12) | YYYY-MM-DD |
-| `--hour` | 없음(전체 시간) | 0~23 중 하나만 |
-| `--out` | `predictions_{rental,return}_test.parquet` | 저장 경로 |
+이미 만들어진 multi-horizon feature 테이블에서 읽어 채점만 하는 조회용
+CLI다 — 실제 서비스가 부르는 진입점이 아니다(그건 아래 `predict_single.py`).
 
-결과가 42행 이하로 좁혀지면 표로 바로 출력하고, 그보다 크면 요약 지표만 찍은 뒤
-전체 결과를 parquet로 저장한다. 이 스크립트를 인자 없이 돌리면 `training`이
-학습 직후 출력한 지표와 소수점까지 정확히 재현된다(모델 저장/로드 round-trip 검증됨).
-
-## 단일 시점 예측
+## 단일/다중 시점 예측 (`predict_single.py`, 실제 진입점)
 
 ```python
 from inference.predict_single import predict_rental_demand, predict_return_demand
 
 predict_rental_demand(
-    station_id="ST-2000", date="2025-06-01", hour=8,
-    temp=22.5, precip=0.0, wind=2.1, humidity=55,
-    population=3200,               # 없으면 생략 가능 — 격자 평소 인구로 대체됨
+    station_id="ST-2000", date="2025-06-01", hour=8, minute=0, horizon=1,
+    temp=22.5, precip=0.0,          # 생략하면 관측/예보 Silver에서 자동 조회
+    population=3200,                # 없으면 생략 가능 — 격자 평소 인구로 대체됨
+    stockout=False,                 # 없으면 생략 가능 — 실시간 재고에서 자동 조회
 )
-# -> {'station_id': 'ST-2000', 'date': '2025-06-01', 'hour': 8,
+# -> {'station_id': 'ST-2000', 'date': '2025-06-01', 'hour': 8, 'minute': 0, 'horizon': 1,
 #     'pred_mean': ..., 'pred_p10': ..., 'pred_p50': ..., 'pred_p90': ...,
 #     'lag_fallback_used': [], 'lag_data_freshness': 1.0,
-#     'population_source': 'provided'}
+#     'population_source': 'provided', 'stockout_source': 'provided'}
 ```
 
-CLI로도 바로 확인 가능 (`--population` 생략 가능):
+`minute`은 `GRID_TICK_MINUTES`(기본 20)의 배수만 유효하다 — 정시로만 고정하면
+그 사이 tick을 요청할 수 없다. `horizon`(1~`HORIZON_COUNT`, 기본 12)은
+"몇 시간 뒤를 물을지"를 그대로 모델 feature로 넘긴다(아래 "여러 horizon
+한 번에" 참고) — `predict_return_demand()`는 시그니처가 같지만 `stockout`이
+없다(반납은 거치대 상태와 무관하게 항상 성공해서 exposure 보정이 필요 없음).
+
+CLI로도 바로 확인 가능(값을 생략하면 실시간 Silver에서 자동 조회):
 
 ```bash
 ./inference/.venv/bin/python -m inference.predict_single \
-  --station-id ST-2000 --date 2025-06-01 --hour 8 \
-  --temp 22.5 --precip 0.0 --wind 2.1 --humidity 55
+  --station-id ST-2000 --date 2025-06-01 --hour 8 --minute 0 --horizon 1
 ```
 
-날짜/시각/날씨/인구만 받는 이유(lag/rolling은 내부에서 자동 조회), 2단계
-fallback(실시간 히스토리 없으면 → 정류소/격자 평소 패턴), 실시간 데이터
-결측·지연 대응은 [DESIGN.md](DESIGN.md)에 자세히 있다.
+날짜/시각/horizon/날씨/인구만 받는 이유(lag/rolling은 내부에서 자동 조회),
+2단계 fallback(실시간 히스토리 없으면 → 정류소/격자 평소 패턴), 실시간
+데이터 결측·지연 대응, 관측 vs 예보 날씨 분기는 [DESIGN.md](../../docs/ml/inference/DESIGN.md)에
+자세히 있다.
 
-## N시간 뒤까지 예측 (재귀, 정확도보다 속도 우선)
+## 여러 horizon 한 번에 (재귀 아님 — horizon이 feature)
 
 ```python
 from inference.predict_single import predict_demand_multi_hour
 
 predict_demand_multi_hour(
-    station_id="ST-2000", date="2025-06-01", hour=8,     # "지금"
-    temp=22.5, precip=0.0, wind=2.1, humidity=55,
+    station_id="ST-2000", date="2025-06-01", hour=8,     # "지금"(anchor_ts=T0)
+    temp=22.5, precip=0.0,        # 스칼라(전체 horizon 재사용) 또는 길이 n_hours 배열(horizon별 예보)
     population=3200,
-    n_hours=12,   # 9시~20시, 1시간 간격 12개
+    n_hours=12,   # horizon=1..12를 한 번에
 )
-# -> [{'station_id': ..., 'date': ..., 'hour': 9,
+# -> [{'station_id': ..., 'date': ..., 'hour': ..., 'minute': ..., 'horizon': 1,
 #      'rental': {'pred_mean': ..., ..., 'lag_fallback_used': [...], 'lag_data_freshness': ...},
-#      'return': {'pred_mean': ...}, 'population_source': ...}, ...] (길이 12)
+#      'return': {'pred_mean': ...}, 'population_source': ..., 'stockout_source': ...}, ...] (길이 12)
 ```
 
 CLI는 `--n-hours`만 추가하면 된다: `./inference/.venv/bin/python -m inference.predict_single ... --n-hours 12`.
 
-**h=1(바로 다음 시간)은 위 단일 시점 예측과 완전히 동일한 값**이다. h=2부터는
-직전 스텝의 예측값을 그 다음 스텝의 "직전 실적"(lag_1h, roll_mean/std_3h/24h)으로
-재귀적으로 사용한다 — 미래라 실측이 없으니 어쩔 수 없는 선택이고, **horizon이
-커질수록 오차가 누적되는 걸 알고도 채택한 것**(history.md 20번 항목,
-20번이 뒤집은 18번 항목의 기각 사유 참고). 더 정확한 대안(재귀 없이 horizon을
-feature로 추가)은 `training/experiments/multi_horizon/`에 이미 구현·검증돼
-있으니, 정확도가 문제되면 그쪽으로 교체할 것.
+**재귀적으로 이전 예측값을 다음 스텝 입력에 먹이지 않는다.** lag(직전 실적)는
+"지금"(anchor_ts) 기준으로 딱 한 번만 계산하고, "몇 시간 뒤인지"(horizon)를
+평범한 입력 feature로 모델에 직접 알려준다 — 그래서 horizon이 커져도 오차가
+누적되지 않는다(옛 버전은 재귀 방식이었으나 폐기됨). 날씨/인구/캘린더는
+horizon마다 그 target_ts(anchor_ts+(horizon-1)시간) 기준으로 새로 계산된다 —
+target_ts가 미래면(horizon>1) 날씨는 예보를 먼저 시도하고 없으면 관측으로
+fallback한다.
 
-## 전체 정류소 배치 (5분 주기 갱신용)
+## 전체 정류소 배치 (Airflow `realtime_5min` DAG가 5분마다 호출)
 
 ```python
 from inference.predict_single import predict_demand_multi_hour_all_stations
 
-predict_demand_multi_hour_all_stations(
-    date="2025-06-01", hour=8, temp=22.5, precip=0.0, wind=2.1, humidity=55,
-    n_hours=5,   # 실사용 범위(위 20번 항목 참고)라면 5 정도로 충분
+outcome = predict_demand_multi_hour_all_stations(
+    date="2025-06-01", hour=8, temp=22.5, precip=0.0,
+    n_hours=5,
 )
-# -> predict_demand_multi_hour()과 같은 형태의 dict를 정류소별로 이어붙인 리스트
-#    (station_ids 생략 시 모델이 실제로 학습한 정류소 2,582개 전체)
+# -> {"results": [...], "failed": [...], "expected_count": 2582, "actual_count": 2581}
 ```
 
-CLI: `./inference/.venv/bin/python -m inference.predict_single --all-stations --date ... --hour ... --temp ... --precip ... --wind ... --humidity ... --n-hours 5 --out result.parquet`
-(`--station-id`와 동시 사용 불가, 인구는 정류소별 격자 평소 인구로 항상 자동 대체).
+CLI: `./inference/.venv/bin/python -m inference.predict_single --all-stations --date ... --hour ... --n-hours 5 --out result.parquet`
+(`--station-id`와 동시 사용 불가, 인구는 정류소별 격자 평소 인구로 항상 자동
+대체). 시간(horizon)마다 전체 정류소를 배치로 묶어서 LightGBM을 한 번만
+호출하고, feature 조립·DataFrame 캐스팅도 horizon당 한 번만 한다 — 대여의
+"직전 실적" 조회(가장 무거운 부분)도 정류소 축이 아니라 anchor 축으로
+벡터화돼 있다. 정류소별 실패는 재시도 없이 건너뛰고 `failed` 목록 +
+`sys.stderr` 로그로 남는다.
 
-시간(h)마다 전체 정류소를 배치로 묶어서 LightGBM을 한 번만 호출하고(정류소별로
-따로 부르면 5분 주기에 못 맞을 정도로 느려짐), feature 조립(정류소별 dict
-생성)과 DataFrame 캐스팅도 시간(h)당 한 번만 한다(history.md 22/23번 항목).
-대여의 "직전 실적" 조회(트립 point-in-time 계산, 가장 무거운 부분)도 정류소
-축이 아니라 **anchor 축으로 뒤집어**(정류소가 몇 개든 anchor 개수(최대
-25개)만큼만 반복) 벡터화했다(history.md 24번 항목). 실측: 전체 2,582개
-x 12시간 **약 1.8분**(캐시 워밍업 포함, 처음 측정한 "약 3시간" 대비 약
-100배), 실사용 범위인 5시간이면 약 1.2분. 정류소별 실패는 재시도 없이
-건너뛰되 `sys.stderr`에 크게 로그를 남긴다.
+**부분 실패는 CLI 종료 코드를 막지 않는다** — 하나라도 성공하면(`actual_count > 0`)
+성공한 결과는 그대로 S3에 저장되고 exit 0으로 끝난다(실패 목록은 별도 파일로
+같이 저장됨). `actual_count == 0`(완전 실패)일 때만 exit 1로 막는다 — 예전엔
+실패가 하나라도 있으면 exit 1이라 Airflow가 이미 성공한 나머지 결과의 DB
+적재까지 막아버리는 운영 취약점이 있었다.
 
 ## 한계
 
-- 2025년 범위를 크게 벗어난 미래를 예측하면 lag/rolling이 전부 fallback(또는
-  프로필도 없으면 NaN)이 되어 정확도가 떨어진다.
-- 날씨는 예보가 아닌 관측치 기준으로 학습됨 — 실제 서비스에서 예보 API 값을
-  넣으면 학습 때보다 정확도가 떨어질 수 있다(train-serve skew, 알려진 한계).
-- station_id는 2025년에 트립이 1건 이상 있었던 정류소만 유효하다. 그 외 ID를
-  넣으면 `ValueError`.
+- 학습 기간(feature_engine이 만든 테이블의 커버리지)을 크게 벗어난 시각을
+  예측하면 lag/rolling이 전부 fallback(또는 프로필도 없으면 NaN)이 되어
+  정확도가 떨어진다.
+- 예보(`weather_short_term_forecast`) 자동 수집 스케줄이 아직 없어(수동
+  트리거만 가능) horizon>1이어도 실제로는 관측 fallback을 타는 경우가 많다.
+- station_id는 실제로 트립 실적이 있어 학습에 포함된 정류소만 유효하다.
+  그 외 ID를 넣으면 `ValueError`.
 
 ## 검증
 
