@@ -7,10 +7,9 @@ import sys
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+from config import TABLE_SPECS, target_table_for
 from core.db import get_connection
 from core.upsert import upsert
-
-from config import TABLE_SPECS, target_table_for
 from retention_config import DATE_TYPED_EXPIRE_TABLES, grace_for
 
 KST = ZoneInfo("Asia/Seoul")
@@ -26,7 +25,10 @@ def _expire_cutoff(target_table: str, window_start: datetime):
 def _delete_expired(conn, target_table: str, expire_col: str, cutoff) -> int:
     """target_table에서 expire_col < cutoff인 행을 지우고 지운 행 수를 반환한다."""
     with conn.cursor() as cur:
-        cur.execute(f"DELETE FROM {target_table} WHERE {expire_col} < %(cutoff)s", {"cutoff": cutoff})
+        cur.execute(
+            f"DELETE FROM {target_table} WHERE {expire_col} < %(cutoff)s",
+            {"cutoff": cutoff},
+        )
         return cur.rowcount
 
 
@@ -59,6 +61,7 @@ def run(table: str, window_start: datetime) -> None:
         table: 대상 테이블 스펙 식별자
         window_start: 수집 기준 시각 (KST)
     """
+    target_table = target_table_for(table)
     spec = TABLE_SPECS[table]
     silver = spec.read(window_start)
 
@@ -69,13 +72,13 @@ def run(table: str, window_start: datetime) -> None:
     else:
         rows = spec.transform(silver)
 
-    target_table = target_table_for(table)
-
     with get_connection() as conn:
         if table == "station_urgency" and rows:
             station_ids = [row["sta_id"] for row in rows]
             with conn.cursor() as cur:
-                cur.execute("SELECT sta_id FROM stations WHERE sta_id = ANY(%s)", (station_ids,))
+                cur.execute(
+                    "SELECT sta_id FROM stations WHERE sta_id = ANY(%s)", (station_ids,)
+                )
                 known_station_ids = {row[0] for row in cur.fetchall()}
             filtered_rows = _only_known_stations(rows, known_station_ids)
             excluded_count = len(rows) - len(filtered_rows)
@@ -84,11 +87,20 @@ def run(table: str, window_start: datetime) -> None:
             rows = filtered_rows
         if table == "rebalance_routes":
             _retire_stale_proposed_routes(conn)
-        upsert(conn, target_table, rows, spec.conflict_cols, spec.update_cols, guard_col=spec.guard_col)
+        upsert(
+            conn,
+            target_table,
+            rows,
+            spec.conflict_cols,
+            spec.update_cols,
+            guard_col=spec.guard_col,
+        )
         if spec.expire_col:
             cutoff = _expire_cutoff(target_table, window_start)
             deleted = _delete_expired(conn, target_table, spec.expire_col, cutoff)
-            print(f"deleted {deleted} expired rows from {target_table} (expire_col={spec.expire_col}, cutoff={cutoff})")
+            print(
+                f"deleted {deleted} expired rows from {target_table} (expire_col={spec.expire_col}, cutoff={cutoff})"
+            )
         conn.commit()
 
     print(f"upserted {len(rows)} rows into {target_table}")
@@ -103,16 +115,25 @@ def _parse_window_start(raw: str) -> datetime:
     (대시보드가 읽는 바로 그 행들) 여기서 오프셋을 반드시 확정한다."""
     parsed = datetime.fromisoformat(raw)
     if parsed.tzinfo is None:
-        print(f"warning: --window-start에 오프셋이 없어 KST로 간주한다: {raw}", file=sys.stderr)
+        print(
+            f"warning: --window-start에 오프셋이 없어 KST로 간주한다: {raw}",
+            file=sys.stderr,
+        )
         return parsed.replace(tzinfo=KST)
     return parsed
 
 
 def main() -> int:
     """CLI 인자를 파싱하고 테이블 적재 파이프라인을 실행한다 (성공 0, 실패 1)."""
-    parser = argparse.ArgumentParser(description="Silver parquet을 읽어 Gold DB에 upsert한다.")
+    parser = argparse.ArgumentParser(
+        description="Silver parquet을 읽어 Gold DB에 upsert한다."
+    )
     parser.add_argument("--table", required=True, choices=sorted(TABLE_SPECS))
-    parser.add_argument("--window-start", required=True, help="ISO8601 시각(KST), 예: 2026-08-16T14:05:00+09:00")
+    parser.add_argument(
+        "--window-start",
+        required=True,
+        help="ISO8601 시각(KST), 예: 2026-08-16T14:05:00+09:00",
+    )
     args = parser.parse_args()
 
     window_start = _parse_window_start(args.window_start)

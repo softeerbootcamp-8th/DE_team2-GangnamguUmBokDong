@@ -35,7 +35,31 @@ make logs    # 로그 확인
 make ps      # 상태 확인
 ```
 
-**중요**: `apps/api`, `apps/web`, `collector`, `ml/*`는 compose에 포함되어 있지 않습니다. 지금처럼 각자 `uv run`/`npm run`으로 로컬에서 직접 실행하고, 위 인프라(Postgres/MinIO)에만 연결해서 씁니다. Airflow만 예외적으로 컨테이너로 뜨는데, DAG 안에서 다른 프로젝트가 필요하면 저장소 전체가 마운트된 컨테이너 안에서 `cd collector && uv run python main.py`처럼 그대로 호출합니다 — 별도 이미지를 만들 필요는 없습니다.
+### Gold PostGIS baseline과 기존 볼륨
+
+로컬 PostgreSQL은 `postgis/postgis:16-3.5`를 사용하며, **새 `postgres-data` 볼륨을
+처음 초기화할 때만** [Gold 스키마 SSOT](gold/target-schema.sql)를 적용합니다. 이후
+기동에서는 스키마 DDL을 다시 실행하지 않습니다.
+
+과거 `postgres:16` 스키마가 든 볼륨을 발견하면 PostgreSQL을 시작하기 전에 명확한
+오류로 중단합니다. Compose는 기존 볼륨을 변환하거나 삭제하지 않습니다. 기존 볼륨을
+보존하면서 새 Gold 개발 환경을 만들려면 먼저 컨테이너만 내리고(`make down`은 named
+volume을 삭제하지 않습니다), 별도 Compose 프로젝트 이름으로 기동합니다.
+
+```bash
+make down
+COMPOSE_PROJECT_NAME=gold-postgis-v1 make up
+```
+
+이후 `logs`, `ps`, `down`에도 같은 `COMPOSE_PROJECT_NAME`을 붙여야 같은 환경을
+다룹니다. 구 스키마에 직접 쓰던 `make seed`와 `apps/api/seed_gold.py`는 비활성화되어
+있습니다. 로컬 fixture는 후속 #152의 source publisher 경로가 준비된 뒤 그 경로로
+적재해야 합니다.
+
+**중요**: Compose는 로컬 확인용 `apps/api`와 `apps/web`도 함께 기동합니다.
+`collector`와 `ml/*`는 Compose에 포함되지 않으므로 각 프로젝트에서 `uv run`으로
+직접 실행합니다. Airflow DAG에서 다른 프로젝트가 필요하면 저장소 전체가 마운트된
+컨테이너 안에서 `cd collector && uv run python main.py`처럼 호출합니다.
 
 ## 사전 준비
 

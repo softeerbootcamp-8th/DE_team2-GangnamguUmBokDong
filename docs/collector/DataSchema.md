@@ -1,5 +1,10 @@
 # 검증 상태 분류 기준
 
+> 이 문서는 원천·Silver 컬럼의 데이터 품질 검증 기준이다. 운영 Gold의 목표 물리
+> 모델과 이름은 #129에서 확정하는 `docs/gold/target-erd.md`와
+> `docs/gold/data-dictionary.md`를 따른다. 따라서 이 문서에 등장하는 논리 컬럼이
+> 모두 Gold에 영속되는 것은 아니다.
+
 ## 1. 분류 원칙
 
 컬럼은 현재 Gold 생성 또는 모델 추론에 직접 필요한지에 따라 `필수`와 `일반`으로 구분한다.
@@ -323,4 +328,3 @@ manifest의 `column_issues.missing`과 `optional_missing` 정책에 걸린다(`c
 | code_nm | 일반 | 값 없음/빈 문자열 | 별도 Hard range 없음 | 사람이 원천 코드를 해석하기 위한 표시명 |
 
 `code_id`는 원천 코드값이 아니라 내부 인공키로 사용한다. 원천 코드값은 `code_value`에 저장하며 `(code_group_id, code_value)`는 UNIQUE를 권장한다.
-

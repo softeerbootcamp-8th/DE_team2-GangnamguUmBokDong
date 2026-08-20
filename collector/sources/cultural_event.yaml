@@ -50,7 +50,7 @@ columns:
     types: [str]
   LOT:
     types: [float]
-    range: { min: 126.7, max: 127.2 }
+    range: { min: 126.5, max: 127.5 }
   LAT:
     types: [float]
-    range: { min: 37.4, max: 37.7 }
+    range: { min: 37.0, max: 38.0 }

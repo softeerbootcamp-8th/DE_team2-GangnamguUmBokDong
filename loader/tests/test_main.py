@@ -2,10 +2,10 @@
 로직 — _expire_cutoff/_delete_expired를 검증한다. run() 전체를 목킹하는 대신 이
 두 함수로 테스트 표면을 좁혔다(#116/#117)."""
 
-from datetime import UTC, date, datetime
+from datetime import UTC, datetime
 
 import pytest
-
+from config import RETIRED_SOURCE_TABLES, RetiredSourceGoldPathError
 from main import (
     KST,
     _delete_expired,
@@ -13,7 +13,9 @@ from main import (
     _only_known_stations,
     _parse_window_start,
     _retire_stale_proposed_routes,
+    run,
 )
+from retention_config import DATE_TYPED_EXPIRE_TABLES, RETENTION_GRACE
 
 
 def test_station_urgency_filters_rows_without_station_fk():
@@ -70,19 +72,11 @@ class TestExpireCutoff:
         # RETENTION_GRACE["forecast_points"] == 2시간
         assert cutoff == datetime(2026, 8, 16, 12, 5, tzinfo=UTC)
 
-    def test_weather_forecast_uses_its_own_grace_period(self):
-        window_start = datetime(2026, 8, 16, 14, 5, tzinfo=UTC)
-        assert _expire_cutoff("weather_forecast", window_start) == datetime(2026, 8, 16, 12, 5, tzinfo=UTC)
 
-    def test_cultural_events_returns_a_date_not_datetime(self):
-        """end_date는 DATE 컬럼이라 datetime이 아니라 date로 비교해야 한다."""
-        window_start = datetime(2026, 8, 16, 14, 5, tzinfo=UTC)
-
-        cutoff = _expire_cutoff("cultural_events", window_start)
-
-        # RETENTION_GRACE["cultural_events"] == 3일
-        assert cutoff == date(2026, 8, 13)
-        assert not isinstance(cutoff, datetime)
+def test_source_publishers_have_no_legacy_retention_authority() -> None:
+    """Weather/event reconcile와 retention은 source publisher만 소유한다."""
+    assert set(RETENTION_GRACE) == {"forecast_points"}
+    assert not DATE_TYPED_EXPIRE_TABLES
 
 
 class TestDeleteExpired:
@@ -98,17 +92,38 @@ class TestDeleteExpired:
         assert "predicted_dttm < %(cutoff)s" in query
         assert params == {"cutoff": cutoff}
 
-    def test_uses_target_table_not_logical_spec_name(self):
-        """weather_forecast_ultra/cultural_events_performance처럼 별칭된 스펙도
-        물리 테이블명(target_table)으로 DELETE해야 한다 — 호출부(main.run)가 이미
-        별칭 해소를 하고 넘겨준다는 전제를 그대로 검증."""
+    def test_uses_the_derived_target_table_name(self):
+        """남은 파생 스펙은 자신의 물리 target 이름으로 DELETE한다."""
         conn = _FakeConnection(rowcount=0)
 
-        _delete_expired(conn, "cultural_events", "end_date", date(2026, 8, 13))
+        _delete_expired(
+            conn,
+            "forecast_points",
+            "predicted_dttm",
+            datetime(2026, 8, 16, 12, 5, tzinfo=UTC),
+        )
 
         [(query, _params)] = conn.cursor_obj.executed
-        assert "DELETE FROM cultural_events" in query
-        assert "weather_forecast_ultra" not in query
+        assert "DELETE FROM forecast_points" in query
+
+
+@pytest.mark.parametrize("table", sorted(RETIRED_SOURCE_TABLES))
+def test_run_rejects_retired_source_tables_before_read_or_db_access(
+    table: str,
+    monkeypatch,
+) -> None:
+    """프로그램 호출도 폐기된 원천 경로를 어떤 I/O보다 먼저 거부한다."""
+
+    def unexpected_io(*args, **kwargs):
+        """폐기 경로에서 I/O가 시작되면 테스트를 실패시킨다."""
+        pytest.fail(
+            f"폐기된 {table} 경로가 I/O를 시작했다: args={args}, kwargs={kwargs}"
+        )
+
+    monkeypatch.setattr("main.get_connection", unexpected_io)
+
+    with pytest.raises(RetiredSourceGoldPathError, match="publication publisher"):
+        run(table, datetime(2026, 8, 16, 14, 5, tzinfo=UTC))
 
 
 class TestParseWindowStart:
@@ -130,7 +145,9 @@ class TestParseWindowStart:
         naive = _parse_window_start("2026-08-16T14:05:00")
         aware = _parse_window_start("2026-08-16T14:05:00+09:00")
 
-        assert _expire_cutoff("forecast_points", naive) == _expire_cutoff("forecast_points", aware)
+        assert _expire_cutoff("forecast_points", naive) == _expire_cutoff(
+            "forecast_points", aware
+        )
 
 
 class TestRetentionConfigValidation:
@@ -140,13 +157,15 @@ class TestRetentionConfigValidation:
         import config
         from config import TableSpec
 
-        specs = {"brand_new_table": TableSpec(
-            source_id="x",
-            transform=lambda df: [],
-            conflict_cols=["id"],
-            update_cols=[],
-            expire_col="expired_at",
-        )}
+        specs = {
+            "brand_new_table": TableSpec(
+                source_id="x",
+                transform=lambda df: [],
+                conflict_cols=["id"],
+                update_cols=[],
+                expire_col="expired_at",
+            )
+        }
 
         with pytest.raises(ValueError, match="brand_new_table"):
             config._validate_retention_config(specs)
