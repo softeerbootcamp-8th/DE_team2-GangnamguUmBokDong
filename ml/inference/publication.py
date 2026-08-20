@@ -9,13 +9,10 @@ revision catalog를 claim하고 success/EMPTY manifest를 마지막에 기록한
 from __future__ import annotations
 
 import re
-import threading
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Protocol, cast
-from urllib.parse import urlsplit
 
 import pandas as pd
 import pyarrow as pa
@@ -24,14 +21,21 @@ from core.gold_publication import (
     Dependency,
     IdSet,
     ImmutableObjectStore,
-    ImmutablePutOutcome,
     ObjectMissingError,
     S3ImmutableObjectStore,
     build_id_set,
-    canonical_json_bytes,
-    format_utc_dttm,
-    parse_canonical_json,
     sha256_hex,
+)
+from core.inference_catalog import (
+    INFERENCE_REVISION_RECORD_SCHEMA_VERSION,
+    InMemoryInferenceRevisionCatalog,
+    InferenceCatalogError,
+    InferenceCatalogSnapshot,
+    InferenceRevisionCatalog,
+    InferenceRevisionConflictError,
+    InferenceRevisionRecord,
+    S3InferenceRevisionCatalog,
+    split_inference_object_base_uri,
 )
 from core.inference_snapshot import (
     INFERENCE_HORIZON_COUNT,
@@ -74,29 +78,8 @@ from .predict_single import (
 INFERENCE_PRODUCER_VERSION = "gold-inference-producer-v1"
 """Inference manifest에 기록하는 producer implementation version이다."""
 
-INFERENCE_REVISION_RECORD_SCHEMA_VERSION = "ml-inference-revision-record-v1"
-"""Logical time별 immutable revision slot의 schema version이다."""
-
-_REVISION_RECORD_KEYS = frozenset(
-    {
-        "logical_dttm",
-        "manifest_byte_sha256",
-        "manifest_uri",
-        "revision_no",
-        "schema_version",
-    }
-)
-_REVISION_KEY_PATTERN = re.compile(
-    r"logical=(?P<logical>\d{8}T\d{6}\d{6}Z)/revision=(?P<revision>\d{6})\.json\Z"
-)
-
-
-class InferencePublicationError(RuntimeError):
-    """Inference 계산·검증·immutable 공개가 완료되지 않았다."""
-
-
-class InferenceRevisionConflictError(InferencePublicationError):
-    """같은 catalog snapshot에서 시작한 다른 writer가 revision을 먼저 claim했다."""
+InferencePublicationError = InferenceCatalogError
+"""기존 producer import와 호환되는 inference publication 오류 경계다."""
 
 
 class InferenceRunStatus(StrEnum):
@@ -104,113 +87,6 @@ class InferenceRunStatus(StrEnum):
 
     PUBLISHED = "published"
     REPLAYED = "replayed"
-
-
-@dataclass(frozen=True, slots=True)
-class InferenceRevisionRecord:
-    """Revision number 하나가 예약한 exact manifest identity다."""
-
-    logical_dttm: datetime
-    revision_no: int
-    manifest_byte_sha256: str
-    manifest_uri: str
-    schema_version: str = INFERENCE_REVISION_RECORD_SCHEMA_VERSION
-
-    def __post_init__(self) -> None:
-        """Record scalar와 canonical-safe logical time을 검증한다."""
-        if type(self.logical_dttm) is not datetime or self.logical_dttm.tzinfo is None:
-            raise InferencePublicationError(
-                "revision logical_dttm은 timezone-aware datetime이어야 합니다."
-            )
-        object.__setattr__(self, "logical_dttm", self.logical_dttm.astimezone(UTC))
-        if (
-            type(self.revision_no) is not int
-            or isinstance(self.revision_no, bool)
-            or self.revision_no < 0
-        ):
-            raise InferencePublicationError(
-                "revision_no는 nonnegative integer여야 합니다."
-            )
-        if type(self.manifest_byte_sha256) is not str or not re.fullmatch(
-            r"[0-9a-f]{64}", self.manifest_byte_sha256
-        ):
-            raise InferencePublicationError("manifest SHA-256 형식이 잘못됐습니다.")
-        if type(self.manifest_uri) is not str or not self.manifest_uri:
-            raise InferencePublicationError(
-                "manifest URI는 non-empty string이어야 합니다."
-            )
-        if self.schema_version != INFERENCE_REVISION_RECORD_SCHEMA_VERSION:
-            raise InferencePublicationError(
-                "revision record schema version이 다릅니다."
-            )
-
-    @property
-    def canonical_bytes(self) -> bytes:
-        """Immutable revision slot에 쓸 canonical JSON bytes를 반환한다."""
-        return canonical_json_bytes(
-            {
-                "logical_dttm": format_utc_dttm(self.logical_dttm),
-                "manifest_byte_sha256": self.manifest_byte_sha256,
-                "manifest_uri": self.manifest_uri,
-                "revision_no": self.revision_no,
-                "schema_version": self.schema_version,
-            }
-        )
-
-
-@dataclass(frozen=True, slots=True)
-class InferenceCatalogSnapshot:
-    """Run 시작 또는 publish 직전 관측한 immutable catalog 상태다."""
-
-    records: tuple[InferenceRevisionRecord, ...]
-    latest_logical_dttm: datetime | None
-
-    def __post_init__(self) -> None:
-        """현재 logical record가 0부터 연속이고 latest가 UTC인지 검증한다."""
-        if type(self.records) is not tuple or any(
-            type(record) is not InferenceRevisionRecord for record in self.records
-        ):
-            raise InferencePublicationError(
-                "catalog records는 exact tuple이어야 합니다."
-            )
-        revisions = tuple(record.revision_no for record in self.records)
-        if revisions != tuple(range(len(self.records))):
-            raise InferencePublicationError(
-                "catalog revision은 0부터 빈틈없이 증가해야 합니다."
-            )
-        if self.records and len({record.logical_dttm for record in self.records}) != 1:
-            raise InferencePublicationError(
-                "catalog snapshot records의 logical time이 섞였습니다."
-            )
-        if self.latest_logical_dttm is not None:
-            if (
-                type(self.latest_logical_dttm) is not datetime
-                or self.latest_logical_dttm.tzinfo is None
-            ):
-                raise InferencePublicationError(
-                    "catalog latest logical time은 timezone-aware여야 합니다."
-                )
-            object.__setattr__(
-                self,
-                "latest_logical_dttm",
-                self.latest_logical_dttm.astimezone(UTC),
-            )
-
-
-class InferenceRevisionCatalog(Protocol):
-    """Mutable pointer 없이 immutable revision slot만 관리하는 경계다."""
-
-    def snapshot(self, logical_dttm: datetime) -> InferenceCatalogSnapshot:
-        """요청 logical의 record와 전체 catalog 최신 logical을 읽는다."""
-        ...
-
-    def claim(self, record: InferenceRevisionRecord) -> None:
-        """해당 logical/revision의 고정 slot이 비어 있을 때만 예약한다."""
-        ...
-
-    def latest_revision(self, logical_dttm: datetime) -> InferenceRevisionRecord | None:
-        """해당 logical의 가장 큰 immutable revision record를 반환한다."""
-        ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -228,124 +104,6 @@ class PublishedInferenceSnapshot:
             raise InferencePublicationError(
                 "returned manifest SHA가 실제 manifest와 다릅니다."
             )
-
-
-class S3InferenceRevisionCatalog:
-    """S3 LIST와 immutable conditional PUT으로 revision slot을 관리한다."""
-
-    def __init__(
-        self, object_base_uri: str, object_store: ImmutableObjectStore
-    ) -> None:
-        """현재 S3 bucket 안의 catalog prefix와 object store를 고정한다."""
-        bucket, prefix = _split_base_uri(object_base_uri)
-        if bucket != s3_io._bucket():
-            raise InferencePublicationError(
-                "기본 S3 revision catalog는 S3_BUCKET과 같은 bucket만 지원합니다."
-            )
-        self._bucket = bucket
-        self._prefix = f"{prefix}/inference/catalog" if prefix else "inference/catalog"
-        self._object_store = object_store
-
-    def snapshot(self, logical_dttm: datetime) -> InferenceCatalogSnapshot:
-        """모든 immutable slot을 검증하고 요청 logical의 연속 record를 반환한다."""
-        requested = _utc_dttm(logical_dttm)
-        keys = sorted(s3_io.list_keys(f"{self._prefix}/"))
-        all_records: list[InferenceRevisionRecord] = []
-        for key in keys:
-            relative = key.removeprefix(f"{self._prefix}/")
-            match = _REVISION_KEY_PATTERN.fullmatch(relative)
-            if match is None:
-                raise InferencePublicationError(
-                    f"알 수 없는 inference catalog object입니다: {key}"
-                )
-            payload = s3_io.get_object_bytes(key)
-            if payload is None:
-                raise InferencePublicationError(
-                    f"LIST한 catalog object가 사라졌습니다: {key}"
-                )
-            record = _parse_revision_record(payload)
-            if _logical_token(record.logical_dttm) != match.group("logical"):
-                raise InferencePublicationError(
-                    "catalog key와 record logical time이 다릅니다."
-                )
-            if record.revision_no != int(match.group("revision")):
-                raise InferencePublicationError(
-                    "catalog key와 record revision이 다릅니다."
-                )
-            all_records.append(record)
-
-        records = tuple(
-            sorted(
-                (record for record in all_records if record.logical_dttm == requested),
-                key=lambda record: record.revision_no,
-            )
-        )
-        latest = max((record.logical_dttm for record in all_records), default=None)
-        return InferenceCatalogSnapshot(records=records, latest_logical_dttm=latest)
-
-    def claim(self, record: InferenceRevisionRecord) -> None:
-        """고정 revision slot을 If-None-Match로 예약하고 existing은 충돌로 처리한다."""
-        uri = self._record_uri(record.logical_dttm, record.revision_no)
-        outcome = self._object_store.put_once(
-            uri,
-            record.canonical_bytes,
-            expected_sha256=sha256_hex(record.canonical_bytes),
-            require_canonical_json=True,
-        )
-        if outcome is not ImmutablePutOutcome.CREATED:
-            raise InferenceRevisionConflictError(
-                f"inference revision을 다른 writer가 먼저 claim했습니다: {uri}"
-            )
-
-    def latest_revision(self, logical_dttm: datetime) -> InferenceRevisionRecord | None:
-        """S3 catalog에서 logical별 가장 큰 revision record를 반환한다."""
-        records = self.snapshot(logical_dttm).records
-        return records[-1] if records else None
-
-    def _record_uri(self, logical_dttm: datetime, revision_no: int) -> str:
-        """Logical time과 zero-padded revision의 fixed catalog slot URI를 만든다."""
-        return (
-            f"s3://{self._bucket}/{self._prefix}/logical={_logical_token(logical_dttm)}"
-            f"/revision={revision_no:06d}.json"
-        )
-
-
-class InMemoryInferenceRevisionCatalog:
-    """단위 테스트와 local composition에 쓰는 thread-safe immutable catalog다."""
-
-    def __init__(self) -> None:
-        """빈 record map을 만든다."""
-        self._records: dict[tuple[datetime, int], InferenceRevisionRecord] = {}
-        self._lock = threading.Lock()
-
-    def snapshot(self, logical_dttm: datetime) -> InferenceCatalogSnapshot:
-        """Lock 아래 현재 logical과 global latest를 일관되게 복사한다."""
-        logical = _utc_dttm(logical_dttm)
-        with self._lock:
-            values = tuple(self._records.values())
-        records = tuple(
-            sorted(
-                (record for record in values if record.logical_dttm == logical),
-                key=lambda record: record.revision_no,
-            )
-        )
-        latest = max((record.logical_dttm for record in values), default=None)
-        return InferenceCatalogSnapshot(records=records, latest_logical_dttm=latest)
-
-    def claim(self, record: InferenceRevisionRecord) -> None:
-        """같은 logical/revision slot의 두 번째 writer를 항상 거부한다."""
-        key = (record.logical_dttm, record.revision_no)
-        with self._lock:
-            if key in self._records:
-                raise InferenceRevisionConflictError(
-                    f"inference revision을 다른 writer가 먼저 claim했습니다: {key}"
-                )
-            self._records[key] = record
-
-    def latest_revision(self, logical_dttm: datetime) -> InferenceRevisionRecord | None:
-        """Lock-consistent snapshot에서 logical별 가장 큰 revision을 반환한다."""
-        records = self.snapshot(logical_dttm).records
-        return records[-1] if records else None
 
 
 def run_and_publish_inference(
@@ -396,12 +154,26 @@ def run_and_publish_inference(
             "custom object_store에는 같은 backend의 revision_catalog를 명시해야 합니다."
         )
 
-    immutable = object_store if object_store is not None else S3ImmutableObjectStore()
-    catalog = (
-        revision_catalog
-        if revision_catalog is not None
-        else S3InferenceRevisionCatalog(object_base_uri, immutable)
-    )
+    default_client = None
+    if object_store is None:
+        default_client = s3_io._client()
+        immutable = S3ImmutableObjectStore(default_client)
+    else:
+        immutable = object_store
+    if revision_catalog is not None:
+        catalog = revision_catalog
+    else:
+        bucket, _prefix = _split_base_uri(object_base_uri)
+        if default_client is None:
+            raise InferencePublicationError(
+                "custom object_store에는 같은 backend의 revision_catalog를 명시해야 합니다."
+            )
+        catalog = S3InferenceRevisionCatalog(
+            default_client,
+            immutable,
+            bucket=bucket,
+            object_base_uri=object_base_uri,
+        )
     initial_catalog = catalog.snapshot(logical)
 
     # 이 함수 안에서 유일한 serving pointer read다. Returned preflight가 exact
@@ -927,29 +699,6 @@ def _put_once_and_readback(
         )
 
 
-def _parse_revision_record(payload: bytes) -> InferenceRevisionRecord:
-    """Canonical revision record bytes를 exact-key typed 값으로 파싱한다."""
-    document = parse_canonical_json(payload)
-    if type(document) is not dict or frozenset(document) != _REVISION_RECORD_KEYS:
-        raise InferencePublicationError("revision record key 집합이 잘못됐습니다.")
-    try:
-        logical = datetime.strptime(
-            cast(str, document["logical_dttm"]),
-            "%Y-%m-%dT%H:%M:%S.%fZ",
-        ).replace(tzinfo=UTC)
-        return InferenceRevisionRecord(
-            logical_dttm=logical,
-            revision_no=cast(int, document["revision_no"]),
-            manifest_byte_sha256=cast(str, document["manifest_byte_sha256"]),
-            manifest_uri=cast(str, document["manifest_uri"]),
-            schema_version=cast(str, document["schema_version"]),
-        )
-    except (KeyError, TypeError, ValueError) as exc:
-        raise InferencePublicationError(
-            "revision record scalar가 잘못됐습니다."
-        ) from exc
-
-
 def _content_uri(base_uri: str, namespace: str, digest: str, extension: str) -> str:
     """Object base 아래 content-addressed exact S3 URI를 만든다."""
     bucket, prefix = _split_base_uri(base_uri)
@@ -959,15 +708,7 @@ def _content_uri(base_uri: str, namespace: str, digest: str, extension: str) -> 
 
 def _split_base_uri(uri: str) -> tuple[str, str]:
     """Prefix를 가리키는 query/fragment 없는 S3 base URI를 검증한다."""
-    if type(uri) is not str:
-        raise TypeError("object_base_uri는 string이어야 합니다.")
-    parsed = urlsplit(uri)
-    if parsed.scheme != "s3" or not parsed.netloc or parsed.query or parsed.fragment:
-        raise InferencePublicationError(
-            "object_base_uri는 query/fragment 없는 s3:// URI여야 합니다."
-        )
-    prefix = parsed.path.lstrip("/").rstrip("/")
-    return parsed.netloc, prefix
+    return split_inference_object_base_uri(uri)
 
 
 def _source_extension(key: str) -> str:
@@ -976,12 +717,6 @@ def _source_extension(key: str) -> str:
     if len(suffix) == 2 and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", suffix[1]):
         return suffix[1].lower()
     return "bin"
-
-
-def _logical_token(value: datetime) -> str:
-    """UTC logical time을 catalog path의 고정 폭 token으로 만든다."""
-    logical = _utc_dttm(value)
-    return logical.strftime("%Y%m%dT%H%M%S%fZ")
 
 
 def _utc_dttm(value: datetime) -> datetime:

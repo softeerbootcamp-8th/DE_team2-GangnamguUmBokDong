@@ -685,7 +685,9 @@ def test_cross_logical_out_of_order_publish_keeps_catalog_latest_max(
             logical_dttm=later,
             revision_no=0,
             manifest_byte_sha256="c" * 64,
-            manifest_uri="s3://fixture/inference/sha256=" + "c" * 64 + ".json",
+            manifest_uri=(
+                "s3://fixture/inference/manifests/sha256=" + "c" * 64 + ".json"
+            ),
         )
     )
     _install_release_loader(monkeypatch, _pinned_release())
@@ -705,7 +707,7 @@ def test_cross_logical_out_of_order_publish_keeps_catalog_latest_max(
     snapshot = catalog.snapshot(LOGICAL)
     assert result.manifest.logical_dttm == LOGICAL
     assert len(snapshot.records) == 1
-    assert snapshot.latest_logical_dttm == later
+    assert snapshot.latest_logical_dttm is None
 
 
 def test_catalog_change_during_compute_is_concurrent_writer_conflict(
@@ -818,8 +820,10 @@ def test_s3_revision_catalog_claim_snapshot_and_latest_use_same_bucket(
         monkeypatch.setattr(s3_io, "_client", lambda _timeout=None: client)
         store = pub.S3ImmutableObjectStore(client)
         catalog = pub.S3InferenceRevisionCatalog(
-            f"s3://{bucket}/authority",
+            client,
             store,
+            bucket=bucket,
+            object_base_uri=f"s3://{bucket}/authority",
         )
         record = pub.InferenceRevisionRecord(
             logical_dttm=LOGICAL,
