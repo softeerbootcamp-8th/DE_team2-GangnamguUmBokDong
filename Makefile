@@ -10,7 +10,7 @@ COMPOSE = docker compose $(if $(wildcard .env),--env-file .env,) -f ops/compose/
 .PHONY: sync-all sync-ci-unit lint test-gold-bootstrap test-gold-transition-available test test-ci test-ci-unit test-ci-integration bootstrap up down logs ps seed seed-e2e e2e-preflight e2e-smoke
 
 E2E_LOGICAL_DTTM ?= $(shell TZ=Asia/Seoul date '+%Y-%m-%dT%H:%M:00+09:00' | awk -F: '{ printf "%s:%02d:00+09:00\n", $$1, int($$2 / 5) * 5 }')
-E2E_STATION_SOURCE_DTTM ?= $(shell date -d '$(E2E_LOGICAL_DTTM) 5 minutes ago' '+%Y-%m-%dT%H:%M:00%:z')
+E2E_STATION_SOURCE_DTTM ?= $(shell python3 ops/e2e_time.py station-source '$(E2E_LOGICAL_DTTM)')
 
 sync-all:
 	@for p in $(PROJECTS); do \
@@ -120,6 +120,10 @@ seed:
 	@false
 
 seed-e2e:
+	@test -n "$(E2E_STATION_SOURCE_DTTM)" || { \
+		echo "[e2e] station source 시각 계산에 실패했습니다: $(E2E_LOGICAL_DTTM)" >&2; \
+		exit 2; \
+	}
 	@$(COMPOSE) exec -T airflow-scheduler sh -lc \
 		'cd /workspace/collector && env -u VIRTUAL_ENV UV_PROJECT_ENVIRONMENT=/opt/venvs/modules/collector uv run --frozen python main.py --source bike_station_realtime --window-start "$(E2E_STATION_SOURCE_DTTM)"'
 	@$(COMPOSE) exec -T airflow-scheduler sh -lc \
