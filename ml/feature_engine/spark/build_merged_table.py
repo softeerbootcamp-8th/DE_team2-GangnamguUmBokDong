@@ -1,10 +1,10 @@
-"""모든 소스를 station x tick(5분 간격) 기준으로 병합해 최종 feature 테이블의 입력을 만든다 (PySpark 포팅).
+"""모든 소스를 station x tick(20분 간격) 기준으로 병합해 최종 feature 테이블의 입력을 만든다 (PySpark 포팅).
 
-**그리드가 시간(hour) 단위에서 5분 tick 단위로 바뀌었다** — `src/build_merged_table.py`
-(pandas)와 동일한 이유: "3시 45분 기준으로 앞으로 1시간"처럼 임의의 5분 단위 기준
+**그리드가 시간(hour) 단위에서 20분 tick 단위로 바뀌었다** — `src/build_merged_table.py`
+(pandas)와 동일한 이유: "3시 40분 기준으로 앞으로 1시간"처럼 임의의 20분 단위 기준
 시각에서 예측하려면 그리드 자체가 그 해상도여야 한다(타겟은 이미
-`build_targets.py`에서 5분 tick sparse step function으로 바뀜). `hour_ts` 컬럼명은
-그대로 두지만(다른 파일들과의 접점이 많아 이름을 바꾸지 않음) 이제 5분 단위로도
+`build_targets.py`에서 20분 tick sparse step function으로 바뀜). `hour_ts` 컬럼명은
+그대로 두지만(다른 파일들과의 접점이 많아 이름을 바꾸지 않음) 이제 20분 단위로도
 값을 가진다.
 
 `src/build_merged_table.py`(pandas, 로컬 검증용)와 **의도적으로 다른 부분이 하나
@@ -36,11 +36,13 @@ join한다 — 그 시간 동안 값이 유지된다고 forward-fill하는 것�
 
 **메모리(dtype 최적화)**: `src/build_merged_table.py`의 `NATIVE_COLUMN_DTYPES`
 (값 범위 실측 기반 다운캐스트)와 동일한 Spark 타입 매핑을 적용한다 — 값 범위는
-그대로, 자료형만 줄여서 EMR에서의 셔플/저장 비용을 낮춘다.
+그대로, 자료형만 줄여서 EMR에서의 셔플/저장 비용을 낮춘다. 같은 이유로 이후
+단계에서 안 쓰는 wind/humidity/pop 세부분류(pop_resd/pop_long_foreign/
+pop_short_foreign)는 원본 join 직후 즉시 버린다(뒤로 전파시키지 않음).
 """
 
-import json
-
+from ml_core.day_index import DAY_INDEX_EPOCH
+from ml_core.holidays_kr import korean_holidays
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.types import ByteType, FloatType, ShortType
@@ -53,48 +55,56 @@ from .rolling_window_features import (
 )
 
 # src/build_merged_table.py의 NATIVE_COLUMN_DTYPES와 동일한 근거(값 범위 실측)로
-# 매핑한 Spark 타입 — bike_count 0~478, rental/return_count 0~245, humidity 13~100
-# 등은 전부 ShortType/ByteType 범위 안.
+# 매핑한 Spark 타입 — bike_count 0~478, rental/return_count 0~245 등은 전부
+# ShortType/ByteType 범위 안. day(2000-01-01 기준 경과일수, ml_core.day_index)/
+# station_no도 ShortType(부호 있는 16비트, 지금 값 범위엔 충분) — Spark엔 unsigned
+# 타입이 없어(uint 계열 자체가 없음) 이 값 그대로가 최종 저장 타입이고, pandas/학습
+# 쪽 model_contract.NATIVE_COLUMN_DTYPES도 같은 int16으로 맞춘다(uint16으로 선언해도
+# 여기서 이미 int16 범위로 잘려 있어 의미가 없다).
 NATIVE_COLUMN_DTYPES = {
     "bike_count": ShortType(),
     "stockout_flag": ByteType(),
     "rental_count": ShortType(),
     "return_count": ShortType(),
-    "capacity": FloatType(),
+    # capacity(거치대 수)는 원래 "LEFT JOIN이라 결측 가능"이라는 이유로 float32였는데,
+    # 실제로는 이 join이 결측을 낼 수 없다 — active_station_ids(rental_targets/
+    # return_targets의 station_id 합집합)는 이미 silver_source.read_rental_trips()의
+    # INNER JOIN(대여 쪽)과 build_targets.py의 end_station_id null 필터(반납 쪽)를
+    # 거쳐서 항상 station_master의 부분집합이다. status도 그 active_station_ids로
+    # 한 번 더 걸러지므로, 여기 capacity를 채우는 LEFT JOIN 시점엔 좌변의 station_id
+    # 집합이 이미 master의 부분집합이라 이 join이 실제로 결측을 낼 수 없다(2026-08
+    # 확인, 코드 경로 추적 — station_no와 결측 이유가 아예 없다는 점이 다름).
+    # 항상 정수(거치대 개수)라 ShortType으로 줄인다 — 최대 대여소 규모는 실측 데이터
+    # 없이 확인 못 했지만 int16(32,767) 여유는 충분히 안전하다고 판단.
+    "capacity": ShortType(),
     "lat": FloatType(),
     "lon": FloatType(),
     "temp": FloatType(),
     "precip": FloatType(),
-    "wind": FloatType(),
-    "humidity": ByteType(),
-    "pop_resd": FloatType(),
-    "pop_long_foreign": FloatType(),
-    "pop_short_foreign": FloatType(),
     "pop_total": FloatType(),
-    "hour": ByteType(),
-    "minute": ByteType(),
+    "hour": ByteType(),  # 더 이상 모델 feature가 아니다(minute이 대체) — 출력/CLI 식별용
+    "minute": ShortType(),  # 자정 기준 경과분(0~1439, ml_core.minute_of_day) — 실제 모델 feature
     "dow": ByteType(),
-    "month": ByteType(),
     "is_holiday": ByteType(),
-    "is_weekend": ByteType(),
-    "is_next_day_off": ByteType(),
-    "is_prev_day_off": ByteType(),
+    "day": ShortType(),
+    # station_id(텍스트, "ST-2565")는 모델 feature에서 station_no(정수 일련번호)로
+    # 대체됐다 — Parquet dictionary encoding이 to_pandas()에서 안 살아남아 매 학습
+    # 읽기마다 object dtype 문자열 배열을 통째로 materialize하는 비용이 있었는데,
+    # station_no는 처음부터 정수라 그 비용 자체가 없다.
+    "station_no": ShortType(),
 }
 
 
-def _load_holidays(spark: SparkSession) -> set[str]:
-    """analysis_summary.json의 holidays_2025 목록을 'YYYY-MM-DD' 문자열 set으로 반환한다.
+def _holidays_for_train_year() -> set[str]:
+    """`config.WINDOW_START`~`WINDOW_END`(롤링 학습기간) 전후(±1년) 대한민국 공휴일을 계산한다.
 
-    local/S3 경로 어디든 동일하게 동작하도록 Spark의 파일 리더로 통째로 읽는다
-    (플레인 파이썬 open()은 S3 URI를 못 읽음).
-
-    args:
-        spark: SparkSession
-    returns:
-        set[str]: 2025년 공휴일 날짜 집합
+    `holidays` 패키지(ml_core.holidays_kr)로 오프라인 계산하므로 analysis_summary.json
+    같은 사전 준비 파일이 필요 없다. 앞뒤로 1년씩 여유를 두는 이유: 증분(`since`)
+    재계산이나 연말/연초 경계에 걸치는 구간이 윈도우 밖 날짜를 포함할 수 있어서다.
+    윈도우 자체가 연도를 걸칠 수 있으므로(2026-08부터, 고정 TRAIN_YEAR 폐지) 범위
+    전체를 `range()`로 커버한다.
     """
-    content = spark.read.text(config.ANALYSIS_SUMMARY_JSON, wholetext=True).collect()[0][0]
-    return set(json.loads(content)["holidays_2025"])
+    return korean_holidays(range(config.WINDOW_START.year - 1, config.WINDOW_END.year + 2))
 
 
 def _expand_hourly_to_ticks(status: DataFrame, tick_minutes: int, spark: SparkSession) -> DataFrame:
@@ -126,7 +136,7 @@ def _expand_hourly_to_ticks(status: DataFrame, tick_minutes: int, spark: SparkSe
 
 
 def build_merged_table(spark: SparkSession, since: str | None = None) -> DataFrame:
-    """station master/타겟/재고/날씨/인구를 station x tick(5분) 기준으로 병합한다.
+    """station master/타겟/재고/날씨/인구를 station x tick(config.GRID_TICK_MINUTES) 기준으로 병합한다.
 
     args:
         spark: SparkSession
@@ -136,19 +146,20 @@ def build_merged_table(spark: SparkSession, since: str | None = None) -> DataFra
             sparse step function이라 이 필터와 무관하게 항상 전체를 읽는다** — 위
             모듈 docstring 참고.
     returns:
-        DataFrame: 최종 병합 테이블 (station_id, rental_count, return_count, bike_count,
-            stockout_flag, capacity, lat, lon, temp, precip, wind, humidity,
-            pop_resd, pop_long_foreign, pop_short_foreign, pop_total, hour_ts,
-            date, hour, minute, dow, month, is_holiday, is_weekend, is_next_day_off,
-            is_prev_day_off)
+        DataFrame: 최종 병합 테이블 (station_no, rental_count, return_count, bike_count,
+            stockout_flag, capacity, lat, lon, temp, precip, pop_total, hour_ts,
+            date, day, hour, minute, dow, is_holiday) — station_id(텍스트)는 없다(아래
+            station_no 관련 주석 참고).
     """
     master = spark.read.parquet(config.STATION_MASTER_PARQUET)
     rental_targets = spark.read.parquet(config.TARGETS_PARQUET)  # sparse step function
     return_targets = spark.read.parquet(config.RETURN_TARGETS_PARQUET)  # sparse step function
     status = spark.read.parquet(config.STATION_STATUS_PARQUET)
-    weather = spark.read.parquet(config.WEATHER_PARQUET)
-    population = spark.read.parquet(config.POPULATION_PARQUET)
-    holidays = _load_holidays(spark)
+    # wind/humidity/pop_resd/pop_long_foreign/pop_short_foreign은 더 이상 모델
+    # 피처가 아니다 — join 전에 select로 걸러서 뒤 단계로 전파되지 않게 한다.
+    weather = spark.read.parquet(config.WEATHER_PARQUET).select("hour_ts", "temp", "precip")
+    population = spark.read.parquet(config.POPULATION_PARQUET).select("grid_id", "hour_ts", "pop_total")
+    holidays = _holidays_for_train_year()
 
     # "활성 station" 여부(트립이 한 번이라도 있었는지)는 반드시 전체 히스토리 기준이어야
     # 한다 — since 필터를 먼저 걸면 증분 실행 시 "최근엔 조용하지만 예전엔 활발했던"
@@ -165,8 +176,8 @@ def build_merged_table(spark: SparkSession, since: str | None = None) -> DataFra
         weather = weather.filter(F.col("hour_ts") >= F.lit(since))
         population = population.filter(F.col("hour_ts") >= F.lit(since))
 
-    # 그리드 = station_status에 실제로 관측 기록이 있는 (station_id, hour_ts)를 5분
-    # tick으로 펼친 것 — 8,760시간 dense grid를 따로 만들지 않는다.
+    # 그리드 = station_status에 실제로 관측 기록이 있는 (station_id, hour_ts)를
+    # GRID_TICK_MINUTES 간격으로 펼친 것 — 8,760시간 dense grid를 따로 만들지 않는다.
     status = status.join(active_station_ids, on="station_id", how="inner")
     df = _expand_hourly_to_ticks(status, config.GRID_TICK_MINUTES, spark)
     df = df.withColumnRenamed("tick", "hour_ts")
@@ -184,7 +195,7 @@ def build_merged_table(spark: SparkSession, since: str | None = None) -> DataFra
     df = df.fillna(0, subset=["rental_count", "return_count"])
 
     df = df.join(
-        master.select("station_id", "capacity", "lat", "lon", "grid_id"), on="station_id", how="left"
+        master.select("station_id", "station_no", "capacity", "lat", "lon", "grid_id"), on="station_id", how="left"
     )
 
     df = df.withColumn("_hour_floor", F.date_trunc("hour", F.col("hour_ts")))
@@ -192,31 +203,27 @@ def build_merged_table(spark: SparkSession, since: str | None = None) -> DataFra
 
     df = df.join(population.withColumnRenamed("hour_ts", "_hour_floor"), on=["grid_id", "_hour_floor"], how="left")
     df = df.drop("_hour_floor")
-    pop_cols = ["pop_resd", "pop_long_foreign", "pop_short_foreign", "pop_total"]
-    df = df.fillna(0.0, subset=pop_cols)
+    df = df.fillna(0.0, subset=["pop_total"])
 
     df = df.withColumn("date", F.date_format("hour_ts", "yyyy-MM-dd"))
-    df = df.withColumn("hour", F.hour("hour_ts"))
-    df = df.withColumn("minute", F.minute("hour_ts"))
+    df = df.withColumn("day", F.datediff(F.col("hour_ts"), F.lit(DAY_INDEX_EPOCH.isoformat())))
+    df = df.withColumn("hour", F.hour("hour_ts"))  # 더 이상 모델 feature 아님 — 출력/CLI 식별용
+    # minute = 자정 기준 경과분(hour*60+분, ml_core.minute_of_day와 동일 공식) — hour
+    # 대신 쓰는 실제 모델 feature. 그리드가 20분 tick이라 hour만 쓰면 같은 시간
+    # 안의 17:00/17:20/17:40이 모델에 전부 같은 값으로 보이는데, minute은 그
+    # 구분을 그대로 담는다.
+    df = df.withColumn("minute", F.hour("hour_ts") * 60 + F.minute("hour_ts"))
     df = df.withColumn("dow", F.weekday("hour_ts"))  # Monday=0 ... Sunday=6, pandas .dt.dayofweek와 동일
-    df = df.withColumn("month", F.month("hour_ts"))
-    df = df.withColumn("is_holiday", F.col("date").isin(list(holidays)).cast("int"))
-    df = df.withColumn("is_weekend", (F.col("dow") >= 5).cast("int"))
-    # 다음날/전날이 휴일(공휴일 또는 주말)인지 — "내일 쉬는 날이라 오늘 저녁 대여가
-    # 늘어난다"/"연휴 다음날은 패턴이 다르다" 같은 신호를 모델에 직접 알려준다.
-    # dow는 Monday=0..Sunday=6이라 (dow+1)%7/(dow+6)%7이 각각 다음날/전날의 dow.
-    next_date = F.date_format(F.date_add(F.col("hour_ts"), 1), "yyyy-MM-dd")
-    prev_date = F.date_format(F.date_sub(F.col("hour_ts"), 1), "yyyy-MM-dd")
-    df = df.withColumn(
-        "is_next_day_off",
-        (next_date.isin(list(holidays)) | (((F.col("dow") + 1) % 7) >= 5)).cast("int"),
-    )
-    df = df.withColumn(
-        "is_prev_day_off",
-        (prev_date.isin(list(holidays)) | (((F.col("dow") + 6) % 7) >= 5)).cast("int"),
-    )
+    # 주말 + 공휴일을 is_holiday 하나로 통합 — 과거의 is_weekend/is_next_day_off/
+    # is_prev_day_off를 대체한다(다음날/전날 조회가 없어져 연도 경계 처리도 단순해짐).
+    df = df.withColumn("is_holiday", (F.col("date").isin(list(holidays)) | (F.col("dow") >= 5)).cast("int"))
 
-    df = df.drop("grid_id")
+    # station_id(텍스트)는 위 join들의 키로만 쓰이고 결과엔 안 남긴다 — station_no(정수)로
+    # 이미 매 station이 유일하게 식별되고(모듈 docstring 참고), 이 테이블은 tick x station
+    # 전체 히스토리라 station_id를 담아두면 그만큼 저장/셔플 비용이 계속 붙는다. 사람이 보는
+    # station_id가 필요한 소비처(inference/build_station_profile.py 등)는 작은
+    # station_master로 따로 join해서 붙인다.
+    df = df.drop("grid_id", "station_id")
 
     for col_name, dtype in NATIVE_COLUMN_DTYPES.items():
         df = df.withColumn(col_name, F.col(col_name).cast(dtype))

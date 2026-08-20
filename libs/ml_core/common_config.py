@@ -13,39 +13,188 @@ LightGBM 하이퍼파라미터처럼 **두 쪽이 반드시 같은 값을 써야
 경로(로컬 파일시스템 vs S3)처럼 두 쪽이 원래 다를 수밖에 없는 값은 각자의
 `config.py`에 그대로 둔다 — 여기 옮기는 건 "반드시 같아야 하는 값"만이다.
 
-**프로필 시스템**: 위 상수들은 `ml/profiles/{ML_PROFILE}.json`(기본 프로필명
-"default")에서 값을 읽어온다. 여러 파라미터 조합(예: embargo 30분 챔피언 vs 45분
-챌린저)을 프로필 파일로 미리 만들어두고, `ML_PROFILE` 환경변수 하나로 전체 조합을
-바꿔 낄 수 있다. 기존에 있던 개별 환경변수 override(예: `ROLLING_EMBARGO_MINUTES=45`,
-`scripts/run_embargo_sweep.py`류 스크립트가 실험 중 값을 임시로 바꿀 때 사용)는
-프로필 값 위에 한 번 더 덮어쓸 수 있게 유지한다 — 우선순위는
-"개별 환경변수 > 프로필 파일 > (프로필 파일도 없을 때만 쓰는 하드코드 기본값 없음,
-프로필 파일이 최종 소스)". `src/config.py`/`feature_engine/spark/config.py`는 지금처럼
-`common_config.XXX`를 그대로 참조하면 되고 인터페이스는 바뀌지 않는다.
+**프로필 시스템(2026-08 S3 이관)**: 위 상수들은 S3의 `profiles/{ML_PROFILE}.json`
+(`ml_core.paths.profile_path()`, 기본 프로필명 "default")에서 값을 읽어온다. 예전엔
+저장소에 커밋된 로컬 JSON 파일이었는데, feature_engine/training/inference가 각자
+다른 서버에 배포되므로 로컬 파일로는 "값 하나 바꾸면 파이프라인 전체에 반영"이
+불가능했다(서버마다 코드 재배포가 필요) — S3는 이미 세 서비스가 공유하는 유일한
+인프라라 여기로 옮겼다. 여러 파라미터 조합(예: embargo 30분 챔피언 vs 45분 챌린저)을
+프로필로 미리 만들어 S3에 두고, `ML_PROFILE` 환경변수 하나로 전체 조합을 바꿔 낄 수
+있다(`ml_core.profile_registry.push_profile()`로 생성/수정 — MLflow에도 같이 기록되어
+변경 이력을 볼 수 있지만, 실제 런타임 조회는 항상 S3 직접 조회다). 기존에 있던 개별
+환경변수 override(예: `ROLLING_EMBARGO_MINUTES=45`)는 프로필 값 위에 한 번 더 덮어쓸
+수 있게 유지한다 — 우선순위는 "개별 환경변수 > S3 프로필 > (S3 조회 실패 시에만 쓰는
+내장 기본값 `_DEFAULT_PROFILE`)". `training/config.py`/`feature_engine/spark/config.py`는
+지금처럼 `common_config.XXX`를 그대로 참조하면 되고 인터페이스는 바뀌지 않는다.
+
+**왜 `core.s3`를 안 쓰고 boto3를 직접 쓰는가**: `core.s3`는 parquet 처리를 위해
+pandas/pyarrow를 무조건 import한다 — 이 파일은 위에서 말한 "pandas/pyspark 등 무거운
+의존성을 전혀 import하지 않는 순수 상수 모듈" 원칙을 지켜야 해서, boto3만 쓰는 최소
+구현을 따로 둔다(`_fetch_profile_from_s3()`).
 """
 
 import json
 import os
-from pathlib import Path
+import sys
+from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 
-PROFILES_DIR = Path(__file__).resolve().parent / "profiles"
+import boto3
+from botocore.config import Config as BotoConfig
+from botocore.exceptions import ClientError
+
+# S3에 아직 아무 프로필도 안 올라갔거나(첫 부트스트랩) S3가 응답하지 않을 때만 쓰는
+# 안전망 — 예전 `libs/ml_core/profiles/default.json`과 내용이 같다. 로컬 JSON 파일은
+# 이제 없다(위 docstring 참고) — 이 파이썬 리터럴이 유일한 "로컬" 기본값이다.
+_DEFAULT_PROFILE = {
+    "ROLLING_TICK_MINUTES": 20,
+    "ROLLING_WINDOW_MINUTES": 60,
+    "ROLLING_EMBARGO_MINUTES": 40,
+    "TARGET_HORIZON_MINUTES": 60,
+    "GRID_TICK_MINUTES": 20,
+    "HORIZON_COUNT": 12,
+    "LGB_PARAMS_COMMON": {
+        "num_leaves": 63,
+        "learning_rate": 0.05,
+        "feature_fraction": 0.8,
+        "bagging_fraction": 0.8,
+        "bagging_freq": 5,
+        "min_data_in_leaf": 100,
+    },
+    "LGB_NUM_BOOST_ROUND": 800,
+    "LGB_EARLY_STOPPING_ROUNDS": 50,
+    "CONFORMAL_TARGET_COVERAGE": 0.80,
+    "INCREMENTAL_LOOKBACK_HOURS": 840,
+    "PERFORMANCE_DEGRADATION_THRESHOLD": 0.10,
+    "COVERAGE_DRIFT_THRESHOLD": 0.15,
+    "MONITOR_LOOKBACK_MONTHS": 1,
+    # --- 2026-08 추가: 학습기간 롤링 윈도우 (TRAIN_YEAR 고정값 폐지) ---
+    "TRAIN_LOOKBACK_MONTHS": 12,
+    "TRAINING_SAFETY_MARGIN_DAYS": 7,
+}
+
+
+def _s3_client(timeout_seconds: float):
+    return boto3.client(
+        "s3",
+        endpoint_url=os.environ.get("S3_ENDPOINT_URL") or None,
+        aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID", "minioadmin"),
+        aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY", "minioadmin"),
+        config=BotoConfig(connect_timeout=timeout_seconds, read_timeout=timeout_seconds, retries={"max_attempts": 1}),
+    )
+
+
+def _fetch_profile_from_s3(name: str, timeout_seconds: float = 2.0) -> dict | None:
+    """`profiles/{name}.json`(`ml_core.paths.profile_path()`와 같은 키 규칙, 순환
+    import를 피하려고 문자열을 직접 조립한다 — paths.py가 이미 이 모듈을 import하므로
+    반대 방향 import는 불가능)을 읽는다. 없으면 None, S3가 아예 응답하지 않으면
+    예외를 그대로 던진다(호출부 `_load_profile()`가 무조건 폴백으로 받는다).
+
+    기본 boto3 재시도 정책으로 존재하지 않는 엔드포인트를 조회하면 실측 8.5초가
+    걸린다 — 프로필 조회는 부가 기능이지 핵심 데이터 경로가 아니므로, 짧은
+    timeout+재시도 없음으로 빠르게 실패하고 내장 기본값으로 넘어가게 한다.
+    """
+    bucket = os.environ.get("S3_BUCKET", "gangnamgu")
+    try:
+        body = _s3_client(timeout_seconds).get_object(Bucket=bucket, Key=f"profiles/{name}.json")["Body"].read()
+    except ClientError as exc:
+        if exc.response["Error"]["Code"] == "NoSuchKey":
+            return None
+        raise
+    return json.loads(body)
 
 
 def _load_profile() -> dict:
     name = os.environ.get("ML_PROFILE", "default")
-    path = PROFILES_DIR / f"{name}.json"
-    with open(path, encoding="utf-8") as f:
-        return json.load(f)
+    try:
+        profile = _fetch_profile_from_s3(name)
+    except Exception as exc:  # noqa: BLE001 — S3 조회 실패 사유와 무관하게 무조건 폴백
+        print(f"[common_config] ERROR: S3에서 프로필 '{name}' 조회 실패({exc}) — 내장 기본값 사용", file=sys.stderr)
+        return _DEFAULT_PROFILE
+    if profile is None:
+        print(f"[common_config] ERROR: S3에 프로필 '{name}' 없음(profiles/{name}.json) — 내장 기본값 사용", file=sys.stderr)
+        return _DEFAULT_PROFILE
+    print(f"[common_config] 프로필 '{name}'을 S3에서 읽음")
+    # 내장 기본값과 병합한다(S3 값이 우선) — 이 프로필이 이번 PR 이전에 올려둔
+    # 것이거나 push_profile()로 사람이 손으로 만든 것이면 신규 키(TRAIN_LOOKBACK_
+    # MONTHS 등)가 없을 수 있는데, 그대로 반환하면 이 파일 끝부분의
+    # `_PROFILE["TRAIN_LOOKBACK_MONTHS"]` 같은 곳에서 KeyError가 나 feature_engine/
+    # training/inference가 전부 import 시점에 죽는다(리뷰 지적) — 병합하면 누락된
+    # 키만 내장 기본값으로 자연히 메워진다.
+    return {**_DEFAULT_PROFILE, **profile}
 
 
 def list_profile_names() -> list[str]:
-    """`PROFILES_DIR` 밑의 프로필 이름 목록을 반환한다(확장자 제외, 정렬됨).
+    """S3 `profiles/` 밑의 프로필 이름 목록을 반환한다(확장자 제외, 정렬됨).
 
     `training/scripts/monthly_retrain_check.py`가 챌린저 재시도 때 어떤 프로필을
-    돌아가며 시도할지 정할 때 쓴다 — 새 프로필 파일을 추가하기만 하면 이 목록에
-    자동으로 잡힌다(코드 수정 불필요).
+    돌아가며 시도할지 정할 때 쓴다 — `ml_core.profile_registry.push_profile()`로 새
+    프로필을 올리기만 하면 이 목록에 자동으로 잡힌다(코드 수정 불필요). S3 조회
+    실패 시 빈 리스트(호출부가 "시도할 챌린저 프로필 없음"으로 자연스럽게 처리).
     """
-    return sorted(p.stem for p in PROFILES_DIR.glob("*.json"))
+    bucket = os.environ.get("S3_BUCKET", "gangnamgu")
+    try:
+        client = _s3_client(timeout_seconds=5.0)
+        keys = [
+            obj["Key"]
+            for page in client.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix="profiles/")
+            for obj in page.get("Contents", [])
+        ]
+    except Exception as exc:  # noqa: BLE001
+        print(f"[common_config] S3 profiles/ 목록 조회 실패({exc})")
+        return []
+    return sorted(k.removeprefix("profiles/").removesuffix(".json") for k in keys if k.endswith(".json"))
+
+
+_KST = ZoneInfo("Asia/Seoul")
+
+
+def today_kst() -> date:
+    """KST(Asia/Seoul) 기준 오늘 날짜.
+
+    원본 데이터(트립 시각 등) 자체가 한국 로컬 wall-clock이라 이 기준으로 통일한다
+    — `date.today()`(시스템 타임존 의존)를 쓰면 배포 환경 타임존에 따라 "오늘"의
+    경계가 달라질 수 있다. 예전엔 `training/config.py`에만 있었는데, 이제
+    feature_engine도 학습기간 롤링 윈도우 계산에 "오늘"이 필요해서 공유 위치로 옮겼다
+    (`training/config.py`는 하위 호환을 위해 재수출).
+    """
+    return datetime.now(_KST).date()
+
+
+def _subtract_months(d: date, months: int) -> date:
+    """`d`에서 `months`개월 전 날짜 — 말일 근처는 대상 월의 실제 말일로 자동 보정한다.
+
+    dateutil 등 새 의존성을 추가하지 않으려고 표준 라이브러리(datetime/calendar)만으로
+    구현한다.
+    """
+    import calendar
+
+    total_months = d.year * 12 + (d.month - 1) - months
+    year, month = divmod(total_months, 12)
+    month += 1
+    day = min(d.day, calendar.monthrange(year, month)[1])
+    return date(year, month, day)
+
+
+def training_window(as_of: date | None = None) -> tuple[date, date]:
+    """(start, end) — 학습에 쓸 롤링 날짜 구간.
+
+    `end = as_of(기본 오늘 KST) - TRAINING_SAFETY_MARGIN_DAYS`(최근 며칠은 라벨이
+    아직 확정 안 됐을 수 있어 제외 — 대여이력은 반납이 끝나야 Silver에 나타남),
+    `start = end - TRAIN_LOOKBACK_MONTHS개월`. `TRAIN_YEAR` 같은 고정 연도 대신
+    이 함수 하나로 feature_engine(Silver 조회 범위)과 training(train/valid/test
+    split 범위)이 항상 같은 롤링 윈도우를 보게 한다 — 프로필의 `TRAIN_LOOKBACK_MONTHS`/
+    `TRAINING_SAFETY_MARGIN_DAYS` 값만 바꾸면 재배포 없이 다음 실행부터 반영된다
+    (feature_engine/training 둘 다 매번 새로 뜨는 배치 프로세스라 "다음 실행부터"로
+    충분하다).
+
+    args:
+        as_of: 기준 날짜(기본 오늘 KST) — 테스트에서 날짜를 고정하기 위한 override
+    """
+    as_of = as_of or today_kst()
+    end = as_of - timedelta(days=TRAINING_SAFETY_MARGIN_DAYS)
+    start = _subtract_months(end, TRAIN_LOOKBACK_MONTHS)
+    return start, end
 
 
 # 이 프로세스가 실제로 어떤 프로필을 쓰고 있는지 — 모델 아티팩트에 "어떤 프로필로
@@ -86,36 +235,41 @@ GRID_TICK_MINUTES = _int_env("GRID_TICK_MINUTES", _PROFILE["GRID_TICK_MINUTES"])
 # 범위와 inference의 기본 예측 구간 수가 이 값 하나를 같이 참조한다.
 HORIZON_COUNT = _int_env("HORIZON_COUNT", _PROFILE["HORIZON_COUNT"])
 
-# --- lag/rolling 피처 파라미터 ---
-LAG_HOURS = _PROFILE["LAG_HOURS"]  # t-1h, 전일 동시간, 전주 동요일 동시간
-ROLLING_WINDOWS = _PROFILE["ROLLING_WINDOWS"]  # rolling mean/std
-
-# --- 모델 입력 feature 스키마(lag/rolling 제외) — feature_engine이 만들고, training이
+# --- 모델 입력 feature 스키마(lag 제외) — feature_engine이 만들고, training이
 # 학습에 쓰고, inference가 동일 순서로 맞춰야 하는 "모델 계약"의 일부라 공유한다.
+#
+# 피처 중요도 분석 결과 gain이 낮거나(wind/humidity/pop 세부분류) 다른 피처와
+# 중복 정보였던(month, is_weekend/is_next_day_off/is_prev_day_off, hour/dow의
+# sin·cos 순환 인코딩) 컬럼을 정리하고 핵심만 남겼다:
+# - `is_holiday` 하나가 주말+공휴일을 전부 흡수(과거의 is_weekend/is_next_day_off/
+#   is_prev_day_off를 대체) — 다음날/전날 조회가 없어져 연도 경계 처리도 단순해짐.
+# - `dow`를 sin/cos로 순환 인코딩하지 않고 원값 그대로 둔다 — 순환 인코딩은
+#   "휴일 여부가 날마다 완전히 다른 패턴을 만든다"는 걸 모델에 감춘다.
+# - `month`/`date` 대신 `day`(2000-01-01 기준 경과일수, ml_core.day_index)를 쓴다
+#   — month 순환 인코딩과 달리 연도 경계(작년 12월과 올해 1월이 가깝고, 같은 해
+#   1월과 12월은 멀다)를 올바르게 표현한다.
+# - `station_id`(텍스트, "ST-2565") 대신 station master의 station_no(정수 일련번호)를
+#   쓴다 — station_id는 출력/S3 키 등 식별 용도로는 계속 쓰이지만, 모델 feature
+#   자체를 정수로 두면 학습 데이터 읽기(core.s3.read_parquet)에서 Parquet dictionary
+#   encoding이 pandas Categorical로 안 살아나 매번 object dtype 문자열 배열을
+#   통째로 만드는 비용을 원천적으로 피한다(정수 컬럼은 그 디코딩 자체가 없음).
+# - `hour`(0~23) 대신 `minute`(자정 기준 경과분 0~1439, ml_core.minute_of_day) 하나로
+#   시각을 나타낸다 — 그리드 자체가 20분 tick인데 hour만 쓰면 같은 시간 안의
+#   17:00/17:20/17:40이 모델에 전부 같은 값으로 보인다. minute은 그 tick 구분을
+#   그대로 담으면서 hour가 주던 정보(시간대별 패턴)도 당연히 포함한다. `hour`는
+#   출력/CLI 조회 등 식별 용도로는 계속 남아있지만 더 이상 모델 feature가 아니다.
 BASE_FEATURE_COLUMNS = [
-    "station_id",
+    "station_no",
     "capacity",
     "lat",
     "lon",
     "temp",
     "precip",
-    "wind",
-    "humidity",
-    "pop_resd",
-    "pop_long_foreign",
-    "pop_short_foreign",
     "pop_total",
-    "hour",
+    "minute",
     "dow",
-    "month",
     "is_holiday",
-    "is_weekend",
-    "is_next_day_off",  # 다음날이 휴일(공휴일 또는 주말)인지 — "내일 쉬는 날이라 오늘 저녁 대여가 늘 것" 같은 패턴
-    "is_prev_day_off",  # 전날이 휴일(공휴일 또는 주말)이었는지 — 연휴 다음날 패턴 반영
-    "hour_sin",
-    "hour_cos",
-    "dow_sin",
-    "dow_cos",
+    "day",
     "horizon",
 ]
 
@@ -174,3 +328,12 @@ COVERAGE_DRIFT_THRESHOLD = _float_env("COVERAGE_DRIFT_THRESHOLD", _PROFILE["COVE
 
 # 매달 점검할 때 "최근 몇 개월"을 실측 성능 구간으로 볼지
 MONITOR_LOOKBACK_MONTHS = _int_env("MONITOR_LOOKBACK_MONTHS", _PROFILE["MONITOR_LOOKBACK_MONTHS"])
+
+# --- 학습기간 롤링 윈도우 (2026-08, TRAIN_YEAR 고정 연도 폐지 — training_window() 참고) ---
+# 매달 재학습할 때마다 "최근 TRAIN_LOOKBACK_MONTHS개월"을 다시 계산해야 하므로 고정
+# 연도 대신 개월 수로 둔다. TRAINING_SAFETY_MARGIN_DAYS는 예전엔 training/config.py
+# 전용이었는데, feature_engine도 이제 같은 마진으로 Silver 조회 범위를 정해야 해서
+# 공유 프로필로 승격했다(대여이력은 반납이 끝나야 Silver에 나타나므로 최근 며칠은
+# 아직 라벨이 안 굳었을 수 있음).
+TRAIN_LOOKBACK_MONTHS = _int_env("TRAIN_LOOKBACK_MONTHS", _PROFILE["TRAIN_LOOKBACK_MONTHS"])
+TRAINING_SAFETY_MARGIN_DAYS = _int_env("TRAINING_SAFETY_MARGIN_DAYS", _PROFILE["TRAINING_SAFETY_MARGIN_DAYS"])

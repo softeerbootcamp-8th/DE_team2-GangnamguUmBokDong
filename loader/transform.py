@@ -338,6 +338,18 @@ def performance_events_from_silver(df: pd.DataFrame, today: date | None = None) 
 def forecast_points_from_predictions(df: pd.DataFrame, batch_run_at: datetime) -> list[dict]:
     """ML 추론 결과 DataFrame을 forecast_points 테이블 레코드 목록으로 변환한다.
 
+    각 행의 date/hour/minute는 이미 그 horizon의 목표 시각이다
+    (predict_demand_multi_hour_all_stations()가 target_ts = anchor_ts + (horizon-1)h로
+    계산해서 채워 넣는다) — horizon을 여기서 다시 더하지 않는다.
+
+    **2026-08 확정**: station_id("ST-101" 등, predict_single.py가 station_master
+    기준으로 채움)와 stations.sta_id(`stations_from_silver()`가 bike_station_realtime의
+    raw stationId를 그대로 씀)가 같은 값 공간인지 실제 샘플 데이터로 대조 완료 —
+    `ml/data/silver/bike_station_realtime/`의 실제 stationId는 이미 "ST-4"처럼
+    접두사가 붙어 있고(raw 자체가 이 형식), `ml/data/processed_v2/station_master.parquet`의
+    station_id와 전수 대조한 결과 realtime 샘플의 1,000개 stationId가 전부(100%)
+    station_master에 존재했다(불일치 0건) — 두 값 공간은 같다, FK/JOIN 누락 위험 없음.
+
     args:
         df: ML 추론 결과 DataFrame
         batch_run_at: 배치 실행 시각 (KST)

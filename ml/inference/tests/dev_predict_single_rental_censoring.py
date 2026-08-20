@@ -1,8 +1,11 @@
-"""predict_single.py의 대여(rental) point-in-time censoring 반영 검증.
+"""predict_single.py의 대여(rental_lag_1h)/반납(return_lag_1h) 계산 검증.
 
 predict_single.py의 캐시는 모듈 전역 변수라, 파일 I/O 없이 합성 트립/히스토리를
 직접 주입해서 테스트한다 (tests/dev_rolling_window_features.py의 `_trip()` 합성
 fixture 패턴 재사용). 각 테스트 후 전역을 리셋해 테스트 간 오염을 막는다.
+
+피처 축소 이후 lag는 한쪽당 1개(`rental_lag_1h`/`return_lag_1h`)뿐이다 — 예전
+lag_24h/168h, roll_mean/std_3h/24h 테스트는 해당 컬럼 자체가 없어져 제거했다.
 """
 
 import numpy as np
@@ -12,6 +15,8 @@ from ml_core.rolling_window_features import count_visible_in_window
 
 from inference import config
 from inference import predict_single as ps
+
+STATION_NO = 1  # 테스트 station "A"의 station_no — profile fallback 조회에만 쓰인다
 
 
 def _trip(station, start, end=None):
@@ -37,7 +42,8 @@ def _reset_module_caches():
         "_history_by_station",
         "_rental_events_by_station",
         "_rental_events_coverage",
-        "_station_profile",
+        "_station_profile_station_index",
+        "_station_profile_values",
     ]
     saved = {n: getattr(ps, n) for n in names}
     ps._rental_events_sorted_by_station = {}
@@ -58,16 +64,30 @@ def _set_rental_events(trips: pd.DataFrame, coverage: tuple[pd.Timestamp, pd.Tim
     ps._rental_events_coverage = coverage or (pd.Timestamp("2025-01-01"), pd.Timestamp("2025-12-31 23:59:59"))
 
 
-def _set_history(station_id: str, hours, rental_counts, return_counts) -> None:
-    idx = pd.to_datetime(hours)
-    ps._history_by_station = {
-        station_id: pd.DataFrame({"rental_count": rental_counts, "return_count": return_counts}, index=idx)
-    }
+def _set_return_history(station_id: str, point, return_count: float) -> None:
+    """`_get_history_by_station()`이 캐시하는 형태 그대로 — 정확히 [target_ts-1시간]
+    시점 하나만 담은 1행 DataFrame."""
+    ps._history_by_station = {station_id: pd.DataFrame({"return_count": [return_count]}, index=[pd.Timestamp(point)])}
 
 
 def _set_profile(entries: dict) -> None:
-    """entries: {(station_id, hour, dow, month): {"rental_mean":..., "rental_std":..., ...}}"""
-    ps._station_profile = entries
+    """entries: {(station_no, minute, dow, month): {"rental_mean":..., "rental_std":..., ...}}
+
+    predict_single.py 내부 캐시는 이제 dict-of-dict가 아니라 dense numpy 배열이라
+    (`_get_station_profile()`/`_build_station_profile_arrays()` 참고, 리뷰 지적으로
+    프로세스당 수 GB 먹던 문제 수정), 여기선 예전과 같은 호출부 형식(`entries` dict
+    literal)을 유지한 채 내부적으로만 DataFrame으로 바꿔 실제 압축 함수를 그대로 태운다."""
+    if not entries:
+        ps._station_profile_station_index = {}
+        ps._station_profile_values = np.empty((0, 0, 0, 0, 0), dtype="float32")
+        return
+    df = pd.DataFrame(
+        [
+            {"station_no": station_no, "minute": minute, "dow": dow, "month": month, **stats}
+            for (station_no, minute, dow, month), stats in entries.items()
+        ]
+    )
+    ps._station_profile_station_index, ps._station_profile_values = ps._build_station_profile_arrays(df)
 
 
 def test_rental_lag_1h_matches_count_visible_in_window():
@@ -79,63 +99,29 @@ def test_rental_lag_1h_matches_count_visible_in_window():
         ]
     )
     _set_rental_events(trips)
-    _set_history("A", pd.date_range("2025-06-01 00:00", periods=200, freq="h"), [0] * 200, [0] * 200)
+    _set_return_history("A", "2025-06-01 09:00:00", 0.0)
     _set_profile({})
 
     target_ts = pd.Timestamp("2025-06-01 10:00:00")
-    out, fallback = ps._lag_rolling_features("A", target_ts)
+    out, fallback = ps._lag_rolling_features("A", STATION_NO, target_ts)
 
     expected = count_visible_in_window(
         trips, as_of=target_ts, window_minutes=config.ROLLING_WINDOW_MINUTES, embargo_minutes=config.ROLLING_EMBARGO_MINUTES
     ).get("A", 0)
 
-    assert out["rental_lag_1h"] == float(expected) == 2.0
+    assert out["rental_lag_1h"] == float(expected)
     assert "rental_lag_1h" not in fallback
-
-
-def test_rental_roll_mean_std_3h_matches_manual_anchors():
-    trips = pd.DataFrame(
-        [
-            _trip("A", "2025-06-01 09:00:07", "2025-06-01 09:10:33"),
-            _trip("A", "2025-06-01 09:20:00", "2025-06-01 10:00:00"),
-            _trip("A", "2025-06-01 09:50:00", "2025-06-01 11:20:00"),
-        ]
-    )
-    _set_rental_events(trips)
-    _set_history("A", pd.date_range("2025-06-01 00:00", periods=200, freq="h"), [0] * 200, [0] * 200)
-    _set_profile({})
-
-    target_ts = pd.Timestamp("2025-06-01 10:00:00")
-    out, fallback = ps._lag_rolling_features("A", target_ts)
-
-    # dense 정의: (target_ts-3h, target_ts] 안의 5분 tick 전부(36개) — features.py와 동일.
-    anchors = pd.date_range(
-        target_ts - pd.Timedelta(hours=3) + pd.Timedelta(minutes=config.GRID_TICK_MINUTES),
-        target_ts,
-        freq=f"{config.GRID_TICK_MINUTES}min",
-    )
-    manual = [
-        count_visible_in_window(
-            trips, as_of=t, window_minutes=config.ROLLING_WINDOW_MINUTES, embargo_minutes=config.ROLLING_EMBARGO_MINUTES
-        ).get("A", 0)
-        for t in anchors
-    ]
-
-    assert out["rental_roll_mean_3h"] == pytest.approx(float(np.mean(manual)))
-    assert out["rental_roll_std_3h"] == pytest.approx(float(np.std(manual, ddof=1)))
-    assert "rental_roll_mean_3h" not in fallback
-    assert "rental_roll_std_3h" not in fallback
 
 
 def test_rental_recent_zero_trips_in_window_is_not_fallback():
     """윈도우 커버리지 안이지만 그 구간에 트립이 0건이면 정상값 0이지 fallback이 아니다."""
     trips = pd.DataFrame([_trip("A", "2025-06-01 06:00:00", "2025-06-01 06:05:00")])
     _set_rental_events(trips)
-    _set_history("A", pd.date_range("2025-06-01 00:00", periods=200, freq="h"), [0] * 200, [0] * 200)
+    _set_return_history("A", "2025-06-01 09:00:00", 0.0)
     _set_profile({})
 
-    target_ts = pd.Timestamp("2025-06-01 10:00:00")  # 윈도우 [08:30,09:30) 안에 트립 없음
-    out, fallback = ps._lag_rolling_features("A", target_ts)
+    target_ts = pd.Timestamp("2025-06-01 10:00:00")  # 윈도우 [08:20,09:20) 안에 트립 없음
+    out, fallback = ps._lag_rolling_features("A", STATION_NO, target_ts)
 
     assert out["rental_lag_1h"] == 0.0
     assert "rental_lag_1h" not in fallback
@@ -144,81 +130,51 @@ def test_rental_recent_zero_trips_in_window_is_not_fallback():
 def test_rental_recent_fallback_when_target_outside_coverage():
     trips = pd.DataFrame([_trip("A", "2025-06-01 09:00:00", "2025-06-01 09:05:00")])
     _set_rental_events(trips, coverage=(pd.Timestamp("2025-06-01"), pd.Timestamp("2025-06-01 23:59:59")))
-    _set_history("A", pd.date_range("2025-06-01 00:00", periods=200, freq="h"), [0] * 200, [0] * 200)
+    _set_return_history("A", "2026-08-01 07:00:00", 0.0)
     _set_profile(
         {
-            ("A", h, dow, m): {"rental_mean": 7.0, "rental_std": 1.5, "return_mean": 0.0, "return_std": 0.0}
-            for h in range(24)
+            (STATION_NO, minute, dow, m): {"rental_mean": 7.0, "rental_std": 1.5, "return_mean": 3.0, "return_std": 0.5}
+            for minute in range(0, 1440, 20)
             for dow in range(7)
             for m in range(1, 13)
         }
     )
 
     target_ts = pd.Timestamp("2026-08-01 08:00:00")  # 트립 커버리지(2025-06-01 하루)와 전혀 안 겹침
-    out, fallback = ps._lag_rolling_features("A", target_ts)
+    out, fallback = ps._lag_rolling_features("A", STATION_NO, target_ts)
 
-    for name in ["rental_lag_1h", "rental_roll_mean_3h", "rental_roll_std_3h", "rental_roll_mean_24h", "rental_roll_std_24h"]:
-        assert name in fallback, name
-        assert out[name] == pytest.approx(7.0 if "mean" in name or name == "rental_lag_1h" else 1.5)
+    assert "rental_lag_1h" in fallback
+    assert out["rental_lag_1h"] == pytest.approx(7.0)
 
 
-def test_rental_lag_24h_168h_unaffected_by_empty_trip_source():
-    """트립 단위 소스가 완전히 비어 있어도 rental_lag_24h/168h는 기존 hourly 히스토리로 정상 계산된다."""
-    ps._rental_events_by_station = {}
-    ps._rental_events_coverage = None
-
-    hours = pd.date_range("2025-06-01 00:00", periods=200, freq="h")
-    rental_counts = list(range(200))
-    _set_history("A", hours, rental_counts, [0] * 200)
+def test_return_lag_1h_uses_exactly_one_hour_ago_history():
+    """return_lag_1h는 _get_history_by_station()이 담아둔 [target_ts-1시간] 값을 그대로 쓴다."""
+    target_ts = pd.Timestamp("2025-06-01 10:00:00")
+    _set_rental_events(pd.DataFrame([_trip("A", "2025-06-01 09:00:00", "2025-06-01 09:05:00")]))
+    _set_return_history("A", target_ts - pd.Timedelta(hours=1), 4.0)
     _set_profile({})
 
-    target_ts = hours[199]
-    out, fallback = ps._lag_rolling_features("A", target_ts)
+    out, fallback = ps._lag_rolling_features("A", STATION_NO, target_ts)
 
-    assert out["rental_lag_24h"] == float(rental_counts[199 - 24])
-    assert out["rental_lag_168h"] == float(rental_counts[199 - 168])
-    assert "rental_lag_24h" not in fallback
-    assert "rental_lag_168h" not in fallback
+    assert out["return_lag_1h"] == 4.0
+    assert "return_lag_1h" not in fallback
 
 
-def test_return_features_exactly_unchanged():
-    ps._rental_events_by_station = {}
-    ps._rental_events_coverage = None
+def test_return_lag_1h_falls_back_to_profile_when_missing():
+    """history 캐시에 그 station이 아예 없으면(예: 반납 트립 자체가 없던 station) profile로 대체한다."""
+    target_ts = pd.Timestamp("2025-06-01 10:00:00")
+    _set_rental_events(pd.DataFrame([_trip("A", "2025-06-01 09:00:00", "2025-06-01 09:05:00")]))
+    ps._history_by_station = {}  # station "A"에 대한 return_count 자체가 없음
+    _set_profile(
+        {
+            (STATION_NO, minute, dow, m): {"rental_mean": 0.0, "rental_std": 0.0, "return_mean": 9.0, "return_std": 2.0}
+            for minute in range(0, 1440, 20)
+            for dow in range(7)
+            for m in range(1, 13)
+        }
+    )
 
-    hours = pd.date_range("2025-06-01 00:00", periods=200, freq="h")
-    return_counts = [(i % 11) for i in range(200)]
-    _set_history("A", hours, [0] * 200, return_counts)
-    _set_profile({})
+    out, fallback = ps._lag_rolling_features("A", STATION_NO, target_ts)
 
-    target_ts = hours[199]
-    out, fallback = ps._lag_rolling_features("A", target_ts)
-
-    series = pd.Series(return_counts, index=hours)
-    for lag in config.LAG_HOURS:
-        expected = series.get(target_ts - pd.Timedelta(hours=lag))
-        assert out[f"return_lag_{lag}h"] == expected
-        assert f"return_lag_{lag}h" not in fallback
-
-    for window in config.ROLLING_WINDOWS:
-        idx = pd.date_range(target_ts - pd.Timedelta(hours=window), target_ts - pd.Timedelta(hours=1), freq="h")
-        vals = series.reindex(idx)
-        assert out[f"return_roll_mean_{window}h"] == pytest.approx(vals.mean())
-        assert out[f"return_roll_std_{window}h"] == pytest.approx(vals.std())
-
-
-def test_return_roll_mean_is_dense_average_over_5min_ticks():
-    """history가 5분 tick 정밀도일 때 return_roll_mean_3h는 hourly 지점 3개가 아니라 tick 전부를 평균해야 한다."""
-    ps._rental_events_by_station = {}
-    ps._rental_events_coverage = None
-
-    ticks = pd.date_range("2025-06-01 00:00", periods=12 * 4, freq="5min")  # 4시간 분량
-    return_counts = list(range(len(ticks)))
-    _set_history("A", ticks, [0] * len(ticks), return_counts)
-    _set_profile({})
-
-    target_ts = ticks[12 * 3]  # 03:00
-    out, fallback = ps._lag_rolling_features("A", target_ts)
-
-    expected = sum(return_counts[0:36]) / 36  # [00:00,03:00) 안 tick 36개 전부
-    assert out["return_roll_mean_3h"] == pytest.approx(expected)
-    assert "return_roll_mean_3h" not in fallback
+    assert "return_lag_1h" in fallback
+    assert out["return_lag_1h"] == pytest.approx(9.0)
