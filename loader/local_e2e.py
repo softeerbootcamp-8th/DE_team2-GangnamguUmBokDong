@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -102,6 +103,16 @@ _STATION_MASTER_COLUMNS = (
     "weather_nx",
     "weather_ny",
 )
+_BUNDLE_ARTIFACT_FILES = {
+    "booster_poisson": "{kind}_poisson.txt",
+    "booster_q10": "{kind}_q10.txt",
+    "booster_q50": "{kind}_q50.txt",
+    "booster_q90": "{kind}_q90.txt",
+    "conformal_correction": "{kind}_conformal_correction.json",
+    "metrics": "{kind}_metrics.json",
+    "station_categories": "{kind}_station_categories.json",
+}
+_BUNDLE_PROFILE_FILE = "{kind}_profile.json"
 
 
 def _required_env(name: str) -> str:
@@ -170,8 +181,14 @@ def _stations_from_realtime(table: pa.Table) -> tuple[dict[str, object], ...]:
             capacity = int(raw["rackTotCnt"])
         except (KeyError, TypeError, ValueError):
             continue
+        try:
+            station_no = int(station_id.removeprefix("ST-"))
+        except ValueError:
+            continue
         if (
             not station_id.startswith("ST-")
+            or station_no <= 0
+            or station_no > np.iinfo(np.int16).max
             or not station_name
             or not math.isfinite(latitude)
             or not math.isfinite(longitude)
@@ -187,13 +204,11 @@ def _stations_from_realtime(table: pa.Table) -> tuple[dict[str, object], ...]:
             "station_address": f"로컬 E2E fixture {station_name}",
             "station_id": station_id,
             "station_name": station_name,
+            "station_no": station_no,
         }
     if not by_station_id:
         raise ValueError("realtime snapshot에 유효한 station fixture 행이 없습니다.")
-    return tuple(
-        {**by_station_id[station_id], "station_no": station_no}
-        for station_no, station_id in enumerate(sorted(by_station_id), start=1)
-    )
+    return tuple(by_station_id[station_id] for station_id in sorted(by_station_id))
 
 
 def _load_stations(logical: datetime) -> tuple[dict[str, object], ...]:
@@ -690,6 +705,96 @@ def _station_profile_payload(station_nos: tuple[int, ...]) -> bytes:
     return _parquet_bytes(table)
 
 
+def _verify_bundle_checksums(bundle_dir: Path) -> None:
+    """번들의 SHA256SUMS가 모든 입력 파일의 실제 bytes와 일치하는지 확인한다."""
+    checksum_path = bundle_dir / "SHA256SUMS"
+    if not checksum_path.is_file():
+        raise ValueError(f"모델 번들 SHA256SUMS가 없습니다: {checksum_path}")
+    seen: set[str] = set()
+    for line in checksum_path.read_text(encoding="utf-8").splitlines():
+        digest, separator, filename = line.partition("  ")
+        if not separator or len(digest) != 64 or not filename or Path(filename).name != filename:
+            raise ValueError("모델 번들 SHA256SUMS 형식이 올바르지 않습니다.")
+        payload_path = bundle_dir / filename
+        if not payload_path.is_file():
+            raise ValueError(f"모델 번들 파일이 없습니다: {filename}")
+        actual = hashlib.sha256(payload_path.read_bytes()).hexdigest()
+        if actual != digest:
+            raise ValueError(f"모델 번들 checksum이 다릅니다: {filename}")
+        seen.add(filename)
+    required = {
+        pattern.format(kind=kind)
+        for kind in ("rental", "return")
+        for pattern in (*_BUNDLE_ARTIFACT_FILES.values(), _BUNDLE_PROFILE_FILE)
+    }
+    if missing := required - seen:
+        raise ValueError(f"모델 번들 checksum 목록에 필수 파일이 없습니다: {sorted(missing)}")
+
+
+def _bundle_payloads(
+    bundle_dir: Path,
+) -> tuple[dict[str, bytes], dict[str, bytes], tuple[int, ...]]:
+    """#175 번들을 현재 12-horizon 로컬 serving 계약으로 확장한다.
+
+    Booster를 재학습하지 않으므로 3~12 horizon은 학습 범위 밖 외삽이다. 이 함수는
+    운영 배포용 승격기가 아니라 ``LOCAL_E2E_ALLOW_FIXTURE``로 보호된 E2E 전용이다.
+    """
+    _verify_bundle_checksums(bundle_dir)
+    effective_profile = common_config.effective_profile()
+    if effective_profile["HORIZON_COUNT"] != 12:
+        raise ValueError("현재 E2E serving 계약의 HORIZON_COUNT는 12여야 합니다.")
+
+    result: dict[str, dict[str, bytes]] = {}
+    categories_by_kind: dict[str, tuple[int, ...]] = {}
+    expected_features = {
+        "rental": RENTAL_FEATURE_COLUMNS,
+        "return": RETURN_FEATURE_COLUMNS,
+    }
+    for kind in ("rental", "return"):
+        source_profile = json.loads(
+            (bundle_dir / _BUNDLE_PROFILE_FILE.format(kind=kind)).read_text(
+                encoding="utf-8"
+            )
+        )
+        if source_profile.get("HORIZON_COUNT") != 2:
+            raise ValueError(f"{kind} #175 원본 HORIZON_COUNT가 2가 아닙니다.")
+        if source_profile.get("GRID_TICK_MINUTES") != effective_profile["GRID_TICK_MINUTES"]:
+            raise ValueError(f"{kind} 모델과 현재 GRID_TICK_MINUTES가 다릅니다.")
+
+        payloads = {
+            role: (bundle_dir / pattern.format(kind=kind)).read_bytes()
+            for role, pattern in _BUNDLE_ARTIFACT_FILES.items()
+        }
+        categories = tuple(json.loads(payloads["station_categories"]))
+        if (
+            not categories
+            or any(type(value) is not int for value in categories)
+            or tuple(sorted(set(categories))) != categories
+            or categories[-1] > np.iinfo(np.int16).max
+        ):
+            raise ValueError(f"{kind} station_categories가 정렬된 unique int16이 아닙니다.")
+        categories_by_kind[kind] = categories
+        for role in ("booster_poisson", "booster_q10", "booster_q50", "booster_q90"):
+            booster = lgb.Booster(model_str=payloads[role].decode("utf-8"))
+            if booster.feature_name() != list(expected_features[kind]):
+                raise ValueError(f"{kind} {role} feature schema가 현재 추론기와 다릅니다.")
+
+        metrics = json.loads(payloads["metrics"])
+        metrics["local_e2e_compatibility"] = {
+            "expanded_horizon_count": 12,
+            "out_of_training_range_horizons": list(range(3, 13)),
+            "source": "issue-175-prototype",
+            "source_horizon_count": 2,
+        }
+        payloads["metrics"] = _json_bytes(metrics)
+        payloads["effective_profile"] = _json_bytes(effective_profile)
+        result[kind] = payloads
+
+    if categories_by_kind["rental"] != categories_by_kind["return"]:
+        raise ValueError("rental과 return station_categories가 다릅니다.")
+    return result["rental"], result["return"], categories_by_kind["rental"]
+
+
 def _model_payloads(booster: bytes, station_nos: tuple[int, ...]) -> dict[str, bytes]:
     """Crosswalk을 제외한 local E2E model snapshot 아티팩트를 만든다."""
     profile = _json_bytes(common_config.effective_profile())
@@ -715,10 +820,25 @@ def _publish_serving_release(
     object_store: S3ImmutableObjectStore,
     bucket: str,
     stations: tuple[dict[str, object], ...],
+    model_bundle: Path | None = None,
 ) -> str:
     """실제 model/release 계약을 통과하는 local E2E 포인터를 게시한다."""
-    station_nos = tuple(int(station["station_no"]) for station in stations)
-    source_payload = _station_source_payload(stations)
+    if model_bundle is None:
+        station_nos = tuple(int(station["station_no"]) for station in stations)
+        model_stations = stations
+        rental_payloads = _model_payloads(
+            _booster_payload(RENTAL_FEATURE_COLUMNS, station_nos), station_nos
+        )
+        return_payloads = _model_payloads(
+            _booster_payload(RETURN_FEATURE_COLUMNS, station_nos), station_nos
+        )
+    else:
+        rental_payloads, return_payloads, station_nos = _bundle_payloads(model_bundle)
+        model_stations = tuple(
+            {"station_id": f"ST-{station_no}", "station_no": station_no}
+            for station_no in station_nos
+        )
+    source_payload = _station_source_payload(model_stations)
     source_ref = publish_release_artifact(
         source_payload,
         role="station_master_source",
@@ -730,14 +850,6 @@ def _publish_serving_release(
         payload=source_payload,
         byte_sha256=source_ref.byte_sha256,
         uri=source_ref.uri,
-    )
-    rental_payloads = _model_payloads(
-        _booster_payload(RENTAL_FEATURE_COLUMNS, station_nos),
-        station_nos,
-    )
-    return_payloads = _model_payloads(
-        _booster_payload(RETURN_FEATURE_COLUMNS, station_nos),
-        station_nos,
     )
     rental = publish_model_snapshot(
         model_kind=ModelKind.RENTAL,
@@ -805,7 +917,7 @@ def _publish_gold_dependencies(
     return dispatch.result.outcome.value, weather.result.outcome.value
 
 
-def seed(logical: datetime) -> dict[str, object]:
+def seed(logical: datetime, *, model_bundle: Path | None = None) -> dict[str, object]:
     """지정 logical time의 local E2E fixture 전체를 멱등 게시한다."""
     _require_local_fixture_environment()
     bucket = _required_env("S3_BUCKET")
@@ -826,7 +938,13 @@ def seed(logical: datetime) -> dict[str, object]:
         logical,
         stations,
     )
-    release_uri = _publish_serving_release(client, object_store, bucket, stations)
+    release_uri = _publish_serving_release(
+        client,
+        object_store,
+        bucket,
+        stations,
+        model_bundle=model_bundle,
+    )
     gold_outcomes = _publish_gold_dependencies(object_store, logical)
     check(logical)
     return {
@@ -834,6 +952,7 @@ def seed(logical: datetime) -> dict[str, object]:
         "gold_outcomes": gold_outcomes,
         "history_window_count": len(history),
         "logical_dttm": logical.isoformat(),
+        "model_source": "issue-175-prototype" if model_bundle else "generated-fixture",
         "nowcasts": nowcasts,
         "prerequisite_source_count": len(prerequisite_sources),
         "serving_release_uri": release_uri,
@@ -897,6 +1016,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="로컬 realtime E2E fixture를 준비한다.")
     parser.add_argument("command", choices=("seed", "check"))
     parser.add_argument("--logical-dttm", required=True)
+    parser.add_argument(
+        "--model-bundle",
+        type=Path,
+        help="검증 후 12-horizon 호환 릴리스로 게시할 #175 모델 디렉터리",
+    )
     return parser.parse_args(argv)
 
 
@@ -905,7 +1029,13 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     try:
         logical = _parse_logical_dttm(args.logical_dttm)
-        result = seed(logical) if args.command == "seed" else check(logical)
+        if args.command == "check" and args.model_bundle is not None:
+            raise ValueError("--model-bundle은 seed에서만 사용할 수 있습니다.")
+        result = (
+            seed(logical, model_bundle=args.model_bundle)
+            if args.command == "seed"
+            else check(logical)
+        )
     except Exception as exc:  # noqa: BLE001 - CLI 경계에서 원인을 보존해 실패한다.
         print(f"local E2E {args.command} failed: {exc}", file=sys.stderr)
         return 1
