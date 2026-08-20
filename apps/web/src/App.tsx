@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api } from "./api";
 import type { Alert, DispatchCenter, ForecastResponse, StationSummary } from "./api";
 import { AlertList } from "./components/AlertList";
@@ -24,16 +24,21 @@ const ALL_REGIONS = "all";
 export default function App() {
   const [stations, setStations] = useState<StationSummary[]>([]);
   const [stationsUpdatedAt, setStationsUpdatedAt] = useState<Date | null>(null);
+  const [stationsError, setStationsError] = useState(false);
   const [alerts, setAlerts] = useState<Alert[]>([]);
+  const [alertsError, setAlertsError] = useState(false);
   const [selectedStationId, setSelectedStationId] = useState<string | null>(null);
+  const selectedStationIdRef = useRef<string | null>(null);
+  const didInitializeSelectionRef = useRef(false);
   const [forecast, setForecast] = useState<ForecastResponse | null>(null);
+  const [forecastError, setForecastError] = useState<Error | null>(null);
+  const forecastRequestGenerationRef = useRef(0);
   // 기본값은 공급필요만(이슈 #63) — 트럭 기사의 실제 작업 순서(어디가 비었나
   // -> 그 주변에서 뭘 가져올까)에 맞춘다. "모두 보기"는 그 전 동작으로 돌아가는
   // 탈출구다.
   const [mapFilterMode, setMapFilterMode] = useState<MapFilterMode>("supply_only");
   // 지도와 우선순위 리스트가 항상 같은 지역만 보여줘야 해서, 필터 상태를 두 패널의
-  // 공통 부모인 여기서 들고 각각에 걸러진 배열을 내려보낸다. 지역센터 관할 경계는
-  // 공개 자료가 없어 최근접 근사로 배정한 값이다(apps/api/regions.py 참고).
+  // 공통 부모인 여기서 들고 Gold에 게시된 dispatch center 기준으로 걸러 내려보낸다.
   const [selectedRegion, setSelectedRegion] = useState<string>(ALL_REGIONS);
   const [regionCenters, setRegionCenters] = useState<DispatchCenter[]>([]);
   // 대여소 상세의 "주변 행사" 탭에서 행사를 고르면 지도를 그 위치로 옮기고
@@ -48,16 +53,55 @@ export default function App() {
 
   useEffect(() => {
     let cancelled = false;
+    let stationsGeneration = 0;
+    let alertsGeneration = 0;
     function refresh() {
-      api.stations().then((data) => {
-        if (!cancelled) {
+      const currentStationsGeneration = ++stationsGeneration;
+      api
+        .stations()
+        .then((data) => {
+          if (cancelled || currentStationsGeneration !== stationsGeneration) return;
           setStations(data);
           setStationsUpdatedAt(new Date());
-        }
-      });
-      api.alerts().then((data) => {
-        if (!cancelled) setAlerts(data);
-      });
+          setStationsError(false);
+          const selectedId = selectedStationIdRef.current;
+          if (selectedId !== null && !data.some((station) => station.sta_id === selectedId)) {
+            selectedStationIdRef.current = null;
+            forecastRequestGenerationRef.current += 1;
+            setSelectedStationId(null);
+            setForecast(null);
+            setForecastError(null);
+            setFocusedEvent(null);
+          }
+        })
+        .catch(() => {
+          if (!cancelled && currentStationsGeneration === stationsGeneration) {
+            setStations([]);
+            setStationsUpdatedAt(null);
+            setStationsError(true);
+            selectedStationIdRef.current = null;
+            forecastRequestGenerationRef.current += 1;
+            setSelectedStationId(null);
+            setForecast(null);
+            setForecastError(null);
+            setFocusedEvent(null);
+          }
+        });
+      const currentAlertsGeneration = ++alertsGeneration;
+      api
+        .alerts()
+        .then((data) => {
+          if (!cancelled && currentAlertsGeneration === alertsGeneration) {
+            setAlerts(data);
+            setAlertsError(false);
+          }
+        })
+        .catch(() => {
+          if (!cancelled && currentAlertsGeneration === alertsGeneration) {
+            setAlerts([]);
+            setAlertsError(true);
+          }
+        });
     }
     refresh();
     const timer = setInterval(refresh, POLL_INTERVAL_MS);
@@ -69,32 +113,52 @@ export default function App() {
 
   // 지역센터 좌표는 대여소처럼 자주 바뀌지 않으니(고정 시설) 폴링 없이 한 번만 가져온다.
   useEffect(() => {
-    api.regions().then(setRegionCenters);
+    api.regions().then(setRegionCenters).catch(() => setRegionCenters([]));
   }, []);
 
   // 첫 화면부터 세 하단 패널이 비어 있지 않도록, 데이터가 도착하면 가장
   // 긴급한 대여소(서버가 urgency 내림차순으로 반환)를 기본 선택한다.
   useEffect(() => {
-    if (selectedStationId === null && alerts.length > 0) {
-      setSelectedStationId(alerts[0].sta_id);
+    const defaultStation = alerts.find((alert) => stations.some((station) => station.sta_id === alert.sta_id));
+    if (selectedStationId === null && defaultStation && !didInitializeSelectionRef.current) {
+      didInitializeSelectionRef.current = true;
+      selectedStationIdRef.current = defaultStation.sta_id;
+      setSelectedStationId(defaultStation.sta_id);
     }
-  }, [alerts, selectedStationId]);
+  }, [alerts, selectedStationId, stations]);
 
   useEffect(() => {
     if (selectedStationId === null) {
+      forecastRequestGenerationRef.current += 1;
       setForecast(null);
+      setForecastError(null);
       return;
     }
     let cancelled = false;
+    setForecast(null);
+    setForecastError(null);
     function refresh() {
-      api.forecast(selectedStationId as string).then((data) => {
-        if (!cancelled) setForecast(data);
-      });
+      const currentGeneration = ++forecastRequestGenerationRef.current;
+      api
+        .forecast(selectedStationId as string)
+        .then((data) => {
+          if (!cancelled && currentGeneration === forecastRequestGenerationRef.current) {
+            setForecast(data);
+            setForecastError(null);
+          }
+        })
+        .catch((error: Error) => {
+          if (!cancelled && currentGeneration === forecastRequestGenerationRef.current) {
+            setForecast(null);
+            setForecastError(error);
+          }
+        });
     }
     refresh();
     const timer = setInterval(refresh, FORECAST_POLL_INTERVAL_MS);
     return () => {
       cancelled = true;
+      forecastRequestGenerationRef.current += 1;
       clearInterval(timer);
     };
   }, [selectedStationId]);
@@ -106,6 +170,17 @@ export default function App() {
   const filteredStations =
     selectedRegion === ALL_REGIONS ? stations : stations.filter((s) => s.region === selectedRegion);
   const filteredAlerts = selectedRegion === ALL_REGIONS ? alerts : alerts.filter((a) => a.region === selectedRegion);
+
+  function selectStation(stationId: string) {
+    if (selectedStationIdRef.current === stationId) return;
+    didInitializeSelectionRef.current = true;
+    selectedStationIdRef.current = stationId;
+    forecastRequestGenerationRef.current += 1;
+    setForecast(null);
+    setForecastError(null);
+    setFocusedEvent(null);
+    setSelectedStationId(stationId);
+  }
 
   return (
     <div className="flex h-screen flex-col bg-background text-foreground p-3 gap-3">
@@ -133,7 +208,7 @@ export default function App() {
                           value={selectedRegion}
                           onChange={(e) => setSelectedRegion(e.target.value)}
                           aria-label="지역센터 필터"
-                          title="지역센터 관할 경계는 근사치입니다(공개 자료 없음, 최근접 배정)"
+                          title="Gold에 게시된 지역센터 기준으로 필터링합니다."
                         >
                           <option value={ALL_REGIONS}>전체 지역센터</option>
                           {regionCenters.map((c) => (
@@ -165,12 +240,17 @@ export default function App() {
                           stations={filteredStations}
                           alerts={filteredAlerts}
                           selectedStationId={selectedStationId}
-                          onSelect={setSelectedStationId}
+                          onSelect={selectStation}
                           mapFilterMode={mapFilterMode}
                           regionCenters={regionCenters}
                           selectedRegion={selectedRegion}
                           focusedEvent={focusedEvent}
                         />
+                        {stationsError && (
+                          <p className="poll-error" role="status">
+                            대여소 정보를 갱신하지 못했습니다.
+                          </p>
+                        )}
                       </div>
                     </div>
                   </section>
@@ -183,7 +263,13 @@ export default function App() {
                   <section className="flex flex-col h-full gap-2 min-w-0 min-h-0">
                     <h2 className="text-base font-semibold tracking-tight">작업 우선순위</h2>
                     <div className="flex-1 overflow-y-auto">
-                      <AlertList alerts={filteredAlerts} selectedStationId={selectedStationId} onSelect={setSelectedStationId} />
+                      {alertsError ? (
+                        <p className="empty-state" role="status">
+                          작업 우선순위를 갱신하지 못했습니다.
+                        </p>
+                      ) : (
+                        <AlertList alerts={filteredAlerts} selectedStationId={selectedStationId} onSelect={selectStation} />
+                      )}
                     </div>
                   </section>
                 </div>
@@ -205,7 +291,7 @@ export default function App() {
                 <section className="flex flex-col h-full gap-2 min-w-0 min-h-0">
                   <h2 className="text-base font-semibold tracking-tight">대여·반납 예측</h2>
                   <div className="flex-1 min-w-0 min-h-0">
-                    <ForecastPanel station={selectedStation} forecast={forecast} />
+                    <ForecastPanel station={selectedStation} forecast={forecast} error={forecastError} />
                   </div>
                 </section>
               </div>
@@ -213,7 +299,7 @@ export default function App() {
                 <section className="flex flex-col h-full gap-2 min-w-0 min-h-0">
                   <h2 className="text-base font-semibold tracking-tight">재고 예측</h2>
                   <div className="flex-1 min-w-0 min-h-0">
-                    <StockPanel station={selectedStation} forecast={forecast} />
+                    <StockPanel station={selectedStation} forecast={forecast} error={forecastError} />
                   </div>
                 </section>
               </div>
@@ -222,8 +308,9 @@ export default function App() {
                   <h2 className="text-base font-semibold tracking-tight">대여소 상세</h2>
                   <div className="flex-1 min-w-0 min-h-0">
                     <DetailPanel
+                      key={selectedStationId ?? "no-station"}
                       stationId={selectedStationId}
-                      reasons={forecast?.reasons ?? []}
+                      stationPoint={selectedStation ? { lat: selectedStation.lat, lon: selectedStation.lon } : null}
                       onFocusEvent={setFocusedEvent}
                     />
                   </div>

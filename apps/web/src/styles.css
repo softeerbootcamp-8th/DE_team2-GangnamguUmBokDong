@@ -117,6 +117,10 @@ body {
   margin-right: 8px;
 }
 
+.status-error {
+  color: var(--status-critical);
+}
+
 /* 위·아래 행이 서로 다른 flex 컨테이너면 gap 개수가 달라서(위 1개, 아래 2개)
    같은 비율을 줘도 세로 경계선이 몇 px씩 어긋난다. 하나의 그리드로 합쳐서
    열 트랙을 공유해야 위/아래 경계가 정확히 일치한다. */
@@ -356,6 +360,21 @@ body {
   padding: 8px;
 }
 
+.poll-error {
+  position: absolute;
+  z-index: 500;
+  top: 8px;
+  left: 50%;
+  transform: translateX(-50%);
+  margin: 0;
+  padding: 6px 10px;
+  border-radius: 6px;
+  background: var(--surface-1);
+  color: var(--status-critical);
+  font-size: 12px;
+  box-shadow: 0 1px 4px rgb(0 0 0 / 15%);
+}
+
 /* 상세 패널 */
 .detail-panel-wrap {
   display: flex;
@@ -411,6 +430,31 @@ body {
 .event-item-meta {
   font-size: 12px;
   color: var(--text-secondary);
+}
+
+.weather-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.weather-item {
+  display: grid;
+  grid-template-columns: minmax(96px, 1.5fr) repeat(3, minmax(54px, 1fr));
+  gap: 2px 8px;
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.weather-item-time,
+.weather-item strong {
+  color: var(--text-primary);
 }
 
 .detail-grid dt {

@@ -8,13 +8,19 @@ from typing import Any
 
 import psycopg
 from psycopg import Connection
+from psycopg.conninfo import conninfo_to_dict
 from psycopg.rows import dict_row
 
 
 def get_connection() -> Connection:
-    """DATABASE_URL 환경변수를 기반으로 PostgreSQL DB 연결 객체를 생성하여 반환한다."""
+    """DATABASE_URL을 사용해 UTC session의 PostgreSQL 연결을 반환한다."""
     database_url = os.environ["DATABASE_URL"]
-    return psycopg.connect(database_url)
+    dsn_options = conninfo_to_dict(database_url).get("options")
+    inherited_options = (
+        dsn_options if dsn_options is not None else os.getenv("PGOPTIONS", "")
+    )
+    connection_options = f"{inherited_options} -c timezone=UTC".strip()
+    return psycopg.connect(database_url, options=connection_options)
 
 
 def execute(query: str, params: Sequence[Any] | None = None) -> None:

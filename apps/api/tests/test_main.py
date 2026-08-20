@@ -1,0 +1,347 @@
+"""Gold PostGIS API의 HTTP 상태와 외부 alias 계약을 검증한다."""
+
+from __future__ import annotations
+
+from datetime import UTC, date, datetime, timedelta
+from uuid import UUID
+
+import pytest
+from fastapi.testclient import TestClient
+
+import main
+import queries
+
+NOW = datetime(2026, 8, 20, 1, 5, tzinfo=UTC)
+BASE = datetime(2026, 8, 20, 1, 0, tzinfo=UTC)
+ROUTE_ID = UUID("11111111-1111-4111-8111-111111111111")
+
+
+@pytest.fixture
+def client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
+    """현재시각을 고정한 FastAPI test client를 반환한다."""
+    monkeypatch.setattr(queries, "now_utc", lambda: NOW)
+    return TestClient(main.app)
+
+
+def _station_row() -> dict:
+    """station API의 정상 응답 fixture를 만든다."""
+    return {
+        "sta_id": "ST-1",
+        "sta_nm": "대여소",
+        "sta_addr": "서울시 테스트로 1",
+        "lat": 37.5,
+        "lon": 127.0,
+        "hold_cnt": 10,
+        "parking_bike_tot_cnt": 12,
+        "region": "테스트 센터",
+        "base_dttm": BASE,
+    }
+
+
+def _forecast_result(state: queries.ForecastState) -> queries.ForecastResult:
+    """지정한 상태의 forecast 결과 fixture를 만든다."""
+    if state is not queries.ForecastState.READY:
+        return queries.ForecastResult(state)
+    points = tuple(
+        {
+            "predicted_dttm": BASE + timedelta(hours=hour),
+            "predicted_rent_cnt": 2,
+            "predicted_return_cnt": 1,
+        }
+        for hour in range(1, 13)
+    )
+    return queries.ForecastResult(
+        state,
+        {
+            "sta_id": "ST-1",
+            "hold_cnt": 10,
+            "last_seen_dttm": BASE,
+            "parking_bike_tot_cnt": 4,
+        },
+        BASE,
+        points,
+    )
+
+
+def _weather_points() -> tuple[dict, ...]:
+    """weather API의 미래 12개 정시 fixture를 만든다."""
+    return tuple(
+        {
+            "forecast_dttm": BASE + timedelta(hours=hour),
+            "temperature": 25.0,
+            "sky_condition_cd": "clear",
+            "precipitation_type_cd": "none",
+            "precipitation_prob": None,
+            "precipitation_amount": None,
+            "humidity": 60.0,
+            "wind_speed": 2.0,
+        }
+        for hour in range(1, 13)
+    )
+
+
+def _route(status: str = "proposed") -> dict:
+    """route API 정상 응답 fixture를 만든다."""
+    return {
+        "route_id": str(ROUTE_ID),
+        "region": "테스트 센터",
+        "status": status,
+        "proposed_at": BASE,
+        "dispatched_at": NOW if status in {"dispatched", "completed"} else None,
+        "completed_at": NOW if status == "completed" else None,
+        "stops": [
+            {
+                "visit_order": 1,
+                "sta_id": "ST-1",
+                "sta_nm": "대여소",
+                "lat": 37.5,
+                "lon": 127.0,
+                "action": "pickup",
+                "bike_cnt": 2,
+            }
+        ],
+    }
+
+
+def test_stations_preserve_aliases_without_gu(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """station 응답은 Point alias와 region을 유지하고 gu를 노출하지 않는다."""
+    row = {**_station_row(), "gu": "남겨서는 안 됨"}
+    monkeypatch.setattr(queries, "fetch_stations", lambda _now: [row])
+
+    response = client.get("/stations")
+
+    assert response.status_code == 200
+    assert response.json() == [
+        {
+            "sta_id": "ST-1",
+            "sta_nm": "대여소",
+            "lat": 37.5,
+            "lon": 127.0,
+            "hold_cnt": 10,
+            "parking_bike_tot_cnt": 12,
+            "shared_rate": 1.2,
+            "region": "테스트 센터",
+            "base_dttm": "2026-08-20T01:00:00Z",
+        }
+    ]
+    assert "gu" not in response.json()[0]
+
+
+def test_station_detail_returns_404_when_not_servable(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """missing·inactive·stale stock은 query에서 모두 제외되어 상세 404가 된다."""
+    monkeypatch.setattr(queries, "fetch_station", lambda _sta_id, _now: None)
+
+    response = client.get("/stations/ST-1")
+
+    assert response.status_code == 404
+
+
+@pytest.mark.parametrize(
+    "state,status_code,detail",
+    [
+        (queries.ForecastState.STATION_NOT_FOUND, 404, "station ST-1 not found"),
+        (queries.ForecastState.FORECAST_NOT_AVAILABLE, 404, "forecast_not_available"),
+        (queries.ForecastState.FORECAST_NOT_READY, 503, "forecast_not_ready"),
+        (queries.ForecastState.STOCK_NOT_ALIGNED, 503, "stock_forecast_not_aligned"),
+    ],
+)
+def test_forecast_maps_contract_states(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    state: queries.ForecastState,
+    status_code: int,
+    detail: str,
+) -> None:
+    """forecast의 station/model/freshness 상태를 404와 503으로 구분한다."""
+    monkeypatch.setattr(
+        queries, "fetch_forecast", lambda _sta_id, _now: _forecast_result(state)
+    )
+
+    response = client.get("/stations/ST-1/forecast")
+
+    assert response.status_code == status_code
+    assert response.json()["detail"] == detail
+
+
+def test_forecast_returns_twelve_points_without_reasons(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """forecast 성공 응답은 기존 alias를 유지하고 빈 reasons 계약을 제거한다."""
+    monkeypatch.setattr(
+        queries,
+        "fetch_forecast",
+        lambda _sta_id, _now: _forecast_result(queries.ForecastState.READY),
+    )
+
+    response = client.get("/stations/ST-1/forecast")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["base_dttm"] == "2026-08-20T01:00:00Z"
+    assert len(payload["points"]) == 12
+    assert payload["points"][0]["predicted_return_cnt"] == 1
+    assert payload["points"][0]["predicted_bikes"] == 3
+    assert "reasons" not in payload
+
+
+def test_status_returns_503_without_real_fresh_projection(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """status는 demand가 없을 때 현재시각 대신 forecast_not_ready를 반환한다."""
+    monkeypatch.setattr(queries, "fetch_status_base_dttm", lambda _now: None)
+
+    response = client.get("/status")
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "forecast_not_ready"
+
+
+def test_events_remove_unused_fields_and_keep_radius(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """event 응답은 검색 반경과 소비 alias만 제공한다."""
+    event = {
+        "event_id": "performance_event:1",
+        "title": "행사",
+        "place": None,
+        "start_date": date(2026, 8, 20),
+        "end_date": date(2026, 8, 21),
+        "lat": 37.51,
+        "lon": 127.01,
+        "distance_km": 1.23,
+        "category": "제거 대상",
+        "is_free": "제거 대상",
+    }
+    monkeypatch.setattr(queries, "fetch_nearby_events", lambda _sta_id, _now: [event])
+
+    response = client.get("/stations/ST-1/events")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["radius_km"] == queries.NEARBY_EVENT_RADIUS_KM
+    assert payload["events"][0]["start_date"] == "2026-08-20"
+    assert "category" not in payload["events"][0]
+    assert "is_free" not in payload["events"][0]
+
+
+@pytest.mark.parametrize(
+    "state,status_code,detail",
+    [
+        (queries.WeatherState.STATION_NOT_FOUND, 404, "station ST-1 not found"),
+        (queries.WeatherState.WEATHER_NOT_READY, 503, "weather_not_ready"),
+    ],
+)
+def test_weather_maps_missing_and_not_ready_states(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    state: queries.WeatherState,
+    status_code: int,
+    detail: str,
+) -> None:
+    """weather는 station 404와 projection 503을 구분한다."""
+    monkeypatch.setattr(
+        queries,
+        "fetch_weather",
+        lambda _sta_id, _now, _hours: queries.WeatherResult(state),
+    )
+
+    response = client.get("/stations/ST-1/weather?hours=12")
+
+    assert response.status_code == status_code
+    assert response.json()["detail"] == detail
+
+
+def test_weather_returns_exact_points_and_rejects_other_hours(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """weather 외부 계약은 hours=12만 허용하고 정확히 12행을 반환한다."""
+    monkeypatch.setattr(
+        queries,
+        "fetch_weather",
+        lambda _sta_id, _now, _hours: queries.WeatherResult(
+            queries.WeatherState.READY,
+            _weather_points(),
+        ),
+    )
+
+    response = client.get("/stations/ST-1/weather?hours=12")
+
+    assert response.status_code == 200
+    assert len(response.json()["points"]) == 12
+    assert response.json()["points"][0]["precipitation_prob"] is None
+    assert client.get("/stations/ST-1/weather?hours=11").status_code == 422
+
+
+def test_route_query_parameters_and_uuid_are_validated_before_db(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """route status·pagination·UUID 오류는 DB cast 전에 422로 거부한다."""
+    monkeypatch.setattr(queries, "fetch_routes", lambda *_args: [])
+    monkeypatch.setattr(queries, "fetch_route", lambda _route_id: None)
+
+    assert client.get("/routes?status=cancelled").status_code == 422
+    assert client.get("/routes?limit=0").status_code == 422
+    assert client.get("/routes?limit=501").status_code == 422
+    assert client.get("/routes?offset=-1").status_code == 422
+    assert client.get("/routes/not-a-uuid").status_code == 422
+
+
+@pytest.mark.parametrize(
+    "result,status_code,detail",
+    [
+        (queries.RouteTransitionResult.NOT_FOUND, 404, f"route {ROUTE_ID} not found"),
+        (
+            queries.RouteTransitionResult.WRONG_STATUS,
+            409,
+            f"route {ROUTE_ID} is not in proposed status",
+        ),
+        (
+            queries.RouteTransitionResult.CONSTRAINT_CONFLICT,
+            409,
+            "route_transition_conflict",
+        ),
+    ],
+)
+def test_dispatch_maps_not_found_state_and_constraints(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    result: queries.RouteTransitionResult,
+    status_code: int,
+    detail: str,
+) -> None:
+    """dispatch는 404·상태 409·DB constraint 409를 명시적으로 매핑한다."""
+    monkeypatch.setattr(queries, "dispatch_route", lambda _route_id, _now: result)
+
+    response = client.post(f"/routes/{ROUTE_ID}/dispatch")
+
+    assert response.status_code == status_code
+    assert response.json()["detail"] == detail
+
+
+def test_route_response_preserves_external_aliases(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """route UUID와 표준 DB 컬럼은 기존 JSON alias로 직렬화된다."""
+    monkeypatch.setattr(queries, "fetch_route", lambda _route_id: _route())
+
+    response = client.get(f"/routes/{ROUTE_ID}")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["route_id"] == str(ROUTE_ID)
+    assert payload["status"] == "proposed"
+    assert payload["proposed_at"] == "2026-08-20T01:00:00Z"
+    assert payload["stops"][0]["visit_order"] == 1
+    assert payload["stops"][0]["action"] == "pickup"

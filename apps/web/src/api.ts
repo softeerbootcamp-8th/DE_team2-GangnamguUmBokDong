@@ -5,7 +5,6 @@ export type ActionType = "supply_needed" | "retrieval_needed" | "normal";
 export interface StationSummary {
   sta_id: string;
   sta_nm: string;
-  gu: string;
   lat: number;
   lon: number;
   hold_cnt: number;
@@ -31,7 +30,6 @@ export interface ForecastResponse {
   sta_id: string;
   base_dttm: string;
   points: ForecastPoint[];
-  reasons: string[];
 }
 
 export interface Alert {
@@ -56,11 +54,9 @@ export interface DispatchCenter {
 export interface CulturalEvent {
   event_id: string;
   title: string;
-  category: string | null;
   place: string | null;
-  start_date: string | null;
-  end_date: string | null;
-  is_free: string | null;
+  start_date: string;
+  end_date: string;
   lat: number;
   lon: number;
   distance_km: number;
@@ -71,10 +67,59 @@ export interface EventsResponse {
   events: CulturalEvent[];
 }
 
+export interface WeatherPoint {
+  forecast_dttm: string;
+  temperature: number;
+  sky_condition_cd: "clear" | "mostly_cloudy" | "cloudy";
+  precipitation_type_cd:
+    | "none"
+    | "rain"
+    | "rain_snow"
+    | "snow"
+    | "shower"
+    | "raindrop"
+    | "raindrop_snow_flurry"
+    | "snow_flurry";
+  precipitation_prob: number | null;
+  precipitation_amount: number | null;
+  humidity: number | null;
+  wind_speed: number | null;
+}
+
+export interface WeatherResponse {
+  sta_id: string;
+  points: WeatherPoint[];
+}
+
+export class ApiError extends Error {
+  readonly status: number;
+  readonly detail: unknown;
+
+  constructor(path: string, status: number, detail: unknown) {
+    const detailText = typeof detail === "string" ? detail : detail === undefined ? "" : JSON.stringify(detail);
+    super(`${path} 요청 실패: ${status}${detailText ? ` ${detailText}` : ""}`);
+    this.name = "ApiError";
+    this.status = status;
+    this.detail = detail;
+  }
+}
+
+async function readErrorDetail(response: Response): Promise<unknown> {
+  try {
+    const body = (await response.json()) as unknown;
+    if (typeof body === "object" && body !== null && "detail" in body) {
+      return (body as { detail: unknown }).detail;
+    }
+    return body;
+  } catch {
+    return undefined;
+  }
+}
+
 async function getJson<T>(path: string): Promise<T> {
   const res = await fetch(`${API_BASE}${path}`);
   if (!res.ok) {
-    throw new Error(`${path} 요청 실패: ${res.status}`);
+    throw new ApiError(path, res.status, await readErrorDetail(res));
   }
   return res.json() as Promise<T>;
 }
@@ -84,6 +129,7 @@ export const api = {
   station: (id: string) => getJson<StationDetail>(`/stations/${id}`),
   forecast: (id: string) => getJson<ForecastResponse>(`/stations/${id}/forecast`),
   events: (id: string) => getJson<EventsResponse>(`/stations/${id}/events`),
+  weather: (id: string) => getJson<WeatherResponse>(`/stations/${id}/weather?hours=12`),
   alerts: () => getJson<Alert[]>("/alerts"),
   status: () => getJson<StatusResponse>("/status"),
   regions: () => getJson<DispatchCenter[]>("/regions"),

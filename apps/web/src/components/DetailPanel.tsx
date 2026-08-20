@@ -1,12 +1,19 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api } from "../api";
-import type { CulturalEvent, StationDetail } from "../api";
+import type { CulturalEvent, StationDetail, WeatherPoint } from "../api";
 import { formatIsoTime } from "../format";
 
 export interface FocusedEvent {
+  eventLat: number;
+  eventLon: number;
+  searchCenterLat: number;
+  searchCenterLon: number;
+  radiusKm: number;
+}
+
+interface StationPoint {
   lat: number;
   lon: number;
-  radiusKm: number;
 }
 
 type Tab = "info" | "events" | "weather";
@@ -16,72 +23,163 @@ const TABS: { key: Tab; label: string }[] = [
   { key: "events", label: "주변 행사" },
   { key: "weather", label: "주변 날씨" },
 ];
+const DETAIL_POLL_INTERVAL_MS = 60_000;
+const SKY_LABEL: Record<WeatherPoint["sky_condition_cd"], string> = {
+  clear: "맑음",
+  mostly_cloudy: "구름 많음",
+  cloudy: "흐림",
+};
+const PRECIPITATION_LABEL: Record<WeatherPoint["precipitation_type_cd"], string> = {
+  none: "없음",
+  rain: "비",
+  rain_snow: "비/눈",
+  snow: "눈",
+  shower: "소나기",
+  raindrop: "빗방울",
+  raindrop_snow_flurry: "빗방울/눈날림",
+  snow_flurry: "눈날림",
+};
 
 interface Props {
   stationId: string | null;
-  reasons: string[];
+  stationPoint: StationPoint | null;
   onFocusEvent: (event: FocusedEvent | null) => void;
 }
 
-export function DetailPanel({ stationId, reasons, onFocusEvent }: Props) {
+function nullableMeasurement(value: number | null, suffix: string): string {
+  return value === null ? "-" : `${value}${suffix}`;
+}
+
+export function DetailPanel({ stationId, stationPoint, onFocusEvent }: Props) {
   const [tab, setTab] = useState<Tab>("info");
   const [detail, setDetail] = useState<StationDetail | null>(null);
+  const [detailError, setDetailError] = useState(false);
   const [events, setEvents] = useState<CulturalEvent[] | null>(null);
   const [eventsError, setEventsError] = useState(false);
   const [radiusKm, setRadiusKm] = useState<number | null>(null);
+  const [weather, setWeather] = useState<WeatherPoint[] | null>(null);
+  const [weatherError, setWeatherError] = useState(false);
   const [focusedEventId, setFocusedEventId] = useState<string | null>(null);
+  const focusedEventIdRef = useRef(focusedEventId);
+  focusedEventIdRef.current = focusedEventId;
 
-  // 대여소를 바꾸면 이전 대여소에서 골라둔 탭이 그대로 유지될 이유가 없다.
-  // 탭이 "주변 행사"에서 벗어나면(정보/날씨로 이동, 혹은 여기서 info로
-  // 리셋되는 경우 포함) 아래 effect가 지도에 띄운 행사 포커스도 같이 지운다.
   useEffect(() => {
     setTab("info");
-  }, [stationId]);
+    setDetail(null);
+    setDetailError(false);
+    setEvents(null);
+    setEventsError(false);
+    setRadiusKm(null);
+    setWeather(null);
+    setWeatherError(false);
+    setFocusedEventId(null);
+    onFocusEvent(null);
+  }, [stationId, onFocusEvent]);
 
-  // "주변 행사" 탭을 벗어나면 포커싱한 행사가 더 이상 의미 없으니 지도 표시를
-  // 지우고, 대여소 포커싱으로 돌아가게 한다(StationMap.tsx가 focusedEvent가
-  // null이 되면 다시 선택된 대여소로 지도를 옮긴다).
   useEffect(() => {
     if (tab !== "events") {
       setFocusedEventId(null);
       onFocusEvent(null);
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tab]);
+  }, [tab, onFocusEvent]);
 
   useEffect(() => {
-    if (stationId === null) {
-      setDetail(null);
-      return;
-    }
+    if (stationId === null) return;
     let cancelled = false;
-    api.station(stationId).then((data) => {
-      if (!cancelled) setDetail(data);
-    });
+    let requestGeneration = 0;
+    function refresh() {
+      const currentGeneration = ++requestGeneration;
+      api
+        .station(stationId as string)
+        .then((data) => {
+          if (!cancelled && currentGeneration === requestGeneration) {
+            setDetail(data);
+            setDetailError(false);
+          }
+        })
+        .catch(() => {
+          if (!cancelled && currentGeneration === requestGeneration) {
+            setDetail(null);
+            setDetailError(true);
+          }
+        });
+    }
+    refresh();
+    const timer = setInterval(refresh, DETAIL_POLL_INTERVAL_MS);
     return () => {
       cancelled = true;
+      clearInterval(timer);
     };
   }, [stationId]);
 
-  // 행사 목록은 정보 탭보다 무거운 조회라, 실제로 행사 탭을 열었을 때만 가져온다.
   useEffect(() => {
     if (stationId === null || tab !== "events") return;
     let cancelled = false;
+    let requestGeneration = 0;
     setEvents(null);
     setEventsError(false);
-    api
-      .events(stationId)
-      .then((data) => {
-        if (!cancelled) {
+    setRadiusKm(null);
+    function refresh() {
+      const currentGeneration = ++requestGeneration;
+      api
+        .events(stationId as string)
+        .then((data) => {
+          if (cancelled || currentGeneration !== requestGeneration) return;
           setEvents(data.events);
           setRadiusKm(data.radius_km);
-        }
-      })
-      .catch(() => {
-        if (!cancelled) setEventsError(true);
-      });
+          setEventsError(false);
+          const focusedId = focusedEventIdRef.current;
+          if (focusedId !== null && !data.events.some((event) => event.event_id === focusedId)) {
+            setFocusedEventId(null);
+            onFocusEvent(null);
+          }
+        })
+        .catch(() => {
+          if (!cancelled && currentGeneration === requestGeneration) {
+            setEvents(null);
+            setRadiusKm(null);
+            setEventsError(true);
+            setFocusedEventId(null);
+            onFocusEvent(null);
+          }
+        });
+    }
+    refresh();
+    const timer = setInterval(refresh, DETAIL_POLL_INTERVAL_MS);
     return () => {
       cancelled = true;
+      clearInterval(timer);
+    };
+  }, [stationId, tab, onFocusEvent]);
+
+  useEffect(() => {
+    if (stationId === null || tab !== "weather") return;
+    let cancelled = false;
+    let requestGeneration = 0;
+    setWeather(null);
+    setWeatherError(false);
+    function refresh() {
+      const currentGeneration = ++requestGeneration;
+      api
+        .weather(stationId as string)
+        .then((data) => {
+          if (!cancelled && currentGeneration === requestGeneration) {
+            setWeather(data.points);
+            setWeatherError(false);
+          }
+        })
+        .catch(() => {
+          if (!cancelled && currentGeneration === requestGeneration) {
+            setWeather(null);
+            setWeatherError(true);
+          }
+        });
+    }
+    refresh();
+    const timer = setInterval(refresh, DETAIL_POLL_INTERVAL_MS);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
     };
   }, [stationId, tab]);
 
@@ -92,22 +190,24 @@ export function DetailPanel({ stationId, reasons, onFocusEvent }: Props) {
   return (
     <div className="detail-panel-wrap">
       <div className="alert-tabs" role="tablist">
-        {TABS.map((t) => (
+        {TABS.map((item) => (
           <button
-            key={t.key}
+            key={item.key}
             type="button"
             role="tab"
-            aria-selected={tab === t.key}
-            className={`alert-tab${tab === t.key ? " active" : ""}`}
-            onClick={() => setTab(t.key)}
+            aria-selected={tab === item.key}
+            className={`alert-tab${tab === item.key ? " active" : ""}`}
+            onClick={() => setTab(item.key)}
           >
-            {t.label}
+            {item.label}
           </button>
         ))}
       </div>
 
       {tab === "info" ? (
-        !detail ? (
+        detailError ? (
+          <p className="empty-state">대여소 정보를 불러오지 못했습니다.</p>
+        ) : !detail ? (
           <p className="empty-state">불러오는 중...</p>
         ) : (
           <dl className="detail-grid">
@@ -121,18 +221,6 @@ export function DetailPanel({ stationId, reasons, onFocusEvent }: Props) {
             </dd>
             <dt>갱신 시각</dt>
             <dd>{formatIsoTime(detail.base_dttm)}</dd>
-            {reasons.length > 0 && (
-              <>
-                <dt>수요 영향 사유</dt>
-                <dd>
-                  <ul className="reason-list">
-                    {reasons.map((reason) => (
-                      <li key={reason}>{reason}</li>
-                    ))}
-                  </ul>
-                </dd>
-              </>
-            )}
           </dl>
         )
       ) : tab === "events" ? (
@@ -152,19 +240,25 @@ export function DetailPanel({ stationId, reasons, onFocusEvent }: Props) {
                     type="button"
                     className={`event-item${isFocused ? " selected" : ""}`}
                     onClick={() => {
-                      if (radiusKm === null) return;
+                      if (radiusKm === null || stationPoint === null) return;
                       if (isFocused) {
                         setFocusedEventId(null);
                         onFocusEvent(null);
                       } else {
                         setFocusedEventId(event.event_id);
-                        onFocusEvent({ lat: event.lat, lon: event.lon, radiusKm });
+                        onFocusEvent({
+                          eventLat: event.lat,
+                          eventLon: event.lon,
+                          searchCenterLat: stationPoint.lat,
+                          searchCenterLon: stationPoint.lon,
+                          radiusKm,
+                        });
                       }
                     }}
                   >
                     <span className="event-item-title">{event.title}</span>
                     <span className="event-item-meta">
-                      {[event.place, [event.start_date, event.end_date].filter(Boolean).join(" ~ "), `${event.distance_km}km`]
+                      {[event.place, `${event.start_date} ~ ${event.end_date}`, `${event.distance_km}km`]
                         .filter(Boolean)
                         .join(" · ")}
                     </span>
@@ -174,10 +268,27 @@ export function DetailPanel({ stationId, reasons, onFocusEvent }: Props) {
             })}
           </ul>
         )
+      ) : weatherError ? (
+        <p className="empty-state">주변 날씨 정보를 불러오지 못했습니다.</p>
+      ) : weather === null ? (
+        <p className="empty-state">불러오는 중...</p>
       ) : (
-        // 날씨는 격자-구 매핑 정확도 문제(#99)가 팀 논의로 결론 나야 데이터 형태가
-        // 정해져서 아직 못 붙였다. 탭 자리만 미리 만들어둔다.
-        <p className="empty-state">주변 날씨는 준비 중입니다.</p>
+        <ul className="weather-list">
+          {weather.map((point) => (
+            <li key={point.forecast_dttm} className="weather-item">
+              <span className="weather-item-time">
+                {formatIsoTime(point.forecast_dttm, { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" })}
+              </span>
+              <strong>{point.temperature}℃</strong>
+              <span>{SKY_LABEL[point.sky_condition_cd]}</span>
+              <span>강수 {PRECIPITATION_LABEL[point.precipitation_type_cd]}</span>
+              <span>확률 {nullableMeasurement(point.precipitation_prob, "%")}</span>
+              <span>강수량 {nullableMeasurement(point.precipitation_amount, "mm")}</span>
+              <span>습도 {nullableMeasurement(point.humidity, "%")}</span>
+              <span>풍속 {nullableMeasurement(point.wind_speed, "m/s")}</span>
+            </li>
+          ))}
+        </ul>
       )}
     </div>
   );
