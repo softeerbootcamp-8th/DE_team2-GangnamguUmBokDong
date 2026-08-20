@@ -133,6 +133,7 @@ services:
       S3_ENDPOINT_URL: http://minio:9000
     volumes:
       - ../..:/workspace
+      - airflow-module-venvs:/opt/venvs/modules
     depends_on:
       postgres-schema-check:
         condition: service_completed_successfully
@@ -161,6 +162,7 @@ services:
       - "${AIRFLOW_WEBSERVER_PORT:-8080}:8080"
     volumes:
       - ../..:/workspace
+      - airflow-module-venvs:/opt/venvs/modules
     depends_on:
       postgres:
         condition: service_healthy
@@ -189,6 +191,7 @@ services:
       S3_ENDPOINT_URL: http://minio:9000
     volumes:
       - ../..:/workspace
+      - airflow-module-venvs:/opt/venvs/modules
     depends_on:
       postgres:
         condition: service_healthy
@@ -214,6 +217,7 @@ services:
       AIRFLOW__API__BASE_URL: http://localhost:${AIRFLOW_WEBSERVER_PORT:-8080}
     volumes:
       - ../..:/workspace
+      - airflow-module-venvs:/opt/venvs/modules
     depends_on:
       postgres:
         condition: service_healthy
@@ -255,4 +259,5 @@ services:
 volumes:
   postgres-data:
   minio-data:
+  airflow-module-venvs:
   web-node-modules:

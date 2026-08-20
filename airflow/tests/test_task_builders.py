@@ -26,7 +26,9 @@ def test_repo_root_resolves_to_repository_root():
 
 def test_collector_task_uses_kst_window_start_and_own_project_environment(dag):
     task = build_collector_task(dag, "bike_station_realtime")
-    assert task.bash_command.startswith("env -u VIRTUAL_ENV -u UV_PROJECT_ENVIRONMENT ")
+    assert task.bash_command.startswith(
+        "env -u VIRTUAL_ENV UV_PROJECT_ENVIRONMENT=/opt/venvs/modules/collector "
+    )
     assert (
         "uv run --frozen python main.py --source bike_station_realtime"
         in task.bash_command
@@ -69,6 +71,9 @@ def test_inference_task_cwd_is_ml_not_ml_inference(dag):
         "uv --project inference run python -m inference.predict_single"
         in task.bash_command
     )
+    assert task.bash_command.startswith(
+        "env -u VIRTUAL_ENV UV_PROJECT_ENVIRONMENT=/opt/venvs/modules/ml-inference "
+    )
     assert "--all-stations" in task.bash_command
     assert "--n-hours 12" in task.bash_command
     assert "// 5" in task.bash_command
@@ -90,6 +95,9 @@ def test_urgency_task_cwd_and_flags(dag):
     task = build_urgency_task(dag)
     assert task.cwd == REBALANCE_DIR
     assert task.cwd.endswith("/rebalance")
+    assert task.bash_command.startswith(
+        "env -u VIRTUAL_ENV UV_PROJECT_ENVIRONMENT=/opt/venvs/modules/rebalance "
+    )
     assert "uv run --frozen python main.py" in task.bash_command
     assert "--date" in task.bash_command
     assert "--hour" in task.bash_command

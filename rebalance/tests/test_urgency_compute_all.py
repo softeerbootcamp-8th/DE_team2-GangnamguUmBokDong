@@ -12,10 +12,10 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
-
 import urgency
-from tests.conftest import TEST_BUCKET
 from urgency import compute_all
+
+from tests.conftest import TEST_BUCKET, put_source_snapshot
 
 # ml/inference의 _target_timestamp와 같은 이유로 pd.Timestamp를 쓴다(naive
 # datetime을 datetime.strptime/datetime()으로 직접 만들면 tzinfo 누락으로
@@ -39,12 +39,15 @@ def _stub_known_station_ids(monkeypatch):
 def _put_parquet(key: str, table: pa.Table) -> None:
     buffer = io.BytesIO()
     pq.write_table(table, buffer)
-    boto3.client("s3", region_name="us-east-1").put_object(Bucket=TEST_BUCKET, Key=key, Body=buffer.getvalue())
+    boto3.client("s3", region_name="us-east-1").put_object(
+        Bucket=TEST_BUCKET, Key=key, Body=buffer.getvalue()
+    )
 
 
 def _put_tick(window_start: datetime, rows: list[dict]) -> None:
-    key = f"silver/bike_station_realtime/dt={window_start:%Y-%m-%d}/hh={window_start:%H}/{window_start:%H%M}.parquet"
-    _put_parquet(key, pa.Table.from_pylist(rows))
+    put_source_snapshot(
+        "bike_station_realtime", window_start, pa.Table.from_pylist(rows)
+    )
 
 
 def _tick_row(sta_id: str, current: int, hold_cnt: int) -> dict:
@@ -76,7 +79,9 @@ def _put_predictions(station_ids: list[str]) -> None:
 
 def test_compute_all_detects_declining_trend_with_prediction_artifact():
     # 14:00에 10대 -> 14:05(anchor)에 5대. hold_cnt(rackTotCnt)=10.
-    _put_tick(pd.Timestamp(2026, 8, 16, 14, 0), [_tick_row("101", current=10, hold_cnt=10)])
+    _put_tick(
+        pd.Timestamp(2026, 8, 16, 14, 0), [_tick_row("101", current=10, hold_cnt=10)]
+    )
     _put_tick(ANCHOR, [_tick_row("101", current=5, hold_cnt=10)])
     _put_predictions(["101"])
 
@@ -95,7 +100,12 @@ def test_compute_all_detects_declining_trend_with_prediction_artifact():
     assert row["sta_id"] == "101"
     assert (row["lat"], row["lon"]) == (_GANGNAM_LAT, _GANGNAM_LON)
     # 분당 -1대 추세, 현재 5대 -> 0석까지 5분. 예측 없어(0) severity 0, bike_qty도 0.
-    assert (row["urgency_score"], row["minutes_until_critical"], row["action_type"], row["bike_qty"]) == (
+    assert (
+        row["urgency_score"],
+        row["minutes_until_critical"],
+        row["action_type"],
+        row["bike_qty"],
+    ) == (
         0.0,
         5,
         "supply_needed",
@@ -104,7 +114,9 @@ def test_compute_all_detects_declining_trend_with_prediction_artifact():
 
 
 def test_compute_all_combines_stock_history_with_predictions():
-    _put_tick(pd.Timestamp(2026, 8, 16, 14, 0), [_tick_row("101", current=5, hold_cnt=10)])
+    _put_tick(
+        pd.Timestamp(2026, 8, 16, 14, 0), [_tick_row("101", current=5, hold_cnt=10)]
+    )
     _put_tick(ANCHOR, [_tick_row("101", current=5, hold_cnt=10)])
 
     predictions_key = f"predictions/dt={ANCHOR:%Y-%m-%d}/hh={ANCHOR:%H}/inference_{ANCHOR:%H%M}.parquet"
@@ -130,7 +142,9 @@ def test_compute_all_combines_stock_history_with_predictions():
             },
         ]
     )
-    _put_parquet(predictions_key, pa.Table.from_pandas(predictions, preserve_index=False))
+    _put_parquet(
+        predictions_key, pa.Table.from_pandas(predictions, preserve_index=False)
+    )
 
     result = compute_all(ANCHOR)
 
@@ -141,7 +155,12 @@ def test_compute_all_combines_stock_history_with_predictions():
     # bike_qty도 같은 부족량(4)이지만 빈 거치대 수(hold_cnt-current=5)보다 작아
     # 클램프 없이 그대로 4.
     assert row["sta_id"] == "101"
-    assert (row["urgency_score"], row["minutes_until_critical"], row["action_type"], row["bike_qty"]) == (
+    assert (
+        row["urgency_score"],
+        row["minutes_until_critical"],
+        row["action_type"],
+        row["bike_qty"],
+    ) == (
         8.3,
         120,
         "supply_needed",
@@ -173,7 +192,9 @@ def test_compute_all_excludes_and_logs_station_without_model_prediction(caplog):
 
 
 def test_compute_all_requires_anchor_stock_snapshot():
-    _put_tick(pd.Timestamp(2026, 8, 16, 14, 0), [_tick_row("101", current=5, hold_cnt=10)])
+    _put_tick(
+        pd.Timestamp(2026, 8, 16, 14, 0), [_tick_row("101", current=5, hold_cnt=10)]
+    )
     _put_predictions(["101"])
 
     with pytest.raises(FileNotFoundError, match="stock snapshot parquet not found"):
@@ -214,7 +235,13 @@ def test_compute_all_excludes_stations_missing_nan_coordinates(caplog):
         ANCHOR,
         [
             _tick_row("101", current=5, hold_cnt=10),
-            {"stationId": "102", "parkingBikeTotCnt": 5, "rackTotCnt": 10, "stationLatitude": None, "stationLongitude": None},
+            {
+                "stationId": "102",
+                "parkingBikeTotCnt": 5,
+                "rackTotCnt": 10,
+                "stationLatitude": None,
+                "stationLongitude": None,
+            },
         ],
     )
     _put_predictions(["101", "102"])

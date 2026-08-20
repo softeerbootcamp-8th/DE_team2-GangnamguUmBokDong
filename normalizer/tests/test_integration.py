@@ -11,17 +11,17 @@ import json
 from datetime import datetime, timedelta
 
 import boto3
-import pyarrow as pa
-import pyarrow.parquet as pq
-import pytest
-from core.forecast import POPULATION_FORECAST_SLOT_COUNT
-
 import grid
 import main
 import merge
 import poi
+import pyarrow as pa
+import pyarrow.parquet as pq
+import pytest
 import storage
-from tests.conftest import KST, TEST_BUCKET
+from core.forecast import POPULATION_FORECAST_SLOT_COUNT
+
+from tests.conftest import KST, TEST_BUCKET, put_source_snapshot
 
 # POI001("강남 MICE 관광특구")와 실제로 크게 겹치는 격자(약 97.9% 겹침, 이번 조사에서 확인).
 OVERLAPPING_CELL_ID = "다사61004575"
@@ -86,11 +86,13 @@ def _seed_realtime_silver(*, with_forecast: bool = True) -> None:
     }
     for slot in range(1, POPULATION_FORECAST_SLOT_COUNT + 1):
         stamp = WINDOW_START.replace(minute=0) + timedelta(hours=slot)
-        row[f"FCST_{slot}_TIME"] = stamp.strftime("%Y-%m-%d %H:%M") if with_forecast else None
+        row[f"FCST_{slot}_TIME"] = (
+            stamp.strftime("%Y-%m-%d %H:%M") if with_forecast else None
+        )
         row[f"FCST_{slot}_PPLTN_MIN"] = 3000 if with_forecast else None
         row[f"FCST_{slot}_PPLTN_MAX"] = 3400 if with_forecast else None
-    _put_parquet(
-        "silver/population_realtime/dt=2026-08-15/hh=14/1405.parquet", pa.Table.from_pylist([row])
+    put_source_snapshot(
+        "population_realtime", WINDOW_START, pa.Table.from_pylist([row])
     )
 
 
@@ -143,7 +145,12 @@ class TestEndToEndRun:
         assert abs(overlapping["SPOP"] - 1200) < abs(200 - 1200)
 
         # 출력 스키마 회귀 방어: 추론기가 이 파일을 지금과 같은 코드로 읽는다.
-        assert set(table.column_names) == {"CELL_ID", "H_DNG_CD", "SPOP", *merge.AGE_COLUMNS}
+        assert set(table.column_names) == {
+            "CELL_ID",
+            "H_DNG_CD",
+            "SPOP",
+            *merge.AGE_COLUMNS,
+        }
         for name in ("SPOP", *merge.AGE_COLUMNS):
             assert table.schema.field(name).type == pa.int64()
 
@@ -162,12 +169,18 @@ class TestEndToEndRun:
             rows, table = _read_normalized(key)
             assert set(rows) == {OVERLAPPING_CELL_ID, PASS_THROUGH_CELL_ID}
             # 미래 파일도 현재분과 같은 스키마여야 한다 — 추론기가 같은 코드로 읽는다.
-            assert set(table.column_names) == {"CELL_ID", "H_DNG_CD", "SPOP", *merge.AGE_COLUMNS}
+            assert set(table.column_names) == {
+                "CELL_ID",
+                "H_DNG_CD",
+                "SPOP",
+                *merge.AGE_COLUMNS,
+            }
 
         # 자정 넘김: 다음 날 파티션이 실제로 쓰였다.
         assert "dt=2026-08-16" in str(
             _s3().list_objects_v2(
-                Bucket=TEST_BUCKET, Prefix="silver/living_population_normalized/dt=2026-08-16/"
+                Bucket=TEST_BUCKET,
+                Prefix="silver/living_population_normalized/dt=2026-08-16/",
             )
         )
 
@@ -188,7 +201,9 @@ class TestEndToEndRun:
         assert abs(overlapping["SPOP"] - 3200) < abs(200 - 3200)
         # 성비는 baseline 그대로(M00:F00 = 1:1), 총량만 커진다.
         assert overlapping["M00"] == overlapping["F00"]
-        assert overlapping["M00"] + overlapping["F00"] == pytest.approx(overlapping["SPOP"], abs=1)
+        assert overlapping["M00"] + overlapping["F00"] == pytest.approx(
+            overlapping["SPOP"], abs=1
+        )
 
     def test_without_forecasts_only_the_current_tick_is_written(self):
         _seed_nowcast_baseline()
@@ -238,8 +253,12 @@ class TestEndToEndRun:
         assert CURRENT_KEY in written
         assert not [k for k in written if "dt=2026-08-16" in k]
 
-        manifest_key = "_manifest/living_population_normalized/dt=2026-08-15/hh=14/1405.json"
-        body = json.loads(_s3().get_object(Bucket=TEST_BUCKET, Key=manifest_key)["Body"].read())
+        manifest_key = (
+            "_manifest/living_population_normalized/dt=2026-08-15/hh=14/1405.json"
+        )
+        body = json.loads(
+            _s3().get_object(Bucket=TEST_BUCKET, Key=manifest_key)["Body"].read()
+        )
         assert len(body["skipped_targets"]) == 3  # 다음 날 01/02/03시
 
     def test_raises_when_the_current_baseline_is_missing(self):
