@@ -7,51 +7,12 @@ import sys
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from config import TABLE_SPECS, target_table_for
 from core.db import get_connection
 from core.upsert import upsert
-from retention_config import DATE_TYPED_EXPIRE_TABLES, grace_for
+
+from config import RETIRED_DERIVED_TABLES, TABLE_SPECS, target_table_for
 
 KST = ZoneInfo("Asia/Seoul")
-
-
-def _expire_cutoff(target_table: str, window_start: datetime):
-    """target_table의 만료 기준 시각(또는 날짜)을 계산한다. window_start에서
-    유예기간(retention_config.RETENTION_GRACE)만큼 뺀 시점보다 오래된 행이 삭제 대상이다."""
-    cutoff = window_start - grace_for(target_table)
-    return cutoff.date() if target_table in DATE_TYPED_EXPIRE_TABLES else cutoff
-
-
-def _delete_expired(conn, target_table: str, expire_col: str, cutoff) -> int:
-    """target_table에서 expire_col < cutoff인 행을 지우고 지운 행 수를 반환한다."""
-    with conn.cursor() as cur:
-        cur.execute(
-            f"DELETE FROM {target_table} WHERE {expire_col} < %(cutoff)s",
-            {"cutoff": cutoff},
-        )
-        return cur.rowcount
-
-
-def _only_known_stations(rows: list[dict], known_station_ids: set[str]) -> list[dict]:
-    """stations FK가 존재하는 urgency row만 반환한다."""
-    return [row for row in rows if row["sta_id"] in known_station_ids]
-
-
-def _retire_stale_proposed_routes(conn) -> None:
-    """이번 배치가 새 proposed 라우트를 넣기 전에, 아직 proposed인(=아무도 안
-    건드린) 예전 라우트를 지운다. compute_routes는 매 사이클 전체 권역의 수요를
-    다시 계산하므로, 지난 사이클의 proposed는 이번 사이클 결과로 완전히
-    대체되는 게 맞다 — 그대로 두면 아무도 안 건드린 예전 제안이 사이클마다
-    계속 쌓인다. dispatched/completed로 이미 넘어간 라우트는 운영자가 실제로
-    처리한 기록이라 안 건드린다. S3(routes_main.py가 매 사이클 써두는 parquet)에
-    "그때 뭘 제안했었는지"는 이미 영구히 남으므로, 아무도 안 건드린 proposed를
-    RDS에서 지워도 잃는 정보가 없다."""
-    with conn.cursor() as cur:
-        cur.execute(
-            "DELETE FROM rebalance_route_stops "
-            "WHERE route_id IN (SELECT route_id FROM rebalance_routes WHERE status = 'proposed')"
-        )
-        cur.execute("DELETE FROM rebalance_routes WHERE status = 'proposed'")
 
 
 def run(table: str, window_start: datetime) -> None:
@@ -64,29 +25,9 @@ def run(table: str, window_start: datetime) -> None:
     target_table = target_table_for(table)
     spec = TABLE_SPECS[table]
     silver = spec.read(window_start)
-
-    if table == "station_stock":
-        rows = spec.transform(silver, observed_at=window_start)
-    elif table in ("forecast_points", "station_urgency"):
-        rows = spec.transform(silver, batch_run_at=window_start)
-    else:
-        rows = spec.transform(silver)
+    rows = spec.transform(silver)
 
     with get_connection() as conn:
-        if table == "station_urgency" and rows:
-            station_ids = [row["sta_id"] for row in rows]
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT sta_id FROM stations WHERE sta_id = ANY(%s)", (station_ids,)
-                )
-                known_station_ids = {row[0] for row in cur.fetchall()}
-            filtered_rows = _only_known_stations(rows, known_station_ids)
-            excluded_count = len(rows) - len(filtered_rows)
-            if excluded_count:
-                print(f"excluded {excluded_count} urgency rows absent from stations")
-            rows = filtered_rows
-        if table == "rebalance_routes":
-            _retire_stale_proposed_routes(conn)
         upsert(
             conn,
             target_table,
@@ -95,12 +36,6 @@ def run(table: str, window_start: datetime) -> None:
             spec.update_cols,
             guard_col=spec.guard_col,
         )
-        if spec.expire_col:
-            cutoff = _expire_cutoff(target_table, window_start)
-            deleted = _delete_expired(conn, target_table, spec.expire_col, cutoff)
-            print(
-                f"deleted {deleted} expired rows from {target_table} (expire_col={spec.expire_col}, cutoff={cutoff})"
-            )
         conn.commit()
 
     print(f"upserted {len(rows)} rows into {target_table}")
@@ -128,7 +63,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description="Silver parquet을 읽어 Gold DB에 upsert한다."
     )
-    parser.add_argument("--table", required=True, choices=sorted(TABLE_SPECS))
+    parser.add_argument(
+        "--table",
+        required=True,
+        choices=sorted(set(TABLE_SPECS) | set(RETIRED_DERIVED_TABLES)),
+    )
     parser.add_argument(
         "--window-start",
         required=True,
