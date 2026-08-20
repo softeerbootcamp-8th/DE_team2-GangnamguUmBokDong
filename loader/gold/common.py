@@ -38,6 +38,7 @@ from core.gold_publication.transaction import (
     ConditionalEmptyValidator,
     LockedValidator,
     MutationCallback,
+    ReplayTargetValidator,
 )
 from core.source_snapshot import (
     SourceSnapshotContractError,
@@ -498,6 +499,8 @@ def publish_verified(
     *,
     validate_locked: LockedValidator | None = None,
     validate_conditional_empty: ConditionalEmptyValidator | None = None,
+    allow_mixed_replay: bool = False,
+    validate_replay_targets_locked: ReplayTargetValidator | None = None,
 ) -> PublicationExecution:
     """공통 evidence verifier와 transaction 실행기만 거쳐 publication을 게시한다."""
     from core.gold_publication import verify_publication_evidence
@@ -515,6 +518,8 @@ def publish_verified(
         mutate_targets,
         validate_locked=validate_locked,
         validate_conditional_empty=validate_conditional_empty,
+        allow_mixed_replay=allow_mixed_replay,
+        validate_replay_targets_locked=validate_replay_targets_locked,
     )
     return PublicationExecution(result=result, evidence=evidence)
 

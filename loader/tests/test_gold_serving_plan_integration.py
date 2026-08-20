@@ -23,6 +23,10 @@ from core.gold_publication import (
     parse_canonical_json,
     sha256_hex,
 )
+from core.inference_catalog import (
+    InferenceRevisionRecord,
+    InMemoryInferenceRevisionCatalog,
+)
 from core.inference_snapshot import (
     ImmutableInputRef,
     InferenceSnapshotCounts,
@@ -79,6 +83,48 @@ _LOOKBACKS = SourceLookbacks(
 _EFFECTIVE_CONTRACT_VERSION = f"sha256:{'e' * 64}"
 
 
+class _DriftingInferenceCatalog(InMemoryInferenceRevisionCatalog):
+    """Final prepare 뒤 locked recheck 직전에 latest correction을 주입한다."""
+
+    def __init__(self) -> None:
+        """비활성 drift counter로 catalog를 시작한다."""
+        super().__init__()
+        self._armed = False
+        self._armed_reads = 0
+
+    def arm(self) -> None:
+        """다음 두 snapshot 중 두 번째에 correction을 주입한다."""
+        self._armed = True
+        self._armed_reads = 0
+
+    def snapshot(self, logical_dttm: datetime) -> Any:
+        """Armed 두 번째 read에서 same-logical next revision을 claim한다."""
+        current = super().snapshot(logical_dttm)
+        if not self._armed:
+            return current
+        self._armed_reads += 1
+        if self._armed_reads != 2:
+            return current
+        self._armed = False
+        revision = len(current.records)
+        checksum = "f" * 64
+        self.claim(
+            InferenceRevisionRecord(
+                logical_dttm=logical_dttm,
+                revision_no=revision,
+                manifest_byte_sha256=checksum,
+                manifest_uri=_uri("inference/manifests", checksum, "json"),
+            )
+        )
+        return super().snapshot(logical_dttm)
+
+
+@pytest.fixture
+def inference_catalog() -> InMemoryInferenceRevisionCatalog:
+    """Producer와 final이 공유하는 test inference revision catalog를 반환한다."""
+    return InMemoryInferenceRevisionCatalog()
+
+
 @pytest.fixture
 def gold_connection() -> Iterator[Connection[Any]]:
     """명시적 disposable gold151_* DB를 serving release 테스트마다 비운다."""
@@ -106,6 +152,7 @@ def gold_connection() -> Iterator[Connection[Any]]:
 def test_clean_bootstrap_activation_replay_correction_and_rollback(
     gold_connection: Connection[Any],
     monkeypatch: pytest.MonkeyPatch,
+    inference_catalog: InMemoryInferenceRevisionCatalog,
 ) -> None:
     """Target 밖 plan부터 네 key publish·replay·correction·rollback을 검증한다."""
     client = boto3.client("s3", region_name="us-east-1")
@@ -147,6 +194,7 @@ def test_clean_bootstrap_activation_replay_correction_and_rollback(
     assert _serving_state(gold_connection) == ()
     inference_uri, inference_sha = _put_inference(
         store,
+        inference_catalog=inference_catalog,
         plan=plan,
         rental_model=rental_model,
         return_model=return_model,
@@ -157,6 +205,7 @@ def test_clean_bootstrap_activation_replay_correction_and_rollback(
         gold_connection,
         store,
         catalog,
+        inference_catalog,
         plan.uri,
         plan.byte_sha256,
         inference_uri,
@@ -179,6 +228,7 @@ def test_clean_bootstrap_activation_replay_correction_and_rollback(
         gold_connection,
         store,
         catalog,
+        inference_catalog,
         plan.uri,
         plan.byte_sha256,
         inference_uri,
@@ -192,11 +242,12 @@ def test_clean_bootstrap_activation_replay_correction_and_rollback(
         cursor.execute(
             "UPDATE station_stock SET parking_bike_tot_cnt = 99 WHERE sta_id = 'ST-1'"
         )
-    with pytest.raises(ContractViolation, match="station_stock target"):
+    with pytest.raises(ContractViolation, match="station_stock"):
         _publish_plan(
             gold_connection,
             store,
             catalog,
+            inference_catalog,
             plan.uri,
             plan.byte_sha256,
             inference_uri,
@@ -229,6 +280,7 @@ def test_clean_bootstrap_activation_replay_correction_and_rollback(
     )
     corrected_inference_uri, corrected_inference_sha = _put_inference(
         store,
+        inference_catalog=inference_catalog,
         plan=corrected_plan,
         rental_model=rental_model,
         return_model=return_model,
@@ -254,6 +306,7 @@ def test_clean_bootstrap_activation_replay_correction_and_rollback(
                 gold_connection,
                 store,
                 catalog,
+                inference_catalog,
                 corrected_plan.uri,
                 corrected_plan.byte_sha256,
                 corrected_inference_uri,
@@ -266,6 +319,7 @@ def test_clean_bootstrap_activation_replay_correction_and_rollback(
         gold_connection,
         store,
         catalog,
+        inference_catalog,
         corrected_plan.uri,
         corrected_plan.byte_sha256,
         corrected_inference_uri,
@@ -299,6 +353,7 @@ def test_clean_bootstrap_activation_replay_correction_and_rollback(
     )
     next_inference_uri, next_inference_sha = _put_inference(
         store,
+        inference_catalog=inference_catalog,
         plan=next_plan,
         rental_model=rental_model,
         return_model=return_model,
@@ -308,20 +363,33 @@ def test_clean_bootstrap_activation_replay_correction_and_rollback(
         gold_connection,
         store,
         catalog,
+        inference_catalog,
         next_plan.uri,
         next_plan.byte_sha256,
         next_inference_uri,
         next_inference_sha,
     )
     assert advanced.result.outcome is PublicationOutcome.PUBLISHED
+    with pytest.raises(ContractViolation, match="same-logical latest"):
+        _publish_plan(
+            gold_connection,
+            store,
+            catalog,
+            inference_catalog,
+            plan.uri,
+            plan.byte_sha256,
+            inference_uri,
+            inference_sha,
+        )
     stale = _publish_plan(
         gold_connection,
         store,
         catalog,
-        plan.uri,
-        plan.byte_sha256,
-        inference_uri,
-        inference_sha,
+        inference_catalog,
+        corrected_plan.uri,
+        corrected_plan.byte_sha256,
+        corrected_inference_uri,
+        corrected_inference_sha,
     )
     assert stale.result.outcome is PublicationOutcome.STALE
     assert _stock_counts(gold_connection) == (("ST-1", 10), ("ST-2", 10))
@@ -329,6 +397,7 @@ def test_clean_bootstrap_activation_replay_correction_and_rollback(
 
 def test_plan_source_drift_and_inference_failure_leave_targets_unchanged(
     gold_connection: Connection[Any],
+    inference_catalog: InMemoryInferenceRevisionCatalog,
 ) -> None:
     """Plan 뒤 source correction과 partial inference가 claim 전 fail-closed 된다."""
     client = boto3.client("s3", region_name="us-east-1")
@@ -368,6 +437,7 @@ def test_plan_source_drift_and_inference_failure_leave_targets_unchanged(
     )
     inference_uri, inference_sha = _put_inference(
         store,
+        inference_catalog=inference_catalog,
         plan=plan,
         rental_model=rental_model,
         return_model=return_model,
@@ -387,6 +457,7 @@ def test_plan_source_drift_and_inference_failure_leave_targets_unchanged(
             gold_connection,
             store,
             catalog,
+            inference_catalog,
             plan.uri,
             plan.byte_sha256,
             inference_uri,
@@ -417,6 +488,7 @@ def test_plan_source_drift_and_inference_failure_leave_targets_unchanged(
             gold_connection,
             store,
             catalog,
+            inference_catalog,
             plan.uri,
             plan.byte_sha256,
             partial_uri,
@@ -425,8 +497,291 @@ def test_plan_source_drift_and_inference_failure_leave_targets_unchanged(
     assert _serving_counts(gold_connection) == (0, 0, 0, 0, 0)
 
 
+def test_inference_only_and_weather_corrections_mutate_published_subsets(
+    gold_connection: Connection[Any],
+    inference_catalog: InMemoryInferenceRevisionCatalog,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Inference-only와 weather correction이 replay target을 다시 쓰지 않는다."""
+    client = boto3.client("s3", region_name="us-east-1")
+    store = S3ImmutableObjectStore(client)
+    catalog = S3SourceSnapshotCatalog(client, store, bucket=_BUCKET)
+    anchor = _safe_anchor()
+    _publish_topology(gold_connection, store, anchor)
+    rental_model, rental_support = _put_model_snapshot(
+        store,
+        ModelKind.RENTAL,
+        ("ST-1",),
+    )
+    return_model, return_support = _put_model_snapshot(
+        store,
+        ModelKind.RETURN,
+        ("ST-1",),
+    )
+    master, realtime, short, ultra = _put_release_sources(
+        client,
+        anchor=anchor,
+        realtime_revision=0,
+        rack_count=20,
+        stock_count=8,
+    )
+    plan = prepare_serving_plan(
+        gold_connection,
+        store,
+        master_artifact=master,
+        realtime_candidate=realtime,
+        short_term_artifact=short,
+        ultra_short_artifact=ultra,
+        rental_support_sta_ids=rental_support,
+        return_support_sta_ids=return_support,
+        source_catalog=catalog,
+        object_base_uri=_BASE_URI,
+        source_lookbacks=_LOOKBACKS,
+    )
+    first_uri, first_sha = _put_inference(
+        store,
+        inference_catalog=inference_catalog,
+        plan=plan,
+        rental_model=rental_model,
+        return_model=return_model,
+        prediction_offset=0.0,
+    )
+    _publish_plan(
+        gold_connection,
+        store,
+        catalog,
+        inference_catalog,
+        plan.uri,
+        plan.byte_sha256,
+        first_uri,
+        first_sha,
+    )
+
+    inference_uri, inference_sha = _put_inference(
+        store,
+        inference_catalog=inference_catalog,
+        plan=plan,
+        rental_model=rental_model,
+        return_model=return_model,
+        prediction_offset=7.0,
+    )
+    state_before_mixed = _serving_state(gold_connection)
+    with gold_connection.transaction(), gold_connection.cursor() as cursor:
+        cursor.execute(
+            "UPDATE station_stock SET parking_bike_tot_cnt = 99 WHERE sta_id = 'ST-1'"
+        )
+    with pytest.raises(ContractViolation, match="station_stock"):
+        _publish_plan(
+            gold_connection,
+            store,
+            catalog,
+            inference_catalog,
+            plan.uri,
+            plan.byte_sha256,
+            inference_uri,
+            inference_sha,
+        )
+    assert _serving_state(gold_connection) == state_before_mixed
+    with gold_connection.transaction(), gold_connection.cursor() as cursor:
+        cursor.execute(
+            "UPDATE station_stock SET parking_bike_tot_cnt = 8 WHERE sta_id = 'ST-1'"
+        )
+
+    def fail_replay_mutation(*_args: Any, **_kwargs: Any) -> None:
+        """Replay target mutation이 호출되면 mixed subset 계약을 실패시킨다."""
+        raise AssertionError("replay target mutation")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            serving_module.station_release,
+            "_upsert_station",
+            fail_replay_mutation,
+        )
+        patch.setattr(
+            serving_module.station_release,
+            "_replace_station_stock",
+            fail_replay_mutation,
+        )
+        patch.setattr(
+            serving_module.weather_forecast,
+            "_upsert_weather_forecast_records",
+            fail_replay_mutation,
+        )
+        inference_corrected = _publish_plan(
+            gold_connection,
+            store,
+            catalog,
+            inference_catalog,
+            plan.uri,
+            plan.byte_sha256,
+            inference_uri,
+            inference_sha,
+        )
+    assert inference_corrected.result.outcome is PublicationOutcome.PUBLISHED
+    revisions = {row[0]: row[1] for row in _serving_state(gold_connection)}
+    assert revisions == {
+        "station": 0,
+        "station_demand_forecast": 1,
+        "station_stock": 0,
+        "weather_forecast": 0,
+    }
+
+    ultra_v1 = _put_weather_source(
+        client,
+        source_id="weather_ultra_short_forecast",
+        logical=ultra.manifest.logical_dttm,
+        revision=1,
+        rows=_weather_rows(anchor, product="ultra_short", temperature=31.0),
+        planned_parts=_KMA_PARTS,
+    )
+    weather_plan = prepare_serving_plan(
+        gold_connection,
+        store,
+        master_artifact=master,
+        realtime_candidate=realtime,
+        short_term_artifact=short,
+        ultra_short_artifact=ultra_v1,
+        rental_support_sta_ids=rental_support,
+        return_support_sta_ids=return_support,
+        source_catalog=catalog,
+        object_base_uri=_BASE_URI,
+        source_lookbacks=_LOOKBACKS,
+    )
+    weather_inference_uri, weather_inference_sha = _put_inference(
+        store,
+        inference_catalog=inference_catalog,
+        plan=weather_plan,
+        rental_model=rental_model,
+        return_model=return_model,
+        prediction_offset=7.0,
+    )
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            serving_module.station_release,
+            "_upsert_station",
+            fail_replay_mutation,
+        )
+        patch.setattr(
+            serving_module.station_release,
+            "_replace_station_stock",
+            fail_replay_mutation,
+        )
+        weather_corrected = _publish_plan(
+            gold_connection,
+            store,
+            catalog,
+            inference_catalog,
+            weather_plan.uri,
+            weather_plan.byte_sha256,
+            weather_inference_uri,
+            weather_inference_sha,
+        )
+    assert weather_corrected.result.outcome is PublicationOutcome.PUBLISHED
+    revisions = {row[0]: row[1] for row in _serving_state(gold_connection)}
+    assert revisions == {
+        "station": 0,
+        "station_demand_forecast": 2,
+        "station_stock": 0,
+        "weather_forecast": 1,
+    }
+    assert _stock_counts(gold_connection) == (("ST-1", 8), ("ST-2", 8))
+
+
+def test_cross_plan_inference_and_locked_catalog_drift_fail_closed(
+    gold_connection: Connection[Any],
+) -> None:
+    """다른 plan inference와 DB lock 뒤 생긴 latest correction을 모두 거부한다."""
+    client = boto3.client("s3", region_name="us-east-1")
+    store = S3ImmutableObjectStore(client)
+    source_catalog = S3SourceSnapshotCatalog(client, store, bucket=_BUCKET)
+    inference_catalog = _DriftingInferenceCatalog()
+    anchor = _safe_anchor()
+    _publish_topology(gold_connection, store, anchor)
+    rental_model, rental_support = _put_model_snapshot(
+        store,
+        ModelKind.RENTAL,
+        ("ST-1",),
+    )
+    return_model, return_support = _put_model_snapshot(
+        store,
+        ModelKind.RETURN,
+        ("ST-1",),
+    )
+    master, realtime, short, ultra = _put_release_sources(
+        client,
+        anchor=anchor,
+        realtime_revision=0,
+        rack_count=20,
+        stock_count=8,
+    )
+    plan = prepare_serving_plan(
+        gold_connection,
+        store,
+        master_artifact=master,
+        realtime_candidate=realtime,
+        short_term_artifact=short,
+        ultra_short_artifact=ultra,
+        rental_support_sta_ids=rental_support,
+        return_support_sta_ids=return_support,
+        source_catalog=source_catalog,
+        object_base_uri=_BASE_URI,
+        source_lookbacks=_LOOKBACKS,
+    )
+    other_plan = prepare_serving_plan(
+        gold_connection,
+        store,
+        master_artifact=master,
+        realtime_candidate=realtime,
+        short_term_artifact=short,
+        ultra_short_artifact=ultra,
+        rental_support_sta_ids=rental_support,
+        return_support_sta_ids=return_support,
+        source_catalog=source_catalog,
+        object_base_uri=f"{_BASE_URI}-other",
+        source_lookbacks=_LOOKBACKS,
+    )
+    inference_uri, inference_sha = _put_inference(
+        store,
+        inference_catalog=inference_catalog,
+        plan=plan,
+        rental_model=rental_model,
+        return_model=return_model,
+        prediction_offset=0.0,
+    )
+
+    with pytest.raises(ContractViolation, match="serving_plan ref"):
+        _publish_plan(
+            gold_connection,
+            store,
+            source_catalog,
+            inference_catalog,
+            other_plan.uri,
+            other_plan.byte_sha256,
+            inference_uri,
+            inference_sha,
+        )
+    assert _serving_counts(gold_connection) == (0, 0, 0, 0, 0)
+    assert _serving_state(gold_connection) == ()
+
+    inference_catalog.arm()
+    with pytest.raises(ContractViolation, match="same-logical latest"):
+        _publish_plan(
+            gold_connection,
+            store,
+            source_catalog,
+            inference_catalog,
+            plan.uri,
+            plan.byte_sha256,
+            inference_uri,
+            inference_sha,
+        )
+    assert _serving_counts(gold_connection) == (0, 0, 0, 0, 0)
+    assert _serving_state(gold_connection) == ()
+
+
 def test_model_unsupported_station_activates_with_demand_empty(
     gold_connection: Connection[Any],
+    inference_catalog: InMemoryInferenceRevisionCatalog,
 ) -> None:
     """13h weather만 있으면 model 미지원 station을 active로 두고 EMPTY demand를 claim한다."""
     client = boto3.client("s3", region_name="us-east-1")
@@ -458,6 +813,7 @@ def test_model_unsupported_station_activates_with_demand_empty(
     )
     inference_uri, inference_sha = _put_inference(
         store,
+        inference_catalog=inference_catalog,
         plan=plan,
         rental_model=rental_model,
         return_model=return_model,
@@ -468,6 +824,7 @@ def test_model_unsupported_station_activates_with_demand_empty(
         gold_connection,
         store,
         catalog,
+        inference_catalog,
         plan.uri,
         plan.byte_sha256,
         inference_uri,
@@ -481,8 +838,212 @@ def test_model_unsupported_station_activates_with_demand_empty(
     assert state["station_demand_forecast"] == (0, 0)
 
 
+def test_missing_current_stock_candidate_stays_inactive(
+    gold_connection: Connection[Any],
+    inference_catalog: InMemoryInferenceRevisionCatalog,
+) -> None:
+    """13h weather와 model support가 있어도 current parking 결측이면 활성화하지 않는다."""
+    client = boto3.client("s3", region_name="us-east-1")
+    store = S3ImmutableObjectStore(client)
+    catalog = S3SourceSnapshotCatalog(client, store, bucket=_BUCKET)
+    anchor = _safe_anchor()
+    _publish_topology(gold_connection, store, anchor)
+    rental_model, rental_support = _put_model_snapshot(
+        store,
+        ModelKind.RENTAL,
+        ("ST-1", "ST-2"),
+    )
+    return_model, return_support = _put_model_snapshot(
+        store,
+        ModelKind.RETURN,
+        ("ST-1", "ST-2"),
+    )
+    master, realtime, short, ultra = _put_release_sources(
+        client,
+        anchor=anchor,
+        realtime_revision=0,
+        rack_count=20,
+        stock_count=8,
+        missing_stock_ids=("ST-2",),
+    )
+    plan = prepare_serving_plan(
+        gold_connection,
+        store,
+        master_artifact=master,
+        realtime_candidate=realtime,
+        short_term_artifact=short,
+        ultra_short_artifact=ultra,
+        rental_support_sta_ids=rental_support,
+        return_support_sta_ids=return_support,
+        source_catalog=catalog,
+        object_base_uri=_BASE_URI,
+        source_lookbacks=_LOOKBACKS,
+    )
+    assert tuple(
+        (record.sta_id, record.is_active)
+        for record in _planned_station_rows(store, plan)
+    ) == (("ST-1", True), ("ST-2", False))
+    assert parse_expected_ids(store, plan.expected_sta_ids) == ("ST-1",)
+    inference_uri, inference_sha = _put_inference(
+        store,
+        inference_catalog=inference_catalog,
+        plan=plan,
+        rental_model=rental_model,
+        return_model=return_model,
+        prediction_offset=0.0,
+    )
+
+    result = _publish_plan(
+        gold_connection,
+        store,
+        catalog,
+        inference_catalog,
+        plan.uri,
+        plan.byte_sha256,
+        inference_uri,
+        inference_sha,
+    )
+
+    assert result.result.outcome is PublicationOutcome.PUBLISHED
+    assert _active_ids(gold_connection) == ("ST-1",)
+    assert _stock_counts(gold_connection) == (("ST-1", 8),)
+    assert _demand_ids(gold_connection) == ("ST-1",)
+    assert _serving_counts(gold_connection) == (2, 1, 1, HORIZON_COUNT, 13)
+
+
+def test_missing_current_stock_keeps_existing_active_station_by_lifecycle_policy(
+    gold_connection: Connection[Any],
+    inference_catalog: InMemoryInferenceRevisionCatalog,
+) -> None:
+    """Stock gate는 신규·재활성만 막고 기존 active는 lifecycle 정책으로 유지한다."""
+    client = boto3.client("s3", region_name="us-east-1")
+    store = S3ImmutableObjectStore(client)
+    catalog = S3SourceSnapshotCatalog(client, store, bucket=_BUCKET)
+    anchor = _safe_anchor()
+    _publish_topology(gold_connection, store, anchor)
+    rental_model, rental_support = _put_model_snapshot(
+        store,
+        ModelKind.RENTAL,
+        ("ST-1", "ST-2"),
+    )
+    return_model, return_support = _put_model_snapshot(
+        store,
+        ModelKind.RETURN,
+        ("ST-1", "ST-2"),
+    )
+    master, realtime, short, ultra = _put_release_sources(
+        client,
+        anchor=anchor,
+        realtime_revision=0,
+        rack_count=20,
+        stock_count=8,
+    )
+    initial_plan = prepare_serving_plan(
+        gold_connection,
+        store,
+        master_artifact=master,
+        realtime_candidate=realtime,
+        short_term_artifact=short,
+        ultra_short_artifact=ultra,
+        rental_support_sta_ids=rental_support,
+        return_support_sta_ids=return_support,
+        source_catalog=catalog,
+        object_base_uri=_BASE_URI,
+        source_lookbacks=_LOOKBACKS,
+    )
+    initial_inference_uri, initial_inference_sha = _put_inference(
+        store,
+        inference_catalog=inference_catalog,
+        plan=initial_plan,
+        rental_model=rental_model,
+        return_model=return_model,
+        prediction_offset=0.0,
+    )
+    _publish_plan(
+        gold_connection,
+        store,
+        catalog,
+        inference_catalog,
+        initial_plan.uri,
+        initial_plan.byte_sha256,
+        initial_inference_uri,
+        initial_inference_sha,
+    )
+    assert _active_ids(gold_connection) == ("ST-1", "ST-2")
+
+    next_anchor = anchor + timedelta(minutes=5)
+    missing_stock_realtime = _put_station_source(
+        client,
+        source_id="bike_station_realtime",
+        logical=next_anchor,
+        revision=0,
+        rows=_realtime_rows(
+            rack_count=21,
+            stock_count=9,
+            missing_stock_ids=("ST-2",),
+        ),
+    )
+    lifecycle_plan = prepare_serving_plan(
+        gold_connection,
+        store,
+        master_artifact=master,
+        realtime_candidate=missing_stock_realtime,
+        short_term_artifact=short,
+        ultra_short_artifact=ultra,
+        rental_support_sta_ids=rental_support,
+        return_support_sta_ids=return_support,
+        source_catalog=catalog,
+        object_base_uri=_BASE_URI,
+        source_lookbacks=_LOOKBACKS,
+    )
+    assert parse_expected_ids(
+        store,
+        lifecycle_plan.plan.activation_ready_sta_ids,
+    ) == ("ST-1",)
+    assert tuple(
+        (record.sta_id, record.is_active)
+        for record in _planned_station_rows(store, lifecycle_plan)
+    ) == (("ST-1", True), ("ST-2", True))
+    assert parse_expected_ids(store, lifecycle_plan.expected_sta_ids) == (
+        "ST-1",
+        "ST-2",
+    )
+    inference_uri, inference_sha = _put_inference(
+        store,
+        inference_catalog=inference_catalog,
+        plan=lifecycle_plan,
+        rental_model=rental_model,
+        return_model=return_model,
+        prediction_offset=1.0,
+    )
+
+    result = _publish_plan(
+        gold_connection,
+        store,
+        catalog,
+        inference_catalog,
+        lifecycle_plan.uri,
+        lifecycle_plan.byte_sha256,
+        inference_uri,
+        inference_sha,
+    )
+
+    assert result.result.outcome is PublicationOutcome.PUBLISHED
+    assert _active_ids(gold_connection) == ("ST-1", "ST-2")
+    assert _stock_counts(gold_connection) == (("ST-1", 9),)
+    assert _demand_ids(gold_connection) == ("ST-1", "ST-2")
+    assert _serving_counts(gold_connection) == (
+        2,
+        2,
+        1,
+        2 * HORIZON_COUNT,
+        13,
+    )
+
+
 def test_missing_weather_candidate_stays_inactive_and_topology_drift_fails(
     gold_connection: Connection[Any],
+    inference_catalog: InMemoryInferenceRevisionCatalog,
 ) -> None:
     """13h가 없는 candidate를 미활성화하고 plan 뒤 topology 변경을 fail-closed 한다."""
     client = boto3.client("s3", region_name="us-east-1")
@@ -551,6 +1112,7 @@ def test_missing_weather_candidate_stays_inactive_and_topology_drift_fails(
     )
     inference_uri, inference_sha = _put_inference(
         store,
+        inference_catalog=inference_catalog,
         plan=plan,
         rental_model=rental_model,
         return_model=return_model,
@@ -574,6 +1136,7 @@ def test_missing_weather_candidate_stays_inactive_and_topology_drift_fails(
             gold_connection,
             store,
             catalog,
+            inference_catalog,
             plan.uri,
             plan.byte_sha256,
             inference_uri,
@@ -585,6 +1148,7 @@ def test_missing_weather_candidate_stays_inactive_and_topology_drift_fails(
 
 def test_same_plan_concurrent_publish_serializes_to_publish_and_replay(
     gold_connection: Connection[Any],
+    inference_catalog: InMemoryInferenceRevisionCatalog,
 ) -> None:
     """동일 plan 동시 게시를 한 PUBLISHED와 한 exact replay로 직렬화한다."""
     client = boto3.client("s3", region_name="us-east-1")
@@ -624,6 +1188,7 @@ def test_same_plan_concurrent_publish_serializes_to_publish_and_replay(
     )
     inference_uri, inference_sha = _put_inference(
         store,
+        inference_catalog=inference_catalog,
         plan=plan,
         rental_model=rental_model,
         return_model=return_model,
@@ -648,6 +1213,7 @@ def test_same_plan_concurrent_publish_serializes_to_publish_and_replay(
                 connection,
                 worker_store,
                 worker_catalog,
+                inference_catalog,
                 plan.uri,
                 plan.byte_sha256,
                 inference_uri,
@@ -675,6 +1241,7 @@ def _put_release_sources(
     realtime_revision: int,
     rack_count: int,
     stock_count: int,
+    missing_stock_ids: tuple[str, ...] = (),
 ) -> tuple[
     SourceManifestArtifact,
     SourceManifestArtifact,
@@ -695,7 +1262,11 @@ def _put_release_sources(
         source_id="bike_station_realtime",
         logical=anchor,
         revision=realtime_revision,
-        rows=_realtime_rows(rack_count=rack_count, stock_count=stock_count),
+        rows=_realtime_rows(
+            rack_count=rack_count,
+            stock_count=stock_count,
+            missing_stock_ids=missing_stock_ids,
+        ),
     )
     short = _put_weather_source(
         client,
@@ -742,8 +1313,10 @@ def _realtime_rows(
     rack_count: int,
     stock_count: int,
     second_point: tuple[float, float] | None = None,
+    missing_stock_ids: tuple[str, ...] = (),
 ) -> tuple[dict[str, object], ...]:
     """두 station의 same-anchor serving-valid realtime row를 반환한다."""
+    missing = set(missing_stock_ids)
     point_by_id = {
         "ST-1": (127.0473, 37.5172),
         "ST-2": second_point or (127.0473, 37.5172),
@@ -753,7 +1326,7 @@ def _realtime_rows(
             "stationId": station_id,
             "stationName": f"강남 대여소 {station_id}",
             "rackTotCnt": rack_count,
-            "parkingBikeTotCnt": stock_count,
+            "parkingBikeTotCnt": None if station_id in missing else stock_count,
             "shared": 0,
             "stationLatitude": point_by_id[station_id][1],
             "stationLongitude": point_by_id[station_id][0],
@@ -801,6 +1374,7 @@ def _put_model_snapshot(
 def _put_inference(
     store: S3ImmutableObjectStore,
     *,
+    inference_catalog: InMemoryInferenceRevisionCatalog,
     plan: Any,
     rental_model: Any,
     return_model: Any,
@@ -843,12 +1417,14 @@ def _put_inference(
         output = None
         inputs = ()
     row_count = len(expected_ids) * HORIZON_COUNT
+    revision_no = len(inference_catalog.snapshot(plan.plan.logical_dttm).records)
     manifest = build_inference_snapshot_manifest(
         logical_dttm=plan.plan.logical_dttm,
-        revision_no=0,
+        revision_no=revision_no,
         status=status,
         producer_version="serving-plan-integration-v1",
         serving_release=release_ref,
+        serving_plan=plan.serving_plan_ref,
         rental_model_manifest=build_model_manifest_ref(
             rental_model,
             _uri("model/rental/manifest", rental_model.sha256, "json"),
@@ -871,12 +1447,20 @@ def _put_inference(
         horizon_count=HORIZON_COUNT,
         output=output,
     )
-    uri = _uri("inference/manifest", manifest.sha256, "json")
+    uri = _uri("inference/manifests", manifest.sha256, "json")
     store.put_once(
         uri,
         manifest.canonical_bytes,
         expected_sha256=manifest.sha256,
         require_canonical_json=True,
+    )
+    inference_catalog.claim(
+        InferenceRevisionRecord(
+            logical_dttm=manifest.logical_dttm,
+            revision_no=manifest.revision_no,
+            manifest_byte_sha256=manifest.sha256,
+            manifest_uri=uri,
+        )
     )
     return uri, manifest.sha256
 
@@ -948,6 +1532,7 @@ def _publish_plan(
     connection: Connection[Any],
     store: S3ImmutableObjectStore,
     catalog: S3SourceSnapshotCatalog,
+    inference_catalog: InMemoryInferenceRevisionCatalog,
     plan_uri: str,
     plan_sha: str,
     inference_uri: str,
@@ -961,6 +1546,7 @@ def _publish_plan(
         plan_sha256=plan_sha,
         inference_manifest_uri=inference_uri,
         inference_manifest_sha256=inference_sha,
+        inference_catalog=inference_catalog,
         source_catalog=catalog,
     )
 

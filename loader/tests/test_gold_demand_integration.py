@@ -23,6 +23,7 @@ from core.inference_snapshot import (
     InferenceSnapshotCounts,
     InferenceSnapshotStatus,
     ParquetOutputRef,
+    ServingPlanRef,
     ServingReleaseRef,
     build_inference_snapshot_manifest,
     build_model_manifest_ref,
@@ -216,6 +217,12 @@ def _put_inference_snapshot(
         release_version=f"sha256:{release_sha}",
         uri=_uri("serving-release", release_sha, "json"),
     )
+    plan_bytes = b'{"plan":"demand-integration-v1"}'
+    plan_sha = sha256_hex(plan_bytes)
+    serving_plan = ServingPlanRef(
+        byte_sha256=plan_sha,
+        uri=_uri("serving-plan", plan_sha, "json"),
+    )
 
     if expected_sta_ids:
         output_bytes = _inference_output_bytes(
@@ -248,6 +255,7 @@ def _put_inference_snapshot(
         status=status,
         producer_version="inference-producer-integration-v1",
         serving_release=serving_release,
+        serving_plan=serving_plan,
         rental_model_manifest=build_model_manifest_ref(
             rental_model,
             _model_uri(rental_model),

@@ -9,11 +9,9 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+import core.gold_publication.transaction as transaction_module
 import psycopg
 import pytest
-from psycopg import Connection, Cursor
-
-import core.gold_publication.transaction as transaction_module
 from core.gold_publication.canonical import parse_canonical_json, sha256_hex
 from core.gold_publication.contract import (
     Artifact,
@@ -49,6 +47,7 @@ from core.gold_publication.transaction import (
     execute_publication,
     required_lock_scope,
 )
+from psycopg import Connection, Cursor
 
 _DATABASE_URL = os.environ.get("GOLD_PUBLICATION_TEST_DATABASE_URL")
 _PUBLIC_TABLES = (
@@ -452,6 +451,222 @@ def test_multi_key_mixed_outcome_fails_without_partial_state(
         execute_publication(gold_connection, [existing, new_key], _fail_if_mutated)
 
     assert _state_row(gold_connection, "event:performance_event") is None
+
+
+def test_opt_in_mixed_replay_validates_all_and_mutates_published_subset(
+    gold_connection: Connection[Any],
+) -> None:
+    """Opt-in 혼합 실행은 전체를 검증하고 replay target 뒤 신규 key만 변경한다."""
+    logical_dttm = datetime.now(UTC) - timedelta(minutes=1)
+    replayed = _prepared_event(logical_dttm, revision_no=0, content="replayed")
+    execute_publication(gold_connection, [replayed], _noop_mutation)
+    published = _prepared(
+        "event:performance_event",
+        logical_dttm,
+        revision_no=0,
+        content="published",
+        target_row_counts={"event": 1},
+    )
+    locked_keys: list[tuple[str, ...]] = []
+    replayed_keys: list[tuple[str, ...]] = []
+    mutated_keys: list[tuple[str, ...]] = []
+
+    def validate_all_locked(
+        _cursor: Cursor[tuple[Any, ...]],
+        publications: tuple[VerifiedPublicationEvidence, ...],
+    ) -> None:
+        """Locked validator가 replay와 publish evidence를 모두 받았음을 기록한다."""
+        locked_keys.append(
+            tuple(item.manifest.publication_key for item in publications)
+        )
+        replay_snapshot = next(
+            item
+            for item in publications
+            if item.manifest.publication_key == "event:cultural_event"
+        )
+        object.__setattr__(replay_snapshot.publication, "manifest", published.manifest)
+
+    def validate_replayed_targets(
+        _cursor: Cursor[tuple[Any, ...]],
+        publications: tuple[VerifiedPublicationEvidence, ...],
+    ) -> None:
+        """Replay target validator가 exact replay subset만 받았음을 기록한다."""
+        replayed_keys.append(
+            tuple(item.manifest.publication_key for item in publications)
+        )
+
+    def mutate_published_targets(
+        _cursor: Cursor[tuple[Any, ...]],
+        publications: tuple[VerifiedPublicationEvidence, ...],
+    ) -> None:
+        """Mutation callback이 PUBLISHED subset만 받았음을 기록한다."""
+        mutated_keys.append(
+            tuple(item.manifest.publication_key for item in publications)
+        )
+
+    result = execute_publication(
+        gold_connection,
+        [published, replayed],
+        mutate_published_targets,
+        validate_locked=validate_all_locked,
+        allow_mixed_replay=True,
+        validate_replay_targets_locked=validate_replayed_targets,
+    )
+
+    assert result.outcome is PublicationOutcome.PUBLISHED
+    assert result.publication_keys == (
+        "event:cultural_event",
+        "event:performance_event",
+    )
+    assert locked_keys == [result.publication_keys]
+    assert replayed_keys == [("event:cultural_event",)]
+    assert mutated_keys == [("event:performance_event",)]
+    assert _state_row(gold_connection, "event:performance_event") is not None
+
+
+def test_opt_in_mixed_replay_target_failure_rolls_back_new_claim(
+    gold_connection: Connection[Any],
+) -> None:
+    """Replay target drift가 있으면 혼합 transaction의 신규 claim도 남기지 않는다."""
+    logical_dttm = datetime.now(UTC) - timedelta(minutes=1)
+    replayed = _prepared_event(logical_dttm, revision_no=0, content="replayed-drift")
+    execute_publication(gold_connection, [replayed], _noop_mutation)
+    published = _prepared(
+        "event:performance_event",
+        logical_dttm,
+        revision_no=0,
+        content="published-rollback",
+        target_row_counts={"event": 1},
+    )
+
+    def reject_replayed_target(
+        _cursor: Cursor[tuple[Any, ...]],
+        _publications: tuple[VerifiedPublicationEvidence, ...],
+    ) -> None:
+        """Sealed replay target drift를 모사한다."""
+        raise ContractViolation("replayed target drift")
+
+    with pytest.raises(ContractViolation, match="replayed target drift"):
+        execute_publication(
+            gold_connection,
+            [replayed, published],
+            _fail_if_mutated,
+            allow_mixed_replay=True,
+            validate_replay_targets_locked=reject_replayed_target,
+        )
+
+    assert _state_row(gold_connection, "event:performance_event") is None
+
+
+def test_opt_in_mixed_replay_rechecks_replayed_dependencies(
+    gold_connection: Connection[Any],
+) -> None:
+    """Replay evidence의 dependency도 전체 lock 아래 current state와 다시 대조한다."""
+    station_dependency = _seed_state(gold_connection, "station")
+    logical_dttm = datetime.now(UTC) - timedelta(minutes=1)
+    replayed = _prepared(
+        "station_demand_forecast",
+        logical_dttm,
+        revision_no=0,
+        content="dependent-replay",
+        target_row_counts={"station_demand_forecast": 1},
+        dependencies=(station_dependency,),
+    )
+    execute_publication(gold_connection, [replayed], _noop_mutation)
+    with gold_connection.transaction(), gold_connection.cursor() as cursor:
+        cursor.execute(
+            """
+            UPDATE gold_meta.publication_state
+               SET revision_no = 1,
+                   manifest_uri = %s,
+                   artifact_set_sha256 = %s,
+                   input_fingerprint_sha256 = %s
+             WHERE publication_key = 'station'
+            """,
+            (
+                "s3://fixture/dependency/station-corrected.json",
+                sha256_hex(b"station-corrected-artifact"),
+                sha256_hex(b"station-corrected-input"),
+            ),
+        )
+    published = _prepared_event(
+        logical_dttm,
+        revision_no=0,
+        content="new-alongside-dependent-replay",
+    )
+
+    with pytest.raises(PublicationDependencyError, match="dependency tuple"):
+        execute_publication(
+            gold_connection,
+            [replayed, published],
+            _fail_if_mutated,
+            allow_mixed_replay=True,
+            validate_replay_targets_locked=_fail_if_mutated,
+        )
+
+    assert _state_row(gold_connection, "event:cultural_event") is None
+
+
+def test_opt_in_keeps_all_replay_and_stale_mixed_legacy_semantics(
+    gold_connection: Connection[Any],
+) -> None:
+    """All-replay는 no-op이고 stale가 섞인 실행은 opt-in에서도 충돌한다."""
+    logical_dttm = datetime.now(UTC) - timedelta(minutes=1)
+    current = _prepared_event(logical_dttm, revision_no=0, content="legacy-replay")
+    execute_publication(gold_connection, [current], _noop_mutation)
+    locked_validations: list[tuple[str, ...]] = []
+    replay_validations: list[tuple[str, ...]] = []
+
+    def validate_all_locked(
+        _cursor: Cursor[tuple[Any, ...]],
+        publications: tuple[VerifiedPublicationEvidence, ...],
+    ) -> None:
+        """Opt-in all-replay도 일반 locked validator를 수행했음을 기록한다."""
+        locked_validations.append(
+            tuple(item.manifest.publication_key for item in publications)
+        )
+
+    def validate_all_replay_targets(
+        _cursor: Cursor[tuple[Any, ...]],
+        publications: tuple[VerifiedPublicationEvidence, ...],
+    ) -> None:
+        """Opt-in all-replay도 lock 안 target 검증을 수행했음을 기록한다."""
+        replay_validations.append(
+            tuple(item.manifest.publication_key for item in publications)
+        )
+
+    replay = execute_publication(
+        gold_connection,
+        [current],
+        _fail_if_mutated,
+        validate_locked=validate_all_locked,
+        allow_mixed_replay=True,
+        validate_replay_targets_locked=validate_all_replay_targets,
+    )
+    assert replay.outcome is PublicationOutcome.EXACT_REPLAY
+    assert locked_validations == [("event:cultural_event",)]
+    assert replay_validations == [("event:cultural_event",)]
+
+    stale = _prepared_event(
+        logical_dttm - timedelta(minutes=1),
+        revision_no=0,
+        content="legacy-stale",
+    )
+    new_key = _prepared(
+        "event:performance_event",
+        logical_dttm,
+        revision_no=0,
+        content="new-with-stale",
+        target_row_counts={"event": 1},
+    )
+    with pytest.raises(PublicationConflictError, match="판정이 섞여"):
+        execute_publication(
+            gold_connection,
+            [stale, new_key],
+            _fail_if_mutated,
+            allow_mixed_replay=True,
+            validate_replay_targets_locked=_fail_if_mutated,
+        )
 
 
 def test_same_key_two_sessions_serialize_to_publish_then_replay(

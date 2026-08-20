@@ -30,6 +30,8 @@ from core.gold_publication import (
     validate_sha256_hex,
     validate_station_stock_release,
 )
+from core.inference_catalog import InferenceRevisionCatalog
+from core.inference_snapshot import ServingPlanRef
 from core.model_snapshot import (
     IdSetArtifactRef,
     build_id_set_artifact_ref,
@@ -38,7 +40,6 @@ from core.model_snapshot import (
 from core.source_snapshot import parse_source_snapshot_manifest
 from psycopg import Connection, Cursor
 from psycopg.pq import TransactionStatus
-from psycopg.rows import tuple_row
 
 from . import demand as demand_publisher
 from . import station_release, weather_forecast
@@ -46,7 +47,6 @@ from .common import (
     OutputObject,
     PublicationExecution,
     build_prepared_publication,
-    content_addressed_uri,
     materialize_publication,
     publish_verified,
 )
@@ -248,7 +248,7 @@ class ServingPlanArtifact:
             raise ContractViolation("plan은 ServingPlan이어야 합니다.")
         if self.byte_sha256 != self.plan.sha256:
             raise ContractViolation("serving plan 반환 SHA가 bytes와 다릅니다.")
-        _nonblank(self.uri, "serving plan URI")
+        ServingPlanRef(byte_sha256=self.byte_sha256, uri=self.uri)
 
     @property
     def station_dependency(self) -> Dependency:
@@ -259,6 +259,11 @@ class ServingPlanArtifact:
     def expected_sta_ids(self) -> IdSetArtifactRef:
         """Inference가 exact-read할 기대 station ID set reference를 반환한다."""
         return self.plan.expected_sta_ids
+
+    @property
+    def serving_plan_ref(self) -> ServingPlanRef:
+        """Inference manifest에 기록할 content-addressed plan reference를 반환한다."""
+        return ServingPlanRef(byte_sha256=self.byte_sha256, uri=self.uri)
 
 
 @dataclass(slots=True)
@@ -449,6 +454,17 @@ def prepare_serving_plan(
         relocation_approval=approval,
         expected_topology=topology,
     )
+    candidate_rows = station_release._realtime_rows(
+        object_store,
+        realtime_candidate,
+        role="bike_station_realtime_manifest",
+    )
+    stock_projection = station_release.build_station_stock_projection(
+        candidate_rows,
+        published_station_ids=tuple(record.sta_id for record in provisional.records),
+        candidate_logical_dttm=anchor,
+    )
+    current_stock_ids = tuple(record.sta_id for record in stock_projection.records)
 
     short_input = InputArtifact(
         byte_sha256=short_term_artifact.byte_sha256,
@@ -478,6 +494,7 @@ def prepare_serving_plan(
         short_input=short_input,
         ultra_input=ultra_input,
         anchor=anchor,
+        current_stock_ids=current_stock_ids,
     )
     _, station_projection = station_release._project_station_with_connection(
         connection,
@@ -505,18 +522,10 @@ def prepare_serving_plan(
         active_grids=final_active_grids,
         anchor=anchor,
     )
-    candidate_rows = station_release._realtime_rows(
-        object_store,
-        realtime_candidate,
-        role="bike_station_realtime_manifest",
-    )
-    stock_projection = station_release.build_station_stock_projection(
-        candidate_rows,
-        published_station_ids=tuple(
-            record.sta_id for record in station_projection.records
-        ),
-        candidate_logical_dttm=anchor,
-    )
+    if tuple(record.sta_id for record in station_projection.records) != tuple(
+        record.sta_id for record in provisional.records
+    ):
+        raise ContractViolation("activation gate가 station identity 집합을 바꿨습니다.")
     station_release._require_nonempty_release(station_projection, stock_projection)
 
     station_materials = materialize_publication(
@@ -579,6 +588,24 @@ def prepare_serving_plan(
         row_count=len(stock_projection.records),
         materials=stock_materials,
     )
+    replayed_station_pair = station_release._existing_realtime_replay(
+        connection,
+        object_store,
+        prior=prior_station,
+        dependencies=dependencies,
+        master_artifact=master_artifact,
+        realtime_candidate=realtime_candidate,
+        window_set=window_set,
+        relocation_approval_payload=relocation_approval_payload,
+    )
+    if (
+        replayed_station_pair is not None
+        and prior_station is not None
+        and prior_stock is not None
+        and station_projection.records == prior_station.records
+        and stock_projection.records == prior_stock.records
+    ):
+        station_prepared, stock_prepared = replayed_station_pair
     validate_station_stock_release(
         station_prepared.input_fingerprint,
         stock_prepared.input_fingerprint,
@@ -650,13 +677,8 @@ def prepare_serving_plan(
         prior_states=initial_states,
         source_lookbacks=source_lookbacks,
     )
-    plan_uri = content_addressed_uri(
-        object_base_uri,
-        publication_key="serving-plan",
-        category="plans",
-        name="serving-plan",
-        payload=plan.canonical_bytes,
-        suffix="json",
+    plan_uri = (
+        f"{object_base_uri.rstrip('/')}/serving-plan/plans/sha256={plan.sha256}.json"
     )
     object_store.put_once(
         plan_uri,
@@ -684,6 +706,7 @@ def publish_serving_plan(
     plan_sha256: str,
     inference_manifest_uri: str,
     inference_manifest_sha256: str,
+    inference_catalog: InferenceRevisionCatalog,
     source_catalog: S3SourceSnapshotCatalog,
     demand_publisher_version: str = DEMAND_PUBLISHER_VERSION,
 ) -> PublicationExecution:
@@ -737,6 +760,11 @@ def publish_serving_plan(
         inference_manifest_uri=inference_manifest_uri,
         inference_manifest_sha256=inference_manifest_sha256,
     )
+    plan_ref = ServingPlanRef(byte_sha256=plan_sha256, uri=plan_uri)
+    if snapshot.manifest.serving_plan != plan_ref:
+        raise ContractViolation(
+            "inference manifest serving_plan ref가 current plan URI·SHA와 다릅니다."
+        )
     if (
         snapshot.manifest.logical_dttm != plan.logical_dttm
         or snapshot.manifest.station_dependency != plan.station_dependency
@@ -746,6 +774,13 @@ def publish_serving_plan(
         raise ContractViolation(
             "inference manifest가 plan anchor·station dependency·expected ID와 다릅니다."
         )
+    _validate_inference_catalog_latest(
+        inference_catalog,
+        logical_dttm=plan.logical_dttm,
+        revision_no=snapshot.manifest.revision_no,
+        manifest_uri=inference_manifest_uri,
+        manifest_sha256=inference_manifest_sha256,
+    )
     _validate_inference_support_binding(
         object_store,
         snapshot,
@@ -769,13 +804,6 @@ def publish_serving_plan(
             station_output.uri,
             station_output.byte_sha256,
         )
-    )
-    stock_output = station_release._single_output(
-        stock_prepared.manifest,
-        "station_stock",
-    )
-    planned_stock_records = station_release._stock_records_from_parquet(
-        object_store.read_bytes(stock_output.uri, stock_output.byte_sha256)
     )
     planned_active_ids = _active_station_ids(planned_station_records)
     if expected_ids != tuple(
@@ -839,17 +867,40 @@ def publish_serving_plan(
     ) -> None:
         """모든 lock 안에서 prior·source·topology·네 sealed output을 재검증한다."""
         evidence_by_key = _evidence_by_key(evidence, _FINAL_PUBLICATION_KEYS)
-        _validate_locked_prior_states(cursor, plan, prior_demand)
-        previous_records = station_release._validate_prior_locked(
-            cursor,
-            object_store,
-            prior_station,
+        _validate_inference_catalog_latest(
+            inference_catalog,
+            logical_dttm=plan.logical_dttm,
+            revision_no=snapshot.manifest.revision_no,
+            manifest_uri=inference_manifest_uri,
+            manifest_sha256=inference_manifest_sha256,
         )
-        station_release._validate_prior_stock_locked(
+        _validate_locked_prior_states(
             cursor,
-            object_store,
-            prior_stock,
+            plan,
+            prior_demand,
+            evidence_by_key,
         )
+        station_is_replay = publication_state_locked(cursor, "station") == (
+            _state_from_evidence(evidence_by_key["station"])
+        )
+        previous_records = (
+            station_release._db_station_records(cursor)
+            if station_is_replay
+            else station_release._validate_prior_locked(
+                cursor,
+                object_store,
+                prior_station,
+            )
+        )
+        stock_is_replay = publication_state_locked(cursor, "station_stock") == (
+            _state_from_evidence(evidence_by_key["station_stock"])
+        )
+        if not stock_is_replay:
+            station_release._validate_prior_stock_locked(
+                cursor,
+                object_store,
+                prior_stock,
+            )
         master_artifact, realtime_artifacts = _station_sources_from_prepared(
             object_store,
             station_prepared,
@@ -881,6 +932,12 @@ def publish_serving_plan(
                 record.sta_id for record in station_projection.records
             ),
         )
+        if not set(activation_ready).issubset(
+            {record.sta_id for record in stock_projection.records}
+        ):
+            raise ContractViolation(
+                "activation-ready station의 locked current stock이 완전하지 않습니다."
+            )
         window_set = station_release._window_set_from_fingerprint(
             object_store,
             evidence_by_key["station"].input_fingerprint,
@@ -987,12 +1044,11 @@ def publish_serving_plan(
             "serving plan conditional EMPTY callback에 예상 밖 key가 전달됐습니다."
         )
 
-    def mutate_targets(
+    def validate_replay_targets_locked(
         cursor: Cursor[tuple[Any, ...]],
         evidence: tuple[VerifiedPublicationEvidence, ...],
     ) -> None:
-        """Station FK parent 뒤 stock·demand·weather를 한 transaction에서 reconcile한다."""
-        _evidence_by_key(evidence, _FINAL_PUBLICATION_KEYS)
+        """혼합 실행의 replay target을 같은 DB lock 아래 sealed projection과 대조한다."""
         if any(
             item is None
             for item in (holder.station, holder.stock, holder.demand, holder.weather)
@@ -1002,21 +1058,53 @@ def publish_serving_plan(
         assert holder.stock is not None
         assert holder.demand is not None
         assert holder.weather is not None
-        station_release._delete_affected_proposed_routes(
+        _validate_target_records_locked(
             cursor,
-            holder.route_invalidating_station_ids,
+            publication_keys=tuple(item.manifest.publication_key for item in evidence),
+            station_records=holder.station.records,
+            stock_records=holder.stock.records,
+            demand_records=holder.demand.records,
+            weather_records=holder.weather.records,
         )
-        station_release._upsert_station(cursor, holder.station.records)
-        station_release._replace_station_stock(cursor, holder.stock.records)
-        demand_publisher._reconcile_demand_records(cursor, holder.demand.records)
-        weather_forecast._upsert_weather_forecast_records(
-            cursor,
-            holder.weather.records,
-        )
-        weather_forecast._delete_absent_weather_forecast_records(
-            cursor,
-            holder.weather.records,
-        )
+
+    def mutate_targets(
+        cursor: Cursor[tuple[Any, ...]],
+        evidence: tuple[VerifiedPublicationEvidence, ...],
+    ) -> None:
+        """Station FK parent 뒤 stock·demand·weather를 한 transaction에서 reconcile한다."""
+        published_keys = {item.manifest.publication_key for item in evidence}
+        if not published_keys or not published_keys.issubset(_FINAL_PUBLICATION_KEYS):
+            raise ContractViolation(
+                "serving release published key subset이 잘못됐습니다."
+            )
+        if any(
+            item is None
+            for item in (holder.station, holder.stock, holder.demand, holder.weather)
+        ):
+            raise ContractViolation("locked serving projection이 완전하지 않습니다.")
+        assert holder.station is not None
+        assert holder.stock is not None
+        assert holder.demand is not None
+        assert holder.weather is not None
+        if "station" in published_keys:
+            station_release._delete_affected_proposed_routes(
+                cursor,
+                holder.route_invalidating_station_ids,
+            )
+            station_release._upsert_station(cursor, holder.station.records)
+        if "station_stock" in published_keys:
+            station_release._replace_station_stock(cursor, holder.stock.records)
+        if "station_demand_forecast" in published_keys:
+            demand_publisher._reconcile_demand_records(cursor, holder.demand.records)
+        if "weather_forecast" in published_keys:
+            weather_forecast._upsert_weather_forecast_records(
+                cursor,
+                holder.weather.records,
+            )
+            weather_forecast._delete_absent_weather_forecast_records(
+                cursor,
+                holder.weather.records,
+            )
 
     execution = publish_verified(
         connection,
@@ -1030,21 +1118,14 @@ def publish_serving_plan(
         mutate_targets,
         validate_locked=validate_locked,
         validate_conditional_empty=validate_conditional_empty,
+        allow_mixed_replay=True,
+        validate_replay_targets_locked=validate_replay_targets_locked,
     )
     if (
         execution.result.outcome is PublicationOutcome.PUBLISHED
         and execution.result.publication_keys != _FINAL_PUBLICATION_KEYS
     ):
         raise ContractViolation("serving release published key 집합이 다릅니다.")
-    if execution.result.outcome is PublicationOutcome.EXACT_REPLAY:
-        _validate_exact_replay_targets(
-            connection,
-            station_records=planned_station_records,
-            stock_records=planned_stock_records,
-            demand_projection=demand_projection,
-            weather_prepared=weather_prepared,
-            object_store=object_store,
-        )
     return execution
 
 
@@ -1342,34 +1423,40 @@ def _validate_sealed_weather_output(
         )
 
 
-def _validate_exact_replay_targets(
-    connection: Connection[Any],
+def _validate_target_records_locked(
+    cursor: Cursor[tuple[Any, ...]],
     *,
+    publication_keys: tuple[str, ...],
     station_records: tuple[StationRecord, ...],
     stock_records: tuple[StationStockRecord, ...],
-    demand_projection: DemandProjection,
-    weather_prepared: PreparedPublication,
-    object_store: ImmutableObjectStore,
+    demand_records: tuple[demand_publisher.DemandForecastRecord, ...],
+    weather_records: tuple[weather_forecast.WeatherForecastRecord, ...],
 ) -> None:
-    """Exact replay가 no-op하기 전 네 DB target이 sealed projection인지 확인한다."""
-    station_release._validate_db_station_short(connection, station_records)
-    station_release._validate_db_stock_short(connection, stock_records)
-    weather_artifacts = weather_prepared.manifest.artifacts
-    weather_records = (
-        ()
-        if not weather_artifacts
-        else weather_forecast._records_from_parquet(
-            object_store.read_bytes(
-                weather_artifacts[0].uri,
-                weather_artifacts[0].byte_sha256,
+    """선택된 replay key의 DB target을 동일 lock snapshot에서 exact 대조한다."""
+    if len(publication_keys) != len(set(publication_keys)) or not set(
+        publication_keys
+    ).issubset(_FINAL_PUBLICATION_KEYS):
+        raise ContractViolation("replay target key subset이 잘못됐습니다.")
+    keys = set(publication_keys)
+    if (
+        "station" in keys
+        and station_release._db_station_records(cursor) != station_records
+    ):
+        raise ContractViolation("replay station target이 sealed projection과 다릅니다.")
+    if "station_stock" in keys:
+        cursor.execute(
+            """
+            SELECT sta_id, base_dttm, parking_bike_tot_cnt
+              FROM station_stock
+             ORDER BY sta_id COLLATE "C"
+            """
+        )
+        actual_stock = tuple(StationStockRecord(*row) for row in cursor.fetchall())
+        if actual_stock != stock_records:
+            raise ContractViolation(
+                "replay station_stock target이 sealed projection과 다릅니다."
             )
-        )
-    )
-    if connection.info.transaction_status is not TransactionStatus.IDLE:
-        raise ContractViolation(
-            "exact replay target 검증은 idle connection이 필요합니다."
-        )
-    with connection.transaction(), connection.cursor(row_factory=tuple_row) as cursor:
+    if "station_demand_forecast" in keys:
         cursor.execute(
             """
             SELECT base_dttm,
@@ -1384,6 +1471,11 @@ def _validate_exact_replay_targets(
         actual_demand = tuple(
             demand_publisher.DemandForecastRecord(*row) for row in cursor.fetchall()
         )
+        if actual_demand != demand_records:
+            raise ContractViolation(
+                "replay demand target이 sealed projection과 다릅니다."
+            )
+    if "weather_forecast" in keys:
         cursor.execute(
             """
             SELECT weather_grid_id,
@@ -1404,14 +1496,10 @@ def _validate_exact_replay_targets(
         actual_weather = tuple(
             weather_forecast.WeatherForecastRecord(*row) for row in cursor.fetchall()
         )
-    if actual_demand != demand_projection.records:
-        raise ContractViolation(
-            "exact replay demand target이 sealed projection과 다릅니다."
-        )
-    if actual_weather != weather_records:
-        raise ContractViolation(
-            "exact replay weather target이 sealed projection과 다릅니다."
-        )
+        if actual_weather != weather_records:
+            raise ContractViolation(
+                "replay weather target이 sealed projection과 다릅니다."
+            )
 
 
 def _weather_projection_from_artifacts(
@@ -1445,9 +1533,15 @@ def _activation_ready_station_ids(
     short_input: InputArtifact,
     ultra_input: InputArtifact,
     anchor: datetime,
+    current_stock_ids: tuple[str, ...],
 ) -> tuple[str, ...]:
-    """13시간 coverage가 있는 inactive candidate ID를 canonical 순서로 반환한다."""
-    covered_grids: set[str] = set()
+    """13시간 weather와 valid current stock이 모두 있는 station ID를 반환한다."""
+    if type(current_stock_ids) is not tuple:
+        raise ContractViolation("current stock ID는 tuple이어야 합니다.")
+    if build_id_set(current_stock_ids).ids != current_stock_ids:
+        raise ContractViolation("current stock ID는 중복 없는 UTF-8 순이어야 합니다.")
+    stock_ids = set(current_stock_ids)
+    covered_grids = set(_active_grid_ids(provisional.records))
     for grid_id in sorted(
         {
             record.weather_grid_id
@@ -1474,7 +1568,7 @@ def _activation_ready_station_ids(
     return tuple(
         record.sta_id
         for record in provisional.records
-        if not record.is_active and record.weather_grid_id in covered_grids
+        if (record.sta_id in stock_ids and record.weather_grid_id in covered_grids)
     )
 
 
@@ -1654,6 +1748,39 @@ def _validate_inference_support_binding(
         )
 
 
+def _validate_inference_catalog_latest(
+    catalog: InferenceRevisionCatalog,
+    *,
+    logical_dttm: datetime,
+    revision_no: int,
+    manifest_uri: str,
+    manifest_sha256: str,
+) -> None:
+    """Catalog의 same-logical latest를 exact inference identity에 결합한다."""
+    snapshot_method = getattr(catalog, "snapshot", None)
+    if not callable(snapshot_method):
+        raise ContractViolation("inference catalog에 snapshot 경계가 없습니다.")
+    snapshot = snapshot_method(logical_dttm)
+    records = getattr(snapshot, "records", None)
+    logical = _utc(logical_dttm, "inference catalog logical_dttm")
+    if type(records) is not tuple or not records:
+        raise ContractViolation("inference catalog에 요청 logical revision이 없습니다.")
+    latest = records[-1]
+    if (
+        _utc(
+            getattr(latest, "logical_dttm", None),
+            "inference catalog record logical_dttm",
+        )
+        != logical
+        or getattr(latest, "revision_no", None) != revision_no
+        or getattr(latest, "manifest_uri", None) != manifest_uri
+        or getattr(latest, "manifest_byte_sha256", None) != manifest_sha256
+    ):
+        raise ContractViolation(
+            "inference manifest가 catalog의 same-logical latest revision이 아닙니다."
+        )
+
+
 def _store_id_set(
     object_store: ImmutableObjectStore,
     *,
@@ -1801,14 +1928,38 @@ def _validate_locked_prior_states(
     cursor: Cursor[tuple[Any, ...]],
     plan: ServingPlan,
     prior_demand: PublicationStateRecord | None,
+    evidence_by_key: Mapping[str, VerifiedPublicationEvidence],
 ) -> None:
-    """Publication lock 안에서 plan 세 key와 final demand prior를 재검증한다."""
+    """Replay current 또는 준비 시 prior인지 publication lock 안에서 검증한다."""
     for key in _PLAN_PUBLICATION_KEYS:
-        _require_plan_prior_state(plan, key, publication_state_locked(cursor, key))
-    if publication_state_locked(cursor, "station_demand_forecast") != prior_demand:
+        actual = publication_state_locked(cursor, key)
+        if actual != _state_from_evidence(evidence_by_key[key]):
+            _require_plan_prior_state(plan, key, actual)
+    demand_key = "station_demand_forecast"
+    demand_actual = publication_state_locked(cursor, demand_key)
+    if (
+        demand_actual != _state_from_evidence(evidence_by_key[demand_key])
+        and demand_actual != prior_demand
+    ):
         raise ContractViolation(
             "demand 준비 후 station_demand_forecast state가 바뀌었습니다."
         )
+
+
+def _state_from_evidence(
+    evidence: VerifiedPublicationEvidence,
+) -> PublicationStateRecord:
+    """Verified evidence를 DB publication state 비교 tuple로 바꾼다."""
+    manifest = evidence.manifest
+    return PublicationStateRecord(
+        publication_key=manifest.publication_key,
+        logical_dttm=manifest.logical_dttm,
+        revision_no=manifest.revision_no,
+        manifest_uri=evidence.manifest_uri,
+        artifact_set_sha256=manifest.artifact_set_sha256,
+        input_fingerprint_sha256=manifest.input_fingerprint_sha256,
+        published_row_cnt=manifest.published_row_cnt,
+    )
 
 
 def _evidence_by_key(

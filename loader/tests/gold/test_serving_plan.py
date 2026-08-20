@@ -19,6 +19,7 @@ from core.model_snapshot import IdSetArtifactRef, build_id_set_artifact_ref
 from gold.serving_plan import (
     PreparedManifestRef,
     ServingPlan,
+    ServingPlanArtifact,
     SourceLookbacks,
     _activation_ready_station_ids,
     _store_id_set,
@@ -172,6 +173,22 @@ def test_serving_plan_canonical_round_trip_and_exact_keys() -> None:
         parse_serving_plan(canonical_json_bytes(document))
 
 
+def test_serving_plan_artifact_exposes_inference_compatible_exact_ref() -> None:
+    """Stored plan URI를 inference ServingPlanRef의 sha256= 형식에 고정한다."""
+    plan = _plan()
+    uri = f"s3://fixture/gold/serving-plan/plans/sha256={plan.sha256}.json"
+    artifact = ServingPlanArtifact(plan, uri, plan.sha256)
+
+    assert artifact.serving_plan_ref.byte_sha256 == plan.sha256
+    assert artifact.serving_plan_ref.uri == uri
+    with pytest.raises(ContractViolation):
+        ServingPlanArtifact(
+            plan,
+            f"s3://fixture/gold/serving-plan-{plan.sha256}.json",
+            plan.sha256,
+        )
+
+
 def test_plan_requires_same_anchor_station_dependency_and_prepared_order() -> None:
     """Inference station tuple과 prepared key 순서가 흔들리면 plan을 거부한다."""
     values = _plan()
@@ -222,15 +239,16 @@ def test_plan_id_set_uses_model_contract_content_addressed_filename() -> None:
     )
 
 
-def test_activation_gate_only_marks_inactive_station_with_complete_weather(
+def test_activation_gate_requires_complete_weather_and_current_stock(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """기존 active는 gate 밖이고 candidate는 singleton 13h coverage로만 준비된다."""
+    """Candidate는 singleton 13h weather와 current stock이 모두 있어야 준비된다."""
     projection = StationProjection(
         records=(
             _station("ST-1", "61_126", active=True),
             _station("ST-2", "62_126", active=False),
             _station("ST-3", "63_126", active=False),
+            _station("ST-4", "64_126", active=False),
         ),
         relocation_applied=False,
         lkg_retained_count=0,
@@ -256,6 +274,7 @@ def test_activation_gate_only_marks_inactive_station_with_complete_weather(
         short_input=object(),  # type: ignore[arg-type]
         ultra_input=object(),  # type: ignore[arg-type]
         anchor=_LOGICAL,
+        current_stock_ids=("ST-1", "ST-2", "ST-3"),
     )
 
-    assert ready == ("ST-2",)
+    assert ready == ("ST-1", "ST-2")
