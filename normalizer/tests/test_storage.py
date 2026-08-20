@@ -7,9 +7,14 @@ import boto3
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
-
 import storage
-from tests.conftest import KST, TEST_BUCKET
+
+from tests.conftest import (
+    KST,
+    TEST_BUCKET,
+    put_partial_source_snapshot,
+    put_source_snapshot,
+)
 
 
 def _s3():
@@ -27,7 +32,9 @@ class TestReadNowcastGrid:
 
     def test_reads_nowcast_parquet_for_the_date(self):
         nowcast = pa.table({"CELL_ID": ["가가00000000"], "TT": ["14"], "SPOP": [10.0]})
-        _put_parquet("silver/living_population_grid/dt=2026-08-12/hh=00/nowcast.parquet", nowcast)
+        _put_parquet(
+            "silver/living_population_grid/dt=2026-08-12/hh=00/nowcast.parquet", nowcast
+        )
 
         result = storage.read_nowcast_grid(date(2026, 8, 12))
 
@@ -36,21 +43,35 @@ class TestReadNowcastGrid:
     def test_reads_future_dates_too(self):
         """nowcaster가 D+3까지 만들므로 12시간 앞(자정 넘김)도 읽을 수 있어야 한다."""
         nowcast = pa.table({"CELL_ID": ["가가00000000"], "TT": ["06"], "SPOP": [7.0]})
-        _put_parquet("silver/living_population_grid/dt=2026-08-13/hh=00/nowcast.parquet", nowcast)
+        _put_parquet(
+            "silver/living_population_grid/dt=2026-08-13/hh=00/nowcast.parquet", nowcast
+        )
 
-        assert storage.read_nowcast_grid(date(2026, 8, 13)).to_pylist() == nowcast.to_pylist()
+        assert (
+            storage.read_nowcast_grid(date(2026, 8, 13)).to_pylist()
+            == nowcast.to_pylist()
+        )
 
     def test_ignores_measured_parquet_in_the_same_prefix(self):
         measured = pa.table({"CELL_ID": ["가가99999999"], "SPOP": [999.0]})
         nowcast = pa.table({"CELL_ID": ["가가00000000"], "SPOP": [10.0]})
-        _put_parquet("silver/living_population_grid/dt=2026-08-12/hh=14/1400.parquet", measured)
-        _put_parquet("silver/living_population_grid/dt=2026-08-12/hh=00/nowcast.parquet", nowcast)
+        _put_parquet(
+            "silver/living_population_grid/dt=2026-08-12/hh=14/1400.parquet", measured
+        )
+        _put_parquet(
+            "silver/living_population_grid/dt=2026-08-12/hh=00/nowcast.parquet", nowcast
+        )
 
-        assert storage.read_nowcast_grid(date(2026, 8, 12)).to_pylist() == nowcast.to_pylist()
+        assert (
+            storage.read_nowcast_grid(date(2026, 8, 12)).to_pylist()
+            == nowcast.to_pylist()
+        )
 
     def test_raises_when_nowcast_missing_even_if_measured_exists(self):
         measured = pa.table({"CELL_ID": ["가가99999999"], "SPOP": [999.0]})
-        _put_parquet("silver/living_population_grid/dt=2026-08-12/hh=14/1400.parquet", measured)
+        _put_parquet(
+            "silver/living_population_grid/dt=2026-08-12/hh=14/1400.parquet", measured
+        )
 
         with pytest.raises(storage.PartitionNotFoundError):
             storage.read_nowcast_grid(date(2026, 8, 12))
@@ -59,11 +80,17 @@ class TestReadNowcastGrid:
         with pytest.raises(storage.PartitionNotFoundError):
             storage.read_nowcast_grid(date(2026, 8, 12))
 
-    def test_latest_nowcast_for_station_geometry_uses_prior_success_and_ignores_future(self):
+    def test_latest_nowcast_for_station_geometry_uses_prior_success_and_ignores_future(
+        self,
+    ):
         prior = pa.table({"CELL_ID": ["가가00000001"], "TT": ["00"], "SPOP": [1.0]})
         future = pa.table({"CELL_ID": ["가가00000002"], "TT": ["00"], "SPOP": [2.0]})
-        _put_parquet("silver/living_population_grid/dt=2026-08-11/hh=00/nowcast.parquet", prior)
-        _put_parquet("silver/living_population_grid/dt=2026-08-13/hh=00/nowcast.parquet", future)
+        _put_parquet(
+            "silver/living_population_grid/dt=2026-08-11/hh=00/nowcast.parquet", prior
+        )
+        _put_parquet(
+            "silver/living_population_grid/dt=2026-08-13/hh=00/nowcast.parquet", future
+        )
 
         snapshot_date, result = storage.read_latest_nowcast_grid(date(2026, 8, 12))
 
@@ -75,7 +102,17 @@ class TestReadRealtimeSilver:
     def test_reads_exact_window_key(self):
         window_start = datetime(2026, 8, 12, 14, 5, tzinfo=KST)
         table = pa.table({"AREA_CD": ["POI001"]})
-        _put_parquet("silver/population_realtime/dt=2026-08-12/hh=14/1405.parquet", table)
+        put_source_snapshot("population_realtime", window_start, table)
+
+        result = storage.read_realtime_silver(window_start)
+
+        assert result.column("AREA_CD").to_pylist() == ["POI001"]
+
+    def test_reads_completed_partial_window_from_diagnostic_manifest(self):
+        """운영 정책상 허용된 POI 일부 누락은 authority 없이도 명시적으로 읽는다."""
+        window_start = datetime(2026, 8, 12, 14, 5, tzinfo=KST)
+        table = pa.table({"AREA_CD": ["POI001"]})
+        put_partial_source_snapshot("population_realtime", window_start, table)
 
         result = storage.read_realtime_silver(window_start)
 
@@ -94,8 +131,13 @@ class TestWriteNormalizedSilverAndManifest:
 
         key = storage.write_normalized_silver(window_start, table)
 
-        assert key == "silver/living_population_normalized/dt=2026-08-12/hh=14/1405.parquet"
-        stored = pq.read_table(io.BytesIO(_s3().get_object(Bucket=TEST_BUCKET, Key=key)["Body"].read()))
+        assert (
+            key
+            == "silver/living_population_normalized/dt=2026-08-12/hh=14/1405.parquet"
+        )
+        stored = pq.read_table(
+            io.BytesIO(_s3().get_object(Bucket=TEST_BUCKET, Key=key)["Body"].read())
+        )
         assert stored.column("SPOP").to_pylist() == [42]
 
     def test_older_generation_cannot_overwrite_newer_target(self):
@@ -117,7 +159,9 @@ class TestWriteNormalizedSilverAndManifest:
 
         assert key is not None
         assert skipped is None
-        stored = pq.read_table(io.BytesIO(_s3().get_object(Bucket=TEST_BUCKET, Key=key)["Body"].read()))
+        stored = pq.read_table(
+            io.BytesIO(_s3().get_object(Bucket=TEST_BUCKET, Key=key)["Body"].read())
+        )
         assert stored.column("SPOP").to_pylist() == [42]
 
     def test_newer_generation_replaces_older_forecast(self):
@@ -137,15 +181,24 @@ class TestWriteNormalizedSilverAndManifest:
         )
 
         assert key is not None
-        stored = pq.read_table(io.BytesIO(_s3().get_object(Bucket=TEST_BUCKET, Key=key)["Body"].read()))
+        stored = pq.read_table(
+            io.BytesIO(_s3().get_object(Bucket=TEST_BUCKET, Key=key)["Body"].read())
+        )
         assert stored.column("SPOP").to_pylist() == [42]
 
     def test_write_manifest_key_and_content(self):
         window_start = datetime(2026, 8, 12, 14, 5, tzinfo=KST)
 
-        key = storage.write_manifest(window_start, {"baseline_date": "2026-08-12", "baseline_date_mode": "strict"})
+        key = storage.write_manifest(
+            window_start,
+            {"baseline_date": "2026-08-12", "baseline_date_mode": "strict"},
+        )
 
-        assert key == "_manifest/living_population_normalized/dt=2026-08-12/hh=14/1405.json"
+        assert (
+            key
+            == "_manifest/living_population_normalized/dt=2026-08-12/hh=14/1405.json"
+        )
         import json
+
         body = json.loads(_s3().get_object(Bucket=TEST_BUCKET, Key=key)["Body"].read())
         assert body == {"baseline_date": "2026-08-12", "baseline_date_mode": "strict"}
