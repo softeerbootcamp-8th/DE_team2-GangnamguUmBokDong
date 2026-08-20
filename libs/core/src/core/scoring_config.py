@@ -1,7 +1,18 @@
-"""urgency_score/enrich_forecast_points 계산에 쓰이는 정책/튜닝값. 실측 데이터로
-분포를 보면서 계속 조정될 값이라, 계산 로직(rebalance/urgency.py, core/forecast.py)과
-분리해서 값만 바꿀 수 있게 둔다. urgency_score는 배치(rebalance/), enrich_forecast_points는
-실시간(apps/api)과 배치 양쪽에서 쓰여 이 상수들을 공유해야 하므로 libs/core에 둔다."""
+"""Urgency 계산의 versioned 정책과 튜닝값을 정의한다.
+
+실측 데이터 분포에 따라 조정될 값이라 계산 로직(rebalance/urgency.py,
+core/forecast.py)과 분리한다. urgency_score는 배치(rebalance/)에서 계산하고
+enrich_forecast_points는 실시간(apps/api)과 배치가 함께 쓰므로 이 상수들은
+libs/core에서 공유한다.
+"""
+
+URGENCY_SCORING_CONFIG_VERSION = "urgency-scoring-v1"
+
+# 현행 urgency reader가 anchor-25분부터 anchor-5분까지 읽는 과거 window의
+# 시간 방향을 byte contract로 고정한다. 현재 anchor는 별도
+# stock_publication_manifest가 소유하므로 전체 계산 window 수는 6개다.
+URGENCY_STOCK_HISTORY_OFFSETS_MINUTES = (-25, -20, -15, -10, -5)
+URGENCY_STOCK_WINDOW_COUNT = len(URGENCY_STOCK_HISTORY_OFFSETS_MINUTES) + 1
 
 RESPONSE_LAG_MIN = 30  # 트럭 출동~도착 소요시간
 HALF_LIFE_MIN = 60  # 대응 여유시간이 이만큼 늘어날 때마다 시급성 점수가 절반이 됨

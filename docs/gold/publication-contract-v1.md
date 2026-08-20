@@ -94,6 +94,22 @@ version을 올린다. `manifest` role은 해당 upstream manifest의 실제 byte
 표의 dependency 집합은 정확히 그 key들이며 각 role과 parameter는 정확히 한 번 나온다.
 `stock_history_manifest_01 … stock_history_manifest_05`는 suffix `01`, `02`, `03`, `04`,
 `05` 다섯 role을 뜻하며 현재 window는 `stock_publication_manifest`가 소유한다.
+시간 방향은 기존 25분 lookback reader와 동일한 오래된 순서다. urgency logical time을
+`t`라고 할 때 `01=t-25분`, `02=t-20분`, `03=t-15분`, `04=t-10분`,
+`05=t-5분`이고 `stock_publication_manifest=t`다. 따라서
+`stock_window_count`의 exact 값은 과거 다섯 window와 현재 하나를 합친 문자열 `"6"`이다.
+다섯 과거 source manifest는 모두 authoritative complete snapshot이어야 한다. 다만 각
+snapshot 자체가 완전하다면 신규 station이 과거 일부 snapshot에 존재하지 않는 것은
+허용하며, station별 추세는 존재하는 과거 point와 current point로 계산한다.
+
+`scoring_config_version`의 최초 exact 값은 `urgency-scoring-v1`이다. 이 version은
+`RESPONSE_LAG_MIN=30`, `HALF_LIFE_MIN=60`, `FIRST_FORECAST_MIN=60`,
+`SUPPLY_LOW_STOCK_RATIO=0.20`, `SEVERITY_SCALE=1.5`와 현재 trend·severity·rounding 의미를
+함께 가리킨다. 이 값이나 알고리즘 의미가 바뀌면 config version과 urgency publisher
+version을 함께 올린다. 과거 source snapshot 또는 current stock의 같은 logical time
+higher correction을 재계산·재게시할 때는 동일 urgency anchor의 명시적으로 더 큰
+revision을 사용해야 하며 exact same version·fingerprint replay만 no-op이다.
+
 `station_previous_projection`만 최초 station state가 없으면 0개,
 있으면 정확히 1개다. `station_relocation_approval`은 100m 초과 Point 후보를 이번
 publication에서 실제 승인 반영할 때만 정확히 1개이고 그 외에는 0개다. 그 밖의
