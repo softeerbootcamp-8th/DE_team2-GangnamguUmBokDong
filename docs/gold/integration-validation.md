@@ -44,7 +44,7 @@ PR #156부터 #160까지는 `develop`에 병합됐다. 이 runbook은 최종 sta
 | Web | PARTIAL | mock API에서 stale clear, 404/503, polling race, weather와 event 상태 및 production build | 실제 API/DB와 연결한 browser E2E |
 | Airflow | PARTIAL | DAG import, dependency graph, allowlisted publisher CLI command wiring | scheduler가 source부터 target까지 실행한 task E2E |
 | publisher/API 최소 권한 | BLOCKED | `PUBLIC` revoke만 존재 | 서비스별 role·credential·GRANT/REVOKE 검증 |
-| weather seed와 station activation | PARTIAL/BLOCKED | 13시간 weather·stock·model support를 같은 lock에서 검증하는 activation 통합 테스트 | 승인 seed 값으로 실행한 최초 activation |
+| weather seed와 station activation | PARTIAL/BLOCKED | 13시간 weather·current stock 및 model-supported 후보의 same-anchor demand를 같은 lock에서 검증하는 activation 통합 테스트 | 승인 seed 값으로 실행한 최초 activation |
 | 최초 전체 체인 | PARTIAL | producer/publisher별 실제 artifact·PostGIS 통합과 Airflow dependency graph | seed → source → inference → finalize → urgency → route → API를 한 scheduler run으로 실행한 lineage |
 
 ## A. 현재 한 명령으로 검증 가능한 범위
@@ -216,9 +216,10 @@ API의 `gold_meta` 접근·일반 target write 거부, route operator의 제한�
 
 fixture의 `weather-grid-v1` 같은 값은 승인값이 아니므로 운영 manifest에 재사용하지 않는다.
 두 값을 SSOT에 확정한 뒤 immutable seed bytes를 만들고 `seed:weather_grid` publisher로 최초
-게시한다. 동일 topology lock 안에서 weather 13시간, current stock과 demand model support가
-준비된 station만 활성화하는 코드·PostGIS 경계는 검증됐다. 다만 승인 seed를 쓰는 최초 운영
-activation은 두 값이 정해질 때까지 BLOCKED다.
+게시한다. 동일 topology lock 안에서 weather 13시간과 current stock을 확인하고,
+model-supported 후보에는 same-anchor demand까지 요구하는 코드·PostGIS 경계는 검증됐다.
+model 미지원 station은 active일 수 있지만 demand는 EMPTY가 정상이다. 승인 seed를 쓰는 최초
+운영 activation은 두 값이 정해질 때까지 BLOCKED다.
 
 ### 확정된 model·inference·urgency 계약
 
@@ -240,7 +241,7 @@ byte contract 부재가 아니라 live E2E 범위의 PARTIAL로 분류한다.
 
 위 결정 전에는 다음 항목을 완료로 표시할 수 없다.
 
-- 승인 seed와 weather/demand coverage를 사용한 신규·재활성 station activation
+- 승인 seed와 weather, model-supported 후보의 demand coverage를 사용한 신규·재활성 station activation
 - publisher/API/route-operator role ACL 검증
 - grid/center → station/stock → demand/weather/event → urgency → route → API의 full
   first-publication live chain
