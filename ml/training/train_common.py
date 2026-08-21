@@ -333,6 +333,8 @@ def train_target(
     mlflow_run = mlflow.start_run(run_name=run_name) if is_primary else contextlib.nullcontext()
 
     with mlflow_run:
+        lgb_params = config.get_lgb_params(model_name)
+
         if is_primary:
             mlflow.log_params({
                 "model_name": model_name,
@@ -343,6 +345,8 @@ def train_target(
                 "valid_days_of_month": sorted(config.VALID_DAYS_OF_MONTH),
                 "test_days_of_month": sorted(config.TEST_DAYS_OF_MONTH),
                 "profile_name": common_config.PROFILE_NAME,
+                "exposure_col": exposure_col,
+                "table_path": table_path,
                 "models_prefix": models_prefix,
                 "train_dates": len(train_dates),
                 "valid_dates": len(valid_dates),
@@ -351,7 +355,7 @@ def train_target(
                 "lgb_num_boost_round": config.LGB_NUM_BOOST_ROUND,
                 "lgb_early_stopping_rounds": config.LGB_EARLY_STOPPING_ROUNDS,
                 "lgb_defer_valid_dataset": config.LGB_DEFER_VALID_DATASET,
-                **config.LGB_PARAMS_COMMON,
+                **lgb_params,
             })
             s3_io.write_json(station_categories_path(model_name, models_prefix), station_categories)
             mlflow.log_dict(station_categories, "station_categories.json")
@@ -363,7 +367,7 @@ def train_target(
         # 청크를 필요할 때만 S3에서 읽고 바이닝 후 버림, lazy_train_dataset.py 참고).
         train_set, y_train, exposure_train = lazy_train_dataset.build_lazy_dataset(
             table_path, train_dates, feature_columns, station_dtype, filters, target_col, exposure_col, cache,
-            dataset_params=config.LGB_PARAMS_COMMON,
+            dataset_params=lgb_params,
             on_chunk_loaded=_chunk_progress(model_name, "train"),
             on_prepass_complete=_progress_on_complete(f"{model_name}-train-label-prepass"),
         )
@@ -385,7 +389,7 @@ def train_target(
         else:
             valid_set, y_valid, exposure_valid = lazy_train_dataset.build_lazy_dataset(
                 table_path, valid_dates, feature_columns, station_dtype, filters, target_col, exposure_col, cache,
-                dataset_params=config.LGB_PARAMS_COMMON,
+                dataset_params=lgb_params,
                 reference=train_set, on_chunk_loaded=_chunk_progress(model_name, "valid"),
                 on_prepass_complete=_progress_on_complete(f"{model_name}-valid-label-prepass"),
             )
@@ -401,7 +405,7 @@ def train_target(
             del y_valid, exposure_valid
 
         poisson_params = {
-            **config.LGB_PARAMS_COMMON, **_distributed_params(), "objective": "poisson", "metric": "poisson",
+            **lgb_params, **_distributed_params(), "objective": "poisson", "metric": "poisson",
         }
         poisson_callbacks = [lgb.log_evaluation(0)]
         if valid_set is not None:
@@ -445,7 +449,7 @@ def train_target(
             gc.collect()
             train_set_q, _, _ = lazy_train_dataset.build_lazy_dataset(
                 table_path, train_dates, feature_columns, station_dtype, filters, target_col, None, cache,
-                dataset_params=config.LGB_PARAMS_COMMON,
+                dataset_params=lgb_params,
                 on_chunk_loaded=_chunk_progress(model_name, "train-quantile"),
                 on_prepass_complete=_progress_on_complete(f"{model_name}-train-quantile-label-prepass"),
             )
@@ -454,14 +458,14 @@ def train_target(
             else:
                 valid_set_q, _, _ = lazy_train_dataset.build_lazy_dataset(
                     table_path, valid_dates, feature_columns, station_dtype, filters, target_col, None, cache,
-                    dataset_params=config.LGB_PARAMS_COMMON,
+                    dataset_params=lgb_params,
                     reference=train_set_q, on_chunk_loaded=_chunk_progress(model_name, "valid-quantile"),
                     on_prepass_complete=_progress_on_complete(f"{model_name}-valid-quantile-label-prepass"),
                 )
 
         quantile_boosters: dict[float, lgb.Booster] = {}
         for alpha in config.QUANTILE_ALPHAS:
-            q_params = {**config.LGB_PARAMS_COMMON, **_distributed_params(), "objective": "quantile", "alpha": alpha}
+            q_params = {**lgb_params, **_distributed_params(), "objective": "quantile", "alpha": alpha}
             q_callbacks = [lgb.log_evaluation(0)]
             if valid_set_q is not None:
                 q_callbacks.insert(

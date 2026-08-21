@@ -230,6 +230,9 @@ CATEGORICAL_FEATURES = ["station_no"]
 # LightGBM 하이퍼파라미터 (common_config.py에서 공유 — feature_engine/spark의 SynapseML
 # 학습도 참고할 수 있게)
 LGB_PARAMS_COMMON = common_config.LGB_PARAMS_COMMON
+LGB_PARAMS_RENTAL = common_config.LGB_PARAMS_RENTAL
+LGB_PARAMS_RETURN = common_config.LGB_PARAMS_RETURN
+get_lgb_params = common_config.get_lgb_params
 LGB_NUM_BOOST_ROUND = common_config.LGB_NUM_BOOST_ROUND
 LGB_EARLY_STOPPING_ROUNDS = common_config.LGB_EARLY_STOPPING_ROUNDS
 

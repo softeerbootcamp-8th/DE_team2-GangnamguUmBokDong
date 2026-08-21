@@ -16,6 +16,15 @@ DAILY_CRON = "0 3 * * *"
 # D-6 대여이력 재수집 후 같은 날짜의 silver를 archive로 묶는 배치.
 COMPACTION_CRON = "30 4 * * *"
 
+# 매달 1일 03:00 KST 대여(Rental) 챔피언 점검 및 재학습 파이프라인.
+MONTHLY_RETRAIN_RENTAL_CRON = "0 3 1 * *"
+
+# 매달 1일 06:00 KST 반납(Return) 챔피언 점검 및 재학습 파이프라인.
+MONTHLY_RETRAIN_RETURN_CRON = "0 6 1 * *"
+
+# 하위 호환용 기본 스케줄
+MONTHLY_RETRAIN_CRON = "0 4 1 * *"
+
 DEFAULT_RETRIES = 2
 DEFAULT_RETRY_DELAY = timedelta(seconds=30)
 DEFAULT_EXECUTION_TIMEOUT = timedelta(seconds=240)
@@ -44,6 +53,12 @@ URGENCY_EXECUTION_TIMEOUT = timedelta(seconds=180)
 # 실측 데이터 없음(placeholder) — urgency 계산을 다시 하고 dispatched 넷팅을 위한
 # RDS 조회 하나가 추가되는 정도라 URGENCY_EXECUTION_TIMEOUT과 비슷하게 잡았다.
 ROUTES_EXECUTION_TIMEOUT = timedelta(seconds=180)
+
+# 월별 ML 재학습 타임아웃
+MONTHLY_EVALUATION_TIMEOUT = timedelta(minutes=30)
+EMR_FEATURE_MART_TIMEOUT = timedelta(minutes=90)
+MONTHLY_TRAINING_TIMEOUT = timedelta(minutes=180)
+MONTHLY_RETRAIN_ORCHESTRATION_TIMEOUT = timedelta(hours=6)
 
 MAX_ACTIVE_RUNS = 1
 CATCHUP = False
