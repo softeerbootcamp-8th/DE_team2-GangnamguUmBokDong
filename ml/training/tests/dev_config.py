@@ -45,6 +45,27 @@ def test_unimplemented_sample_fraction_env_is_rejected(monkeypatch):
         config._reject_unsupported_sample_frac_env()
 
 
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [("true", True), ("1", True), ("ON", True), ("false", False), ("0", False)],
+)
+def test_bool_env_parses_explicit_values(
+    monkeypatch: pytest.MonkeyPatch, raw: str, expected: bool
+) -> None:
+    """저메모리 opt-in은 흔한 명시적 bool 표기만 허용한다."""
+    monkeypatch.setenv("TEST_BOOL_OPTION", raw)
+
+    assert config._bool_env("TEST_BOOL_OPTION") is expected
+
+
+def test_bool_env_rejects_ambiguous_value(monkeypatch: pytest.MonkeyPatch) -> None:
+    """잘못 쓴 저메모리 옵션을 기본값으로 조용히 처리하면 안 된다."""
+    monkeypatch.setenv("TEST_BOOL_OPTION", "enabled")
+
+    with pytest.raises(ValueError, match="true/false"):
+        config._bool_env("TEST_BOOL_OPTION")
+
+
 def test_train_window_is_rolling_and_ends_at_safety_cutoff():
     # 고정 TRAIN_YEAR 대신 "오늘 기준 롤링 윈도우"로 바뀌었다(2026-08) — 끝은
     # safety_cutoff_date()와 정확히 같아야 하고(같은 마진을 공유), 시작은 그보다

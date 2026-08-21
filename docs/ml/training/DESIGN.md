@@ -209,14 +209,24 @@ Sequence를 필요할 때만(그것도 두 단계 — 표본 추출용 개별 �
 다시 필요해지면 재조회 — 메모리 대신 네트워크 I/O를 쓰는 트레이드오프).
 
 - **train/valid**: `build_lazy_dataset()`이 이 방식으로 Sequence 기반 `lgb.Dataset`을
-  만든다. 라벨(+exposure)만 별도로 가벼운 사전 스캔(컬럼 1~2개, 8억 행이어도
-  수 GB대)으로 미리 확보한다(`lgb.Dataset(label=...)`은 라벨 배열을 구성 시점에
-  미리 다 가지고 있어야 하므로).
+  만든다. 라벨(+exposure)은 날짜 하나씩 읽어 삭제 예약된 로컬 scratch memmap에
+  순서대로 기록한다. `lgb.Dataset(label=...)`은 전체 길이의 1차원 배열을 구성
+  시점에 요구하지만, disk-backed ndarray로 같은 인터페이스를 제공해 전체 기간의
+  pandas/Arrow 합본과 numpy 재복사를 피한다. 대여 init-score도 별도 memmap에서
+  계산한다.
 - **test**: 학습에 안 쓰이고 `predict()`/지표 계산에만 쓰이므로 `Dataset`으로
   만들지 않는다 — `predict_over_dates()`가 날짜별로 그 청크만 읽어 즉시
   predict한 뒤, 큰 feature 행렬은 버리고 작은(1D) 예측값/라벨 배열만
   이어붙인다. valid도 학습 후 conformal correction 계산에 같은 함수를 다시
   쓴다(학습용 Sequence 적재와는 별개 시점이라 청크를 한 번 더 읽음).
+
+단일 머신에서 native train/valid Dataset을 동시에 유지하는 것만으로 메모리
+보호선을 넘으면 `LGB_DEFER_VALID_DATASET=true`를 쓸 수 있다. 이 모드는 train
+전체로 요청한 boosting round를 고정 실행한 뒤 Dataset을 해제하고, valid 전체를
+날짜별 streaming predict해서 지표와 conformal correction을 계산한다. 날짜나
+horizon을 줄이는 샘플링은 아니지만 학습 중 valid Dataset이 없으므로 early
+stopping은 사용하지 않는다. 기본값은 false여서 기존 학습·조기 종료 계약은
+그대로 유지된다.
 
 날짜(train/valid/test 소속)는 여전히 `TRAIN_DAY_DIVISOR`/`VALID_DAYS_OF_MONTH`/
 `TEST_DAYS_OF_MONTH`로 정해지지만, `_dates_for_split()`가 Spark의 `date=` 파티션

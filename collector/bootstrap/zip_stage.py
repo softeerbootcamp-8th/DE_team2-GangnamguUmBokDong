@@ -10,11 +10,17 @@
         --zip ../data/archive.zip \
         --bootstrap-dir ../data/bootstrap \
         --population-dir ../data/population \
-        --from 2025-01-01 --to 2025-01-20 --dry-run
+        --from 2025-01-01 --to 2025-12-31 \
+        --rental-context-before-days 35 \
+        --rental-context-after-days 7 --dry-run
 
 ASOS 파일은 중앙 디렉터리만 보고 요청 날짜 전체를 포함하는지 확정할 수 없다.
 이 단계에서는 ``raw_forecast``의 ASOS 파일이 정확히 하나인지까지만 확인하며,
 실제 행 날짜 제한은 뒤의 bootstrap 날짜 필터가 담당한다.
+
+대여 타깃은 시작 경계 이전에 출발한 트립과 종료 경계 뒤에 반납된 트립도 읽는다.
+두 context 옵션은 그 구간과 겹치는 **대여 월 파일만** 추가하며, 본 기간 밖 재고·
+인구 파일까지 요구하지 않는다.
 """
 
 from __future__ import annotations
@@ -178,41 +184,56 @@ def _one(logical_name: str, candidates: list[Member]) -> Member:
     return candidates[0]
 
 
+def _rental_selection(
+    members: list[Member], bootstrap_dir: Path, yymm: str
+) -> Selection:
+    """요청 월의 대여 이력 하나를 선택해 출력 계획을 반환한다."""
+    rental = _one(
+        f"rental:{yymm}",
+        [
+            member
+            for member in members
+            if _has_path(member, "raw")
+            and (match := _RENTAL_RE.fullmatch(member.basename)) is not None
+            and match.group("yymm") == yymm
+        ],
+    )
+    return Selection(
+        logical_name=f"rental:{yymm}",
+        member=rental,
+        destination=bootstrap_dir / rental.basename,
+    )
+
+
 def _select(
     members: list[Member],
     bootstrap_dir: Path,
     population_dir: Path,
     first: date,
     last: date,
+    rental_context_before_days: int = 0,
+    rental_context_after_days: int = 0,
 ) -> list[Selection]:
-    """요청 기간의 논리 파일을 정확히 하나씩 선택해 출력 계획을 만든다."""
+    """요청 기간과 대여 컨텍스트의 논리 파일을 선택해 출력 계획을 만든다."""
     if first > last:
         raise StageError(f"--from({first})이 --to({last})보다 뒤다")
     if first.year != last.year:
         raise StageError(
             "ASOS 출력이 연도별 하나이므로 --from과 --to는 같은 연도여야 한다"
         )
+    if rental_context_before_days < 0 or rental_context_after_days < 0:
+        raise StageError("대여 컨텍스트 일수는 0 이상이어야 한다")
 
     selections: list[Selection] = []
-    for yymm in _months(first, last):
-        rental = _one(
-            f"rental:{yymm}",
-            [
-                member
-                for member in members
-                if _has_path(member, "raw")
-                and (match := _RENTAL_RE.fullmatch(member.basename)) is not None
-                and match.group("yymm") == yymm
-            ],
-        )
-        selections.append(
-            Selection(
-                logical_name=f"rental:{yymm}",
-                member=rental,
-                destination=bootstrap_dir / rental.basename,
-            )
-        )
+    primary_months = _months(first, last)
+    context_months = _months(
+        first - timedelta(days=rental_context_before_days),
+        last + timedelta(days=rental_context_after_days),
+    )
+    for yymm in context_months:
+        selections.append(_rental_selection(members, bootstrap_dir, yymm))
 
+    for yymm in primary_months:
         station = _one(
             f"station:{yymm}",
             [
@@ -357,6 +378,8 @@ def stage(
     *,
     dry_run: bool = False,
     force: bool = False,
+    rental_context_before_days: int = 0,
+    rental_context_after_days: int = 0,
 ) -> StageSummary:
     """원본 ZIP에서 요청 기간의 CSV만 선택해 준비하고 요약을 반환한다.
 
@@ -371,6 +394,8 @@ def stage(
         last: 포함할 마지막 날짜.
         dry_run: 참이면 쓰지 않고 선택 결과만 검증한다.
         force: 참이면 기존 출력 파일을 원자적으로 교체한다.
+        rental_context_before_days: 시작일 전 대여 이력을 추가할 일수.
+        rental_context_after_days: 종료일 후 대여 이력을 추가할 일수.
     returns:
         선택 파일 수와 압축 전후 합계 크기.
     raises:
@@ -382,7 +407,13 @@ def stage(
         raise StageError(f"ZIP 경로가 파일이 아니다: {zip_path}")
     with zipfile.ZipFile(zip_path) as archive:
         selections = _select(
-            _members(archive), bootstrap_dir, population_dir, first, last
+            _members(archive),
+            bootstrap_dir,
+            population_dir,
+            first,
+            last,
+            rental_context_before_days,
+            rental_context_after_days,
         )
         _guard_existing(selections, force)
         if not dry_run:
@@ -421,6 +452,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--force", action="store_true", help="기존 출력 파일을 교체한다"
     )
+    parser.add_argument(
+        "--rental-context-before-days",
+        type=int,
+        default=0,
+        help="시작일 전 대여 이력만 추가할 일수",
+    )
+    parser.add_argument(
+        "--rental-context-after-days",
+        type=int,
+        default=0,
+        help="종료일 후 대여 이력만 추가할 일수",
+    )
     return parser.parse_args(argv)
 
 
@@ -436,6 +479,8 @@ def main(argv: list[str] | None = None) -> int:
             date.fromisoformat(args.to_date),
             dry_run=args.dry_run,
             force=args.force,
+            rental_context_before_days=args.rental_context_before_days,
+            rental_context_after_days=args.rental_context_after_days,
         )
     except (StageError, OSError, ValueError, zipfile.BadZipFile) as exc:
         print(f"error: {exc}", file=sys.stderr)
