@@ -5,9 +5,9 @@
 # 만들려면 state가 필요하다"는 순환을 피하기 위해서다. 버킷 하나짜리 인프라의 인프라라
 # IaC로 관리해 얻는 이점이 거의 없다.
 #
-#   aws s3 mb s3://de-team2-tfstate-<suffix> --region ap-northeast-2
+#   aws s3 mb s3://gng-ubd-tfstate --region ap-northeast-2
 #   aws s3api put-bucket-versioning \
-#     --bucket de-team2-tfstate-<suffix> \
+#     --bucket gng-ubd-tfstate \
 #     --versioning-configuration Status=Enabled
 #
 # 버저닝은 필수다. 4명이 같은 state를 쓰므로 잘못된 apply를 되돌릴 유일한 수단이다.
@@ -15,5 +15,5 @@
 # 초기화:
 #   AWS_PROFILE=mfa terraform init -backend-config=backend.hcl
 
-bucket = "de-team2-tfstate-CHANGEME"
+bucket = "gng-ubd-tfstate"
 region = "ap-northeast-2"
