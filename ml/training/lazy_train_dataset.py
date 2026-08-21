@@ -45,6 +45,7 @@ import numpy as np
 import pandas as pd
 from core import s3 as s3_io
 from ml_core.day_index import day_index
+from ml_core.holidays_kr import korean_holidays
 from ml_core.profile_contract import (
     DEFAULT_HOLIDAY_PEAK_HOURS,
     DEFAULT_MODEL_GRID_TICK_MINUTES,

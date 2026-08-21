@@ -441,4 +441,53 @@ def test_adaptive_anchor_mask_supports_various_grid_ticks():
     assert len(selected_60) == 24
 
 
+def test_is_holiday_date_identifies_weekdays_and_korean_holidays():
+    """평일 대한민국 공휴일(신정, 어린이날, 광복절 등)과 주말을 정확히 판별한다."""
+    from datetime import date
+    from training.lazy_train_dataset import _is_holiday_date
+
+    # 1) 평일 공휴일 (수요일 신정, 월요일 어린이날, 금요일 광복절)
+    assert _is_holiday_date(date(2025, 1, 1)) is True
+    assert _is_holiday_date(date(2025, 5, 5)) is True
+    assert _is_holiday_date(date(2025, 8, 15)) is True
+
+    # 2) 일반 평일 (목요일, 금요일)
+    assert _is_holiday_date(date(2025, 1, 2)) is False
+    assert _is_holiday_date(date(2025, 1, 3)) is False
+
+    # 3) 주말 (토요일, 일요일)
+    assert _is_holiday_date(date(2025, 1, 4)) is True
+    assert _is_holiday_date(date(2025, 1, 5)) is True
+
+
+def test_apply_adaptive_anchor_filter_applies_holiday_peak_hours_on_weekday_holiday():
+    """평일 공휴일(2025-01-01 수요일)에 평일 피크(07시~) 대신 휴일 피크(08시~) 규칙이 적용되는지 검증한다."""
+    from training.lazy_train_dataset import _apply_adaptive_anchor_filter
+
+    day = "2025-01-01"  # 수요일 신정 (공휴일 + 3일 주기 심야 대상일)
+    minutes = list(range(0, 1440, 20))  # 72행
+    df = pd.DataFrame({
+        "station_no": [1] * len(minutes),
+        "minute": minutes,
+        "x1": [1.0] * len(minutes),
+    })
+
+    result = _apply_adaptive_anchor_filter(df, day)
+    selected_minutes = result["minute"].tolist()
+
+    # 휴일 피크(08~21시)이므로 07시는 비피크 평시 -> 07:00(420)만 남고 07:20(440), 07:40(460) 탈락
+    assert 420 in selected_minutes
+    assert 440 not in selected_minutes
+    assert 460 not in selected_minutes
+
+    # 08시는 피크 시간 -> 08:00(480), 08:20(500), 08:40(520) 모두 유지
+    assert 480 in selected_minutes
+    assert 500 in selected_minutes
+    assert 520 in selected_minutes
+
+    # 휴일 심야 대상일 총 50행 (평일 심야 52행과 구별)
+    assert len(selected_minutes) == 50
+
+
+
 
