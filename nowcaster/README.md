@@ -23,8 +23,9 @@
 
 ## 2. 핵심 역할
 
-1. **아카이브 백필 (`backfill-archive`)**:
+1. **아카이브 백필 (`backfill-archive`, `bootstrap-lookback`)**:
    - 수집된 원본 CSV 파일들을 읽어 표준 물리 스키마(SPOP, 연령대별 M00~M70, F00~F70)의 Parquet으로 정규화하고 `archive/`에 일자별로 적재합니다.
+   - 초기 운영에는 `bootstrap-lookback`으로 현재 추정 구간이 참조하는 1~4주 전 날짜만 선별 적재하고, 필요한 날짜가 하나라도 없으면 실패시킵니다.
 2. **일일 추정 및 실측 승격 (`estimate`)**:
    - **실측 승격**: 수집기(Collector)가 당일 가져온 최신 실측 데이터를 실제 발생일자(`biz_date`) 아카이브로 영구 보관하고, 기존에 생성해 두었던 해당 일자의 임시 추정치를 자동 삭제합니다.
    - **나우캐스팅 추정**: 기준일(D-0) 전후 일주일(D-3 ~ D+3) 중 실측이 없는 날짜들에 대해 250m 격자·시간대(00~23)별 인구를 추정하여 `silver/` 경로에 저장합니다.
@@ -93,7 +94,19 @@ uv sync
 # 2. 과거 원본 CSV 일괄 백필
 uv run python main.py backfill-archive --csv-dir /path/to/csv/
 
-# 3. 당일 실측 승격 및 D-3 ~ D+3 나우캐스팅 실행 (기본 KST 오늘 기준)
+# 3. 초기 운영: D-3~D+3 추정에 필요한 1~4주 전 데이터만 선별 백필
+# 생활인구 API는 과거 날짜를 지정할 수 없으므로 공식 과거 CSV가 필요합니다.
+uv run python main.py bootstrap-lookback \
+  --csv-dir /path/to/csv/ \
+  --target-date 2026-08-21
+
+# 특정 하루의 1·2·3·4주 전 네 날짜만 검사/적재하려면:
+uv run python main.py bootstrap-lookback \
+  --csv-dir /path/to/csv/ \
+  --target-date 2026-08-21 \
+  --horizon-days 0
+
+# 4. 당일 실측 승격 및 D-3 ~ D+3 나우캐스팅 실행 (기본 KST 오늘 기준)
 uv run python main.py estimate
 
 # 특정 기준일 지정 실행
