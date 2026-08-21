@@ -8,7 +8,7 @@ import heapq
 import json
 import math
 from collections import Counter, defaultdict
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 from datetime import UTC, date, datetime, timedelta
 from itertools import pairwise
@@ -159,8 +159,64 @@ def load_station_coordinates(path: Path) -> dict[int, tuple[str, float, float]]:
     }
 
 
-def read_rental_trips(path: Path, target_date: date) -> tuple[RentalTrip, ...]:
-    """월 대여 이력 CSV에서 목표일과 겹치는 정상 이용 건을 스트리밍해 읽는다."""
+def read_station_crosswalk(path: Path) -> dict[int, int]:
+    """월 대여 이력에서 공공 대여소 번호와 내부 ST suffix의 1:1 대응을 읽는다.
+
+    재고 원천은 공공 번호를 사용하지만 모델·station master는 ``ST-<suffix>``의
+    내부 번호를 사용한다. 한 달 안에서 어느 한쪽이라도 여러 값에 대응하면 잘못된
+    재고·좌표 결합을 막기 위해 평가를 fail-closed한다.
+    """
+    internal_by_public: dict[int, set[int]] = defaultdict(set)
+    public_by_internal: dict[int, set[int]] = defaultdict(set)
+    with path.open("r", encoding="cp949", newline="") as stream:
+        for row in csv.DictReader(stream):
+            for public_key, internal_key in (
+                ("대여 대여소번호", "대여대여소ID"),
+                ("반납대여소번호", "반납대여소ID"),
+            ):
+                try:
+                    public_no = _station_no(row[public_key])
+                    internal_no = _internal_station_no(row[internal_key])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                internal_by_public[public_no].add(internal_no)
+                public_by_internal[internal_no].add(public_no)
+    public_ambiguity = {
+        station_no: sorted(values)
+        for station_no, values in internal_by_public.items()
+        if len(values) != 1
+    }
+    internal_ambiguity = {
+        station_no: sorted(values)
+        for station_no, values in public_by_internal.items()
+        if len(values) != 1
+    }
+    if public_ambiguity or internal_ambiguity:
+        raise ValueError(
+            "월 대여 이력의 공공 번호와 내부 ST ID가 1:1이 아닙니다: "
+            f"public={list(public_ambiguity.items())[:5]}, "
+            f"internal={list(internal_ambiguity.items())[:5]}"
+        )
+    if not internal_by_public:
+        raise ValueError("월 대여 이력에서 대여소 crosswalk를 만들 수 없습니다.")
+    return {
+        public_no: next(iter(internal_nos))
+        for public_no, internal_nos in sorted(internal_by_public.items())
+    }
+
+
+def read_rental_trips(
+    path: Path,
+    target_date: date,
+    *,
+    station_crosswalk: Mapping[int, int] | None = None,
+) -> tuple[RentalTrip, ...]:
+    """월 대여 이력 CSV에서 목표일과 겹치는 정상 이용 건을 스트리밍해 읽는다.
+
+    ``station_crosswalk``를 주면 시민 사건 키를 공공 번호에서 모델·station master와
+    같은 내부 ST suffix로 변환한다. 원본 행의 ST ID와 crosswalk가 다르면 평가를
+    중단해 서로 다른 대여소의 재고와 수요가 결합되지 않게 한다.
+    """
     day_start = datetime.combine(target_date, datetime.min.time(), tzinfo=SEOUL)
     day_end = day_start + timedelta(days=1)
     trips: list[RentalTrip] = []
@@ -173,10 +229,25 @@ def read_rental_trips(path: Path, target_date: date) -> tuple[RentalTrip, ...]:
                 returned_at = datetime.strptime(
                     row["반납일시"], "%Y-%m-%d %H:%M:%S"
                 ).replace(tzinfo=SEOUL)
-                rent_station_no = _station_no(row["대여 대여소번호"])
-                return_station_no = _station_no(row["반납대여소번호"])
+                public_rent_station_no = _station_no(row["대여 대여소번호"])
+                public_return_station_no = _station_no(row["반납대여소번호"])
             except (KeyError, TypeError, ValueError):
                 continue
+            rent_station_no = public_rent_station_no
+            return_station_no = public_return_station_no
+            if station_crosswalk is not None:
+                try:
+                    rent_station_no = station_crosswalk[public_rent_station_no]
+                    return_station_no = station_crosswalk[public_return_station_no]
+                    row_rent_station_no = _internal_station_no(row["대여대여소ID"])
+                    row_return_station_no = _internal_station_no(row["반납대여소ID"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if (
+                    rent_station_no != row_rent_station_no
+                    or return_station_no != row_return_station_no
+                ):
+                    raise ValueError("대여 이력 행의 공공 번호와 내부 ST ID가 다릅니다.")
             if returned_at < day_start or rented_at >= day_end:
                 continue
             if returned_at < rented_at:
@@ -228,8 +299,15 @@ def station_id_candidates(
 def read_stock_observations(
     path: Path,
     target_date: date,
+    *,
+    station_crosswalk: Mapping[int, int] | None = None,
 ) -> tuple[StockObservation, ...]:
-    """시간대별 재고 CSV에서 목표일의 유효한 관측을 읽는다."""
+    """시간대별 재고 CSV에서 목표일의 유효한 관측을 읽는다.
+
+    재고 원천에는 내부 ST ID가 없으므로 crosswalk를 받으면 공공 번호를 모델과 같은
+    내부 suffix로 변환한다. 월 이력에서 관측되지 않아 대응이 없는 대여소는 모델
+    평가 집합에 안전하게 포함할 수 없으므로 제외한다.
+    """
     observations = []
     with path.open("r", encoding="cp949", newline="") as stream:
         for row in csv.DictReader(stream):
@@ -241,10 +319,21 @@ def read_stock_observations(
                     datetime.min.time(),
                     tzinfo=SEOUL,
                 ) + timedelta(hours=int(row["시간대"]))
+                public_station_no = _station_no(row["대여소번호"])
+                if (
+                    station_crosswalk is not None
+                    and public_station_no not in station_crosswalk
+                ):
+                    continue
+                station_no = (
+                    public_station_no
+                    if station_crosswalk is None
+                    else station_crosswalk[public_station_no]
+                )
                 observations.append(
                     StockObservation(
                         observed_at=observed_at,
-                        station_no=_station_no(row["대여소번호"]),
+                        station_no=station_no,
                         quantity=max(0, int(float(row["거치대수량"]))),
                     )
                 )
@@ -942,6 +1031,20 @@ def _station_no(value: str) -> int:
     if not normalized:
         raise ValueError("대여소 번호가 비었습니다.")
     return int(normalized)
+
+
+def _internal_station_no(value: str) -> int:
+    """대여 이력의 내부 ``ST-<숫자>`` ID에서 모델 범주 suffix를 반환한다."""
+    normalized = value.strip()
+    if not normalized.startswith("ST-"):
+        raise ValueError("내부 대여소 ID가 ST-<숫자> 형식이 아닙니다.")
+    suffix = normalized.removeprefix("ST-")
+    if not suffix or not suffix.isdigit():
+        raise ValueError("내부 대여소 ID suffix가 양의 정수가 아닙니다.")
+    station_no = int(suffix)
+    if station_no <= 0:
+        raise ValueError("내부 대여소 번호는 양수여야 합니다.")
+    return station_no
 
 
 def _haversine_km(

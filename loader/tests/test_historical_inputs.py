@@ -12,6 +12,7 @@ from evaluation.historical_inputs import (
     latest_published_weather,
 )
 from evaluation.rebalance_backtest import RentalTrip
+from evaluation.run_policy_backtest import _population_required_hours
 
 SEOUL = ZoneInfo("Asia/Seoul")
 ANCHOR = datetime(2025, 6, 17, 6, tzinfo=SEOUL)
@@ -88,3 +89,34 @@ def test_lags_use_embargo_visibility_and_successful_returns() -> None:
     )
     assert rental == {1: 1}
     assert returned == {2: 2}
+
+
+def test_population_nowcast_requires_only_inference_target_hours(tmp_path) -> None:
+    """평가가 조회하지 않는 시간 결측은 막지 않고 조회 시간 결측만 차단한다."""
+    target = date(2025, 6, 17)
+    candidates = _population_candidate_dates(target)
+    for candidate in candidates:
+        rows = ["\"시간\",\"250M격자\",\"생활인구합계\""]
+        rows.extend(f'"{hour}","GRID","10"' for hour in range(6, 20))
+        (tmp_path / f"250_LOCAL_RESD_{candidate:%Y%m%d}.csv").write_text(
+            "\n".join(rows) + "\n",
+            encoding="euc-kr",
+        )
+    required = _population_required_hours(
+        window_start=ANCHOR,
+        window_end=ANCHOR + timedelta(hours=3),
+        tick_minutes=5,
+    )
+    nowcast = build_population_nowcast(
+        population_dir=tmp_path,
+        target_dates=tuple(required),
+        grid_ids=frozenset(("GRID", "MISSING")),
+        required_hours_by_date=required,
+        require_complete=False,
+    )
+    assert required == {target: frozenset(range(6, 20))}
+    assert nowcast.complete_grid_ids(
+        frozenset(("GRID", "MISSING")),
+        required,
+    ) == frozenset(("GRID",))
+    assert nowcast.value(ANCHOR.replace(hour=19), "GRID") == pytest.approx(10)

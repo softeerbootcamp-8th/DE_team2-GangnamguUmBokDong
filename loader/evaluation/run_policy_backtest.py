@@ -21,6 +21,7 @@ from .backtest_contract import (
     validate_sensitivity_contracts,
 )
 from .historical_inputs import (
+    HORIZON_COUNT,
     HistoricalStation,
     ModelBundle,
     PredictionAudit,
@@ -43,6 +44,7 @@ from .rebalance_backtest import (
     StockObservation,
     load_centers,
     read_rental_trips,
+    read_station_crosswalk,
     read_stock_observations,
 )
 
@@ -115,6 +117,10 @@ class SourceProvenance:
     weather_csv: SourceFile
     population_csvs: tuple[SourceFile, ...]
     station_master_content_sha256: str
+    station_crosswalk_count: int
+    station_crosswalk_sha256: str
+    population_excluded_station_count: int
+    population_excluded_grid_ids: tuple[str, ...]
     backtest_contract_version: str
     route_algorithm_version: str
 
@@ -163,8 +169,17 @@ def run_policy_backtest(
         secret_key=secret_key,
     )
     selected = _select_center_stations(station_master, center, centers, model)
-    trips = read_rental_trips(rental_csv, target_date)
-    observations = read_stock_observations(stock_csv, target_date)
+    station_crosswalk = read_station_crosswalk(rental_csv)
+    trips = read_rental_trips(
+        rental_csv,
+        target_date,
+        station_crosswalk=station_crosswalk,
+    )
+    observations = read_stock_observations(
+        stock_csv,
+        target_date,
+        station_crosswalk=station_crosswalk,
+    )
     max_end = _window_start(target_date, start_hour) + timedelta(
         minutes=max(evaluation_minutes)
     )
@@ -176,23 +191,42 @@ def run_policy_backtest(
     )
     if not selected:
         raise ValueError("선택 권역에서 model·station·재고 공통 평가 대여소가 없습니다.")
-    initial_stock = _stock_at(
-        observations,
-        frozenset(selected),
-        _window_start(target_date, start_hour),
+    population_requirements = _population_required_hours(
+        window_start=_window_start(target_date, start_hour),
+        window_end=max_end,
+        tick_minutes=contracts[0].tick_minutes,
     )
-    population_dates = tuple(
-        sorted(
-            {
-                (_window_start(target_date, start_hour) + timedelta(hours=offset)).date()
-                for offset in range(12)
-            }
-        )
+    population_dates = tuple(population_requirements)
+    candidate_grid_ids = frozenset(
+        station.grid_id for station in selected.values()
     )
     population = build_population_nowcast(
         population_dir=population_dir,
         target_dates=population_dates,
-        grid_ids=frozenset(station.grid_id for station in selected.values()),
+        grid_ids=candidate_grid_ids,
+        required_hours_by_date=population_requirements,
+        require_complete=False,
+    )
+    complete_grid_ids = population.complete_grid_ids(
+        candidate_grid_ids,
+        population_requirements,
+    )
+    population_excluded_grid_ids = tuple(
+        sorted(candidate_grid_ids - complete_grid_ids)
+    )
+    station_count_before_population = len(selected)
+    selected = {
+        station_no: station
+        for station_no, station in selected.items()
+        if station.grid_id in complete_grid_ids
+    }
+    if not selected:
+        raise ValueError("point-in-time 생활인구가 완전한 평가 대여소가 없습니다.")
+    population_excluded_station_count = station_count_before_population - len(selected)
+    initial_stock = _stock_at(
+        observations,
+        frozenset(selected),
+        _window_start(target_date, start_hour),
     )
     weather = read_weather_history(weather_csv)
     population_source_paths = tuple(
@@ -210,7 +244,11 @@ def run_policy_backtest(
         weather_csv=_source_file(weather_csv),
         population_csvs=tuple(_source_file(path) for path in population_source_paths),
         station_master_content_sha256=_station_master_sha256(tuple(selected.values())),
-        backtest_contract_version="point-in-time-policy-backtest-v1",
+        station_crosswalk_count=len(station_crosswalk),
+        station_crosswalk_sha256=_station_crosswalk_sha256(station_crosswalk),
+        population_excluded_station_count=population_excluded_station_count,
+        population_excluded_grid_ids=population_excluded_grid_ids,
+        backtest_contract_version="point-in-time-policy-backtest-v2",
         route_algorithm_version="route-v2",
     )
 
@@ -475,6 +513,26 @@ def _window_start(target_date: date, start_hour: int) -> datetime:
     )
 
 
+def _population_required_hours(
+    *,
+    window_start: datetime,
+    window_end: datetime,
+    tick_minutes: int,
+) -> dict[date, frozenset[int]]:
+    """모든 정책 tick의 12시간 모델 target이 실제 조회할 날짜·시간을 계산한다."""
+    required: dict[date, set[int]] = {}
+    anchor = window_start
+    while anchor < window_end:
+        for horizon in range(HORIZON_COUNT):
+            target = anchor + timedelta(hours=horizon)
+            required.setdefault(target.date(), set()).add(target.hour)
+        anchor += timedelta(minutes=tick_minutes)
+    return {
+        target_date: frozenset(hours)
+        for target_date, hours in sorted(required.items())
+    }
+
+
 def _distance_sq(
     station: HistoricalStation,
     center: DispatchCenterTopology,
@@ -503,6 +561,21 @@ def _station_master_sha256(stations: tuple[HistoricalStation, ...]) -> str:
     rows = [
         asdict(station)
         for station in sorted(stations, key=lambda row: row.station_id.encode("utf-8"))
+    ]
+    payload = json.dumps(
+        rows,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _station_crosswalk_sha256(station_crosswalk: Mapping[int, int]) -> str:
+    """공공 번호와 내부 ST suffix의 canonical 대응표 내용 해시를 계산한다."""
+    rows = [
+        {"public_station_no": public_no, "internal_station_no": internal_no}
+        for public_no, internal_no in sorted(station_crosswalk.items())
     ]
     payload = json.dumps(
         rows,

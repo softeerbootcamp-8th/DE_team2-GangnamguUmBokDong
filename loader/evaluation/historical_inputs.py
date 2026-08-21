@@ -109,6 +109,22 @@ class PopulationNowcast:
         """대상일 추정에 실제 사용된 과거 원천 날짜를 반환한다."""
         return self._source_dates[target_date]
 
+    def complete_grid_ids(
+        self,
+        grid_ids: frozenset[str],
+        required_hours_by_date: Mapping[date, frozenset[int]],
+    ) -> frozenset[str]:
+        """요구된 모든 날짜·시간에 point-in-time 값이 있는 격자만 반환한다."""
+        return frozenset(
+            grid_id
+            for grid_id in grid_ids
+            if all(
+                (target_date, hour, grid_id) in self._values
+                for target_date, hours in required_hours_by_date.items()
+                for hour in hours
+            )
+        )
+
 
 def load_station_master_from_s3(
     *,
@@ -209,12 +225,30 @@ def build_population_nowcast(
     population_dir: Path,
     target_dates: tuple[date, ...],
     grid_ids: frozenset[str],
+    required_hours_by_date: Mapping[date, frozenset[int]] | None = None,
+    require_complete: bool = True,
 ) -> PopulationNowcast:
     """운영 nowcaster의 1~4주 가중평균을 미래 자료 없이 재구성한다.
 
     최근 네 후보가 모두 결측인 셀만 5~8주 전의 가장 가까운 값으로 대체한다.
     그 이전에도 값이 없으면 미래나 대상일 실측으로 채우지 않고 fail-closed한다.
+    ``required_hours_by_date``를 주면 실제 추론이 조회할 시간 셀만 검증한다.
     """
+    if type(require_complete) is not bool:
+        raise ValueError("생활인구 require_complete는 bool이어야 합니다.")
+    target_set = set(target_dates)
+    if required_hours_by_date is not None:
+        if set(required_hours_by_date) != target_set:
+            raise ValueError("생활인구 required hour 날짜가 target_dates와 다릅니다.")
+        if any(
+            not hours
+            or any(
+                type(hour) is not int or not 0 <= hour <= 23
+                for hour in hours
+            )
+            for hours in required_hours_by_date.values()
+        ):
+            raise ValueError("생활인구 required hour는 날짜별 0..23의 nonempty 집합이어야 합니다.")
     values: dict[tuple[date, int, str], float] = {}
     source_dates_by_target: dict[date, tuple[date, ...]] = {}
     cache: dict[date, dict[tuple[int, str], float]] = {}
@@ -237,7 +271,12 @@ def build_population_nowcast(
             for day in extended_dates
         ]
         missing = []
-        for hour in range(24):
+        required_hours = (
+            range(24)
+            if required_hours_by_date is None
+            else sorted(required_hours_by_date[target])
+        )
+        for hour in required_hours:
             for grid_id in grid_ids:
                 key = (hour, grid_id)
                 weighted = [
@@ -264,7 +303,7 @@ def build_population_nowcast(
                     missing.append(key)
                 else:
                     values[(target, hour, grid_id)] = fallback
-        if missing:
+        if missing and require_complete:
             raise ValueError(
                 f"과거 자료만으로 생활인구를 만들 수 없는 셀이 있습니다: "
                 f"date={target}, missing={missing[:10]}, count={len(missing)}"

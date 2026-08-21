@@ -1,8 +1,10 @@
 """재배치 정책 백테스트의 잔차·재생·route-v2 연결을 검증한다."""
 
 from datetime import datetime, timedelta
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import pytest
 from evaluation.rebalance_backtest import (
     RentalTrip,
     RouteAction,
@@ -13,6 +15,9 @@ from evaluation.rebalance_backtest import (
     build_station_metadata,
     detect_relocation_candidates,
     estimate_existing_operations,
+    read_rental_trips,
+    read_station_crosswalk,
+    read_stock_observations,
     replay_policy,
     schedule_route_actions,
 )
@@ -212,3 +217,53 @@ def test_station_without_trip_gets_noncolliding_evaluation_id() -> None:
     )
     assert metadata[1].station_id == "ST-10000002"
     assert metadata[2].station_id == "ST-20000002"
+
+
+def test_public_station_numbers_are_remapped_to_internal_model_ids(
+    tmp_path: Path,
+) -> None:
+    """공공 번호 재고·이용을 내부 ST suffix로 바꿔 station master와 결합한다."""
+    rental_path = tmp_path / "rental.csv"
+    rental_path.write_text(
+        "자전거번호,대여일시,대여 대여소번호,반납일시,반납대여소번호,"
+        "대여대여소ID,반납대여소ID\n"
+        "B1,2025-01-17 06:10:00,00781,2025-01-17 06:20:00,02251,"
+        "ST-2007,ST-781\n",
+        encoding="cp949",
+    )
+    stock_path = tmp_path / "stock.csv"
+    stock_path.write_text(
+        "일시,대여소번호,시간대,거치대수량\n"
+        "2025-01-17,00781,6,76\n"
+        "2025-01-17,02251,6,19\n",
+        encoding="cp949",
+    )
+    crosswalk = read_station_crosswalk(rental_path)
+    trips = read_rental_trips(
+        rental_path,
+        START.date(),
+        station_crosswalk=crosswalk,
+    )
+    stock = read_stock_observations(
+        stock_path,
+        START.date(),
+        station_crosswalk=crosswalk,
+    )
+    assert crosswalk == {781: 2007, 2251: 781}
+    assert [(trip.rent_station_no, trip.return_station_no) for trip in trips] == [
+        (2007, 781)
+    ]
+    assert [(row.station_no, row.quantity) for row in stock] == [(781, 19), (2007, 76)]
+
+
+def test_station_crosswalk_rejects_many_to_one_mapping(tmp_path: Path) -> None:
+    """같은 내부 ST ID가 여러 공공 번호에 연결되면 평가를 중단한다."""
+    rental_path = tmp_path / "ambiguous.csv"
+    rental_path.write_text(
+        "대여 대여소번호,대여대여소ID,반납대여소번호,반납대여소ID\n"
+        "00781,ST-2007,02251,ST-781\n"
+        "00782,ST-2007,02251,ST-781\n",
+        encoding="cp949",
+    )
+    with pytest.raises(ValueError, match="1:1"):
+        read_station_crosswalk(rental_path)
