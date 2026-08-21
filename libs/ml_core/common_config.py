@@ -384,6 +384,15 @@ profile_contract.validate_train_anchor_contract(
     TRAIN_ANCHOR_TICK_MINUTES,
     f"{PROFILE_NAME}+환경변수",
 )
+PEAK_ANCHOR_TICK_MINUTES = _int_env(
+    "PEAK_ANCHOR_TICK_MINUTES",
+    int(_PROFILE.get("PEAK_ANCHOR_TICK_MINUTES", TRAIN_ANCHOR_TICK_MINUTES)),
+)
+profile_contract.validate_train_anchor_contract(
+    GRID_TICK_MINUTES,
+    PEAK_ANCHOR_TICK_MINUTES,
+    f"{PROFILE_NAME}+환경변수:PEAK_ANCHOR_TICK_MINUTES",
+)
 
 # --- 배치예측 horizon(몇 시간 뒤까지 한 번에 예측하는지) ---
 # lag/rolling(직전 실적)은 항상 "지금(T0)" 기준으로 고정하고, horizon(1..HORIZON_COUNT)을

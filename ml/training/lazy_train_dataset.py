@@ -45,8 +45,11 @@ import numpy as np
 import pandas as pd
 from core import s3 as s3_io
 from ml_core.day_index import day_index
-from ml_core.holidays_kr import korean_holidays
-from ml_core.profile_contract import DEFAULT_HOLIDAY_PEAK_HOURS, DEFAULT_WEEKDAY_PEAK_HOURS
+from ml_core.profile_contract import (
+    DEFAULT_HOLIDAY_PEAK_HOURS,
+    DEFAULT_MODEL_GRID_TICK_MINUTES,
+    DEFAULT_WEEKDAY_PEAK_HOURS,
+)
 
 from . import config
 
@@ -77,12 +80,15 @@ def _adaptive_anchor_mask(
     is_holiday: bool = False,
     weekday_peak_hours: tuple[tuple[int, int], ...] = DEFAULT_WEEKDAY_PEAK_HOURS,
     holiday_peak_hours: tuple[tuple[int, int], ...] = DEFAULT_HOLIDAY_PEAK_HOURS,
+    peak_tick_minutes: int = DEFAULT_MODEL_GRID_TICK_MINUTES,
+    regular_tick_minutes: int = 60,
+    night_tick_minutes: int = 60,
 ) -> np.ndarray:
     """시간대별 가변 앵커링 불리언 마스크를 계산한다.
 
-    - 피크 시간대(평일: weekday_peak_hours, 휴일: holiday_peak_hours): 20분 단위 전체 앵커 (minute % 20 == 0)
-    - 평시 시간대: 60분 단위 정시 앵커 (minute % 60 == 0)
-    - 심야 시간대(00~06시, minute < 360): 3일에 1번(is_night_day=True)만 60분 단위 정시 앵커 (minute % 60 == 0)
+    - 피크 시간대(평일: weekday_peak_hours, 휴일: holiday_peak_hours): peak_tick_minutes 단위 전체 앵커 (minute % peak_tick_minutes == 0)
+    - 평시 시간대: regular_tick_minutes 단위 정시 앵커 (minute % regular_tick_minutes == 0)
+    - 심야 시간대(00~06시, minute < 360): 3일에 1번(is_night_day=True)만 night_tick_minutes 단위 정시 앵커 (minute % night_tick_minutes == 0)
 
     args:
         minute_series: 자정 기준 경과분(0~1439) Series
@@ -90,6 +96,9 @@ def _adaptive_anchor_mask(
         is_holiday: 주말 또는 공휴일 여부
         weekday_peak_hours: 평일 피크 시간대 구간 목록
         holiday_peak_hours: 휴일 피크 시간대 구간 목록
+        peak_tick_minutes: 피크 시간대 샘플링 간격(분, 기본값 TRAIN_ANCHOR_TICK_MINUTES/20분)
+        regular_tick_minutes: 평시 주간 샘플링 간격(분, 기본값 60분)
+        night_tick_minutes: 심야 샘플링 간격(분, 기본값 60분)
     returns:
         np.ndarray: 유효 앵커 여부 불리언 마스크 배열
     """
@@ -100,19 +109,24 @@ def _adaptive_anchor_mask(
     night_mask = minutes < 360
     regular_mask = ~peak_mask & ~night_mask
 
-    valid_peak = peak_mask & (minutes % 20 == 0)
-    valid_regular = regular_mask & (minutes % 60 == 0)
-    valid_night = (night_mask & (minutes % 60 == 0)) if is_night_day else np.zeros_like(night_mask, dtype=bool)
+    valid_peak = peak_mask & (minutes % peak_tick_minutes == 0)
+    valid_regular = regular_mask & (minutes % regular_tick_minutes == 0)
+    valid_night = (night_mask & (minutes % night_tick_minutes == 0)) if is_night_day else np.zeros_like(night_mask, dtype=bool)
 
     return valid_peak | valid_regular | valid_night
 
 
-def _apply_adaptive_anchor_filter(df: pd.DataFrame, date_str: str) -> pd.DataFrame:
+def _apply_adaptive_anchor_filter(
+    df: pd.DataFrame,
+    date_str: str,
+    peak_tick_minutes: int | None = None,
+) -> pd.DataFrame:
     """시간대별 가변 앵커링 필터를 적용해 유효한 앵커 행만 남긴다.
 
     args:
         df: 날짜 파티션 DataFrame
         date_str: 파티션 날짜 문자열("YYYY-MM-DD")
+        peak_tick_minutes: 피크 시간대 샘플링 간격(None이면 config 설정 사용)
     returns:
         pd.DataFrame: 가변 앵커 필터가 적용된 DataFrame
     """
@@ -126,12 +140,19 @@ def _apply_adaptive_anchor_filter(df: pd.DataFrame, date_str: str) -> pd.DataFra
         is_night_day = True
         is_holiday = False
 
+    resolved_peak_tick = (
+        peak_tick_minutes
+        if peak_tick_minutes is not None
+        else getattr(config, "PEAK_ANCHOR_TICK_MINUTES", getattr(config, "TRAIN_ANCHOR_TICK_MINUTES", DEFAULT_MODEL_GRID_TICK_MINUTES))
+    )
+
     mask = _adaptive_anchor_mask(
         df["minute"],
         is_night_day=is_night_day,
         is_holiday=is_holiday,
         weekday_peak_hours=config.WEEKDAY_PEAK_HOURS,
         holiday_peak_hours=config.HOLIDAY_PEAK_HOURS,
+        peak_tick_minutes=resolved_peak_tick,
     )
     return df[mask]
 

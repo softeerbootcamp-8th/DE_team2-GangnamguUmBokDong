@@ -361,6 +361,30 @@ def test_legacy_anchor_environment_aliases_are_materialized(legacy_env, expected
     assert json.loads(result.stdout)["TRAIN_ANCHOR_TICK_MINUTES"] == expected
 
 
+def test_peak_anchor_tick_minutes_defaults_to_train_anchor_tick():
+    """PEAK_ANCHOR_TICK_MINUTES 미지정 시 TRAIN_ANCHOR_TICK_MINUTES를 기본값으로 사용한다."""
+    merged = profile_contract.merge_and_validate_profile(
+        {
+            "GRID_TICK_MINUTES": 30,
+            "ROLLING_TICK_MINUTES": 30,
+            "TRAIN_ANCHOR_TICK_MINUTES": 30,
+        },
+        "test-30m",
+    )
+    assert merged["PEAK_ANCHOR_TICK_MINUTES"] == 30
+
+    merged_custom_peak = profile_contract.merge_and_validate_profile(
+        {
+            "GRID_TICK_MINUTES": 10,
+            "ROLLING_TICK_MINUTES": 10,
+            "TRAIN_ANCHOR_TICK_MINUTES": 20,
+            "PEAK_ANCHOR_TICK_MINUTES": 10,
+        },
+        "test-hybrid",
+    )
+    assert merged_custom_peak["PEAK_ANCHOR_TICK_MINUTES"] == 10
+
+
 def test_conflicting_anchor_environment_aliases_fail_closed():
     """canonical/legacy 환경변수가 서로 다른 학습 밀도를 요구하면 import가 실패해야 한다."""
     env = _fresh_process_env(

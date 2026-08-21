@@ -243,6 +243,11 @@ def _parse_peak_hours(
 WEEKDAY_PEAK_HOURS = _parse_peak_hours("WEEKDAY_PEAK_HOURS", common_config.WEEKDAY_PEAK_HOURS)
 HOLIDAY_PEAK_HOURS = _parse_peak_hours("HOLIDAY_PEAK_HOURS", common_config.HOLIDAY_PEAK_HOURS)
 
+GRID_TICK_MINUTES = common_config.GRID_TICK_MINUTES
+TRAIN_ANCHOR_TICK_MINUTES = common_config.TRAIN_ANCHOR_TICK_MINUTES
+PEAK_ANCHOR_TICK_MINUTES = int(os.environ.get("PEAK_ANCHOR_TICK_MINUTES", getattr(common_config, "PEAK_ANCHOR_TICK_MINUTES", TRAIN_ANCHOR_TICK_MINUTES)))
+
+
 
 
 # 2025 전체 d1/h12 실측에서 native train+valid Dataset을 동시에 유지한 채 첫

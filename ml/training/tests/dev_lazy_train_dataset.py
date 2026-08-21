@@ -374,3 +374,71 @@ def test_read_date_chunk_applies_sparse_horizon_filter():
     assert sorted(result["horizon"].tolist()) == sparse_horizons
 
 
+def test_adaptive_anchor_mask_supports_various_grid_ticks():
+    """5·10·15·20·30·60분 다양한 grid 간격에서 피크 시간대 앵커가 온전히 유지되는지 검증한다."""
+    from training.lazy_train_dataset import _adaptive_anchor_mask
+
+    # 1) 30분 grid: 피크 07~21시의 :30 앵커가 20분 배수 검사로 버려지지 않고 모두 유지돼야 함
+    minutes_30 = pd.Series(range(0, 1440, 30))  # 48개
+    mask_30 = _adaptive_anchor_mask(
+        minutes_30,
+        is_night_day=True,
+        is_holiday=False,
+        peak_tick_minutes=30,
+    )
+    selected_30 = minutes_30[mask_30].tolist()
+    # 심야(00~06): 6개 (0, 60, 120, 180, 240, 300) - 30분 단위는 탈락
+    # 평시(06시): 1개 (360) - 390 탈락
+    # 피크(07~21시): 14시간 * 2 = 28개 (420, 450, 480, 510, ..., 1230)
+    # 평시(21~24시): 3개 (1260, 1320, 1380) - 1290, 1350, 1410 탈락
+    # 합계: 6 + 1 + 28 + 3 = 38개
+    assert len(selected_30) == 38
+    assert 420 in selected_30 and 450 in selected_30  # 07:00, 07:30 유지
+    assert 480 in selected_30 and 510 in selected_30  # 08:00, 08:30 유지
+    assert 30 not in selected_30  # 심야 00:30 탈락
+    assert 1290 not in selected_30  # 평시 21:30 탈락
+
+    # 2) 15분 grid: 피크 07~21시의 :15, :30, :45 앵커가 모두 유지돼야 함
+    minutes_15 = pd.Series(range(0, 1440, 15))  # 96개
+    mask_15 = _adaptive_anchor_mask(
+        minutes_15,
+        is_night_day=True,
+        is_holiday=False,
+        peak_tick_minutes=15,
+    )
+    selected_15 = minutes_15[mask_15].tolist()
+    # 심야: 6개 (60분 정시)
+    # 평시(06시): 1개 (60분 정시)
+    # 피크(07~21시): 14시간 * 4 = 56개 (15분 단위 전체)
+    # 평시(21~24시): 3개 (60분 정시)
+    # 합계: 6 + 1 + 56 + 3 = 66개
+    assert len(selected_15) == 66
+    assert 420 in selected_15 and 435 in selected_15 and 450 in selected_15 and 465 in selected_15
+
+    # 3) 5분 grid: 피크 시간대에 5분 단위 전체(12개/시간) 유지
+    minutes_5 = pd.Series(range(0, 1440, 5))  # 288개
+    mask_5 = _adaptive_anchor_mask(
+        minutes_5,
+        is_night_day=False,
+        is_holiday=False,
+        peak_tick_minutes=5,
+    )
+    selected_5 = minutes_5[mask_5].tolist()
+    # 비심야일: 심야 0개, 평시 4개(06, 21, 22, 23시), 피크 14시간 * 12 = 168개
+    # 합계: 172개
+    assert len(selected_5) == 172
+    assert 420 in selected_5 and 425 in selected_5 and 430 in selected_5
+
+    # 4) 60분 grid: 피크 시간대와 평시 모두 60분 정시
+    minutes_60 = pd.Series(range(0, 1440, 60))  # 24개
+    mask_60 = _adaptive_anchor_mask(
+        minutes_60,
+        is_night_day=True,
+        is_holiday=False,
+        peak_tick_minutes=60,
+    )
+    selected_60 = minutes_60[mask_60].tolist()
+    assert len(selected_60) == 24
+
+
+
