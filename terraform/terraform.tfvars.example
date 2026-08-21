@@ -1,0 +1,30 @@
+# cp terraform.tfvars.example terraform.tfvars 후 필요한 값만 주석 해제한다.
+# terraform.tfvars는 커밋하지 않는다.
+#
+# 기본값만으로도 동작한다(variables.tf 참고). 아래는 실제로 바꿀 일이 있는 항목들이다.
+
+# --- UI 접근 ---
+# Airflow(8080)·MLflow(5000) UI를 직접 열어줄 IP.
+# 비워두면(기본) SG 규칙이 생기지 않고 SSM 포트 포워딩으로만 접근한다:
+#   aws ssm start-session --target <app_instance_id> \
+#     --document-name AWS-StartPortForwardingSession \
+#     --parameters '{"portNumber":["8080"],"localPortNumber":["8080"]}'
+#
+# 발표장처럼 직접 열어야 할 때만 현장 IP를 넣고 apply한다. MLflow는 인증이 아예
+# 없고 Airflow UI에서는 DAG를 임의로 트리거할 수 있으므로 상시 개방하지 않는다.
+# admin_cidrs = ["203.0.113.10/32", "198.51.100.20/32"]
+
+# --- 학습 인스턴스 ---
+# 1개월 smoke test로 peak RSS를 잰 뒤 조정한다. 같은 Graviton 계열이면
+# stop → 변경 → start로 in-place 처리되고 EBS가 유지된다.
+#   r7g.2xlarge = 64GB / r7g.4xlarge = 128GB(기본) / r7g.8xlarge = 256GB
+# train_instance_type = "r7g.8xlarge"
+
+# --- 상시 인스턴스 ---
+# 리허설에서 swap을 실제로 쓰기 시작하면 올린다(8GB → 16GB).
+# app_instance_type = "t4g.xlarge"
+
+# --- RDS ---
+# check_gold_schema.sql이 PostGIS 정확히 3.5를 요구한다. 16.14에 없으면
+# 아래로 내려가며 재생성한다(데이터가 없어 재생성이 싸다). 사용 가능: 16.9~16.14
+# rds_engine_version = "16.13"

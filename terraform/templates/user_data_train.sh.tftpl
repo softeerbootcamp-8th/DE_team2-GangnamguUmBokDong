@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# 학습 EC2 부팅 스크립트.
+#
+# 학습은 컨테이너 없이 호스트에서 uv로 직접 돌린다 — ml/training은 Airflow가 부르지
+# 않는 수동 작업이고, 큰 메모리를 쓰는 단일 프로세스라 컨테이너를 한 겹 두를 이유가 없다.
+#
+# 시크릿을 여기에 절대 넣지 말 것. user_data는 인스턴스 메타데이터로 노출된다.
+set -euxo pipefail
+
+dnf update -y
+# libgomp: LightGBM 런타임 의존성. git/jq: 배포 스크립트용.
+dnf install -y git jq libgomp
+
+# uv (ml/training이 uv 프로젝트다)
+curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh
+
+# 학습 중 피크에서 OOM Killer에 죽는 것을 완충한다. 실제로 swap을 쓰기 시작하면
+# 디스크 스와핑으로 급격히 느려지므로(2026-08 사건), 그때는 인스턴스 타입을 올려야 한다.
+if [ ! -f /swapfile ]; then
+  dd if=/dev/zero of=/swapfile bs=1M count=8192
+  chmod 600 /swapfile
+  mkswap /swapfile
+  swapon /swapfile
+  echo '/swapfile none swap sw 0 0' >> /etc/fstab
+fi
+
+mkdir -p /opt/app
+chown ec2-user:ec2-user /opt/app
+
+# 학습 프로세스가 읽는 환경변수. AWS 자격증명은 넣지 않는다 — instance profile을 쓴다.
+# S3_ENDPOINT_URL도 비워둬야 core.s3가 실제 AWS S3로 간다.
+cat > /etc/profile.d/gng-train.sh <<PROFILE
+export AWS_DEFAULT_REGION=${region}
+export S3_BUCKET=${s3_bucket}
+export MODELS_PREFIX=models
+# 상시 EC2의 사설 IP. 같은 VPC 안이라 인터넷을 타지 않고, sg-app의
+# "5000 ← sg-train" 규칙으로 통제된다.
+export MLFLOW_TRACKING_URI=http://${mlflow_host}:5000
+PROFILE
+
+cat > /etc/motd <<'MOTD'
+${project} 학습 EC2 (평소 정지 상태)
+
+준비 완료: uv, libgomp, swap 8GB, /opt/app
+
+다음 단계:
+  1) cd /opt/app && git clone <repo> .
+  2) cd ml/training && uv sync
+  3) 1개월 smoke test로 peak RSS 측정 후 인스턴스 타입 확정
+  4) 학습이 끝나면 반드시 정지 (make train-stop)
+MOTD
