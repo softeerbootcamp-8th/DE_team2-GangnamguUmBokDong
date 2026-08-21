@@ -9,7 +9,8 @@
 set -euxo pipefail
 
 dnf update -y
-dnf install -y docker git jq
+# make: Makefile의 deploy-* 타겟 실행용
+dnf install -y docker git jq make
 
 # docker compose v2 플러그인 (dnf 패키지로는 안 들어온다)
 DOCKER_CLI_PLUGINS=/usr/local/lib/docker/cli-plugins

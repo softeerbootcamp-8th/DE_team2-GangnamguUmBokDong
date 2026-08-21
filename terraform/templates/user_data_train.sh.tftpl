@@ -8,8 +8,8 @@
 set -euxo pipefail
 
 dnf update -y
-# libgomp: LightGBM 런타임 의존성. git/jq: 배포 스크립트용.
-dnf install -y git jq libgomp
+# libgomp: LightGBM 런타임 의존성. git/jq/make: 배포 스크립트와 Makefile 타겟용.
+dnf install -y git jq make libgomp
 
 # uv (ml/training이 uv 프로젝트다)
 curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh
