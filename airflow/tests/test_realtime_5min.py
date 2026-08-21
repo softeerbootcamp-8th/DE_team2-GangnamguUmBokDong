@@ -4,10 +4,16 @@ from datetime import timedelta
 from itertools import pairwise
 
 from airflow.providers.standard.operators.bash import BashOperator
+from airflow.providers.standard.sensors.bash import BashSensor
 from airflow.task.trigger_rule import TriggerRule
 from airflow.timetables.trigger import CronTriggerTimetable
-
-from config.schedules import EXECUTION_TIMEOUT_OVERRIDES, REALTIME_5MIN_CRON, TIMEZONE
+from config.schedules import (
+    EXECUTION_TIMEOUT_OVERRIDES,
+    REALTIME_5MIN_CRON,
+    TIMEZONE,
+    WEATHER_MANIFEST_POKE_INTERVAL_SECONDS,
+    WEATHER_MANIFEST_WAIT_TIMEOUT_SECONDS,
+)
 from config.sources import REALTIME_5MIN_SOURCES, RENTAL_HISTORY_LOOKBACK_HOURS
 from dags.realtime_5min import dag
 
@@ -27,6 +33,7 @@ def test_only_coordinated_serving_tasks_exist() -> None:
         {f"collect_{source}" for source in REALTIME_5MIN_SOURCES}
         | {
             "run_normalizer",
+            "wait_for_weather_manifests",
             "prepare_serving_plan",
             "run_inference",
             "finalize_serving_release",
@@ -50,10 +57,25 @@ def test_only_coordinated_serving_tasks_exist() -> None:
     }.intersection(dag.task_ids)
 
 
-def test_prepare_waits_only_for_current_station_realtime() -> None:
-    """Plan source 준비가 population/rental 계산 input에 불필요하게 직렬화되지 않는다."""
+def test_prepare_waits_for_station_and_bounded_weather_sensor() -> None:
+    """Plan은 station 성공과 날씨 bounded wait 종료 후 준비된다."""
     prepare = dag.get_task("prepare_serving_plan")
-    assert prepare.upstream_task_ids == {"collect_bike_station_realtime"}
+    assert prepare.upstream_task_ids == {
+        "collect_bike_station_realtime",
+        "wait_for_weather_manifests",
+    }
+    assert prepare.trigger_rule == TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS
+
+    sensor = dag.get_task("wait_for_weather_manifests")
+    assert isinstance(sensor, BashSensor)
+    assert sensor.poke_interval == WEATHER_MANIFEST_POKE_INTERVAL_SECONDS == 2
+    assert sensor.timeout == WEATHER_MANIFEST_WAIT_TIMEOUT_SECONDS == 30
+    assert sensor.soft_fail is True
+    assert sensor.mode == "poke"
+    assert sensor.upstream_task_ids == set()
+    assert "serving_cli.py weather-ready" in sensor.bash_command
+    assert "--project" in sensor.bash_command
+    assert "astimezone" in sensor.bash_command
 
 
 def test_inference_waits_for_plan_normalizer_and_rental_input() -> None:
