@@ -40,4 +40,36 @@ describe("api", () => {
     await expect(api.weather("ST-1")).resolves.toEqual(response);
     expect(fetchMock).toHaveBeenCalledWith("http://localhost:8000/stations/ST-1/weather?hours=12");
   });
+
+  it("작업 목록 필터를 query string으로 직렬화한다", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response("[]", { status: 200, headers: { "Content-Type": "application/json" } }),
+    );
+
+    await expect(api.routes({ region: "영남", status: "dispatched" })).resolves.toEqual([]);
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://localhost:8000/routes?region=%EC%98%81%EB%82%A8&status=dispatched&limit=500&offset=0",
+    );
+  });
+
+  it("작업 승인 요청은 POST를 사용한다", async () => {
+    const response = {
+      route_id: "route-1",
+      region: "영남",
+      status: "dispatched",
+      proposed_at: "2026-08-20T00:00:00Z",
+      dispatched_at: "2026-08-20T00:01:00Z",
+      completed_at: null,
+      cancelled_at: null,
+      stops: [],
+    };
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify(response), { status: 200, headers: { "Content-Type": "application/json" } }),
+    );
+
+    await expect(api.dispatchRoute("route-1")).resolves.toEqual(response);
+
+    expect(fetchMock).toHaveBeenCalledWith("http://localhost:8000/routes/route-1/dispatch", { method: "POST" });
+  });
 });

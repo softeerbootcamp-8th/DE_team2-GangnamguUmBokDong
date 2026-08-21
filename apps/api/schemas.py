@@ -71,7 +71,7 @@ class DispatchCenter(BaseModel):
     lon: float
 
 
-RouteStatus = Literal["proposed", "dispatched", "completed"]
+RouteStatus = Literal["proposed", "dispatched", "completed", "cancelled"]
 RouteAction = Literal["pickup", "dropoff"]
 
 
@@ -96,6 +96,7 @@ class Route(BaseModel):
     proposed_at: datetime
     dispatched_at: datetime | None
     completed_at: datetime | None
+    cancelled_at: datetime | None
     stops: list[RouteStop]
 
 

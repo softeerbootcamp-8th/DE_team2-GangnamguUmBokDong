@@ -18,7 +18,7 @@ npm install
 npm run dev            # http://localhost:5173
 ```
 
-백엔드 주소를 8000이 아닌 다른 포트로 띄웠다면 `.env.local`에 `VITE_API_BASE=http://localhost:<포트>`를 넣는다. `.env.local`은 커밋하지 않는다(`.gitignore` 처리됨).
+기본 백엔드 주소는 브라우저가 대시보드에 접속한 호스트명과 `VITE_API_PORT`(기본 8000)를 조합한다. 따라서 같은 화면을 `localhost` 또는 다른 PC의 Tailscale/LAN 주소로 열어도 해당 호스트의 API에 자동으로 연결된다. 완전히 다른 API 서버를 사용해야 할 때만 `.env.local`에 `VITE_API_BASE=http://<호스트>:<포트>`를 넣는다. `.env.local`은 커밋하지 않는다(`.gitignore` 처리됨).
 
 ## 폴더·파일 구조
 
@@ -29,7 +29,7 @@ web/
   package-lock.json
   vite.config.ts              # Vite 설정(React 플러그인 등록)
   tsconfig.json                # TypeScript 컴파일러 설정
-  .env.local                  # (커밋 안 됨) VITE_API_BASE로 백엔드 주소 지정
+  .env.local                  # (커밋 안 됨) 필요할 때만 VITE_API_BASE로 백엔드 주소 재정의
   src/
     main.tsx                  # React 엔트리포인트, App을 DOM에 마운트
     App.tsx                   # 최상위 레이아웃 조립, 폴링·선택 상태 관리

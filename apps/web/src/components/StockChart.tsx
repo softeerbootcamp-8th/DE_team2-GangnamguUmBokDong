@@ -14,9 +14,23 @@ const HEIGHT = 220;
 const MARGIN = { top: 16, right: 16, bottom: 24, left: 32 };
 const PLOT_WIDTH = WIDTH - MARGIN.left - MARGIN.right;
 const PLOT_HEIGHT = HEIGHT - MARGIN.top - MARGIN.bottom;
+const X_TICK_COUNT = 5;
 
 function formatTime(iso: string): string {
   return formatIsoTime(iso, { hour: "2-digit", minute: "2-digit" });
+}
+
+function tickIndices(length: number): number[] {
+  if (length <= 1) return [0];
+
+  const tickCount = Math.min(X_TICK_COUNT, length);
+  return Array.from(
+    new Set(
+      Array.from({ length: tickCount }, (_, index) =>
+        Math.round((index / (tickCount - 1)) * (length - 1)),
+      ),
+    ),
+  );
 }
 
 export function StockChart({ station, baseDttm, points }: Props) {
@@ -35,6 +49,7 @@ export function StockChart({ station, baseDttm, points }: Props) {
   const xAt = (i: number) => MARGIN.left + (i / (series.length - 1)) * PLOT_WIDTH;
   const yAt = (v: number) => MARGIN.top + (1 - v / maxY) * PLOT_HEIGHT;
   const yTicks = [0, Math.round(station.hold_cnt / 2), station.hold_cnt];
+  const xTicks = tickIndices(series.length);
   const last = series[series.length - 1];
 
   function handlePointerMove(event: React.PointerEvent<SVGRectElement>) {
@@ -82,6 +97,19 @@ export function StockChart({ station, baseDttm, points }: Props) {
                 {tick}
               </text>
             </g>
+          ))}
+
+          {xTicks.map((index, tickIndex) => (
+            <text
+              key={series[index].time}
+              x={xAt(index)}
+              y={HEIGHT - 5}
+              textAnchor={tickIndex === 0 ? "start" : tickIndex === xTicks.length - 1 ? "end" : "middle"}
+              fontSize={11}
+              fill="var(--text-muted)"
+            >
+              {formatTime(series[index].time)}
+            </text>
           ))}
 
           <line

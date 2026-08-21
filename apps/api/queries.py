@@ -476,7 +476,8 @@ def _route_aggregate_query(where_clause: str, page_clause: str = "") -> str:
                    route.route_status_cd AS status,
                    route.proposed_dttm AS proposed_at,
                    route.dispatched_dttm AS dispatched_at,
-                   route.completed_dttm AS completed_at
+                   route.completed_dttm AS completed_at,
+                   route.cancelled_dttm AS cancelled_at
               FROM rebalance_route AS route
               JOIN dispatch_center AS center USING (dispatch_center_id)
              {where_clause}
@@ -489,6 +490,7 @@ def _route_aggregate_query(where_clause: str, page_clause: str = "") -> str:
                page.proposed_at,
                page.dispatched_at,
                page.completed_at,
+               page.cancelled_at,
                COALESCE(stops.items, '[]'::jsonb) AS stops
           FROM route_page AS page
           LEFT JOIN LATERAL (
@@ -626,4 +628,18 @@ def complete_route(
         expected_status="dispatched",
         next_status="completed",
         timestamp_column="completed_dttm",
+    )
+
+
+def cancel_route(
+    route_id: UUID,
+    now: datetime,
+) -> dict[str, Any] | RouteTransitionResult:
+    """route를 dispatched에서 cancelled로 원자 전이한다."""
+    return _transition_route(
+        route_id,
+        now,
+        expected_status="dispatched",
+        next_status="cancelled",
+        timestamp_column="cancelled_dttm",
     )

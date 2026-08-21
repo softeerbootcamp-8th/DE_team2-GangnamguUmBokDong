@@ -624,7 +624,7 @@ station_stock.updated_dttm` 및 `urgency.updated_dttm >= station.updated_dttm`�
 같은 anchor stock correction이나 station topology correction 뒤 urgency가 재게시되기 전에는
 옛 판단을 숨긴다. 따라서 `/stations`에 없는 stale-stock station을 alert 첫 행으로 선택하지
 않는다. 결과는 `urgency_score DESC, sta_id ASC`의 결정적 순서로 반환한다. route 목록은 선택적 `region`과
-`proposed|dispatched|completed` status만 허용하고 기본 `limit=100`, 최대 `500`,
+`proposed|dispatched|completed|cancelled` status만 허용하고 기본 `limit=100`, 최대 `500`,
 `offset>=0`의 bounded pagination 및 `(proposed_dttm DESC, route_id ASC)` 정렬을 사용한다.
 상태 전이 API는 없는 route를 404, 현재 상태가 요청의 expected status와 다르면 409로
 반환한다. `UPDATE ... WHERE route_id=:id AND status=:expected RETURNING`과 동일 transaction의

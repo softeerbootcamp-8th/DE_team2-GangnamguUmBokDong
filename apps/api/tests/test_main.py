@@ -5,11 +5,10 @@ from __future__ import annotations
 from datetime import UTC, date, datetime, timedelta
 from uuid import UUID
 
-import pytest
-from fastapi.testclient import TestClient
-
 import main
+import pytest
 import queries
+from fastapi.testclient import TestClient
 
 NOW = datetime(2026, 8, 20, 1, 5, tzinfo=UTC)
 BASE = datetime(2026, 8, 20, 1, 0, tzinfo=UTC)
@@ -87,8 +86,9 @@ def _route(status: str = "proposed") -> dict:
         "region": "테스트 센터",
         "status": status,
         "proposed_at": BASE,
-        "dispatched_at": NOW if status in {"dispatched", "completed"} else None,
+        "dispatched_at": NOW if status in {"dispatched", "completed", "cancelled"} else None,
         "completed_at": NOW if status == "completed" else None,
+        "cancelled_at": NOW if status == "cancelled" else None,
         "stops": [
             {
                 "visit_order": 1,
@@ -290,7 +290,8 @@ def test_route_query_parameters_and_uuid_are_validated_before_db(
     monkeypatch.setattr(queries, "fetch_routes", lambda *_args: [])
     monkeypatch.setattr(queries, "fetch_route", lambda _route_id: None)
 
-    assert client.get("/routes?status=cancelled").status_code == 422
+    assert client.get("/routes?status=invalid").status_code == 422
+    assert client.get("/routes?status=cancelled").status_code == 200
     assert client.get("/routes?limit=0").status_code == 422
     assert client.get("/routes?limit=501").status_code == 422
     assert client.get("/routes?offset=-1").status_code == 422
@@ -327,6 +328,20 @@ def test_dispatch_maps_not_found_state_and_constraints(
 
     assert response.status_code == status_code
     assert response.json()["detail"] == detail
+
+
+def test_cancel_returns_cancelled_route(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """cancel은 dispatched route를 cancelled 응답으로 전이한다."""
+    monkeypatch.setattr(queries, "cancel_route", lambda _route_id, _now: _route("cancelled"))
+
+    response = client.post(f"/routes/{ROUTE_ID}/cancel")
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "cancelled"
+    assert response.json()["cancelled_at"] == "2026-08-20T01:05:00Z"
 
 
 def test_route_response_preserves_external_aliases(
