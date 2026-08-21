@@ -276,3 +276,218 @@ def test_predict_over_dates_matches_per_date_eager_predict():
     assert np.array_equal(result["y"], expected_y)
     assert np.allclose(result["poisson"], expected_preds)
     assert result["exposure"] is None
+
+
+def test_adaptive_anchor_mask_rules():
+    """평일 및 휴일 시간대별 가변 앵커링 마스크 규칙이 정확히 동작하는지 검증한다.
+
+    - 평일: 주간(07~21시) 20분 단위, 평시 60분 단위, 심야(00~06시) 3일 1회 60분
+    - 휴일: 주간(08~21시) 20분 단위, 평시 60분 단위, 심야(00~06시) 3일 1회 60분
+    """
+    from training.lazy_train_dataset import _adaptive_anchor_mask
+
+    all_minutes = pd.Series(range(0, 1440, 20))  # 0, 20, 40, ..., 1420 (총 72개)
+
+    # 1) 평일 심야 대상일 (is_night_day=True, is_holiday=False)
+    mask_w_night = _adaptive_anchor_mask(all_minutes, is_night_day=True, is_holiday=False)
+    selected_w_night = all_minutes[mask_w_night].tolist()
+    # 심야 6개 (0, 60, 120, 180, 240, 300)
+    # 평시 6시 (360) 1개
+    # 주간 7~20시 (420~1240, 14시간 * 3) 42개
+    # 평시 21~23시 (1260, 1320, 1380) 3개
+    # 합계: 6 + 1 + 42 + 3 = 52개
+    assert len(selected_w_night) == 52
+    assert 0 in selected_w_night
+    assert 20 not in selected_w_night  # 심야 20분 탈락
+    assert 420 in selected_w_night and 440 in selected_w_night  # 07시 20분 유지
+    assert 600 in selected_w_night and 620 in selected_w_night  # 10시 20분 주간 유지
+    assert 720 in selected_w_night and 740 in selected_w_night  # 12시 20분 점심 유지
+
+    # 2) 평일 심야 비대상일 (is_night_day=False, is_holiday=False)
+    mask_w_non_night = _adaptive_anchor_mask(all_minutes, is_night_day=False, is_holiday=False)
+    selected_w_non_night = all_minutes[mask_w_non_night].tolist()
+    # 심야 0개, 나머지 46개
+    assert len(selected_w_non_night) == 46
+    assert 0 not in selected_w_non_night
+
+    # 3) 휴일 심야 대상일 (is_night_day=True, is_holiday=True)
+    mask_h_night = _adaptive_anchor_mask(all_minutes, is_night_day=True, is_holiday=True)
+    selected_h_night = all_minutes[mask_h_night].tolist()
+    # 심야 6개 (0, 60, 120, 180, 240, 300)
+    # 평시 6~7시 (360, 420) 2개
+    # 주간 8~20시 (480~1240, 13시간 * 3) 39개
+    # 평시 21~23시 (1260, 1320, 1380) 3개
+    # 합계: 6 + 2 + 39 + 3 = 50개
+    assert len(selected_h_night) == 50
+    assert 420 in selected_h_night and 440 not in selected_h_night  # 휴일 07시는 60분 정시만 유지
+    assert 480 in selected_h_night and 500 in selected_h_night  # 휴일 08시는 20분 주간 유지
+    assert 780 in selected_h_night and 800 in selected_h_night  # 휴일 13시는 20분 주간 유지
+
+    # 4) 커스텀 피크 시간대 지정 테스트
+    mask_custom = _adaptive_anchor_mask(
+        all_minutes,
+        is_night_day=False,
+        is_holiday=False,
+        weekday_peak_hours=((8, 9),),
+    )
+    selected_custom = all_minutes[mask_custom].tolist()
+    assert 480 in selected_custom and 500 in selected_custom  # 08:00~09:00 피크 20분 유지
+    assert 420 in selected_custom and 440 not in selected_custom  # 07:00는 평시 정시만 유지
+
+
+def test_read_date_chunk_applies_adaptive_anchor_filter():
+    """_read_date_chunk가 minute 컬럼을 감지해 가변 앵커 필터를 적용하는지 검증한다."""
+    path = "processed_v2/test/adaptive_table"
+    day = "2025-01-02"  # 평일 (목요일)
+    minutes = list(range(0, 1440, 20))  # 72행
+    df = pd.DataFrame({
+        "station_no": [1] * len(minutes),
+        "minute": minutes,
+        "x1": [1.0] * len(minutes),
+    })
+    s3_io.write_parquet(df, f"{path}/date={day}/part-0000.parquet")
+
+    # adaptive_anchors=True: 평일 비심야일(2025-01-02 % 3 != 0) 46행 반환
+    result_adaptive = _read_date_chunk(path, day, ["station_no", "minute", "x1"], filters=None, adaptive_anchors=True)
+    assert len(result_adaptive) == 46
+
+    # adaptive_anchors=False: 72행 전체 반환
+    result_all = _read_date_chunk(path, day, ["station_no", "minute", "x1"], filters=None, adaptive_anchors=False)
+    assert len(result_all) == 72
+
+
+def test_read_date_chunk_applies_sparse_horizon_filter():
+    """_read_date_chunk가 PyArrow filters로 horizon 스파스 샘플링을 적용하는지 검증한다."""
+    path = "processed_v2/test/horizon_table"
+    day = "2025-01-01"
+    horizons = list(range(1, 13))  # 1~12 (12행)
+    df = pd.DataFrame({
+        "station_no": [1] * 12,
+        "minute": [480] * 12,  # 피크 시간 08:00
+        "horizon": horizons,
+    })
+    s3_io.write_parquet(df, f"{path}/date={day}/part-0000.parquet")
+
+    sparse_horizons = [1, 2, 3, 4, 5, 6, 9, 12]
+    filters = [("horizon", "in", sparse_horizons)]
+    result = _read_date_chunk(path, day, ["station_no", "minute", "horizon"], filters=filters)
+    assert sorted(result["horizon"].tolist()) == sparse_horizons
+
+
+def test_adaptive_anchor_mask_supports_various_grid_ticks():
+    """5·10·15·20·30·60분 다양한 grid 간격에서 피크 시간대 앵커가 온전히 유지되는지 검증한다."""
+    from training.lazy_train_dataset import _adaptive_anchor_mask
+
+    # 1) 30분 grid: 피크 07~21시의 :30 앵커가 20분 배수 검사로 버려지지 않고 모두 유지돼야 함
+    minutes_30 = pd.Series(range(0, 1440, 30))  # 48개
+    mask_30 = _adaptive_anchor_mask(
+        minutes_30,
+        is_night_day=True,
+        is_holiday=False,
+        peak_tick_minutes=30,
+    )
+    selected_30 = minutes_30[mask_30].tolist()
+    # 심야(00~06): 6개 (0, 60, 120, 180, 240, 300) - 30분 단위는 탈락
+    # 평시(06시): 1개 (360) - 390 탈락
+    # 피크(07~21시): 14시간 * 2 = 28개 (420, 450, 480, 510, ..., 1230)
+    # 평시(21~24시): 3개 (1260, 1320, 1380) - 1290, 1350, 1410 탈락
+    # 합계: 6 + 1 + 28 + 3 = 38개
+    assert len(selected_30) == 38
+    assert 420 in selected_30 and 450 in selected_30  # 07:00, 07:30 유지
+    assert 480 in selected_30 and 510 in selected_30  # 08:00, 08:30 유지
+    assert 30 not in selected_30  # 심야 00:30 탈락
+    assert 1290 not in selected_30  # 평시 21:30 탈락
+
+    # 2) 15분 grid: 피크 07~21시의 :15, :30, :45 앵커가 모두 유지돼야 함
+    minutes_15 = pd.Series(range(0, 1440, 15))  # 96개
+    mask_15 = _adaptive_anchor_mask(
+        minutes_15,
+        is_night_day=True,
+        is_holiday=False,
+        peak_tick_minutes=15,
+    )
+    selected_15 = minutes_15[mask_15].tolist()
+    # 심야: 6개 (60분 정시)
+    # 평시(06시): 1개 (60분 정시)
+    # 피크(07~21시): 14시간 * 4 = 56개 (15분 단위 전체)
+    # 평시(21~24시): 3개 (60분 정시)
+    # 합계: 6 + 1 + 56 + 3 = 66개
+    assert len(selected_15) == 66
+    assert 420 in selected_15 and 435 in selected_15 and 450 in selected_15 and 465 in selected_15
+
+    # 3) 5분 grid: 피크 시간대에 5분 단위 전체(12개/시간) 유지
+    minutes_5 = pd.Series(range(0, 1440, 5))  # 288개
+    mask_5 = _adaptive_anchor_mask(
+        minutes_5,
+        is_night_day=False,
+        is_holiday=False,
+        peak_tick_minutes=5,
+    )
+    selected_5 = minutes_5[mask_5].tolist()
+    # 비심야일: 심야 0개, 평시 4개(06, 21, 22, 23시), 피크 14시간 * 12 = 168개
+    # 합계: 172개
+    assert len(selected_5) == 172
+    assert 420 in selected_5 and 425 in selected_5 and 430 in selected_5
+
+    # 4) 60분 grid: 피크 시간대와 평시 모두 60분 정시
+    minutes_60 = pd.Series(range(0, 1440, 60))  # 24개
+    mask_60 = _adaptive_anchor_mask(
+        minutes_60,
+        is_night_day=True,
+        is_holiday=False,
+        peak_tick_minutes=60,
+    )
+    selected_60 = minutes_60[mask_60].tolist()
+    assert len(selected_60) == 24
+
+
+def test_is_holiday_date_identifies_weekdays_and_korean_holidays():
+    """평일 대한민국 공휴일(신정, 어린이날, 광복절 등)과 주말을 정확히 판별한다."""
+    from datetime import date
+    from training.lazy_train_dataset import _is_holiday_date
+
+    # 1) 평일 공휴일 (수요일 신정, 월요일 어린이날, 금요일 광복절)
+    assert _is_holiday_date(date(2025, 1, 1)) is True
+    assert _is_holiday_date(date(2025, 5, 5)) is True
+    assert _is_holiday_date(date(2025, 8, 15)) is True
+
+    # 2) 일반 평일 (목요일, 금요일)
+    assert _is_holiday_date(date(2025, 1, 2)) is False
+    assert _is_holiday_date(date(2025, 1, 3)) is False
+
+    # 3) 주말 (토요일, 일요일)
+    assert _is_holiday_date(date(2025, 1, 4)) is True
+    assert _is_holiday_date(date(2025, 1, 5)) is True
+
+
+def test_apply_adaptive_anchor_filter_applies_holiday_peak_hours_on_weekday_holiday():
+    """평일 공휴일(2025-01-01 수요일)에 평일 피크(07시~) 대신 휴일 피크(08시~) 규칙이 적용되는지 검증한다."""
+    from training.lazy_train_dataset import _apply_adaptive_anchor_filter
+
+    day = "2025-01-01"  # 수요일 신정 (공휴일 + 3일 주기 심야 대상일)
+    minutes = list(range(0, 1440, 20))  # 72행
+    df = pd.DataFrame({
+        "station_no": [1] * len(minutes),
+        "minute": minutes,
+        "x1": [1.0] * len(minutes),
+    })
+
+    result = _apply_adaptive_anchor_filter(df, day)
+    selected_minutes = result["minute"].tolist()
+
+    # 휴일 피크(08~21시)이므로 07시는 비피크 평시 -> 07:00(420)만 남고 07:20(440), 07:40(460) 탈락
+    assert 420 in selected_minutes
+    assert 440 not in selected_minutes
+    assert 460 not in selected_minutes
+
+    # 08시는 피크 시간 -> 08:00(480), 08:20(500), 08:40(520) 모두 유지
+    assert 480 in selected_minutes
+    assert 500 in selected_minutes
+    assert 520 in selected_minutes
+
+    # 휴일 심야 대상일 총 50행 (평일 심야 52행과 구별)
+    assert len(selected_minutes) == 50
+
+
+
+
