@@ -3,28 +3,43 @@
 #
 # 기본값만으로도 동작한다(variables.tf 참고). 아래는 실제로 바꿀 일이 있는 항목들이다.
 
+# --- 데이터 버킷 ---
+# 팀이 만들어둔 버킷 하나로 통합했다(2026-08-21). raw-data/에 원본 ZIP 12GB가 있어
+# terraform import로 편입했고, prevent_destroy가 걸려 있다.
+# 이름을 바꾸면 Terraform이 "지우고 새로 만들기"로 처리하려다 prevent_destroy에
+# 막힌다. 정말 바꾼다면 데이터를 먼저 옮기고 data.tf의 lifecycle 블록을 지운다.
+# s3_bucket_name = "gng-ubd-s3-bucket"
+
 # --- UI 접근 ---
-# Airflow(8080)·MLflow(5000) UI를 직접 열어줄 IP.
-# 비워두면(기본) SG 규칙이 생기지 않고 SSM 포트 포워딩으로만 접근한다:
-#   aws ssm start-session --target <app_instance_id> \
-#     --document-name AWS-StartPortForwardingSession \
-#     --parameters '{"portNumber":["8080"],"localPortNumber":["8080"]}'
+# Airflow(8080)·MLflow(5000)·SSH(22)를 열어줄 IP. SSM이 계정 정책상 전면 거부라
+# (StartSession·SendCommand·DescribeInstanceInformation) SSH가 유일한 접속 수단이다.
+# 비워두면 SG 규칙이 생기지 않아 인스턴스에 접근할 방법이 없다.
 #
-# 발표장처럼 직접 열어야 할 때만 현장 IP를 넣고 apply한다. MLflow는 인증이 아예
-# 없고 Airflow UI에서는 DAG를 임의로 트리거할 수 있으므로 상시 개방하지 않는다.
+# 접속 IP가 바뀌면 `make allow-my-ip`가 현재 공인 IP로 admin_cidrs.auto.tfvars를
+# 다시 쓰고 SG만 갱신한다(10초 내외).
+#
+# MLflow는 인증이 아예 없고 Airflow UI에서는 DAG를 임의로 트리거할 수 있으므로
+# 상시 개방하지 않는다. UI는 `make tunnel-airflow` / `make tunnel-mlflow`로 SSH
+# 포워딩해 보는 것이 기본이다. MLflow는 외부 IP로 직접 열면 uvicorn이 Host 헤더를
+# 검증해 403을 내므로 터널이 사실상 필수다.
 # admin_cidrs = ["203.0.113.10/32", "198.51.100.20/32"]
 
 # --- 학습 인스턴스 ---
-# 1개월 smoke test로 peak RSS를 잰 뒤 조정한다. 같은 Graviton 계열이면
+# 이 계정의 SCP(p-zypy0yfm)가 t3/t3a/t4g 버스터블 계열만 허용하고 2xlarge가 상한이다
+# (2026-08-21 실측). m/c/r 계열은 전부 거부라 r7g.4xlarge(128GB)를 띄울 수 없고,
+# t4g.2xlarge(8 vCPU / 32GB)가 현재 가능한 최대치다.
+#
+# 실측 peak: 피처마트 한 달 7.86GB, 학습 한 달 10.14GB. 32GB 상한에서 2~3개월이
+# 한계다. 1개월 smoke test로 peak RSS를 먼저 재고 범위를 정한다.
+# 운영진이 타입 제한을 풀어주면 아래를 되돌린다 — 같은 Graviton 계열이면
 # stop → 변경 → start로 in-place 처리되고 EBS가 유지된다.
-#   r7g.2xlarge = 64GB / r7g.4xlarge = 128GB(기본) / r7g.8xlarge = 256GB
-# train_instance_type = "r7g.8xlarge"
+# train_instance_type = "t4g.2xlarge"
 
 # --- 상시 인스턴스 ---
 # 리허설에서 swap을 실제로 쓰기 시작하면 올린다(8GB → 16GB).
 # app_instance_type = "t4g.xlarge"
 
 # --- RDS ---
-# check_gold_schema.sql이 PostGIS 정확히 3.5를 요구한다. 16.14에 없으면
-# 아래로 내려가며 재생성한다(데이터가 없어 재생성이 싸다). 사용 가능: 16.9~16.14
-# rds_engine_version = "16.13"
+# 운영 RDS(PostgreSQL 16.14)가 PostGIS 3.4.6만 제공한다. dev/prod 모두 3.4로
+# 통일했으므로(2026-08-21) 버전을 내릴 이유는 없다. 사용 가능: 16.9~16.14
+# rds_engine_version = "16.14"

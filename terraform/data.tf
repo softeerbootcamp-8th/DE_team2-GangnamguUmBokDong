@@ -9,10 +9,16 @@
 resource "aws_s3_bucket" "data" {
   bucket = var.s3_bucket_name
 
-  # 일부러 false로 둔다. true면 terraform destroy가 12개월치 archive를 조용히 지운다 —
-  # 다시 올리는 데 몇 시간이 걸리는 데이터다. 객체가 있으면 destroy가 실패해 사고를 막고,
-  # 데모 종료 시에는 `aws s3 rm s3://<bucket> --recursive` 후 destroy하면 된다.
+  # 일부러 false로 둔다. true면 terraform destroy가 버킷 내용을 조용히 지운다.
+  # 객체가 있으면 destroy가 실패해 사고를 막는다.
   force_destroy = false
+
+  # raw-data/의 원본 ZIP 12GB는 팀원에게 다시 받아야 하는 데이터다. force_destroy가
+  # 막지 못하는 경우(빈 버킷, 이름 변경으로 인한 재생성)까지 걸러내려고 한 겹 더 둔다.
+  # destroy 계획이 세워지는 순간 apply 전에 멈춘다. 정말 지울 때는 이 블록을 지운다.
+  lifecycle {
+    prevent_destroy = true
+  }
 
   tags = { Name = var.s3_bucket_name }
 }

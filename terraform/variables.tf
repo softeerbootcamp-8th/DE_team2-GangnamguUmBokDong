@@ -121,7 +121,7 @@ variable "rds_storage_gb" {
 }
 
 variable "s3_bucket_name" {
-  description = "데이터 버킷 이름. 팀이 이미 만들어둔 버킷을 그대로 쓴다."
+  description = "데이터 버킷 이름. 팀이 만들어둔 버킷 하나로 통합해 쓴다(raw-data/에 원본 ZIP)."
   type        = string
   default     = "gng-ubd-s3-bucket"
 }
