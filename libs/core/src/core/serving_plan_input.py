@@ -21,13 +21,14 @@ from .gold_publication import (
 from .inference_snapshot import ServingPlanRef
 from .model_snapshot import IdSetArtifactRef
 
-SERVING_PLAN_SCHEMA_VERSION = "gold-serving-plan-v1"
+SERVING_PLAN_SCHEMA_VERSION = "gold-serving-plan-v2"
 """Inference input extractor가 허용하는 serving plan schema version이다."""
 
 _PLAN_KEYS = frozenset(
     {
         "activation_ready_sta_ids",
         "expected_sta_ids",
+        "inference_eligible_sta_ids",
         "logical_dttm",
         "object_base_uri",
         "prepared_publications",

@@ -17,19 +17,34 @@ from core.gold_publication import (
 )
 from core.model_snapshot import IdSetArtifactRef, build_id_set_artifact_ref
 from core.serving_plan_input import read_serving_plan_inference_inputs
-
 from gold.serving_plan import (
     PreparedManifestRef,
     ServingPlan,
     ServingPlanArtifact,
     SourceLookbacks,
     _activation_ready_station_ids,
+    _inference_expected_station_ids,
     _store_id_set,
     parse_serving_plan,
 )
 from gold.station import StationProjection, StationRecord
 
 _LOGICAL = datetime(2026, 8, 20, 0, 5, tzinfo=UTC)
+
+
+def test_expected_ids_isolate_small_known_quality_gap_but_reject_large_gap() -> None:
+    """1% 이내 결측은 제외하고 이를 넘는 품질 저하는 plan 실패로 처리한다."""
+    candidates = tuple(f"ST-{number:03d}" for number in range(100))
+
+    expected = _inference_expected_station_ids(
+        candidates, candidates, candidates, candidates[:-1]
+    )
+
+    assert expected == candidates[:-1]
+    with pytest.raises(ContractViolation, match="제외율이 기준을 초과"):
+        _inference_expected_station_ids(
+            candidates, candidates, candidates, candidates[:-2]
+        )
 _SHA_A = "a" * 64
 _SHA_B = "b" * 64
 _SHA_C = "c" * 64
@@ -111,6 +126,7 @@ def _plan() -> ServingPlan:
         station_dependency=_dependency(),
         activation_ready_sta_ids=activation,
         expected_sta_ids=expected,
+        inference_eligible_sta_ids=activation,
         rental_support_sta_ids=rental,
         return_support_sta_ids=returned,
         prepared_publications=(
@@ -267,6 +283,7 @@ def test_plan_requires_same_anchor_station_dependency_and_prepared_order() -> No
             station_dependency=values.station_dependency,
             activation_ready_sta_ids=values.activation_ready_sta_ids,
             expected_sta_ids=values.expected_sta_ids,
+            inference_eligible_sta_ids=values.inference_eligible_sta_ids,
             rental_support_sta_ids=values.rental_support_sta_ids,
             return_support_sta_ids=values.return_support_sta_ids,
             prepared_publications=values.prepared_publications,
@@ -280,6 +297,7 @@ def test_plan_requires_same_anchor_station_dependency_and_prepared_order() -> No
             station_dependency=values.station_dependency,
             activation_ready_sta_ids=values.activation_ready_sta_ids,
             expected_sta_ids=values.expected_sta_ids,
+            inference_eligible_sta_ids=values.inference_eligible_sta_ids,
             rental_support_sta_ids=values.rental_support_sta_ids,
             return_support_sta_ids=values.return_support_sta_ids,
             prepared_publications=tuple(reversed(values.prepared_publications)),

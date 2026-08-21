@@ -732,60 +732,7 @@ def _validated_station_row(
     raises:
         ValueError: 필수 값이 결측·비수치·비정수·허용 좌표 범위 밖일 때
     """
-    if isinstance(station_row, pd.DataFrame):
-        raise TypeError(
-            f"station master에 station_id가 중복됨: station_id={station_id!r}"
-        )
-
-    normalized = station_row.copy()
-
-    def _finite_number(column: str) -> float:
-        """한 필드를 유한 실수로 변환하고 실패하면 station 문맥을 붙여 예외를 낸다."""
-        message = f"station master의 {column} 값이 유효한 숫자가 아님: station_id={station_id!r}"
-        try:
-            raw_value = normalized[column]
-            if isinstance(raw_value, (bool, np.bool_)):
-                raise TypeError
-            value = float(raw_value)
-        except (KeyError, TypeError, ValueError, OverflowError) as exc:
-            raise ValueError(message) from exc
-        if not np.isfinite(value):
-            raise ValueError(message)
-        return value
-
-    for column, minimum in (("station_no", 1), ("capacity", 0)):
-        value = _finite_number(column)
-        if not value.is_integer() or value < minimum:
-            raise ValueError(
-                f"station master의 {column} 값이 유효한 정수가 아님: station_id={station_id!r}"
-            )
-        normalized[column] = int(value)
-
-    latitude = _finite_number("lat")
-    longitude = _finite_number("lon")
-    if not 36.5 <= latitude <= 38.5:
-        raise ValueError(
-            f"station master의 lat 값이 서울 좌표 범위 밖임: station_id={station_id!r}"
-        )
-    if not 125.5 <= longitude <= 128.5:
-        raise ValueError(
-            f"station master의 lon 값이 서울 좌표 범위 밖임: station_id={station_id!r}"
-        )
-    normalized["lat"] = latitude
-    normalized["lon"] = longitude
-
-    try:
-        grid_id = normalized["grid_id"]
-    except KeyError as exc:
-        raise ValueError(
-            f"station master의 grid_id 값이 없음: station_id={station_id!r}"
-        ) from exc
-    if pd.isna(grid_id) or not str(grid_id).strip():
-        raise ValueError(
-            f"station master의 grid_id 값이 유효하지 않음: station_id={station_id!r}"
-        )
-    normalized["grid_id"] = str(grid_id).strip()
-    return normalized
+    return silver_schema.validate_inference_station_row(station_id, station_row)
 
 
 def _get_holidays(year: int) -> set[str]:
