@@ -199,9 +199,9 @@ def _chunk_progress(model_name: str, label: str):
 def _lgb_mlflow_progress_callback(
     model_name: str,
     phase_name: str,
-    log_interval: int = 10,
+    log_interval: int = 5,
 ) -> Callable[[Any], None]:
-    """LightGBM 학습 중 주기적으로 MLflow 지표와 진행 로그를 남기는 경량 콜백을 생성한다.
+    """LightGBM 학습 중 주기적으로 MLflow 지표, 태그 및 진행 로그를 남기는 경량 콜백을 생성한다.
 
     args:
         model_name: 모델 이름 (예: 'rental', 'return')
@@ -213,7 +213,16 @@ def _lgb_mlflow_progress_callback(
 
     def _callback(env: Any) -> None:
         iteration = env.iteration + 1
-        if iteration % log_interval == 0 or env.iteration == env.end_iteration - 1:
+        total_rounds = env.end_iteration
+        if iteration == 1 or iteration % log_interval == 0 or iteration == total_rounds:
+            pct = (iteration / total_rounds) * 100
+            stage_str = f"[{model_name}][{phase_name}] {iteration}/{total_rounds} ({pct:.1f}%)"
+            try:
+                mlflow.set_tag("training_stage", stage_str)
+                mlflow.log_metric(f"{phase_name}_progress_pct", pct, step=iteration)
+                mlflow.log_metric(f"{phase_name}_round", iteration, step=iteration)
+            except Exception:
+                pass
             metrics_to_log: dict[str, float] = {}
             for item in env.evaluation_result_list:
                 data_name, eval_name, val = item[0], item[1], item[2]
@@ -225,12 +234,14 @@ def _lgb_mlflow_progress_callback(
                     pass
                 summary = " ".join(f"{k}={v:.4f}" for k, v in metrics_to_log.items())
                 _append_progress_log(
-                    f"[{model_name}][{phase_name}] round {iteration}/{env.end_iteration} — {summary}, peak_rss={_peak_rss_mb():.0f}MB"
+                    f"[{model_name}][{phase_name}] round {iteration}/{total_rounds} ({pct:.1f}%) — {summary}, peak_rss={_peak_rss_mb():.0f}MB"
                 )
+                print(f"  [{model_name}][{phase_name}] round {iteration}/{total_rounds} ({pct:.1f}%) — {summary}", flush=True)
             else:
                 _append_progress_log(
-                    f"[{model_name}][{phase_name}] round {iteration}/{env.end_iteration}, peak_rss={_peak_rss_mb():.0f}MB"
+                    f"[{model_name}][{phase_name}] round {iteration}/{total_rounds} ({pct:.1f}%), peak_rss={_peak_rss_mb():.0f}MB"
                 )
+                print(f"  [{model_name}][{phase_name}] round {iteration}/{total_rounds} ({pct:.1f}%)", flush=True)
 
     _callback.order = 20  # early_stopping 이후에 실행
     return _callback
@@ -410,6 +421,11 @@ def train_target(
         metrics: dict = {"model_name": model_name}
         cache = lazy_train_dataset.ChunkCache()
 
+        try:
+            mlflow.set_tag("training_stage", f"[{model_name}] 1/4 Poisson Dataset Loading")
+        except Exception:
+            pass
+
         # 1) Poisson (+ exposure offset) — train/valid Dataset은 Sequence 기반(날짜별
         # 청크를 필요할 때만 S3에서 읽고 바이닝 후 버림, lazy_train_dataset.py 참고).
         train_set, y_train, exposure_train = lazy_train_dataset.build_lazy_dataset(
@@ -460,7 +476,7 @@ def train_target(
             pass
         poisson_callbacks = [
             lgb.log_evaluation(0),
-            _lgb_mlflow_progress_callback(model_name, "poisson", log_interval=10),
+            _lgb_mlflow_progress_callback(model_name, "poisson", log_interval=5),
         ]
         if valid_set is not None:
             poisson_callbacks.insert(
@@ -493,6 +509,10 @@ def train_target(
         if exposure_col is None:
             train_set_q, valid_set_q = train_set, valid_set
         else:
+            try:
+                mlflow.set_tag("training_stage", f"[{model_name}] 2/4 Quantile Dataset Loading")
+            except Exception:
+                pass
             # 대여 quantile Dataset은 offset 없는 새 native binned storage가 필요하다.
             # poisson Dataset 변수를 둔 채 새 Dataset을 construct하면 두 train/valid
             # storage가 동시에 상주해 23GB 머신에서 OOM이 난다. lgb.train() 기본값은
@@ -527,7 +547,7 @@ def train_target(
             q_params = {**lgb_params, **_distributed_params(), "objective": "quantile", "alpha": alpha}
             q_callbacks = [
                 lgb.log_evaluation(0),
-                _lgb_mlflow_progress_callback(model_name, q_alpha_name, log_interval=10),
+                _lgb_mlflow_progress_callback(model_name, q_alpha_name, log_interval=5),
             ]
             if valid_set_q is not None:
                 q_callbacks.insert(
