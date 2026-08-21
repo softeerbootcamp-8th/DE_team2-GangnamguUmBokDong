@@ -28,7 +28,9 @@ def aggregate_results(documents: Sequence[dict[str, Any]]) -> dict[str, Any]:
             or not gate["legacy_endpoint_reconciliation_passed"]
             or not gate["heldout_day_of_month"]
         ):
-            raise ValueError(f"point-in-time held-out gate를 통과하지 못했습니다: {document['target_date']}")
+            raise ValueError(
+                f"point-in-time held-out gate를 통과하지 못했습니다: {document['target_date']}"
+            )
     _validate_contract_parity(documents)
 
     accumulators: dict[tuple[int, str], dict[str, float]] = defaultdict(
@@ -50,6 +52,23 @@ def aggregate_results(documents: Sequence[dict[str, Any]]) -> dict[str, Any]:
             ]
             legacy_accumulators[minutes]["added_bikes"] += legacy["added_bikes"]
             legacy_accumulators[minutes]["removed_bikes"] += legacy["removed_bikes"]
+            evidence = legacy.get("relocation_evidence", {})
+            for source_name, target_name in (
+                ("candidate_intervals", "id_candidates"),
+                ("internal_candidate_intervals", "id_internal_candidates"),
+                ("hourly_bounded_intervals", "id_hourly_bounded"),
+                ("residual_compatible_intervals", "id_residual_compatible"),
+                ("residual_compatible_within_6h", "id_compatible_within_6h"),
+                ("residual_compatible_within_24h", "id_compatible_within_24h"),
+                ("residual_station_units", "residual_station_units"),
+                (
+                    "residual_explained_station_units",
+                    "residual_explained_station_units",
+                ),
+            ):
+                legacy_accumulators[minutes][target_name] += float(
+                    evidence.get(source_name, 0)
+                )
             legacy_accumulators[minutes]["empty_min"] += min(legacy_values)
             legacy_accumulators[minutes]["empty_max"] += max(legacy_values)
             legacy_accumulators[minutes]["negative_min"] += min(legacy_negative)
@@ -103,12 +122,30 @@ def aggregate_results(documents: Sequence[dict[str, Any]]) -> dict[str, Any]:
             "negative_station_minutes_min": round(values["negative_min"], 3),
             "negative_station_minutes_max": round(values["negative_max"], 3),
             "endpoint_max_absolute_error": int(values["endpoint_max_error"]),
+            "id_candidate_intervals": int(values["id_candidates"]),
+            "id_internal_candidate_intervals": int(values["id_internal_candidates"]),
+            "id_hourly_bounded_intervals": int(values["id_hourly_bounded"]),
+            "id_residual_compatible_intervals": int(values["id_residual_compatible"]),
+            "id_compatible_within_6h": int(values["id_compatible_within_6h"]),
+            "id_compatible_within_24h": int(values["id_compatible_within_24h"]),
+            "residual_station_units": int(values["residual_station_units"]),
+            "residual_explained_station_units": int(
+                values["residual_explained_station_units"]
+            ),
+            "residual_explained_pct": (
+                None
+                if values["residual_station_units"] == 0
+                else round(
+                    values["residual_explained_station_units"]
+                    / values["residual_station_units"]
+                    * 100.0,
+                    3,
+                )
+            ),
         }
         for minutes, values in sorted(legacy_accumulators.items())
     ]
-    legacy_by_minutes = {
-        row["evaluation_minutes"]: row for row in legacy_summaries
-    }
+    legacy_by_minutes = {row["evaluation_minutes"]: row for row in legacy_summaries}
     rows = []
     for (minutes, policy), values in sorted(accumulators.items()):
         baseline = accumulators[(minutes, "no_rebalance")]
@@ -132,16 +169,23 @@ def aggregate_results(documents: Sequence[dict[str, Any]]) -> dict[str, Any]:
                 "empty_station_minutes": round(values["empty_station_minutes"], 3),
                 "empty_station_minutes_change_vs_no_rebalance_pct": (
                     None
-                    if policy == "no_rebalance" or baseline["empty_station_minutes"] == 0
+                    if policy == "no_rebalance"
+                    or baseline["empty_station_minutes"] == 0
                     else round(
-                        (values["empty_station_minutes"] - baseline["empty_station_minutes"])
+                        (
+                            values["empty_station_minutes"]
+                            - baseline["empty_station_minutes"]
+                        )
                         / baseline["empty_station_minutes"]
                         * 100.0,
                         3,
                     )
                 ),
                 "unfulfilled_change_vs_no_rebalance": (
-                    int(values["unfulfilled_requests"] - baseline["unfulfilled_requests"])
+                    int(
+                        values["unfulfilled_requests"]
+                        - baseline["unfulfilled_requests"]
+                    )
                 ),
                 "dates_fulfillment_better": sum(
                     row["fulfillment_delta"] > 1e-12 for row in comparisons
@@ -180,7 +224,7 @@ def aggregate_results(documents: Sequence[dict[str, Any]]) -> dict[str, Any]:
             }
         )
     return {
-        "schema_version": "point-in-time-policy-suite-v1",
+        "schema_version": "point-in-time-policy-suite-v2-bike-lineage",
         "dates": sorted(dates),
         "model_bundle_sha256": next(iter(model_hashes)),
         "result_count": len(documents),
@@ -235,10 +279,30 @@ def aggregate_markdown(result: dict[str, Any]) -> str:
     lines.extend(
         (
             "",
+            "## 자전거 ID·재고 잔차 양립성",
+            "",
+            "| 구간 | ID 후보 | 한 시간 내 확정 | 잔차 양립 | 6시간 이내 | 24시간 이내 | 잔차 설명 |",
+            "|---:|---:|---:|---:|---:|---:|---:|",
+        )
+    )
+    for legacy in result["legacy_summaries"]:
+        explained = legacy["residual_explained_pct"]
+        explained_text = "해당 없음" if explained is None else f"{explained:.1f}%"
+        lines.append(
+            f"| {legacy['evaluation_minutes']}분 | "
+            f"{legacy['id_candidate_intervals']} | "
+            f"{legacy['id_hourly_bounded_intervals']} | "
+            f"{legacy['id_residual_compatible_intervals']} | "
+            f"{legacy['id_compatible_within_6h']} | "
+            f"{legacy['id_compatible_within_24h']} | {explained_text} |"
+        )
+    lines.extend(
+        (
+            "",
             "## 정책 결과",
             "",
-        "| 구간 | 정책 | 요청 | 충족률 | 미충족 변화 | 품절 대여소-분 변화 | 날짜별 충족률 개선/동일/악화 | 이동 | 차량 분 |",
-        "|---:|---|---:|---:|---:|---:|---:|---:|---:|",
+            "| 구간 | 정책 | 요청 | 충족률 | 미충족 변화 | 품절 대여소-분 변화 | 날짜별 충족률 개선/동일/악화 | 이동 | 차량 분 |",
+            "|---:|---|---:|---:|---:|---:|---:|---:|---:|",
         )
     )
     for row in result["rows"]:
@@ -257,8 +321,10 @@ def aggregate_markdown(result: dict[str, Any]) -> str:
     lines.extend(
         (
             "",
-            "> 여러 held-out 날짜 집계도 관측 성공 수요 replay다. 실패 수요와 기존 운영 "
-            "작업 로그가 없으므로 실제 운영 대비 인과적 개선율로 인용하면 안 된다.",
+            (
+                "> 여러 held-out 날짜 집계도 관측 성공 수요 replay다. 실패 수요와 기존 운영 "
+                "작업 로그가 없으므로 실제 운영 대비 인과적 개선율로 인용하면 안 된다."
+            ),
             "",
         )
     )
