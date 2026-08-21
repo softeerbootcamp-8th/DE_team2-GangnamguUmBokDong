@@ -135,6 +135,50 @@ def test_oracle_need_runs_current_route_v2_without_copying_planner() -> None:
     assert all(row.executed_at > START for row in actions)
 
 
+def test_current_planner_accepts_evaluation_stop_limit() -> None:
+    """운영 기본값을 바꾸지 않고 평가 실행만 작업 대여소 상한을 제한한다."""
+    center = DispatchCenterTopology("center", 127.0, 37.5, True)
+    stations = {
+        index: StationMetadata(
+            index,
+            f"ST-{index}",
+            f"대여소 {index}",
+            37.5 + index / 1000,
+            127.0 + index / 1000,
+            "center",
+        )
+        for index in range(1, 9)
+    }
+    trips = tuple(
+        _trip(f"D{index}", 10 + index, index, 99, duration=30) for index in range(5, 9)
+    )
+    urgency = build_oracle_urgency(
+        trips=trips,
+        initial_stock={
+            **{index: 5 for index in range(1, 5)},
+            **{index: 0 for index in range(5, 9)},
+        },
+        stations=stations,
+        window_start=START,
+        window_end=END,
+        movement_budget=4,
+    )
+    plan = build_current_route_plan(
+        logical_dttm=START,
+        center=center,
+        stations=stations,
+        urgency=urgency,
+        max_stops_per_route=5,
+    )
+    stops_by_route = {
+        route.route_id: [
+            stop for stop in plan.route_stops if stop.route_id == route.route_id
+        ]
+        for route in plan.routes
+    }
+    assert all(len(stops) <= 5 for stops in stops_by_route.values())
+
+
 def test_detect_relocation_candidates_uses_consecutive_bike_locations() -> None:
     """동일 자전거의 반납지와 다음 대여지가 다를 때만 후보로 센다."""
     first = _trip("A", 0, 1, 2)
