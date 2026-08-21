@@ -16,7 +16,13 @@ DAILY_CRON = "0 3 * * *"
 # D-6 대여이력 재수집 후 같은 날짜의 silver를 archive로 묶는 배치.
 COMPACTION_CRON = "30 4 * * *"
 
-# 매달 1일 04:00 KST 월별 챔피언 모델 점검 및 재학습 파이프라인.
+# 매달 1일 03:00 KST 대여(Rental) 챔피언 점검 및 재학습 파이프라인.
+MONTHLY_RETRAIN_RENTAL_CRON = "0 3 1 * *"
+
+# 매달 1일 06:00 KST 반납(Return) 챔피언 점검 및 재학습 파이프라인.
+MONTHLY_RETRAIN_RETURN_CRON = "0 6 1 * *"
+
+# 하위 호환용 기본 스케줄
 MONTHLY_RETRAIN_CRON = "0 4 1 * *"
 
 DEFAULT_RETRIES = 2

@@ -147,31 +147,29 @@ def _champion_profile_name(model_name: str) -> str | None:
 def _candidate_profiles(model_name: str) -> list[tuple[str, dict[str, str]]]:
     """시도할 (프로필 이름, 이 시도에만 덮어쓸 환경변수) 순서.
 
-    **1차**: 챔피언이 실제로 학습됐던 프로필을 그대로 쓰되(임베고/앵커/LGB
-    파라미터 등은 안 건드림), 학습기간만 지금 프로세스의 기본 롤링 윈도우
-    (`TRAIN_LOOKBACK_MONTHS`, 최신 증분 포함)로 갱신해서 재시도한다 — "성능이
-    나빠졌으니 일단 최신 데이터로 다시 학습해보자"가 첫 시도여야지, 하이퍼파라미터
-    자체를 바꾸는 건 별개 문제라 여기서 같이 안 한다. `common_config.py`가
-    이미 `TRAIN_LOOKBACK_MONTHS` 환경변수를 프로필 값 위에 override할 수 있게
-    지원하므로(`_int_env()`), 프로필 자체를 새로 만들어 S3에 올릴 필요 없이
-    이 환경변수 하나만 얹으면 된다.
-    **2차 이후**: 그래도 챔피언을 못 넘으면, 미리 등록해둔 다른 프로필
-    (`ml_core.profile_registry.push_profile()`로 생성)을 이름순으로 검토한다.
-    현재 서빙 계약과 같은 후보(LGB/학습 전용 설정 차이)만 실제로 실행하고,
-    임베고/앵커처럼 피처 의미가 다른 후보는 `_validate_candidate_serving_contract()`가
-    무거운 작업 전에 건너뛴다. 이쪽은 프로필에 저장된 기간 값을 그대로 쓴다.
-
-    S3 `profiles/` 목록이 비어 있거나 조회에 실패해도(`list_profile_names()`가
-    `[]` 반환) 1차 시도와 내장 `builtin-default`는 항상 존재한다. 기존 챔피언이
-    원격 프로필이면 그 조건으로 최신 데이터 재학습을 먼저 시도한 뒤, 새 코드의
-    안전한 5분 내장 기본값도 후보로 검토해야 한다(현재 서빙 계약과 다르면 preflight에서
-    건너뜀). 이름이 겹치면 한 번만 남긴다.
+    **1차**: 챔피언이 실제로 학습됐던 프로필을 그대로 쓰되, 학습기간만 지금
+    프로세스의 기본 롤링 윈도우(`TRAIN_LOOKBACK_MONTHS`, 최신 증분 포함)로 갱신해서
+    재시도한다.
+    **2차**: 해당 모델 전용 프로필(`{model_name}_*` 형식, 예: `rental_embargo45`).
+    **3차**: 내장 기본값(`builtin-default`) 및 일반 공통 프로필.
+    단, 타 모델 전용 프로필(예: 대여 모델 시도 시 `return_*`)은 후보에서 제외한다.
     """
     primary = _champion_profile_name(model_name) or common_config.PROFILE_NAME
+    other_model = "return" if model_name == "rental" else "rental"
+
+    remote_profiles = common_config.list_profile_names()
+    # 타 모델 전용 프로필 제외
+    valid_remotes = [p for p in remote_profiles if not p.startswith(f"{other_model}_")]
+
+    # 해당 모델 전용 프로필을 일반 공통 프로필보다 우선 시도
+    model_specific = sorted([p for p in valid_remotes if p.startswith(f"{model_name}_")])
+    general_remotes = sorted([p for p in valid_remotes if not p.startswith(f"{model_name}_")])
+
     ordered_names = [
         primary,
+        *model_specific,
         common_config.BUILTIN_PROFILE_NAME,
-        *sorted(common_config.list_profile_names()),
+        *general_remotes,
     ]
     unique_names = list(dict.fromkeys(ordered_names))
     refreshed_period = {"TRAIN_LOOKBACK_MONTHS": str(common_config.TRAIN_LOOKBACK_MONTHS)}
@@ -483,10 +481,18 @@ def main() -> list[dict]:
     if not args.json_output:
         _print_report(results)
 
-    retrain_needed = [r for r in results if r["needs_retrain"]]
-    target_models = [
-        m.strip() for m in args.models.split(",") if m.strip()
-    ] if args.models else [r["model_name"] for r in retrain_needed]
+    requested_models = (
+        [m.strip() for m in args.models.split(",") if m.strip()]
+        if args.models
+        else None
+    )
+    relevant_results = (
+        [r for r in results if r["model_name"] in requested_models]
+        if requested_models
+        else results
+    )
+    retrain_needed = [r for r in relevant_results if r["needs_retrain"]]
+    target_models = [r["model_name"] for r in retrain_needed]
 
     if args.check_only or not args.execute:
         summary = {
@@ -495,7 +501,7 @@ def main() -> list[dict]:
             "candidate_profiles": list(dict.fromkeys(
                 name for r in retrain_needed for name, _ in _candidate_profiles(r["model_name"])
             )) if retrain_needed else [],
-            "results": results,
+            "results": relevant_results,
         }
         if args.json_output:
             import json
@@ -508,7 +514,7 @@ def main() -> list[dict]:
                     f"기준 미달 모델 {len(retrain_needed)}개 — 실제 재학습은 --execute로 다시 실행하세요 "
                     "(지금은 dry-run/check-only라 아무것도 바꾸지 않았습니다)"
                 )
-        return results
+        return relevant_results
 
     if not target_models:
         _notify("재학습 대상 모델이 없음 — 종료")

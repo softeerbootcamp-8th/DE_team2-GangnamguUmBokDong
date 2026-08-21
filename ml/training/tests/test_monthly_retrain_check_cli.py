@@ -177,3 +177,105 @@ def test_main_check_only_json_output(monkeypatch, capsys):
     assert data["needs_retrain"] is True
     assert data["retrain_models"] == ["rental"]
     assert len(data["results"]) == 2
+
+
+def test_main_check_only_model_filtering(monkeypatch, capsys):
+    """--models로 특정 모델을 지정했을 때 해당 모델의 결과만 평가되고 요약에 포함된다."""
+    mock_results = [
+        {
+            "model_name": "rental",
+            "needs_retrain": True,
+            "period": {"start": "2026-07-01", "end": "2026-07-31"},
+            "n_rows": 1000,
+            "baseline_deviance": 0.90,
+            "current_deviance": 1.05,
+            "deviance_relative_change": 0.16,
+            "baseline_coverage": 0.80,
+            "current_coverage": 0.79,
+            "coverage_drift": -0.01,
+            "reasons": ["deviance 16.7% 악화"],
+        },
+        {
+            "model_name": "return",
+            "needs_retrain": False,
+            "period": {"start": "2026-07-01", "end": "2026-07-31"},
+            "n_rows": 1000,
+            "baseline_deviance": 0.85,
+            "current_deviance": 0.86,
+            "deviance_relative_change": 0.01,
+            "baseline_coverage": 0.82,
+            "current_coverage": 0.81,
+            "coverage_drift": -0.01,
+            "reasons": [],
+        },
+    ]
+
+    monkeypatch.setattr(mrc, "check_all_models", lambda as_of=None: mock_results)
+
+    # 1. --models return: return은 정상이므로 needs_retrain=False
+    monkeypatch.setattr("sys.argv", ["monthly_retrain_check", "--check-only", "--json-output", "--models", "return"])
+    mrc.main()
+    captured = capsys.readouterr()
+    data = json.loads(captured.out)
+    assert data["needs_retrain"] is False
+    assert data["retrain_models"] == []
+    assert len(data["results"]) == 1
+    assert data["results"][0]["model_name"] == "return"
+
+    # 2. --models rental: rental은 재학습 필요하므로 needs_retrain=True
+    monkeypatch.setattr("sys.argv", ["monthly_retrain_check", "--check-only", "--json-output", "--models", "rental"])
+    mrc.main()
+    captured = capsys.readouterr()
+    data = json.loads(captured.out)
+    assert data["needs_retrain"] is True
+    assert data["retrain_models"] == ["rental"]
+    assert len(data["results"]) == 1
+    assert data["results"][0]["model_name"] == "rental"
+
+
+
+def test_candidate_profiles_model_specific_filtering(monkeypatch):
+    """대여 모델은 rental_* 프로필을 우선하고 return_*을 제외하며, 반납 모델은 반대로 동작한다."""
+    mock_profiles = [
+        "rental_embargo45",
+        "return_fast_lgb",
+        "general_profile",
+    ]
+    monkeypatch.setattr(common_config, "list_profile_names", lambda: mock_profiles)
+    monkeypatch.setattr(mrc, "_champion_profile_name", lambda _: "champ_prof")
+
+    rental_candidates = [name for name, _ in mrc._candidate_profiles("rental")]
+    # 대여: return_fast_lgb는 제외되고 rental_embargo45가 우선순위에 위치
+    assert "return_fast_lgb" not in rental_candidates
+    assert "rental_embargo45" in rental_candidates
+    assert "general_profile" in rental_candidates
+    assert rental_candidates[0] == "champ_prof"
+    assert rental_candidates[1] == "rental_embargo45"
+
+    return_candidates = [name for name, _ in mrc._candidate_profiles("return")]
+    # 반납: rental_embargo45는 제외되고 return_fast_lgb가 우선순위에 위치
+    assert "rental_embargo45" not in return_candidates
+    assert "return_fast_lgb" in return_candidates
+    assert "general_profile" in return_candidates
+    assert return_candidates[0] == "champ_prof"
+    assert return_candidates[1] == "return_fast_lgb"
+
+
+def test_get_lgb_params_model_specific_overrides():
+    """LGB_PARAMS_RENTAL 및 LGB_PARAMS_RETURN이 LGB_PARAMS_COMMON 위에 올바르게 병합된다."""
+    custom_profile = {
+        "LGB_PARAMS_COMMON": {"num_leaves": 63, "learning_rate": 0.05},
+        "LGB_PARAMS_RENTAL": {"learning_rate": 0.02, "feature_fraction": 0.7},
+        "LGB_PARAMS_RETURN": {"num_leaves": 31, "min_data_in_leaf": 50},
+    }
+
+    rental_params = common_config.get_lgb_params("rental", profile=custom_profile)
+    assert rental_params["num_leaves"] == 63
+    assert rental_params["learning_rate"] == 0.02
+    assert rental_params["feature_fraction"] == 0.7
+
+    return_params = common_config.get_lgb_params("return", profile=custom_profile)
+    assert return_params["num_leaves"] == 31
+    assert return_params["learning_rate"] == 0.05
+    assert return_params["min_data_in_leaf"] == 50
+

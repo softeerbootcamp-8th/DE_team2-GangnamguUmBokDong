@@ -26,6 +26,8 @@ DEFAULT_PROFILE = {
         "bagging_freq": 5,
         "min_data_in_leaf": 100,
     },
+    "LGB_PARAMS_RENTAL": {},
+    "LGB_PARAMS_RETURN": {},
     "LGB_NUM_BOOST_ROUND": 800,
     "LGB_EARLY_STOPPING_ROUNDS": 50,
     "CONFORMAL_TARGET_COVERAGE": 0.80,
@@ -127,15 +129,16 @@ def validate_profile(profile: dict, name: str) -> None:
         profile: 기본값과 원격 override를 병합한 프로필
         name: 오류 메시지에 표시할 프로필 이름
     raises:
-        TypeError: 프로필 또는 LGB_PARAMS_COMMON이 객체가 아닐 때
+        TypeError: 프로필 또는 LGB_PARAMS_* 가 객체가 아닐 때
         ValueError: 예약 메타데이터나 모델 학습 grid 계약이 잘못됐을 때
     """
     if not isinstance(profile, dict):
         raise TypeError(f"프로필 '{name}'의 최상위 JSON 값은 객체여야 합니다")
     if "profile_name" in profile:
         raise ValueError(f"프로필 '{name}'은 예약 메타데이터 키 profile_name을 포함할 수 없습니다")
-    if not isinstance(profile.get("LGB_PARAMS_COMMON"), dict):
-        raise TypeError(f"프로필 '{name}'의 LGB_PARAMS_COMMON은 객체여야 합니다")
+    for param_key in ("LGB_PARAMS_COMMON", "LGB_PARAMS_RENTAL", "LGB_PARAMS_RETURN"):
+        if param_key in profile and not isinstance(profile.get(param_key), dict):
+            raise TypeError(f"프로필 '{name}'의 {param_key}은 객체여야 합니다")
     ticks: dict[str, int] = {}
     for key in ("GRID_TICK_MINUTES", "ROLLING_TICK_MINUTES"):
         try:
@@ -162,20 +165,34 @@ def validate_profile(profile: dict, name: str) -> None:
 def merge_and_validate_profile(overrides: dict, name: str) -> dict:
     """부분 프로필을 기본값과 깊이 1단계 병합하고 검증해 새 dict로 반환한다.
 
-    `LGB_PARAMS_COMMON`은 별도로 병합해 `max_bin` 같은 미래 키와 기존 기본 키를
-    모두 보존한다.
+    `LGB_PARAMS_COMMON`, `LGB_PARAMS_RENTAL`, `LGB_PARAMS_RETURN`은 별도로 병합해
+    모델별 하이퍼파라미터 오버라이드를 지원한다.
     """
     if not isinstance(overrides, dict):
         raise TypeError(f"프로필 '{name}'의 최상위 JSON 값은 객체여야 합니다")
     lgb_overrides = overrides.get("LGB_PARAMS_COMMON", {})
     if not isinstance(lgb_overrides, dict):
         raise TypeError(f"프로필 '{name}'의 LGB_PARAMS_COMMON은 객체여야 합니다")
+    lgb_rental_overrides = overrides.get("LGB_PARAMS_RENTAL", {})
+    if not isinstance(lgb_rental_overrides, dict):
+        raise TypeError(f"프로필 '{name}'의 LGB_PARAMS_RENTAL은 객체여야 합니다")
+    lgb_return_overrides = overrides.get("LGB_PARAMS_RETURN", {})
+    if not isinstance(lgb_return_overrides, dict):
+        raise TypeError(f"프로필 '{name}'의 LGB_PARAMS_RETURN은 객체여야 합니다")
     merged = {
         **DEFAULT_PROFILE,
         **overrides,
         "LGB_PARAMS_COMMON": {
             **DEFAULT_PROFILE["LGB_PARAMS_COMMON"],
             **lgb_overrides,
+        },
+        "LGB_PARAMS_RENTAL": {
+            **DEFAULT_PROFILE.get("LGB_PARAMS_RENTAL", {}),
+            **lgb_rental_overrides,
+        },
+        "LGB_PARAMS_RETURN": {
+            **DEFAULT_PROFILE.get("LGB_PARAMS_RETURN", {}),
+            **lgb_return_overrides,
         },
     }
     # 오래된 프로필에는 anchor 키가 없다. 명시하지 않은 경우 그 프로필의 실제

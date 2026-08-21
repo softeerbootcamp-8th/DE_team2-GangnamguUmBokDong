@@ -3,13 +3,18 @@
 from unittest.mock import MagicMock
 
 import dags.monthly_retrain as monthly_dag
+import dags.monthly_retrain_rental as monthly_rental_dag
+import dags.monthly_retrain_return as monthly_return_dag
 from airflow.task.trigger_rule import TriggerRule
 
 
-def test_monthly_retrain_dag_structure() -> None:
-    """monthly_retrain DAG의 ID, 태스크 목록 및 의존성 구조를 검증한다."""
-    dag = monthly_dag.dag
-    assert dag.dag_id == "monthly_retrain"
+def test_monthly_retrain_dags_structure() -> None:
+    """대여 및 반납 monthly_retrain DAG의 ID, 태스크 목록 및 의존성 구조를 검증한다."""
+    rental_dag = monthly_rental_dag.dag
+    assert rental_dag.dag_id == "monthly_retrain_rental"
+
+    return_dag = monthly_return_dag.dag
+    assert return_dag.dag_id == "monthly_retrain_return"
 
     expected_tasks = {
         "start_ec2_eval",
@@ -20,32 +25,33 @@ def test_monthly_retrain_dag_structure() -> None:
         "skip_monthly_retrain",
         "ensure_all_instances_stopped",
     }
-    assert set(dag.task_ids) == expected_tasks
+    assert set(rental_dag.task_ids) == expected_tasks
+    assert set(return_dag.task_ids) == expected_tasks
 
 
 def test_monthly_retrain_fail_safe_trigger_rules() -> None:
     """인스턴스 정리 태스크는 상위 태스크 실패 시에도 ALL_DONE으로 반드시 실행된다."""
-    dag = monthly_dag.dag
+    for dag in (monthly_rental_dag.dag, monthly_return_dag.dag):
+        stop_eval = dag.get_task("stop_ec2_eval")
+        assert stop_eval.trigger_rule == TriggerRule.ALL_DONE
 
-    stop_eval = dag.get_task("stop_ec2_eval")
-    assert stop_eval.trigger_rule == TriggerRule.ALL_DONE
-
-    ensure_stopped = dag.get_task("ensure_all_instances_stopped")
-    assert ensure_stopped.trigger_rule == TriggerRule.ALL_DONE
+        ensure_stopped = dag.get_task("ensure_all_instances_stopped")
+        assert ensure_stopped.trigger_rule == TriggerRule.ALL_DONE
 
 
 def test_check_retrain_branch_decisions() -> None:
     """needs_retrain 값에 따라 올바른 다운스트림 태스크로 분기한다."""
     mock_ti = MagicMock()
+    branch_fn = monthly_dag.make_task_check_retrain_branch("rental")
 
     # Case 1: 재학습 필요 시 orchestrate_retrain_loop로 분기
     mock_ti.xcom_pull.return_value = True
-    branch = monthly_dag.task_check_retrain_branch(ti=mock_ti)
+    branch = branch_fn(ti=mock_ti)
     assert branch == "orchestrate_retrain_loop"
 
     # Case 2: 재학습 불필요 시 skip_monthly_retrain으로 분기
     mock_ti.xcom_pull.return_value = False
-    branch = monthly_dag.task_check_retrain_branch(ti=mock_ti)
+    branch = branch_fn(ti=mock_ti)
     assert branch == "skip_monthly_retrain"
 
 
@@ -53,8 +59,7 @@ def test_orchestrate_retrain_loop_executes_emr_then_ec2(monkeypatch) -> None:
     """재학습 오케스트레이션이 EMR 피처마트 생성 후 EC2 학습/평가를 순차 실행하고 EC2를 중지한다."""
     mock_ti = MagicMock()
     mock_ti.xcom_pull.side_effect = lambda task_ids, key: {
-        "candidate_profiles": ["test-profile-1"],
-        "retrain_models": ["rental"],
+        "candidate_profiles": ["rental-profile-1"],
     }.get(key, [])
 
     emr_calls = []
@@ -77,10 +82,11 @@ def test_orchestrate_retrain_loop_executes_emr_then_ec2(monkeypatch) -> None:
         lambda cmd, working_dir=None: commands_run.append(cmd) or {"StandardOutputContent": "success"},
     )
 
-    result = monthly_dag.task_orchestrate_retrain_loop(ti=mock_ti)
+    loop_fn = monthly_dag.make_task_orchestrate_retrain_loop("rental")
+    result = loop_fn(ti=mock_ti)
 
     assert result["status"] == "completed"
-    assert emr_calls == ["test-profile-1"]
+    assert emr_calls == ["rental-profile-1"]
     assert len(ec2_starts) == 1
     assert len(ec2_stops) == 1
-    assert any("--profile-name test-profile-1" in cmd for cmd in commands_run)
+    assert any("--profile-name rental-profile-1" in cmd and "--models rental" in cmd for cmd in commands_run)
