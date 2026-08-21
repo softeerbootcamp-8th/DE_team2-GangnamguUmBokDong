@@ -144,7 +144,7 @@ def test_route_constants_match_publication_contract() -> None:
     assert TRUCK_CAPACITY == 20
     assert TRUCK_CAPACITY_CONFIG_VERSION == "truck-capacity-v1"
     assert INITIAL_TRUCK_LOAD == 0
-    assert MAX_STOPS_PER_ROUTE == 5
+    assert MAX_STOPS_PER_ROUTE == 8
     assert MAX_ROUTES_PER_CENTER == 3
     assert ROUTE_WORK_UNIT_CONFIG_VERSION == "route-work-unit-v1"
 
@@ -572,10 +572,10 @@ def test_unpaired_action_does_not_create_incomplete_route() -> None:
     assert dropoff_only == RebalanceRoutePlan((), ())
 
 
-def test_work_unit_has_at_most_five_stops_and_center_route_cap() -> None:
-    """작업은 2~5개 대여소로 완결되고 센터별 상위 3개까지만 제안한다."""
-    pickup_stations = tuple(_station(f"ST-{100 + index}") for index in range(1, 9))
-    dropoff_stations = tuple(_station(f"ST-{200 + index}") for index in range(1, 9))
+def test_work_unit_has_at_most_eight_stops_and_center_route_cap() -> None:
+    """작업은 2~8개 대여소로 완결되고 센터별 상위 3개까지만 제안한다."""
+    pickup_stations = tuple(_station(f"ST-{100 + index}") for index in range(1, 13))
+    dropoff_stations = tuple(_station(f"ST-{200 + index}") for index in range(1, 13))
     plan = _plan(
         stations=pickup_stations + dropoff_stations,
         urgency=tuple(

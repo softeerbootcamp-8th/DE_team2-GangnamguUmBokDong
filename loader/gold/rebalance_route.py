@@ -63,7 +63,7 @@ ROUTE_ALGORITHM_VERSION = "route-v2"
 TRUCK_CAPACITY = 20
 TRUCK_CAPACITY_CONFIG_VERSION = "truck-capacity-v1"
 INITIAL_TRUCK_LOAD = 0
-MAX_STOPS_PER_ROUTE = 5
+MAX_STOPS_PER_ROUTE = 8
 MAX_ROUTES_PER_CENTER = 3
 ROUTE_WORK_UNIT_CONFIG_VERSION = "route-work-unit-v1"
 ROUTE_PUBLISHER_VERSION = "gold-route-publisher-v1"
@@ -1741,7 +1741,7 @@ def _choose_balanced_stop_split(
     pickups: list[_Candidate],
     dropoffs: list[_Candidate],
 ) -> tuple[int, int, int] | None:
-    """최대 5개 대여소로 가장 많은 수량을 완결할 stop 배분을 고른다.
+    """최대 8개 대여소로 가장 많은 수량을 완결할 stop 배분을 고른다.
 
     pickup과 dropoff에 각각 한 자리를 보장하고, 처리 가능 수량이 같으면 더 적은
     대여소와 더 높은 긴급도 합을 우선한다. 후보 목록은 이미 경로 효율 순으로

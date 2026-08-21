@@ -446,7 +446,7 @@ cascade된다.
 3. 차량 초기 적재량은 0이다. visit 순서대로 pickup은 더하고 dropoff는 빼며 모든 중간
    적재량이 manifest의 `0..TRUCK_CAPACITY`인지 검증한다. DB는 과거 경로 호환을 위해
    마지막 양수 잔량을 허용한다. 다만 `route-v2`의 새 proposed 작업은 pickup·dropoff 합계가
-   같아 마지막 적재량이 0이며, pickup·dropoff를 모두 포함한 2~5개 대여소로 제한한다.
+   같아 마지막 적재량이 0이며, pickup·dropoff를 모두 포함한 2~8개 대여소로 제한한다.
    활성 센터별 proposed 작업은 최대 3개이고 제한 밖 수요는 다음 batch 후보로 남긴다.
 4. 한 transaction에서 기존 `proposed` route만 삭제하고 새 헤더를 모두
    `proposed`로 삽입한 뒤 모든 stop을 삽입한다.

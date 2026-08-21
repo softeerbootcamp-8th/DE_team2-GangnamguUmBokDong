@@ -42,11 +42,11 @@ _ROUTE_ARTIFACT_SET_BYTES = (
 _ROUTE_ARTIFACT_SET_SHA256 = (
     "576eec2c53f1be8985ce531f512f4f4014fe05879d1f53714128dd774d8abf87"
 )
-_ROUTE_INPUT_SHA256 = "bcb75a7077bb984de473c02a90575d79578639a339c108ef94dba20348e54211"
+_ROUTE_INPUT_SHA256 = "0de0cd4437f089bec16b778cf927c1fef732cd349dca7533a465100b94c5454e"
 _ID_SET_BYTES = b'{"ids":["ST-1","ST-2"],"schema_version":"gold-id-set-v1"}'
 _ID_SET_SHA256 = "a080d2f47ea7c4d0f5d27704264ed23d5a93ec525dd12544812f81b3519fa52f"
 _ROUTE_MANIFEST_SHA256 = (
-    "2fac4751c1a547d5d52c9c916d2ca42814570b010749329aa023e35bdb9e67b5"
+    "01b04e4af53f338184842157ac269915b1be70e45073d1f12b35184e598a49cf"
 )
 
 
@@ -131,7 +131,7 @@ def _route_input_fingerprint() -> InputFingerprint:
     )
     parameters = (
         Parameter("max_routes_per_center", "3"),
-        Parameter("max_stops_per_route", "5"),
+        Parameter("max_stops_per_route", "8"),
         Parameter("truck_capacity_config_version", "truck-capacity-v1"),
         Parameter("truck_capacity", "20"),
         Parameter(

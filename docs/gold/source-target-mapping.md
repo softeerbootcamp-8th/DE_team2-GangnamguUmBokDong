@@ -551,8 +551,12 @@ urgency 판단의 `retrieval_needed`는 차량 `pickup`, `supply_needed`는 `dro
 2. 차량 초기 적재량은 0이다. visit 순서대로 pickup은 더하고 dropoff는 빼며 매 단계
    running load가 `0..TRUCK_CAPACITY`인지 검증한다. `route-v2`가 생성하는 proposed 작업은
    pickup과 dropoff를 각각 하나 이상 포함하고 합계가 정확히 같아 마지막 적재량이 0이다.
-   작업당 대여소는 2~5개, 활성 센터별 proposed 작업은 최대 3개다. 짝이 맞지 않거나 제한
+   작업당 대여소는 2~8개, 활성 센터별 proposed 작업은 최대 3개다. 짝이 맞지 않거나 제한
    밖인 수요는 작업으로 만들지 않고 다음 batch 후보로 남긴다.
+   8개 상한은 대시보드와 같은 직선거리×1.25·도심 18km/h·정차 4분·자전거 1대당 30초
+   산식으로 후보를 비교해, 평균 120분과 배치별 p90 150분 이내에서 처리량을 가장 크게
+   유지하는 값으로 정한다. 변경할 때는 동일 산식으로 재실험하고 fingerprint parameter를
+   함께 갱신한다.
 3. 한 transaction에서 기존 `proposed` route만 삭제하고 cascade로 stop을 지운다.
 4. 새 헤더와 모든 stop을 함께 삽입한다. 빈 batch도 유효하며 기존 proposed를 비운다.
 5. `dispatched`, `completed` 이력은 publisher가 수정·삭제하지 않는다.
