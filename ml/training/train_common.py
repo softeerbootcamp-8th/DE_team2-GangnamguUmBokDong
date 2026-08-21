@@ -22,7 +22,9 @@ import json
 import resource
 import sys
 import time
+from collections.abc import Callable
 from datetime import UTC, date, datetime
+from typing import Any
 
 import lightgbm as lgb
 import mlflow
@@ -194,6 +196,46 @@ def _chunk_progress(model_name: str, label: str):
     return _on_chunk_loaded
 
 
+def _lgb_mlflow_progress_callback(
+    model_name: str,
+    phase_name: str,
+    log_interval: int = 10,
+) -> Callable[[Any], None]:
+    """LightGBM 학습 중 주기적으로 MLflow 지표와 진행 로그를 남기는 경량 콜백을 생성한다.
+
+    args:
+        model_name: 모델 이름 (예: 'rental', 'return')
+        phase_name: 단계 이름 (예: 'poisson', 'q10', 'q50', 'q90')
+        log_interval: 로깅 간격 (에포크/라운드 수)
+    returns:
+        LightGBM 콜백 함수
+    """
+
+    def _callback(env: Any) -> None:
+        iteration = env.iteration + 1
+        if iteration % log_interval == 0 or env.iteration == env.end_iteration - 1:
+            metrics_to_log: dict[str, float] = {}
+            for item in env.evaluation_result_list:
+                data_name, eval_name, val = item[0], item[1], item[2]
+                metrics_to_log[f"{phase_name}_{data_name}_{eval_name}"] = float(val)
+            if metrics_to_log:
+                try:
+                    mlflow.log_metrics(metrics_to_log, step=iteration)
+                except Exception:
+                    pass
+                summary = " ".join(f"{k}={v:.4f}" for k, v in metrics_to_log.items())
+                _append_progress_log(
+                    f"[{model_name}][{phase_name}] round {iteration}/{env.end_iteration} — {summary}, peak_rss={_peak_rss_mb():.0f}MB"
+                )
+            else:
+                _append_progress_log(
+                    f"[{model_name}][{phase_name}] round {iteration}/{env.end_iteration}, peak_rss={_peak_rss_mb():.0f}MB"
+                )
+
+    _callback.order = 20  # early_stopping 이후에 실행
+    return _callback
+
+
 def _distributed_params() -> dict:
     """LightGBM Socket 분산 학습 파라미터. config.LGB_TREE_LEARNER="serial"(기본값)이면
     빈 dict를 반환해 지금까지와 동일한 단일 머신 학습으로 동작한다 — 워커 인프라
@@ -276,7 +318,8 @@ def train_target(
     _append_progress_log(
         f"[{model_name}] 학습 시작 — window={config.TRAIN_WINDOW_START.isoformat()}~"
         f"{config.TRAIN_WINDOW_END.isoformat()}, divisor={config.TRAIN_DAY_DIVISOR}, "
-        f"max_horizon={config.MAX_TRAIN_HORIZON}, peak_rss={_peak_rss_mb():.0f}MB"
+        f"train_horizons={list(config.TRAIN_HORIZONS)}, adaptive_anchors={config.ADAPTIVE_TRAIN_ANCHORS}, "
+        f"peak_rss={_peak_rss_mb():.0f}MB"
     )
     if config.LGB_NUM_MACHINES > 1:
         raise NotImplementedError(
@@ -288,7 +331,7 @@ def train_target(
 
     feature_columns = _FEATURE_COLUMNS_BY_MODEL[model_name]
     table_path = _TRAINING_TABLE_BY_MODEL[model_name]
-    filters = [("horizon", "<=", config.MAX_TRAIN_HORIZON)]
+    filters = [("horizon", "in", list(config.TRAIN_HORIZONS))]
 
     train_dates, valid_dates, test_dates = _dates_for_split(config.TRAIN_WINDOW_START, config.TRAIN_WINDOW_END)
     if not train_dates or not valid_dates or not test_dates:
@@ -300,7 +343,7 @@ def train_target(
         )
     _append_progress_log(
         f"[{model_name}] 날짜 확정 — train {len(train_dates)}개, valid {len(valid_dates)}개, "
-        f"test {len(test_dates)}개, max_horizon={config.MAX_TRAIN_HORIZON}"
+        f"test {len(test_dates)}개, train_horizons={list(config.TRAIN_HORIZONS)}"
     )
 
     # station_categories는 train/valid/test 전체 날짜에서 한 번만 뽑는다 — 세 split
@@ -342,6 +385,10 @@ def train_target(
                 "train_window_end": config.TRAIN_WINDOW_END.isoformat(),
                 "train_day_divisor": config.TRAIN_DAY_DIVISOR,
                 "max_train_horizon": config.MAX_TRAIN_HORIZON,
+                "train_horizons": str(list(config.TRAIN_HORIZONS)),
+                "adaptive_train_anchors": config.ADAPTIVE_TRAIN_ANCHORS,
+                "weekday_peak_hours": str([list(p) for p in config.WEEKDAY_PEAK_HOURS]),
+                "holiday_peak_hours": str([list(p) for p in config.HOLIDAY_PEAK_HOURS]),
                 "valid_days_of_month": sorted(config.VALID_DAYS_OF_MONTH),
                 "test_days_of_month": sorted(config.TEST_DAYS_OF_MONTH),
                 "profile_name": common_config.PROFILE_NAME,
@@ -407,7 +454,14 @@ def train_target(
         poisson_params = {
             **lgb_params, **_distributed_params(), "objective": "poisson", "metric": "poisson",
         }
-        poisson_callbacks = [lgb.log_evaluation(0)]
+        try:
+            mlflow.set_tag("training_stage", f"[{model_name}] 1/4 Poisson Boosting")
+        except Exception:
+            pass
+        poisson_callbacks = [
+            lgb.log_evaluation(0),
+            _lgb_mlflow_progress_callback(model_name, "poisson", log_interval=10),
+        ]
         if valid_set is not None:
             poisson_callbacks.insert(
                 0,
@@ -464,9 +518,17 @@ def train_target(
                 )
 
         quantile_boosters: dict[float, lgb.Booster] = {}
-        for alpha in config.QUANTILE_ALPHAS:
+        for idx, alpha in enumerate(config.QUANTILE_ALPHAS, start=2):
+            q_alpha_name = f"q{int(alpha * 100)}"
+            try:
+                mlflow.set_tag("training_stage", f"[{model_name}] {idx}/4 {q_alpha_name} Boosting")
+            except Exception:
+                pass
             q_params = {**lgb_params, **_distributed_params(), "objective": "quantile", "alpha": alpha}
-            q_callbacks = [lgb.log_evaluation(0)]
+            q_callbacks = [
+                lgb.log_evaluation(0),
+                _lgb_mlflow_progress_callback(model_name, q_alpha_name, log_interval=10),
+            ]
             if valid_set_q is not None:
                 q_callbacks.insert(
                     0,
@@ -501,6 +563,10 @@ def train_target(
         # quantile을 따로 읽지 않아 I/O와 중간 배열 중복을 줄인다.
         q_named = {f"q{int(alpha * 100)}": b for alpha, b in quantile_boosters.items()}
         prediction_models = {"poisson": booster, **q_named}
+        try:
+            mlflow.set_tag("training_stage", f"[{model_name}] Evaluating & Conformal Calibration")
+        except Exception:
+            pass
         valid_q = lazy_train_dataset.predict_over_dates(
             table_path, valid_dates, feature_columns, station_dtype, filters, target_col, exposure_col,
             prediction_models, on_chunk_loaded=_chunk_progress(model_name, "valid-predict"),
@@ -582,6 +648,10 @@ def train_target(
             mlflow.log_dict(profile_payload, "profile.json")
             # metrics의 "model_name"은 문자열이라 mlflow.log_metrics(숫자만 허용)에서 뺀다.
             mlflow.log_metrics({k: v for k, v in metrics.items() if isinstance(v, int | float)})
+            try:
+                mlflow.set_tag("training_stage", f"[{model_name}] Completed")
+            except Exception:
+                pass
 
     _append_progress_log(
         f"[{model_name}] 학습 완료, elapsed={time.monotonic() - started_at:.1f}s, "

@@ -8,7 +8,11 @@
 BUILTIN_PROFILE_NAME = "builtin-default"
 SERVING_TICK_MINUTES = 5
 DEFAULT_MODEL_GRID_TICK_MINUTES = 20
+DEFAULT_PEAK_ANCHOR_TICK_MINUTES = DEFAULT_MODEL_GRID_TICK_MINUTES
 SUPPORTED_MODEL_GRID_TICK_MINUTES = (5, 10, 15, 20, 30, 60)
+DEFAULT_TRAIN_HORIZONS = (1, 2, 3, 4, 5, 6, 9, 12)
+DEFAULT_WEEKDAY_PEAK_HOURS = ((7, 21),)
+DEFAULT_HOLIDAY_PEAK_HOURS = ((8, 21),)
 PROFILES_PREFIX = "profiles"
 
 DEFAULT_PROFILE = {
@@ -18,6 +22,11 @@ DEFAULT_PROFILE = {
     "TARGET_HORIZON_MINUTES": 60,
     "GRID_TICK_MINUTES": DEFAULT_MODEL_GRID_TICK_MINUTES,
     "HORIZON_COUNT": 12,
+    "TRAIN_HORIZONS": list(DEFAULT_TRAIN_HORIZONS),
+    "ADAPTIVE_TRAIN_ANCHORS": True,
+    "PEAK_ANCHOR_TICK_MINUTES": DEFAULT_PEAK_ANCHOR_TICK_MINUTES,
+    "WEEKDAY_PEAK_HOURS": [list(p) for p in DEFAULT_WEEKDAY_PEAK_HOURS],
+    "HOLIDAY_PEAK_HOURS": [list(p) for p in DEFAULT_HOLIDAY_PEAK_HOURS],
     "LGB_PARAMS_COMMON": {
         "num_leaves": 63,
         "learning_rate": 0.05,
@@ -161,6 +170,12 @@ def validate_profile(profile: dict, name: str) -> None:
         raise ValueError(f"프로필 '{name}'의 TRAIN_ANCHOR_TICK_MINUTES는 정수여야 합니다") from exc
     validate_train_anchor_contract(grid_tick, anchor_tick, name)
 
+    try:
+        peak_anchor_tick = int(profile.get("PEAK_ANCHOR_TICK_MINUTES", anchor_tick))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"프로필 '{name}'의 PEAK_ANCHOR_TICK_MINUTES는 정수여야 합니다") from exc
+    validate_train_anchor_contract(grid_tick, peak_anchor_tick, f"{name}:PEAK_ANCHOR_TICK_MINUTES")
+
 
 def merge_and_validate_profile(overrides: dict, name: str) -> dict:
     """부분 프로필을 기본값과 깊이 1단계 병합하고 검증해 새 dict로 반환한다.
@@ -200,5 +215,7 @@ def merge_and_validate_profile(overrides: dict, name: str) -> dict:
     # 항상 materialize해 월별 preflight와 model artifact가 같은 계약을 보게 한다.
     if "TRAIN_ANCHOR_TICK_MINUTES" not in overrides:
         merged["TRAIN_ANCHOR_TICK_MINUTES"] = merged["GRID_TICK_MINUTES"]
+    if "PEAK_ANCHOR_TICK_MINUTES" not in overrides:
+        merged["PEAK_ANCHOR_TICK_MINUTES"] = merged["TRAIN_ANCHOR_TICK_MINUTES"]
     validate_profile(merged, name)
     return merged
