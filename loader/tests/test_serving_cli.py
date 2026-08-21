@@ -94,7 +94,7 @@ def test_weather_ready_requires_both_forecasts_on_three_hour_boundary(
 
 
 def test_prepare_pins_support_refs_with_same_client_and_bucket(monkeypatch) -> None:
-    """운영자가 support ref를 고르지 않고 current release preflight에서 가져온다."""
+    """운영자가 support ref를 고르지 않고 경량 release snapshot에서 가져온다."""
     client = _CatalogClient()
     store = object()
 
@@ -120,14 +120,8 @@ def test_prepare_pins_support_refs_with_same_client_and_bucket(monkeypatch) -> N
     rental_ref = object()
     return_ref = object()
     pinned = SimpleNamespace(
-        preflight=SimpleNamespace(
-            rental_snapshot=SimpleNamespace(
-                manifest=SimpleNamespace(support_sta_ids=rental_ref)
-            ),
-            return_snapshot=SimpleNamespace(
-                manifest=SimpleNamespace(support_sta_ids=return_ref)
-            ),
-        )
+        rental_model=SimpleNamespace(support_sta_ids=rental_ref),
+        return_model=SimpleNamespace(support_sta_ids=return_ref),
     )
     captured = {}
 
@@ -154,7 +148,11 @@ def test_prepare_pins_support_refs_with_same_client_and_bucket(monkeypatch) -> N
         "_runtime",
         lambda: ("fixture", client, store, source_catalog),
     )
-    monkeypatch.setattr(serving_cli, "load_current_serving_release", load_current)
+    monkeypatch.setattr(
+        serving_cli,
+        "load_current_serving_release_for_plan",
+        load_current,
+    )
     monkeypatch.setattr(serving_cli, "prepare_serving_plan", prepare_plan)
     monkeypatch.setattr(
         serving_cli,

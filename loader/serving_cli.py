@@ -36,7 +36,7 @@ from gold.urgency import (
 )
 from ml_core.serving_release import (
     S3ServingReleasePointerStore,
-    load_current_serving_release,
+    load_current_serving_release_for_plan,
 )
 
 _OBJECT_PREFIX = "gold_publication"
@@ -86,7 +86,7 @@ def prepare(
     logical = _utc_dttm(logical_dttm)
     bucket, client, object_store, source_catalog = _runtime()
     object_base_uri = f"s3://{bucket}/{_OBJECT_PREFIX}"
-    pinned = load_current_serving_release(
+    pinned = load_current_serving_release_for_plan(
         object_store=object_store,
         pointer_store=S3ServingReleasePointerStore(client, bucket),
     )
@@ -123,10 +123,10 @@ def prepare(
                 lookback=lookbacks.ultra_short,
             ),
             rental_support_sta_ids=(
-                pinned.preflight.rental_snapshot.manifest.support_sta_ids
+                pinned.rental_model.support_sta_ids
             ),
             return_support_sta_ids=(
-                pinned.preflight.return_snapshot.manifest.support_sta_ids
+                pinned.return_model.support_sta_ids
             ),
             source_catalog=source_catalog,
             object_base_uri=object_base_uri,

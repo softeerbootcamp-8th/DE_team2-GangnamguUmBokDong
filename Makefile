@@ -7,10 +7,13 @@ CI_INTEGRATION_PROJECTS := loader
 PLATFORM_COMPOSE := $(shell bash ops/compose/platform_args.sh)
 COMPOSE = docker compose $(if $(wildcard .env),--env-file .env,) -f ops/compose/docker-compose.yml $(PLATFORM_COMPOSE)
 
-.PHONY: sync-all sync-ci-unit lint test-gold-bootstrap test-gold-transition-available test test-ci test-ci-unit test-ci-integration bootstrap up down logs ps migrate-route-cancellation seed seed-e2e e2e-preflight e2e-smoke
+.PHONY: sync-all sync-ci-unit lint test-gold-bootstrap test-gold-transition-available test test-ci test-ci-unit test-ci-integration bootstrap up down logs ps migrate-route-cancellation seed bootstrap-gold-seeds seed-e2e e2e-preflight e2e-smoke
 
 E2E_LOGICAL_DTTM ?= $(shell TZ=Asia/Seoul date '+%Y-%m-%dT%H:%M:00+09:00' | awk -F: '{ printf "%s:%02d:00+09:00\n", $$1, int($$2 / 5) * 5 }')
 E2E_STATION_SOURCE_DTTM ?= $(shell python3 ops/e2e_time.py station-source '$(E2E_LOGICAL_DTTM)')
+GOLD_DISPATCH_CENTER_EFFECTIVE_DTTM := 2026-08-19T03:15:38Z
+GOLD_WEATHER_GRID_SEED_VERSION ?= local-dev-weather-grid-v1
+GOLD_WEATHER_GRID_EFFECTIVE_DTTM ?= 2026-08-19T03:15:38Z
 
 sync-all:
 	@for p in $(PROJECTS); do \
@@ -123,6 +126,25 @@ seed:
 	@echo "[gold-postgis] make seed는 weather grid seed_version/effective_dttm SSOT 확정 전이라 비활성화되었습니다." >&2
 	@echo "[gold-postgis] 승인된 값으로 loader/gold_cli.py의 seed:dispatch_center, seed:weather_grid를 명시적으로 실행하세요." >&2
 	@false
+
+# 신규 로컬 Gold DB에서 최초 1회 실행한다. make up에 자동 연결하지 않는다.
+# AWS에서는 승인된 GOLD_WEATHER_GRID_SEED_VERSION/EFFECTIVE_DTTM을 명시한다.
+bootstrap-gold-seeds:
+	@test -n "$(GOLD_WEATHER_GRID_SEED_VERSION)" || { \
+		echo "[gold-postgis] GOLD_WEATHER_GRID_SEED_VERSION이 필요합니다." >&2; \
+		exit 2; \
+	}
+	@test -n "$(GOLD_WEATHER_GRID_EFFECTIVE_DTTM)" || { \
+		echo "[gold-postgis] GOLD_WEATHER_GRID_EFFECTIVE_DTTM이 필요합니다." >&2; \
+		exit 2; \
+	}
+	@echo "[gold-postgis] dispatch_center seed 게시"
+	@$(COMPOSE) exec -T airflow-scheduler sh -lc \
+		'cd /workspace/loader && env -u VIRTUAL_ENV UV_PROJECT_ENVIRONMENT=/opt/venvs/modules/loader uv run --frozen python gold_cli.py --publication seed:dispatch_center --window-start "$(GOLD_DISPATCH_CENTER_EFFECTIVE_DTTM)"'
+	@echo "[gold-postgis] weather_grid seed 게시: version=$(GOLD_WEATHER_GRID_SEED_VERSION) effective=$(GOLD_WEATHER_GRID_EFFECTIVE_DTTM)"
+	@$(COMPOSE) exec -T airflow-scheduler sh -lc \
+		'cd /workspace/loader && env -u VIRTUAL_ENV GOLD_WEATHER_GRID_SEED_VERSION="$(GOLD_WEATHER_GRID_SEED_VERSION)" UV_PROJECT_ENVIRONMENT=/opt/venvs/modules/loader uv run --frozen python gold_cli.py --publication seed:weather_grid --window-start "$(GOLD_WEATHER_GRID_EFFECTIVE_DTTM)"'
+	@echo "[gold-postgis] Gold seed bootstrap 완료"
 
 seed-e2e:
 	@test -n "$(E2E_STATION_SOURCE_DTTM)" || { \

@@ -94,6 +94,7 @@ from collections.abc import Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from contextvars import ContextVar
+from datetime import datetime
 from functools import wraps
 
 import numpy as np
@@ -227,6 +228,8 @@ def _clear_runtime_caches() -> None:
 @contextmanager
 def authority_inference_run(
     station_profile: VerifiedStationProfile,
+    *,
+    logical_dttm: datetime | None = None,
 ) -> Iterator[None]:
     """Pinned station profile을 쓰는 격리된 authority 계산 cache 경계를 연다.
 
@@ -249,14 +252,56 @@ def authority_inference_run(
         )
     token = None
     try:
-        profile = pd.read_parquet(io.BytesIO(station_profile.payload))
+        filters = None
+        if logical_dttm is not None:
+            logical = pd.Timestamp(logical_dttm)
+            if logical.tzinfo is None:
+                raise ValueError("logical_dttm은 timezone-aware여야 합니다.")
+            anchor = logical.tz_convert("Asia/Seoul")
+            calendar_pairs = {
+                (int(point.month), int(point.dayofweek))
+                for point in (anchor, anchor - pd.Timedelta(hours=1))
+            }
+            filters = [
+                [("month", "=", month), ("dow", "=", dow)]
+                for month, dow in sorted(calendar_pairs)
+            ]
+        profile = pd.read_parquet(
+            io.BytesIO(station_profile.payload),
+            columns=[
+                "station_no",
+                "minute",
+                "dow",
+                "month",
+                *_STATION_PROFILE_STAT_COLS,
+            ],
+            filters=filters,
+        )
+        if filters is not None and profile.empty:
+            # 작은 test/legacy profile은 모든 calendar 조합을 갖지 않을 수 있다.
+            # 운영 profile은 release 게시 시 global grid를 검증하므로 이 fallback에
+            # 들어오지 않으며, 비정상 부분 profile도 기존 의미대로 NaN을 반환한다.
+            filters = None
+            profile = pd.read_parquet(
+                io.BytesIO(station_profile.payload),
+                columns=[
+                    "station_no",
+                    "minute",
+                    "dow",
+                    "month",
+                    *_STATION_PROFILE_STAT_COLS,
+                ],
+            )
         pinned_profile = _build_station_profile_arrays(profile)
         observed_minutes = tuple(
             sorted(pd.to_numeric(profile["minute"], errors="raise").unique().tolist())
         )
         if (
-            len(profile) != station_profile.row_count
-            or tuple(sorted(pinned_profile[0])) != station_profile.station_nos
+            filters is None
+            and (
+                len(profile) != station_profile.row_count
+                or tuple(sorted(pinned_profile[0])) != station_profile.station_nos
+            )
             or observed_minutes != station_profile.minute_values
         ):
             raise ValueError(
