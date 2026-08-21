@@ -2,26 +2,37 @@
 
 ## 한눈에 보는 진행 상태
 
-2026-08-21 기준 `develop@44b4bff`에서 아래 순서로 실행했다.
+2026-08-21 기준 `develop@44b4bff`에서 실행했다. 결론은 두 가지다.
 
-| 순서 | 작업 | 상태 | 결과 또는 중단 지점 |
-|---:|---|---|---|
-| 1 | 2025 원천 데이터 적재 | 완료 | 필요한 날짜와 앞뒤 context를 모두 Archive에 저장 |
-| 2 | feature·target 생성 | 완료 | rental/return mart와 fallback profile 생성 |
-| 3 | 샘플링 없는 12개월 모델 학습 | 중단 | LightGBM 첫 boosting round를 끝내기 전에 RAM 안전선 도달 |
-| 4 | 축소 모델로 배포 연결 확인 | 완료 | rental/return pair 게시와 전체 대여소 5분 추론 성공 |
-| 5 | 실제 12개월 모델 게시 | 미완료 | 3번의 전체 모델이 없으므로 아직 게시하지 않음 |
+- **정식 전체 모델:** 데이터 준비는 끝났지만, 학습을 시작해 첫 번째 나무 하나를
+  만들기 전에 메모리 안전선에 걸렸다.
+- **AWS 연결용 임시 모델:** 2025년 각 월에서 학습일을 표본으로 뽑아 대여·반납
+  모델을 만들었고, 게시와 전체 대여소 5분 추론까지 성공했다.
+
+| 경로 | 원천 적재 | feature 생성 | 모델 학습 | pair 게시 | 5분 추론 |
+|---|---:|---:|---:|---:|---:|
+| 정식 전체 모델(샘플링 없음) | 완료 | 완료 | **메모리 중단** | 미실행 | 미실행 |
+| AWS 연결용 임시 모델 | 재사용 | 재사용 | **완료** | **완료** | **완료** |
+
+정식 전체 모델이 멈춘 위치는 아래와 같다.
+
+`원천 적재 완료 → feature 생성 완료 → 5.69억 train행 로드 완료 → LightGBM 학습 진입 → 첫 round 완료 전 중단`
+
+임시 모델은 아래 전 과정을 끝냈다.
+
+`2025년 월별 학습일 12일 선택 → 대여·반납 학습 완료 → generation 1 게시 → 2,681개 대여소 × 12시간 추론 성공`
 
 ### 지금 확정된 결론
 
 - 데이터·feature·fallback·serving 연결 코드는 동작한다.
 - 31.34GiB RAM에서 호스트 안전 여유 3GiB를 지키며 실행한 12개월 학습은
   rental/return 모두 완주하지 못했다.
-- 설정된 swap 8GiB 중 최대 4.61GiB만 사용했다. **swap이 고갈돼 중단된 것이
-  아니다.** 남은 swap까지 허용했을 때의 완주 여부와 최종 메모리 peak는 모른다.
+- 설정된 swap 8GiB 중 최대 4.61GiB만 사용했다. 약 3.39GiB가 남아 있었으므로
+  **swap을 다 써서 중단된 것이 아니다.** WSL 가용 RAM을 3GiB 남기는 안전장치가
+  먼저 학습 프로세스를 종료했다.
 - 64GiB는 성공 확정치가 아니라 32GiB 다음 단계의 첫 검증 요청 사양이다.
-- #163은 전체 모델이 없으므로 열어 둔다. #178도 그 전체 모델 pair를 실제로
-  게시한 뒤 닫는다.
+- 임시 pair는 AWS 연결 시험에 쓸 수 있지만 운영 품질의 champion으로 확정하지
+  않는다. #163과 #178은 샘플링 없는 전체 모델을 검증할 때까지 열어 둔다.
 
 배포 연결만 검증한 `d8/h1/20 rounds` 모델은
 `dt=2026-08-21-local-smoke`에 격리했다. 이 모델은 운영 품질 후보가 아니다.
@@ -66,6 +77,10 @@
 | population fallback profile | 성공 | 10.35초 | 8.25GiB | 14.75GiB | 0.00GiB |
 | release 게시(smoke pair) | 성공 | 7.89초 | 3.06GiB | 7.88GiB | 0.00GiB |
 | 5분 배치 추론 | 성공 | 12.70초 | 4.10GiB | 9.29GiB | 0.00GiB |
+| 임시 rental 학습 | 성공 | 172.50초 | 5.61GiB | 15.05GiB | 0.63GiB |
+| 임시 return 학습 | 성공 | 128.27초 | 5.81GiB | 14.69GiB | 0.21GiB |
+| 임시 pair 게시 | 성공 | 7.78초 | 3.05GiB | 11.90GiB | 0.00GiB |
+| 임시 pair 5분 추론 | 성공 | 12.93초 | 3.92GiB | 12.39GiB | 0.00GiB |
 
 첫 multi-horizon write는 `partitionBy(date)`가 입력 partition마다 작은 파일을
 써서 rental만 46,190개 미완성 object와 약 10GB가 생겼다. 이를 중단하고 date로
@@ -121,14 +136,40 @@
 
 ## Serving-release 검증
 
-로컬 검증 페어는 2025년 12개월을 포함하되 `d8/h1/20 rounds`로 줄여 각각
-4,678,194 train행, 2,339,655 valid행을 사용했다. rental은 39.50초/2.33GiB,
-return은 34.91초/2.26GiB에 끝났고 16개 model artifact의 총 크기는
-2,532,577B다.
+### AWS 연결용 임시 모델
+
+당장 AWS에 올려 end-to-end 연결을 확인할 모델은 2025년 12개월을 모두 포함하되
+각 월의 학습일 1일씩, 총 12일을 결정적으로 골랐다. horizon은 1~12를 유지하고
+학습 반복만 20 rounds로 제한했다.
+
+| 항목 | 값 |
+|---|---:|
+| train | 28,081,827행(정식 전체 train의 약 4.93%) |
+| valid | 27,544,044행 |
+| test | 28,084,062행 |
+| rental | 170.88초, Poisson deviance 2.1628, RMSE 2.3693 |
+| return | 126.57초, Poisson deviance 2.2613, RMSE 2.4152 |
+
+대여·반납 artifact 16개를 같은 archive prefix에 저장하고 `generation 1`로 원자
+게시했다. release manifest SHA-256은
+`4afa876d32bf316e70ab04b65cfd5701cdfff8b88dbac3218452afd66cd49b55`다.
+새 process에서 이를 다시 읽어 2025-12-31 08:05 기준 2,681개 대여소 × 12시간,
+총 32,172행을 11.92초에 추론했다. 대여소별 실패 0건, 유한값과 분위수 순서가
+모두 정상이었고 `minute=7`도 계약대로 거부됐다.
+
+이 모델은 **AWS 연결용 임시 모델**이다. 학습 표본이 정식 전체의 4.93%이고
+20 rounds만 사용했으므로 운영 품질의 champion이라고 판단하지 않는다.
+
+### 이전 연결 smoke
+
+초기 배포 코드 검증에는 더 작은 `d8/h1/20 rounds` pair를 사용했다. 각각
+4,678,194 train행, 2,339,655 valid행이며 rental은 39.50초/2.33GiB, return은
+34.91초/2.26GiB에 끝났다. 이 pair는 이제 임시 모델 generation 1로 교체됐으며
+재현 기록으로만 남긴다.
 
 수동 production CLI가 exact rental/return archive, station profile, Spark station
 master를 받아 canonical crosswalk를 만들고 pair release를 원자 게시했다.
-격리 버킷 결과는 generation 0, release manifest SHA-256
+당시 격리 버킷 결과는 generation 0, release manifest SHA-256
 `3220965e0a16d192820aff4be0dd367ca45aecf8b89fd6563a7bef752c6c5569`다.
 
 새 process가 `serving-release/current.json`을 한 번 읽어 고정한 artifact로
