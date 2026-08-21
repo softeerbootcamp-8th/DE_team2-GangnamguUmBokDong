@@ -41,12 +41,16 @@ variable "azs" {
 
 variable "admin_cidrs" {
   description = <<-EOT
-    Airflow(8080)·MLflow(5000) UI를 직접 열어줄 CIDR 목록.
+    SSH(22)를 열어줄 CIDR 목록. **비어 있으면 아무도 접속할 수 없다.**
 
-    기본값은 비어 있다(= 규칙을 만들지 않음). 평소에는 SSM 포트 포워딩으로 접근하고,
-    발표처럼 직접 열어야 할 때만 현장 IP를 넣어 apply한다. 두 UI 모두 노출 시
-    위험이 크다 — MLflow는 인증이 아예 없고, Airflow는 UI에서 DAG를 임의로 트리거해
-    OpenAPI 키 할당량을 소진시키거나 archive를 덮어쓸 수 있다.
+    SSM이 이 계정에서 전면 거부되어 SSH가 유일한 접속 수단이다. 그래서 이 값은
+    비워둘 수 없고, 접속하는 IP가 바뀔 때마다 갱신해야 한다:
+      make allow-my-ip     # 현재 공인 IP로 admin_cidrs.auto.tfvars를 다시 쓰고 apply
+
+    UI(8080·5000)는 여기서 열지 않는다. SSH 로컬 포트 포워딩으로 접근한다:
+      ssh -N -L 8080:localhost:8080 -L 5000:localhost:5000 ec2-user@<eip>
+    노출면을 22 하나로 줄이기 위해서다 — MLflow는 인증이 아예 없고, Airflow UI에서는
+    DAG를 임의로 트리거해 OpenAPI 키 할당량을 소진시키거나 archive를 덮어쓸 수 있다.
   EOT
   type        = list(string)
   default     = []
@@ -120,4 +124,17 @@ variable "s3_bucket_name" {
   description = "데이터 버킷 이름. 팀이 이미 만들어둔 버킷을 그대로 쓴다."
   type        = string
   default     = "gng-ubd-s3-bucket"
+}
+
+variable "ssh_public_key_path" {
+  description = <<-EOT
+    EC2에 등록할 SSH 공개키 경로.
+
+    SSM Session Manager가 이 계정에서 전면 거부되어(StartSession·SendCommand·
+    DescribeInstanceInformation 모두) SSH가 유일한 접속 수단이다. 로컬에서 만든
+    키의 **공개키만** 등록하므로 개인키는 AWS를 거치지 않는다:
+      ssh-keygen -t ed25519 -f ~/.ssh/gng-ubd
+  EOT
+  type        = string
+  default     = "~/.ssh/gng-ubd.pub"
 }

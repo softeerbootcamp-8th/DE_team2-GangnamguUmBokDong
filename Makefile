@@ -134,6 +134,9 @@ PROD_COMPOSE       = docker compose --env-file $(PROD_ENV) -f ops/compose/docker
 # bash 문법(`[[ ]]`, 배열, here-string)을 쓴다. postgres:16은 multi-arch라 Graviton에서도 돈다.
 PSQL_IMAGE        ?= postgres:16
 
+# SSM 대신 SSH를 쓴다(계정 정책상 SSM 전면 거부). 공개키만 AWS에 등록되어 있다.
+SSH_KEY           ?= ~/.ssh/gng-ubd
+
 EMR_STAGE          = .emr-stage
 EMR_RELEASE       ?= emr-7.9.0
 EMR_INSTANCE_TYPE ?= m5.xlarge
@@ -141,7 +144,8 @@ EMR_INSTANCE_COUNT?= 3
 
 .PHONY: deploy-env deploy-db-bootstrap deploy-db-check deploy-seed-models \
         deploy-up deploy-down deploy-ps deploy-logs deploy-restart deploy-resync deploy-smoke \
-        train-start train-stop train-status tunnel-airflow tunnel-mlflow session-app \
+        train-start train-stop train-status tunnel-airflow tunnel-mlflow \
+        ssh-app ssh-train allow-my-ip \
         emr-package emr-features emr-status
 
 # --- 상시 EC2 안에서 실행 ---
@@ -154,7 +158,7 @@ deploy-env:
 	fi; \
 	S3_BUCKET="$$S3_BUCKET" bash ops/deploy/render_env.sh
 
-# 최초 1회. DB 3개 생성 + Gold PostGIS baseline 적용. PostGIS 3.5가 없으면 exit 78로 멈춘다.
+# 최초 1회. DB 3개 생성 + Gold PostGIS baseline 적용. PostGIS 3.4가 없으면 exit 78로 멈춘다.
 deploy-db-bootstrap:
 	@set -a; . $(PROD_ENV); set +a; \
 	docker run --rm \
@@ -212,19 +216,32 @@ deploy-smoke:
 
 # --- 로컬에서 실행 ---
 
-session-app:
-	@aws ssm start-session --target $$($(TF) output -raw app_instance_id)
+# SSM은 이 계정에서 전면 거부다(StartSession·SendCommand·DescribeInstanceInformation).
+# SSH가 유일한 접속 수단이라 22만 admin_cidrs로 열고, UI는 로컬 포트 포워딩으로 본다.
+ssh-app:
+	@ssh -i $(SSH_KEY) ec2-user@$$($(TF) output -raw app_public_ip)
 
-# UI 포트를 열지 않고 접근한다. SG의 admin_cidrs가 비어 있어도 동작한다.
+# 학습 EC2는 인터넷에 22를 열지 않는다. 상시 EC2를 bastion으로 경유한다.
+# ProxyJump는 각 홉 인증을 로컬에서 하므로 개인키를 bastion에 두지 않아도 된다.
+ssh-train:
+	@ssh -i $(SSH_KEY) -J ec2-user@$$($(TF) output -raw app_public_ip) \
+	  ec2-user@$$($(TF) output -raw train_private_ip)
+
+# 8080/5000을 SG에 열지 않고 SSH 터널로 본다. 종료는 Ctrl+C.
 tunnel-airflow:
-	@aws ssm start-session --target $$($(TF) output -raw app_instance_id) \
-	  --document-name AWS-StartPortForwardingSession \
-	  --parameters '{"portNumber":["8080"],"localPortNumber":["8080"]}'
+	@echo "http://localhost:8080 에서 Airflow UI (종료: Ctrl+C)"; \
+	ssh -i $(SSH_KEY) -N -L 8080:localhost:8080 ec2-user@$$($(TF) output -raw app_public_ip)
 
 tunnel-mlflow:
-	@aws ssm start-session --target $$($(TF) output -raw app_instance_id) \
-	  --document-name AWS-StartPortForwardingSession \
-	  --parameters '{"portNumber":["5000"],"localPortNumber":["5000"]}'
+	@echo "http://localhost:5000 에서 MLflow UI (종료: Ctrl+C)"; \
+	ssh -i $(SSH_KEY) -N -L 5000:localhost:5000 ec2-user@$$($(TF) output -raw app_public_ip)
+
+# 접속 IP가 바뀌었을 때. 현재 공인 IP로 admin_cidrs를 다시 쓰고 SG 규칙만 갱신한다(10초 내외).
+allow-my-ip:
+	@IP=$$$$(curl -fsS https://checkip.amazonaws.com | tr -d '\n'); \
+	printf 'admin_cidrs = ["%s/32"]\n' "$$$$IP" > terraform/admin_cidrs.auto.tfvars; \
+	echo "admin_cidrs = $$$$IP/32"; \
+	$(TF) apply -auto-approve
 
 train-start:
 	@aws ec2 start-instances --instance-ids $$($(TF) output -raw train_instance_id)

@@ -1,7 +1,8 @@
 # 데이터 계층 — S3 버킷, KMS 키, RDS, 그리고 설정 객체.
 #
 # 시크릿을 SSM Parameter Store나 Secrets Manager에 두지 않는다. 정찰 결과 두 서비스가
-# 모두 계정 정책상 거부이고, S3와 KMS는 허용이라 S3 객체 + SSE-KMS로 대체한다.
+# 모두 계정 정책상 거부라 S3 객체로 대체한다. kms:CreateKey도 거부여서 고객 관리 키는
+# 못 만들고, 버킷 기본 암호화(SSE-S3)를 쓴다.
 
 # --- S3 ---
 
@@ -67,20 +68,9 @@ resource "aws_s3_bucket_lifecycle_configuration" "data" {
   }
 }
 
-# --- KMS (설정 객체 암호화용) ---
-
-resource "aws_kms_key" "config" {
-  description             = "${var.project} 운영 설정/시크릿 객체 암호화"
-  deletion_window_in_days = 7
-  enable_key_rotation     = true
-
-  tags = { Name = "${var.project}-config" }
-}
-
-resource "aws_kms_alias" "config" {
-  name          = "alias/${var.project}-config"
-  target_key_id = aws_kms_key.config.key_id
-}
+# KMS 고객 관리 키를 만들지 않는다 — 이 계정은 kms:CreateKey가 거부된다(2026-08-21 실측).
+# 설정 객체는 버킷 기본 암호화(SSE-S3, 위 server_side_encryption_configuration)로 보호되고,
+# 접근 통제는 인스턴스 역할 + 버킷 정책 + Block Public Access가 담당한다.
 
 # --- RDS ---
 
@@ -108,9 +98,12 @@ resource "aws_db_parameter_group" "main" {
 }
 
 resource "random_password" "db" {
-  length = 32
-  # RDS 마스터 비밀번호에 쓸 수 없는 문자를 뺀다(/, @, ", 공백).
-  override_special = "!#$%&*()-_=+[]{}<>:?"
+  # 영숫자만 쓴다(32자 ≈ 190비트로 충분히 강하다). 특수문자를 넣으면 두 곳이 깨진다:
+  #   1) DATABASE_URL — #·?·& 가 URL 파싱을 깨뜨려 psycopg가 DSN을 잘못 읽는다
+  #   2) /opt/app/.env — (·)·$·& 가 셸 메타문자라 `. .env`(source)가 문법 오류를 낸다
+  #      (Makefile의 deploy-db-bootstrap/deploy-db-check가 이 방식으로 읽는다)
+  length  = 32
+  special = false
 }
 
 resource "aws_db_instance" "main" {
@@ -211,6 +204,5 @@ resource "aws_s3_object" "prod_env" {
   content_type = "text/plain"
   content      = local.prod_env
 
-  server_side_encryption = "aws:kms"
-  kms_key_id             = aws_kms_key.config.arn
+  # 버킷 기본 암호화(SSE-S3)가 적용된다.
 }

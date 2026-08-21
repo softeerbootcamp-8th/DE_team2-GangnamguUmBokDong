@@ -1,6 +1,7 @@
 # 상시 EC2 — Airflow 3종 + API + nginx/web + MLflow.
 
 resource "aws_iam_role" "app" {
+  provider           = aws.untagged
   name               = "${var.project}-app"
   assume_role_policy = data.aws_iam_policy_document.ec2_assume.json
 }
@@ -19,11 +20,13 @@ resource "aws_iam_role_policy_attachment" "app_ssm" {
 }
 
 resource "aws_iam_instance_profile" "app" {
-  name = "${var.project}-app"
-  role = aws_iam_role.app.name
+  provider = aws.untagged
+  name     = "${var.project}-app"
+  role     = aws_iam_role.app.name
 }
 
 resource "aws_instance" "app" {
+  key_name               = aws_key_pair.main.key_name
   ami                    = data.aws_ami.al2023_arm64.id
   instance_type          = var.app_instance_type
   subnet_id              = aws_subnet.public[0].id

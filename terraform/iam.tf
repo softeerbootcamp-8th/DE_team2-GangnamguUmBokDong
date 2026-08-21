@@ -46,17 +46,10 @@ data "aws_iam_policy_document" "data_access" {
     resources = ["${aws_s3_bucket.data.arn}/*"]
   }
 
-  # config/prod.env가 SSE-KMS로 암호화돼 있어 복호화 권한이 필요하다.
-  statement {
-    sid     = "DecryptConfig"
-    effect  = "Allow"
-    actions = ["kms:Decrypt", "kms:DescribeKey"]
-    # 쓰기(설정 갱신)는 Terraform이 하고 인스턴스는 읽기만 하므로 GenerateDataKey는 뺀다.
-    resources = [aws_kms_key.config.arn]
-  }
 }
 
 resource "aws_iam_policy" "data_access" {
+  provider    = aws.untagged
   name        = "${var.project}-data-access"
   description = "S3 데이터 버킷 읽기/쓰기 + 설정 객체 복호화"
   policy      = data.aws_iam_policy_document.data_access.json
@@ -83,4 +76,14 @@ data "aws_ami" "al2023_arm64" {
     name   = "state"
     values = ["available"]
   }
+}
+
+# EC2 접속용 키페어. 공개키만 올라간다.
+#
+# key_name은 RunInstances 시점에만 지정할 수 있는 불변 속성이라(cloud-init이 첫 부팅에
+# 메타데이터에서 읽어 authorized_keys에 쓴다), 나중에 붙이려면 인스턴스를 재생성해야 한다.
+resource "aws_key_pair" "main" {
+  provider   = aws.untagged
+  key_name   = "${var.project}-key"
+  public_key = file(pathexpand(var.ssh_public_key_path))
 }

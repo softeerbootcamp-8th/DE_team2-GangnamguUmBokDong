@@ -69,25 +69,29 @@ resource "aws_vpc_endpoint" "s3" {
 
 # --- 보안 그룹 ---
 
+# AWS는 GroupDescription에 ASCII만 허용한다 — 한글 설명은 주석으로 남긴다.
+# 상시 EC2: Airflow 3종 + API + nginx/web + MLflow
 resource "aws_security_group" "app" {
   name        = "${var.project}-app"
-  description = "상시 EC2 (Airflow / API / web / MLflow)"
+  description = "Always-on EC2: Airflow, API, web, MLflow"
   vpc_id      = aws_vpc.main.id
 
   tags = { Name = "${var.project}-app" }
 }
 
+# 학습 EC2. 인바운드 규칙이 하나도 없어 퍼블릭 IP가 있어도 도달 불가.
 resource "aws_security_group" "train" {
   name        = "${var.project}-train"
-  description = "학습 EC2. 인바운드 규칙 없음 — 접속은 SSM Session Manager로만."
+  description = "Training EC2. No inbound rules; access via SSM Session Manager only"
   vpc_id      = aws_vpc.main.id
 
   tags = { Name = "${var.project}-train" }
 }
 
+# RDS. app SG에서만 5432로 접근 가능.
 resource "aws_security_group" "rds" {
   name        = "${var.project}-rds"
-  description = "RDS PostgreSQL. app SG에서만 접근 가능."
+  description = "RDS PostgreSQL. Reachable only from the app security group"
   vpc_id      = aws_vpc.main.id
 
   tags = { Name = "${var.project}-rds" }
@@ -124,6 +128,32 @@ resource "aws_vpc_security_group_ingress_rule" "app_mlflow_ui" {
   from_port         = 5000
   to_port           = 5000
   ip_protocol       = "tcp"
+}
+
+# SSH. SSM이 이 계정에서 전면 거부되어 유일한 접속 수단이다.
+# admin_cidrs가 비어 있으면 규칙이 생기지 않으므로, 접속 전에 반드시 채워야 한다
+# (make allow-my-ip가 현재 공인 IP로 갱신해준다).
+resource "aws_vpc_security_group_ingress_rule" "app_ssh" {
+  for_each = toset(var.admin_cidrs)
+
+  security_group_id = aws_security_group.app.id
+  description       = "ssh"
+  cidr_ipv4         = each.value
+  from_port         = 22
+  to_port           = 22
+  ip_protocol       = "tcp"
+}
+
+# 학습 EC2는 인터넷에 22를 열지 않는다. 상시 EC2를 bastion으로 경유한다:
+#   ssh -J ec2-user@<app-eip> ec2-user@<train-private-ip>
+# ProxyJump는 각 홉의 인증을 로컬에서 하므로 개인키를 bastion에 두지 않아도 된다.
+resource "aws_vpc_security_group_ingress_rule" "train_ssh_from_app" {
+  security_group_id            = aws_security_group.train.id
+  description                  = "ssh from bastion"
+  referenced_security_group_id = aws_security_group.app.id
+  from_port                    = 22
+  to_port                      = 22
+  ip_protocol                  = "tcp"
 }
 
 # 학습 EC2가 실험을 기록한다. 소스를 CIDR이 아니라 SG로 지정해, 그 SG를 단

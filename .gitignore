@@ -52,6 +52,8 @@ terraform/terraform_override.tf
 # 환경/팀마다 다르고 IP·버킷 이름이 들어간다. *.example만 커밋한다.
 terraform/backend.hcl
 terraform/terraform.tfvars
+# make allow-my-ip가 현재 공인 IP로 다시 쓴다.
+terraform/admin_cidrs.auto.tfvars
 
 # Claude
 docs/superpowers/

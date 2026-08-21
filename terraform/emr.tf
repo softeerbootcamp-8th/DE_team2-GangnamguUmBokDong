@@ -21,6 +21,7 @@ data "aws_iam_policy_document" "emr_assume" {
 }
 
 resource "aws_iam_role" "emr_service" {
+  provider           = aws.untagged
   name               = "${var.project}-emr-service"
   assume_role_policy = data.aws_iam_policy_document.emr_assume.json
 }
@@ -37,6 +38,7 @@ resource "aws_iam_role_policy_attachment" "emr_service" {
 # --- EMR 노드(EC2)가 쓰는 역할 ---
 
 resource "aws_iam_role" "emr_ec2" {
+  provider           = aws.untagged
   name               = "${var.project}-emr-ec2"
   assume_role_policy = data.aws_iam_policy_document.ec2_assume.json
 }
@@ -56,6 +58,7 @@ resource "aws_iam_role_policy_attachment" "emr_ec2_ssm" {
 }
 
 resource "aws_iam_instance_profile" "emr_ec2" {
-  name = "${var.project}-emr-ec2"
-  role = aws_iam_role.emr_ec2.name
+  provider = aws.untagged
+  name     = "${var.project}-emr-ec2"
+  role     = aws_iam_role.emr_ec2.name
 }

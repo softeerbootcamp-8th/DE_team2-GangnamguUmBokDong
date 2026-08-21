@@ -2,8 +2,9 @@
 # S3의 설정 객체를 내려받아 /opt/app/.env를 만든다.
 #
 # 시크릿을 SSM Parameter Store나 Secrets Manager에 두지 않는 이유는 두 서비스가 모두
-# 계정 정책상 거부이기 때문이다(2026-08-21 정찰). S3 + SSE-KMS로 대체하고, 접근은
-# 인스턴스 역할로 통제한다.
+# 계정 정책상 거부이기 때문이다(2026-08-21 정찰). S3 객체로 대체하고, 암호화는 버킷
+# 기본값(SSE-S3)에 맡긴다 — kms:CreateKey도 거부라 고객 관리 키를 못 만든다.
+# 접근 통제는 인스턴스 역할 + 버킷 정책 + Block Public Access가 담당한다.
 #
 # 객체가 둘로 나뉘어 있다:
 #   config/prod.env     Terraform이 생성 (DB 연결·생성된 시크릿·버킷 등)
@@ -37,7 +38,7 @@ fetch() {
     fi
     if [[ "${required}" == "required" ]]; then
         echo "[render-env] 필수 객체를 읽을 수 없습니다: s3://${S3_BUCKET}/${key}" >&2
-        echo "[render-env] terraform apply가 끝났는지, 인스턴스 역할에 kms:Decrypt가 있는지 확인하세요." >&2
+        echo "[render-env] terraform apply가 끝났는지, 인스턴스 역할에 s3:GetObject가 있는지 확인하세요." >&2
         exit 66
     fi
     echo "[render-env] 선택 객체 없음(건너뜀): s3://${S3_BUCKET}/${key}" >&2
@@ -78,7 +79,7 @@ done
 if (( ${#missing[@]} > 0 )); then
     echo "[render-env] 값이 비었거나 없는 키: ${missing[*]}" >&2
     echo "[render-env] SEOUL_OPENAPI_KEY/KMA_APIHUB_KEY는 사람이 올려야 합니다:" >&2
-    echo "[render-env]   aws s3 cp secrets.env s3://${S3_BUCKET}/${SECRETS_KEY} --sse aws:kms" >&2
+    echo "[render-env]   aws s3 cp secrets.env s3://${S3_BUCKET}/${SECRETS_KEY}" >&2
     exit 78
 fi
 

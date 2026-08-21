@@ -9,6 +9,7 @@
 # 처리되고 EBS가 유지된다. terraform plan에서 `~ update in-place`인지 반드시 확인할 것.
 
 resource "aws_iam_role" "train" {
+  provider           = aws.untagged
   name               = "${var.project}-train"
   assume_role_policy = data.aws_iam_policy_document.ec2_assume.json
 }
@@ -26,11 +27,13 @@ resource "aws_iam_role_policy_attachment" "train_ssm" {
 }
 
 resource "aws_iam_instance_profile" "train" {
-  name = "${var.project}-train"
-  role = aws_iam_role.train.name
+  provider = aws.untagged
+  name     = "${var.project}-train"
+  role     = aws_iam_role.train.name
 }
 
 resource "aws_instance" "train" {
+  key_name      = aws_key_pair.main.key_name
   ami           = data.aws_ami.al2023_arm64.id
   instance_type = var.train_instance_type
   subnet_id     = aws_subnet.public[0].id

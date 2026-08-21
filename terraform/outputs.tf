@@ -15,6 +15,11 @@ output "app_instance_id" {
   value       = aws_instance.app.id
 }
 
+output "train_private_ip" {
+  description = "bastion(상시 EC2)을 경유해 SSH로 붙을 주소. make ssh-train이 쓴다."
+  value       = aws_instance.train.private_ip
+}
+
 output "train_instance_id" {
   description = "make train-start / train-stop 대상."
   value       = aws_instance.train.id
@@ -38,11 +43,6 @@ output "s3_bucket" {
 output "config_object_uri" {
   description = "render_env.sh가 내려받는 설정 객체."
   value       = "s3://${aws_s3_bucket.data.id}/${aws_s3_object.prod_env.key}"
-}
-
-output "kms_key_alias" {
-  description = "설정 객체 암호화 키."
-  value       = aws_kms_alias.config.name
 }
 
 output "subnet_id" {

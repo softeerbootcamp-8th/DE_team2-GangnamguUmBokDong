@@ -48,3 +48,13 @@ provider "aws" {
     }
   }
 }
+
+# 이 계정은 iam:TagRole · iam:TagPolicy · iam:TagInstanceProfile · kms:TagResource가
+# 모두 거부된다(2026-08-21 실측). default_tags가 붙으면 리소스 **생성 자체가** 403으로
+# 실패하므로, 태그를 달 수 없는 리소스는 이 alias를 지정해 만든다.
+#
+# S3·VPC·EC2·RDS 태깅은 허용되므로 그쪽은 기본 provider를 그대로 쓴다.
+provider "aws" {
+  alias  = "untagged"
+  region = var.region
+}
