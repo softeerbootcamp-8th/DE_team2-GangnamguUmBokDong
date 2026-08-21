@@ -1,4 +1,4 @@
-"""Gold rebalance route-v1 planner·coverage·Parquet 계약을 검증한다."""
+"""Gold rebalance route-v2 planner·coverage·Parquet 계약을 검증한다."""
 
 from __future__ import annotations
 
@@ -19,7 +19,10 @@ from gold import rebalance_route as route_module
 from gold.common import parquet_bytes, read_parquet_bytes
 from gold.rebalance_route import (
     INITIAL_TRUCK_LOAD,
+    MAX_ROUTES_PER_CENTER,
+    MAX_STOPS_PER_ROUTE,
     ROUTE_ALGORITHM_VERSION,
+    ROUTE_WORK_UNIT_CONFIG_VERSION,
     TRUCK_CAPACITY,
     TRUCK_CAPACITY_CONFIG_VERSION,
     DispatchCenterTopology,
@@ -136,11 +139,14 @@ def _plan(
 
 
 def test_route_constants_match_publication_contract() -> None:
-    """route fingerprint에 들어가는 v1 상수를 SSOT 값으로 고정한다."""
-    assert ROUTE_ALGORITHM_VERSION == "route-v1"
+    """route fingerprint에 들어가는 v2 작업 단위 상수를 SSOT 값으로 고정한다."""
+    assert ROUTE_ALGORITHM_VERSION == "route-v2"
     assert TRUCK_CAPACITY == 20
     assert TRUCK_CAPACITY_CONFIG_VERSION == "truck-capacity-v1"
     assert INITIAL_TRUCK_LOAD == 0
+    assert MAX_STOPS_PER_ROUTE == 8
+    assert MAX_ROUTES_PER_CENTER == 3
+    assert ROUTE_WORK_UNIT_CONFIG_VERSION == "route-work-unit-v1"
 
 
 def test_empty_plan_excludes_normal_and_nonpositive_quantities() -> None:
@@ -394,6 +400,8 @@ def test_current_station_center_fk_controls_grouping_and_center_order() -> None:
     stations = (
         _station("ST-1", center_id="center_b", longitude=126.9001),
         _station("ST-2", center_id="center_a", longitude=127.0999),
+        _station("ST-3", center_id="center_b", longitude=126.9002),
+        _station("ST-4", center_id="center_a", longitude=127.0998),
     )
 
     plan = _plan(
@@ -402,6 +410,8 @@ def test_current_station_center_fk_controls_grouping_and_center_order() -> None:
         urgency=(
             _urgency("ST-1", "retrieval_needed", 1),
             _urgency("ST-2", "retrieval_needed", 1),
+            _urgency("ST-3", "supply_needed", 1),
+            _urgency("ST-4", "supply_needed", 1),
         ),
     )
 
@@ -409,9 +419,16 @@ def test_current_station_center_fk_controls_grouping_and_center_order() -> None:
         "center_a",
         "center_b",
     )
-    station_by_route = {stop.route_id: stop.sta_id for stop in plan.route_stops}
-    assert station_by_route[plan.routes[0].route_id] == "ST-2"
-    assert station_by_route[plan.routes[1].route_id] == "ST-1"
+    stations_by_route = {
+        route.route_id: {
+            stop.sta_id
+            for stop in plan.route_stops
+            if stop.route_id == route.route_id
+        }
+        for route in plan.routes
+    }
+    assert stations_by_route[plan.routes[0].route_id] == {"ST-2", "ST-4"}
+    assert stations_by_route[plan.routes[1].route_id] == {"ST-1", "ST-3"}
 
 
 def test_candidate_and_nearest_ties_break_by_station_id() -> None:
@@ -420,6 +437,7 @@ def test_candidate_and_nearest_ties_break_by_station_id() -> None:
         _station("ST-2", longitude=127.001),
         _station("ST-1", longitude=127.001),
         _station("ST-3", longitude=127.002),
+        _station("ST-4", longitude=127.003),
     )
     plan = _plan(
         stations=stations,
@@ -427,6 +445,7 @@ def test_candidate_and_nearest_ties_break_by_station_id() -> None:
             _urgency("ST-2", "retrieval_needed", 15, score=90),
             _urgency("ST-1", "retrieval_needed", 15, score=90),
             _urgency("ST-3", "retrieval_needed", 1, score=10),
+            _urgency("ST-4", "supply_needed", 20, score=50),
         ),
     )
 
@@ -435,11 +454,33 @@ def test_candidate_and_nearest_ties_break_by_station_id() -> None:
     assert [(stop.sta_id, stop.bike_cnt) for stop in first_stops] == [
         ("ST-1", 15),
         ("ST-2", 5),
+        ("ST-4", 20),
     ]
 
 
-def test_pickups_precede_dropoffs_and_each_group_starts_at_center() -> None:
-    """route-v1은 pickup과 dropoff를 각각 current center 기준 최근접 순회한다."""
+def test_additional_stop_combines_urgency_with_anchor_distance() -> None:
+    """첫 긴급 pickup은 보존하고 추가 stop은 가까운 작업 효율을 반영한다."""
+    plan = _plan(
+        stations=(
+            _station("ST-1", longitude=127.0),
+            _station("ST-2", longitude=127.1),
+            _station("ST-3", longitude=127.001),
+            _station("ST-4", longitude=127.002),
+        ),
+        urgency=(
+            _urgency("ST-1", "retrieval_needed", 10, score=100),
+            _urgency("ST-2", "retrieval_needed", 10, score=80),
+            _urgency("ST-3", "retrieval_needed", 10, score=70),
+            _urgency("ST-4", "supply_needed", 20, score=60),
+        ),
+    )
+
+    selected_ids = {stop.sta_id for stop in plan.route_stops}
+    assert selected_ids == {"ST-1", "ST-3", "ST-4"}
+
+
+def test_pickups_precede_dropoffs_and_dropoff_continues_from_last_pickup() -> None:
+    """route-v2는 마지막 pickup 위치에서 가까운 dropoff로 동선을 이어간다."""
     stations = (
         _station("ST-1", longitude=127.01),
         _station("ST-2", longitude=127.011),
@@ -459,8 +500,8 @@ def test_pickups_precede_dropoffs_and_each_group_starts_at_center() -> None:
     assert [stop.sta_id for stop in plan.route_stops] == [
         "ST-1",
         "ST-2",
-        "ST-3",
         "ST-4",
+        "ST-3",
     ]
     assert [stop.route_action_type_cd for stop in plan.route_stops] == [
         "pickup",
@@ -473,11 +514,14 @@ def test_pickups_precede_dropoffs_and_each_group_starts_at_center() -> None:
 def test_capacity_rollover_uses_one_based_ordinal_and_ssot_uuid() -> None:
     """20대를 넘는 pickup은 center 내 ordinal 1부터 결정적 회차로 분리한다."""
     plan = _plan(
-        stations=(_station("ST-1"),),
-        urgency=(_urgency("ST-1", "retrieval_needed", 25),),
+        stations=(_station("ST-1"), _station("ST-2")),
+        urgency=(
+            _urgency("ST-1", "retrieval_needed", 25),
+            _urgency("ST-2", "supply_needed", 25),
+        ),
     )
 
-    assert [stop.bike_cnt for stop in plan.route_stops] == [20, 5]
+    assert [stop.bike_cnt for stop in plan.route_stops] == [20, 20, 5, 5]
     assert [route.route_id for route in plan.routes] == [
         "7dd58c8d-7dc7-5279-8845-7673c9c87be2",
         str(route_uuid_v5("center_a", _UTC_1600, 0, 2)),
@@ -485,7 +529,7 @@ def test_capacity_rollover_uses_one_based_ordinal_and_ssot_uuid() -> None:
 
 
 def test_dropoff_is_limited_by_actual_pickup_per_route() -> None:
-    """각 회차 dropoff 합은 capacity 빈칸이 아니라 그 회차 실제 pickup 합 이하이다."""
+    """각 회차 pickup과 dropoff 수량은 같은 완결 작업이다."""
     plan = _plan(
         stations=(_station("ST-1"), _station("ST-2")),
         urgency=(
@@ -502,7 +546,7 @@ def test_dropoff_is_limited_by_actual_pickup_per_route() -> None:
         dropped = sum(
             stop.bike_cnt for stop in stops if stop.route_action_type_cd == "dropoff"
         )
-        assert dropped <= picked <= TRUCK_CAPACITY
+        assert dropped == picked <= TRUCK_CAPACITY
     assert (
         sum(
             stop.bike_cnt
@@ -513,11 +557,62 @@ def test_dropoff_is_limited_by_actual_pickup_per_route() -> None:
     )
 
 
+def test_unpaired_action_does_not_create_incomplete_route() -> None:
+    """회수 또는 배치 한쪽만 있으면 실행 불가능한 proposed 작업을 만들지 않는다."""
+    pickup_only = _plan(
+        stations=(_station("ST-1"),),
+        urgency=(_urgency("ST-1", "retrieval_needed", 20),),
+    )
+    dropoff_only = _plan(
+        stations=(_station("ST-2"),),
+        urgency=(_urgency("ST-2", "supply_needed", 20),),
+    )
+
+    assert pickup_only == RebalanceRoutePlan((), ())
+    assert dropoff_only == RebalanceRoutePlan((), ())
+
+
+def test_work_unit_has_at_most_eight_stops_and_center_route_cap() -> None:
+    """작업은 2~8개 대여소로 완결되고 센터별 상위 3개까지만 제안한다."""
+    pickup_stations = tuple(_station(f"ST-{100 + index}") for index in range(1, 13))
+    dropoff_stations = tuple(_station(f"ST-{200 + index}") for index in range(1, 13))
+    plan = _plan(
+        stations=pickup_stations + dropoff_stations,
+        urgency=tuple(
+            _urgency(station.sta_id, "retrieval_needed", 1, score=100 - index)
+            for index, station in enumerate(pickup_stations)
+        )
+        + tuple(
+            _urgency(station.sta_id, "supply_needed", 1, score=100 - index)
+            for index, station in enumerate(dropoff_stations)
+        ),
+    )
+
+    assert len(plan.routes) == MAX_ROUTES_PER_CENTER
+    for route in plan.routes:
+        stops = [stop for stop in plan.route_stops if stop.route_id == route.route_id]
+        assert 2 <= len(stops) <= MAX_STOPS_PER_ROUTE
+        picked = sum(
+            stop.bike_cnt
+            for stop in stops
+            if stop.route_action_type_cd == "pickup"
+        )
+        dropped = sum(
+            stop.bike_cnt
+            for stop in stops
+            if stop.route_action_type_cd == "dropoff"
+        )
+        assert picked == dropped > 0
+
+
 def test_revision_is_explicit_route_identity_input() -> None:
     """같은 계산 입력도 명시 revision이 다르면 UUID만 새 identity로 고정된다."""
     arguments = {
-        "stations": (_station("ST-1"),),
-        "urgency": (_urgency("ST-1", "retrieval_needed", 1),),
+        "stations": (_station("ST-1"), _station("ST-2")),
+        "urgency": (
+            _urgency("ST-1", "retrieval_needed", 1),
+            _urgency("ST-2", "supply_needed", 1),
+        ),
     }
 
     revision_zero = _plan(revision_no=0, **arguments)

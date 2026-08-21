@@ -42,11 +42,11 @@ def _local_mlflow(tmp_path, monkeypatch):
 
 
 def _seed_return_table(n_each: int = 8) -> None:
-    """train(2일)/valid(11일)/test(17일) 기본값에 맞춰 반납 모델용 multi-horizon
+    """train(1일)/valid(3일)/test(10일) 기본값에 맞춰 반납 모델용 multi-horizon
     테이블을 moto S3에 날짜 파티션으로 심는다(VALID_DAYS_OF_MONTH/TEST_DAYS_OF_MONTH
-    기본값 {11,13}/{17,19}, TRAIN_DAY_DIVISOR 기본값 1을 그대로 씀)."""
+    기본값 {3,19}/{10,26}, TRAIN_DAY_DIVISOR 기본값 1을 그대로 씀)."""
     table_path = config.RETURN_MULTI_HORIZON_FEATURES_TABLE_PARQUET
-    for date_str in ("2025-01-02", "2025-01-11", "2025-01-17"):
+    for date_str in ("2025-01-01", "2025-01-03", "2025-01-10"):
         day_of_month = int(date_str[-2:])
         rows = [
             {
@@ -57,7 +57,7 @@ def _seed_return_table(n_each: int = 8) -> None:
                 "temp": 20.0,
                 "precip": 0.0,
                 "pop_total": 1000.0,
-                "minute": 0,
+                "minute": 480,
                 "dow": 0,
                 "is_holiday": 0,
                 "day": day_index(date(2025, 1, day_of_month)),

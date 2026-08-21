@@ -54,6 +54,9 @@ BUILTIN_PROFILE_NAME = profile_contract.BUILTIN_PROFILE_NAME
 SERVING_TICK_MINUTES = profile_contract.SERVING_TICK_MINUTES
 DEFAULT_MODEL_GRID_TICK_MINUTES = profile_contract.DEFAULT_MODEL_GRID_TICK_MINUTES
 SUPPORTED_MODEL_GRID_TICK_MINUTES = profile_contract.SUPPORTED_MODEL_GRID_TICK_MINUTES
+DEFAULT_TRAIN_HORIZONS = profile_contract.DEFAULT_TRAIN_HORIZONS
+DEFAULT_WEEKDAY_PEAK_HOURS = profile_contract.DEFAULT_WEEKDAY_PEAK_HOURS
+DEFAULT_HOLIDAY_PEAK_HOURS = profile_contract.DEFAULT_HOLIDAY_PEAK_HOURS
 _DEFAULT_PROFILE = profile_contract.DEFAULT_PROFILE
 
 
@@ -272,6 +275,19 @@ def _float_env(name: str, default: float) -> float:
     return float(os.environ.get(name, default))
 
 
+def _bool_env(name: str, default: bool = False) -> bool:
+    """명시적인 true/false 환경변수를 bool로 파싱한다."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    normalized = raw.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name}은 true/false 값이어야 합니다: {raw!r}")
+
+
 def _resolved_train_anchor_tick(
     profile: Mapping[str, object],
     grid_tick: int,
@@ -368,6 +384,15 @@ profile_contract.validate_train_anchor_contract(
     TRAIN_ANCHOR_TICK_MINUTES,
     f"{PROFILE_NAME}+환경변수",
 )
+PEAK_ANCHOR_TICK_MINUTES = _int_env(
+    "PEAK_ANCHOR_TICK_MINUTES",
+    int(_PROFILE.get("PEAK_ANCHOR_TICK_MINUTES", TRAIN_ANCHOR_TICK_MINUTES)),
+)
+profile_contract.validate_train_anchor_contract(
+    GRID_TICK_MINUTES,
+    PEAK_ANCHOR_TICK_MINUTES,
+    f"{PROFILE_NAME}+환경변수:PEAK_ANCHOR_TICK_MINUTES",
+)
 
 # --- 배치예측 horizon(몇 시간 뒤까지 한 번에 예측하는지) ---
 # lag/rolling(직전 실적)은 항상 "지금(T0)" 기준으로 고정하고, horizon(1..HORIZON_COUNT)을
@@ -375,6 +400,96 @@ profile_contract.validate_train_anchor_contract(
 # 쓰지 않는 이유는 history.md 18번 항목 참고. feature_engine의 multi-horizon self-join
 # 범위와 inference의 기본 예측 구간 수가 이 값 하나를 같이 참조한다.
 HORIZON_COUNT = _int_env("HORIZON_COUNT", _PROFILE["HORIZON_COUNT"])
+
+
+def _parse_train_horizons(profile_horizons: object) -> tuple[int, ...]:
+    """학습에 사용할 horizon 목록을 환경변수 또는 프로필에서 파싱한다."""
+    raw = os.environ.get("TRAIN_HORIZONS")
+    if raw is not None:
+        try:
+            horizons = tuple(int(x.strip()) for x in raw.split(",") if x.strip())
+        except ValueError as exc:
+            raise ValueError(f"TRAIN_HORIZONS는 쉼표로 구분한 정수여야 합니다: {raw!r}") from exc
+        if not horizons or any(h < 1 or h > HORIZON_COUNT for h in horizons):
+            raise ValueError(f"TRAIN_HORIZONS는 1~{HORIZON_COUNT} 사이 정수여야 합니다: {horizons}")
+        return horizons
+    if isinstance(profile_horizons, (list, tuple)):
+        return tuple(int(h) for h in profile_horizons)
+    return DEFAULT_TRAIN_HORIZONS
+
+
+TRAIN_HORIZONS = _parse_train_horizons(_PROFILE.get("TRAIN_HORIZONS", DEFAULT_TRAIN_HORIZONS))
+ADAPTIVE_TRAIN_ANCHORS = _bool_env(
+    "ADAPTIVE_TRAIN_ANCHORS",
+    bool(_PROFILE.get("ADAPTIVE_TRAIN_ANCHORS", True)),
+)
+
+
+def _parse_peak_hours(
+    name: str,
+    profile_val: object,
+    default: tuple[tuple[int, int], ...],
+) -> tuple[tuple[int, int], ...]:
+    """평일 또는 휴일 피크 시간대 구간 목록을 파싱한다."""
+    raw = os.environ.get(name)
+    target = raw if raw is not None else profile_val
+
+    if target is None:
+        return default
+
+    if isinstance(target, str):
+        target = target.strip()
+        if not target or target.lower() in {"none", "false", "empty", "off"}:
+            return ()
+        if target.startswith("["):
+            try:
+                target = json.loads(target)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"{name} JSON 형식이 올바르지 않습니다: {target!r}") from exc
+        else:
+            intervals = []
+            for token in [t.strip() for t in target.split(",") if t.strip()]:
+                parts = None
+                for delim in ("-", ":", "~"):
+                    if delim in token:
+                        parts = [p.strip() for p in token.split(delim)]
+                        break
+                if not parts or len(parts) != 2:
+                    raise ValueError(f"{name} 구간 형식이 잘못되었습니다 (예: '7-10,17-21'): {token!r}")
+                try:
+                    s, e = int(parts[0]), int(parts[1])
+                except ValueError as exc:
+                    raise ValueError(f"{name} 시간은 정수여야 합니다: {token!r}") from exc
+                intervals.append((s, e))
+            target = intervals
+
+    if isinstance(target, (list, tuple)):
+        result = []
+        for item in target:
+            if not isinstance(item, (list, tuple)) or len(item) != 2:
+                raise ValueError(f"{name} 각 구간은 [start_hour, end_hour] 형태여야 합니다: {item!r}")
+            try:
+                s, e = int(item[0]), int(item[1])
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"{name} 구간의 시작과 끝은 정수여야 합니다: {item!r}") from exc
+            if not (0 <= s < e <= 24):
+                raise ValueError(f"{name} 구간은 0 <= start < end <= 24 범위여야 합니다: [{s}, {e}]")
+            result.append((s, e))
+        return tuple(result)
+
+    raise ValueError(f"{name} 형식을 해석할 수 없습니다: {target!r}")
+
+
+WEEKDAY_PEAK_HOURS = _parse_peak_hours(
+    "WEEKDAY_PEAK_HOURS",
+    _PROFILE.get("WEEKDAY_PEAK_HOURS", DEFAULT_WEEKDAY_PEAK_HOURS),
+    DEFAULT_WEEKDAY_PEAK_HOURS,
+)
+HOLIDAY_PEAK_HOURS = _parse_peak_hours(
+    "HOLIDAY_PEAK_HOURS",
+    _PROFILE.get("HOLIDAY_PEAK_HOURS", DEFAULT_HOLIDAY_PEAK_HOURS),
+    DEFAULT_HOLIDAY_PEAK_HOURS,
+)
 
 # --- 모델 입력 feature 스키마(lag 제외) — feature_engine이 만들고, training이
 # 학습에 쓰고, inference가 동일 순서로 맞춰야 하는 "모델 계약"의 일부라 공유한다.
@@ -564,4 +679,8 @@ def effective_profile() -> dict:
         "MONITOR_LOOKBACK_MONTHS": MONITOR_LOOKBACK_MONTHS,
         "TRAIN_LOOKBACK_MONTHS": TRAIN_LOOKBACK_MONTHS,
         "TRAINING_SAFETY_MARGIN_DAYS": TRAINING_SAFETY_MARGIN_DAYS,
+        "TRAIN_HORIZONS": list(TRAIN_HORIZONS),
+        "ADAPTIVE_TRAIN_ANCHORS": ADAPTIVE_TRAIN_ANCHORS,
+        "WEEKDAY_PEAK_HOURS": [list(p) for p in WEEKDAY_PEAK_HOURS],
+        "HOLIDAY_PEAK_HOURS": [list(p) for p in HOLIDAY_PEAK_HOURS],
     }

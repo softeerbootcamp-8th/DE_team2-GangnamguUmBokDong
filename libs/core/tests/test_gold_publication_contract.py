@@ -42,11 +42,11 @@ _ROUTE_ARTIFACT_SET_BYTES = (
 _ROUTE_ARTIFACT_SET_SHA256 = (
     "576eec2c53f1be8985ce531f512f4f4014fe05879d1f53714128dd774d8abf87"
 )
-_ROUTE_INPUT_SHA256 = "a5ad345d552d4392e3ba07a88606e834c55ad3bbe3c51a08649d5c1197877d8f"
+_ROUTE_INPUT_SHA256 = "0de0cd4437f089bec16b778cf927c1fef732cd349dca7533a465100b94c5454e"
 _ID_SET_BYTES = b'{"ids":["ST-1","ST-2"],"schema_version":"gold-id-set-v1"}'
 _ID_SET_SHA256 = "a080d2f47ea7c4d0f5d27704264ed23d5a93ec525dd12544812f81b3519fa52f"
 _ROUTE_MANIFEST_SHA256 = (
-    "0fed5dd5a093b3aa0256645bebb685f3b00f08d1c557e3c87f27071e62b5a6ff"
+    "01b04e4af53f338184842157ac269915b1be70e45073d1f12b35184e598a49cf"
 )
 
 
@@ -130,13 +130,16 @@ def _route_input_fingerprint() -> InputFingerprint:
         ),
     )
     parameters = (
+        Parameter("max_routes_per_center", "3"),
+        Parameter("max_stops_per_route", "8"),
         Parameter("truck_capacity_config_version", "truck-capacity-v1"),
         Parameter("truck_capacity", "20"),
         Parameter(
             "route_coverage_sha256",
             "13cd1f4fe82d4b09370fd4141d1ee1a727f25c5b109de11f06bb904f9c001e8b",
         ),
-        Parameter("route_algorithm_version", "route-v1"),
+        Parameter("route_work_unit_config_version", "route-work-unit-v1"),
+        Parameter("route_algorithm_version", "route-v2"),
     )
     return build_input_fingerprint(
         "rebalance_route",
@@ -416,8 +419,11 @@ def test_registry_matches_all_ten_ssot_publication_keys() -> None:
             ),
             ("route_coverage", "urgency_publication_manifest"),
             (
+                "max_routes_per_center",
+                "max_stops_per_route",
                 "route_algorithm_version",
                 "route_coverage_sha256",
+                "route_work_unit_config_version",
                 "truck_capacity",
                 "truck_capacity_config_version",
             ),

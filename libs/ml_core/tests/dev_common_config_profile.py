@@ -361,6 +361,30 @@ def test_legacy_anchor_environment_aliases_are_materialized(legacy_env, expected
     assert json.loads(result.stdout)["TRAIN_ANCHOR_TICK_MINUTES"] == expected
 
 
+def test_peak_anchor_tick_minutes_defaults_to_train_anchor_tick():
+    """PEAK_ANCHOR_TICK_MINUTES 미지정 시 TRAIN_ANCHOR_TICK_MINUTES를 기본값으로 사용한다."""
+    merged = profile_contract.merge_and_validate_profile(
+        {
+            "GRID_TICK_MINUTES": 30,
+            "ROLLING_TICK_MINUTES": 30,
+            "TRAIN_ANCHOR_TICK_MINUTES": 30,
+        },
+        "test-30m",
+    )
+    assert merged["PEAK_ANCHOR_TICK_MINUTES"] == 30
+
+    merged_custom_peak = profile_contract.merge_and_validate_profile(
+        {
+            "GRID_TICK_MINUTES": 10,
+            "ROLLING_TICK_MINUTES": 10,
+            "TRAIN_ANCHOR_TICK_MINUTES": 20,
+            "PEAK_ANCHOR_TICK_MINUTES": 10,
+        },
+        "test-hybrid",
+    )
+    assert merged_custom_peak["PEAK_ANCHOR_TICK_MINUTES"] == 10
+
+
 def test_conflicting_anchor_environment_aliases_fail_closed():
     """canonical/legacy 환경변수가 서로 다른 학습 밀도를 요구하면 import가 실패해야 한다."""
     env = _fresh_process_env(
@@ -503,6 +527,31 @@ def test_profile_registry_rejects_reserved_builtin_name():
         profile_registry.push_profile(common_config.BUILTIN_PROFILE_NAME, common_config._DEFAULT_PROFILE)
 
 
+def test_peak_hours_parsing_and_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_parse_peak_hours의 다양한 입력(문자열, JSON, 리스트, 결측값) 파싱을 검증한다."""
+    default = ((7, 10), (17, 21))
+
+    # 기본값
+    assert common_config._parse_peak_hours("TEST_PEAK", None, default) == default
+
+    # 리스트 / 튜플 형태
+    assert common_config._parse_peak_hours("TEST_PEAK", [[8, 10], [18, 20]], default) == ((8, 10), (18, 20))
+
+    # 문자열 다양한 구분자 (-, :, ~)
+    assert common_config._parse_peak_hours("TEST_PEAK", "8-10, 18:20, 21~23", default) == ((8, 10), (18, 20), (21, 23))
+
+    # JSON 문자열
+    assert common_config._parse_peak_hours("TEST_PEAK", "[[13, 19]]", default) == ((13, 19),)
+
+    # 비활성화 (none, empty)
+    assert common_config._parse_peak_hours("TEST_PEAK", "none", default) == ()
+    assert common_config._parse_peak_hours("TEST_PEAK", "", default) == ()
+
+    # 유효하지 않은 범위
+    with pytest.raises(ValueError, match="0 <= start < end <= 24"):
+        common_config._parse_peak_hours("TEST_PEAK", "20-10", default)
+
+
 class _CapturingBoto3:
     """`boto3.client()`에 실제로 넘어간 kwargs를 잡아두는 스텁."""
 
@@ -544,3 +593,4 @@ def test_s3_client_with_endpoint_passes_explicit_credentials(monkeypatch):
     assert fake.kwargs["endpoint_url"] == "http://minio:9000"
     assert fake.kwargs["aws_access_key_id"] == "local-key"
     assert fake.kwargs["aws_secret_access_key"] == "local-secret"
+
