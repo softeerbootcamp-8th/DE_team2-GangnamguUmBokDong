@@ -89,6 +89,57 @@ def _dedup_full_row(table: pa.Table, schema: pa.Schema) -> pa.Table:
     return conform(grouped, schema)
 
 
+def _materialize_empty(
+    scfg: SourceConfig,
+    day: date,
+    *,
+    dropped: int,
+    out_of_range: int,
+    column_issues: dict[str, dict[str, int]],
+    silver_present: bool,
+    station_map_stats: dict | None,
+) -> DateResult:
+    """확인된 0행 날짜를 스키마가 있는 Archive와 manifest로 기록한다."""
+    schema = archive_schema(scfg)
+    table = pa.Table.from_arrays(
+        [pa.array([], type=field.type) for field in schema],
+        schema=schema,
+    )
+    archive_key = storage.write_archive(scfg.source_id, day, table)
+    storage.write_archive_manifest(
+        scfg.source_id,
+        day,
+        {
+            "source_id": scfg.source_id,
+            "date": f"{day:%Y-%m-%d}",
+            "archive_key": archive_key,
+            "source_kind": SOURCE_KIND_BOOTSTRAP,
+            "rows": 0,
+            "dropped": dropped,
+            "out_of_range": out_of_range,
+            "column_issues": column_issues,
+            "silver_present": silver_present,
+            "materialized_empty": True,
+            "loaded_at": datetime.now(tz=_KST).isoformat(),
+            **({"station_map": station_map_stats} if station_map_stats else {}),
+        },
+    )
+    logger.info(
+        f"stage=bootstrap status=loaded source={scfg.source_id} date={day} "
+        f"rows=0 dropped={dropped} out_of_range={out_of_range} "
+        f"materialized_empty=true key={archive_key}"
+    )
+    return DateResult(
+        day=day,
+        status="loaded",
+        rows=0,
+        dropped=dropped,
+        out_of_range=out_of_range,
+        archive_key=archive_key,
+        silver_present=silver_present,
+    )
+
+
 def load_date(
     scfg: SourceConfig,
     bcfg: BootstrapConfig,
@@ -97,6 +148,7 @@ def load_date(
     *,
     force: bool = False,
     station_map_stats: dict | None = None,
+    materialize_empty: bool = False,
 ) -> DateResult:
     """그 날짜의 행을 검증해 archive에 쓴다.
 
@@ -109,10 +161,11 @@ def load_date(
         station_map_stats: 조인 매핑표의 출처 정보. 주면 manifest에 그대로 실린다.
             매핑표가 실행 시점 API 스냅샷이라 `rackTotCnt`·`shared`가 "그날의 값"이므로,
             나중에 그 상수 컬럼의 출처를 되짚을 수 있어야 한다.
+        materialize_empty: 참이면 확인된 0행도 빈 Archive와 manifest로 기록한다.
     returns:
         이 날짜의 처리 결과. 예외를 던지지 않는다.
     """
-    if not rows:
+    if not rows and not materialize_empty:
         return DateResult(day=day, status="empty")
     if not force and storage.archive_exists(scfg.source_id, day):
         return DateResult(day=day, status="skipped")
@@ -124,6 +177,17 @@ def load_date(
         logger.warning(
             f"stage=bootstrap source={scfg.source_id} date={day} "
             "silver_present=true 다음 compaction이 이 archive를 덮어쓴다"
+        )
+
+    if not rows:
+        return _materialize_empty(
+            scfg,
+            day,
+            dropped=0,
+            out_of_range=0,
+            column_issues={},
+            silver_present=silver_present,
+            station_map_stats=station_map_stats,
         )
 
     schema = archive_schema(scfg)
@@ -174,6 +238,16 @@ def load_date(
         )
 
     if not tables:
+        if materialize_empty:
+            return _materialize_empty(
+                scfg,
+                day,
+                dropped=dropped,
+                out_of_range=out_of_range,
+                column_issues=column_issues,
+                silver_present=silver_present,
+                station_map_stats=station_map_stats,
+            )
         return DateResult(
             day=day, status="empty", rows=0, dropped=dropped,
             out_of_range=out_of_range, silver_present=silver_present,

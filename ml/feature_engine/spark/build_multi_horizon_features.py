@@ -201,6 +201,28 @@ def _features_in_training_window(features: DataFrame) -> DataFrame:
     )
 
 
+def _write_date_partitioned(features: DataFrame, output_path: str) -> None:
+    """날짜 하나가 writer task 하나에만 가도록 모은 뒤 Parquet을 저장한다.
+
+    ``partitionBy("date")``만 호출하면 입력의 모든 Spark partition이 각 날짜
+    디렉터리에 파일을 하나씩 쓴다. 2025년 전체 multi-horizon 실측에서는 대여
+    mart 하나에 45,341개 파일이 생겨 S3 listing/GET 비용과 학습 로더 지연이
+    커졌다. 먼저 date로 hash repartition하면 같은 날짜는 정확히 한 task에만
+    들어가므로 날짜당 data file 하나를 유지하면서 논리 partition 계약은 같다.
+
+    args:
+        features: date 컬럼이 있는 multi-horizon DataFrame.
+        output_path: overwrite할 Parquet 경로.
+    raises:
+        ValueError: date 컬럼이 없을 때.
+    """
+    if "date" not in features.columns:
+        raise ValueError("multi-horizon 출력에는 date 컬럼이 필요합니다")
+    features.repartition("date").write.mode("overwrite").partitionBy("date").parquet(
+        output_path
+    )
+
+
 def _run_cli() -> None:
     from .spark_session import get_spark
 
@@ -218,16 +240,18 @@ def _run_cli() -> None:
     # date 파티션으로 써야 training/monitor_performance가 core.s3.read_parquet()의
     # date_range로 필요한 기간만 읽을 수 있다(전체 히스토리를 매번 훑지 않음) — s3.py
     # 모듈 docstring 참고.
-    rental_result.write.mode("overwrite").partitionBy("date").parquet(
-        config.RENTAL_MULTI_HORIZON_FEATURES_TABLE_PARQUET
+    _write_date_partitioned(
+        rental_result,
+        config.RENTAL_MULTI_HORIZON_FEATURES_TABLE_PARQUET,
     )
     print(f"rental multi-horizon features -> {config.RENTAL_MULTI_HORIZON_FEATURES_TABLE_PARQUET}")
 
     return_result = build_multi_horizon_features(
         spark, features, RETURN_ANCHOR_COLUMNS, RETURN_TARGET_COLUMNS, anchor_df=anchor_input
     )
-    return_result.write.mode("overwrite").partitionBy("date").parquet(
-        config.RETURN_MULTI_HORIZON_FEATURES_TABLE_PARQUET
+    _write_date_partitioned(
+        return_result,
+        config.RETURN_MULTI_HORIZON_FEATURES_TABLE_PARQUET,
     )
     print(f"return multi-horizon features -> {config.RETURN_MULTI_HORIZON_FEATURES_TABLE_PARQUET}")
 

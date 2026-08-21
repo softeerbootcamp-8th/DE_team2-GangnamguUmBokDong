@@ -20,13 +20,16 @@ class TestParseArgs:
     def test_parses_range_and_options(self):
         args = cli.parse_args([
             "--source", "bike_rental_history", "--from", "2026-06-01", "--to", "2026-06-03",
-            "--csv-dir", "data", "--concurrency", "8", "--force",
+            "--csv-dir", "data", "--concurrency", "8", "--csv-batch-by-month", "--force",
+            "--materialize-empty-archive",
         ])
 
         assert args.source == "bike_rental_history"
         assert getattr(args, "from") == "2026-06-01"
         assert args.csv_dir == "data"
         assert args.concurrency == 8
+        assert args.csv_batch_by_month is True
+        assert args.materialize_empty_archive is True
         assert args.force is True
 
     def test_default_concurrency_is_four(self):
@@ -118,6 +121,77 @@ class TestMain:
         assert load_calls[0][3] == [{"row": "d1"}]
         assert load_calls[1][2] == date(2026, 6, 2)
         assert load_calls[1][3] == [{"row": "d2"}]
+
+    def test_csv_month_batches_bound_resident_tables(self, monkeypatch, tmp_path):
+        """월별 모드는 날짜 범위를 달력 경계로 나눠 각각 한 번씩 읽는다."""
+        bcfg = SimpleNamespace(kind="csv", join=None)
+        monkeypatch.setattr(cli.bootstrap_config, "load", lambda source_id: bcfg)
+        (tmp_path / "data.csv").write_text("x")
+        read_calls = []
+
+        def fake_read_by_date(cfg, csv_dir, days, station_map=None):
+            read_calls.append(tuple(sorted(days)))
+            return {}
+
+        monkeypatch.setattr(cli.csv_source, "read_by_date", fake_read_by_date)
+        monkeypatch.setattr(
+            cli.runner,
+            "load_date",
+            lambda scfg, bcfg_arg, day, rows, **kwargs: DateResult(
+                day=day, status="empty"
+            ),
+        )
+
+        code = cli.main(
+            [
+                "--source",
+                "bike_rental_history",
+                "--from",
+                "2025-01-31",
+                "--to",
+                "2025-03-01",
+                "--csv-dir",
+                str(tmp_path),
+                "--csv-batch-by-month",
+            ]
+        )
+
+        assert code == 0
+        assert [batch[0].month for batch in read_calls] == [1, 2, 3]
+        assert [len(batch) for batch in read_calls] == [1, 28, 1]
+
+    def test_csv_empty_materialization_option_reaches_loader(
+        self, monkeypatch, tmp_path
+    ):
+        """명시적 0행 보존 옵션만 runner의 materialize 경로를 활성화한다."""
+        bcfg = SimpleNamespace(kind="csv", join=None)
+        monkeypatch.setattr(cli.bootstrap_config, "load", lambda source_id: bcfg)
+        (tmp_path / "data.csv").write_text("x")
+        monkeypatch.setattr(cli.csv_source, "read_by_date", lambda *args, **kwargs: {})
+        seen = {}
+
+        def fake_load_date(scfg, bcfg_arg, day, rows, **kwargs):
+            seen.update(kwargs)
+            return DateResult(day=day, status="loaded", rows=0)
+
+        monkeypatch.setattr(cli.runner, "load_date", fake_load_date)
+
+        code = cli.main(
+            [
+                "--source",
+                "bike_station_realtime",
+                "--from",
+                "2025-01-09",
+                "--to",
+                "2025-01-09",
+                "--csv-dir",
+                str(tmp_path),
+                "--materialize-empty-archive",
+            ]
+        )
+
+        assert code == 0
+        assert seen["materialize_empty"] is True
 
     def test_csv_kind_without_csv_dir_exits(self, monkeypatch):
         bcfg = SimpleNamespace(kind="csv", join=None)
@@ -427,8 +501,9 @@ class TestStationJoinWiring:
         monkeypatch.setattr(cli.runner, "load_date",
                             lambda *a, **k: DateResult(day=date(2025, 12, 1), status="empty"))
 
-        cli.main(["--source", "bike_station_realtime", "--from", "2025-12-01",
-                  "--to", "2025-12-31", "--csv-dir", str(tmp_path)])
+        cli.main(["--source", "bike_station_realtime", "--from", "2025-11-30",
+                  "--to", "2025-12-31", "--csv-dir", str(tmp_path),
+                  "--csv-batch-by-month"])
 
         assert len(calls) == 1
 

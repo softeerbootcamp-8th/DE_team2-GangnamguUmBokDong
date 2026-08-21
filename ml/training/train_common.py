@@ -272,6 +272,12 @@ def train_target(
             몫만 남기게 확장하면 된다, 구조상 막혀있지 않음).
         ValueError: train/valid/test 구간에 날짜 또는 데이터가 하나도 없을 때
     """
+    started_at = time.monotonic()
+    _append_progress_log(
+        f"[{model_name}] 학습 시작 — window={config.TRAIN_WINDOW_START.isoformat()}~"
+        f"{config.TRAIN_WINDOW_END.isoformat()}, divisor={config.TRAIN_DAY_DIVISOR}, "
+        f"max_horizon={config.MAX_TRAIN_HORIZON}, peak_rss={_peak_rss_mb():.0f}MB"
+    )
     if config.LGB_NUM_MACHINES > 1:
         raise NotImplementedError(
             "lazy_train_dataset(날짜 파티션 단위 지연 로딩)은 아직 분산 학습"
@@ -348,6 +354,7 @@ def train_target(
                 "feature_columns": ",".join(feature_columns),
                 "lgb_num_boost_round": config.LGB_NUM_BOOST_ROUND,
                 "lgb_early_stopping_rounds": config.LGB_EARLY_STOPPING_ROUNDS,
+                "lgb_defer_valid_dataset": config.LGB_DEFER_VALID_DATASET,
                 **lgb_params,
             })
             s3_io.write_json(station_categories_path(model_name, models_prefix), station_categories)
@@ -362,55 +369,61 @@ def train_target(
             table_path, train_dates, feature_columns, station_dtype, filters, target_col, exposure_col, cache,
             dataset_params=lgb_params,
             on_chunk_loaded=_chunk_progress(model_name, "train"),
+            on_prepass_complete=_progress_on_complete(f"{model_name}-train-label-prepass"),
         )
-        valid_set, y_valid, exposure_valid = lazy_train_dataset.build_lazy_dataset(
-            table_path, valid_dates, feature_columns, station_dtype, filters, target_col, exposure_col, cache,
-            dataset_params=lgb_params,
-            reference=train_set, on_chunk_loaded=_chunk_progress(model_name, "valid"),
-        )
-        _append_progress_log(
-            f"[{model_name}] train/valid Dataset 구성 완료 — train {len(y_train):,}행, "
-            f"valid {len(y_valid):,}행, peak_rss={_peak_rss_mb():.0f}MB"
-        )
-        print(f"[{model_name}] train={len(y_train):,} valid={len(y_valid):,}")
-        # label/init_score는 construct된 Dataset의 native buffer에 이미 복사됐다.
-        # conformal에 필요한 y_valid만 남기고 Python-side train label/exposure 배열은
-        # 즉시 내려 peak RSS를 줄인다.
-        del y_train, exposure_train, exposure_valid
+        train_row_count = len(y_train)
+        # train label/exposure는 native Dataset에 이미 복사됐고 이후 Python 계산에
+        # 쓰지 않는다. valid Dataset을 만들기 전에 memmap 참조를 내려 두 split의
+        # prepass 배열이 겹치는 순간 peak를 막는다.
+        del y_train, exposure_train
+        gc.collect()
+        if config.LGB_DEFER_VALID_DATASET:
+            valid_set = None
+            valid_row_count = None
+            _append_progress_log(
+                f"[{model_name}] train Dataset 구성 완료 — train {train_row_count:,}행, "
+                "valid native Dataset은 저메모리 모드로 지연, "
+                f"peak_rss={_peak_rss_mb():.0f}MB"
+            )
+            print(f"[{model_name}] train={train_row_count:,} valid=streaming-after-train")
+        else:
+            valid_set, y_valid, exposure_valid = lazy_train_dataset.build_lazy_dataset(
+                table_path, valid_dates, feature_columns, station_dtype, filters, target_col, exposure_col, cache,
+                dataset_params=lgb_params,
+                reference=train_set, on_chunk_loaded=_chunk_progress(model_name, "valid"),
+                on_prepass_complete=_progress_on_complete(f"{model_name}-valid-label-prepass"),
+            )
+            valid_row_count = len(y_valid)
+            _append_progress_log(
+                f"[{model_name}] train/valid Dataset 구성 완료 — train {train_row_count:,}행, "
+                f"valid {valid_row_count:,}행, peak_rss={_peak_rss_mb():.0f}MB"
+            )
+            print(f"[{model_name}] train={train_row_count:,} valid={valid_row_count:,}")
+            # label/init_score는 construct된 Dataset의 native buffer에 이미 복사됐다.
+            # 평가는 학습 뒤 streaming predict가 반환하는 y를 사용하므로 Python-side
+            # valid 배열도 즉시 내려 peak RSS를 줄인다.
+            del y_valid, exposure_valid
 
         poisson_params = {
             **lgb_params, **_distributed_params(), "objective": "poisson", "metric": "poisson",
         }
+        poisson_callbacks = [lgb.log_evaluation(0)]
+        if valid_set is not None:
+            poisson_callbacks.insert(
+                0,
+                lgb.early_stopping(config.LGB_EARLY_STOPPING_ROUNDS, verbose=False),
+            )
         booster = lgb.train(
             poisson_params,
             train_set,
             num_boost_round=config.LGB_NUM_BOOST_ROUND,
-            valid_sets=[valid_set],
-            callbacks=[lgb.early_stopping(config.LGB_EARLY_STOPPING_ROUNDS, verbose=False), lgb.log_evaluation(0)],
+            valid_sets=None if valid_set is None else [valid_set],
+            callbacks=poisson_callbacks,
         )
         if is_primary:
             model_io.stage_and_upload_booster(
                 booster, model_key(model_name, "poisson", models_prefix), log_to_mlflow=True
             )
-
-        # test는 lgb.Dataset으로 안 쓴다(학습 없이 predict()/지표 계산에만 쓰임) — 날짜별로
-        # 그 청크만 읽어 즉시 predict한 뒤 큰 feature 행렬은 버리고 작은 결과만 이어붙인다
-        # (lazy_train_dataset.predict_over_dates(), X_test라는 실체를 아예 안 만듦).
-        test_poisson = lazy_train_dataset.predict_over_dates(
-            table_path, test_dates, feature_columns, station_dtype, filters, target_col, exposure_col,
-            {"poisson": booster}, on_chunk_loaded=_chunk_progress(model_name, "test-poisson"),
-        )
-        y_test = test_poisson["y"]
-        exposure_test = test_poisson["exposure"] if exposure_col else np.ones(len(y_test))
-        mu_test = exposure_test * test_poisson["poisson"]
-        metrics["poisson_deviance_test"] = _poisson_deviance(y_test, mu_test)
-        metrics["rmse_test"] = float(np.sqrt(np.mean((y_test - mu_test) ** 2)))
-        metrics["best_iteration"] = booster.best_iteration
-        print(
-            f"  [poisson] best_iter={booster.best_iteration} "
-            f"test_deviance={metrics['poisson_deviance_test']:.4f} test_rmse={metrics['rmse_test']:.4f}"
-        )
-        del test_poisson, exposure_test, mu_test
 
         # 2) Quantile P10/P50/P90 (exposure offset 미적용 — quantile loss는 offset 해석이 표준적이지 않음)
         #
@@ -438,32 +451,41 @@ def train_target(
                 table_path, train_dates, feature_columns, station_dtype, filters, target_col, None, cache,
                 dataset_params=lgb_params,
                 on_chunk_loaded=_chunk_progress(model_name, "train-quantile"),
+                on_prepass_complete=_progress_on_complete(f"{model_name}-train-quantile-label-prepass"),
             )
-            valid_set_q, _, _ = lazy_train_dataset.build_lazy_dataset(
-                table_path, valid_dates, feature_columns, station_dtype, filters, target_col, None, cache,
-                dataset_params=lgb_params,
-                reference=train_set_q, on_chunk_loaded=_chunk_progress(model_name, "valid-quantile"),
-            )
+            if config.LGB_DEFER_VALID_DATASET:
+                valid_set_q = None
+            else:
+                valid_set_q, _, _ = lazy_train_dataset.build_lazy_dataset(
+                    table_path, valid_dates, feature_columns, station_dtype, filters, target_col, None, cache,
+                    dataset_params=lgb_params,
+                    reference=train_set_q, on_chunk_loaded=_chunk_progress(model_name, "valid-quantile"),
+                    on_prepass_complete=_progress_on_complete(f"{model_name}-valid-quantile-label-prepass"),
+                )
 
         quantile_boosters: dict[float, lgb.Booster] = {}
         for alpha in config.QUANTILE_ALPHAS:
             q_params = {**lgb_params, **_distributed_params(), "objective": "quantile", "alpha": alpha}
+            q_callbacks = [lgb.log_evaluation(0)]
+            if valid_set_q is not None:
+                q_callbacks.insert(
+                    0,
+                    lgb.early_stopping(config.LGB_EARLY_STOPPING_ROUNDS, verbose=False),
+                )
             q_booster = lgb.train(
                 q_params,
                 train_set_q,
                 num_boost_round=config.LGB_NUM_BOOST_ROUND,
-                valid_sets=[valid_set_q],
-                callbacks=[
-                    lgb.early_stopping(config.LGB_EARLY_STOPPING_ROUNDS, verbose=False),
-                    lgb.log_evaluation(0),
-                ],
+                valid_sets=None if valid_set_q is None else [valid_set_q],
+                callbacks=q_callbacks,
             )
             if is_primary:
                 model_io.stage_and_upload_booster(
                     q_booster, model_key(model_name, f"q{int(alpha * 100)}", models_prefix), log_to_mlflow=True
                 )
             quantile_boosters[alpha] = q_booster
-            print(f"  [q{int(alpha * 100)}] best_iter={q_booster.best_iteration}")
+            q_iteration = q_booster.best_iteration or q_booster.current_iteration()
+            print(f"  [q{int(alpha * 100)}] best_iter={q_iteration}")
 
         # 학습이 끝난 binned Dataset은 아래 streaming predict/conformal 계산에 필요
         # 없다. 반납 모델은 poisson Dataset 별칭이므로 원래 이름도 함께 제거한다.
@@ -473,17 +495,40 @@ def train_target(
         cache.clear()
         gc.collect()
 
-        # valid/test 청크를 quantile booster 3개 전부로 한 번에 predict한다(alpha별로
-        # 따로 부르면 같은 날짜를 3번씩 다시 읽게 되므로 I/O가 3배 든다).
+        # 학습 Dataset을 모두 해제한 뒤 valid/test 청크를 booster 4개로 한 번에
+        # predict한다. 전체 valid를 native Dataset으로 만들지 않는 저메모리 모드도
+        # 여기서 같은 평가/conformal 행을 전부 사용한다. 기본 모드 역시 poisson과
+        # quantile을 따로 읽지 않아 I/O와 중간 배열 중복을 줄인다.
         q_named = {f"q{int(alpha * 100)}": b for alpha, b in quantile_boosters.items()}
+        prediction_models = {"poisson": booster, **q_named}
         valid_q = lazy_train_dataset.predict_over_dates(
-            table_path, valid_dates, feature_columns, station_dtype, filters, target_col, exposure_col, q_named,
-            on_chunk_loaded=_chunk_progress(model_name, "valid-quantile-predict"),
+            table_path, valid_dates, feature_columns, station_dtype, filters, target_col, exposure_col,
+            prediction_models, on_chunk_loaded=_chunk_progress(model_name, "valid-predict"),
         )
         test_q = lazy_train_dataset.predict_over_dates(
-            table_path, test_dates, feature_columns, station_dtype, filters, target_col, exposure_col, q_named,
-            on_chunk_loaded=_chunk_progress(model_name, "test-quantile-predict"),
+            table_path, test_dates, feature_columns, station_dtype, filters, target_col, exposure_col,
+            prediction_models, on_chunk_loaded=_chunk_progress(model_name, "test-predict"),
         )
+        y_valid = valid_q["y"]
+        y_test = test_q["y"]
+        observed_valid_row_count = len(y_valid)
+        if valid_row_count is not None and valid_row_count != observed_valid_row_count:
+            raise RuntimeError(
+                "native/streaming valid 행 수가 다릅니다: "
+                f"native={valid_row_count}, streaming={observed_valid_row_count}"
+            )
+        valid_row_count = observed_valid_row_count
+        exposure_test = test_q["exposure"] if exposure_col else np.ones(len(y_test))
+        mu_test = exposure_test * test_q["poisson"]
+        metrics["poisson_deviance_test"] = _poisson_deviance(y_test, mu_test)
+        metrics["rmse_test"] = float(np.sqrt(np.mean((y_test - mu_test) ** 2)))
+        metrics["best_iteration"] = booster.best_iteration or booster.current_iteration()
+        print(
+            f"  [poisson] best_iter={metrics['best_iteration']} "
+            f"test_deviance={metrics['poisson_deviance_test']:.4f} "
+            f"test_rmse={metrics['rmse_test']:.4f}"
+        )
+        del exposure_test, mu_test
         quantile_preds_valid = {alpha: valid_q[f"q{int(alpha * 100)}"] for alpha in config.QUANTILE_ALPHAS}
         quantile_preds_test = {alpha: test_q[f"q{int(alpha * 100)}"] for alpha in config.QUANTILE_ALPHAS}
         for alpha in config.QUANTILE_ALPHAS:
@@ -495,9 +540,8 @@ def train_target(
         metrics["p10_p90_coverage_raw_test"] = raw_coverage
         print(f"  [calibration] 보정 전 P10~P90 커버리지 = {raw_coverage:.3f} (이론값 {config.CONFORMAL_TARGET_COVERAGE})")
 
-        # split-conformal 보정: 검증셋(build_lazy_dataset이 이미 구해둔 y_valid — 위
-        # valid_q["y"]와 같은 날짜/필터라 동일한 값, 다시 안 뽑음)에서 목표 커버리지에
-        # 맞는 correction을 구해 저장, 테스트셋에 적용해 재평가.
+        # split-conformal 보정은 위 streaming valid 전체 라벨로 계산한다. 저메모리
+        # 모드도 평가 행을 샘플링하지 않으며 native Dataset 상주만 피한다.
         correction = _conformal_correction(
             y_valid, quantile_preds_valid[0.1], quantile_preds_valid[0.9], config.CONFORMAL_TARGET_COVERAGE
         )
@@ -511,6 +555,13 @@ def train_target(
         calibrated_coverage = float(np.mean((y_test >= p10_calibrated) & (y_test <= p90_calibrated)))
         metrics["conformal_correction"] = correction
         metrics["p10_p90_coverage_calibrated_test"] = calibrated_coverage
+        metrics["train_row_count"] = train_row_count
+        metrics["valid_row_count"] = valid_row_count
+        metrics["test_row_count"] = len(y_test)
+        metrics["requested_num_boost_round"] = config.LGB_NUM_BOOST_ROUND
+        metrics["early_stopping_used"] = not config.LGB_DEFER_VALID_DATASET
+        metrics["training_wall_time_seconds"] = time.monotonic() - started_at
+        metrics["peak_rss_mb"] = _peak_rss_mb()
         print(f"  [calibration] correction={correction:.4f} 적용 후 커버리지 = {calibrated_coverage:.3f}")
 
         # monitor_performance.py가 "이 모델이 학습/검수 시점에 어느 정도였는지"를 알아야
@@ -532,7 +583,10 @@ def train_target(
             # metrics의 "model_name"은 문자열이라 mlflow.log_metrics(숫자만 허용)에서 뺀다.
             mlflow.log_metrics({k: v for k, v in metrics.items() if isinstance(v, int | float)})
 
-    _append_progress_log(f"[{model_name}] 학습 완료, peak_rss={_peak_rss_mb():.0f}MB")
+    _append_progress_log(
+        f"[{model_name}] 학습 완료, elapsed={time.monotonic() - started_at:.1f}s, "
+        f"peak_rss={_peak_rss_mb():.0f}MB"
+    )
     return metrics
 
 

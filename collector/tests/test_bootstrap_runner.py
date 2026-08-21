@@ -168,6 +168,47 @@ class TestLoadDate:
         assert result.status == "empty"
         assert read_parquet("archive/t_source/dt=2026-06-01.parquet", as_pandas=False) is None
 
+    def test_materialized_empty_has_schema_and_manifest(self):
+        """알려진 원천 공백은 누락과 구분되는 0행 Archive로 보존한다."""
+        scfg = _source_config()
+
+        result = load_date(
+            scfg,
+            _bootstrap_config(),
+            DAY,
+            [],
+            materialize_empty=True,
+        )
+
+        table = read_parquet(
+            "archive/t_source/dt=2026-06-01.parquet", as_pandas=False
+        )
+        manifest = read_archive_manifest("t_source", DAY)
+        assert result.status == "loaded"
+        assert result.rows == 0
+        assert table.num_rows == 0
+        assert table.schema == archive_schema(scfg)
+        assert manifest["materialized_empty"] is True
+        assert manifest["rows"] == 0
+
+    def test_materializes_all_rows_dropped_when_requested(self):
+        """검증으로 전량 폐기된 날짜도 dropped 근거와 빈 스키마를 함께 남긴다."""
+        rows = [{"BIKE_ID": "", "RENT_DT": "2026-06-01 09:05:00"}]
+
+        result = load_date(
+            _source_config(),
+            _bootstrap_config(),
+            DAY,
+            rows,
+            materialize_empty=True,
+        )
+
+        manifest = read_archive_manifest("t_source", DAY)
+        assert result.status == "loaded"
+        assert result.dropped == 1
+        assert manifest["dropped"] == 1
+        assert manifest["column_issues"]["BIKE_ID"]["missing"] == 1
+
     def test_out_of_range_window_is_dropped_and_counted(self):
         """API가 경계 시각에 다른 날짜의 관측을 섞어 줄 수 있다 — target day가 아닌
         시간대 그룹은 archive에 넣지 않고 out_of_range로 집계한다."""
