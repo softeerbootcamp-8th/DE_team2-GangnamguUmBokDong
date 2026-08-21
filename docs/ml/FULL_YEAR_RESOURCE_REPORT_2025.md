@@ -112,26 +112,27 @@ master를 받아 canonical crosswalk를 만들고 pair release를 원자 게시�
 
 ### 상시 EC2
 
-허용된 `t4g.large`는 2 vCPU/8GiB의 Arm Graviton2 burstable 인스턴스다. 추론
-단독 peak 4.10GiB와 rental bootstrap peak 2.85GiB를 단순 합산해도 6.95GiB라
-OS, Airflow scheduler/worker, Docker, collector 동시 실행 여유가 거의 없다.
-따라서 다음 중 하나가 필요하다.
+허용된 `t4g.large`는 2 vCPU/8GiB의 Arm Graviton2 burstable 인스턴스다. 2026-08-21
+x86_64 로컬에서 Airflow scheduler/webserver/dag-processor, MLflow, API, Web과
+로컬 RDS/S3 대역을 모두 띄운 상태로 2,681개 대여소×12 horizon 추론을 실제로
+겹쳤다. 13.08초 동안 추론 process-tree peak는 3.87GiB, system used peak는
+12.33GiB였고 swap은 사용하지 않았다.
 
-1. 우선 `t4g.large` 한 대에서 collector와 inference가 겹치지 않도록 제한하고,
-   backfill/compaction 포함 동시 soak test를 수행한다.
-2. 동시 실행이 필수라면 `t4g.xlarge` 16GiB 또는 상시 EC2 두 대를 요청한다.
+실행 직전 EC2 배치 대상 컨테이너만의 working set도 약 4.31GiB였다. 여기에 추론
+3.87GiB를 더하면 8.18GiB로, OS와 Docker 여유를 넣기 전부터 `t4g.large`의 8GiB를
+넘는다. 로컬 Postgres/MinIO는 이 4.31GiB에서 제외했으므로 운영에서 RDS/S3를
+외부화해도 결론은 바뀌지 않는다. 따라서 **Airflow·MLflow·API·Web·collector·추론을
+한 대에 상시 배치하는 초기안에는 `t4g.large`를 요청하지 않는다.** `t4g.xlarge`
+16GiB 한 대 또는 역할을 나눈 `t4g.large` 두 대가 필요하다. 8GiB 한 대만 허용되면
+MLflow/Web을 상시 프로세스에서 제외하고 collector·compaction·inference가 겹치지
+않도록 직렬화해야 하며, 이는 초기안과 다른 축소 운영안이다.
 
-로컬 실측은 x86_64였고 t4g는 arm64이므로 PR CI에 네이티브
-`ubuntu-24.04-arm` gate를 추가했다. Airflow/collector/inference/training을 포함한
-uv lock 해석과 model runtime 테스트, Airflow/MLflow image의 `linux/arm64` build를
-통과해야 배포할 수 있다. 다만 CI는 t4g의 8GiB/CPU credit 조건을 재현하지 않으므로
-실제 인스턴스 soak는 별도로 남는다. T4g의 CPU credit 특성상 장시간 compaction을
-상시 서버에서 돌리는 것도 분리하는 편이 안전하다.
-
-운영 t4g에서는 amd64-only인 로컬 `postgis/postgis:16-3.5` 컨테이너를 실행하지
-않고 할당된 `db.t4g.medium` RDS에 접속한다. ECR에는 CI가 검증한
-`linux/arm64` Airflow/MLflow 이미지를 게시하며, 로컬 Compose 전체를 그대로 EC2에
-복제하는 방식은 지원하지 않는다.
+위 값은 용량 결정을 위한 x86_64 로컬 실측이다. 아키텍처 호환성은 네이티브
+`ubuntu-24.04-arm` CI에서 uv lock, Airflow/collector/inference/training 테스트,
+Airflow/MLflow `linux/arm64` image build까지 성공했다. 실제 t4g의 CPU credit과
+Arm64 실행 시간은 배정 후 확인할 항목이지, 8GiB 초과 판정을 뒤집는 근거로 쓰지
+않는다. 운영 t4g는 amd64-only 로컬 PostGIS container 대신 할당된
+`db.t4g.medium` RDS에 접속한다.
 
 AWS 공식 사양:
 
@@ -147,6 +148,12 @@ AWS 공식 사양:
 29.28GiB와 swap을 소진했고, 관측 peak가 최종 peak의 하한이라는 점이다.
 최소 100GiB gp3 scratch를 붙이고 rental/return을 순차 실행한다. 첫 실행에서도
 동일한 3GiB guard를 유지하며 64GiB를 넘으면 그 manifest로 다음 증설을 판단한다.
+
+여기서 100GiB gp3는 feature/label 임시 파일용 scratch이며 swap 권고가 아니다.
+100GiB swap을 만들고 memory guard를 해제하면 12개월 학습이 더 진행될 가능성은
+있지만, 5.69억 행 LightGBM의 무작위 접근이 disk paging으로 바뀌어 실행 시간이
+수일 이상으로 늘거나 WSL/Windows가 응답 불능이 될 수 있고 완주도 보장하지 않는다.
+따라서 swap 증설 결과는 운영 학습 성공이나 EC2 RAM 산정 근거로 인정하지 않는다.
 
 `r6g.2xlarge`가 대상 리전에 없거나 승인 정책상 최신 세대만 가능하면 같은 Arm64
 계약의 `r7g.2xlarge`(8 vCPU/64GiB)를 대안으로 요청한다. x86 `r6i.2xlarge`는
