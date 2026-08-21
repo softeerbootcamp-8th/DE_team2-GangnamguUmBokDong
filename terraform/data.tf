@@ -168,6 +168,13 @@ locals {
     POSTGRES_AIRFLOW_DB=airflow
     POSTGRES_MLFLOW_DB=mlflow
 
+    # ops/postgres/bootstrap_rds.sh와 check_gold_schema.sh가 psql 표준 변수로 읽는다.
+    # 두 스크립트는 EC2에서 도는데 그곳엔 terraform이 없으므로 여기서 넘겨준다.
+    PGHOST=${aws_db_instance.main.address}
+    PGPORT=${aws_db_instance.main.port}
+    PGPASSWORD=${random_password.db.result}
+    PGSSLMODE=require
+
     DATABASE_URL=postgresql://${aws_db_instance.main.username}:${random_password.db.result}@${local.db_url_base}/app?sslmode=require
     AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://${aws_db_instance.main.username}:${random_password.db.result}@${local.db_url_base}/airflow?sslmode=require
     MLFLOW_BACKEND_STORE_URI=postgresql://${aws_db_instance.main.username}:${random_password.db.result}@${local.db_url_base}/mlflow

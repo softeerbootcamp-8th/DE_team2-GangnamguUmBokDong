@@ -39,6 +39,9 @@ airflow/webserver_config.py
 airflow/standalone_admin_password.txt
 
 
+# EMR 패키징 임시 디렉터리 (make emr-package)
+.emr-stage/
+
 # Terraform
 # .terraform.lock.hcl은 커밋한다 — provider 버전을 팀 전체가 고정해야 한다.
 terraform/.terraform/
