@@ -783,6 +783,11 @@ body {
   background: var(--diverging-red);
 }
 
+.route-stop-map-marker .selected {
+  border-color: var(--brand-green);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--brand-green) 35%, transparent), 0 2px 7px rgb(0 0 0 / 30%);
+}
+
 .route-center-map-marker {
   border: 0;
   background: transparent;
