@@ -65,8 +65,10 @@ from ml_core.serving_release import (
     PinnedServingRelease,
     ServingReleasePointerStore,
     VerifiedStationProfile,
-    load_current_serving_release,
     parse_effective_serving_contract,
+)
+from ml_core.serving_release import (
+    load_current_serving_release_for_inference as load_current_serving_release,
 )
 
 from . import config
@@ -232,7 +234,10 @@ def run_and_publish_inference(
     if expected_sta_ids.ids:
         kst_logical = pd.Timestamp(logical).tz_convert("Asia/Seoul")
         with (
-            authority_inference_run(pinned.preflight.station_profile),
+            authority_inference_run(
+                pinned.preflight.station_profile,
+                logical_dttm=logical,
+            ),
             use_pinned_scoring_models(pinned_models),
             s3_io.capture_object_reads() as read_capture,
         ):

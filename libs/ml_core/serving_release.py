@@ -550,6 +550,66 @@ class PinnedServingRelease:
 
 
 @dataclass(frozen=True, slots=True)
+class PinnedServingPlanRelease:
+    """Serving plan에 필요한 pointer와 model manifest만 고정한 경량 snapshot이다."""
+
+    pointer: ServingReleasePointer
+    pointer_payload: bytes
+    manifest: ServingReleaseManifest
+    manifest_payload: bytes
+    rental_model: ModelSnapshotManifest
+    rental_model_payload: bytes
+    return_model: ModelSnapshotManifest
+    return_model_payload: bytes
+
+    def __post_init__(self) -> None:
+        """Retained bytes와 상위 manifest reference가 같은 snapshot인지 검증한다."""
+        if (
+            type(self.pointer) is not ServingReleasePointer
+            or type(self.pointer_payload) is not bytes
+            or parse_serving_release_pointer(self.pointer_payload) != self.pointer
+        ):
+            raise ServingReleasePreflightError(
+                "plan용 pinned pointer payload와 typed pointer가 다릅니다."
+            )
+        if (
+            type(self.manifest) is not ServingReleaseManifest
+            or type(self.manifest_payload) is not bytes
+            or parse_serving_release_manifest(self.manifest_payload) != self.manifest
+            or self.pointer.release_manifest_byte_sha256 != self.manifest.sha256
+        ):
+            raise ServingReleasePreflightError(
+                "plan용 pinned release manifest가 pointer와 다릅니다."
+            )
+        pairs = (
+            (
+                self.manifest.rental_model_manifest,
+                self.rental_model,
+                self.rental_model_payload,
+            ),
+            (
+                self.manifest.return_model_manifest,
+                self.return_model,
+                self.return_model_payload,
+            ),
+        )
+        for reference, model, payload in pairs:
+            if (
+                type(model) is not ModelSnapshotManifest
+                or type(payload) is not bytes
+                or parse_model_snapshot_manifest(payload) != model
+                or model.sha256 != reference.byte_sha256
+                or model.model_kind is not reference.model_kind
+                or model.model_version != reference.model_version
+                or model.effective_contract_version
+                != reference.effective_contract_version
+            ):
+                raise ServingReleasePreflightError(
+                    "plan용 pinned model manifest가 release reference와 다릅니다."
+                )
+
+
+@dataclass(frozen=True, slots=True)
 class ExplicitImmutablePayload:
     """Caller가 출처를 명시한 immutable source bytes와 identity다."""
 
@@ -1346,8 +1406,17 @@ def parse_serving_release_pointer(payload: bytes) -> ServingReleasePointer:
 def preflight_serving_release(
     manifest: ServingReleaseManifest,
     object_store: ImmutableObjectStore,
+    *,
+    trust_published_station_profile: bool = False,
 ) -> ServingReleasePreflight:
-    """Release와 model manifests가 참조하는 모든 bytes/SHA와 profile 결합을 검증한다."""
+    """Release와 model manifests가 참조하는 모든 bytes/SHA와 profile 결합을 검증한다.
+
+    게시 경계는 station profile 전체를 검증한다. 이미 이 경계를 통과해 immutable
+    release에 고정된 profile을 매 5분 추론에서 다시 여는 경우에는 exact SHA와
+    Parquet footer만 확인해 수천만 행 materialization을 피할 수 있다.
+    """
+    if type(trust_published_station_profile) is not bool:
+        raise TypeError("trust_published_station_profile은 bool이어야 합니다.")
     validate_serving_release_manifest(manifest)
 
     contract_payload = object_store.read_bytes(
@@ -1404,12 +1473,31 @@ def preflight_serving_release(
         raise ServingReleasePreflightError(
             "station profile 결합에 필요한 model category/crosswalk가 잘못됐습니다."
         ) from exc
-    station_profile = validate_station_profile_payload(
-        station_profile_payload,
-        expected_grid_tick_minutes=contract["GRID_TICK_MINUTES"],
-        station_crosswalk=shared_crosswalk,
-        required_station_nos=tuple(sorted({*rental_categories, *return_categories})),
+    required_station_nos = tuple(
+        sorted({*rental_categories, *return_categories})
     )
+    if trust_published_station_profile:
+        try:
+            row_count = pq.ParquetFile(io.BytesIO(station_profile_payload)).metadata.num_rows
+        except (pa.ArrowInvalid, pa.ArrowTypeError, OSError) as exc:
+            raise ServingReleasePreflightError(
+                "station profile payload의 Parquet footer를 읽을 수 없습니다."
+            ) from exc
+        grid_tick = contract["GRID_TICK_MINUTES"]
+        station_profile = VerifiedStationProfile(
+            payload=station_profile_payload,
+            row_count=row_count,
+            station_nos=required_station_nos,
+            minute_values=tuple(range(0, 1440, grid_tick)),
+            grid_tick_minutes=grid_tick,
+        )
+    else:
+        station_profile = validate_station_profile_payload(
+            station_profile_payload,
+            expected_grid_tick_minutes=contract["GRID_TICK_MINUTES"],
+            station_crosswalk=shared_crosswalk,
+            required_station_nos=required_station_nos,
+        )
     return ServingReleasePreflight(
         rental_snapshot=rental,
         return_snapshot=returned,
@@ -1551,12 +1639,104 @@ def load_current_serving_release(
     )
 
 
-def _preflight_model_manifest(
+def load_current_serving_release_for_inference(
+    *,
+    object_store: ImmutableObjectStore | None = None,
+    pointer_store: ServingReleasePointerStore | None = None,
+    pointer_key: str | None = None,
+) -> PinnedServingRelease:
+    """게시 시 검증된 profile을 재검증하지 않고 inference snapshot을 고정한다.
+
+    Pointer, release, model artifact와 station profile은 기존 loader와 동일하게 exact
+    SHA로 읽는다. 차이는 station profile의 수천만 행 validation을 반복하지 않고
+    Parquet footer만 확인한다는 점이다. 최초 release 게시에는 이 경로를 사용하지
+    않으며 항상 ``publish_serving_release``의 전체 preflight를 통과해야 한다.
+    """
+    immutable = object_store if object_store is not None else S3ImmutableObjectStore()
+    mutable = (
+        pointer_store if pointer_store is not None else S3ServingReleasePointerStore()
+    )
+    resolved_pointer_key = pointer_key or serving_release_pointer_key()
+    pointer_read = mutable.read(resolved_pointer_key)
+    if pointer_read.payload is None:
+        raise FileNotFoundError(
+            f"serving release pointer가 없습니다: {resolved_pointer_key}"
+        )
+    pointer = parse_serving_release_pointer(pointer_read.payload)
+    manifest_payload = immutable.read_bytes(
+        pointer.release_manifest_uri,
+        pointer.release_manifest_byte_sha256,
+        require_canonical_json=True,
+    )
+    manifest = parse_serving_release_manifest(manifest_payload)
+    preflight = preflight_serving_release(
+        manifest,
+        immutable,
+        trust_published_station_profile=True,
+    )
+    return PinnedServingRelease(
+        pointer=pointer,
+        pointer_payload=pointer_read.payload,
+        manifest=manifest,
+        manifest_payload=manifest_payload,
+        preflight=preflight,
+    )
+
+
+def load_current_serving_release_for_plan(
+    *,
+    object_store: ImmutableObjectStore | None = None,
+    pointer_store: ServingReleasePointerStore | None = None,
+    pointer_key: str | None = None,
+) -> PinnedServingPlanRelease:
+    """Plan 준비에 필요한 pointer/release/model manifest만 exact-read해 고정한다.
+
+    Station profile 전체 검증과 booster artifact 로드는 release 게시 및 실제 inference
+    loader의 책임으로 남긴다. Serving plan은 두 model의 content-addressed support
+    reference만 사용하므로, 매 5분 1천만 행대 Parquet을 materialize하지 않는다.
+    """
+    immutable = object_store if object_store is not None else S3ImmutableObjectStore()
+    mutable = (
+        pointer_store if pointer_store is not None else S3ServingReleasePointerStore()
+    )
+    resolved_pointer_key = pointer_key or serving_release_pointer_key()
+    pointer_read = mutable.read(resolved_pointer_key)
+    if pointer_read.payload is None:
+        raise FileNotFoundError(
+            f"serving release pointer가 없습니다: {resolved_pointer_key}"
+        )
+    pointer = parse_serving_release_pointer(pointer_read.payload)
+    manifest_payload = immutable.read_bytes(
+        pointer.release_manifest_uri,
+        pointer.release_manifest_byte_sha256,
+        require_canonical_json=True,
+    )
+    manifest = parse_serving_release_manifest(manifest_payload)
+    rental_payload, rental = _read_model_manifest(
+        manifest.rental_model_manifest,
+        immutable,
+    )
+    return_payload, returned = _read_model_manifest(
+        manifest.return_model_manifest,
+        immutable,
+    )
+    return PinnedServingPlanRelease(
+        pointer=pointer,
+        pointer_payload=pointer_read.payload,
+        manifest=manifest,
+        manifest_payload=manifest_payload,
+        rental_model=rental,
+        rental_model_payload=rental_payload,
+        return_model=returned,
+        return_model_payload=return_payload,
+    )
+
+
+def _read_model_manifest(
     reference: ModelManifestRef,
-    effective_contract_payload: bytes,
     object_store: ImmutableObjectStore,
-) -> VerifiedModelSnapshot:
-    """Model manifest와 그 모든 transitive artifact를 exact bytes로 검증한다."""
+) -> tuple[bytes, ModelSnapshotManifest]:
+    """Model manifest bytes를 SHA 검증하고 release reference와 결합한다."""
     payload = object_store.read_bytes(
         reference.uri,
         reference.byte_sha256,
@@ -1572,6 +1752,16 @@ def _preflight_model_manifest(
         raise ServingReleasePreflightError(
             f"{reference.model_kind.value} model ref가 실제 manifest metadata와 다릅니다."
         )
+    return payload, manifest
+
+
+def _preflight_model_manifest(
+    reference: ModelManifestRef,
+    effective_contract_payload: bytes,
+    object_store: ImmutableObjectStore,
+) -> VerifiedModelSnapshot:
+    """Model manifest와 그 모든 transitive artifact를 exact bytes로 검증한다."""
+    payload, manifest = _read_model_manifest(reference, object_store)
 
     artifact_payloads: dict[str, bytes] = {}
     verified_artifacts: list[VerifiedModelArtifact] = []

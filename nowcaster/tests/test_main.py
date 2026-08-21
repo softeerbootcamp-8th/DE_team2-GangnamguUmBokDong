@@ -133,6 +133,64 @@ class TestRunBackfillArchive:
         assert second.column("SPOP").to_pylist() == [222.0]
 
 
+class TestBootstrapLookback:
+    def test_exact_four_weeks_for_single_weekday_target(self):
+        target = date(2026, 8, 20)  # 목요일
+
+        assert main.required_lookback_dates(target, horizon_days=0) == [
+            date(2026, 7, 23),
+            date(2026, 7, 30),
+            date(2026, 8, 6),
+            date(2026, 8, 13),
+        ]
+
+    def test_writes_only_required_dates_and_marks_actual(self, tmp_path):
+        target = date(2026, 8, 20)
+        required = main.required_lookback_dates(target, horizon_days=0)
+        unrelated = date(2026, 8, 12)
+        csv_path = tmp_path / "250_LOCAL_RESD_lookback.csv"
+        rows = [
+            _portal_row(f"{day:%Y%m%d}", "C1", str(index * 100.0))
+            for index, day in enumerate(required, start=1)
+        ]
+        rows.append(_portal_row(f"{unrelated:%Y%m%d}", "C1", "999.0"))
+        csv_path.write_bytes(
+            (_PORTAL_HEADER + "\n" + "\n".join(rows) + "\n").encode("euc-kr")
+        )
+
+        result = main.run_bootstrap_lookback(
+            str(tmp_path), target, horizon_days=0
+        )
+
+        assert result == 0
+        for day in required:
+            archived = storage.read_archive(day)
+            assert archived is not None
+            assert archived.column("is_estimated").to_pylist() == [False]
+        assert storage.read_archive(unrelated) is None
+
+    def test_returns_failure_when_a_required_date_is_missing(self, tmp_path):
+        target = date(2026, 8, 20)
+        required = main.required_lookback_dates(target, horizon_days=0)
+        csv_path = tmp_path / "250_LOCAL_RESD_incomplete.csv"
+        csv_path.write_bytes(
+            (
+                _PORTAL_HEADER
+                + "\n"
+                + "\n".join(
+                    _portal_row(f"{day:%Y%m%d}", "C1", "100.0")
+                    for day in required[:-1]
+                )
+                + "\n"
+            ).encode("euc-kr")
+        )
+
+        assert (
+            main.run_bootstrap_lookback(str(tmp_path), target, horizon_days=0)
+            == 1
+        )
+
+
 class TestCliDispatch:
     def test_estimate_command_calls_run_estimate_with_parsed_date(self, monkeypatch):
         captured = {}
@@ -151,3 +209,36 @@ class TestCliDispatch:
         main.main(["backfill-archive", "--csv-dir", "/tmp/some-dir"])
 
         assert captured["csv_dir"] == "/tmp/some-dir"
+
+    def test_bootstrap_lookback_dispatches_target_and_options(self, monkeypatch):
+        captured = {}
+
+        def fake_run(csv_dir, today, *, horizon_days, force):
+            captured.update(
+                csv_dir=csv_dir,
+                today=today,
+                horizon_days=horizon_days,
+                force=force,
+            )
+            return 0
+
+        monkeypatch.setattr(main, "run_bootstrap_lookback", fake_run)
+
+        assert main.main(
+            [
+                "bootstrap-lookback",
+                "--csv-dir",
+                "/data/population",
+                "--target-date",
+                "2026-08-20",
+                "--horizon-days",
+                "1",
+                "--force",
+            ]
+        ) == 0
+        assert captured == {
+            "csv_dir": "/data/population",
+            "today": date(2026, 8, 20),
+            "horizon_days": 1,
+            "force": True,
+        }

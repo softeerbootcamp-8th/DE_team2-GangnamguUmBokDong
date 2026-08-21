@@ -32,6 +32,8 @@ from ml_core.serving_release import (
     build_serving_release_manifest,
     effective_contract_version,
     load_current_serving_release,
+    load_current_serving_release_for_inference,
+    load_current_serving_release_for_plan,
     parse_effective_serving_contract,
     parse_serving_release_manifest,
     parse_serving_release_pointer,
@@ -675,6 +677,68 @@ def test_runtime_loader_pins_pointer_once_and_returns_typed_transitive_snapshot(
         == store.objects[pinned.preflight.rental_model.support_sta_ids.uri]
     )
     assert sum(operation == "pointer-read" for operation, _ in store.events) == 1
+
+
+def test_plan_loader_skips_large_profile_and_model_artifact_reads() -> None:
+    """Plan loader는 pointer와 세 manifest만 읽고 대용량 transitive bytes를 건너뛴다."""
+    store, pointer_store, manifest, source = _release_fixture()
+    uri = (
+        "s3://test-bucket/models/serving-release/manifests/"
+        f"sha256={manifest.sha256}.json"
+    )
+    pointer = publish_serving_release(
+        manifest,
+        station_source=source,
+        object_store=store,
+        pointer_store=pointer_store,
+        release_manifest_uri=uri,
+    )
+    store.events.clear()
+
+    pinned = load_current_serving_release_for_plan(
+        object_store=store,
+        pointer_store=pointer_store,
+    )
+
+    assert pinned.pointer == pointer
+    assert pinned.manifest == manifest
+    assert pinned.rental_model.model_kind is ModelKind.RENTAL
+    assert pinned.return_model.model_kind is ModelKind.RETURN
+    read_uris = tuple(uri for operation, uri in store.events if operation == "read")
+    assert read_uris == (
+        pointer.release_manifest_uri,
+        manifest.rental_model_manifest.uri,
+        manifest.return_model_manifest.uri,
+    )
+    assert manifest.station_profile.uri not in read_uris
+    assert manifest.effective_contract.uri not in read_uris
+    assert sum(operation == "pointer-read" for operation, _ in store.events) == 1
+
+
+def test_inference_loader_uses_published_profile_footer_metadata() -> None:
+    """Inference loader는 exact profile bytes를 읽되 전체 행 preflight를 반복하지 않는다."""
+    store, pointer_store, manifest, source = _release_fixture()
+    uri = (
+        "s3://test-bucket/models/serving-release/manifests/"
+        f"sha256={manifest.sha256}.json"
+    )
+    publish_serving_release(
+        manifest,
+        station_source=source,
+        object_store=store,
+        pointer_store=pointer_store,
+        release_manifest_uri=uri,
+    )
+
+    pinned = load_current_serving_release_for_inference(
+        object_store=store,
+        pointer_store=pointer_store,
+    )
+
+    profile = pinned.preflight.station_profile
+    assert profile.payload == store.objects[manifest.station_profile.uri]
+    assert profile.row_count == pq.ParquetFile(io.BytesIO(profile.payload)).metadata.num_rows
+    assert profile.minute_values == tuple(range(0, 1440, 20))
 
 
 def test_pointer_cas_conflict_keeps_previous_release_active() -> None:
