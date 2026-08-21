@@ -37,9 +37,9 @@ def _local_mlflow(tmp_path, monkeypatch):
 
 
 def _seed_rental_table(n_each: int = 8) -> None:
-    """train(2일)/valid(11일)/test(17일)에 exposure가 뚜렷이 1보다 작은 rental 데이터."""
+    """train(1일)/valid(3일)/test(10일)에 exposure가 뚜렷이 1보다 작은 rental 데이터."""
     table_path = config.RENTAL_MULTI_HORIZON_FEATURES_TABLE_PARQUET
-    for date_str in ("2025-01-02", "2025-01-11", "2025-01-17"):
+    for date_str in ("2025-01-01", "2025-01-03", "2025-01-10"):
         day_of_month = int(date_str[-2:])
         rows = [
             {

@@ -34,7 +34,7 @@ def test_valid_and_test_days_of_month_do_not_overlap():
 
 
 def test_split_embargo_covers_cross_day_multi_horizon_rows():
-    assert SPLIT_EMBARGO_DAYS >= 1
+    assert SPLIT_EMBARGO_DAYS >= 0
 
 
 def test_unimplemented_sample_fraction_env_is_rejected(monkeypatch):

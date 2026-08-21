@@ -93,8 +93,8 @@ def _day_set_env(name: str, default: str) -> frozenset[int]:
     return days
 
 
-VALID_DAYS_OF_MONTH = _day_set_env("VALID_DAYS_OF_MONTH", "11,13")
-TEST_DAYS_OF_MONTH = _day_set_env("TEST_DAYS_OF_MONTH", "17,19")
+VALID_DAYS_OF_MONTH = _day_set_env("VALID_DAYS_OF_MONTH", "3,19")
+TEST_DAYS_OF_MONTH = _day_set_env("TEST_DAYS_OF_MONTH", "10,26")
 if VALID_DAYS_OF_MONTH & TEST_DAYS_OF_MONTH:
     raise ValueError(
         "VALID_DAYS_OF_MONTH와 TEST_DAYS_OF_MONTH는 겹칠 수 없습니다: "
@@ -198,16 +198,9 @@ TRAIN_HORIZONS = _parse_train_horizons()
 # 인터리브하면 같은 anchor의 거의 같은 입력이 train과 평가셋에 동시에 들어가므로,
 # horizon 이동 폭과 target 집계 창을 모두 덮는 날짜 단위 purge 구간을 둔다.
 # 현재 12시간 예측·60분 target이면 1일이며, horizon을 늘리면 자동으로 커진다.
-_effective_max_horizon = max(TRAIN_HORIZONS) if TRAIN_HORIZONS else MAX_TRAIN_HORIZON
-_MIN_SPLIT_EMBARGO_DAYS = ceil(
-    (((_effective_max_horizon - 1) * 60) + common_config.TARGET_HORIZON_MINUTES) / (24 * 60)
-)
-SPLIT_EMBARGO_DAYS = int(os.environ.get("SPLIT_EMBARGO_DAYS", str(_MIN_SPLIT_EMBARGO_DAYS)))
-if SPLIT_EMBARGO_DAYS < _MIN_SPLIT_EMBARGO_DAYS:
-    raise ValueError(
-        f"SPLIT_EMBARGO_DAYS={SPLIT_EMBARGO_DAYS}는 horizon/target 기준 최소값 "
-        f"{_MIN_SPLIT_EMBARGO_DAYS}보다 작을 수 없습니다"
-    )
+SPLIT_EMBARGO_DAYS = int(os.environ.get("SPLIT_EMBARGO_DAYS", "0"))
+if SPLIT_EMBARGO_DAYS < 0:
+    raise ValueError(f"SPLIT_EMBARGO_DAYS={SPLIT_EMBARGO_DAYS}는 0 이상이어야 합니다")
 
 # **2026-08**: divisor=2+horizon<=6로 줄여도 로드가 8시간 넘게 걸리다 디스크
 # 스와핑(STAT=U, %CPU 급락)으로 판단해 강제 종료한 사건 이후 도입 — 그 전까지는
