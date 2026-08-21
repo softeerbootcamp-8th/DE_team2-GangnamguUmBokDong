@@ -60,10 +60,14 @@ EOSQL
 
 # --- 2. PostGIS 가용성 확인 ---
 #
-# check_gold_schema.sql이 정확히 3.5를 요구한다(split_part로 major/minor를 본다).
-# 스키마를 적용하기 전에 먼저 확인해 실패를 앞당긴다 — 없으면 엔진 마이너 버전을
-# 내려서 RDS를 재생성해야 하고, 데이터가 없는 이 시점이 가장 싸다.
-echo "[bootstrap-rds] PostGIS 3.5 가용성 확인"
+# check_gold_schema.sql이 정확히 3.4를 요구한다(split_part로 major/minor를 본다).
+# 스키마를 적용하기 전에 먼저 확인해 실패를 앞당긴다 — 안 맞으면 엔진 버전을 바꿔
+# RDS를 재생성해야 하고, 데이터가 없는 이 시점이 가장 싸다.
+#
+# 3.4로 맞춘 경위: RDS PostgreSQL 16.14가 PostGIS 3.4.6만 제공한다(2026-08-21 실측).
+# 로컬 이미지도 postgis/postgis:16-3.4로 내려 dev/prod를 같은 조합으로 유지한다.
+# 스키마·함수 18개·트리거 35개·GiST 3개·ACL이 3.4에서 전부 통과함을 확인했다.
+echo "[bootstrap-rds] PostGIS 3.4 가용성 확인"
 postgis_versions="$(
     "${PSQL_BIN}" \
         --no-psqlrc --set ON_ERROR_STOP=1 --tuples-only --no-align --quiet \
@@ -71,13 +75,14 @@ postgis_versions="$(
         --command "SELECT string_agg(version, ' ') FROM pg_available_extension_versions WHERE name = 'postgis'"
 )"
 
-if [[ "${postgis_versions}" != *"3.5"* ]]; then
+if [[ "${postgis_versions}" != *"3.4"* ]]; then
     cat >&2 <<EOF
-[bootstrap-rds] 이 엔진 버전에 PostGIS 3.5가 없습니다.
+[bootstrap-rds] 이 엔진 버전에 PostGIS 3.4가 없습니다.
 [bootstrap-rds] 사용 가능한 버전: ${postgis_versions:-(없음)}
-[bootstrap-rds] ops/postgres/check_gold_schema.sql이 정확히 3.5를 요구하므로,
-[bootstrap-rds] terraform.tfvars의 rds_engine_version을 16.13 → 16.12 순으로
-[bootstrap-rds] 내려 재생성하세요(데이터가 없어 재생성이 쌉니다).
+[bootstrap-rds] ops/postgres/check_gold_schema.sql이 정확히 3.4를 요구합니다.
+[bootstrap-rds] PostGIS 버전은 엔진 버전이 올라갈수록 높아지므로, 3.4보다 낮으면
+[bootstrap-rds] rds_engine_version을 올리고 높으면 내려서 재생성하세요
+[bootstrap-rds] (데이터가 없는 시점이면 재생성이 쌉니다).
 EOF
     exit 78
 fi

@@ -2,7 +2,7 @@ name: de-team2-gangnamguumbokdong
 
 services:
   postgres:
-    image: postgis/postgis:16-3.5
+    image: postgis/postgis:16-3.4
     entrypoint: ["bash", "/usr/local/bin/gold-postgis-entrypoint.sh"]
     # Compose에서 entrypoint를 덮으면 이미지의 기본 CMD가 비워지므로 명시한다.
     command: ["postgres"]
@@ -36,7 +36,7 @@ services:
   # 기존 볼륨에는 DDL을 재적용하지 않는다. 새 볼륨의 원자적 baseline 적용 후에도
   # SSOT의 핵심 객체가 모두 있는지 읽기 전용으로 확인한 뒤 소비자를 시작한다.
   postgres-schema-check:
-    image: postgis/postgis:16-3.5
+    image: postgis/postgis:16-3.4
     environment:
       PGHOST: postgres
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
