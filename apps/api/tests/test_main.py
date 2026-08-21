@@ -5,11 +5,10 @@ from __future__ import annotations
 from datetime import UTC, date, datetime, timedelta
 from uuid import UUID
 
-import pytest
-from fastapi.testclient import TestClient
-
 import main
+import pytest
 import queries
+from fastapi.testclient import TestClient
 
 NOW = datetime(2026, 8, 20, 1, 5, tzinfo=UTC)
 BASE = datetime(2026, 8, 20, 1, 0, tzinfo=UTC)
@@ -87,8 +86,9 @@ def _route(status: str = "proposed") -> dict:
         "region": "테스트 센터",
         "status": status,
         "proposed_at": BASE,
-        "dispatched_at": NOW if status in {"dispatched", "completed"} else None,
+        "dispatched_at": NOW if status in {"dispatched", "completed", "cancelled"} else None,
         "completed_at": NOW if status == "completed" else None,
+        "cancelled_at": NOW if status == "cancelled" else None,
         "stops": [
             {
                 "visit_order": 1,
@@ -290,7 +290,8 @@ def test_route_query_parameters_and_uuid_are_validated_before_db(
     monkeypatch.setattr(queries, "fetch_routes", lambda *_args: [])
     monkeypatch.setattr(queries, "fetch_route", lambda _route_id: None)
 
-    assert client.get("/routes?status=cancelled").status_code == 422
+    assert client.get("/routes?status=invalid").status_code == 422
+    assert client.get("/routes?status=cancelled").status_code == 200
     assert client.get("/routes?limit=0").status_code == 422
     assert client.get("/routes?limit=501").status_code == 422
     assert client.get("/routes?offset=-1").status_code == 422
@@ -329,6 +330,20 @@ def test_dispatch_maps_not_found_state_and_constraints(
     assert response.json()["detail"] == detail
 
 
+def test_cancel_returns_cancelled_route(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """cancel은 dispatched route를 cancelled 응답으로 전이한다."""
+    monkeypatch.setattr(queries, "cancel_route", lambda _route_id, _now: _route("cancelled"))
+
+    response = client.post(f"/routes/{ROUTE_ID}/cancel")
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "cancelled"
+    assert response.json()["cancelled_at"] == "2026-08-20T01:05:00Z"
+
+
 def test_route_response_preserves_external_aliases(
     client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
@@ -345,3 +360,50 @@ def test_route_response_preserves_external_aliases(
     assert payload["proposed_at"] == "2026-08-20T01:00:00Z"
     assert payload["stops"][0]["visit_order"] == 1
     assert payload["stops"][0]["action"] == "pickup"
+
+
+def _unreachable_db(*_args, **_kwargs):
+    """DB 연결 실패를 흉내낸다."""
+    raise RuntimeError("database is down")
+
+
+def test_healthz_stays_ok_while_database_is_down(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """생존 신호는 DB를 조회하지 않는다.
+
+    조회하면 RDS 순단이 컨테이너 재시작 루프로 번진다.
+    """
+    monkeypatch.setattr(main, "fetch_one", _unreachable_db)
+
+    response = client.get("/healthz")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+
+
+def test_readyz_ok_when_database_reachable(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DB에 연결되면 준비 완료를 반환한다."""
+    monkeypatch.setattr(main, "fetch_one", lambda *_args, **_kwargs: {"ok": 1})
+
+    response = client.get("/readyz")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ready"}
+
+
+def test_readyz_503_when_database_unreachable(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DB에 연결할 수 없으면 503과 명시적 사유를 반환한다."""
+    monkeypatch.setattr(main, "fetch_one", _unreachable_db)
+
+    response = client.get("/readyz")
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "database_unavailable"

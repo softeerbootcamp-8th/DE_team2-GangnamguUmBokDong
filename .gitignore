@@ -39,6 +39,22 @@ airflow/webserver_config.py
 airflow/standalone_admin_password.txt
 
 
+# EMR 패키징 임시 디렉터리 (make emr-package)
+.emr-stage/
+
+# Terraform
+# .terraform.lock.hcl은 커밋한다 — provider 버전을 팀 전체가 고정해야 한다.
+terraform/.terraform/
+terraform/*.tfstate
+terraform/*.tfstate.*
+terraform/*.tfplan
+terraform/terraform_override.tf
+# 환경/팀마다 다르고 IP·버킷 이름이 들어간다. *.example만 커밋한다.
+terraform/backend.hcl
+terraform/terraform.tfvars
+# make allow-my-ip가 현재 공인 IP로 다시 쓴다.
+terraform/admin_cidrs.auto.tfvars
+
 # Claude
 docs/superpowers/
 

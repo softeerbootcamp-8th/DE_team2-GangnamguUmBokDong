@@ -22,9 +22,12 @@ make bootstrap
 
 `.env`가 없으면 `.env.example`에서 자동으로 복사하고, Postgres / MinIO / Airflow(webserver+scheduler)를 기동합니다. 완료되면 아래 주소로 접속할 수 있습니다.
 
-- Postgres: `localhost:5432` (앱 DB: `app`, Airflow 메타데이터 DB: `airflow` — 인스턴스 하나에 분리 생성됨)
+- 대시보드: `http://localhost:5173`
+- API: `http://localhost:8000`
+- Postgres: `localhost:5433` (앱 DB: `app`, Airflow·MLflow 메타데이터 DB도 같은 인스턴스 안에 분리 생성됨)
 - MinIO 콘솔: `http://localhost:9001`
 - Airflow 웹서버: `http://localhost:8081`
+- MLflow: `http://localhost:5000`
 
 이후에는 아래 명령으로 다룹니다.
 
@@ -35,13 +38,29 @@ make logs    # 로그 확인
 make ps      # 상태 확인
 ```
 
+기존 #129 Gold 볼륨에서 작업 취소 기능이 포함된 코드로 처음 전환할 때는 스택이
+실행 중인 상태에서 아래 호환 마이그레이션을 한 번 적용한다. 명령은 재실행해도 같다.
+
+```bash
+make migrate-route-cancellation
+```
+
+로컬에서 보존해야 하는 데이터 볼륨은 두 개뿐이다.
+
+- `umbokdong-dashboard-live_postgres-data`: 앱 Gold 데이터와 Airflow·MLflow 메타데이터
+- `umbokdong-dashboard-live_minio-data`: 수집 원본·가공 데이터·학습 산출물·서빙 모델
+
+`umbokdong-dashboard-live_airflow-module-venvs`와
+`umbokdong-dashboard-live_web-node-modules`는 재설치 가능한 의존성 캐시다. PostgreSQL과
+MinIO는 저장 형식과 복구 절차가 완전히 다르므로 하나의 물리 볼륨에 섞지 않는다.
+
 전체 realtime 파이프라인을 로컬 Airflow에서 시각적으로 확인하려면 스택 기동 후
 `make e2e-smoke`를 실행합니다. Fixture 범위와 UI 확인 방법은
 [로컬 Airflow E2E smoke](airflow/local-e2e.md)를 참고하세요.
 
 ### Apple Silicon에서 PostGIS 실행
 
-로컬 Compose가 사용하는 `postgis/postgis:16-3.5` 이미지는 `linux/amd64`만
+로컬 Compose가 사용하는 `postgis/postgis:16-3.4` 이미지는 `linux/amd64`만
 배포됩니다. M1/M2/M3/M4 Mac의 Docker Linux VM은 기본 `linux/arm64`이므로 플랫폼을
 명시하지 않으면 `no matching manifest for linux/arm64/v8` 오류가 발생합니다.
 
@@ -71,24 +90,32 @@ docker compose \
 
 ### Gold PostGIS baseline과 기존 볼륨
 
-로컬 PostgreSQL은 `postgis/postgis:16-3.5`를 사용하며, **새 `postgres-data` 볼륨을
+로컬 PostgreSQL은 `postgis/postgis:16-3.4`를 사용하며, **새 `postgres-data` 볼륨을
 처음 초기화할 때만** [Gold 스키마 SSOT](gold/target-schema.sql)를 적용합니다. 이후
 기동에서는 스키마 DDL을 다시 실행하지 않습니다.
 
+> **PostGIS 3.5 → 3.4 변경 (2026-08-21)**
+>
+> 운영 RDS(PostgreSQL 16.14)가 **PostGIS 3.4.6만 제공**해서, dev/prod를 같은 조합으로
+> 맞추기 위해 로컬 이미지도 3.4로 내렸습니다. 스키마·함수 18개·트리거 35개·GiST 3개·ACL이
+> 3.4에서 전부 통과함을 확인했습니다(`check_gold_schema.sql`의 버전 조건도 3.4로 변경).
+>
+> **기존 볼륨을 쓰던 사람은 반드시 볼륨을 새로 만들어야 합니다.** 3.5로 초기화된 볼륨에
+> 3.4 이미지를 붙이면 `check_gold_schema.sh`가 버전 불일치로 exit 78을 냅니다.
+>
+> ```bash
+> make down
+> docker volume rm de-team2-gangnamguumbokdong_postgres-data
+> make up
+> ```
+
 과거 `postgres:16` 스키마가 든 볼륨을 발견하면 PostgreSQL을 시작하기 전에 명확한
-오류로 중단합니다. Compose는 기존 볼륨을 변환하거나 삭제하지 않습니다. 기존 볼륨을
-보존하면서 새 Gold 개발 환경을 만들려면 먼저 컨테이너만 내리고(`make down`은 named
-volume을 삭제하지 않습니다), 별도 Compose 프로젝트 이름으로 기동합니다.
-
-```bash
-make down
-COMPOSE_PROJECT_NAME=gold-postgis-v1 make up
-```
-
-이후 `logs`, `ps`, `down`에도 같은 `COMPOSE_PROJECT_NAME`을 붙여야 같은 환경을
-다룹니다. 구 스키마에 직접 쓰던 `make seed`와 `apps/api/seed_gold.py`는 비활성화되어
-있습니다. 로컬 fixture는 후속 #152의 source publisher 경로가 준비된 뒤 그 경로로
-적재해야 합니다.
+오류로 중단합니다. Compose는 기존 볼륨을 변환하거나 삭제하지 않습니다. 기본 Compose
+프로젝트명은 `umbokdong-dashboard-live`로 고정돼 있어 `make up/down/ps`가 항상 같은
+PostgreSQL·MinIO 영속 볼륨을 재사용합니다. 구 스키마 전환이 필요하면 기존 볼륨을
+삭제하거나 새 프로젝트를 즉석에서 만들지 말고 먼저 백업과 마이그레이션 계획을
+확정합니다. 구 스키마에 직접 쓰던 `make seed`와 `apps/api/seed_gold.py`는
+비활성화되어 있습니다.
 
 **중요**: Compose는 로컬 확인용 `apps/api`와 `apps/web`도 함께 기동합니다.
 `collector`와 `ml/*`는 Compose에 포함되지 않으므로 각 프로젝트에서 `uv run`으로

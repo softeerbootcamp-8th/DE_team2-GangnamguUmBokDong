@@ -7,16 +7,16 @@ from datetime import UTC, datetime, timedelta
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
+import main
 import psycopg
 import pytest
-from fastapi.testclient import TestClient
-
-import main
 import queries
+from fastapi.testclient import TestClient
 
 DATABASE_URL_ENV = "GOLD_API_TEST_DATABASE_URL"
 ROUTE_ID = UUID("11111111-1111-4111-8111-111111111111")
 CONFLICT_ROUTE_ID = UUID("22222222-2222-4222-8222-222222222222")
+CANCEL_ROUTE_ID = UUID("33333333-3333-4333-8333-333333333333")
 
 
 @pytest.fixture
@@ -399,6 +399,24 @@ def test_route_lifecycle_and_constraint_error_mapping(database_url: str) -> None
     now = datetime.now(UTC)
     _seed_serving_fixture(database_url, now)
 
+    with psycopg.connect(database_url) as connection:
+        connection.execute(
+            """
+            INSERT INTO rebalance_route (
+                route_id, dispatch_center_id, route_status_cd, proposed_dttm
+            ) VALUES (%(route_id)s, 'test_center', 'proposed', %(proposed_dttm)s)
+            """,
+            {"route_id": CANCEL_ROUTE_ID, "proposed_dttm": now},
+        )
+        connection.execute(
+            """
+            INSERT INTO rebalance_route_stop (
+                route_id, visit_no, sta_id, route_action_type_cd, bike_cnt
+            ) VALUES (%(route_id)s, 1, 'ST-1', 'pickup', 2)
+            """,
+            {"route_id": CANCEL_ROUTE_ID},
+        )
+
     dispatched = queries.dispatch_route(ROUTE_ID, now)
     assert isinstance(dispatched, dict)
     assert dispatched["status"] == "dispatched"
@@ -411,6 +429,13 @@ def test_route_lifecycle_and_constraint_error_mapping(database_url: str) -> None
         queries.complete_route(ROUTE_ID, now + timedelta(seconds=2))
         is queries.RouteTransitionResult.WRONG_STATUS
     )
+
+    cancelled = queries.dispatch_route(CANCEL_ROUTE_ID, now)
+    assert isinstance(cancelled, dict)
+    cancelled = queries.cancel_route(CANCEL_ROUTE_ID, now + timedelta(seconds=1))
+    assert isinstance(cancelled, dict)
+    assert cancelled["status"] == "cancelled"
+    assert cancelled["cancelled_at"] == now + timedelta(seconds=1)
 
     with psycopg.connect(database_url) as connection:
         connection.execute("SET session_replication_role = replica")

@@ -586,17 +586,24 @@ CREATE TABLE rebalance_route (
     proposed_dttm TIMESTAMPTZ NOT NULL,
     dispatched_dttm TIMESTAMPTZ,
     completed_dttm TIMESTAMPTZ,
+    cancelled_dttm TIMESTAMPTZ,
     created_dttm TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     updated_dttm TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     CONSTRAINT rebalance_route_dispatch_center_fk FOREIGN KEY (dispatch_center_id)
         REFERENCES dispatch_center (dispatch_center_id) ON UPDATE RESTRICT ON DELETE RESTRICT,
     CONSTRAINT rebalance_route_status_ck CHECK (
         (route_status_cd = 'proposed'
-            AND dispatched_dttm IS NULL AND completed_dttm IS NULL)
+            AND dispatched_dttm IS NULL AND completed_dttm IS NULL
+            AND cancelled_dttm IS NULL)
         OR (route_status_cd = 'dispatched'
-            AND dispatched_dttm IS NOT NULL AND completed_dttm IS NULL)
+            AND dispatched_dttm IS NOT NULL AND completed_dttm IS NULL
+            AND cancelled_dttm IS NULL)
         OR (route_status_cd = 'completed'
-            AND dispatched_dttm IS NOT NULL AND completed_dttm IS NOT NULL)
+            AND dispatched_dttm IS NOT NULL AND completed_dttm IS NOT NULL
+            AND cancelled_dttm IS NULL)
+        OR (route_status_cd = 'cancelled'
+            AND dispatched_dttm IS NOT NULL AND completed_dttm IS NULL
+            AND cancelled_dttm IS NOT NULL)
     ),
     CONSTRAINT rebalance_route_dttm_order_ck CHECK (
         isfinite(proposed_dttm)
@@ -605,6 +612,9 @@ CREATE TABLE rebalance_route (
         ))
         AND (completed_dttm IS NULL OR (
             isfinite(completed_dttm) AND completed_dttm >= dispatched_dttm
+        ))
+        AND (cancelled_dttm IS NULL OR (
+            isfinite(cancelled_dttm) AND cancelled_dttm >= dispatched_dttm
         ))
     ),
     CONSTRAINT rebalance_route_metadata_dttm_ck CHECK (
@@ -741,9 +751,9 @@ BEGIN
     END IF;
 
     IF OLD.route_status_cd = NEW.route_status_cd THEN
-        IF ROW(NEW.dispatched_dttm, NEW.completed_dttm)
+        IF ROW(NEW.dispatched_dttm, NEW.completed_dttm, NEW.cancelled_dttm)
            IS DISTINCT FROM
-           ROW(OLD.dispatched_dttm, OLD.completed_dttm) THEN
+           ROW(OLD.dispatched_dttm, OLD.completed_dttm, OLD.cancelled_dttm) THEN
             RAISE EXCEPTION 'rebalance route lifecycle timestamps cannot change without a status transition'
                 USING ERRCODE = '23514';
         END IF;
@@ -752,7 +762,8 @@ BEGIN
 
     IF OLD.route_status_cd = 'proposed' AND NEW.route_status_cd = 'dispatched' THEN
         IF NEW.dispatched_dttm IS NULL
-           OR NEW.completed_dttm IS NOT NULL THEN
+           OR NEW.completed_dttm IS NOT NULL
+           OR NEW.cancelled_dttm IS NOT NULL THEN
             RAISE EXCEPTION 'proposed -> dispatched requires only dispatched_dttm'
                 USING ERRCODE = '23514';
         END IF;
@@ -787,8 +798,16 @@ BEGIN
         END IF;
     ELSIF OLD.route_status_cd = 'dispatched' AND NEW.route_status_cd = 'completed' THEN
         IF NEW.dispatched_dttm IS DISTINCT FROM OLD.dispatched_dttm
-           OR NEW.completed_dttm IS NULL THEN
+           OR NEW.completed_dttm IS NULL
+           OR NEW.cancelled_dttm IS NOT NULL THEN
             RAISE EXCEPTION 'dispatched -> completed must preserve dispatched_dttm and set completed_dttm'
+                USING ERRCODE = '23514';
+        END IF;
+    ELSIF OLD.route_status_cd = 'dispatched' AND NEW.route_status_cd = 'cancelled' THEN
+        IF NEW.dispatched_dttm IS DISTINCT FROM OLD.dispatched_dttm
+           OR NEW.completed_dttm IS NOT NULL
+           OR NEW.cancelled_dttm IS NULL THEN
+            RAISE EXCEPTION 'dispatched -> cancelled must preserve dispatched_dttm and set cancelled_dttm'
                 USING ERRCODE = '23514';
         END IF;
     ELSE

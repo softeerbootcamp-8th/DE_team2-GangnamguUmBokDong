@@ -3,11 +3,11 @@
 from typing import Literal
 from uuid import UUID
 
+import queries
+from core.db import fetch_one
 from core.forecast import enrich_forecast_points
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-
-import queries
 from schemas import (
     Alert,
     DispatchCenter,
@@ -20,7 +20,7 @@ from schemas import (
     WeatherResponse,
 )
 
-RouteStatusFilter = Literal["proposed", "dispatched", "completed"]
+RouteStatusFilter = Literal["proposed", "dispatched", "completed", "cancelled"]
 
 app = FastAPI(title="GangnamguUmBokDong API")
 
@@ -31,6 +31,36 @@ app.add_middleware(
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
+
+
+@app.get("/healthz")
+def healthz() -> dict:
+    """프로세스 생존만 알린다.
+
+    DB를 일부러 조회하지 않는다 — 컨테이너 healthcheck와 리버스 프록시의 업스트림
+    판정에 쓰이므로, RDS 순단이나 파이프라인 지연이 프로세스 재시작으로 번지면 안 된다.
+    데이터가 준비됐는지는 `/status`, DB 연결 여부는 `/readyz`가 따로 답한다.
+    """
+    return {"status": "ok"}
+
+
+@app.get("/readyz")
+def readyz() -> dict:
+    """DB에 실제로 연결되는지까지 확인한다.
+
+    배포 직후 `DATABASE_URL`과 RDS 접근이 되는지 보는 용도다. 파이프라인이 아직
+    한 번도 안 돌아 데이터가 비어 있어도 여기서는 200이 나온다 — 신선도 판정은
+    `/status`의 몫이라 의도적으로 분리했다.
+
+    raises:
+        HTTPException: DB에 연결할 수 없을 때 503
+    """
+    try:
+        fetch_one("SELECT 1 AS ok")
+    except Exception as exc:
+        # 연결 실패 원인(자격증명·네트워크·DATABASE_URL 누락)과 무관하게 not ready다.
+        raise HTTPException(status_code=503, detail="database_unavailable") from exc
+    return {"status": "ready"}
 
 
 def _shared_rate(row: dict) -> float:
@@ -176,4 +206,11 @@ def dispatch_route(route_id: UUID) -> dict:
 def complete_route(route_id: UUID) -> dict:
     """route를 dispatched에서 completed로 guarded 전이한다."""
     result = queries.complete_route(route_id, queries.now_utc())
+    return _route_transition_response(route_id, result, "dispatched")
+
+
+@app.post("/routes/{route_id}/cancel", response_model=Route)
+def cancel_route(route_id: UUID) -> dict:
+    """route를 dispatched에서 cancelled로 guarded 전이한다."""
+    result = queries.cancel_route(route_id, queries.now_utc())
     return _route_transition_response(route_id, result, "dispatched")

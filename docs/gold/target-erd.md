@@ -429,10 +429,11 @@ stateDiagram-v2
     [*] --> proposed
     proposed --> dispatched
     dispatched --> completed
+    dispatched --> cancelled
 ```
 
 route ID·센터·제안 일시는 불변이고, 상태 전이 없이 lifecycle 일시를 바꿀 수 없다.
-`dispatched`, `completed` 상태의 stop은 수정할 수 없고 해당 route도 삭제할
+`dispatched`, `completed`, `cancelled` 상태의 stop은 수정할 수 없고 해당 route도 삭제할
 수 없다. `proposed` route의 stop만 삽입·수정·삭제할 수 있으며, route 삭제 시 stop이
 cascade된다.
 
@@ -483,7 +484,7 @@ commit에서 거부한다. terminal route가 보존하는 업무 이력은 stati
 API도 route 헤더와 stop을 한 SQL statement 또는 한 read transaction에서 읽어 서로
 다른 snapshot을 조합하지 않는다. PostgreSQL UUID는 JSON 문자열 계약에 맞게 출력할
 때 `route_id::text`로 cast하고, 문자열 배열 입력은 명시적으로 `uuid[]`로 cast한다.
-목록은 선택적 센터명과 `proposed|dispatched|completed` status만 필터로 허용하고 기본
+목록은 선택적 센터명과 `proposed|dispatched|completed|cancelled` status만 필터로 허용하고 기본
 `limit=100`, 최대 `500`, `offset>=0`으로 제한한다. 페이지 순서는
 `proposed_dttm DESC, route_id ASC`로 고정한다. 상태 변경은 expected status를 WHERE에 넣은
 guarded UPDATE와 같은 transaction의 aggregate 재조회로 처리하고, 없는 ID는 404,
@@ -513,7 +514,8 @@ SELECT r.route_id::text AS route_id,
        r.route_status_cd AS status,
        r.proposed_dttm AS proposed_at,
        r.dispatched_dttm AS dispatched_at,
-       r.completed_dttm AS completed_at
+       r.completed_dttm AS completed_at,
+       r.cancelled_dttm AS cancelled_at
   FROM rebalance_route AS r
   JOIN dispatch_center AS dc USING (dispatch_center_id)
  WHERE r.route_id = CAST(:route_id AS UUID);
@@ -533,7 +535,7 @@ DB 표준명과 외부 응답명은 다음처럼 한 번만 변환한다.
 | `critical_remaining_min` | `minutes_until_critical` | 분 단위 |
 | `route_id::text` | `route_id` | Pydantic `str`·JSON 문자열 계약 |
 | `route_status_cd` | `status` | route 상태 |
-| route lifecycle `_dttm` | `proposed_at`, `dispatched_at`, `completed_at` | 외부 명칭만 `_at` 유지 |
+| route lifecycle `_dttm` | `proposed_at`, `dispatched_at`, `completed_at`, `cancelled_at` | 외부 명칭만 `_at` 유지 |
 | `visit_no` | `visit_order` | 1부터 시작 |
 | `route_action_type_cd` | `action` | 차량 작업 코드 |
 | `event_name`, `event_spot_nm` | `title`, `place` | 장소명은 nullable |

@@ -47,6 +47,8 @@ COMPACTION_EXECUTION_TIMEOUT = timedelta(seconds=900)
 # 실측 데이터 없음(placeholder) — 로컬에서 --all-stations 1회 실행 시간을 재본 뒤 조정.
 INFERENCE_EXECUTION_TIMEOUT = timedelta(seconds=300)
 DB_LOADER_EXECUTION_TIMEOUT = timedelta(seconds=120)
+WEATHER_MANIFEST_WAIT_TIMEOUT_SECONDS = 30
+WEATHER_MANIFEST_POKE_INTERVAL_SECONDS = 2
 # 실측 데이터 없음(placeholder) — S3 tick 5~6개 + 예측 결과 1개만 읽는 순수 계산이라
 # 추론보다는 가볍게 잡았다. 로컬에서 1회 실행 시간을 재본 뒤 조정.
 URGENCY_EXECUTION_TIMEOUT = timedelta(seconds=180)

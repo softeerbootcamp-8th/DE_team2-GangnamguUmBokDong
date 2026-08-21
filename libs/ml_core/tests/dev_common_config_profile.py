@@ -527,3 +527,46 @@ def test_peak_hours_parsing_and_defaults(monkeypatch: pytest.MonkeyPatch) -> Non
     with pytest.raises(ValueError, match="0 <= start < end <= 24"):
         common_config._parse_peak_hours("TEST_PEAK", "20-10", default)
 
+
+class _CapturingBoto3:
+    """`boto3.client()`에 실제로 넘어간 kwargs를 잡아두는 스텁."""
+
+    def __init__(self):
+        self.kwargs: dict | None = None
+
+    def client(self, service_name, **kwargs):
+        self.kwargs = kwargs
+        return object()
+
+
+@pytest.mark.parametrize("endpoint", [None, ""])
+def test_s3_client_without_endpoint_delegates_credentials_to_boto3_chain(monkeypatch, endpoint):
+    # core.s3._client()와 같은 계약 — 자격증명을 명시하면 boto3가 EMR 실행 역할이나
+    # instance profile을 조회하지 않아 운영에서 프로필 조회가 403으로 죽는다.
+    fake = _CapturingBoto3()
+    monkeypatch.setattr(common_config, "boto3", fake)
+    if endpoint is None:
+        monkeypatch.delenv("S3_ENDPOINT_URL", raising=False)
+    else:
+        monkeypatch.setenv("S3_ENDPOINT_URL", endpoint)
+
+    common_config._s3_client(2.0)
+
+    assert "aws_access_key_id" not in fake.kwargs
+    assert "aws_secret_access_key" not in fake.kwargs
+    assert "endpoint_url" not in fake.kwargs
+
+
+def test_s3_client_with_endpoint_passes_explicit_credentials(monkeypatch):
+    fake = _CapturingBoto3()
+    monkeypatch.setattr(common_config, "boto3", fake)
+    monkeypatch.setenv("S3_ENDPOINT_URL", "http://minio:9000")
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "local-key")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "local-secret")
+
+    common_config._s3_client(2.0)
+
+    assert fake.kwargs["endpoint_url"] == "http://minio:9000"
+    assert fake.kwargs["aws_access_key_id"] == "local-key"
+    assert fake.kwargs["aws_secret_access_key"] == "local-secret"
+
