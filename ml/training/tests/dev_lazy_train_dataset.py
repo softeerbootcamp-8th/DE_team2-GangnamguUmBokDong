@@ -120,6 +120,38 @@ def test_build_lazy_dataset_label_matches_date_order():
     assert list(y[0:4]) == [10.0] * 4  # 2026-01-02
     assert list(y[4:8]) == [20.0] * 4  # 2026-01-03
     assert list(y[8:12]) == [30.0] * 4  # 2026-01-04
+    assert isinstance(y, np.memmap)
+    assert not __import__("pathlib").Path(y.filename).exists()
+
+
+def test_build_lazy_dataset_streams_exposure_to_unlinked_memmap():
+    """대여 exposure와 init_score 경로도 전체 pandas 합본 없이 disk-backed여야 한다."""
+    path = "processed_v2/test/lazy_exposure"
+    for index, date_str in enumerate(DATES, start=1):
+        frame = pd.DataFrame({
+            "station_no": np.array([1, 2], dtype=np.int16),
+            "x1": np.array([index, index + 1], dtype=np.float32),
+            "x2": np.array([0, 1], dtype=np.float32),
+            "y": np.array([index, index + 1], dtype=np.int16),
+            "exposure": np.array([0.05, 1.0], dtype=np.float32),
+        })
+        s3_io.write_parquet(frame, f"{path}/date={date_str}/part-0000.parquet")
+
+    _dataset, y, exposure = build_lazy_dataset(
+        path,
+        DATES,
+        FEATURE_COLUMNS,
+        STATION_DTYPE,
+        None,
+        "y",
+        "exposure",
+        ChunkCache(),
+    )
+
+    assert isinstance(y, np.memmap)
+    assert isinstance(exposure, np.memmap)
+    assert np.allclose(exposure, [0.05, 1.0] * len(DATES))
+    assert not __import__("pathlib").Path(exposure.filename).exists()
 
 
 def test_build_lazy_dataset_sets_feature_names_and_construction_params():
@@ -146,6 +178,8 @@ def test_build_lazy_dataset_sets_feature_names_and_construction_params():
     assert dataset.feature_name == FEATURE_COLUMNS
     assert dataset.params["max_bin"] == 31
     assert dataset.params["min_data_in_leaf"] == 5
+    assert dataset.label is None
+    assert dataset.init_score is None
 
 
 def test_build_lazy_dataset_keeps_reference_positional_argument_compatible():

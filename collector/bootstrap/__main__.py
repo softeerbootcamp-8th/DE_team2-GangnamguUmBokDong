@@ -4,7 +4,8 @@
 
     cd collector
     uv run --frozen python -m bootstrap --source bike_rental_history \
-        --from 2025-01-01 --to 2025-12-31 --csv-dir ../data
+        --from 2025-01-01 --to 2025-12-31 --csv-dir ../data \
+        --csv-batch-by-month
     uv run --frozen python -m bootstrap --source bike_station_realtime \
         --from 2025-12-01 --to 2025-12-31 --csv-dir ../data
 
@@ -18,6 +19,10 @@ Airflow가 부르지 않는 수동 작업이라 태스크 빌더를 만들지 �
 이미 archive가 있는 날짜는 건너뛴다. 상태 파일을 두지 않는다 — 날짜 단위로
 원자적이라(한 날짜를 다 만든 뒤 쓴다) 중단 시 그 날짜는 아예 안 써지고 다음 실행이
 다시 만든다. `--force`로 무시한다.
+
+1년치 대여·재고 CSV는 `--csv-batch-by-month`를 사용한다. 파일 내부 10만 행 청크와
+별개로, 이 옵션은 날짜별 Arrow 결과를 한 달 적재 후 해제해 전체 연도가 메모리에
+동시에 남는 것을 막는다. Join 소스의 대여소 매핑은 월 배치 밖에서 한 번만 만든다.
 
 ## 종료 코드
 
@@ -65,6 +70,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--to", required=True, help="끝 날짜, 포함 (YYYY-MM-DD)")
     parser.add_argument("--csv-dir", help="kind=csv일 때 CSV들이 있는 디렉터리")
     parser.add_argument("--concurrency", type=int, default=4, help="kind=history_api의 동시 조회 수")
+    parser.add_argument(
+        "--csv-batch-by-month",
+        action="store_true",
+        help="대용량 CSV 범위를 월별로 읽고 적재해 peak memory를 제한한다",
+    )
+    parser.add_argument(
+        "--materialize-empty-archive",
+        action="store_true",
+        help="확인된 0행 날짜도 스키마가 있는 빈 Archive와 manifest로 기록한다",
+    )
     parser.add_argument("--force", action="store_true", help="archive가 있어도 다시 쓴다")
     return parser.parse_args(argv)
 
@@ -84,6 +99,26 @@ def resolve_dates(args: argparse.Namespace) -> list[date]:
 def exit_code_for(results: list[runner.DateResult]) -> int:
     """실패한 날짜가 있으면 non-zero."""
     return 1 if any(r.status == "failed" for r in results) else 0
+
+
+def _csv_day_batches(days: list[date], batch_by_month: bool) -> list[list[date]]:
+    """CSV 날짜를 전체 한 묶음 또는 달력 월별 묶음으로 반환한다.
+
+    월별 모드는 파일 하나를 읽는 동안 생성한 날짜별 Arrow table이 다음 달 처리 전에
+    해제될 수 있게 한다. 대여소 매핑은 호출부가 배치 밖에서 한 번만 생성하므로 API와
+    대여 이력 스캔을 달마다 반복하지 않는다.
+    """
+    if not days or not batch_by_month:
+        return [days]
+    batches: list[list[date]] = []
+    for day in days:
+        if not batches or (batches[-1][0].year, batches[-1][0].month) != (
+            day.year,
+            day.month,
+        ):
+            batches.append([])
+        batches[-1].append(day)
+    return batches
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -111,13 +146,35 @@ def main(argv: list[str] | None = None) -> int:
         # 매핑표는 API를 여러 번 부르므로 범위 전체에 대해 한 번만 만든다.
         station_map = station_join.build(csv_dir) if bcfg.join else None
         station_map_stats = station_map.stats if station_map else None
-        by_date = csv_source.read_by_date(bcfg, csv_dir, set(days), station_map)
-        for day in days:
-            table = by_date.get(day)
-            rows = table.to_pylist() if table is not None else []
-            results.append(runner.load_date(
-                scfg, bcfg, day, rows, force=args.force, station_map_stats=station_map_stats,
-            ))
+        day_batches = _csv_day_batches(days, args.csv_batch_by_month)
+        for batch_number, day_batch in enumerate(day_batches, start=1):
+            if args.csv_batch_by_month:
+                logger.info(
+                    f"stage=bootstrap_csv source={args.source} batch={batch_number}/"
+                    f"{len(day_batches)} month={day_batch[0]:%Y-%m} days={len(day_batch)}"
+                )
+            by_date = csv_source.read_by_date(
+                bcfg, csv_dir, set(day_batch), station_map
+            )
+            for day in day_batch:
+                table = by_date.get(day)
+                rows = table.to_pylist() if table is not None else []
+                empty_options = (
+                    {"materialize_empty": True}
+                    if args.materialize_empty_archive
+                    else {}
+                )
+                results.append(
+                    runner.load_date(
+                        scfg,
+                        bcfg,
+                        day,
+                        rows,
+                        force=args.force,
+                        station_map_stats=station_map_stats,
+                        **empty_options,
+                    )
+                )
     else:
         consecutive_failures = 0
         with httpx.Client(timeout=60.0) as client:

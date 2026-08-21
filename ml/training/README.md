@@ -22,7 +22,7 @@ brew install libomp   # macOS에서 LightGBM 실행에 필요
 
 ## 학습 실행
 
-최초 챔피언은 아래처럼 feature 생성과 학습 양쪽에 같은 명시적 구간을 주어
+2025년 전체 운영 후보는 아래처럼 feature 생성과 학습 양쪽에 같은 명시적 구간을 주어
 2025년 전체를 정확히 사용한다. 두 변수는 반드시 쌍으로 지정해야 하며, 한쪽만
 있거나 날짜 형식이 잘못됐거나 시작일이 종료일보다 늦으면 실행 전에 실패한다.
 
@@ -37,8 +37,10 @@ export TRAIN_WINDOW_START=2025-01-01
 export TRAIN_WINDOW_END=2025-12-31
 ./feature_engine/.venv/bin/python -m feature_engine.spark.run_pipeline
 ./feature_engine/.venv/bin/python -m feature_engine.spark.build_multi_horizon_features
-./training/.venv/bin/python -m training.train_rental_model --promote-if-no-champion
-./training/.venv/bin/python -m training.train_return_model --promote-if-no-champion
+./inference/.venv/bin/python -m inference.build_station_profile
+./inference/.venv/bin/python -m inference.build_population_profile
+./training/.venv/bin/python -m training.train_rental_model
+./training/.venv/bin/python -m training.train_return_model
 unset TRAIN_WINDOW_START TRAIN_WINDOW_END
 ```
 
@@ -47,10 +49,10 @@ unset TRAIN_WINDOW_START TRAIN_WINDOW_END
 재학습 subprocess는 최초학습용 고정 구간을 상위 환경에서 상속하지 않고 이 rolling
 경로를 사용한다.
 
-`--promote-if-no-champion`은 학습 결과를 아카이브에 저장한 뒤 기존 promotion의
-profile contract 검증을 거쳐 최초 챔피언 포인터를 만든다. 같은 모델의 챔피언이
-이미 있으면 학습 전에 오류로 중단하고 포인터를 절대 덮어쓰지 않는다. 따라서 대여
-승격 후 반납 학습만 실패한 경우, 위 환경을 다시 설정하고 반납 명령만 재실행하면 된다.
+이 전체 실행은 challenger-only다. 개별 `champion/{model_name}.json` 포인터를
+순차 변경하면 rental/return이 서로 다른 계약을 가리킬 수 있으므로
+`--promote-if-no-champion`을 붙이지 않는다. 두 archive와 station dependency를
+모두 검수한 뒤 아래 pair serving release 명령으로 한 번에 게시한다.
 
 각 명령은 학습 후 poisson deviance/rmse/pinball/커버리지 지표를 출력하고,
 S3 아카이브 prefix(`{MODELS_ARCHIVE_PREFIX}/dt={MODEL_ARCHIVE_DATE}/{ML_PROFILE}/`,
@@ -67,10 +69,11 @@ S3 아카이브 prefix(`{MODELS_ARCHIVE_PREFIX}/dt={MODEL_ARCHIVE_DATE}/{ML_PROF
 | `ML_PROFILE` | 미지정(`builtin-default`) | 미지정 시 S3를 조회하지 않는 내장 g20/r20/a20 프로필. 원격 프로필은 이름을 명시하며, **feature_engine이 이 피처마트를 만들 때 쓴 프로필과 같아야 한다** |
 | `GRID_TICK_MINUTES` / `ROLLING_TICK_MINUTES` | `20` / `20` | base feature/target grid와 rolling 계산 grid. 두 값은 같아야 하며 `5, 10, 15, 20, 30, 60` 중 하나 |
 | `TRAIN_ANCHOR_TICK_MINUTES` | `GRID_TICK_MINUTES`와 같음 | multi-horizon 학습 행을 남기는 anchor 간격. base grid 이상인 배수이면서 1시간과 1일을 나눠야 한다 |
-| `TRAIN_WINDOW_START` / `TRAIN_WINDOW_END` | 미지정(rolling) | 둘 다 `YYYY-MM-DD`로 지정하면 inclusive 고정 학습 구간. 최초 챔피언은 `2025-01-01` / `2025-12-31` 사용 |
+| `TRAIN_WINDOW_START` / `TRAIN_WINDOW_END` | 미지정(rolling) | 둘 다 `YYYY-MM-DD`로 지정하면 inclusive 고정 학습 구간. 2025 전체 운영 후보는 `2025-01-01` / `2025-12-31` 사용 |
 | `TRAIN_DAY_DIVISOR` | `1` | 기본은 모든 안전한 train 날짜 사용. 로컬 검증에서만 2, 3, 5로 올려 날짜를 줄이는 비상 dial |
 | `MAX_TRAIN_HORIZON` | 제한 없음(`HORIZON_COUNT`) | 읽는 시점에 `horizon <= 이 값`으로도 한 번 더 줄인다 — 그래도 OOM이면 낮출 것(단, 그 이상 horizon 예측 품질은 검증 안 됨) |
 | `SPLIT_EMBARGO_DAYS` | horizon/target에서 계산(현재 `1`) | 같은 anchor가 train/valid/test에 걸치지 않도록 평가일 앞뒤에서 purge할 날짜 수. 계산된 최소값보다 낮출 수 없음 |
+| `LGB_DEFER_VALID_DATASET` | `false` | `true`면 native valid Dataset을 학습 중 상주시키지 않고 고정 round 학습 뒤 valid 전체를 streaming 평가/conformal에 사용. 날짜·horizon은 유지하지만 early stopping은 사용하지 않음 |
 
 `SERVING_TICK_MINUTES`는 위 학습 설정과 별개인 5분 고정 코드 계약이며 환경변수
 dial이 아니다. 따라서 기본 모델은 **g20/r20/a20으로 학습하고 5분마다 추론**한다.
@@ -100,11 +103,16 @@ g5/r5/a5와 g5/r5/a20은 base feature를 재사용하되 학습 테이블은 덮
 `FEATURE_PARAM_COMBO_ID`를 직접 지정하면 자동 base-grid 격리를 우회하므로,
 서로 다른 g/r 조합에 같은 custom ID를 재사용하면 안 된다.
 
-OOM이면 먼저 전체 horizon을 유지한 채 train 날짜를 결정적으로 줄인다. 예를 들어
+native train+valid 동시 상주 때문에 OOM이면 날짜와 horizon을 줄이기 전에
+`LGB_DEFER_VALID_DATASET=true`를 검토한다. 이 모드는 valid 전체를 평가에서
+유지하지만 early stopping 없이 `LGB_NUM_BOOST_ROUND`를 고정 실행하므로 별도
+프로필/manifest에 명시해야 한다.
+
+그래도 OOM이면 전체 horizon을 유지한 채 train 날짜를 결정적으로 줄인다. 예를 들어
 `TRAIN_DAY_DIVISOR=2`는 평가/embargo 날짜를 제외한 매월 짝수 날짜만 학습에 쓴다.
 
 ```bash
-TRAIN_DAY_DIVISOR=2 ./training/.venv/bin/python -m training.train_rental_model --promote-if-no-champion
+TRAIN_DAY_DIVISOR=2 ./training/.venv/bin/python -m training.train_rental_model
 ```
 
 그래도 부족한 로컬 검증에서는 마지막 수단으로 `MAX_TRAIN_HORIZON=6`을 함께 줄일
@@ -114,10 +122,11 @@ TRAIN_DAY_DIVISOR=2 ./training/.venv/bin/python -m training.train_rental_model -
 `TRAIN_SAMPLE_FRAC`/`VALID_SAMPLE_FRAC`/`TEST_SAMPLE_FRAC`는 실제 로더에 적용되지
 않던 가짜 dial이라 제거했으며, 설정하면 이제 즉시 오류를 낸다.
 
-남은 메모리 한계도 있다. feature 행렬은 날짜별 `lgb.Sequence`로 지연 로드하지만,
-각 split의 label/date(+대여 exposure) prepass는 아직 선택 날짜 전체를 하나의 pandas
-DataFrame으로 읽는다. 이 1차원 계열만으로도 메모리를 넘는 규모라면 날짜별 prepass
-집계로 별도 재설계해야 하며, 현재 dial이 그 peak를 해결해 주지는 않는다.
+feature 행렬은 날짜별 `lgb.Sequence`로 지연 로드하고, label/exposure prepass도
+날짜별로 읽어 삭제 예약된 로컬 scratch memmap에 이어 쓴다. 따라서 전체 기간의
+pandas 합본은 만들지 않지만, label/exposure/init-score와 Spark 피처 단계의 spill을
+수용할 충분한 로컬 디스크가 필요하다. 2025년 전체 대여 prepass의 과거 eager 합본은
+process-tree RSS 23.64GiB에서 32GB WSL 보호선을 넘겨 이 경로로 교체됐다.
 
 ## 산출물 (S3 아카이브)
 
@@ -155,6 +164,35 @@ DataFrame으로 읽는다. 이 1차원 계열만으로도 메모리를 넘는 �
 horizon 의미로 승격되는 것을 막기 위한 안전장치다. 최초 부트스트랩처럼 반대
 챔피언이 아직 없을 때는 현재 서빙 계약만 맞으면 승격할 수 있다. 학습 기간과
 LightGBM 파라미터만 다른 프로필은 호환되는 것으로 본다.
+
+### Pair serving release 수동 게시
+
+운영 `realtime_5min`은 개별 champion pointer가 아니라
+`models/serving-release/current.json`에 고정된 rental/return pair와 station
+dependency를 읽는다. 전체 학습과 검수를 마친 뒤 운영자가 아래 명령에 exact
+archive prefix 둘과 station 산출물을 명시해 수동 게시한다.
+
+```bash
+cd ml
+./training/.venv/bin/python -m training.publish_serving_release \
+  --rental-archive-prefix 'models/archive/dt=<RUN_ID>/<PROFILE>' \
+  --return-archive-prefix 'models/archive/dt=<RUN_ID>/<PROFILE>' \
+  --station-profile-key 'processed/features/<COMBO>/station_hourly_profile.parquet' \
+  --station-master-key 'processed_v2/station_master.parquet'
+```
+
+`--station-master-key`는 Spark multipart prefix여도 된다. 명령이 실제로 읽은 모든
+part의 bytes를 fingerprint하고 `station_id`/`station_no` 1:1 mapping을 canonical
+crosswalk JSON 한 개로 만든 뒤 content-addressed object로 고정한다. Rental/return
+모델, effective profile, crosswalk, station profile 검증을 모두 통과해야 마지막에
+단일 pointer CAS를 수행한다. 성공 출력의 `generation`, release manifest URI/SHA,
+crosswalk source fingerprint를 운영 증거로 보존한다. 입력 누락·계약 불일치·CAS
+충돌 시 기존 pointer는 유지된다.
+
+기존 release/champion과 serving feature 계약이 달라지는 maintenance migration만
+사전 승인 후 `--allow-contract-change`를 명시한다. 월별 자동 재학습 경로에는 이
+옵션을 연결하지 않는다. 특히 #163 최초 full-year 산출물은 challenger 검수와 5분
+smoke를 마친 뒤 이 수동 명령으로만 게시한다.
 
 ## 월별 성능 모니터링 / 재학습 트리거
 

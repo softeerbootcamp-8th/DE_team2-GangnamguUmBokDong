@@ -190,6 +190,64 @@ def test_dry_run_reads_metadata_without_creating_output(tmp_path, capsys):
     assert "compressed_bytes=" in output
 
 
+def test_rental_context_selects_boundary_months_without_other_sources(tmp_path):
+    """본 기간 밖 컨텍스트는 대여 이력만 선택하고 재고·인구를 요구하지 않는다."""
+    entries = _entries()
+    entries.update(
+        {
+            "bundle/raw/서울특별시 공공자전거 대여이력 정보_2412.csv": b"rent-dec",
+            "bundle/raw/서울특별시 공공자전거 대여이력 정보_2503.csv": b"rent-mar",
+        }
+    )
+    zip_path = _write_zip(tmp_path / "context.zip", entries)
+    output_root = tmp_path / "out"
+
+    summary = zip_stage.stage(
+        zip_path,
+        output_root / "bootstrap",
+        output_root / "population",
+        date(2025, 1, 31),
+        date(2025, 2, 1),
+        rental_context_before_days=35,
+        rental_context_after_days=31,
+    )
+
+    assert summary.file_count == 9
+    assert (
+        output_root / "bootstrap/서울특별시 공공자전거 대여이력 정보_2412.csv"
+    ).read_bytes() == b"rent-dec"
+    assert (
+        output_root / "bootstrap/서울특별시 공공자전거 대여이력 정보_2503.csv"
+    ).read_bytes() == b"rent-mar"
+
+
+@pytest.mark.parametrize("option", ["--rental-context-before-days", "--rental-context-after-days"])
+def test_negative_rental_context_is_rejected(tmp_path, option):
+    """음수 대여 컨텍스트는 출력 전에 명시적으로 거부한다."""
+    zip_path = _write_zip(tmp_path / "small.zip", _entries())
+
+    exit_code = zip_stage.main(
+        [
+            "--zip",
+            str(zip_path),
+            "--bootstrap-dir",
+            str(tmp_path / "bootstrap"),
+            "--population-dir",
+            str(tmp_path / "population"),
+            "--from",
+            "2025-01-31",
+            "--to",
+            "2025-02-01",
+            option,
+            "-1",
+            "--dry-run",
+        ]
+    )
+
+    assert exit_code == 1
+    assert not (tmp_path / "bootstrap").exists()
+
+
 def test_existing_output_requires_force_and_force_replaces_atomically(tmp_path):
     """기본은 덮어쓰지 않고 force에서만 기존 파일을 교체한다."""
     zip_path = _write_zip(tmp_path / "small.zip", _entries())

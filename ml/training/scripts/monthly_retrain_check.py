@@ -147,31 +147,29 @@ def _champion_profile_name(model_name: str) -> str | None:
 def _candidate_profiles(model_name: str) -> list[tuple[str, dict[str, str]]]:
     """시도할 (프로필 이름, 이 시도에만 덮어쓸 환경변수) 순서.
 
-    **1차**: 챔피언이 실제로 학습됐던 프로필을 그대로 쓰되(임베고/앵커/LGB
-    파라미터 등은 안 건드림), 학습기간만 지금 프로세스의 기본 롤링 윈도우
-    (`TRAIN_LOOKBACK_MONTHS`, 최신 증분 포함)로 갱신해서 재시도한다 — "성능이
-    나빠졌으니 일단 최신 데이터로 다시 학습해보자"가 첫 시도여야지, 하이퍼파라미터
-    자체를 바꾸는 건 별개 문제라 여기서 같이 안 한다. `common_config.py`가
-    이미 `TRAIN_LOOKBACK_MONTHS` 환경변수를 프로필 값 위에 override할 수 있게
-    지원하므로(`_int_env()`), 프로필 자체를 새로 만들어 S3에 올릴 필요 없이
-    이 환경변수 하나만 얹으면 된다.
-    **2차 이후**: 그래도 챔피언을 못 넘으면, 미리 등록해둔 다른 프로필
-    (`ml_core.profile_registry.push_profile()`로 생성)을 이름순으로 검토한다.
-    현재 서빙 계약과 같은 후보(LGB/학습 전용 설정 차이)만 실제로 실행하고,
-    임베고/앵커처럼 피처 의미가 다른 후보는 `_validate_candidate_serving_contract()`가
-    무거운 작업 전에 건너뛴다. 이쪽은 프로필에 저장된 기간 값을 그대로 쓴다.
-
-    S3 `profiles/` 목록이 비어 있거나 조회에 실패해도(`list_profile_names()`가
-    `[]` 반환) 1차 시도와 내장 `builtin-default`는 항상 존재한다. 기존 챔피언이
-    원격 프로필이면 그 조건으로 최신 데이터 재학습을 먼저 시도한 뒤, 새 코드의
-    안전한 5분 내장 기본값도 후보로 검토해야 한다(현재 서빙 계약과 다르면 preflight에서
-    건너뜀). 이름이 겹치면 한 번만 남긴다.
+    **1차**: 챔피언이 실제로 학습됐던 프로필을 그대로 쓰되, 학습기간만 지금
+    프로세스의 기본 롤링 윈도우(`TRAIN_LOOKBACK_MONTHS`, 최신 증분 포함)로 갱신해서
+    재시도한다.
+    **2차**: 해당 모델 전용 프로필(`{model_name}_*` 형식, 예: `rental_embargo45`).
+    **3차**: 내장 기본값(`builtin-default`) 및 일반 공통 프로필.
+    단, 타 모델 전용 프로필(예: 대여 모델 시도 시 `return_*`)은 후보에서 제외한다.
     """
     primary = _champion_profile_name(model_name) or common_config.PROFILE_NAME
+    other_model = "return" if model_name == "rental" else "rental"
+
+    remote_profiles = common_config.list_profile_names()
+    # 타 모델 전용 프로필 제외
+    valid_remotes = [p for p in remote_profiles if not p.startswith(f"{other_model}_")]
+
+    # 해당 모델 전용 프로필을 일반 공통 프로필보다 우선 시도
+    model_specific = sorted([p for p in valid_remotes if p.startswith(f"{model_name}_")])
+    general_remotes = sorted([p for p in valid_remotes if not p.startswith(f"{model_name}_")])
+
     ordered_names = [
         primary,
+        *model_specific,
         common_config.BUILTIN_PROFILE_NAME,
-        *sorted(common_config.list_profile_names()),
+        *general_remotes,
     ]
     unique_names = list(dict.fromkeys(ordered_names))
     refreshed_period = {"TRAIN_LOOKBACK_MONTHS": str(common_config.TRAIN_LOOKBACK_MONTHS)}
@@ -307,27 +305,45 @@ def _run_training_subprocess(
     return metrics
 
 
-def _attempt_promotion(model_name: str, champion_metrics: dict | None) -> bool:
-    """프로필을 하나씩 시도해가며 챔피언을 넘어서는 챌린저가 나올 때까지 재학습한다.
+def _attempt_promotion(
+    model_name: str,
+    champion_metrics: dict | None,
+    *,
+    skip_feature_pipeline: bool = False,
+    target_profile: str | None = None,
+    archive_date: str | None = None,
+) -> bool:
+    """후보 프로필을 시도하며 챔피언을 대체할 최적의 챌린저를 선정하여 승격한다.
+
+    1. 완전 기준(Deviance 개선 및 Coverage 정상)을 충족하는 후보 중 Deviance가 가장 낮은 후보로 승격한다.
+    2. 완전 기준에 미달하더라도 챔피언보다 Deviance가 우수한 후보가 있다면 그중 최선의 후보로 차선책 승격한다.
+    3. 모든 후보가 챔피언보다 열세라면 챔피언을 그대로 유지하고 실패 로그를 남긴다.
 
     args:
         model_name: "rental" 또는 "return"
-        champion_metrics: 현재 챔피언의 metrics.json (아직 챔피언이 없으면 None —
-            이 경우 첫 학습 결과가 무조건 승격된다, should_promote() 참고)
+        champion_metrics: 현재 챔피언의 metrics.json (없으면 None)
+        skip_feature_pipeline: True면 EMR이 이미 피처를 생성했다고 보고 Spark 생략
+        target_profile: 특정 프로필만 단독 실행할 때 프로필 이름
+        archive_date: 아카이브 날짜 접미사 (None이면 새로 생성)
     returns:
         bool: 승격이 일어났는지
     """
-    # 날짜만 쓰면(예: "2026-08-19") 같은 날 이 스크립트를 다시 --execute로 실행할
-    # 때(수동 재실행, 부분 실패 후 재시도 등) archive_prefix가 이전 시도와 겹친다
-    # — 이미 그 prefix가 챔피언 포인터가 가리키는 곳이라면, 학습 subprocess가
-    # 파일을 그 자리에 다시 쓰는 순간 원자적 포인터 설계가 무력화된다(should_promote()
-    # 가 이 챌린저를 반려해도 이미 챔피언 아티팩트는 비원자적으로 교체된 뒤 —
-    # 리뷰 지적). unique_archive_date()가 실행마다 고유한 접미사를 붙여
-    # archive_prefix 자체가 항상 새 위치를 가리키게 한다(archive가 immutable이라는
-    # 가정을 실제로 보장 — train_rental_model.py/train_return_model.py의
-    # MODEL_ARCHIVE_DATE 미지정 기본값도 동일한 이유로 같은 함수를 쓴다).
-    archive_date = unique_archive_date()
-    for profile_name, env_overrides in _candidate_profiles(model_name):
+    exec_archive_date = archive_date or unique_archive_date()
+    candidates = (
+        [(target_profile, {})]
+        if target_profile
+        else _candidate_profiles(model_name)
+    )
+
+    champion_deviance = (
+        champion_metrics["poisson_deviance_test"]
+        if champion_metrics and "poisson_deviance_test" in champion_metrics
+        else float("inf")
+    )
+
+    evaluated_candidates: list[dict] = []
+
+    for profile_name, env_overrides in candidates:
         try:
             _validate_candidate_serving_contract(profile_name, env_overrides)
         except ServingProfileContractError as exc:
@@ -336,33 +352,88 @@ def _attempt_promotion(model_name: str, champion_metrics: dict | None) -> bool:
                 "— feature 생성/학습을 시작하지 않음"
             )
             continue
+
         try:
-            _trigger_feature_pipeline(profile_name, env_overrides)
-            challenger_metrics = _run_training_subprocess(model_name, profile_name, archive_date, env_overrides)
+            if not skip_feature_pipeline:
+                _trigger_feature_pipeline(profile_name, env_overrides)
+            challenger_metrics = _run_training_subprocess(
+                model_name, profile_name, exec_archive_date, env_overrides
+            )
         except subprocess.CalledProcessError as exc:
             _notify(f"[{model_name}] '{profile_name}' 시도 실패(subprocess 오류: {exc}) — 다음 프로필로 넘어감")
+            continue
+        except (RuntimeError, OSError, ValueError) as exc:
+            _notify(f"[{model_name}] '{profile_name}' 실행 중 오류 발생: {exc}")
             continue
 
         promote, reasons = should_promote(challenger_metrics, champion_metrics)
         for reason in reasons:
             _notify(f"[{model_name}] '{profile_name}' 판정 — {reason}")
 
-        if promote:
-            archive_prefix = archive_models_prefix(archive_date, profile_name)
-            try:
-                promote_challenger(model_name, archive_prefix)
-            except ServingProfileContractError as exc:
-                _notify(
-                    f"[{model_name}] '{profile_name}' 챌린저 승격 거부(서빙 계약 불일치: {exc}) "
-                    "— 다음 프로필로 넘어감"
-                )
-                continue
-            _notify(f"[{model_name}] '{profile_name}' 챌린저를 챔피언으로 승격 — 포인터가 {archive_prefix}를 가리키도록 전환")
+        challenger_deviance = challenger_metrics.get("poisson_deviance_test", float("inf"))
+        is_better = challenger_deviance < champion_deviance
+        archive_prefix = archive_models_prefix(exec_archive_date, profile_name)
+
+        evaluated_candidates.append(
+            {
+                "profile_name": profile_name,
+                "archive_prefix": archive_prefix,
+                "metrics": challenger_metrics,
+                "deviance": challenger_deviance,
+                "fully_qualified": promote,
+                "better_than_champion": is_better,
+                "reasons": reasons,
+            }
+        )
+
+        # 단일 프로필 지정 모드이고 완전 충족 시 바로 승격 시도
+        if target_profile and promote:
+            break
+
+    if not evaluated_candidates:
+        _notify(f"[{model_name}] 실행 가능한 후보 프로필이 없음 — 챔피언 유지")
+        return False
+
+    # 1순위: 완전 충족 후보 중 최저 deviance 순서로 시도
+    fully_qualified = sorted(
+        [c for c in evaluated_candidates if c["fully_qualified"]],
+        key=lambda c: c["deviance"],
+    )
+    for best in fully_qualified:
+        try:
+            promote_challenger(model_name, best["archive_prefix"])
+            _notify(
+                f"[{model_name}] '{best['profile_name']}' 완전 승격 기준 충족 "
+                f"(deviance={best['deviance']:.4f}) — 챔피언으로 승격 ({best['archive_prefix']})"
+            )
             return True
+        except ServingProfileContractError as exc:
+            _notify(f"[{model_name}] '{best['profile_name']}' 승격 거부(서빙 계약 불일치: {exc}) — 다음 후보 시도")
 
-        _notify(f"[{model_name}] '{profile_name}' 챌린저가 기준 미달 — 다음 프로필 시도")
+    # 2순위: 완전 기준(Coverage 등)은 미달했으나 챔피언보다 Deviance가 우수한 후보 중 최저 deviance 순서로 시도
+    better_candidates = sorted(
+        [c for c in evaluated_candidates if c["better_than_champion"]],
+        key=lambda c: c["deviance"],
+    )
+    for best in better_candidates:
+        try:
+            promote_challenger(model_name, best["archive_prefix"])
+            _notify(
+                f"[{model_name}] '{best['profile_name']}' 완전 기준(Coverage 등)에는 미달했으나 "
+                f"기존 챔피언보다 성능 우수 (deviance {best['deviance']:.4f} < {champion_deviance:.4f}) "
+                f"— 차선책으로 챔피언 교체 ({best['archive_prefix']})"
+            )
+            return True
+        except ServingProfileContractError as exc:
+            _notify(f"[{model_name}] '{best['profile_name']}' 승격 거부(서빙 계약 불일치: {exc}) — 다음 후보 시도")
 
-    _notify(f"[{model_name}] 가능한 프로필을 모두 시도했지만 챔피언을 넘어서지 못함 — 챔피언 유지, 다음 달에 재시도")
+    # 3순위: 챔피언보다 뛰어난 후보가 없음 -> 유지
+    best_attempt = min(evaluated_candidates, key=lambda c: c["deviance"])
+    _notify(
+        f"[{model_name}] 가능한 프로필({len(evaluated_candidates)}개)을 모두 시도했지만 "
+        f"챔피언보다 뛰어난 모델이 없음 (최선 deviance={best_attempt['deviance']:.4f} >= 챔피언 {champion_deviance:.4f}) "
+        "— 기존 챔피언 유지, 다음 달에 재시도"
+    )
     return False
 
 
@@ -375,36 +446,92 @@ def main() -> list[dict]:
         help="기준 미달 모델이 있으면 실제로 챌린저 학습을 시도한다 (기본은 리포트만 찍는 dry-run)",
     )
     parser.add_argument(
+        "--check-only",
+        action="store_true",
+        help="성능 점검만 수행하고 재학습은 일체 진행하지 않는다",
+    )
+    parser.add_argument(
+        "--skip-feature-pipeline",
+        action="store_true",
+        help="EMR 등에서 피처마트가 이미 생성되었다고 가정하고 Spark 생성을 건너뛴다",
+    )
+    parser.add_argument(
+        "--profile-name",
+        default=None,
+        help="특정 프로필 하나만 지정하여 학습/평가를 수행한다",
+    )
+    parser.add_argument(
+        "--models",
+        default=None,
+        help="쉼표로 구분된 대상 모델 목록 (예: 'rental,return' 또는 'rental')",
+    )
+    parser.add_argument(
+        "--json-output",
+        action="store_true",
+        help="점검 또는 실행 결과를 JSON 문자열로 출력한다",
+    )
+    parser.add_argument(
         "--as-of",
         default=None,
-        help="기준 날짜(YYYY-MM-DD) override — 기본은 오늘. 과거 특정 달을 다시 점검하거나 "
-        "(feature mart 범위 밖인) 운영 환경 밖에서 테스트할 때 사용",
+        help="기준 날짜(YYYY-MM-DD) override — 기본은 오늘",
     )
     args = parser.parse_args()
 
     results = check_all_models(as_of=args.as_of)
-    _print_report(results)
+    if not args.json_output:
+        _print_report(results)
 
-    retrain_needed = [r for r in results if r["needs_retrain"]]
-    if not retrain_needed:
-        _notify("모든 모델이 기준 이내 — 재학습 시도 없음")
+    requested_models = (
+        [m.strip() for m in args.models.split(",") if m.strip()]
+        if args.models
+        else None
+    )
+    relevant_results = (
+        [r for r in results if r["model_name"] in requested_models]
+        if requested_models
+        else results
+    )
+    retrain_needed = [r for r in relevant_results if r["needs_retrain"]]
+    target_models = [r["model_name"] for r in retrain_needed]
+
+    if args.check_only or not args.execute:
+        summary = {
+            "needs_retrain": len(retrain_needed) > 0,
+            "retrain_models": [r["model_name"] for r in retrain_needed],
+            "candidate_profiles": list(dict.fromkeys(
+                name for r in retrain_needed for name, _ in _candidate_profiles(r["model_name"])
+            )) if retrain_needed else [],
+            "results": relevant_results,
+        }
+        if args.json_output:
+            import json
+            print(json.dumps(summary, ensure_ascii=False, indent=2))
+        else:
+            if not retrain_needed:
+                _notify("모든 모델이 기준 이내 — 재학습 필요 없음")
+            else:
+                _notify(
+                    f"기준 미달 모델 {len(retrain_needed)}개 — 실제 재학습은 --execute로 다시 실행하세요 "
+                    "(지금은 dry-run/check-only라 아무것도 바꾸지 않았습니다)"
+                )
+        return relevant_results
+
+    if not target_models:
+        _notify("재학습 대상 모델이 없음 — 종료")
         return results
 
-    if not args.execute:
-        _notify(
-            f"기준 미달 모델 {len(retrain_needed)}개 — 실제 재학습은 --execute로 다시 실행하세요 "
-            "(지금은 dry-run이라 아무것도 바꾸지 않았습니다)"
-        )
-        return results
-
-    _notify(f"=== 챌린저 재학습 시도 시작 ({len(retrain_needed)}개 모델) ===")
-    for r in retrain_needed:
-        model_name = r["model_name"]
+    _notify(f"=== 챌린저 재학습 시도 시작 ({len(target_models)}개 모델: {target_models}) ===")
+    for model_name in target_models:
         try:
             champion_metrics = _load_baseline_metrics(model_name)
         except FileNotFoundError:
             champion_metrics = None
-        _attempt_promotion(model_name, champion_metrics)
+        _attempt_promotion(
+            model_name,
+            champion_metrics,
+            skip_feature_pipeline=args.skip_feature_pipeline,
+            target_profile=args.profile_name,
+        )
 
     return results
 

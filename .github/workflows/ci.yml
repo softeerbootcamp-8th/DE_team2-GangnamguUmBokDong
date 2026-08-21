@@ -74,12 +74,58 @@ jobs:
         if: always()
         run: make down
 
+  arm64-compatibility:
+    name: Arm64 Compatibility
+    runs-on: ubuntu-24.04-arm
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: false
+
+      - name: Set up Python
+        run: uv python install
+
+      - name: Verify native architecture
+        run: test "$(uname -m)" = "aarch64"
+
+      - name: Sync Graviton runtime dependencies
+        run: |
+          for project in \
+            airflow collector apps/api ml/inference ml/training ml/feature_engine \
+            libs/core libs/ml_core normalizer nowcaster loader rebalance; do
+            echo "==> ${project}"
+            (cd "${project}" && uv sync --frozen)
+          done
+
+      - name: Test Arm model runtime paths
+        run: |
+          (cd airflow && uv run pytest -q)
+          (cd collector && uv run pytest -q)
+          (cd ml/inference && uv run pytest -q)
+          (cd ml/training && uv run pytest -q)
+          (cd libs/ml_core && uv run pytest -q)
+
+      - name: Build Arm service images
+        run: |
+          docker build --platform linux/arm64 \
+            -f ops/compose/Dockerfile.airflow \
+            -t de-team2-airflow:arm64 .
+          docker build --platform linux/arm64 \
+            -f ops/compose/Dockerfile.mlflow \
+            -t de-team2-mlflow:arm64 .
+
   quality:
     name: Lint and Test
     if: always()
     needs:
       - unit-tests
       - integration-tests
+      - arm64-compatibility
     runs-on: ubuntu-latest
 
     steps:
@@ -87,6 +133,8 @@ jobs:
         env:
           UNIT_RESULT: ${{ needs.unit-tests.result }}
           INTEGRATION_RESULT: ${{ needs.integration-tests.result }}
+          ARM64_RESULT: ${{ needs.arm64-compatibility.result }}
         run: |
           test "$UNIT_RESULT" = "success"
           test "$INTEGRATION_RESULT" = "success"
+          test "$ARM64_RESULT" = "success"

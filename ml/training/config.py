@@ -196,6 +196,27 @@ if SPLIT_EMBARGO_DAYS < _MIN_SPLIT_EMBARGO_DAYS:
 TRAIN_PROGRESS_LOG_PATH = os.environ.get("TRAIN_PROGRESS_LOG_PATH", "training_progress.log")
 TRAIN_PROGRESS_LOG_INTERVAL_SECONDS = float(os.environ.get("TRAIN_PROGRESS_LOG_INTERVAL_SECONDS", "5"))
 
+
+def _bool_env(name: str, default: bool = False) -> bool:
+    """명시적인 true/false 환경변수를 bool로 파싱한다."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    normalized = raw.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name}은 true/false 값이어야 합니다: {raw!r}")
+
+
+# 2025 전체 d1/h12 실측에서 native train+valid Dataset을 동시에 유지한 채 첫
+# boosting round에 들어가면 31GiB WSL의 안전 한계를 넘었다. 이 opt-in 모드는
+# train Dataset만으로 고정 round를 학습한 뒤 valid 전체를 streaming predict해
+# 평가/conformal에 사용한다. 날짜나 horizon을 샘플링하지 않지만 학습 중 early
+# stopping은 쓸 수 없으므로 기본값은 False이며 실행 manifest에 반드시 기록한다.
+LGB_DEFER_VALID_DATASET = _bool_env("LGB_DEFER_VALID_DATASET")
+
 # MLflow(ops/compose의 mlflow 서비스, ml_core.mlflow_tracking이 접속을 담당)에
 # 이 실험 이름으로 run을 남긴다 — divisor/horizon 조합을 바꿔가며 여러 번 학습을
 # 시도할 때(2026-08 OOM 대응 이력) 같은 실험 아래 run들을 나란히 비교하기 위함.
@@ -209,6 +230,9 @@ CATEGORICAL_FEATURES = ["station_no"]
 # LightGBM 하이퍼파라미터 (common_config.py에서 공유 — feature_engine/spark의 SynapseML
 # 학습도 참고할 수 있게)
 LGB_PARAMS_COMMON = common_config.LGB_PARAMS_COMMON
+LGB_PARAMS_RENTAL = common_config.LGB_PARAMS_RENTAL
+LGB_PARAMS_RETURN = common_config.LGB_PARAMS_RETURN
+get_lgb_params = common_config.get_lgb_params
 LGB_NUM_BOOST_ROUND = common_config.LGB_NUM_BOOST_ROUND
 LGB_EARLY_STOPPING_ROUNDS = common_config.LGB_EARLY_STOPPING_ROUNDS
 
