@@ -72,11 +72,13 @@ variable "app_instance_type" {
 variable "train_instance_type" {
   description = <<-EOT
     학습 EC2. 평소 정지 상태로 두고 학습할 때만 켠다.
-    128GB는 "한 달 20분 anchor = peak 10.14GB"를 12개월로 외삽한 추정치다.
-    1개월 smoke test로 실측한 뒤 r7g.2xlarge(64GB)나 r7g.8xlarge(256GB)로 조정한다.
+    이 계정의 SCP(p-zypy0yfm)가 t3/t3a/t4g 버스터블 계열만 허용하고 2xlarge가
+    상한이다(2026-08-21 실측). m/c/r 계열은 전부 거부라 t4g.2xlarge(8 vCPU / 32GB)가
+    현재 가능한 최대치다. 운영진이 타입 제한을 풀어주면 r7g 계열로 되돌린다 — 같은
+    Graviton 계열이면 stop → 변경 → start로 in-place 처리되고 EBS가 유지된다.
   EOT
   type        = string
-  default     = "r7g.4xlarge"
+  default     = "t4g.2xlarge"
 }
 
 variable "app_root_volume_gb" {

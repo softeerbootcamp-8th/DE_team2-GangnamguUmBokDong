@@ -5,7 +5,7 @@
 # 함께 사라져 매번 레포 clone과 uv sync를 다시 해야 하기 때문이다 — 학습이 실패해
 # 재시도할 때 환경이 보존되는 stop/start가 낫다.
 #
-# 인스턴스 타입 변경(r7g.4xlarge ↔ r7g.8xlarge)은 같은 Graviton 계열이라 in-place로
+# 인스턴스 타입 변경(t4g.2xlarge ↔ r7g.4xlarge 등)은 같은 Graviton 계열이라 in-place로
 # 처리되고 EBS가 유지된다. terraform plan에서 `~ update in-place`인지 반드시 확인할 것.
 
 resource "aws_iam_role" "train" {

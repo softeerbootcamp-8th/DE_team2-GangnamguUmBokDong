@@ -263,9 +263,9 @@ tunnel-mlflow:
 
 # 접속 IP가 바뀌었을 때. 현재 공인 IP로 admin_cidrs를 다시 쓰고 SG 규칙만 갱신한다(10초 내외).
 allow-my-ip:
-	@IP=$$$$(curl -fsS https://checkip.amazonaws.com | tr -d '\n'); \
-	printf 'admin_cidrs = ["%s/32"]\n' "$$$$IP" > terraform/admin_cidrs.auto.tfvars; \
-	echo "admin_cidrs = $$$$IP/32"; \
+	@IP=$$(curl -fsS https://checkip.amazonaws.com | tr -d '\n'); \
+	printf 'admin_cidrs = ["%s/32"]\n' "$$IP" > terraform/admin_cidrs.auto.tfvars; \
+	echo "admin_cidrs = $$IP/32"; \
 	$(TF) apply -auto-approve
 
 train-start:
