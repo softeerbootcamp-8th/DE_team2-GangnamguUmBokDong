@@ -1,25 +1,38 @@
 # 2025 전체 모델 실행·AWS 자원 보고서
 
-## 결론
+## 한눈에 보는 진행 상태
 
-2026-08-21 기준 `develop`의 `44b4bff42a4db93cb176f704a18f450fade92469`에서
-2025 Archive 적재, `g20/r20/a20` feature/target, fallback profile, 모델 학습,
-pair serving release, 5분 추론 순서로 격리 실행했다.
+2026-08-21 기준 `develop@44b4bff`에서 아래 순서로 실행했다.
 
-- 2025 전체 feature와 profile은 완성됐다.
-- 샘플링 없는 전체 학습은 train 569,134,731행, valid 55,624,083행을 native
-  LightGBM Dataset으로 만든 뒤 학습 작업 메모리가 붙는 시점에 31.34GiB WSL의
-  안전 한계를 넘었다. rental/return 모두 같은 지점에서 중단됐다.
-- 그러므로 #163의 운영 후보 모델은 아직 생성되지 않았으며 #163 완료로 표시하면
-  안 된다. #178의 production CLI와 pair-atomic 연결 경로는 구현·검증됐지만,
-  실제 #163 산출물 게시라는 최종 조건은 64GiB 학습 머신에서 다시 실행해야 한다.
-- 로컬 검증용 `d8/h1/20 rounds` 페어는 별도
-  `dt=2026-08-21-local-smoke` archive에 만들었다. 이 페어는 연결 검증 전용이며
-  champion 또는 운영 성능 후보가 아니다.
+| 순서 | 작업 | 상태 | 결과 또는 중단 지점 |
+|---:|---|---|---|
+| 1 | 2025 원천 데이터 적재 | 완료 | 필요한 날짜와 앞뒤 context를 모두 Archive에 저장 |
+| 2 | feature·target 생성 | 완료 | rental/return mart와 fallback profile 생성 |
+| 3 | 샘플링 없는 12개월 모델 학습 | 중단 | LightGBM 첫 boosting round를 끝내기 전에 RAM 안전선 도달 |
+| 4 | 축소 모델로 배포 연결 확인 | 완료 | rental/return pair 게시와 전체 대여소 5분 추론 성공 |
+| 5 | 실제 12개월 모델 게시 | 미완료 | 3번의 전체 모델이 없으므로 아직 게시하지 않음 |
 
-실행 중인 WSL 설정은 RAM 33,654,714,368 bytes(31.34GiB), swap 8GiB였다.
-36GB로 재시작하지 않았다. 4GB를 더 주는 것보다 Windows 호스트를 보호하면서
-32GB급 실패 증거를 남기는 편이 안전하고, 아래 결과상 36GB도 운영 여유가 없다.
+### 지금 확정된 결론
+
+- 데이터·feature·fallback·serving 연결 코드는 동작한다.
+- 31.34GiB RAM에서 호스트 안전 여유 3GiB를 지키며 실행한 12개월 학습은
+  rental/return 모두 완주하지 못했다.
+- 설정된 swap 8GiB 중 최대 4.61GiB만 사용했다. **swap이 고갈돼 중단된 것이
+  아니다.** 남은 swap까지 허용했을 때의 완주 여부와 최종 메모리 peak는 모른다.
+- 64GiB는 성공 확정치가 아니라 32GiB 다음 단계의 첫 검증 요청 사양이다.
+- #163은 전체 모델이 없으므로 열어 둔다. #178도 그 전체 모델 pair를 실제로
+  게시한 뒤 닫는다.
+
+배포 연결만 검증한 `d8/h1/20 rounds` 모델은
+`dt=2026-08-21-local-smoke`에 격리했다. 이 모델은 운영 품질 후보가 아니다.
+
+### 측정 환경
+
+- WSL RAM: 31.34GiB
+- WSL swap: 8.00GiB
+- 학습 중단 조건: system 가용 RAM이 3.00GiB 미만
+- 측정 아키텍처: x86_64
+- ARM64: 네이티브 CI에서 의존성·테스트·image build만 확인
 
 ## 원천 데이터 완전성
 
@@ -35,12 +48,13 @@ pair serving release, 5분 추론 순서로 격리 실행했다.
 대체하지 않았다. 최신 station master는 2,752행이며 station mapping은
 2,682행(97.456%)이다.
 
-## 단계별 실측
+## 단계별 시간·자원 사용량
 
-모든 RSS는 wrapper가 자식 JVM을 포함한 process tree를 주기적으로 합산한 값이다.
-system peak에는 WSL의 다른 프로세스와 page cache도 포함된다.
+- `작업 peak`: 해당 명령과 자식 프로세스가 RAM에 올린 최대량
+- `WSL peak`: 다른 프로세스와 page cache까지 포함한 WSL 전체 최대 사용량
+- `임시 디스크`: 작업 중 최대로 늘어난 scratch 사용량
 
-| 단계 | 상태 | 시간 | process-tree peak RSS | system used peak | scratch peak |
+| 단계 | 상태 | 시간 | 작업 peak | WSL peak | 임시 디스크 peak |
 |---|---|---:|---:|---:|---:|
 | ZIP stage(393개) | 성공 | 82.33초 | 0.03GiB | 2.96GiB | 30.09GiB |
 | rental bootstrap | 성공 | 775.11초 | 2.85GiB | 9.85GiB | 0.00GiB |
@@ -60,10 +74,30 @@ system peak에는 WSL의 다른 프로세스와 page cache도 포함된다.
 1월 9/10은 station source가 실제 0행이라 grid도 없으므로 363일이 정상이다.
 전체 feature prefix는 19,744,507,296B다.
 
-## 전체 학습 메모리 한계
+## 12개월 전체 학습은 어디서 중단됐나
 
-전체 계약은 `TRAIN_DAY_DIVISOR=1`, horizon 1..12, train/valid/test 날짜 수
-245/24/24다. rental/return 모두 train 569,134,731행, valid 55,624,083행이다.
+### 실행 규모
+
+- 날짜 샘플링 없음: `TRAIN_DAY_DIVISOR=1`
+- 예측 범위 축소 없음: horizon 1~12
+- 날짜: train 245일, valid 24일, test 24일
+- 모델별 행 수: train 569,134,731행, valid 55,624,083행
+
+### 중단 위치
+
+학습은 다음 순서로 진행된다.
+
+1. 날짜별 Parquet에서 label과 feature를 읽는다.
+2. LightGBM용 train Dataset을 만든다.
+3. 기본 모드는 valid Dataset도 만든다. 저메모리 모드는 이 단계를 학습 뒤로 미룬다.
+4. LightGBM boosting round를 실행한다.
+5. valid/test 평가와 모델 8개 artifact 저장을 완료한다.
+
+기본 경로는 3번까지 완료했고, valid 지연 경로는 의도적으로 3번을 건너뛰었다.
+두 경로 모두 **4번의 첫 round가 끝나기 전에** RAM 안전선에 도달했다. 따라서
+전체 학습 시간과 최종 peak는 아직 측정하지 못했다.
+
+### 시도별 결과
 
 | 실행 | 개선 내용 | 종료 시점 | 시간 | process RSS peak | system used peak | system swap peak | scratch peak |
 |---|---|---|---:|---:|---:|---:|---:|
@@ -75,18 +109,15 @@ system peak에는 WSL의 다른 프로세스와 page cache도 포함된다.
 | return deferred-valid | 위 설정 + native valid 지연 | LightGBM 학습 진입에서 guard | 167.57초 | 24.55GiB | 28.73GiB | 2.06GiB | 4.24GiB |
 | return quantized | 위 설정 + quantized gradient | LightGBM 학습 진입에서 guard | 166.55초 | 25.74GiB | 29.75GiB | 2.31GiB | 4.24GiB |
 
-가용 system memory 3GiB 하한에서 해당 process group만 SIGTERM으로 종료했다.
-즉 위 수치는 실제 최종 peak가 아니라 **32GB급에서 관측 가능한 하한**이다.
-LightGBM round가 진행되기 전에 종료됐기 때문에 전체 학습 시간도 이 머신에서
-외삽해 완료 시간으로 단정할 수 없다. 첫 64GiB 실행은 rental/return을 반드시
-순차로 돌리고 같은 probe를 유지해야 한다.
+### RAM과 swap에서 확인한 범위
 
-LightGBM 공식 OOM 권고인 `histogram_pool_size`, `force_col_wise`, `max_bin`과
-4.x의 quantized gradient까지 별도 프로필로 비교했으며, train 전체를 유지하고
-native valid만 학습 뒤로 미루는 경로도 시험했다. 모두 첫 boosting round 직후
-보호선을 넘었으므로 36GB WSL 재시작을 추가로 시도할 근거보다 64GiB EC2 요청
-근거가 강하다. deferred-valid 경로는 valid 날짜/행을 버리지 않고 학습 뒤 전체
-streaming 평가·conformal에 사용하지만 early stopping 대신 고정 round를 쓴다.
+- RAM 안전선에 가장 먼저 도달한 것이 종료 원인이다.
+- swap은 최대 4.61GiB를 사용했다. 설정된 8GiB를 전부 사용하지 않았다.
+- 표의 peak는 완주 peak가 아니라 중단 시점까지 관측한 **하한**이다.
+- `force_col_wise`, histogram 512MiB, `max_bin=63`, quantized gradient, valid 지연을
+  각각 시험했지만 전체 데이터에서는 첫 round를 완료하지 못했다.
+- 따라서 “안정적으로 필요한 RAM은 32GiB보다 크다”까지만 확인됐다. 정확한 최소
+  RAM과 전체 학습 시간은 큰 swap 진단 또는 더 큰 RAM에서 완주해야 알 수 있다.
 
 ## Serving-release 검증
 
@@ -141,19 +172,24 @@ AWS 공식 사양:
 
 ### 학습 EC2
 
-`r6g.2xlarge`(8 vCPU/64GiB, Arm Graviton2, EBS-only) 1대를 필요할 때만 켜는 안을
-요청한다. 상시 `t4g.large`와 같은 Graviton2 아키텍처에서 학습·재로드·추론까지
-검증해 x86 전용 경로를 만들지 않기 위함이다. 메모리 증설 근거는 32GB급에서 두
-모델 모두 LightGBM round 시작 전에 system
-29.28GiB와 swap을 소진했고, 관측 peak가 최종 peak의 하한이라는 점이다.
+`r6g.2xlarge`(8 vCPU/64GiB, Arm Graviton2, EBS-only)는 성공이 확정된 최소 사양이
+아니라 첫 검증 요청 사양이다. 32GiB급에서 두 모델 모두 LightGBM 첫 round 전에
+system used 29.75GiB, swap 4.61GiB까지 관측됐다. 3GiB RAM 안전 여유를 지키는
+32GiB 환경이 부족하다는 것은 확인됐지만, swap 8GiB가 고갈된 것은 아니며 보호
+종료 이후의 최종 peak는 모른다. R6g의 32GiB 다음 표준 크기가 64GiB이고 상시
+t4g와 같은 Graviton2에서 학습·재로드·추론을 검증할 수 있어 먼저 요청한다.
 최소 100GiB gp3 scratch를 붙이고 rental/return을 순차 실행한다. 첫 실행에서도
-동일한 3GiB guard를 유지하며 64GiB를 넘으면 그 manifest로 다음 증설을 판단한다.
+동일한 3GiB guard를 유지하며, 성공해야만 64GiB를 확정하고 guard가 작동하면 그
+manifest로 다음 증설을 판단한다.
 
 여기서 100GiB gp3는 feature/label 임시 파일용 scratch이며 swap 권고가 아니다.
-100GiB swap을 만들고 memory guard를 해제하면 12개월 학습이 더 진행될 가능성은
-있지만, 5.69억 행 LightGBM의 무작위 접근이 disk paging으로 바뀌어 실행 시간이
-수일 이상으로 늘거나 WSL/Windows가 응답 불능이 될 수 있고 완주도 보장하지 않는다.
-따라서 swap 증설 결과는 운영 학습 성공이나 EC2 RAM 산정 근거로 인정하지 않는다.
+다만 최소 RAM 범위를 먼저 좁혀야 한다면 32GiB RAM에 큰 swap을 붙인 별도 진단
+실험은 의미가 있다. 완주 시 peak system memory와 peak swap을 함께 기록하면 64GiB
+요청을 보강하거나 128GiB로 바로 올릴 근거가 된다. 이 합은 page cache와 inactive
+page를 포함해 필요한 물리 RAM과 정확히 1:1은 아니므로 보수적으로 해석한다.
+5.69억 행 LightGBM의 무작위 접근이 disk paging으로 바뀌면 수일 이상 걸리거나
+WSL/Windows가 응답 불능이 될 수 있으므로 swap 완주는 운영 성공으로 인정하지 않고,
+실행 시간 제한·swap 사용 상한·진행 로그를 둔 자원 진단으로만 수행한다.
 
 `r6g.2xlarge`가 대상 리전에 없거나 승인 정책상 최신 세대만 가능하면 같은 Arm64
 계약의 `r7g.2xlarge`(8 vCPU/64GiB)를 대안으로 요청한다. x86 `r6i.2xlarge`는
@@ -238,6 +274,7 @@ valid 상주가 다시 병목일 때만 별도 프로필로 사용하고, 이 �
    확인한다.
 3. 그 **전체 모델 페어**에 대해서만 수동 serving-release CLI를 실행하고 :00/:05
    12-horizon smoke를 반복한다. 로컬 smoke pointer를 운영으로 복사하지 않는다.
-4. 상시 `t4g.large`에서 backfill·compaction·collector·Airflow·inference 동시
-   soak를 수행해 8GiB 유지 또는 16GiB 요청을 최종 결정한다.
+4. 배정된 `t4g.large`에서는 MLflow/Web을 제외하고 작업을 직렬화한 축소 운영안만
+   확인한다. 초기 all-in-one 구성은 로컬 peak가 8GiB를 넘었으므로 16GiB 또는
+   두 대 분리를 요청한다.
 5. EMR 5노드에서 executor/driver peak와 실제 EBS shuffle 사용량을 다시 계측한다.
