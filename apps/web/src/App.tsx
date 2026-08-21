@@ -56,6 +56,7 @@ export default function App() {
   const [routes, setRoutes] = useState<Route[]>([]);
   const [routesError, setRoutesError] = useState(false);
   const [routesInitialized, setRoutesInitialized] = useState(false);
+  const routeMutationGenerationRef = useRef(0);
   const [listMode, setListMode] = useState<ListMode>("routes");
   const [selectedRouteId, setSelectedRouteId] = useState<string | null>(null);
   const selectedRouteIdRef = useRef<string | null>(null);
@@ -159,8 +160,13 @@ export default function App() {
     let requestGeneration = 0;
     function refresh() {
       const currentGeneration = ++requestGeneration;
+      const currentMutationGeneration = routeMutationGenerationRef.current;
       fetchAllRoutes(selectedRegion).then((data) => {
-        if (cancelled || currentGeneration !== requestGeneration) return;
+        if (
+          cancelled
+          || currentGeneration !== requestGeneration
+          || currentMutationGeneration !== routeMutationGenerationRef.current
+        ) return;
         setRoutes(data);
         setRoutesError(false);
         setRoutesInitialized(true);
@@ -176,7 +182,11 @@ export default function App() {
         setSelectedRouteId(nextRoute?.route_id ?? null);
         if (nextRoute?.stops[0]) selectStation(nextRoute.stops[0].sta_id);
       }).catch(() => {
-        if (!cancelled && currentGeneration === requestGeneration) {
+        if (
+          !cancelled
+          && currentGeneration === requestGeneration
+          && currentMutationGeneration === routeMutationGenerationRef.current
+        ) {
           setRoutes([]);
           setRoutesError(true);
           setRoutesInitialized(true);
@@ -268,6 +278,7 @@ export default function App() {
 
   async function transitionRoute(route: Route, transition: RouteTransition) {
     if (busyRouteId) return;
+    routeMutationGenerationRef.current += 1;
     setBusyRouteId(route.route_id);
     setRouteTransitionError(null);
     try {
@@ -276,8 +287,10 @@ export default function App() {
         : transition === "complete"
           ? await api.completeRoute(route.route_id)
           : await api.cancelRoute(route.route_id);
+      routeMutationGenerationRef.current += 1;
       setRoutes((current) => current.map((item) => item.route_id === updated.route_id ? updated : item));
     } catch (error) {
+      routeMutationGenerationRef.current += 1;
       setRouteTransitionError(error instanceof Error ? error.message : "작업 상태를 변경하지 못했습니다.");
     } finally {
       setBusyRouteId(null);

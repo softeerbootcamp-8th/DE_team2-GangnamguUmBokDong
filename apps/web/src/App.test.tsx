@@ -183,6 +183,29 @@ describe("App polling state", () => {
     expect(apiMock.dispatchRoute).toHaveBeenCalledWith(ROUTES[0].route_id);
   });
 
+  it("승인 전에 시작한 polling 응답이 승인 완료 상태를 덮지 못한다", async () => {
+    const staleRoutes = deferred<Route[]>();
+    apiMock.stations.mockResolvedValue(STATIONS);
+    apiMock.routes.mockResolvedValueOnce(ROUTES).mockReturnValueOnce(staleRoutes.promise);
+    render(<App />);
+    await settleRequests();
+    await settleRequests();
+
+    await act(async () => {
+      vi.advanceTimersByTime(30_000);
+      await Promise.resolve();
+    });
+    fireEvent.click(screen.getByRole("button", { name: "승인" }));
+    await settleRequests();
+    expect(screen.getByRole("button", { name: "완료" })).not.toBeNull();
+
+    staleRoutes.resolve(ROUTES);
+    await settleRequests();
+
+    expect(screen.queryByRole("button", { name: "승인" })).toBeNull();
+    expect(screen.getByRole("button", { name: "완료" })).not.toBeNull();
+  });
+
   it("대여소 선택을 바꾸는 즉시 이전 forecast를 지운다", async () => {
     apiMock.stations.mockResolvedValue(STATIONS);
     apiMock.forecast.mockResolvedValueOnce(FORECAST).mockReturnValueOnce(new Promise(() => {}));
