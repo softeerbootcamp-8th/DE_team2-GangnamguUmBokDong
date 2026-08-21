@@ -1,9 +1,7 @@
 """5분 운영 체인을 immutable plan과 coordinated Gold release로 실행한다."""
 
 import pendulum
-from airflow import DAG
 from airflow.timetables.trigger import CronTriggerTimetable
-
 from config.schedules import CATCHUP, MAX_ACTIVE_RUNS, REALTIME_5MIN_CRON, TIMEZONE
 from config.sources import REALTIME_5MIN_SOURCES, RENTAL_HISTORY_LOOKBACK_HOURS
 from orchestration.collector_task import (
@@ -16,8 +14,11 @@ from orchestration.routes_task import build_routes_task
 from orchestration.serving_task import (
     build_finalize_serving_task,
     build_prepare_serving_task,
+    build_weather_manifest_sensor,
 )
 from orchestration.urgency_task import build_urgency_task
+
+from airflow import DAG
 
 with DAG(
     dag_id="realtime_5min",
@@ -34,8 +35,12 @@ with DAG(
     run_normalizer = build_normalizer_task(dag)
     collector_tasks["population_realtime"] >> run_normalizer
 
-    prepare_plan = build_prepare_serving_task(dag)
-    collector_tasks["bike_station_realtime"] >> prepare_plan
+    wait_for_weather = build_weather_manifest_sensor(dag)
+    prepare_plan = build_prepare_serving_task(
+        dag,
+        trigger_rule="none_failed_min_one_success",
+    )
+    [collector_tasks["bike_station_realtime"], wait_for_weather] >> prepare_plan
 
     run_inference = build_inference_task(dag, plan_task_id=prepare_plan.task_id)
     [

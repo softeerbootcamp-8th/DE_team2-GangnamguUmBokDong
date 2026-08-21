@@ -986,20 +986,6 @@ def publish_serving_plan(
             object_store,
             weather_prepared,
         )
-        weather_forecast._require_latest_source(
-            source_catalog,
-            short_artifact,
-            weather_forecast.SHORT_TERM_SOURCE_ID,
-            plan.logical_dttm,
-            plan.source_lookbacks.short_term,
-        )
-        weather_forecast._require_latest_source(
-            source_catalog,
-            ultra_artifact,
-            weather_forecast.ULTRA_SHORT_SOURCE_ID,
-            plan.logical_dttm,
-            plan.source_lookbacks.ultra_short,
-        )
         weather_projection_locked = _weather_projection_from_artifacts(
             object_store,
             short_term_artifact=short_artifact,

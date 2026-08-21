@@ -8,9 +8,9 @@ from datetime import UTC, datetime
 from types import SimpleNamespace
 
 import pytest
-from core.gold_publication import ContractViolation, PublicationOutcome
-
 import serving_cli
+from core.gold_publication import ContractViolation, PublicationOutcome
+from core.source_snapshot import SourceSnapshotStatus
 
 
 class _CatalogClient:
@@ -23,6 +23,74 @@ class _CatalogClient:
     def get_object(self, **_kwargs):
         """이 fixture에서 호출되면 실패한다."""
         raise AssertionError("unexpected GET")
+
+
+class _WeatherCatalog:
+    """날씨 readiness가 요청한 exact window를 기록하는 fixture catalog다."""
+
+    def __init__(self, missing: set[str] | None = None) -> None:
+        """누락시킬 source와 호출 기록을 초기화한다."""
+        self.missing = missing or set()
+        self.calls: list[tuple[str, datetime]] = []
+
+    def exact_window(self, source_id, logical):
+        """요청 source가 준비됐으면 성공 authority fixture를 반환한다."""
+        self.calls.append((source_id, logical))
+        if source_id in self.missing:
+            raise ContractViolation("not ready")
+        return SimpleNamespace(
+            manifest=SimpleNamespace(status=SourceSnapshotStatus.SUCCEEDED)
+        )
+
+
+def test_weather_ready_skips_polling_between_ten_minute_boundaries(monkeypatch) -> None:
+    """5분 중간 tick에는 runtime/S3 조회 없이 즉시 준비 완료한다."""
+    monkeypatch.setattr(
+        serving_cli,
+        "_runtime",
+        lambda: pytest.fail("5분 중간 tick은 S3를 조회하면 안 됩니다."),
+    )
+
+    assert serving_cli.weather_sources_ready(
+        datetime(2026, 8, 20, 10, 5, tzinfo=serving_cli.ZoneInfo("Asia/Seoul"))
+    )
+
+
+def test_weather_ready_requires_ultra_short_on_ten_minute_boundary(monkeypatch) -> None:
+    """일반 10분 경계에는 같은 logical 초단기예보 authority만 기다린다."""
+    catalog = _WeatherCatalog()
+    monkeypatch.setattr(
+        serving_cli,
+        "_runtime",
+        lambda: ("fixture", object(), object(), catalog),
+    )
+
+    assert serving_cli.weather_sources_ready(
+        datetime(2026, 8, 20, 10, 10, tzinfo=serving_cli.ZoneInfo("Asia/Seoul"))
+    )
+    assert [source for source, _logical in catalog.calls] == [
+        "weather_ultra_short_forecast"
+    ]
+
+
+def test_weather_ready_requires_both_forecasts_on_three_hour_boundary(
+    monkeypatch,
+) -> None:
+    """3시간 정각에는 초단기와 단기예보 authority가 모두 있어야 한다."""
+    catalog = _WeatherCatalog(missing={"weather_short_term_forecast"})
+    monkeypatch.setattr(
+        serving_cli,
+        "_runtime",
+        lambda: ("fixture", object(), object(), catalog),
+    )
+
+    assert not serving_cli.weather_sources_ready(
+        datetime(2026, 8, 20, 12, 0, tzinfo=serving_cli.ZoneInfo("Asia/Seoul"))
+    )
+    assert [source for source, _logical in catalog.calls] == [
+        "weather_ultra_short_forecast",
+        "weather_short_term_forecast",
+    ]
 
 
 def test_prepare_pins_support_refs_with_same_client_and_bucket(monkeypatch) -> None:
