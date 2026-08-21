@@ -1,25 +1,51 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { List, Route as RouteIcon } from "lucide-react";
 import { api } from "./api";
-import type { Alert, DispatchCenter, ForecastResponse, StationSummary } from "./api";
+import type { Alert, DispatchCenter, ForecastResponse, Route, StationFilter, StationSummary } from "./api";
 import { AlertList } from "./components/AlertList";
 import { DetailPanel } from "./components/DetailPanel";
 import type { FocusedEvent } from "./components/DetailPanel";
 import { ForecastPanel } from "./components/ForecastPanel";
 import { Header } from "./components/Header";
+import { RouteList } from "./components/RouteList";
+import { RouteStopRail } from "./components/RouteStopRail";
 import { StationMap } from "./components/StationMap";
-import type { MapFilterMode } from "./components/StationMap";
 import { StockPanel } from "./components/StockPanel";
 import { formatClock } from "./format";
+import { isRebalanceRoute } from "./routeOperations";
 import { ResizableHandle, ResizablePanel, ResizablePanelGroup } from "@/components/ui/resizable";
-
 
 const POLL_INTERVAL_MS = 15_000;
 const FORECAST_POLL_INTERVAL_MS = 60_000;
-const MAP_FILTER_TABS: { key: MapFilterMode; label: string }[] = [
-  { key: "supply_only", label: "부족한것만" },
-  { key: "all", label: "모두 보기" },
-];
+const ROUTE_POLL_INTERVAL_MS = 30_000;
+const ROUTE_PAGE_SIZE = 500;
 const ALL_REGIONS = "all";
+type ListMode = "routes" | "stations";
+type RouteTransition = "dispatch" | "complete" | "cancel";
+
+function preferredRoute(routes: Route[]): Route | null {
+  return routes.find((route) => route.status === "dispatched")
+    ?? routes.find((route) => route.status === "proposed")
+    ?? routes[0]
+    ?? null;
+}
+
+async function fetchAllRoutes(region: string): Promise<Route[]> {
+  const routesById = new Map<string, Route>();
+  let offset = 0;
+  while (true) {
+    const page = await api.routes({
+      region: region === ALL_REGIONS ? undefined : region,
+      limit: ROUTE_PAGE_SIZE,
+      offset,
+    });
+    page.forEach((route) => routesById.set(route.route_id, route));
+    if (page.length < ROUTE_PAGE_SIZE) {
+      return [...routesById.values()].filter(isRebalanceRoute);
+    }
+    offset += page.length;
+  }
+}
 
 export default function App() {
   const [stations, setStations] = useState<StationSummary[]>([]);
@@ -27,29 +53,51 @@ export default function App() {
   const [stationsError, setStationsError] = useState(false);
   const [alerts, setAlerts] = useState<Alert[]>([]);
   const [alertsError, setAlertsError] = useState(false);
+  const [routes, setRoutes] = useState<Route[]>([]);
+  const [routesError, setRoutesError] = useState(false);
+  const [routesInitialized, setRoutesInitialized] = useState(false);
+  const [listMode, setListMode] = useState<ListMode>("routes");
+  const [selectedRouteId, setSelectedRouteId] = useState<string | null>(null);
+  const selectedRouteIdRef = useRef<string | null>(null);
+  const [busyRouteId, setBusyRouteId] = useState<string | null>(null);
+  const [routeTransitionError, setRouteTransitionError] = useState<string | null>(null);
   const [selectedStationId, setSelectedStationId] = useState<string | null>(null);
+  const [stationFocusRequest, setStationFocusRequest] = useState(0);
   const selectedStationIdRef = useRef<string | null>(null);
   const didInitializeSelectionRef = useRef(false);
   const [forecast, setForecast] = useState<ForecastResponse | null>(null);
   const [forecastError, setForecastError] = useState<Error | null>(null);
   const forecastRequestGenerationRef = useRef(0);
-  // 기본값은 공급필요만(이슈 #63) — 트럭 기사의 실제 작업 순서(어디가 비었나
-  // -> 그 주변에서 뭘 가져올까)에 맞춘다. "모두 보기"는 그 전 동작으로 돌아가는
-  // 탈출구다.
-  const [mapFilterMode, setMapFilterMode] = useState<MapFilterMode>("supply_only");
-  // 지도와 우선순위 리스트가 항상 같은 지역만 보여줘야 해서, 필터 상태를 두 패널의
-  // 공통 부모인 여기서 들고 Gold에 게시된 dispatch center 기준으로 걸러 내려보낸다.
+  const [stationFilter, setStationFilter] = useState<StationFilter>("supply_needed");
   const [selectedRegion, setSelectedRegion] = useState<string>(ALL_REGIONS);
   const [regionCenters, setRegionCenters] = useState<DispatchCenter[]>([]);
-  // 대여소 상세의 "주변 행사" 탭에서 행사를 고르면 지도를 그 위치로 옮기고
-  // 초록 점 + 검색 반경 원을 띄운다. DetailPanel과 StationMap이 형제 컴포넌트라
-  // 공통 부모인 여기서 들고 내려보낸다.
   const [focusedEvent, setFocusedEvent] = useState<FocusedEvent | null>(null);
-  // 상단(지도:리스트)은 드래그로 폭을 바꿀 수 있는데 하단(예측/재고:상세)이 항상
-  // 고정 1/3씩이면 두 줄의 세로 구획선이 안 맞는다(#97). 상단 그룹의 실제 레이아웃을
-  // 여기로 받아와서 하단 그리드 폭 계산에 그대로 쓴다 — 핸들을 드래그하면 하단도
-  // 같이 움직인다.
-  const [mapColumnPercent, setMapColumnPercent] = useState(66.666);
+
+  const selectStation = useCallback((stationId: string) => {
+    setStationFocusRequest((current) => current + 1);
+    if (selectedStationIdRef.current === stationId) {
+      setFocusedEvent(null);
+      return;
+    }
+    didInitializeSelectionRef.current = true;
+    selectedStationIdRef.current = stationId;
+    forecastRequestGenerationRef.current += 1;
+    setForecast(null);
+    setForecastError(null);
+    setFocusedEvent(null);
+    setSelectedStationId(stationId);
+  }, []);
+
+  const selectRoute = useCallback(
+    (route: Route) => {
+      selectedRouteIdRef.current = route.route_id;
+      setSelectedRouteId(route.route_id);
+      setRouteTransitionError(null);
+      const firstStop = [...route.stops].sort((a, b) => a.visit_order - b.visit_order)[0];
+      if (firstStop) selectStation(firstStop.sta_id);
+    },
+    [selectStation],
+  );
 
   useEffect(() => {
     let cancelled = false;
@@ -57,51 +105,46 @@ export default function App() {
     let alertsGeneration = 0;
     function refresh() {
       const currentStationsGeneration = ++stationsGeneration;
-      api
-        .stations()
-        .then((data) => {
-          if (cancelled || currentStationsGeneration !== stationsGeneration) return;
-          setStations(data);
-          setStationsUpdatedAt(new Date());
-          setStationsError(false);
-          const selectedId = selectedStationIdRef.current;
-          if (selectedId !== null && !data.some((station) => station.sta_id === selectedId)) {
-            selectedStationIdRef.current = null;
-            forecastRequestGenerationRef.current += 1;
-            setSelectedStationId(null);
-            setForecast(null);
-            setForecastError(null);
-            setFocusedEvent(null);
-          }
-        })
-        .catch(() => {
-          if (!cancelled && currentStationsGeneration === stationsGeneration) {
-            setStations([]);
-            setStationsUpdatedAt(null);
-            setStationsError(true);
-            selectedStationIdRef.current = null;
-            forecastRequestGenerationRef.current += 1;
-            setSelectedStationId(null);
-            setForecast(null);
-            setForecastError(null);
-            setFocusedEvent(null);
-          }
-        });
+      api.stations().then((data) => {
+        if (cancelled || currentStationsGeneration !== stationsGeneration) return;
+        setStations(data);
+        setStationsUpdatedAt(new Date());
+        setStationsError(false);
+        const selectedId = selectedStationIdRef.current;
+        if (selectedId !== null && !data.some((station) => station.sta_id === selectedId)) {
+          selectedStationIdRef.current = null;
+          forecastRequestGenerationRef.current += 1;
+          setSelectedStationId(null);
+          setForecast(null);
+          setForecastError(null);
+          setFocusedEvent(null);
+        }
+      }).catch(() => {
+        if (!cancelled && currentStationsGeneration === stationsGeneration) {
+          setStations([]);
+          setStationsUpdatedAt(null);
+          setStationsError(true);
+          selectedStationIdRef.current = null;
+          forecastRequestGenerationRef.current += 1;
+          setSelectedStationId(null);
+          setForecast(null);
+          setForecastError(null);
+          setFocusedEvent(null);
+        }
+      });
+
       const currentAlertsGeneration = ++alertsGeneration;
-      api
-        .alerts()
-        .then((data) => {
-          if (!cancelled && currentAlertsGeneration === alertsGeneration) {
-            setAlerts(data);
-            setAlertsError(false);
-          }
-        })
-        .catch(() => {
-          if (!cancelled && currentAlertsGeneration === alertsGeneration) {
-            setAlerts([]);
-            setAlertsError(true);
-          }
-        });
+      api.alerts().then((data) => {
+        if (!cancelled && currentAlertsGeneration === alertsGeneration) {
+          setAlerts(data);
+          setAlertsError(false);
+        }
+      }).catch(() => {
+        if (!cancelled && currentAlertsGeneration === alertsGeneration) {
+          setAlerts([]);
+          setAlertsError(true);
+        }
+      });
     }
     refresh();
     const timer = setInterval(refresh, POLL_INTERVAL_MS);
@@ -111,21 +154,56 @@ export default function App() {
     };
   }, []);
 
-  // 지역센터 좌표는 대여소처럼 자주 바뀌지 않으니(고정 시설) 폴링 없이 한 번만 가져온다.
+  useEffect(() => {
+    let cancelled = false;
+    let requestGeneration = 0;
+    function refresh() {
+      const currentGeneration = ++requestGeneration;
+      fetchAllRoutes(selectedRegion).then((data) => {
+        if (cancelled || currentGeneration !== requestGeneration) return;
+        setRoutes(data);
+        setRoutesError(false);
+        setRoutesInitialized(true);
+        if (data.some((route) => route.route_id === selectedRouteIdRef.current)) return;
+        if (listMode !== "routes") {
+          selectedRouteIdRef.current = null;
+          setSelectedRouteId(null);
+          return;
+        }
+
+        const nextRoute = preferredRoute(data);
+        selectedRouteIdRef.current = nextRoute?.route_id ?? null;
+        setSelectedRouteId(nextRoute?.route_id ?? null);
+        if (nextRoute?.stops[0]) selectStation(nextRoute.stops[0].sta_id);
+      }).catch(() => {
+        if (!cancelled && currentGeneration === requestGeneration) {
+          setRoutes([]);
+          setRoutesError(true);
+          setRoutesInitialized(true);
+          selectedRouteIdRef.current = null;
+          setSelectedRouteId(null);
+        }
+      });
+    }
+    refresh();
+    const timer = setInterval(refresh, ROUTE_POLL_INTERVAL_MS);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [listMode, selectedRegion, selectStation]);
+
   useEffect(() => {
     api.regions().then(setRegionCenters).catch(() => setRegionCenters([]));
   }, []);
 
-  // 첫 화면부터 세 하단 패널이 비어 있지 않도록, 데이터가 도착하면 가장
-  // 긴급한 대여소(서버가 urgency 내림차순으로 반환)를 기본 선택한다.
   useEffect(() => {
+    if (!routesInitialized || routes.length > 0) return;
     const defaultStation = alerts.find((alert) => stations.some((station) => station.sta_id === alert.sta_id));
     if (selectedStationId === null && defaultStation && !didInitializeSelectionRef.current) {
-      didInitializeSelectionRef.current = true;
-      selectedStationIdRef.current = defaultStation.sta_id;
-      setSelectedStationId(defaultStation.sta_id);
+      selectStation(defaultStation.sta_id);
     }
-  }, [alerts, selectedStationId, stations]);
+  }, [alerts, routes.length, routesInitialized, selectStation, selectedStationId, stations]);
 
   useEffect(() => {
     if (selectedStationId === null) {
@@ -135,24 +213,20 @@ export default function App() {
       return;
     }
     let cancelled = false;
-    setForecast(null);
-    setForecastError(null);
+    const stationId = selectedStationId;
     function refresh() {
       const currentGeneration = ++forecastRequestGenerationRef.current;
-      api
-        .forecast(selectedStationId as string)
-        .then((data) => {
-          if (!cancelled && currentGeneration === forecastRequestGenerationRef.current) {
-            setForecast(data);
-            setForecastError(null);
-          }
-        })
-        .catch((error: Error) => {
-          if (!cancelled && currentGeneration === forecastRequestGenerationRef.current) {
-            setForecast(null);
-            setForecastError(error);
-          }
-        });
+      api.forecast(stationId).then((data) => {
+        if (!cancelled && currentGeneration === forecastRequestGenerationRef.current) {
+          setForecast(data);
+          setForecastError(null);
+        }
+      }).catch((error: Error) => {
+        if (!cancelled && currentGeneration === forecastRequestGenerationRef.current) {
+          setForecast(null);
+          setForecastError(error);
+        }
+      });
     }
     refresh();
     const timer = setInterval(refresh, FORECAST_POLL_INTERVAL_MS);
@@ -163,112 +237,140 @@ export default function App() {
     };
   }, [selectedStationId]);
 
-  // 상세 패널(예측/재고/상세)은 지역 필터와 무관하게 이미 선택된 대여소를 계속
-  // 보여줘야 하므로, 필터링 안 된 전체 stations에서 찾는다.
-  const selectedStation = stations.find((s) => s.sta_id === selectedStationId) ?? null;
+  const selectedRoute = routes.find((route) => route.route_id === selectedRouteId) ?? null;
+  const selectedStation = stations.find((station) => station.sta_id === selectedStationId) ?? null;
+  const filteredStations = selectedRegion === ALL_REGIONS
+    ? stations
+    : stations.filter((station) => station.region === selectedRegion);
+  const filteredAlerts = selectedRegion === ALL_REGIONS
+    ? alerts
+    : alerts.filter((alert) => alert.region === selectedRegion);
 
-  const filteredStations =
-    selectedRegion === ALL_REGIONS ? stations : stations.filter((s) => s.region === selectedRegion);
-  const filteredAlerts = selectedRegion === ALL_REGIONS ? alerts : alerts.filter((a) => a.region === selectedRegion);
+  function changeRegion(region: string) {
+    if (region === selectedRegion) return;
+    setSelectedRegion(region);
+    setRouteTransitionError(null);
+    selectedRouteIdRef.current = null;
+    setSelectedRouteId(null);
+  }
 
-  function selectStation(stationId: string) {
-    if (selectedStationIdRef.current === stationId) return;
-    didInitializeSelectionRef.current = true;
-    selectedStationIdRef.current = stationId;
-    forecastRequestGenerationRef.current += 1;
-    setForecast(null);
-    setForecastError(null);
-    setFocusedEvent(null);
-    setSelectedStationId(stationId);
+  function changeListMode(mode: ListMode) {
+    setListMode(mode);
+    setRouteTransitionError(null);
+    if (mode === "stations") {
+      selectedRouteIdRef.current = null;
+      setSelectedRouteId(null);
+      return;
+    }
+    const nextRoute = preferredRoute(routes);
+    if (!selectedRouteIdRef.current && nextRoute) selectRoute(nextRoute);
+  }
+
+  async function transitionRoute(route: Route, transition: RouteTransition) {
+    if (busyRouteId) return;
+    setBusyRouteId(route.route_id);
+    setRouteTransitionError(null);
+    try {
+      const updated = transition === "dispatch"
+        ? await api.dispatchRoute(route.route_id)
+        : transition === "complete"
+          ? await api.completeRoute(route.route_id)
+          : await api.cancelRoute(route.route_id);
+      setRoutes((current) => current.map((item) => item.route_id === updated.route_id ? updated : item));
+    } catch (error) {
+      setRouteTransitionError(error instanceof Error ? error.message : "작업 상태를 변경하지 못했습니다.");
+    } finally {
+      setBusyRouteId(null);
+    }
   }
 
   return (
-    <div className="flex h-screen flex-col bg-background text-foreground p-3 gap-3">
+    <div className="flex h-screen flex-col gap-3 bg-background p-3 text-foreground">
       <Header />
       <div className="flex-1 overflow-hidden">
-        <ResizablePanelGroup orientation="vertical" className="rounded-lg border">
-          {/* Top Row: Map and Alert List */}
-          <ResizablePanel defaultSize={67} minSize={30}>
-            <ResizablePanelGroup
-              orientation="horizontal"
-              onLayoutChange={(layout) => {
-                const mapPercent = layout["map-col"];
-                if (mapPercent !== undefined) setMapColumnPercent(mapPercent);
-              }}
-            >
-              {/* Map */}
-              <ResizablePanel id="map-col" defaultSize={66.666} minSize={30}>
-                <div className="flex h-full flex-col px-4 py-2 bg-background">
-                  <section className="flex flex-col h-full gap-2 min-w-0 min-h-0">
-                    <div className="flex items-center justify-between">
-                      <span className="flex items-center gap-2">
-                        <h2 className="text-base font-semibold tracking-tight">대여소 지도</h2>
-                        <select
-                          className="region-select"
-                          value={selectedRegion}
-                          onChange={(e) => setSelectedRegion(e.target.value)}
-                          aria-label="지역센터 필터"
-                          title="Gold에 게시된 지역센터 기준으로 필터링합니다."
-                        >
-                          <option value={ALL_REGIONS}>전체 지역센터</option>
-                          {regionCenters.map((c) => (
-                            <option key={c.region} value={c.region}>
-                              {c.region}
-                            </option>
-                          ))}
-                        </select>
-                        <div className="alert-tabs alert-tabs--inline" role="tablist" aria-label="지도 표시 범위">
-                          {MAP_FILTER_TABS.map((t) => (
-                            <button
-                              key={t.key}
-                              type="button"
-                              role="tab"
-                              aria-selected={mapFilterMode === t.key}
-                              className={`alert-tab${mapFilterMode === t.key ? " active" : ""}`}
-                              onClick={() => setMapFilterMode(t.key)}
-                            >
-                              {t.label}
-                            </button>
-                          ))}
-                        </div>
+        <ResizablePanelGroup orientation="vertical" className="rounded-lg border bg-background">
+          <ResizablePanel defaultSize={64} minSize={36}>
+            <ResizablePanelGroup orientation="horizontal">
+              <ResizablePanel id="map-col" defaultSize={50} minSize={35}>
+                <div className="flex h-full flex-col bg-background px-4 py-2">
+                  <section className="flex h-full min-h-0 min-w-0 flex-col gap-2">
+                    <div className="map-panel-toolbar">
+                      <span className="map-panel-title">
+                        <h2>{selectedRoute ? "작업 경로 지도" : "대여소 지도"}</h2>
                       </span>
-                      <span className="text-xs text-muted-foreground">기준 시각 {stationsUpdatedAt ? formatClock(stationsUpdatedAt) : "-"}</span>
+                      <span className="text-xs text-muted-foreground">
+                        기준 시각 {stationsUpdatedAt ? formatClock(stationsUpdatedAt) : "-"}
+                      </span>
                     </div>
-                    <div className="flex-1 min-h-0 rounded-md border overflow-hidden relative">
+                    <div className="relative min-h-0 flex-1 overflow-hidden rounded-md border">
                       <div className="absolute inset-0 z-0">
                         <StationMap
                           stations={filteredStations}
                           alerts={filteredAlerts}
                           selectedStationId={selectedStationId}
+                          stationFocusRequest={stationFocusRequest}
                           onSelect={selectStation}
-                          mapFilterMode={mapFilterMode}
+                          mapFilterMode={stationFilter}
                           regionCenters={regionCenters}
                           selectedRegion={selectedRegion}
                           focusedEvent={focusedEvent}
+                          selectedRoute={selectedRoute}
                         />
-                        {stationsError && (
-                          <p className="poll-error" role="status">
-                            대여소 정보를 갱신하지 못했습니다.
-                          </p>
-                        )}
+                        {stationsError && <p className="poll-error" role="status">대여소 정보를 갱신하지 못했습니다.</p>}
                       </div>
                     </div>
                   </section>
                 </div>
               </ResizablePanel>
+
               <ResizableHandle withHandle />
-              {/* Alert List */}
-              <ResizablePanel id="list-col" defaultSize={33.334} minSize={20}>
-                <div className="flex h-full flex-col overflow-auto bg-card px-4 py-2 min-w-0 min-h-0">
-                  <section className="flex flex-col h-full gap-2 min-w-0 min-h-0">
-                    <h2 className="text-base font-semibold tracking-tight">작업 우선순위</h2>
-                    <div className="flex-1 overflow-y-auto">
-                      {alertsError ? (
-                        <p className="empty-state" role="status">
-                          작업 우선순위를 갱신하지 못했습니다.
-                        </p>
+
+              <ResizablePanel id="list-col" defaultSize={50} minSize={35}>
+                <div className="flex h-full min-h-0 min-w-0 flex-col bg-card px-4 py-2">
+                  <section className="flex h-full min-h-0 min-w-0 flex-col gap-2">
+                    <div className="work-list-header">
+                      <h2>{listMode === "routes" ? "재배치 작업" : "대여소 우선순위"}</h2>
+                      <button
+                        type="button"
+                        className="list-mode-toggle"
+                        onClick={() => changeListMode(listMode === "routes" ? "stations" : "routes")}
+                      >
+                        {listMode === "routes" ? <List size={15} /> : <RouteIcon size={15} />}
+                        {listMode === "routes" ? "대여소 보기" : "작업 보기"}
+                      </button>
+                    </div>
+
+                    <div className="min-h-0 flex-1 overflow-hidden">
+                      {listMode === "routes" ? routesError ? (
+                        <p className="empty-state" role="status">작업 목록을 갱신하지 못했습니다.</p>
                       ) : (
-                        <AlertList alerts={filteredAlerts} selectedStationId={selectedStationId} onSelect={selectStation} />
+                        <RouteList
+                          routes={routes}
+                          alerts={filteredAlerts}
+                          regions={regionCenters}
+                          selectedRegion={selectedRegion}
+                          selectedRouteId={selectedRouteId}
+                          busyRouteId={busyRouteId}
+                          transitionError={routeTransitionError}
+                          onRegionChange={changeRegion}
+                          onSelect={selectRoute}
+                          onDispatch={(route) => void transitionRoute(route, "dispatch")}
+                          onComplete={(route) => void transitionRoute(route, "complete")}
+                          onCancel={(route) => void transitionRoute(route, "cancel")}
+                        />
+                      ) : alertsError ? (
+                        <p className="empty-state" role="status">대여소 우선순위를 갱신하지 못했습니다.</p>
+                      ) : (
+                        <AlertList
+                          alerts={filteredAlerts}
+                          regions={regionCenters}
+                          selectedRegion={selectedRegion}
+                          filter={stationFilter}
+                          selectedStationId={selectedStationId}
+                          onRegionChange={changeRegion}
+                          onFilterChange={setStationFilter}
+                          onSelect={selectStation}
+                        />
                       )}
                     </div>
                   </section>
@@ -279,42 +381,39 @@ export default function App() {
 
           <ResizableHandle withHandle />
 
-          {/* Bottom Row: Forecast, Stock, Details */}
-          <ResizablePanel defaultSize={33} minSize={20}>
-            <div
-              className="grid h-full divide-x"
-              style={{
-                gridTemplateColumns: `${mapColumnPercent / 2}% ${mapColumnPercent / 2}% ${100 - mapColumnPercent}%`,
-              }}
-            >
-              <div className="flex h-full flex-col overflow-auto bg-card px-4 py-2 min-w-0 min-h-0">
-                <section className="flex flex-col h-full gap-2 min-w-0 min-h-0">
-                  <h2 className="text-base font-semibold tracking-tight">대여·반납 예측</h2>
-                  <div className="flex-1 min-w-0 min-h-0">
-                    <ForecastPanel station={selectedStation} forecast={forecast} error={forecastError} />
-                  </div>
-                </section>
-              </div>
-              <div className="flex h-full flex-col overflow-auto bg-card px-4 py-2 min-w-0 min-h-0">
-                <section className="flex flex-col h-full gap-2 min-w-0 min-h-0">
-                  <h2 className="text-base font-semibold tracking-tight">재고 예측</h2>
-                  <div className="flex-1 min-w-0 min-h-0">
-                    <StockPanel station={selectedStation} forecast={forecast} error={forecastError} />
-                  </div>
-                </section>
-              </div>
-              <div className="flex h-full flex-col overflow-auto bg-card px-4 py-2 min-w-0 min-h-0">
-                <section className="flex flex-col h-full gap-2 min-w-0 min-h-0">
-                  <h2 className="text-base font-semibold tracking-tight">대여소 상세</h2>
-                  <div className="flex-1 min-w-0 min-h-0">
-                    <DetailPanel
-                      key={selectedStationId ?? "no-station"}
-                      stationId={selectedStationId}
-                      stationPoint={selectedStation ? { lat: selectedStation.lat, lon: selectedStation.lon } : null}
-                      onFocusEvent={setFocusedEvent}
-                    />
-                  </div>
-                </section>
+          <ResizablePanel defaultSize={36} minSize={24}>
+            <div className="flex h-full min-h-0 flex-col bg-card">
+              <RouteStopRail
+                route={selectedRoute}
+                selectedStationId={selectedStationId}
+                onSelectStation={selectStation}
+              />
+              <div className="grid min-h-0 flex-1 grid-cols-3 divide-x">
+                <div className="flex h-full min-h-0 min-w-0 flex-col overflow-hidden bg-card px-4 py-2">
+                  <section className="flex h-full min-h-0 min-w-0 flex-col gap-2">
+                    <h2 className="text-base font-semibold tracking-tight">대여·반납 예측</h2>
+                    <div className="min-h-0 min-w-0 flex-1"><ForecastPanel station={selectedStation} forecast={forecast} error={forecastError} /></div>
+                  </section>
+                </div>
+                <div className="flex h-full min-h-0 min-w-0 flex-col overflow-hidden bg-card px-4 py-2">
+                  <section className="flex h-full min-h-0 min-w-0 flex-col gap-2">
+                    <h2 className="text-base font-semibold tracking-tight">재고 예측</h2>
+                    <div className="min-h-0 min-w-0 flex-1"><StockPanel station={selectedStation} forecast={forecast} error={forecastError} /></div>
+                  </section>
+                </div>
+                <div className="flex h-full min-h-0 min-w-0 flex-col overflow-hidden bg-card px-4 py-2">
+                  <section className="flex h-full min-h-0 min-w-0 flex-col gap-2">
+                    <h2 className="text-base font-semibold tracking-tight">대여소 상세</h2>
+                    <div className="min-h-0 min-w-0 flex-1">
+                      <DetailPanel
+                        key={selectedStationId ?? "no-station"}
+                        stationId={selectedStationId}
+                        stationPoint={selectedStation ? { lat: selectedStation.lat, lon: selectedStation.lon } : null}
+                        onFocusEvent={setFocusedEvent}
+                      />
+                    </div>
+                  </section>
+                </div>
               </div>
             </div>
           </ResizablePanel>

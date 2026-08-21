@@ -204,92 +204,94 @@ export function DetailPanel({ stationId, stationPoint, onFocusEvent }: Props) {
         ))}
       </div>
 
-      {tab === "info" ? (
-        detailError ? (
-          <p className="empty-state">대여소 정보를 불러오지 못했습니다.</p>
-        ) : !detail ? (
+      <div className="detail-panel-content">
+        {tab === "info" ? (
+          detailError ? (
+            <p className="empty-state">대여소 정보를 불러오지 못했습니다.</p>
+          ) : !detail ? (
+            <p className="empty-state">불러오는 중...</p>
+          ) : (
+            <dl className="detail-grid">
+              <dt>대여소명</dt>
+              <dd>{detail.sta_nm}</dd>
+              <dt>주소</dt>
+              <dd>{detail.sta_addr}</dd>
+              <dt>현재 자전거 수</dt>
+              <dd>
+                {detail.parking_bike_tot_cnt} / {detail.hold_cnt}대 ({Math.round(detail.shared_rate * 100)}%)
+              </dd>
+              <dt>갱신 시각</dt>
+              <dd>{formatIsoTime(detail.base_dttm)}</dd>
+            </dl>
+          )
+        ) : tab === "events" ? (
+          eventsError ? (
+            <p className="empty-state">주변 행사 정보를 불러오지 못했습니다.</p>
+          ) : events === null ? (
+            <p className="empty-state">불러오는 중...</p>
+          ) : events.length === 0 ? (
+            <p className="empty-state">주변에 진행 중인 행사가 없습니다.</p>
+          ) : (
+            <ul className="event-list">
+              {events.map((event) => {
+                const isFocused = focusedEventId === event.event_id;
+                return (
+                  <li key={event.event_id}>
+                    <button
+                      type="button"
+                      className={`event-item${isFocused ? " selected" : ""}`}
+                      onClick={() => {
+                        if (radiusKm === null || stationPoint === null) return;
+                        if (isFocused) {
+                          setFocusedEventId(null);
+                          onFocusEvent(null);
+                        } else {
+                          setFocusedEventId(event.event_id);
+                          onFocusEvent({
+                            eventLat: event.lat,
+                            eventLon: event.lon,
+                            searchCenterLat: stationPoint.lat,
+                            searchCenterLon: stationPoint.lon,
+                            radiusKm,
+                          });
+                        }
+                      }}
+                    >
+                      <span className="event-item-title">{event.title}</span>
+                      <span className="event-item-meta">
+                        {[event.place, `${event.start_date} ~ ${event.end_date}`, `${event.distance_km}km`]
+                          .filter(Boolean)
+                          .join(" · ")}
+                      </span>
+                    </button>
+                  </li>
+                );
+              })}
+            </ul>
+          )
+        ) : weatherError ? (
+          <p className="empty-state">주변 날씨 정보를 불러오지 못했습니다.</p>
+        ) : weather === null ? (
           <p className="empty-state">불러오는 중...</p>
         ) : (
-          <dl className="detail-grid">
-            <dt>대여소명</dt>
-            <dd>{detail.sta_nm}</dd>
-            <dt>주소</dt>
-            <dd>{detail.sta_addr}</dd>
-            <dt>현재 자전거 수</dt>
-            <dd>
-              {detail.parking_bike_tot_cnt} / {detail.hold_cnt}대 ({Math.round(detail.shared_rate * 100)}%)
-            </dd>
-            <dt>갱신 시각</dt>
-            <dd>{formatIsoTime(detail.base_dttm)}</dd>
-          </dl>
-        )
-      ) : tab === "events" ? (
-        eventsError ? (
-          <p className="empty-state">주변 행사 정보를 불러오지 못했습니다.</p>
-        ) : events === null ? (
-          <p className="empty-state">불러오는 중...</p>
-        ) : events.length === 0 ? (
-          <p className="empty-state">주변에 진행 중인 행사가 없습니다.</p>
-        ) : (
-          <ul className="event-list">
-            {events.map((event) => {
-              const isFocused = focusedEventId === event.event_id;
-              return (
-                <li key={event.event_id}>
-                  <button
-                    type="button"
-                    className={`event-item${isFocused ? " selected" : ""}`}
-                    onClick={() => {
-                      if (radiusKm === null || stationPoint === null) return;
-                      if (isFocused) {
-                        setFocusedEventId(null);
-                        onFocusEvent(null);
-                      } else {
-                        setFocusedEventId(event.event_id);
-                        onFocusEvent({
-                          eventLat: event.lat,
-                          eventLon: event.lon,
-                          searchCenterLat: stationPoint.lat,
-                          searchCenterLon: stationPoint.lon,
-                          radiusKm,
-                        });
-                      }
-                    }}
-                  >
-                    <span className="event-item-title">{event.title}</span>
-                    <span className="event-item-meta">
-                      {[event.place, `${event.start_date} ~ ${event.end_date}`, `${event.distance_km}km`]
-                        .filter(Boolean)
-                        .join(" · ")}
-                    </span>
-                  </button>
-                </li>
-              );
-            })}
+          <ul className="weather-list">
+            {weather.map((point) => (
+              <li key={point.forecast_dttm} className="weather-item">
+                <span className="weather-item-time">
+                  {formatIsoTime(point.forecast_dttm, { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" })}
+                </span>
+                <strong>{point.temperature}℃</strong>
+                <span>{SKY_LABEL[point.sky_condition_cd]}</span>
+                <span>강수 {PRECIPITATION_LABEL[point.precipitation_type_cd]}</span>
+                <span>확률 {nullableMeasurement(point.precipitation_prob, "%")}</span>
+                <span>강수량 {nullableMeasurement(point.precipitation_amount, "mm")}</span>
+                <span>습도 {nullableMeasurement(point.humidity, "%")}</span>
+                <span>풍속 {nullableMeasurement(point.wind_speed, "m/s")}</span>
+              </li>
+            ))}
           </ul>
-        )
-      ) : weatherError ? (
-        <p className="empty-state">주변 날씨 정보를 불러오지 못했습니다.</p>
-      ) : weather === null ? (
-        <p className="empty-state">불러오는 중...</p>
-      ) : (
-        <ul className="weather-list">
-          {weather.map((point) => (
-            <li key={point.forecast_dttm} className="weather-item">
-              <span className="weather-item-time">
-                {formatIsoTime(point.forecast_dttm, { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" })}
-              </span>
-              <strong>{point.temperature}℃</strong>
-              <span>{SKY_LABEL[point.sky_condition_cd]}</span>
-              <span>강수 {PRECIPITATION_LABEL[point.precipitation_type_cd]}</span>
-              <span>확률 {nullableMeasurement(point.precipitation_prob, "%")}</span>
-              <span>강수량 {nullableMeasurement(point.precipitation_amount, "mm")}</span>
-              <span>습도 {nullableMeasurement(point.humidity, "%")}</span>
-              <span>풍속 {nullableMeasurement(point.wind_speed, "m/s")}</span>
-            </li>
-          ))}
-        </ul>
-      )}
+        )}
+      </div>
     </div>
   );
 }

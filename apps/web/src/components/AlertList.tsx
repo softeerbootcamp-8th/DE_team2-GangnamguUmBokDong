@@ -1,7 +1,7 @@
-import { useState } from "react";
-import type { Alert } from "../api";
+import type { Alert, DispatchCenter, StationFilter } from "../api";
 import { ACTION_LABEL, formatUntilCritical, statusOf } from "../format";
 import type { UrgencyTier } from "../format";
+import { RegionTabs } from "./RegionTabs";
 
 const TIER_COLOR: Record<UrgencyTier, string> = {
   critical: "var(--status-critical)",
@@ -10,9 +10,7 @@ const TIER_COLOR: Record<UrgencyTier, string> = {
   good: "var(--status-good)",
 };
 
-type Tab = "all" | "supply_needed" | "retrieval_needed";
-
-const TABS: { key: Tab; label: string }[] = [
+const TABS: { key: StationFilter; label: string }[] = [
   { key: "all", label: "전체" },
   { key: "supply_needed", label: "공급 필요" },
   { key: "retrieval_needed", label: "회수 필요" },
@@ -20,29 +18,42 @@ const TABS: { key: Tab; label: string }[] = [
 
 interface Props {
   alerts: Alert[];
+  regions: DispatchCenter[];
+  selectedRegion: string;
+  filter: StationFilter;
   selectedStationId: string | null;
+  onRegionChange: (region: string) => void;
+  onFilterChange: (filter: StationFilter) => void;
   onSelect: (stationId: string) => void;
 }
 
-export function AlertList({ alerts, selectedStationId, onSelect }: Props) {
-  const [tab, setTab] = useState<Tab>("all");
-
+export function AlertList({
+  alerts,
+  regions,
+  selectedRegion,
+  filter,
+  selectedStationId,
+  onRegionChange,
+  onFilterChange,
+  onSelect,
+}: Props) {
   // 지역센터 필터는 지도와 공유해야 해서(같은 지역만 지도+리스트 동시에 보여야 함)
   // 이 컴포넌트 자체가 아니라 App.tsx가 들고 있다 — 여기 들어오는 alerts는 이미
   // 그 필터가 적용된 상태다.
-  const filtered = tab === "all" ? alerts : alerts.filter((alert) => alert.action_type === tab);
+  const filtered = filter === "all" ? alerts : alerts.filter((alert) => alert.action_type === filter);
 
   return (
     <div className="alert-list-wrap">
-      <div className="alert-tabs" role="tablist">
+      <RegionTabs regions={regions} selectedRegion={selectedRegion} onChange={onRegionChange} />
+      <div className="filter-tab-row" role="tablist" aria-label="대여소 상태">
         {TABS.map((t) => (
           <button
             key={t.key}
             type="button"
             role="tab"
-            aria-selected={tab === t.key}
-            className={`alert-tab${tab === t.key ? " active" : ""}`}
-            onClick={() => setTab(t.key)}
+            aria-selected={filter === t.key}
+            className={`alert-tab${filter === t.key ? " active" : ""}`}
+            onClick={() => onFilterChange(t.key)}
           >
             {t.label}
           </button>

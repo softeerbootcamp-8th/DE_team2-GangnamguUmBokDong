@@ -391,20 +391,20 @@ batch가 소유하므로 Gold에 중복 저장하지 않는다. route producer�
 | `proposed_dttm` | `TIMESTAMPTZ` | NOT NULL | route batch anchor | 제안 일시 |
 | `dispatched_dttm` | `TIMESTAMPTZ` | NULL | 운영 API | 실행 확정 일시 |
 | `completed_dttm` | `TIMESTAMPTZ` | NULL | 운영 API | 완료 일시 |
+| `cancelled_dttm` | `TIMESTAMPTZ` | NULL | 운영 API | 승인 후 취소 일시 |
 | `created_dttm` | `TIMESTAMPTZ` | NOT NULL | DB default | 행 생성 일시 |
 | `updated_dttm` | `TIMESTAMPTZ` | NOT NULL | DB trigger | 상태 변경 일시 |
 
-상태는 `proposed`, `dispatched`, `completed`다. INSERT는 활성 센터의
-`proposed`만 허용한다. 전이는 `proposed→dispatched→completed`만 허용하며 각 전이
-일시는 한 번만 설정한다. ID,
+상태는 `proposed`, `dispatched`, `completed`, `cancelled`다. INSERT는 활성 센터의
+`proposed`만 허용한다. 전이는 `proposed→dispatched→completed` 또는
+`proposed→dispatched→cancelled`만 허용하며 각 전이 일시는 한 번만 설정한다. ID,
 센터, 제안일시, 이미 설정한 lifecycle 일시는 불변이다. 삭제는 `proposed`만 가능하다.
-취소는 현재 endpoint·응답·사용자가 없으므로 만들지 않고, 실제 취소 기능 이슈에서
-상태·일시·전이를 함께 추가한다.
-모든 일시는 유한하고 `proposed_dttm <= dispatched_dttm <= completed_dttm` 순서다.
+모든 일시는 유한하고 완료 시 `proposed_dttm <= dispatched_dttm <= completed_dttm`,
+취소 시 `proposed_dttm <= dispatched_dttm <= cancelled_dttm` 순서다.
 UUIDv5 namespace는 `d0d59897-9e72-541f-bb05-bd3d113c2639`다. name의 정확한 canonical JSON과
 회귀 UUID는 [publication-contract-v1.md](publication-contract-v1.md)를 따른다. center ID와
 후보의 동률 정렬 규칙은 원천-목표 매핑 문서를 따른다.
-route 목록은 `proposed|dispatched|completed`만 status filter로 받고 기본 100·최대 500의
+route 목록은 `proposed|dispatched|completed|cancelled`만 status filter로 받고 기본 100·최대 500의
 `limit`, 0 이상의 `offset`, `(proposed_dttm DESC, route_id ASC)` 정렬을 사용한다. 상태 변경은
 expected status guarded UPDATE이고 없는 ID는 404, 상태 충돌은 409다. path ID는 API UUID
 타입으로 먼저 검증해 malformed 값은 422, 응답 UUID는 문자열이다.

@@ -7,9 +7,8 @@ from typing import Any, Self
 from uuid import UUID
 
 import pytest
-from psycopg.errors import CheckViolation, RaiseException
-
 import queries
+from psycopg.errors import CheckViolation, RaiseException
 
 NOW = datetime(2026, 8, 20, 1, 5, tzinfo=UTC)
 BASE = datetime(2026, 8, 20, 1, 0, tzinfo=UTC)
@@ -534,6 +533,22 @@ def test_dispatch_updates_and_reads_aggregate_in_same_transaction(
     assert "UPDATE rebalance_route" in cursor.statements[0]
     assert "route_status_cd = %(expected_status)s" in cursor.statements[0]
     assert "rebalance_route_stop AS stop" in cursor.statements[1]
+
+
+def test_cancel_sets_cancelled_timestamp_in_same_transaction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """cancel은 dispatched guard와 cancelled_dttm을 같은 transaction에서 갱신한다."""
+    route = {"route_id": str(ROUTE_ID), "status": "cancelled", "stops": []}
+    cursor = _TransitionCursor([{"route_id": ROUTE_ID}, route])
+    connection = _TransitionConnection(cursor)
+    monkeypatch.setattr(queries, "get_connection", lambda: connection)
+
+    result = queries.cancel_route(ROUTE_ID, NOW)
+
+    assert result == route
+    assert "cancelled_dttm" in cursor.statements[0]
+    assert "route_status_cd = %(expected_status)s" in cursor.statements[0]
 
 
 @pytest.mark.parametrize(

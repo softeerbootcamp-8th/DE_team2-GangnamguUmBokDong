@@ -4,8 +4,8 @@ import "leaflet/dist/leaflet.css";
 import { Delaunay } from "d3-delaunay";
 import L from "leaflet";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Circle, CircleMarker, MapContainer, Marker, Polygon, TileLayer, Tooltip, useMapEvents } from "react-leaflet";
-import type { ActionType, Alert, DispatchCenter, StationSummary } from "../api";
+import { Circle, CircleMarker, MapContainer, Marker, Polygon, Polyline, TileLayer, Tooltip, useMapEvents } from "react-leaflet";
+import type { ActionType, Alert, DispatchCenter, Route, StationFilter, StationSummary } from "../api";
 import type { FocusedEvent } from "./DetailPanel";
 import seoulBoundary from "../seoul_boundary.json";
 
@@ -23,7 +23,7 @@ const COUNT_LABEL_MIN_ZOOM = 14; // 이 줌 레벨부터 재고 수를 라벨로
 const MIN_RADIUS = 9;
 const MAX_RADIUS = 20;
 const CLICK_PADDING = 10; // 시각적 마커보다 이만큼 더 넓게 클릭을 받는다
-const SELECTED_BORDER = "#0b0b0b";
+const SELECTED_BORDER = "#2edb8c";
 const IDLE_BORDER = "#fcfcfb";
 const MAX_VISIBLE_MARKERS = 100; // 현재 화면 범위 안에 이보다 많으면 덜 급한 것부터 숨긴다
 
@@ -36,6 +36,12 @@ const SEOUL_BOUNDS: L.LatLngBoundsExpression = [SEOUL_SW, SEOUL_NE];
 const SEOUL_MIN_ZOOM = 10; // 이보다 축소하면 서울 전체가 한 화면보다 작아져서 의미가 없다
 const REGION_FILL = "#2edb8c"; // 따릉이 브랜드 그린
 const EVENT_MARKER_COLOR = "#405260"; // 주변 행사 포커스 점·검색 반경 원(브랜드 네이비 — REGION_FILL과 동시에 떠도 구분되게)
+const ROUTE_CENTER_ICON = L.divIcon({
+  className: "route-center-map-marker",
+  html: "<span>센터</span>",
+  iconSize: [42, 42],
+  iconAnchor: [21, 21],
+});
 
 // 지역센터 관할의 실제 경계 데이터는 없다(apps/api/regions.py 참고). 그래서
 // "권역 면적"은 우리 배정 로직(최근접 지역센터)이 암묵적으로 정의하는 경계,
@@ -78,7 +84,7 @@ function computeRegionCell(centers: DispatchCenter[], selectedRegion: string): [
   return outerRingsToLatLng(clipped.geometry);
 }
 
-export type MapFilterMode = "all" | "supply_only";
+export type MapFilterMode = StationFilter;
 
 // 트럭 기사는 "어디가 비었나 -> 그 주변에서 뭘 가져올까" 순서로 판단하므로,
 // 선택된 공급필요 대여소로부터 이 반경(직선거리) 안에 있는 회수필요 대여소만
@@ -98,16 +104,31 @@ function haversineKm(a: { lat: number; lon: number }, b: { lat: number; lon: num
   return 2 * EARTH_RADIUS_KM * Math.asin(Math.sqrt(h));
 }
 
-// "부족한것만" 모드에서는 공급필요 대여소만 기본으로 보여주고, 그중 하나를
-// 선택했을 때만 그 주변 회수필요 후보를 몇 개 더 드러낸다. "전체" 모드는
-// 필터링 없이 기존 동작(모든 대여소 표시) 그대로 둔다.
+// "공급 필요" 탭은 부족 대여소를 기본으로 보여주고, 하나를 선택했을 때만
+// 주변 회수 후보를 함께 드러낸다. "회수 필요"는 해당 대여소만, "전체"는
+// 필터링 없이 모든 대여소를 표시한다.
 function applyMapFilter(
   stations: StationSummary[],
   alertsByStation: Map<string, Alert>,
   mode: MapFilterMode,
   selectedStationId: string | null,
+  selectedRoute: Route | null,
 ): StationSummary[] {
+  if (selectedRoute) {
+    const routeStationIds = new Set(selectedRoute.stops.map((stop) => stop.sta_id));
+    return stations.filter((station) => routeStationIds.has(station.sta_id));
+  }
   if (mode === "all") return stations;
+  if (mode === "retrieval_needed") {
+    const retrievalStations = stations.filter(
+      (station) => alertsByStation.get(station.sta_id)?.action_type === "retrieval_needed",
+    );
+    const selectedStation = stations.find((station) => station.sta_id === selectedStationId);
+    if (selectedStation && !retrievalStations.some((station) => station.sta_id === selectedStation.sta_id)) {
+      return [...retrievalStations, selectedStation];
+    }
+    return retrievalStations;
+  }
 
   const supplyStations = stations.filter((s) => alertsByStation.get(s.sta_id)?.action_type === "supply_needed");
   const visible = new Map(supplyStations.map((s) => [s.sta_id, s]));
@@ -256,22 +277,26 @@ interface Props {
   stations: StationSummary[];
   alerts: Alert[];
   selectedStationId: string | null;
+  stationFocusRequest: number;
   onSelect: (stationId: string) => void;
   mapFilterMode: MapFilterMode;
   regionCenters: DispatchCenter[];
   selectedRegion: string;
   focusedEvent: FocusedEvent | null;
+  selectedRoute: Route | null;
 }
 
 function StationMarkers({
   stations,
   alerts,
   selectedStationId,
+  stationFocusRequest,
   onSelect,
   mapFilterMode,
   regionCenters,
   selectedRegion,
   focusedEvent,
+  selectedRoute,
 }: Props) {
   const [zoom, setZoom] = useState(DEFAULT_ZOOM);
   const [bounds, setBounds] = useState<L.LatLngBounds | null>(null);
@@ -298,8 +323,8 @@ function StationMarkers({
   // 좁힌다(공급필요 + 선택된 대여소 주변 회수필요 후보). 이후 파이프라인은
   // "전체" 모드와 동일하게 이 후보군 안에서 랭킹/화면범위로 자른다.
   const filteredStations = useMemo(
-    () => applyMapFilter(stations, alertsByStation, mapFilterMode, selectedStationId),
-    [stations, alertsByStation, mapFilterMode, selectedStationId],
+    () => applyMapFilter(stations, alertsByStation, mapFilterMode, selectedStationId, selectedRoute),
+    [stations, alertsByStation, mapFilterMode, selectedStationId, selectedRoute],
   );
 
   // urgency_score 정렬은 filteredStations/alerts가 바뀔 때만 다시 계산한다.
@@ -369,12 +394,47 @@ function StationMarkers({
     if (selectedStationId === null) return;
     const station = stationsRef.current.find((s) => s.sta_id === selectedStationId);
     if (!station) return;
+    if (selectedRoute) {
+      // 작업을 고를 때 한 번 계산한 route fit 줌을 유지하고, 이후 하단 순서표나
+      // 지도 마커에서 대여소를 고르면 줌 애니메이션 없이 지도 pane 전체를 부드럽게
+      // 이동한다. 같은 줌에서 pan만 하므로 타일·SVG 마커가 한 덩어리로 움직인다.
+      map.panTo([station.lat, station.lon], {
+        animate: true,
+        duration: 0.45,
+        easeLinearity: 0.25,
+      });
+      return;
+    }
     // flyTo()의 애니메이션 도중에는 지도 타일과 마커(SVG 벡터 레이어)가 이
     // 개발 환경에서 서로 다른 프레임에 갱신돼 마커가 잠깐 멈춰 있다가 도착
     // 시점에 툭 튀는 것처럼 보인다. setView는 애니메이션 없이 한 번에
     // 이동시켜서 지도와 마커가 항상 같은 프레임에 같이 자리 잡는다.
     map.setView([station.lat, station.lon], Math.max(map.getZoom(), COUNT_LABEL_MIN_ZOOM));
-  }, [selectedStationId, focusedEvent, map]);
+  }, [selectedStationId, stationFocusRequest, focusedEvent, selectedRoute?.route_id, map]);
+
+  const selectedRouteCenter = useMemo(() => {
+    if (!selectedRoute) return null;
+    return regionCenters.find((item) => item.region === selectedRoute.region) ?? null;
+  }, [selectedRoute, regionCenters]);
+
+  const selectedRoutePositions = useMemo(() => {
+    if (!selectedRoute) return [];
+    const stopPositions = [...selectedRoute.stops]
+      .sort((left, right) => left.visit_order - right.visit_order)
+      .map((stop) => [stop.lat, stop.lon] as [number, number]);
+    return selectedRouteCenter
+      ? ([[selectedRouteCenter.lat, selectedRouteCenter.lon], ...stopPositions, [selectedRouteCenter.lat, selectedRouteCenter.lon]] as [number, number][])
+      : stopPositions;
+  }, [selectedRoute, selectedRouteCenter]);
+
+  useEffect(() => {
+    if (!selectedRoute || selectedRoutePositions.length === 0) return;
+    if (selectedRoutePositions.length === 1) {
+      map.setView(selectedRoutePositions[0], COUNT_LABEL_MIN_ZOOM);
+      return;
+    }
+    map.fitBounds(L.latLngBounds(selectedRoutePositions), { padding: [44, 44], maxZoom: 15 });
+  }, [selectedRoute?.route_id, regionCenters, map]);
 
   // 주변 행사 탭에서 행사를 고르면 그 위치로 지도를 옮겨서 보여준다. 선택된
   // 대여소는 이미 검은 테두리로 구분되므로, 여기서는 행사 위치를 기준으로
@@ -390,13 +450,13 @@ function StationMarkers({
   );
 
   useEffect(() => {
-    if (selectedRegion === ALL_REGIONS) return;
+    if (selectedRoute || selectedRegion === ALL_REGIONS) return;
     if (!regionCell || regionCell.length === 0) return;
     // 선택된 권역의 경계(보로노이 셀) 전체가 화면에 들어오게 이동한다. 대여소
     // 이동(setView, 위 effect)과 달리 여기는 넓은 영역을 한 번에 보여줘야 하므로
     // fitBounds를 쓴다.
     map.fitBounds(L.latLngBounds(regionCell.flat()), { padding: [24, 24] });
-  }, [selectedRegion, regionCell, map]);
+  }, [selectedRegion, regionCell, selectedRoute, map]);
 
   return (
     <>
@@ -407,6 +467,24 @@ function StationMarkers({
           pathOptions={{ color: REGION_FILL, weight: 2, fillColor: REGION_FILL, fillOpacity: 0.08 }}
           interactive={false}
         />
+      )}
+      {selectedRoute && selectedRoutePositions.length > 1 && (
+        <Polyline
+          positions={selectedRoutePositions}
+          pathOptions={{ color: "#405260", weight: 5, opacity: 0.9, lineCap: "round", lineJoin: "round" }}
+          interactive={false}
+        />
+      )}
+      {selectedRoute && selectedRouteCenter && (
+        <Marker
+          position={[selectedRouteCenter.lat, selectedRouteCenter.lon]}
+          icon={ROUTE_CENTER_ICON}
+          zIndexOffset={3_000_000}
+        >
+          <Tooltip direction="top" offset={[0, -18]}>
+            {selectedRoute.region} 센터 · 출발 및 복귀
+          </Tooltip>
+        </Marker>
       )}
       {/* 주변 행사 탭에서 고른 행사의 위치(초록 점)와, 이 행사를 찾을 때 쓴
           대여소 기준 검색 반경(원, radius_km — 실측된 행사 고유의 영향
@@ -486,6 +564,24 @@ function StationMarkers({
               />
             );
           })}
+      {selectedRoute?.stops.map((stop) => (
+        <Marker
+          key={`route-stop-${stop.visit_order}-${stop.sta_id}`}
+          position={[stop.lat, stop.lon]}
+          icon={L.divIcon({
+            className: "route-stop-map-marker",
+            html: `<span class="${stop.action}">${stop.visit_order}</span>`,
+            iconSize: [28, 28],
+            iconAnchor: [14, 14],
+          })}
+          eventHandlers={{ click: () => onSelect(stop.sta_id) }}
+          zIndexOffset={2_000_000 + stop.visit_order}
+        >
+          <Tooltip direction="top" offset={[0, -12]}>
+            {stop.visit_order}. {stop.sta_nm} · {stop.action === "pickup" ? "회수" : "공급"} {stop.bike_cnt}대
+          </Tooltip>
+        </Marker>
+      ))}
     </>
   );
 }
@@ -507,12 +603,26 @@ export function StationMap({
   stations,
   alerts,
   selectedStationId,
+  stationFocusRequest,
   onSelect,
   mapFilterMode,
   regionCenters,
   selectedRegion,
   focusedEvent,
+  selectedRoute,
 }: Props) {
+  const [prefersDark, setPrefersDark] = useState(() =>
+    typeof window === "undefined" ? false : window.matchMedia("(prefers-color-scheme: dark)").matches,
+  );
+
+  useEffect(() => {
+    const media = window.matchMedia("(prefers-color-scheme: dark)");
+    const update = (event: MediaQueryListEvent) => setPrefersDark(event.matches);
+    setPrefersDark(media.matches);
+    media.addEventListener("change", update);
+    return () => media.removeEventListener("change", update);
+  }, []);
+
   return (
     <MapContainer
       center={GANGNAM_CENTER}
@@ -526,17 +636,19 @@ export function StationMap({
       <MapResizer />
       <TileLayer
         attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions">CARTO</a>'
-        url="https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png"
+        url={`https://{s}.basemaps.cartocdn.com/${prefersDark ? "dark_all" : "light_all"}/{z}/{x}/{y}{r}.png`}
       />
       <StationMarkers
         stations={stations}
         alerts={alerts}
         selectedStationId={selectedStationId}
+        stationFocusRequest={stationFocusRequest}
         onSelect={onSelect}
         mapFilterMode={mapFilterMode}
         regionCenters={regionCenters}
         selectedRegion={selectedRegion}
         focusedEvent={focusedEvent}
+        selectedRoute={selectedRoute}
       />
     </MapContainer>
   );

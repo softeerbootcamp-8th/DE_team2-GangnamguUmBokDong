@@ -1,6 +1,14 @@
-const API_BASE = import.meta.env.VITE_API_BASE ?? "http://localhost:8000";
+const configuredApiBase = import.meta.env.VITE_API_BASE?.trim();
+const apiPort = import.meta.env.VITE_API_PORT?.trim() || "8000";
+const browserOrigin =
+  typeof window === "undefined"
+    ? "http://localhost"
+    : `${window.location.protocol}//${window.location.hostname}`;
+const API_BASE =
+  configuredApiBase || `${browserOrigin}:${apiPort}`;
 
 export type ActionType = "supply_needed" | "retrieval_needed" | "normal";
+export type StationFilter = "all" | "supply_needed" | "retrieval_needed";
 
 export interface StationSummary {
   sta_id: string;
@@ -49,6 +57,37 @@ export interface DispatchCenter {
   region: string;
   lat: number;
   lon: number;
+}
+
+export type RouteStatus = "proposed" | "dispatched" | "completed" | "cancelled";
+export type RouteAction = "pickup" | "dropoff";
+
+export interface RouteStop {
+  visit_order: number;
+  sta_id: string;
+  sta_nm: string;
+  lat: number;
+  lon: number;
+  action: RouteAction;
+  bike_cnt: number;
+}
+
+export interface Route {
+  route_id: string;
+  region: string;
+  status: RouteStatus;
+  proposed_at: string;
+  dispatched_at: string | null;
+  completed_at: string | null;
+  cancelled_at: string | null;
+  stops: RouteStop[];
+}
+
+export interface RouteQuery {
+  region?: string;
+  status?: RouteStatus;
+  limit?: number;
+  offset?: number;
 }
 
 export interface CulturalEvent {
@@ -124,6 +163,23 @@ async function getJson<T>(path: string): Promise<T> {
   return res.json() as Promise<T>;
 }
 
+async function postJson<T>(path: string): Promise<T> {
+  const res = await fetch(`${API_BASE}${path}`, { method: "POST" });
+  if (!res.ok) {
+    throw new ApiError(path, res.status, await readErrorDetail(res));
+  }
+  return res.json() as Promise<T>;
+}
+
+function routeQueryString(query: RouteQuery): string {
+  const params = new URLSearchParams();
+  if (query.region) params.set("region", query.region);
+  if (query.status) params.set("status", query.status);
+  params.set("limit", String(query.limit ?? 500));
+  params.set("offset", String(query.offset ?? 0));
+  return params.toString();
+}
+
 export const api = {
   stations: () => getJson<StationSummary[]>("/stations"),
   station: (id: string) => getJson<StationDetail>(`/stations/${id}`),
@@ -133,4 +189,8 @@ export const api = {
   alerts: () => getJson<Alert[]>("/alerts"),
   status: () => getJson<StatusResponse>("/status"),
   regions: () => getJson<DispatchCenter[]>("/regions"),
+  routes: (query: RouteQuery = {}) => getJson<Route[]>(`/routes?${routeQueryString(query)}`),
+  dispatchRoute: (routeId: string) => postJson<Route>(`/routes/${routeId}/dispatch`),
+  completeRoute: (routeId: string) => postJson<Route>(`/routes/${routeId}/complete`),
+  cancelRoute: (routeId: string) => postJson<Route>(`/routes/${routeId}/cancel`),
 };

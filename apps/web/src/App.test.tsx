@@ -4,7 +4,7 @@ import { act, cleanup, fireEvent, render, screen } from "@testing-library/react"
 import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
-import type { Alert, ForecastResponse, StationSummary } from "./api";
+import type { Alert, ForecastResponse, Route, StationSummary } from "./api";
 
 const apiMock = vi.hoisted(() => ({
   stations: vi.fn(),
@@ -15,6 +15,10 @@ const apiMock = vi.hoisted(() => ({
   alerts: vi.fn(),
   status: vi.fn(),
   regions: vi.fn(),
+  routes: vi.fn(),
+  dispatchRoute: vi.fn(),
+  completeRoute: vi.fn(),
+  cancelRoute: vi.fn(),
 }));
 
 vi.mock("./api", async (importOriginal) => {
@@ -99,6 +103,37 @@ const FORECAST: ForecastResponse = {
   base_dttm: "2026-08-20T00:00:00Z",
   points: [],
 };
+const ROUTES: Route[] = [
+  {
+    route_id: "11111111-1111-4111-8111-111111111111",
+    region: "센터",
+    status: "proposed",
+    proposed_at: "2026-08-20T00:00:00Z",
+    dispatched_at: null,
+    completed_at: null,
+    cancelled_at: null,
+    stops: [
+      {
+        visit_order: 1,
+        sta_id: "ST-1",
+        sta_nm: "첫 번째 대여소",
+        lat: 37.5,
+        lon: 127,
+        action: "pickup",
+        bike_cnt: 2,
+      },
+      {
+        visit_order: 2,
+        sta_id: "ST-2",
+        sta_nm: "두 번째 대여소",
+        lat: 37.51,
+        lon: 127.01,
+        action: "dropoff",
+        bike_cnt: 2,
+      },
+    ],
+  },
+];
 
 async function settleRequests(): Promise<void> {
   await act(async () => {
@@ -123,6 +158,10 @@ beforeEach(() => {
   apiMock.alerts.mockResolvedValue(ALERTS);
   apiMock.forecast.mockResolvedValue(FORECAST);
   apiMock.regions.mockResolvedValue([]);
+  apiMock.routes.mockResolvedValue(ROUTES);
+  apiMock.dispatchRoute.mockResolvedValue({ ...ROUTES[0], status: "dispatched" });
+  apiMock.completeRoute.mockResolvedValue({ ...ROUTES[0], status: "completed" });
+  apiMock.cancelRoute.mockResolvedValue({ ...ROUTES[0], status: "cancelled" });
 });
 
 afterEach(() => {
@@ -132,6 +171,18 @@ afterEach(() => {
 });
 
 describe("App polling state", () => {
+  it("작업 승인 버튼을 실제 상태 전이 API와 연결한다", async () => {
+    apiMock.stations.mockResolvedValue(STATIONS);
+    render(<App />);
+    await settleRequests();
+    await settleRequests();
+
+    fireEvent.click(screen.getByRole("button", { name: "승인" }));
+    await settleRequests();
+
+    expect(apiMock.dispatchRoute).toHaveBeenCalledWith(ROUTES[0].route_id);
+  });
+
   it("대여소 선택을 바꾸는 즉시 이전 forecast를 지운다", async () => {
     apiMock.stations.mockResolvedValue(STATIONS);
     apiMock.forecast.mockResolvedValueOnce(FORECAST).mockReturnValueOnce(new Promise(() => {}));
@@ -204,7 +255,8 @@ describe("App polling state", () => {
     });
 
     expect(screen.getByTestId("map-alerts").textContent).toBe("");
-    expect(screen.getByText("작업 우선순위를 갱신하지 못했습니다.")).not.toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "대여소 보기" }));
+    expect(screen.getByText("대여소 우선순위를 갱신하지 못했습니다.")).not.toBeNull();
   });
 
   it("stations와 alerts의 느린 이전 요청이 최신 polling 결과를 복원하지 못한다", async () => {
