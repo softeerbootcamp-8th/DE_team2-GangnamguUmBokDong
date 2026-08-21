@@ -63,13 +63,17 @@ from .station_stock import StationStockProjection, StationStockRecord
 from .versioning import PublicationCandidate, allocate_revision
 from .weather_forecast import WeatherForecastProjection
 
-SERVING_PLAN_SCHEMA_VERSION = "gold-serving-plan-v1"
+SERVING_PLAN_SCHEMA_VERSION = "gold-serving-plan-v2"
 """Inference 전 orchestration plan의 exact schema version이다."""
+
+MAX_INFERENCE_INELIGIBLE_RATIO = 0.01
+"""활성·모델지원 후보 중 입력 품질 문제로 제외할 수 있는 최대 비율이다."""
 
 _PLAN_KEYS = frozenset(
     {
         "activation_ready_sta_ids",
         "expected_sta_ids",
+        "inference_eligible_sta_ids",
         "logical_dttm",
         "object_base_uri",
         "prepared_publications",
@@ -165,6 +169,7 @@ class ServingPlan:
     station_dependency: Dependency
     activation_ready_sta_ids: IdSetArtifactRef
     expected_sta_ids: IdSetArtifactRef
+    inference_eligible_sta_ids: IdSetArtifactRef
     rental_support_sta_ids: IdSetArtifactRef
     return_support_sta_ids: IdSetArtifactRef
     prepared_publications: tuple[PreparedManifestRef, ...]
@@ -190,6 +195,7 @@ class ServingPlan:
         for name, value in (
             ("activation_ready_sta_ids", self.activation_ready_sta_ids),
             ("expected_sta_ids", self.expected_sta_ids),
+            ("inference_eligible_sta_ids", self.inference_eligible_sta_ids),
             ("rental_support_sta_ids", self.rental_support_sta_ids),
             ("return_support_sta_ids", self.return_support_sta_ids),
         ):
@@ -294,6 +300,7 @@ def prepare_serving_plan(
     station_publisher_version: str = station_release.STATION_PUBLISHER_VERSION,
     stock_publisher_version: str = station_release.STATION_STOCK_PUBLISHER_VERSION,
     weather_publisher_version: str = weather_forecast.WEATHER_FORECAST_PUBLISHER_VERSION,
+    inference_eligible_sta_ids: tuple[str, ...] | None = None,
 ) -> ServingPlanArtifact:
     """추론 전에 station·stock·weather와 activation 기대 집합을 immutable 준비한다.
 
@@ -344,6 +351,20 @@ def prepare_serving_plan(
         return_support_sta_ids,
         "return support",
     )
+    if inference_eligible_sta_ids is None:
+        inference_eligible_sta_ids = tuple(
+            sorted(
+                set(rental_ids) | set(return_ids),
+                key=lambda value: value.encode("utf-8"),
+            )
+        )
+    if type(inference_eligible_sta_ids) is not tuple:
+        raise ContractViolation("inference eligible station ID는 tuple이어야 합니다.")
+    eligible_ids = build_id_set(inference_eligible_sta_ids).ids
+    if eligible_ids != inference_eligible_sta_ids:
+        raise ContractViolation(
+            "inference eligible station ID는 중복 없는 UTF-8 순이어야 합니다."
+        )
 
     prior_station = station_release._load_prior_station(connection, object_store)
     prior_stock = station_release._load_prior_stock(connection, object_store)
@@ -506,11 +527,11 @@ def prepare_serving_plan(
         activation_ready_station_ids=activation_ready,
     )
     active_ids = _active_station_ids(station_projection.records)
-    expected_ids = tuple(
-        sorted(
-            set(active_ids) & set(rental_ids) & set(return_ids),
-            key=lambda value: value.encode("utf-8"),
-        )
+    expected_ids = _inference_expected_station_ids(
+        active_ids,
+        rental_ids,
+        return_ids,
+        eligible_ids,
     )
     final_active_grids = _active_grid_ids(station_projection.records)
     weather_projection = _weather_projection_from_artifacts(
@@ -658,12 +679,19 @@ def prepare_serving_plan(
         name="expected-sta-ids",
         values=expected_ids,
     )
+    eligible_ref = _store_id_set(
+        object_store,
+        object_base_uri=object_base_uri,
+        name="inference-eligible-sta-ids",
+        values=eligible_ids,
+    )
     plan = ServingPlan(
         logical_dttm=anchor,
         object_base_uri=object_base_uri,
         station_dependency=station_dependency,
         activation_ready_sta_ids=activation_ref,
         expected_sta_ids=expected_ref,
+        inference_eligible_sta_ids=eligible_ref,
         rental_support_sta_ids=rental_support_sta_ids,
         return_support_sta_ids=return_support_sta_ids,
         prepared_publications=tuple(
@@ -745,6 +773,11 @@ def publish_serving_plan(
         plan.expected_sta_ids,
         "inference expected",
     )
+    inference_eligible = _read_station_id_set_ref(
+        object_store,
+        plan.inference_eligible_sta_ids,
+        "inference eligible",
+    )
     rental_support = _read_station_id_set_ref(
         object_store,
         plan.rental_support_sta_ids,
@@ -806,18 +839,19 @@ def publish_serving_plan(
         )
     )
     planned_active_ids = _active_station_ids(planned_station_records)
-    if expected_ids != tuple(
-        sorted(
-            set(planned_active_ids) & set(rental_support) & set(return_support),
-            key=lambda value: value.encode("utf-8"),
-        )
+    if expected_ids != _inference_expected_station_ids(
+        planned_active_ids,
+        rental_support,
+        return_support,
+        inference_eligible,
     ):
         raise ContractViolation(
-            "plan expected ID가 incoming active∩rental∩return과 다릅니다."
+            "plan expected ID가 incoming active∩rental∩return∩eligible과 다릅니다."
         )
     demand_projection = demand_publisher._projection_from_snapshot(
         snapshot,
         active_sta_ids=planned_active_ids,
+        expected_sta_ids=expected_ids,
     )
     if demand_projection.expected_sta_ids != expected_ids:
         raise ContractViolation("inference projection 기대 집합이 plan과 다릅니다.")
@@ -958,11 +992,11 @@ def publish_serving_plan(
             stock_projection,
         )
         locked_active_ids = _active_station_ids(station_projection.records)
-        locked_expected_ids = tuple(
-            sorted(
-                set(locked_active_ids) & set(rental_support) & set(return_support),
-                key=lambda value: value.encode("utf-8"),
-            )
+        locked_expected_ids = _inference_expected_station_ids(
+            locked_active_ids,
+            rental_support,
+            return_support,
+            inference_eligible,
         )
         if locked_expected_ids != expected_ids:
             raise ContractViolation(
@@ -971,6 +1005,7 @@ def publish_serving_plan(
         demand_projection_locked = demand_publisher._projection_from_snapshot(
             snapshot,
             active_sta_ids=locked_active_ids,
+            expected_sta_ids=locked_expected_ids,
         )
         validate_id_set_parameter(
             "station_demand_forecast",
@@ -1163,6 +1198,10 @@ def parse_serving_plan(payload: bytes) -> ServingPlan:
             document["expected_sta_ids"],
             "expected_sta_ids",
         ),
+        inference_eligible_sta_ids=_parse_id_set_ref(
+            document["inference_eligible_sta_ids"],
+            "inference_eligible_sta_ids",
+        ),
         rental_support_sta_ids=_parse_id_set_ref(
             document["rental_support_sta_ids"],
             "rental_support_sta_ids",
@@ -1323,6 +1362,7 @@ def _demand_staging_validator(
         expected = demand_publisher._projection_from_snapshot(
             verified,
             active_sta_ids=active_sta_ids,
+            expected_sta_ids=projection.expected_sta_ids,
         )
         if expected != projection:
             raise ContractViolation("demand staging projection이 plan과 다릅니다.")
@@ -1576,6 +1616,33 @@ def _weather_outputs(
 def _active_station_ids(records: tuple[StationRecord, ...]) -> tuple[str, ...]:
     """Station projection에서 active ID를 existing canonical 순서로 반환한다."""
     return tuple(record.sta_id for record in records if record.is_active)
+
+
+def _inference_expected_station_ids(
+    active_ids: tuple[str, ...],
+    rental_ids: tuple[str, ...],
+    return_ids: tuple[str, ...],
+    eligible_ids: tuple[str, ...],
+) -> tuple[str, ...]:
+    """알려진 입력 결측을 격리하고 안전한 exact inference 집합을 반환한다."""
+    model_ready_ids = set(active_ids) & set(rental_ids) & set(return_ids)
+    ineligible_ids = model_ready_ids.difference(eligible_ids)
+    ineligible_ratio = (
+        len(ineligible_ids) / len(model_ready_ids) if model_ready_ids else 0.0
+    )
+    if ineligible_ratio > MAX_INFERENCE_INELIGIBLE_RATIO:
+        raise ContractViolation(
+            "추론 입력 품질 제외율이 기준을 초과했습니다: "
+            f"excluded={len(ineligible_ids)} candidate={len(model_ready_ids)} "
+            f"ratio={ineligible_ratio:.3%} "
+            f"limit={MAX_INFERENCE_INELIGIBLE_RATIO:.3%}"
+        )
+    return tuple(
+        sorted(
+            model_ready_ids & set(eligible_ids),
+            key=lambda value: value.encode("utf-8"),
+        )
+    )
 
 
 def _active_grid_ids(records: tuple[StationRecord, ...]) -> tuple[str, ...]:
@@ -1974,6 +2041,9 @@ def _plan_document(plan: ServingPlan) -> dict[str, Any]:
     return {
         "activation_ready_sta_ids": _id_set_ref_document(plan.activation_ready_sta_ids),
         "expected_sta_ids": _id_set_ref_document(plan.expected_sta_ids),
+        "inference_eligible_sta_ids": _id_set_ref_document(
+            plan.inference_eligible_sta_ids
+        ),
         "logical_dttm": format_utc_dttm(plan.logical_dttm),
         "object_base_uri": plan.object_base_uri,
         "prepared_publications": [

@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import io
 import sys
 from contextlib import nullcontext
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 import serving_cli
 from core.gold_publication import ContractViolation, PublicationOutcome
@@ -41,6 +44,56 @@ class _WeatherCatalog:
         return SimpleNamespace(
             manifest=SimpleNamespace(status=SourceSnapshotStatus.SUCCEEDED)
         )
+
+
+def test_inference_eligibility_excludes_known_master_quality_errors() -> None:
+    """결측 grid 같은 알려진 master 품질 문제는 expected 후보에서 격리한다."""
+    table = pa.table(
+        {
+            "station_id": ["ST-1", "ST-2"],
+            "station_no": [1, 2],
+            "capacity": [10, 10],
+            "lat": [37.5, 37.5],
+            "lon": [127.0, 127.0],
+            "grid_id": ["GRID-1", None],
+        }
+    )
+    sink = io.BytesIO()
+    pq.write_table(table, sink)
+
+    class _Body:
+        """Boto streaming body의 최소 read 계약이다."""
+
+        def read(self):
+            """Fixture parquet bytes를 반환한다."""
+            return sink.getvalue()
+
+    class _Client:
+        """Enriched master 하나를 반환하는 S3 fixture다."""
+
+        def list_objects_v2(self, **_kwargs):
+            """최신 enriched parquet key를 반환한다."""
+            return {
+                "Contents": [
+                    {
+                        "Key": "silver/station_master_enriched/"
+                        "dt=2026-08-22/hh=00/0035.parquet"
+                    }
+                ],
+                "IsTruncated": False,
+            }
+
+        def get_object(self, **_kwargs):
+            """Fixture parquet body를 반환한다."""
+            return {"Body": _Body()}
+
+    eligible, excluded = serving_cli._load_inference_eligible_station_ids(
+        _Client(), "fixture"
+    )
+
+    assert eligible == ("ST-1",)
+    assert excluded[0][0] == "ST-2"
+    assert "grid_id 값이 유효하지 않음" in excluded[0][1]
 
 
 def test_weather_ready_skips_polling_between_ten_minute_boundaries(monkeypatch) -> None:
@@ -153,6 +206,11 @@ def test_prepare_pins_support_refs_with_same_client_and_bucket(monkeypatch) -> N
         "load_current_serving_release_for_plan",
         load_current,
     )
+    monkeypatch.setattr(
+        serving_cli,
+        "_load_inference_eligible_station_ids",
+        lambda _client, _bucket: (("ST-1",), ()),
+    )
     monkeypatch.setattr(serving_cli, "prepare_serving_plan", prepare_plan)
     monkeypatch.setattr(
         serving_cli,
@@ -170,6 +228,7 @@ def test_prepare_pins_support_refs_with_same_client_and_bucket(monkeypatch) -> N
     }
     assert captured["rental_support_sta_ids"] is rental_ref
     assert captured["return_support_sta_ids"] is return_ref
+    assert captured["inference_eligible_sta_ids"] == ("ST-1",)
 
 
 def test_finalize_returns_only_four_exact_refs(monkeypatch) -> None:

@@ -237,8 +237,9 @@ def build_demand_projection(
     active_station_ids: tuple[str, ...],
     rental_model_station_ids: tuple[str, ...],
     return_model_station_ids: tuple[str, ...],
+    expected_station_ids: tuple[str, ...] | None = None,
 ) -> DemandProjection:
-    """typed inference를 active·두 모델 교집합의 완전한 Gold 행으로 만든다."""
+    """Typed inference를 plan의 완전한 expected Gold 행으로 만든다."""
     base = _utc_dttm(base_dttm, "projection base_dttm")
     if type(predictions) is not tuple or any(
         type(record) is not DemandPredictionRecord for record in predictions
@@ -249,12 +250,21 @@ def build_demand_projection(
     active = _station_id_set(active_station_ids, "active station")
     rental = _station_id_set(rental_model_station_ids, "rental model station")
     returned = _station_id_set(return_model_station_ids, "return model station")
-    expected_ids = tuple(
+    supported_ids = tuple(
         sorted(
             set(active) & set(rental) & set(returned),
             key=lambda value: value.encode("utf-8"),
         )
     )
+    expected_ids = (
+        supported_ids
+        if expected_station_ids is None
+        else _station_id_set(expected_station_ids, "expected station")
+    )
+    if not set(expected_ids).issubset(supported_ids):
+        raise ContractViolation(
+            "expected station이 active·두 model support 교집합의 subset이 아닙니다."
+        )
     indexed: dict[tuple[str, int], DemandPredictionRecord] = {}
     for prediction in predictions:
         if prediction.base_dttm != base:
@@ -275,7 +285,7 @@ def build_demand_projection(
         missing = len(expected_keys - actual_keys)
         extra = len(actual_keys - expected_keys)
         raise ContractViolation(
-            "inference가 active∩rental∩return×horizon 1..12와 다릅니다: "
+            "inference가 plan expected×horizon 1..12와 다릅니다: "
             f"missing={missing}, extra={extra}"
         )
     records = tuple(
@@ -737,18 +747,20 @@ def _projection_from_snapshot(
     snapshot: DemandInferenceSnapshot,
     *,
     active_sta_ids: tuple[str, ...],
+    expected_sta_ids: tuple[str, ...] | None = None,
 ) -> DemandProjection:
-    """Verified inference와 actual active topology로 complete projection을 만든다."""
+    """Verified inference와 plan expected로 complete projection을 만든다."""
     projection = build_demand_projection(
         snapshot.predictions,
         base_dttm=snapshot.manifest.logical_dttm,
         active_station_ids=active_sta_ids,
         rental_model_station_ids=snapshot.rental_support_sta_ids,
         return_model_station_ids=snapshot.return_support_sta_ids,
+        expected_station_ids=expected_sta_ids,
     )
     if projection.expected_sta_ids != snapshot.expected_sta_ids:
         raise ContractViolation(
-            "inference expected ID set이 active·두 model support 교집합과 다릅니다."
+            "inference expected ID set이 plan expected와 다릅니다."
         )
     return projection
 

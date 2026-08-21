@@ -78,6 +78,21 @@ def _projection(
     )
 
 
+def test_projection_accepts_plan_expected_subset_of_active_model_support() -> None:
+    """Prepare에서 격리한 station은 demand 완결성 기대 집합에서도 제외한다."""
+    projection = build_demand_projection(
+        _complete_predictions(("ST-2",)),
+        base_dttm=BASE,
+        active_station_ids=("ST-10", "ST-2"),
+        rental_model_station_ids=("ST-10", "ST-2"),
+        return_model_station_ids=("ST-10", "ST-2"),
+        expected_station_ids=("ST-2",),
+    )
+
+    assert projection.expected_sta_ids == ("ST-2",)
+    assert len(projection.records) == HORIZON_COUNT
+
+
 def _inference_authority_payload(
     station_ids: tuple[str, ...] = ("ST-1",),
 ) -> bytes:

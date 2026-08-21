@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import os
 import sys
@@ -13,6 +14,7 @@ from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
 import boto3
+import pyarrow.parquet as pq
 from core.db import get_connection
 from core.gold_publication import (
     ContractViolation,
@@ -34,6 +36,7 @@ from gold.urgency import (
     URGENCY_STOCK_HISTORY_OFFSETS_MINUTES,
     publish_station_urgency,
 )
+from ml_core import silver_schema
 from ml_core.serving_release import (
     S3ServingReleasePointerStore,
     load_current_serving_release_for_plan,
@@ -102,6 +105,16 @@ def prepare(
         relocation_approval_sha256,
         "relocation approval",
     )
+    eligible_ids, excluded = _load_inference_eligible_station_ids(client, bucket)
+    if excluded:
+        preview = ", ".join(
+            f"{station_id}({reason})" for station_id, reason in excluded[:20]
+        )
+        print(
+            "Serving plan input-quality exclusions: "
+            f"count={len(excluded)} preview=[{preview}]",
+            file=sys.stderr,
+        )
     with get_connection() as connection:
         artifact = prepare_serving_plan(
             connection,
@@ -128,12 +141,68 @@ def prepare(
             return_support_sta_ids=(
                 pinned.return_model.support_sta_ids
             ),
+            inference_eligible_sta_ids=eligible_ids,
             source_catalog=source_catalog,
             object_base_uri=object_base_uri,
             source_lookbacks=lookbacks,
             relocation_approval_payload=relocation_payload,
         )
     return {"plan": _ref(artifact.uri, artifact.byte_sha256)}
+
+
+def _load_inference_eligible_station_ids(
+    client: Any, bucket: str
+) -> tuple[tuple[str, ...], tuple[tuple[str, str], ...]]:
+    """최신 enriched master에서 추론 가능 ID와 제외 사유를 계산한다."""
+    keys: list[str] = []
+    token: str | None = None
+    while True:
+        kwargs: dict[str, Any] = {
+            "Bucket": bucket,
+            "Prefix": silver_schema.STATION_MASTER_ENRICHED_PREFIX,
+        }
+        if token is not None:
+            kwargs["ContinuationToken"] = token
+        page = client.list_objects_v2(**kwargs)
+        keys.extend(
+            item["Key"]
+            for item in page.get("Contents", ())
+            if item["Key"].endswith(".parquet")
+        )
+        if not page.get("IsTruncated"):
+            break
+        token = page.get("NextContinuationToken")
+        if type(token) is not str or not token:
+            raise ContractViolation("enriched station master LIST token이 없습니다.")
+    if not keys:
+        raise ContractViolation("최신 station_master_enriched parquet이 없습니다.")
+    key = max(keys)
+    payload = client.get_object(Bucket=bucket, Key=key)["Body"].read()
+    raw = pq.read_table(io.BytesIO(payload)).to_pandas()
+    master = raw.rename(columns=silver_schema.STATION_COLUMN_MAP)
+    if "station_id" not in master:
+        raise ContractViolation("station_master_enriched에 station_id가 없습니다.")
+    if (
+        master["station_id"].isna().any()
+        or not master["station_id"].map(lambda value: type(value) is str and bool(value)).all()
+        or master["station_id"].duplicated().any()
+    ):
+        raise ContractViolation(
+            "station_master_enriched의 station_id가 결측 또는 중복입니다."
+        )
+    eligible: list[str] = []
+    excluded: list[tuple[str, str]] = []
+    indexed = master.set_index("station_id")
+    for station_id in sorted(indexed.index.astype(str), key=lambda value: value.encode("utf-8")):
+        try:
+            silver_schema.validate_inference_station_row(
+                station_id, indexed.loc[station_id]
+            )
+        except (TypeError, ValueError) as exc:
+            excluded.append((station_id, str(exc)))
+        else:
+            eligible.append(station_id)
+    return tuple(eligible), tuple(excluded)
 
 
 def finalize(
