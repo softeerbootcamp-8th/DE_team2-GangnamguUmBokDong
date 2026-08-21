@@ -114,39 +114,40 @@ def task_orchestrate_retrain_loop(**context: Any) -> dict[str, Any]:
             "=== [프로필: %s] EMR 피처마트 생성 시작 (EC2는 OFF 상태) ===",
             profile,
         )
-        # 1. EMR 클러스터 기동 & 피처마트 생성 (완료 시 자동 Terminate)
-        emr_job_id = run_emr_feature_mart_job(profile)
-        logger.info(
-            "=== [프로필: %s] EMR 피처마트 생성 완료 (%s) ===",
-            profile,
-            emr_job_id,
-        )
-
-        # 2. EMR 종료 확인 후 EC2 기동 & 챌린저 학습/평가
-        logger.info(
-            "=== [프로필: %s] EC2 기동 & 챌린저 학습 시작 (EMR은 OFF 상태) ===",
-            profile,
-        )
         try:
-            start_ec2_instance()
-            train_cmd = (
-                "uv run --frozen python -m training.scripts.monthly_retrain_check "
-                f"--execute --skip-feature-pipeline --profile-name {profile} --models {models_arg}"
+            # 1. EMR 클러스터 기동 & 피처마트 생성 (완료 시 자동 Terminate)
+            emr_job_id = run_emr_feature_mart_job(profile)
+            logger.info(
+                "=== [프로필: %s] EMR 피처마트 생성 완료 (%s) ===",
+                profile,
+                emr_job_id,
             )
-            train_result = run_command_on_ec2(
-                train_cmd, working_dir="/workspace/ml"
+
+            # 2. EMR 종료 확인 후 EC2 기동 & 챌린저 학습/평가
+            logger.info(
+                "=== [프로필: %s] EC2 기동 & 챌린저 학습 시작 (EMR은 OFF 상태) ===",
+                profile,
             )
-            results_by_profile[profile] = {
-                "status": "success",
-                "output": train_result.get("StandardOutputContent", "")[:500],
-            }
-        except (RuntimeError, OSError, ValueError) as exc:
-            logger.error("[프로필: %s] EC2 학습 중 오류 발생: %s", profile, exc)
+            try:
+                start_ec2_instance()
+                train_cmd = (
+                    "uv run --frozen python -m training.scripts.monthly_retrain_check "
+                    f"--execute --skip-feature-pipeline --profile-name {profile} --models {models_arg}"
+                )
+                train_result = run_command_on_ec2(
+                    train_cmd, working_dir="/workspace/ml"
+                )
+                results_by_profile[profile] = {
+                    "status": "success",
+                    "output": train_result.get("StandardOutputContent", "")[:500],
+                }
+            finally:
+                # 성공/실패 무관하게 EC2 즉시 중지
+                logger.info("=== [프로필: %s] EC2 인스턴스 중지 ===", profile)
+                stop_ec2_instance()
+        except (RuntimeError, OSError, ValueError, TimeoutError) as exc:
+            logger.error("[프로필: %s] 재학습 루프 중 오류 발생: %s", profile, exc)
             results_by_profile[profile] = {"status": "failed", "error": str(exc)}
-        finally:
-            # 성공/실패 무관하게 EC2 즉시 중지
-            logger.info("=== [프로필: %s] EC2 인스턴스 중지 ===", profile)
-            stop_ec2_instance()
 
     return {"status": "completed", "profiles": results_by_profile}
 
