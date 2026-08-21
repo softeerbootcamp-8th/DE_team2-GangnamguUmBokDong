@@ -57,6 +57,29 @@ class RentalTrip:
 
 
 @dataclass(frozen=True, slots=True)
+class BikeRelocationInterval:
+    """동일 자전거의 연속 이용 사이에서 관측된 위치 이동 구간을 표현한다."""
+
+    bike_id: str
+    origin_station_no: int
+    destination_station_no: int
+    earliest_at: datetime
+    latest_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class BikeLineageReadResult:
+    """월 이력의 자전거 연속성 검사와 평가 구간 이동 후보를 묶는다."""
+
+    intervals: tuple[BikeRelocationInterval, ...]
+    source_trip_count: int
+    bike_count: int
+    consecutive_pair_count: int
+    changed_station_pair_count: int
+    overlapping_pair_count: int
+
+
+@dataclass(frozen=True, slots=True)
 class StockObservation:
     """정시 기준 대여소의 실측 재고를 표현한다."""
 
@@ -222,46 +245,81 @@ def read_rental_trips(
     trips: list[RentalTrip] = []
     with path.open("r", encoding="cp949", newline="") as stream:
         for row in csv.DictReader(stream):
-            try:
-                rented_at = datetime.strptime(
-                    row["대여일시"], "%Y-%m-%d %H:%M:%S"
-                ).replace(tzinfo=SEOUL)
-                returned_at = datetime.strptime(
-                    row["반납일시"], "%Y-%m-%d %H:%M:%S"
-                ).replace(tzinfo=SEOUL)
-                public_rent_station_no = _station_no(row["대여 대여소번호"])
-                public_return_station_no = _station_no(row["반납대여소번호"])
-            except (KeyError, TypeError, ValueError):
+            trip = _rental_trip_from_row(row, station_crosswalk=station_crosswalk)
+            if trip is None:
                 continue
-            rent_station_no = public_rent_station_no
-            return_station_no = public_return_station_no
-            if station_crosswalk is not None:
-                try:
-                    rent_station_no = station_crosswalk[public_rent_station_no]
-                    return_station_no = station_crosswalk[public_return_station_no]
-                    row_rent_station_no = _internal_station_no(row["대여대여소ID"])
-                    row_return_station_no = _internal_station_no(row["반납대여소ID"])
-                except (KeyError, TypeError, ValueError):
-                    continue
-                if (
-                    rent_station_no != row_rent_station_no
-                    or return_station_no != row_return_station_no
-                ):
-                    raise ValueError("대여 이력 행의 공공 번호와 내부 ST ID가 다릅니다.")
-            if returned_at < day_start or rented_at >= day_end:
+            if trip.returned_at < day_start or trip.rented_at >= day_end:
                 continue
-            if returned_at < rented_at:
-                continue
-            trips.append(
-                RentalTrip(
-                    bike_id=row.get("자전거번호", "").strip(),
-                    rented_at=rented_at,
-                    rent_station_no=rent_station_no,
-                    returned_at=returned_at,
-                    return_station_no=return_station_no,
-                )
-            )
+            trips.append(trip)
     return tuple(sorted(trips, key=lambda trip: (trip.rented_at, trip.bike_id)))
+
+
+def read_bike_relocation_intervals(
+    path: Path,
+    *,
+    window_start: datetime,
+    window_end: datetime,
+    station_crosswalk: Mapping[int, int],
+) -> BikeLineageReadResult:
+    """월 전체의 자전거별 연속 이용에서 위치 이동 가능구간을 읽는다.
+
+    이전 이용의 반납 대여소와 다음 이용의 대여 대여소가 다르면 자전거가 두 사건
+    사이에 이동했다는 사실만 확정할 수 있다. 이동의 정확한 시각이나 트럭 경로는
+    확정하지 않으며, 평가 창과 겹치는 구간만 반환한다. 원천이 자전거별 시간순이
+    아니면 잘못된 연속 쌍을 만들지 않도록 중단한다.
+    """
+    previous_by_bike: dict[str, RentalTrip] = {}
+    intervals: list[BikeRelocationInterval] = []
+    source_trip_count = 0
+    consecutive_pair_count = 0
+    changed_station_pair_count = 0
+    overlapping_pair_count = 0
+    with path.open("r", encoding="cp949", newline="") as stream:
+        for row in csv.DictReader(stream):
+            trip = _rental_trip_from_row(row, station_crosswalk=station_crosswalk)
+            if trip is None or not trip.bike_id:
+                continue
+            source_trip_count += 1
+            previous = previous_by_bike.get(trip.bike_id)
+            if previous is not None:
+                if trip.rented_at < previous.rented_at:
+                    raise ValueError(
+                        "월 대여 이력이 자전거별 대여시각 순서가 아닙니다: "
+                        f"{trip.bike_id}"
+                    )
+                consecutive_pair_count += 1
+                gap = trip.rented_at - previous.returned_at
+                if gap < timedelta(0):
+                    overlapping_pair_count += 1
+                elif previous.return_station_no != trip.rent_station_no:
+                    changed_station_pair_count += 1
+                    if (
+                        previous.returned_at < window_end
+                        and trip.rented_at >= window_start
+                    ):
+                        intervals.append(
+                            BikeRelocationInterval(
+                                bike_id=trip.bike_id,
+                                origin_station_no=previous.return_station_no,
+                                destination_station_no=trip.rent_station_no,
+                                earliest_at=previous.returned_at,
+                                latest_at=trip.rented_at,
+                            )
+                        )
+            previous_by_bike[trip.bike_id] = trip
+    return BikeLineageReadResult(
+        intervals=tuple(
+            sorted(
+                intervals,
+                key=lambda row: (row.latest_at, row.earliest_at, row.bike_id),
+            )
+        ),
+        source_trip_count=source_trip_count,
+        bike_count=len(previous_by_bike),
+        consecutive_pair_count=consecutive_pair_count,
+        changed_station_pair_count=changed_station_pair_count,
+        overlapping_pair_count=overlapping_pair_count,
+    )
 
 
 def station_id_candidates(
@@ -1045,6 +1103,49 @@ def _internal_station_no(value: str) -> int:
     if station_no <= 0:
         raise ValueError("내부 대여소 번호는 양수여야 합니다.")
     return station_no
+
+
+def _rental_trip_from_row(
+    row: Mapping[str, str],
+    *,
+    station_crosswalk: Mapping[int, int] | None,
+) -> RentalTrip | None:
+    """대여 원천 한 행을 검증하고 선택한 대여소 번호 공간으로 변환한다."""
+    try:
+        rented_at = datetime.strptime(row["대여일시"], "%Y-%m-%d %H:%M:%S").replace(
+            tzinfo=SEOUL
+        )
+        returned_at = datetime.strptime(row["반납일시"], "%Y-%m-%d %H:%M:%S").replace(
+            tzinfo=SEOUL
+        )
+        public_rent_station_no = _station_no(row["대여 대여소번호"])
+        public_return_station_no = _station_no(row["반납대여소번호"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if returned_at < rented_at:
+        return None
+    rent_station_no = public_rent_station_no
+    return_station_no = public_return_station_no
+    if station_crosswalk is not None:
+        try:
+            rent_station_no = station_crosswalk[public_rent_station_no]
+            return_station_no = station_crosswalk[public_return_station_no]
+            row_rent_station_no = _internal_station_no(row["대여대여소ID"])
+            row_return_station_no = _internal_station_no(row["반납대여소ID"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        if (
+            rent_station_no != row_rent_station_no
+            or return_station_no != row_return_station_no
+        ):
+            raise ValueError("대여 이력 행의 공공 번호와 내부 ST ID가 다릅니다.")
+    return RentalTrip(
+        bike_id=row.get("자전거번호", "").strip(),
+        rented_at=rented_at,
+        rent_station_no=rent_station_no,
+        returned_at=returned_at,
+        return_station_no=return_station_no,
+    )
 
 
 def _haversine_km(

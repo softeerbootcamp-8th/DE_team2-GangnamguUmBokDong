@@ -15,6 +15,7 @@ from evaluation.rebalance_backtest import (
     build_station_metadata,
     detect_relocation_candidates,
     estimate_existing_operations,
+    read_bike_relocation_intervals,
     read_rental_trips,
     read_station_crosswalk,
     read_stock_observations,
@@ -254,6 +255,43 @@ def test_public_station_numbers_are_remapped_to_internal_model_ids(
         (2007, 781)
     ]
     assert [(row.station_no, row.quantity) for row in stock] == [(781, 19), (2007, 76)]
+
+
+def test_bike_lineage_preserves_relocation_time_interval(tmp_path: Path) -> None:
+    """이전 반납지와 다음 대여지가 다른 자전거의 이동 가능구간을 보존한다."""
+    rental_path = tmp_path / "rental.csv"
+    rental_path.write_text(
+        "자전거번호,대여일시,대여 대여소번호,반납일시,반납대여소번호,"
+        "대여대여소ID,반납대여소ID\n"
+        "B1,2025-01-17 05:30:00,1,2025-01-17 05:50:00,2,ST-1,ST-2\n"
+        "B2,2025-01-17 05:55:00,4,2025-01-17 06:05:00,5,ST-4,ST-5\n"
+        "B1,2025-01-17 06:20:00,3,2025-01-17 06:30:00,4,ST-3,ST-4\n"
+        "B2,2025-01-17 06:25:00,6,2025-01-17 06:35:00,7,ST-6,ST-7\n",
+        encoding="cp949",
+    )
+    lineage = read_bike_relocation_intervals(
+        rental_path,
+        window_start=START,
+        window_end=START + timedelta(hours=1),
+        station_crosswalk={index: index for index in range(1, 8)},
+    )
+    assert lineage.source_trip_count == 4
+    assert lineage.consecutive_pair_count == 2
+    assert lineage.changed_station_pair_count == 2
+    assert lineage.overlapping_pair_count == 0
+    assert [
+        (
+            row.bike_id,
+            row.origin_station_no,
+            row.destination_station_no,
+            row.earliest_at,
+            row.latest_at,
+        )
+        for row in lineage.intervals
+    ] == [
+        ("B1", 2, 3, START - timedelta(minutes=10), START + timedelta(minutes=20)),
+        ("B2", 5, 6, START + timedelta(minutes=5), START + timedelta(minutes=25)),
+    ]
 
 
 def test_station_crosswalk_rejects_many_to_one_mapping(tmp_path: Path) -> None:

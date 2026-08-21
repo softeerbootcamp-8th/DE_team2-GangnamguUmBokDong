@@ -40,9 +40,11 @@ from .legacy_baseline import (
 )
 from .policy_simulator import SimulationMetrics, simulate_no_rebalance, simulate_policy
 from .rebalance_backtest import (
+    BikeLineageReadResult,
     RentalTrip,
     StockObservation,
     load_centers,
+    read_bike_relocation_intervals,
     read_rental_trips,
     read_station_crosswalk,
     read_stock_observations,
@@ -62,7 +64,10 @@ class EvidenceGate:
     model_existed_at_historical_anchor: bool
     latent_failed_demand_observed: bool
     operator_route_logs_observed: bool
+    bike_lineage_observed: bool
+    bike_lineage_hybrid_replay_passed: bool
     same_bike_movement_budget_cap_enforced: bool
+    common_residual_movement_cap_enforced: bool
     same_vehicle_budget_proven: bool
     causal_superiority_vs_legacy_allowed: bool
     publication_grade_system_claim_allowed: bool
@@ -93,7 +98,8 @@ class PolicyBacktestResult:
     model_bundle_root: str
     model_bundle_sha256: str
     source_trip_count: int
-    source_provenance: "SourceProvenance"
+    bike_lineage: BikeLineageAudit
+    source_provenance: SourceProvenance
     evidence_gate: EvidenceGate
     contracts: tuple[Mapping[str, object], ...]
     durations: tuple[DurationResult, ...]
@@ -106,6 +112,18 @@ class SourceFile:
     path: str
     size_bytes: int
     sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class BikeLineageAudit:
+    """월 전체 자전거 연속 이력의 완전성과 평가 구간 후보 수를 기록한다."""
+
+    source_trip_count: int
+    bike_count: int
+    consecutive_pair_count: int
+    changed_station_pair_count: int
+    overlapping_pair_count: int
+    evaluation_window_candidate_count: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -175,13 +193,19 @@ def run_policy_backtest(
         target_date,
         station_crosswalk=station_crosswalk,
     )
+    max_end = _window_start(target_date, start_hour) + timedelta(
+        minutes=max(evaluation_minutes)
+    )
+    lineage = read_bike_relocation_intervals(
+        rental_csv,
+        window_start=_window_start(target_date, start_hour),
+        window_end=max_end,
+        station_crosswalk=station_crosswalk,
+    )
     observations = read_stock_observations(
         stock_csv,
         target_date,
         station_crosswalk=station_crosswalk,
-    )
-    max_end = _window_start(target_date, start_hour) + timedelta(
-        minutes=max(evaluation_minutes)
     )
     selected = _require_hourly_observation_coverage(
         selected,
@@ -190,16 +214,16 @@ def run_policy_backtest(
         window_end=max_end,
     )
     if not selected:
-        raise ValueError("선택 권역에서 model·station·재고 공통 평가 대여소가 없습니다.")
+        raise ValueError(
+            "선택 권역에서 model·station·재고 공통 평가 대여소가 없습니다."
+        )
     population_requirements = _population_required_hours(
         window_start=_window_start(target_date, start_hour),
         window_end=max_end,
         tick_minutes=contracts[0].tick_minutes,
     )
     population_dates = tuple(population_requirements)
-    candidate_grid_ids = frozenset(
-        station.grid_id for station in selected.values()
-    )
+    candidate_grid_ids = frozenset(station.grid_id for station in selected.values())
     population = build_population_nowcast(
         population_dir=population_dir,
         target_dates=population_dates,
@@ -211,9 +235,7 @@ def run_policy_backtest(
         candidate_grid_ids,
         population_requirements,
     )
-    population_excluded_grid_ids = tuple(
-        sorted(candidate_grid_ids - complete_grid_ids)
-    )
+    population_excluded_grid_ids = tuple(sorted(candidate_grid_ids - complete_grid_ids))
     station_count_before_population = len(selected)
     selected = {
         station_no: station
@@ -248,7 +270,7 @@ def run_policy_backtest(
         station_crosswalk_sha256=_station_crosswalk_sha256(station_crosswalk),
         population_excluded_station_count=population_excluded_station_count,
         population_excluded_grid_ids=population_excluded_grid_ids,
-        backtest_contract_version="point-in-time-policy-backtest-v2",
+        backtest_contract_version="point-in-time-policy-backtest-v3-bike-lineage",
         route_algorithm_version="route-v2",
     )
 
@@ -287,6 +309,7 @@ def run_policy_backtest(
             station_nos=station_nos,
             window_start=window_start,
             window_end=window_end,
+            relocations=lineage.intervals,
         )
         legacy_timing = tuple(
             replay_legacy_timing(
@@ -298,7 +321,9 @@ def run_policy_backtest(
                 station_nos=station_nos,
                 window_start=window_start,
                 window_end=window_end,
+                use_lineage_assignment=use_lineage_assignment,
             )
+            for use_lineage_assignment in (False, True)
             for timing in contract.operator_timing_scenarios
         )
         no_rebalance = simulate_no_rebalance(
@@ -332,7 +357,9 @@ def run_policy_backtest(
                 model_policies=model_policies,
             )
         )
-    point_in_time_passed = _audit_prediction_inputs(tuple(duration_results), target_date)
+    point_in_time_passed = _audit_prediction_inputs(
+        tuple(duration_results), target_date
+    )
     operation_contract_passed = _audit_operation_contract(
         tuple(duration_results),
         contracts,
@@ -350,7 +377,14 @@ def run_policy_backtest(
         model_existed_at_historical_anchor=False,
         latent_failed_demand_observed=False,
         operator_route_logs_observed=False,
-        same_bike_movement_budget_cap_enforced=all(
+        bike_lineage_observed=(
+            lineage.source_trip_count > 0
+            and lineage.consecutive_pair_count > 0
+            and lineage.changed_station_pair_count > 0
+        ),
+        bike_lineage_hybrid_replay_passed=legacy_reconciliation_passed,
+        same_bike_movement_budget_cap_enforced=False,
+        common_residual_movement_cap_enforced=all(
             policy.movement_budget is not None
             and policy.movement_budget_used <= policy.movement_budget
             for duration in duration_results
@@ -374,10 +408,23 @@ def run_policy_backtest(
         model_bundle_root=str(model_bundle_root),
         model_bundle_sha256=model.bundle_sha256,
         source_trip_count=len(trips),
+        bike_lineage=_lineage_audit(lineage),
         source_provenance=provenance,
         evidence_gate=evidence_gate,
         contracts=tuple(contract.audit_document() for contract in contracts),
         durations=tuple(duration_results),
+    )
+
+
+def _lineage_audit(lineage: BikeLineageReadResult) -> BikeLineageAudit:
+    """원시 이동구간을 제외한 월 자전거 연속성 감사 지표를 만든다."""
+    return BikeLineageAudit(
+        source_trip_count=lineage.source_trip_count,
+        bike_count=lineage.bike_count,
+        consecutive_pair_count=lineage.consecutive_pair_count,
+        changed_station_pair_count=lineage.changed_station_pair_count,
+        overlapping_pair_count=lineage.overlapping_pair_count,
+        evaluation_window_candidate_count=len(lineage.intervals),
     )
 
 
@@ -464,7 +511,10 @@ def _audit_prediction_inputs(
         weather = datetime.fromisoformat(audit.weather_observed_at)
         if weather > cutoff.replace(tzinfo=None):
             return False
-        if any(date.fromisoformat(day) >= target_date for day in audit.population_candidate_dates):
+        if any(
+            date.fromisoformat(day) >= target_date
+            for day in audit.population_candidate_dates
+        ):
             return False
         if datetime.fromisoformat(audit.rental_visibility_cutoff) != anchor:
             return False
@@ -528,8 +578,7 @@ def _population_required_hours(
             required.setdefault(target.date(), set()).add(target.hour)
         anchor += timedelta(minutes=tick_minutes)
     return {
-        target_date: frozenset(hours)
-        for target_date, hours in sorted(required.items())
+        target_date: frozenset(hours) for target_date, hours in sorted(required.items())
     }
 
 
@@ -593,6 +642,12 @@ def result_markdown(result: PolicyBacktestResult) -> str:
         "",
         f"- 근거 등급: `{result.evidence_grade}`",
         f"- 모델 SHA-256: `{result.model_bundle_sha256}`",
+        (
+            "- 자전거 ID 연속 쌍: "
+            f"{result.bike_lineage.consecutive_pair_count:,}개, "
+            f"위치 변경 {result.bike_lineage.changed_station_pair_count:,}개, "
+            f"평가 창 후보 {result.bike_lineage.evaluation_window_candidate_count:,}개"
+        ),
         f"- 발표용 시스템 개선 주장 허용: **{result.evidence_gate.publication_grade_system_claim_allowed}**",
         f"- 제한 이유: {result.evidence_gate.reason}",
         "",
@@ -615,16 +670,25 @@ def result_markdown(result: PolicyBacktestResult) -> str:
                 f"{policy.vehicle_busy_minutes:.1f} |"
             )
         legacy_values = [row.empty_station_minutes for row in duration.legacy_timing]
+        evidence = duration.legacy_movement.relocation_evidence
         lines.append(
             f"| {duration.evaluation_minutes}분 | 추정 기존 운영 범위 | 해당 없음 | 해당 없음 | "
             f"{min(legacy_values):.1f}~{max(legacy_values):.1f} | "
-            f"예산 {duration.legacy_movement.balanced_movement_budget} | 경로 미관측 | 미관측 |"
+            f"잔차 상한 {duration.legacy_movement.balanced_movement_budget} "
+            f"(ID 양립 {evidence.residual_compatible_internal_intervals}, "
+            f"잔차 설명 {evidence.residual_explained_pct}%) | "
+            "경로 미관측 | 미관측 |"
         )
     lines.extend(
         (
             "",
-            "> 기존 운영 범위는 시간별 재고 잔차를 구간 초·중·말에 적용한 민감도다. "
-            "운영 route·truck과 실패 수요가 없으므로 실제 운영 대비 인과적 우월성으로 인용하면 안 된다.",
+            (
+                "> 기존 운영 범위는 잔차만 구간 초·중·말에 적용한 세 경우와, 자전거 ID "
+                "이동 가능구간 중 잔차 방향과 양립하는 후보를 짧은 구간부터 한 번씩 "
+                "할당한 세 경우를 모두 포함한다. ID 할당은 가능한 재구성이지 확정시각이 아니다. "
+                "ID는 이동 출발지·도착지와 가능 시간구간만 알려주며 운영 route·truck과 "
+                "정확한 이동시각, 실패 수요는 알려주지 않는다."
+            ),
             "",
         )
     )
@@ -664,7 +728,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--date", required=True, type=date.fromisoformat)
     parser.add_argument("--center", required=True)
     parser.add_argument("--start-hour", type=int, default=6)
-    parser.add_argument("--evaluation-minutes", nargs="+", type=int, default=[60, 120, 180])
+    parser.add_argument(
+        "--evaluation-minutes", nargs="+", type=int, default=[60, 120, 180]
+    )
     parser.add_argument("--fleet-size", type=int, default=3)
     parser.add_argument("--max-stops", nargs="+", type=int, default=[5, 8])
     parser.add_argument("--rental-csv", required=True, type=Path)
@@ -689,18 +755,29 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=Path,
         default=Path("../docs/gold/dispatch-center-seed.yaml"),
     )
-    parser.add_argument("--s3-endpoint", default=os.environ.get("S3_ENDPOINT_URL", "http://localhost:9000"))
+    parser.add_argument(
+        "--s3-endpoint",
+        default=os.environ.get("S3_ENDPOINT_URL", "http://localhost:9000"),
+    )
     parser.add_argument("--s3-bucket", default="issue163-full-year")
-    parser.add_argument("--access-key", default=os.environ.get("AWS_ACCESS_KEY_ID", "minioadmin"))
-    parser.add_argument("--secret-key", default=os.environ.get("AWS_SECRET_ACCESS_KEY", "minioadmin"))
-    parser.add_argument("--output-dir", type=Path, default=Path("../data/backtest-results"))
+    parser.add_argument(
+        "--access-key", default=os.environ.get("AWS_ACCESS_KEY_ID", "minioadmin")
+    )
+    parser.add_argument(
+        "--secret-key", default=os.environ.get("AWS_SECRET_ACCESS_KEY", "minioadmin")
+    )
+    parser.add_argument(
+        "--output-dir", type=Path, default=Path("../data/backtest-results")
+    )
     args = parser.parse_args(argv)
     if not 0 <= args.start_hour <= 23:
         parser.error("--start-hour는 0..23이어야 합니다.")
     if args.date.day != 17:
         parser.error("현재 고정 모델의 held-out test split인 매월 17일만 평가합니다.")
     if tuple(args.evaluation_minutes) != (60, 120, 180):
-        parser.error("기본 근거 실행은 --evaluation-minutes 60 120 180을 모두 사용해야 합니다.")
+        parser.error(
+            "기본 근거 실행은 --evaluation-minutes 60 120 180을 모두 사용해야 합니다."
+        )
     if args.fleet_size <= 0:
         parser.error("--fleet-size는 양수여야 합니다.")
     if any(not 2 <= value <= 32767 for value in args.max_stops):
