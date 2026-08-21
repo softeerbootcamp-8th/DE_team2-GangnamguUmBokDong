@@ -16,8 +16,14 @@ from core.gold_publication import (
     parse_route_coverage,
     route_uuid_v5,
 )
+
 from gold import rebalance_route as route_module
 from gold.common import parquet_bytes, read_parquet_bytes
+from gold.rebalance_policy import (
+    LEGACY_REBALANCE_POLICY,
+    RebalancePolicyConfig,
+    risk_band_policy,
+)
 from gold.rebalance_route import (
     INITIAL_TRUCK_LOAD,
     MAX_ROUTES_PER_CENTER,
@@ -128,6 +134,8 @@ def _plan(
     revision_no: int = 0,
     coverage=None,
     max_stops_per_route: int = MAX_STOPS_PER_ROUTE,
+    policy_config: RebalancePolicyConfig = LEGACY_REBALANCE_POLICY,
+    pickup_cooldown_sta_ids: frozenset[str] = frozenset(),
 ) -> RebalanceRoutePlan:
     """공통 anchor로 pure route planner를 실행한다."""
     return plan_rebalance_routes(
@@ -138,18 +146,20 @@ def _plan(
         urgency=urgency,
         route_coverage=coverage or _empty_coverage(),
         max_stops_per_route=max_stops_per_route,
+        policy_config=policy_config,
+        pickup_cooldown_sta_ids=pickup_cooldown_sta_ids,
     )
 
 
 def test_route_constants_match_publication_contract() -> None:
-    """route fingerprint에 들어가는 v2 작업 단위 상수를 SSOT 값으로 고정한다."""
-    assert ROUTE_ALGORITHM_VERSION == "route-v2"
+    """route fingerprint에 들어가는 v3 작업 단위 상수를 SSOT 값으로 고정한다."""
+    assert ROUTE_ALGORITHM_VERSION == "route-v3-risk-band"
     assert TRUCK_CAPACITY == 20
     assert TRUCK_CAPACITY_CONFIG_VERSION == "truck-capacity-v1"
     assert INITIAL_TRUCK_LOAD == 0
-    assert MAX_STOPS_PER_ROUTE == 8
+    assert MAX_STOPS_PER_ROUTE == 5
     assert MAX_ROUTES_PER_CENTER == 3
-    assert ROUTE_WORK_UNIT_CONFIG_VERSION == "route-work-unit-v1"
+    assert ROUTE_WORK_UNIT_CONFIG_VERSION == "route-work-unit-v2"
 
 
 def test_planner_can_override_stop_limit_for_offline_evaluation() -> None:
@@ -444,9 +454,7 @@ def test_current_station_center_fk_controls_grouping_and_center_order() -> None:
     )
     stations_by_route = {
         route.route_id: {
-            stop.sta_id
-            for stop in plan.route_stops
-            if stop.route_id == route.route_id
+            stop.sta_id for stop in plan.route_stops if stop.route_id == route.route_id
         }
         for route in plan.routes
     }
@@ -564,14 +572,10 @@ def test_dropoff_is_limited_by_actual_pickup_per_route() -> None:
     for route in plan.routes:
         stops = [stop for stop in plan.route_stops if stop.route_id == route.route_id]
         picked = sum(
-            stop.bike_cnt
-            for stop in stops
-            if stop.route_action_type_cd == "pickup"
+            stop.bike_cnt for stop in stops if stop.route_action_type_cd == "pickup"
         )
         dropped = sum(
-            stop.bike_cnt
-            for stop in stops
-            if stop.route_action_type_cd == "dropoff"
+            stop.bike_cnt for stop in stops if stop.route_action_type_cd == "dropoff"
         )
         assert dropped == picked <= TRUCK_CAPACITY
     assert (
@@ -626,6 +630,84 @@ def test_work_unit_has_at_most_eight_stops_and_center_route_cap() -> None:
             stop.bike_cnt for stop in stops if stop.route_action_type_cd == "dropoff"
         )
         assert picked == dropped > 0
+
+
+def test_exclusive_pickup_station_is_not_split_across_concurrent_routes() -> None:
+    """한 공급원의 큰 수량은 한 plan에서 한 경로에만 배정하고 잔량은 재평가한다."""
+    policy = risk_band_policy(
+        protection_horizon_hours=2,
+        minimum_stock_ratio=0.2,
+        uncertainty_z=0.0,
+    )
+    plan = _plan(
+        stations=tuple(_station(f"ST-{index}") for index in range(1, 5)),
+        urgency=(
+            _urgency("ST-1", "retrieval_needed", 40, score=100),
+            _urgency("ST-2", "supply_needed", 10, score=90),
+            _urgency("ST-3", "supply_needed", 10, score=80),
+            _urgency("ST-4", "supply_needed", 10, score=70),
+        ),
+        policy_config=policy,
+    )
+    pickup_routes = {
+        stop.route_id
+        for stop in plan.route_stops
+        if stop.sta_id == "ST-1" and stop.route_action_type_cd == "pickup"
+    }
+    assert len(pickup_routes) == 1
+
+
+def test_exclusive_active_pickup_waits_for_next_recalculation() -> None:
+    """이미 active 경로가 예약한 공급원은 남은 수량이 있어도 새 plan에서 제외한다."""
+    policy = risk_band_policy(
+        protection_horizon_hours=2,
+        minimum_stock_ratio=0.2,
+        uncertainty_z=0.0,
+    )
+    coverage = build_current_route_coverage(
+        stock_anchor_dttm=_UTC_1600,
+        routes=(
+            _existing_route(
+                "00000000-0000-0000-0000-000000000001",
+                "dispatched",
+                stops=(
+                    _stop("ST-1", action="pickup", bike_cnt=10),
+                    _stop("ST-2", action="dropoff", bike_cnt=10, visit_no=2),
+                ),
+                dispatched_dttm=_UTC_1600 - timedelta(minutes=5),
+            ),
+        ),
+    )
+    plan = _plan(
+        stations=(_station("ST-1"), _station("ST-2")),
+        urgency=(
+            _urgency("ST-1", "retrieval_needed", 40),
+            _urgency("ST-2", "supply_needed", 40),
+        ),
+        coverage=coverage,
+        policy_config=policy,
+    )
+    assert plan == RebalanceRoutePlan((), ())
+
+
+def test_pickup_cooldown_station_is_excluded_from_new_routes() -> None:
+    """최근 회수한 공급원은 수량이 남아도 cooldown 동안 다시 배차하지 않는다."""
+    policy = risk_band_policy(
+        protection_horizon_hours=2,
+        minimum_stock_ratio=0.2,
+        uncertainty_z=0.0,
+        pickup_cooldown_minutes=120,
+    )
+    plan = _plan(
+        stations=(_station("ST-1"), _station("ST-2")),
+        urgency=(
+            _urgency("ST-1", "retrieval_needed", 20),
+            _urgency("ST-2", "supply_needed", 20),
+        ),
+        policy_config=policy,
+        pickup_cooldown_sta_ids=frozenset({"ST-1"}),
+    )
+    assert plan == RebalanceRoutePlan((), ())
 
 
 def test_revision_is_explicit_route_identity_input() -> None:

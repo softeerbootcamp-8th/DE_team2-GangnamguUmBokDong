@@ -25,6 +25,7 @@ from core.source_snapshot import (
 
 from gold.common import parquet_bytes
 from gold.demand import DemandForecastRecord
+from gold.rebalance_policy import risk_band_policy
 from gold.source_catalog import S3SourceSnapshotCatalog
 from gold.station_stock import StationStockRecord
 from gold.urgency import (
@@ -34,6 +35,7 @@ from gold.urgency import (
     UrgencyCalculationInputs,
     UrgencyProjection,
     UrgencyRecord,
+    _bike_qty_risk_band_v2,
     _bike_qty_v1,
     _history_window_from_manifest,
     _serving_release_manifest_refs,
@@ -333,7 +335,7 @@ def test_compute_projection_allows_new_station_absent_from_old_complete_windows(
             urgency_score=53.5,
             critical_remaining_min=0,
             rebalance_need_type_cd="supply_needed",
-            bike_qty=19,
+            bike_qty=7,
         ),
     )
 
@@ -379,6 +381,83 @@ def test_scoring_and_bike_quantity_are_equivalent_to_rebalance_v1() -> None:
         20,
         expected[2],
         points,
+    )
+
+
+def test_risk_band_pickup_preserves_lower_stock_across_protection_horizon() -> None:
+    """장기 초과량이 커도 보호 구간 하방 재고에서 안전재고를 뺀 만큼만 수거한다."""
+    points = enrich_forecast_points(
+        40,
+        10,
+        [
+            {"predicted_rent_cnt": 0, "predicted_return_cnt": 0},
+            {"predicted_rent_cnt": 30, "predicted_return_cnt": 0},
+        ],
+    )
+    policy = risk_band_policy(
+        protection_horizon_hours=2,
+        minimum_stock_ratio=0.2,
+        uncertainty_z=0.0,
+    )
+    assert _bike_qty_v1(40, 10, "retrieval_needed", points) == 30
+    assert (
+        _bike_qty_risk_band_v2(
+            40,
+            10,
+            "retrieval_needed",
+            points,
+            policy,
+        )
+        == 8
+    )
+
+
+def test_risk_band_dropoff_raises_lower_stock_to_minimum() -> None:
+    """배치량은 보호 구간의 최저 하방 재고를 최소 안전재고까지 올린다."""
+    points = enrich_forecast_points(
+        0,
+        10,
+        [{"predicted_rent_cnt": 5, "predicted_return_cnt": 0}],
+    )
+    policy = risk_band_policy(
+        protection_horizon_hours=1,
+        minimum_stock_ratio=0.2,
+        uncertainty_z=0.0,
+    )
+    assert (
+        _bike_qty_risk_band_v2(
+            0,
+            10,
+            "supply_needed",
+            points,
+            policy,
+        )
+        == 7
+    )
+
+
+def test_risk_band_pickup_limits_single_decision_stock_fraction() -> None:
+    """한 회수 판단은 공급원 현재 재고의 설정 비율을 넘지 않는다."""
+    points = enrich_forecast_points(
+        40,
+        10,
+        [{"predicted_rent_cnt": 0, "predicted_return_cnt": 0}],
+    )
+    policy = risk_band_policy(
+        protection_horizon_hours=1,
+        minimum_stock_ratio=0.2,
+        uncertainty_z=0.0,
+        max_pickup_stock_fraction=0.2,
+    )
+    assert (
+        _bike_qty_risk_band_v2(
+            40,
+            10,
+            "retrieval_needed",
+            points,
+            policy,
+        )
+        == 8
     )
 
 

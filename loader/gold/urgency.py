@@ -57,6 +57,10 @@ from .common import (
     store_input_payload,
 )
 from .demand import DemandForecastRecord, demand_records_from_parquet
+from .rebalance_policy import (
+    DEFAULT_REBALANCE_POLICY,
+    RebalancePolicyConfig,
+)
 from .source_catalog import S3SourceSnapshotCatalog
 from .state import (
     PublicationStateRecord,
@@ -376,10 +380,16 @@ def build_urgency_projection(
     return UrgencyProjection(ordered, base, expected)
 
 
-def compute_urgency_projection(inputs: UrgencyCalculationInputs) -> UrgencyProjection:
-    """검증된 Gold·immutable 입력으로 현행 urgency-v1 projection을 계산한다."""
+def compute_urgency_projection(
+    inputs: UrgencyCalculationInputs,
+    *,
+    policy_config: RebalancePolicyConfig = DEFAULT_REBALANCE_POLICY,
+) -> UrgencyProjection:
+    """검증된 Gold·immutable 입력과 재배치 정책으로 urgency projection을 계산한다."""
     if type(inputs) is not UrgencyCalculationInputs:
         raise ContractViolation("inputs는 UrgencyCalculationInputs여야 합니다.")
+    if type(policy_config) is not RebalancePolicyConfig:
+        raise ContractViolation("policy_config는 RebalancePolicyConfig여야 합니다.")
     active_by_id = {station.sta_id: station for station in inputs.active_stations}
     current_by_id = {record.sta_id: record for record in inputs.current_stock}
     demand_by_id: dict[str, list[DemandForecastRecord]] = {}
@@ -438,11 +448,21 @@ def compute_urgency_projection(inputs: UrgencyCalculationInputs) -> UrgencyProje
                 urgency_score=score,
                 critical_remaining_min=minutes,
                 rebalance_need_type_cd=action_type,
-                bike_qty=_bike_qty_v1(
-                    current,
-                    station.hold_cnt,
-                    action_type,
-                    points,
+                bike_qty=(
+                    _bike_qty_v1(
+                        current,
+                        station.hold_cnt,
+                        action_type,
+                        points,
+                    )
+                    if policy_config.quantity_strategy == "legacy"
+                    else _bike_qty_risk_band_v2(
+                        current,
+                        station.hold_cnt,
+                        action_type,
+                        points,
+                        policy_config,
+                    )
                 ),
             )
         )
@@ -603,6 +623,10 @@ def publish_station_urgency(
         input_artifacts=(*input_artifacts, urgency_input),
         parameters=(
             Parameter("expected_sta_id_sha256", expected_ids.sha256),
+            Parameter(
+                "rebalance_policy_config",
+                DEFAULT_REBALANCE_POLICY.canonical_json,
+            ),
             Parameter("scoring_config_version", URGENCY_SCORING_CONFIG_VERSION),
             Parameter("stock_window_count", str(URGENCY_STOCK_WINDOW_COUNT)),
         ),
@@ -1437,6 +1461,64 @@ def _bike_qty_v1(
             max(0, hold_cnt - current),
         )
     return 0
+
+
+def _bike_qty_risk_band_v2(
+    current: int,
+    hold_cnt: int,
+    action_type: str,
+    points: list[dict[str, Any]],
+    policy_config: RebalancePolicyConfig,
+) -> int:
+    """보호 horizon의 하방 신뢰 재고가 안전 구간을 지키는 이동량을 계산한다.
+
+    대여와 반납 count를 독립 포아송 변수로 근사하면 누적 순수요의 분산은 두 count
+    합이다. 수거는 각 시점의 ``평균 재고 - z * sqrt(누적 count)``를 보수 재고로
+    두고 모든 시점이 최소 재고 이상인 범위만 허용한다. 배치는 불확실성 때문에
+    이동 예산을 과소비하지 않도록 평균 최저 재고를 최소 재고까지 올린다.
+    """
+    horizon_points = points[: policy_config.protection_horizon_hours]
+    minimum_stock = math.ceil(policy_config.minimum_stock_ratio * hold_cnt)
+    if action_type == "retrieval_needed":
+        lower_path = _forecast_lower_stock_path(
+            current,
+            horizon_points,
+            uncertainty_z=policy_config.uncertainty_z,
+        )
+        desired = max(0, math.floor(max(lower_path) - hold_cnt))
+        safe = max(0, math.floor(min(lower_path) - minimum_stock))
+        concentration_limit = math.floor(
+            current * policy_config.max_pickup_stock_fraction
+        )
+        return min(current, desired, safe, concentration_limit)
+    if action_type == "supply_needed":
+        lower_path = _forecast_lower_stock_path(
+            current,
+            horizon_points,
+            uncertainty_z=0.0,
+        )
+        needed = max(0, math.ceil(minimum_stock - min(lower_path)))
+        return min(needed, max(0, hold_cnt - current))
+    return 0
+
+
+def _forecast_lower_stock_path(
+    current: int,
+    points: list[dict[str, Any]],
+    *,
+    uncertainty_z: float,
+) -> tuple[float, ...]:
+    """독립 포아송 순수요 완충을 적용한 시점별 하방 재고를 반환한다."""
+    mean_stock = float(current)
+    cumulative_variance = 0.0
+    lower = [mean_stock]
+    for point in points:
+        rentals = max(0, int(point["predicted_rent_cnt"]))
+        returns = max(0, int(point["predicted_return_cnt"]))
+        mean_stock += returns - rentals
+        cumulative_variance += rentals + returns
+        lower.append(mean_stock - uncertainty_z * math.sqrt(cumulative_variance))
+    return tuple(lower)
 
 
 def _urgency_score_v1(

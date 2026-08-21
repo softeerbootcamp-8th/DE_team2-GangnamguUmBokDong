@@ -11,6 +11,10 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from gold.demand import DemandForecastRecord
+from gold.rebalance_policy import (
+    LEGACY_REBALANCE_POLICY,
+    RebalancePolicyConfig,
+)
 from gold.rebalance_route import (
     DispatchCenterTopology,
     ExistingRoute,
@@ -49,6 +53,7 @@ class ScheduledStop:
     station_id: str
     action: str
     planned_quantity: int
+    minimum_station_stock: int
     visit_no: int
 
 
@@ -88,7 +93,7 @@ class JobAudit:
     planned_bikes: int
     moved_bikes: int
     stop_count: int
-    stops: tuple["StopAudit", ...]
+    stops: tuple[StopAudit, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,6 +106,7 @@ class StopAudit:
     action: str
     executed_at: str
     planned_quantity: int
+    minimum_station_stock: int
     actual_quantity: int | None
 
 
@@ -121,6 +127,7 @@ class SimulationMetrics:
     """한 정책의 시민 서비스와 운영 자원 결과를 표현한다."""
 
     policy: str
+    policy_configuration: Mapping[str, object]
     window_start: str
     window_end: str
     observed_requests: int
@@ -163,10 +170,13 @@ def simulate_policy(
     forecast_provider: ForecastProvider | None,
     max_stops_per_route: int,
     movement_budget: int | None,
+    policy_config: RebalancePolicyConfig = LEGACY_REBALANCE_POLICY,
 ) -> SimulationMetrics:
     """동일 수요에서 5분 재계획·진행 작업 coverage·트럭 복귀를 재생한다."""
     if contract.approval_delay_minutes != 0:
         raise ValueError("현재 검증 시나리오는 자동 승인 지연 0분만 지원합니다.")
+    if type(policy_config) is not RebalancePolicyConfig:
+        raise ValueError("policy_config는 RebalancePolicyConfig여야 합니다.")
     start = datetime.combine(
         contract.target_date,
         datetime.min.time(),
@@ -214,6 +224,7 @@ def simulate_policy(
     truck_available = {truck_id: start for truck_id in range(contract.fleet_size)}
     active_jobs: dict[str, ActiveJob] = {}
     completed_jobs: list[ActiveJob] = []
+    pickup_cooldown_until: dict[int, datetime] = {}
     stock_history: dict[datetime, dict[int, int]] = {}
     tick_audits = []
     observed_requests = 0
@@ -286,7 +297,17 @@ def simulate_policy(
             route_id, stop = event.payload
             job = active_jobs[route_id]
             if stop.action == "pickup":
-                actual = min(stop.planned_quantity, stock[stop.station_no])
+                available = max(
+                    0,
+                    stock[stop.station_no] - stop.minimum_station_stock,
+                )
+                available = min(
+                    available,
+                    math.floor(
+                        stock[stop.station_no] * policy_config.max_pickup_stock_fraction
+                    ),
+                )
+                actual = min(stop.planned_quantity, available)
                 stock[stop.station_no] -= actual
                 job.truck_load += actual
             else:
@@ -323,7 +344,10 @@ def simulate_policy(
         )
         base_utc = occurred_at.astimezone(UTC)
         supported_ids = tuple(
-            sorted({record.sta_id for record in records}, key=lambda value: value.encode("utf-8"))
+            sorted(
+                {record.sta_id for record in records},
+                key=lambda value: value.encode("utf-8"),
+            )
         )
         current_stock = tuple(
             StationStockRecord(
@@ -347,7 +371,9 @@ def simulate_policy(
                         observed_at=history_time.astimezone(UTC),
                         parking_bike_tot_cnt=snapshot[station.station_no],
                     )
-                    for station in sorted(selected.values(), key=lambda row: row.station_id)
+                    for station in sorted(
+                        selected.values(), key=lambda row: row.station_id
+                    )
                     if station.station_id in supported_ids
                 )
             )
@@ -360,7 +386,8 @@ def simulate_policy(
                 current_stock=current_stock,
                 demand=records,
                 base_dttm=base_utc,
-            )
+            ),
+            policy_config=policy_config,
         )
         active_routes = tuple(
             ExistingRoute(
@@ -401,6 +428,12 @@ def simulate_policy(
             ),
             route_coverage=coverage,
             max_stops_per_route=max_stops_per_route,
+            policy_config=policy_config,
+            pickup_cooldown_sta_ids=frozenset(
+                selected[station_no].station_id
+                for station_no, until in pickup_cooldown_until.items()
+                if until > occurred_at
+            ),
         )
         idle = sorted(
             truck_id
@@ -429,6 +462,7 @@ def simulate_policy(
                 speed_kmh=contract.speed_kmh,
                 service_minutes=contract.service_minutes_per_stop,
                 transfer_limit=remaining_budget,
+                policy_config=policy_config,
             )
             if job is None:
                 continue
@@ -438,6 +472,13 @@ def simulate_policy(
                 stop.planned_quantity for stop in job.stops if stop.action == "dropoff"
             )
             active_jobs[job.route_id] = job
+            if policy_config.pickup_cooldown_minutes > 0:
+                cooldown_until = occurred_at + timedelta(
+                    minutes=policy_config.pickup_cooldown_minutes
+                )
+                for stop in job.stops:
+                    if stop.action == "pickup":
+                        pickup_cooldown_until[stop.station_no] = cooldown_until
             idle.pop(0)
             truck_available[truck_id] = job.return_at
             for stop in job.stops:
@@ -459,7 +500,8 @@ def simulate_policy(
         )
 
     empty_station_minutes += (
-        (end - last_event_time).total_seconds() / 60.0
+        (end - last_event_time).total_seconds()
+        / 60.0
         * sum(value <= 0 for value in stock.values())
     )
     all_jobs = [*completed_jobs, *active_jobs.values()]
@@ -481,9 +523,7 @@ def simulate_policy(
             ),
             return_at=job.return_at.isoformat(),
             planned_bikes=sum(
-                stop.planned_quantity
-                for stop in job.stops
-                if stop.action == "dropoff"
+                stop.planned_quantity for stop in job.stops if stop.action == "dropoff"
             ),
             moved_bikes=job.moved_bikes,
             stop_count=len(job.stops),
@@ -495,6 +535,7 @@ def simulate_policy(
                     action=stop.action,
                     executed_at=stop.executed_at.isoformat(),
                     planned_quantity=stop.planned_quantity,
+                    minimum_station_stock=stop.minimum_station_stock,
                     actual_quantity=job.executed_quantities.get(stop.visit_no),
                 )
                 for stop in job.stops
@@ -504,6 +545,7 @@ def simulate_policy(
     )
     return SimulationMetrics(
         policy=policy,
+        policy_configuration=policy_config.audit_document(),
         window_start=start.isoformat(),
         window_end=end.isoformat(),
         observed_requests=observed_requests,
@@ -549,6 +591,7 @@ def simulate_no_rebalance(
         forecast_provider=None,
         max_stops_per_route=8,
         movement_budget=0,
+        policy_config=LEGACY_REBALANCE_POLICY,
     )
 
 
@@ -563,6 +606,7 @@ def _schedule_job(
     speed_kmh: float,
     service_minutes: float,
     transfer_limit: int | None,
+    policy_config: RebalancePolicyConfig,
 ) -> ActiveJob | None:
     """planner 경로를 예산에 맞춰 완결 수량으로 자르고 센터 복귀까지 예약한다."""
     by_id = {station.station_id: station for station in stations.values()}
@@ -573,7 +617,11 @@ def _schedule_job(
     planned_transfer = sum(
         stop.bike_cnt for stop in raw_stops if stop.route_action_type_cd == "dropoff"
     )
-    transfer = planned_transfer if transfer_limit is None else min(planned_transfer, transfer_limit)
+    transfer = (
+        planned_transfer
+        if transfer_limit is None
+        else min(planned_transfer, transfer_limit)
+    )
     if transfer <= 0:
         return None
     remaining_by_action = {"pickup": transfer, "dropoff": transfer}
@@ -611,6 +659,11 @@ def _schedule_job(
                 station_id=station.station_id,
                 action=stop.route_action_type_cd,
                 planned_quantity=quantity,
+                minimum_station_stock=(
+                    math.ceil(station.capacity * policy_config.execution_reserve_ratio)
+                    if stop.route_action_type_cd == "pickup"
+                    else 0
+                ),
                 visit_no=visit_no,
             )
         )
