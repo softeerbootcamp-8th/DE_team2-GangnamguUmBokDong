@@ -174,7 +174,7 @@ SELECT EXISTS (
              FROM pg_extension
             WHERE extname = 'postgis'
               AND split_part(extversion, '.', 1) = '3'
-              AND split_part(extversion, '.', 2) = '5'
+              AND split_part(extversion, '.', 2) = '4'
        )
    AND current_setting('default_transaction_read_only') = 'on'
    AND :'airflow_db' <> current_database()
