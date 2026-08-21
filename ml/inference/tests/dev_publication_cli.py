@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 from core.gold_publication import ContractViolation, build_id_set
 from core.inference_snapshot import ServingPlanRef
+from core.model_snapshot import build_id_set_artifact_ref
 
 from inference import publication_cli
 
@@ -27,6 +28,14 @@ class _Client:
 def test_run_exact_reads_plan_and_shares_injected_backend(monkeypatch) -> None:
     """Plan extractor·producer·pointer·catalog가 같은 client/store/bucket을 사용한다."""
     client = _Client()
+    expected_sta_ids = build_id_set(("ST-1",))
+    expected_sta_ids_ref = build_id_set_artifact_ref(
+        expected_sta_ids,
+        (
+            "s3://fixture/gold_publication/serving-plan/inputs/"
+            f"expected-sta-ids/sha256={expected_sta_ids.sha256}.json"
+        ),
+    )
     inputs = SimpleNamespace(
         logical_dttm=object(),
         station_dependency=object(),
@@ -39,7 +48,8 @@ def test_run_exact_reads_plan_and_shares_injected_backend(monkeypatch) -> None:
                 + ".json"
             ),
         ),
-        expected_sta_ids=build_id_set(("ST-1",)),
+        expected_sta_ids=expected_sta_ids,
+        expected_sta_ids_ref=expected_sta_ids_ref,
         object_base_uri="s3://fixture/gold_publication",
     )
     captured = {}
@@ -75,6 +85,7 @@ def test_run_exact_reads_plan_and_shares_injected_backend(monkeypatch) -> None:
     result = publication_cli.run(plan_uri=plan_uri, plan_sha256="a" * 64)
 
     assert captured["plan"] == (plan_uri, "a" * 64)
+    assert captured["publish"]["expected_sta_ids_ref"] == expected_sta_ids_ref
     assert result == {
         "inference": {
             "byte_sha256": "b" * 64,

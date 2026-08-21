@@ -42,6 +42,7 @@ def run(*, plan_uri: str, plan_sha256: str) -> dict[str, dict[str, str]]:
         station_dependency=inputs.station_dependency,
         serving_plan=inputs.serving_plan,
         expected_sta_ids=inputs.expected_sta_ids,
+        expected_sta_ids_ref=inputs.expected_sta_ids_ref,
         object_base_uri=inputs.object_base_uri,
         object_store=object_store,
         pointer_store=S3ServingReleasePointerStore(client, bucket),

@@ -131,6 +131,8 @@ services:
       # 내부에서 실제로 Postgres/MinIO에 붙도록, 호스트 관점 .env 값을 컨테이너 관점으로 덮어쓴다.
       DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_APP_DB:-app}
       S3_ENDPOINT_URL: http://minio:9000
+      GOLD_STATION_MASTER_LOOKBACK_HOURS: ${GOLD_STATION_MASTER_LOOKBACK_HOURS:-168}
+      GOLD_STATION_REALTIME_LOOKBACK_HOURS: ${GOLD_STATION_REALTIME_LOOKBACK_HOURS:-24}
     volumes:
       - ../..:/workspace
       - airflow-module-venvs:/opt/venvs/modules
@@ -189,6 +191,8 @@ services:
       AIRFLOW__API__BASE_URL: http://localhost:${AIRFLOW_WEBSERVER_PORT:-8080}
       DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_APP_DB:-app}
       S3_ENDPOINT_URL: http://minio:9000
+      GOLD_STATION_MASTER_LOOKBACK_HOURS: ${GOLD_STATION_MASTER_LOOKBACK_HOURS:-168}
+      GOLD_STATION_REALTIME_LOOKBACK_HOURS: ${GOLD_STATION_REALTIME_LOOKBACK_HOURS:-24}
     volumes:
       - ../..:/workspace
       - airflow-module-venvs:/opt/venvs/modules

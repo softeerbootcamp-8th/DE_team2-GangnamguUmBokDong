@@ -34,6 +34,8 @@ stopping)까지 포함해 eager 버전과 예측값이 byte-identical함을 직�
 시점이라 청크를 다시 읽음 — 같은 트레이드오프).
 """
 
+import os
+import tempfile
 from collections import OrderedDict
 from collections.abc import Callable
 
@@ -176,17 +178,150 @@ def station_categories_for_dates(
     filters: list[tuple] | None,
     on_complete: Callable[[int, int], None] | None = None,
 ) -> list[int]:
-    """주어진 날짜 전체에서 station_no 유니크 값만 골라 읽는다(컬럼 1개, 8억 행이어도 수백MB대).
+    """날짜별로 station_no를 읽고 즉시 set에 합쳐 전역 카테고리를 반환한다.
 
     train_target()이 학습을 시작하기 전에 train+valid+test 날짜를 합쳐 한 번만
     호출해서 전역 station_dtype을 고정한다 — station_no 카테고리 코드는 세 split
     전체에서 같은 매핑을 써야 LightGBM이 같은 station을 같은 코드로 본다(기존
-    `train_common._prepare_xy()`와 같은 이유).
+    `train_common._prepare_xy()`와 같은 이유). 전체 기간의 station_no 열을 하나의
+    pandas DataFrame으로 합치지 않아 행 수가 늘어도 peak memory는 하루치로 제한된다.
     """
-    df = s3_io.read_parquet(table_path, columns=["station_no"], dates=dates, filters=filters, on_complete=on_complete)
-    if df is None:
+    categories: set[int] = set()
+    for done, date_str in enumerate(dates, start=1):
+        try:
+            df = _read_date_chunk(
+                table_path,
+                date_str,
+                ["station_no"],
+                filters,
+            )
+        except FileNotFoundError:
+            df = None
+        if df is not None:
+            categories.update(int(value) for value in df["station_no"].unique())
+            del df
+        if on_complete is not None:
+            on_complete(done, len(dates))
+    if not categories:
         raise FileNotFoundError(f"S3에 없음: {table_path} (dates 예: {dates[:3]})")
-    return sorted(int(s) for s in df["station_no"].unique())
+    return sorted(categories)
+
+
+def _open_unlinked_memmap(file_obj, row_count: int) -> np.memmap:
+    """작성 완료한 임시 파일을 float64 memmap으로 열고 디렉터리 항목은 제거한다.
+
+    Linux에서 열린 mmap은 파일을 unlink한 뒤에도 마지막 참조가 사라질 때까지
+    유효하다. 정상·예외 종료 모두 거대한 prepass 파일이 남지 않게 하면서 label과
+    exposure를 RAM 대신 로컬 scratch에 둔다.
+
+    args:
+        file_obj: float64 raw bytes를 쓴 열린 임시 파일.
+        row_count: 배열 원소 수.
+    returns:
+        삭제 예약된 임시 파일을 backing store로 쓰는 1차원 memmap.
+    """
+    path = file_obj.name
+    file_obj.flush()
+    os.fsync(file_obj.fileno())
+    file_obj.close()
+    mapped = np.memmap(path, dtype=np.float64, mode="r+", shape=(row_count,))
+    os.unlink(path)
+    return mapped
+
+
+def _stream_prepass_arrays(
+    table_path: str,
+    dates: list[str],
+    filters: list[tuple] | None,
+    label_col: str,
+    exposure_col: str | None,
+    on_complete: Callable[[int, int], None] | None,
+) -> tuple[list[int], np.memmap, np.memmap | None]:
+    """label/exposure를 날짜별로 읽어 삭제 예약된 disk-backed 배열에 이어 쓴다.
+
+    전체 날짜를 Arrow/pandas로 합친 뒤 numpy로 다시 복사하던 경로는 2025년 대여
+    train prepass 직후 process-tree RSS가 23.64GiB까지 치솟았다. 이 함수는 날짜
+    하나를 변환한 즉시 raw float64 bytes로 scratch에 내리고 해제한다. 최종 배열은
+    ``np.memmap``이라 LightGBM에 같은 1차원 numpy 계약을 제공하면서 peak RAM은
+    하루치로 제한된다.
+
+    returns:
+        날짜별 행 수, label memmap, 선택적 exposure memmap.
+    raises:
+        ValueError: 선택한 날짜 전체가 비어 있을 때.
+    """
+    label_file = tempfile.NamedTemporaryFile(prefix="bike-label-", suffix=".bin", delete=False)
+    exposure_file = (
+        tempfile.NamedTemporaryFile(prefix="bike-exposure-", suffix=".bin", delete=False)
+        if exposure_col
+        else None
+    )
+    row_counts: list[int] = []
+    total_rows = 0
+    try:
+        columns = [label_col] + ([exposure_col] if exposure_col else [])
+        for done, date_str in enumerate(dates, start=1):
+            try:
+                df = _read_date_chunk(table_path, date_str, columns, filters)
+            except FileNotFoundError:
+                df = None
+            row_count = 0 if df is None else len(df)
+            row_counts.append(row_count)
+            total_rows += row_count
+            if df is not None:
+                labels = df[label_col].to_numpy(dtype=np.float64)
+                label_file.write(labels.tobytes(order="C"))
+                if exposure_file is not None and exposure_col is not None:
+                    exposures = df[exposure_col].to_numpy(dtype=np.float64)
+                    exposure_file.write(exposures.tobytes(order="C"))
+                    del exposures
+                del labels, df
+            if on_complete is not None:
+                on_complete(done, len(dates))
+
+        if total_rows == 0:
+            raise ValueError(
+                f"학습 구간에 데이터가 없음: {table_path} "
+                f"dates={dates[:3]}...({len(dates)}개) — feature mart 확인 필요"
+            )
+        labels_mmap = _open_unlinked_memmap(label_file, total_rows)
+        exposure_mmap = (
+            _open_unlinked_memmap(exposure_file, total_rows)
+            if exposure_file is not None
+            else None
+        )
+        return row_counts, labels_mmap, exposure_mmap
+    except Exception:
+        for file_obj in (label_file, exposure_file):
+            if file_obj is None:
+                continue
+            path = file_obj.name
+            if not file_obj.closed:
+                file_obj.close()
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+        raise
+
+
+def _log_memmap(values: np.ndarray) -> np.memmap:
+    """양수 exposure의 자연로그를 별도 삭제 예약된 disk-backed 배열로 만든다."""
+    file_obj = tempfile.NamedTemporaryFile(prefix="bike-init-score-", suffix=".bin", delete=False)
+    path = file_obj.name
+    try:
+        file_obj.truncate(values.size * np.dtype(np.float64).itemsize)
+        mapped = _open_unlinked_memmap(file_obj, values.size)
+        np.log(values, out=mapped)
+        return mapped
+    except Exception:
+        if not file_obj.closed:
+            file_obj.close()
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+        raise
 
 
 def build_lazy_dataset(
@@ -205,9 +340,9 @@ def build_lazy_dataset(
 ) -> tuple[lgb.Dataset, np.ndarray, np.ndarray | None]:
     """train 또는 valid 하나를 Sequence 기반 `lgb.Dataset`으로 만든다.
 
-    1. 라벨(+exposure) 사전 스캔 — 컬럼 1~2개뿐이라(+`date`, 날짜별로 다시 가르는 용도)
-       8억 행이어도 수 GB대. `dates` 순서대로 이어붙여 전역 `y`/`exposure`를 만든다 —
-       이 순서가 아래 Sequence 목록 순서와 반드시 일치해야 라벨이 안 어긋난다.
+    1. 라벨(+exposure) 사전 스캔 — 날짜 하나씩 읽어 로컬 scratch의 삭제 예약된
+       memmap에 이어 쓴다. `dates` 순서가 아래 Sequence 목록 순서와 반드시 같아야
+       라벨이 어긋나지 않는다.
     2. 날짜별 행 수로 `_DatePartitionSequence` 리스트 생성(공유 `cache` 주입).
     3. `lgb.Dataset(data=sequences, ...)` 구성.
 
@@ -225,22 +360,14 @@ def build_lazy_dataset(
             안 쌓였을 수 있음) — `lgb.train()` 안에서 알아보기 힘든 에러로 죽기 전에
             여기서 먼저 걸러낸다.
     """
-    prepass_columns = [label_col, "date"] + ([exposure_col] if exposure_col else [])
-    prepass_df = s3_io.read_parquet(
-        table_path, columns=prepass_columns, dates=dates, filters=filters, on_complete=on_prepass_complete
+    row_counts, y, exposure = _stream_prepass_arrays(
+        table_path,
+        dates,
+        filters,
+        label_col,
+        exposure_col,
+        on_prepass_complete,
     )
-    if prepass_df is None or prepass_df.empty:
-        raise ValueError(f"학습 구간에 데이터가 없음: {table_path} dates={dates[:3]}...({len(dates)}개) — feature mart 확인 필요")
-
-    groups = prepass_df.groupby("date", sort=False).groups
-    row_counts = [len(groups[d]) if d in groups else 0 for d in dates]
-    y = np.concatenate([prepass_df.loc[groups[d], label_col].to_numpy() for d in dates if d in groups]).astype(np.float64)
-    exposure = None
-    if exposure_col:
-        exposure = np.concatenate(
-            [prepass_df.loc[groups[d], exposure_col].to_numpy() for d in dates if d in groups]
-        ).astype(np.float64)
-    del prepass_df, groups
 
     sequences = [
         _DatePartitionSequence(
@@ -249,7 +376,7 @@ def build_lazy_dataset(
         for d, rc in zip(dates, row_counts, strict=True)
         if rc > 0
     ]
-    init_score = np.log(exposure) if exposure_col else None
+    init_score = _log_memmap(exposure) if exposure is not None else None
     cat_idx = [feature_columns.index("station_no")]
     dataset = lgb.Dataset(
         data=sequences,
@@ -261,6 +388,15 @@ def build_lazy_dataset(
         params=dataset_params,
     )
     dataset.construct()
+    # construct()는 label/init_score를 native Dataset handle에 복사한 뒤 다시 numpy
+    # field로 읽어 `dataset.label`/`dataset.init_score`에도 보관한다. 대규모 train은
+    # 이 Python-side 복사본만 수 GB이고, 호출부가 보유한 memmap과 valid Dataset
+    # 구성 시점에 겹치면 32GB 환경의 peak를 넘는다. 둘을 None으로 비워도
+    # `get_label()`/`get_init_score()`가 필요할 때 native field에서 다시 읽을 수 있고,
+    # `lgb.train()`은 이미 구성된 handle을 직접 사용한다.
+    dataset.label = None
+    dataset.init_score = None
+    del init_score
     return dataset, y, exposure
 
 

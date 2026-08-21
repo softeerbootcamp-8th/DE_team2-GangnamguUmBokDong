@@ -444,6 +444,41 @@ def _build_lgb_params(profile_params: dict) -> dict:
 
 
 LGB_PARAMS_COMMON = _build_lgb_params(_LGB_PROFILE)
+LGB_PARAMS_RENTAL = dict(_PROFILE.get("LGB_PARAMS_RENTAL", {}))
+LGB_PARAMS_RETURN = dict(_PROFILE.get("LGB_PARAMS_RETURN", {}))
+
+
+def get_lgb_params(model_name: str, profile: dict | None = None) -> dict:
+    """대여/반납 모델별 최종 LightGBM 하이퍼파라미터를 반환한다.
+
+    LGB_PARAMS_COMMON을 베이스로 하고, LGB_PARAMS_RENTAL 또는 LGB_PARAMS_RETURN 설정을 덮어쓴다.
+
+    args:
+        model_name: "rental" 또는 "return"
+        profile: 명시적 프로필 dict (None이면 모듈 전역 _PROFILE 기반)
+    returns:
+        dict: 병합된 LightGBM 파라미터 dict
+    """
+    if profile is not None:
+        common = dict(profile.get("LGB_PARAMS_COMMON", {}))
+        if model_name == "rental":
+            specific = dict(profile.get("LGB_PARAMS_RENTAL", {}))
+        elif model_name == "return":
+            specific = dict(profile.get("LGB_PARAMS_RETURN", {}))
+        else:
+            specific = {}
+        return {**common, **specific}
+
+    common = dict(LGB_PARAMS_COMMON)
+    if model_name == "rental":
+        specific = LGB_PARAMS_RENTAL
+    elif model_name == "return":
+        specific = LGB_PARAMS_RETURN
+    else:
+        specific = {}
+    return {**common, **specific}
+
+
 LGB_NUM_BOOST_ROUND = _int_env("LGB_NUM_BOOST_ROUND", _PROFILE["LGB_NUM_BOOST_ROUND"])
 LGB_EARLY_STOPPING_ROUNDS = _int_env("LGB_EARLY_STOPPING_ROUNDS", _PROFILE["LGB_EARLY_STOPPING_ROUNDS"])
 
@@ -518,6 +553,8 @@ def effective_profile() -> dict:
         "TRAIN_ANCHOR_TICK_MINUTES": TRAIN_ANCHOR_TICK_MINUTES,
         "HORIZON_COUNT": HORIZON_COUNT,
         "LGB_PARAMS_COMMON": dict(LGB_PARAMS_COMMON),
+        "LGB_PARAMS_RENTAL": dict(LGB_PARAMS_RENTAL),
+        "LGB_PARAMS_RETURN": dict(LGB_PARAMS_RETURN),
         "LGB_NUM_BOOST_ROUND": LGB_NUM_BOOST_ROUND,
         "LGB_EARLY_STOPPING_ROUNDS": LGB_EARLY_STOPPING_ROUNDS,
         "CONFORMAL_TARGET_COVERAGE": CONFORMAL_TARGET_COVERAGE,

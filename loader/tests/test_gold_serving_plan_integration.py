@@ -395,11 +395,11 @@ def test_clean_bootstrap_activation_replay_correction_and_rollback(
     assert _stock_counts(gold_connection) == (("ST-1", 10), ("ST-2", 10))
 
 
-def test_plan_source_drift_and_inference_failure_leave_targets_unchanged(
+def test_weather_drift_uses_plan_snapshot_but_inference_failure_is_atomic(
     gold_connection: Connection[Any],
     inference_catalog: InMemoryInferenceRevisionCatalog,
 ) -> None:
-    """Plan 뒤 source correction과 partial inference가 claim 전 fail-closed 된다."""
+    """Plan 뒤 날씨 correction은 허용하고 partial inference는 원자적으로 거부한다."""
     client = boto3.client("s3", region_name="us-east-1")
     store = S3ImmutableObjectStore(client)
     catalog = S3SourceSnapshotCatalog(client, store, bucket=_BUCKET)
@@ -452,19 +452,19 @@ def test_plan_source_drift_and_inference_failure_leave_targets_unchanged(
         planned_parts=_KMA_PARTS,
     )
 
-    with pytest.raises(ContractViolation, match="correction이 갱신"):
-        _publish_plan(
-            gold_connection,
-            store,
-            catalog,
-            inference_catalog,
-            plan.uri,
-            plan.byte_sha256,
-            inference_uri,
-            inference_sha,
-        )
-    assert _serving_counts(gold_connection) == (0, 0, 0, 0, 0)
-    assert _serving_state(gold_connection) == ()
+    published = _publish_plan(
+        gold_connection,
+        store,
+        catalog,
+        inference_catalog,
+        plan.uri,
+        plan.byte_sha256,
+        inference_uri,
+        inference_sha,
+    )
+    assert published.result.outcome is PublicationOutcome.PUBLISHED
+    published_counts = _serving_counts(gold_connection)
+    published_state = _serving_state(gold_connection)
     partial_document = parse_canonical_json(
         store.read_bytes(
             inference_uri,
@@ -494,7 +494,8 @@ def test_plan_source_drift_and_inference_failure_leave_targets_unchanged(
             partial_uri,
             partial_sha,
         )
-    assert _serving_counts(gold_connection) == (0, 0, 0, 0, 0)
+    assert _serving_counts(gold_connection) == published_counts
+    assert _serving_state(gold_connection) == published_state
 
 
 def test_inference_only_and_weather_corrections_mutate_published_subsets(
