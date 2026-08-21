@@ -569,8 +569,8 @@ function StationMarkers({
           key={`route-stop-${stop.visit_order}-${stop.sta_id}`}
           position={[stop.lat, stop.lon]}
           icon={L.divIcon({
-            className: "route-stop-map-marker",
-            html: `<span class="${stop.action}${stop.sta_id === selectedStationId ? " selected" : ""}">${stop.visit_order}</span>`,
+            className: `route-stop-map-marker${stop.sta_id === selectedStationId ? " selected" : ""}`,
+            html: `<span class="${stop.action}">${stop.visit_order}</span>`,
             iconSize: [28, 28],
             iconAnchor: [14, 14],
           })}
