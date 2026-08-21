@@ -48,16 +48,6 @@ def _document(target_date: str, baseline_fulfilled: int, model_fulfilled: int) -
                     "balanced_movement_budget": 1,
                     "added_bikes": 1,
                     "removed_bikes": 1,
-                    "relocation_evidence": {
-                        "candidate_intervals": 4,
-                        "internal_candidate_intervals": 3,
-                        "hourly_bounded_intervals": 1,
-                        "residual_compatible_intervals": 2,
-                        "residual_compatible_within_6h": 1,
-                        "residual_compatible_within_24h": 2,
-                        "residual_station_units": 4,
-                        "residual_explained_station_units": 2,
-                    },
                 },
                 "legacy_timing": [
                     {
@@ -86,10 +76,6 @@ def test_aggregate_reports_better_and_worse_dates_separately() -> None:
     assert row["dates_fulfillment_better"] == 1
     assert row["dates_fulfillment_worse"] == 1
     assert row["empty_station_minutes_change_vs_no_rebalance_pct"] == -20.0
-    legacy = result["legacy_summaries"][0]
-    assert legacy["id_candidate_intervals"] == 8
-    assert legacy["id_residual_compatible_intervals"] == 4
-    assert legacy["residual_explained_pct"] == 50.0
 
 
 def test_aggregate_rejects_resource_contract_mismatch() -> None:
