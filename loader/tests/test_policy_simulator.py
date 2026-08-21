@@ -8,6 +8,7 @@ from evaluation.historical_inputs import HistoricalStation, PredictionAudit
 from evaluation.policy_simulator import simulate_no_rebalance, simulate_policy
 from evaluation.rebalance_backtest import RentalTrip
 from gold.demand import DemandForecastRecord
+from gold.rebalance_policy import risk_band_policy
 from gold.rebalance_route import DispatchCenterTopology
 
 SEOUL = ZoneInfo("Asia/Seoul")
@@ -50,14 +51,18 @@ def _forecast(anchor, stock, successful):
                     base_dttm=base,
                     sta_id=station_id,
                     predicted_dttm=base + timedelta(hours=horizon),
-                    predicted_rent_cnt=5 if station_id == "ST-2" and horizon == 1 else 0,
+                    predicted_rent_cnt=5
+                    if station_id == "ST-2" and horizon == 1
+                    else 0,
                     predicted_rtn_cnt=5 if station_id == "ST-1" and horizon == 1 else 0,
                 )
             )
     rows.sort(key=lambda row: (row.sta_id, row.predicted_dttm))
     audit = PredictionAudit(
         anchor=anchor.isoformat(),
-        weather_observed_at=(anchor - timedelta(hours=1)).replace(tzinfo=None).isoformat(),
+        weather_observed_at=(anchor - timedelta(hours=1))
+        .replace(tzinfo=None)
+        .isoformat(),
         weather_cutoff=(anchor - timedelta(hours=1)).isoformat(),
         population_candidate_dates=("2025-06-10",),
         rental_lag_start=(anchor - timedelta(minutes=100)).isoformat(),
@@ -87,7 +92,9 @@ def test_no_rebalance_removes_return_of_failed_rental() -> None:
     assert result.fulfilled_requests == 0
 
 
-def test_policy_replans_every_five_minutes_without_double_dispatching_covered_work() -> None:
+def test_policy_replans_every_five_minutes_without_double_dispatching_covered_work() -> (
+    None
+):
     """진행 중 route coverage와 truck 점유가 다음 5분 tick의 중복 작업을 막는다."""
     contract = EvaluationContract(
         date(2025, 6, 17),
@@ -140,3 +147,41 @@ def test_policy_does_not_dispatch_route_that_cannot_return_before_cutoff() -> No
     assert result.dispatched_routes == 0
     assert result.trucks_still_busy_at_cutoff == 0
     assert all(audit.idle_trucks_before == 1 for audit in result.tick_audits)
+
+
+def test_pickup_execution_preserves_station_reserve_after_new_rentals() -> None:
+    """배차 뒤 시민 대여가 생기면 도착 시 계획량을 줄여 최소 재고를 남긴다."""
+    contract = EvaluationContract(
+        date(2025, 6, 17),
+        6,
+        evaluation_minutes=60,
+        fleet_size=1,
+    )
+    stations = (_station(1, 10, 37.5001), _station(2, 10, 37.5002))
+    policy = risk_band_policy(
+        protection_horizon_hours=1,
+        minimum_stock_ratio=0.2,
+        uncertainty_z=0.0,
+    )
+    result = simulate_policy(
+        policy="risk_band",
+        contract=contract,
+        center=DispatchCenterTopology("center", 127.0, 37.5, True),
+        stations=stations,
+        initial_stock={1: 10, 2: 0},
+        trips=tuple(_trip(1, 1, 1) for _ in range(4)),
+        forecast_provider=_forecast,
+        max_stops_per_route=8,
+        movement_budget=5,
+        policy_config=policy,
+    )
+    pickup = next(
+        stop
+        for job in result.job_audits
+        for stop in job.stops
+        if stop.action == "pickup"
+    )
+    assert pickup.planned_quantity == 5
+    assert pickup.minimum_station_stock == 2
+    assert pickup.actual_quantity == 4
+    assert result.moved_bikes == 4

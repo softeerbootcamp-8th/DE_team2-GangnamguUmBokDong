@@ -7,7 +7,7 @@ import re
 import unicodedata
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID
 
@@ -30,6 +30,7 @@ from core.gold_publication import (
     build_input_fingerprint,
     build_route_coverage,
     build_route_coverage_route,
+    parse_id_set,
     parse_input_fingerprint,
     parse_publication_manifest,
     parse_route_coverage,
@@ -52,6 +53,7 @@ from .common import (
     read_parquet_bytes,
     store_input_payload,
 )
+from .rebalance_policy import DEFAULT_REBALANCE_POLICY, RebalancePolicyConfig
 from .state import (
     PublicationStateRecord,
     load_dependencies,
@@ -59,14 +61,14 @@ from .state import (
     read_state_manifest,
 )
 
-ROUTE_ALGORITHM_VERSION = "route-v2"
+ROUTE_ALGORITHM_VERSION = "route-v3-risk-band"
 TRUCK_CAPACITY = 20
 TRUCK_CAPACITY_CONFIG_VERSION = "truck-capacity-v1"
 INITIAL_TRUCK_LOAD = 0
-MAX_STOPS_PER_ROUTE = 8
+MAX_STOPS_PER_ROUTE = 5
 MAX_ROUTES_PER_CENTER = 3
-ROUTE_WORK_UNIT_CONFIG_VERSION = "route-work-unit-v1"
-ROUTE_PUBLISHER_VERSION = "gold-route-publisher-v1"
+ROUTE_WORK_UNIT_CONFIG_VERSION = "route-work-unit-v2"
+ROUTE_PUBLISHER_VERSION = "gold-route-publisher-v2"
 _MAX_DATABASE_REVISION = 2_147_483_647
 
 _STATION_ID = re.compile(r"ST-[0-9]+\Z")
@@ -408,6 +410,7 @@ class RouteDatabaseSnapshot:
     dispatch_centers: tuple[DispatchCenterTopology, ...]
     stations: tuple[StationRouteTopology, ...]
     route_coverage: RouteCoverageDocument
+    pickup_cooldown_sta_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         """DB snapshot의 exact tuple과 canonical coverage 타입을 검증한다."""
@@ -415,6 +418,19 @@ class RouteDatabaseSnapshot:
         _index_stations(self.stations)
         if type(self.route_coverage) is not RouteCoverageDocument:
             raise ContractViolation("route DB snapshot coverage 타입이 잘못됐습니다.")
+        cooldown_ids = tuple(
+            sorted(
+                self.pickup_cooldown_sta_ids, key=lambda value: value.encode("utf-8")
+            )
+        )
+        if (
+            self.pickup_cooldown_sta_ids != cooldown_ids
+            or len(cooldown_ids) != len(set(cooldown_ids))
+            or any(_STATION_ID.fullmatch(value) is None for value in cooldown_ids)
+        ):
+            raise ContractViolation(
+                "pickup cooldown station ID가 canonical하지 않습니다."
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -517,6 +533,8 @@ def plan_rebalance_routes(
     urgency: tuple[RouteUrgencyInput, ...],
     route_coverage: RouteCoverageDocument,
     max_stops_per_route: int = MAX_STOPS_PER_ROUTE,
+    policy_config: RebalancePolicyConfig = DEFAULT_REBALANCE_POLICY,
+    pickup_cooldown_sta_ids: frozenset[str] = frozenset(),
 ) -> RebalanceRoutePlan:
     """route-v2 완결 작업·coverage·용량 계약으로 proposed aggregate를 계산한다.
 
@@ -530,6 +548,14 @@ def plan_rebalance_routes(
         raise ContractViolation("max_stops_per_route는 2..32767 integer여야 합니다.")
     if type(route_coverage) is not RouteCoverageDocument:
         raise ContractViolation("route_coverage는 RouteCoverageDocument여야 합니다.")
+    if type(policy_config) is not RebalancePolicyConfig:
+        raise ContractViolation("policy_config는 RebalancePolicyConfig여야 합니다.")
+    if type(pickup_cooldown_sta_ids) is not frozenset or any(
+        type(sta_id) is not str or not sta_id for sta_id in pickup_cooldown_sta_ids
+    ):
+        raise ContractViolation(
+            "pickup cooldown station ID는 frozenset[str]여야 합니다."
+        )
     if route_coverage.stock_anchor_dttm != logical:
         raise ContractViolation(
             "route coverage stock anchor가 urgency logical_dttm과 다릅니다."
@@ -543,6 +569,8 @@ def plan_rebalance_routes(
         stations_by_id=stations_by_id,
         centers_by_id=centers_by_id,
         coverage_qty=coverage_qty,
+        exclusive_pickup_station=policy_config.exclusive_pickup_station,
+        pickup_cooldown_sta_ids=pickup_cooldown_sta_ids,
     )
     routes: list[RebalanceRoute] = []
     route_stops: list[RebalanceRouteStop] = []
@@ -558,11 +586,7 @@ def plan_rebalance_routes(
             candidate for candidate in candidates if candidate.action == "dropoff"
         ]
         ordinal = 1
-        while (
-            pickups
-            and dropoffs
-            and ordinal <= MAX_ROUTES_PER_CENTER
-        ):
+        while pickups and dropoffs and ordinal <= MAX_ROUTES_PER_CENTER:
             anchor_candidate = pickups[0]
             route_pickups = _rank_for_route(
                 pickups,
@@ -591,6 +615,15 @@ def plan_rebalance_routes(
                 transfer_qty,
                 stop_limit=dropoff_stop_limit,
             )
+            if policy_config.exclusive_pickup_station:
+                selected_pickup_ids = {
+                    stop.candidate.sta_id for stop in selected_pickups
+                }
+                pickup_remainder = [
+                    candidate
+                    for candidate in pickup_remainder
+                    if candidate.sta_id not in selected_pickup_ids
+                ]
             pickups = sorted(pickup_remainder, key=_candidate_priority)
             dropoffs = sorted(dropoff_remainder, key=_candidate_priority)
             picked_qty = sum(stop.bike_cnt for stop in selected_pickups)
@@ -783,11 +816,29 @@ def publish_rebalance_route(
             suffix="json",
         ),
     )
+    cooldown_ids = build_id_set(database_snapshot.pickup_cooldown_sta_ids)
+    cooldown_payload = cooldown_ids.canonical_bytes
+    cooldown_input = InputArtifact(
+        byte_sha256=cooldown_ids.sha256,
+        role="pickup_cooldown_station_ids",
+        uri=content_addressed_uri(
+            object_base_uri,
+            publication_key="rebalance_route",
+            category="inputs",
+            name="pickup_cooldown_station_ids",
+            payload=cooldown_payload,
+            suffix="json",
+        ),
+    )
     input_fingerprint = build_input_fingerprint(
         "rebalance_route",
         dependencies,
-        (coverage_input, urgency_snapshot.manifest_input),
+        (coverage_input, cooldown_input, urgency_snapshot.manifest_input),
         (
+            Parameter(
+                "rebalance_policy_config",
+                DEFAULT_REBALANCE_POLICY.canonical_json,
+            ),
             Parameter("route_algorithm_version", ROUTE_ALGORITHM_VERSION),
             Parameter(
                 "route_coverage_sha256",
@@ -853,12 +904,27 @@ def publish_rebalance_route(
     )
     if stored_coverage != coverage_input:
         raise ContractViolation("stored route coverage identity가 preview와 다릅니다.")
+    stored_cooldown = store_input_payload(
+        object_store,
+        base_uri=object_base_uri,
+        publication_key="rebalance_route",
+        role="pickup_cooldown_station_ids",
+        payload=cooldown_payload,
+        suffix="json",
+        require_canonical_json=True,
+    )
+    if stored_cooldown != cooldown_input:
+        raise ContractViolation("stored pickup cooldown ID 집합이 preview와 다릅니다.")
     materials = materialize_publication(
         object_store,
         base_uri=object_base_uri,
         publication_key="rebalance_route",
         dependencies=dependencies,
-        input_artifacts=(coverage_input, urgency_snapshot.manifest_input),
+        input_artifacts=(
+            coverage_input,
+            cooldown_input,
+            urgency_snapshot.manifest_input,
+        ),
         parameters=input_fingerprint.parameters,
         outputs=candidate.outputs,
     )
@@ -896,6 +962,11 @@ def publish_rebalance_route(
         if actual_coverage != database_snapshot.route_coverage:
             raise ContractViolation(
                 "verified route coverage bytes가 준비한 DB projection과 다릅니다."
+            )
+        actual_cooldown_ids = parse_id_set(payloads[cooldown_input.uri])
+        if actual_cooldown_ids != cooldown_ids:
+            raise ContractViolation(
+                "verified pickup cooldown ID 집합이 준비한 DB projection과 다릅니다."
             )
         validate_route_urgency_dependencies(
             publication.input_fingerprint,
@@ -1055,6 +1126,8 @@ def _plan_from_snapshots(
         stations=database_snapshot.stations,
         urgency=urgency_snapshot.records,
         route_coverage=database_snapshot.route_coverage,
+        policy_config=DEFAULT_REBALANCE_POLICY,
+        pickup_cooldown_sta_ids=frozenset(database_snapshot.pickup_cooldown_sta_ids),
     )
 
 
@@ -1290,7 +1363,30 @@ def _route_database_snapshot_locked(
     )
     stations = tuple(StationRouteTopology(*row) for row in cursor.fetchall())
     coverage = _route_coverage_locked(cursor, logical)
-    return RouteDatabaseSnapshot(centers, stations, coverage)
+    cursor.execute(
+        """
+        SELECT DISTINCT stop.sta_id
+          FROM rebalance_route AS route
+          JOIN rebalance_route_stop AS stop USING (route_id)
+         WHERE route.route_status_cd IN ('dispatched', 'completed')
+           AND route.dispatched_dttm > %s
+           AND route.dispatched_dttm <= %s
+           AND stop.route_action_type_cd = 'pickup'
+         ORDER BY stop.sta_id COLLATE "C"
+        """,
+        (
+            logical
+            - timedelta(minutes=DEFAULT_REBALANCE_POLICY.pickup_cooldown_minutes),
+            logical,
+        ),
+    )
+    pickup_cooldown_sta_ids = tuple(row[0] for row in cursor.fetchall())
+    return RouteDatabaseSnapshot(
+        centers,
+        stations,
+        coverage,
+        pickup_cooldown_sta_ids,
+    )
 
 
 def _route_coverage_locked(
@@ -1627,12 +1723,16 @@ def _build_candidates(
     stations_by_id: dict[str, StationRouteTopology],
     centers_by_id: dict[str, DispatchCenterTopology],
     coverage_qty: dict[tuple[str, str], int],
+    exclusive_pickup_station: bool = False,
+    pickup_cooldown_sta_ids: frozenset[str] = frozenset(),
 ) -> dict[str, tuple[_Candidate, ...]]:
     """현재 station FK와 coverage를 적용한 센터별 결정적 후보를 만든다."""
     candidates: dict[str, list[_Candidate]] = {}
     for row in urgency:
         action = _route_action(row.action_type)
         if action is None or row.bike_qty <= 0:
+            continue
+        if action == "pickup" and row.sta_id in pickup_cooldown_sta_ids:
             continue
         station = stations_by_id.get(row.sta_id)
         if station is None or not station.is_active:
@@ -1644,7 +1744,10 @@ def _build_candidates(
             raise ContractViolation(
                 f"actionable urgency station의 current center가 active가 아닙니다: {row.sta_id}"
             )
-        remaining = row.bike_qty - coverage_qty.get((row.sta_id, action), 0)
+        covered = coverage_qty.get((row.sta_id, action), 0)
+        if exclusive_pickup_station and action == "pickup" and covered > 0:
+            continue
+        remaining = row.bike_qty - covered
         if remaining <= 0:
             continue
         candidates.setdefault(station.dispatch_center_id, []).append(
@@ -1720,9 +1823,7 @@ def _take_by_priority(
     """후보 우선순위를 보존하며 양수 limit까지 수량을 배정한다."""
     if type(limit) is not int or limit < 0:
         raise ContractViolation("route selection limit은 0 이상 integer여야 합니다.")
-    if stop_limit is not None and (
-        type(stop_limit) is not int or stop_limit < 0
-    ):
+    if stop_limit is not None and (type(stop_limit) is not int or stop_limit < 0):
         raise ContractViolation("route stop limit은 0 이상 integer여야 합니다.")
     if limit == 0 or not candidates:
         return (), list(candidates)
@@ -1730,9 +1831,7 @@ def _take_by_priority(
     remaining: list[_Candidate] = []
     available = limit
     for candidate in candidates:
-        if available == 0 or (
-            stop_limit is not None and len(selected) >= stop_limit
-        ):
+        if available == 0 or (stop_limit is not None and len(selected) >= stop_limit):
             remaining.append(candidate)
             continue
         quantity = min(candidate.remaining_qty, available)
@@ -1788,8 +1887,7 @@ def _choose_balanced_stop_split(
                 continue
             stop_count = pickup_stop_limit + dropoff_stop_limit
             urgency_sum = sum(
-                item.urgency_score
-                for item in (*pickup_candidates, *dropoff_candidates)
+                item.urgency_score for item in (*pickup_candidates, *dropoff_candidates)
             )
             key = (
                 transfer_qty,
