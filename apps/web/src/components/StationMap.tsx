@@ -508,7 +508,7 @@ function StationMarkers({
       {/* 마커 자체보다 넓게 깔아 두는 투명 클릭 영역. 시각적 마커 밑에 먼저 그려야
           마커 위에서의 호버가 그대로 툴팁을 띄우고, 마커 밖 여백(CLICK_PADDING)만
           이 레이어가 받아서 대충 눌러도 선택되게 한다. */}
-      {stackOrder.map((station) => {
+      {!selectedRoute && stackOrder.map((station) => {
         const alert = alertsByStation.get(station.sta_id);
         return (
           <CircleMarker
@@ -520,7 +520,7 @@ function StationMarkers({
           />
         );
       })}
-      {stackOrder.map((station) => {
+      {!selectedRoute && stackOrder.map((station) => {
         const isSelected = station.sta_id === selectedStationId;
         const alert = alertsByStation.get(station.sta_id);
         const radius = markerRadius(alert) * scale;
@@ -544,7 +544,7 @@ function StationMarkers({
           </CircleMarker>
         );
       })}
-      {showCounts &&
+      {!selectedRoute && showCounts &&
         visible
           .filter((station) => !occludedStationIds.has(station.sta_id))
           .map((station) => {
