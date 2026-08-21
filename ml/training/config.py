@@ -171,13 +171,36 @@ if not 1 <= MAX_TRAIN_HORIZON <= common_config.HORIZON_COUNT:
         f"MAX_TRAIN_HORIZON은 1~{common_config.HORIZON_COUNT} 사이여야 합니다: {MAX_TRAIN_HORIZON}"
     )
 
+
+def _parse_train_horizons() -> tuple[int, ...]:
+    """학습에 사용할 horizon 목록을 파싱한다."""
+    raw = os.environ.get("TRAIN_HORIZONS")
+    if raw is not None:
+        try:
+            horizons = tuple(int(x.strip()) for x in raw.split(",") if x.strip())
+        except ValueError as exc:
+            raise ValueError(f"TRAIN_HORIZONS는 쉼표로 구분한 정수여야 합니다: {raw!r}") from exc
+        if not horizons or any(h < 1 or h > common_config.HORIZON_COUNT for h in horizons):
+            raise ValueError(f"TRAIN_HORIZONS는 1~{common_config.HORIZON_COUNT} 사이 정수여야 합니다: {horizons}")
+    else:
+        horizons = common_config.TRAIN_HORIZONS
+
+    clamped = tuple(h for h in horizons if h <= MAX_TRAIN_HORIZON)
+    if not clamped:
+        raise ValueError(f"TRAIN_HORIZONS 중 MAX_TRAIN_HORIZON={MAX_TRAIN_HORIZON} 이하인 값이 없습니다: {horizons}")
+    return clamped
+
+
+TRAIN_HORIZONS = _parse_train_horizons()
+
 # multi-horizon 한 anchor는 target 날짜가 자정을 넘으면 서로 다른 `date=` 파티션에
 # 최대 MAX_TRAIN_HORIZON개 행으로 나뉜다. train/valid/test를 day-of-month로만
 # 인터리브하면 같은 anchor의 거의 같은 입력이 train과 평가셋에 동시에 들어가므로,
 # horizon 이동 폭과 target 집계 창을 모두 덮는 날짜 단위 purge 구간을 둔다.
 # 현재 12시간 예측·60분 target이면 1일이며, horizon을 늘리면 자동으로 커진다.
+_effective_max_horizon = max(TRAIN_HORIZONS) if TRAIN_HORIZONS else MAX_TRAIN_HORIZON
 _MIN_SPLIT_EMBARGO_DAYS = ceil(
-    (((MAX_TRAIN_HORIZON - 1) * 60) + common_config.TARGET_HORIZON_MINUTES) / (24 * 60)
+    (((_effective_max_horizon - 1) * 60) + common_config.TARGET_HORIZON_MINUTES) / (24 * 60)
 )
 SPLIT_EMBARGO_DAYS = int(os.environ.get("SPLIT_EMBARGO_DAYS", str(_MIN_SPLIT_EMBARGO_DAYS)))
 if SPLIT_EMBARGO_DAYS < _MIN_SPLIT_EMBARGO_DAYS:
@@ -208,6 +231,25 @@ def _bool_env(name: str, default: bool = False) -> bool:
     if normalized in {"0", "false", "no", "off"}:
         return False
     raise ValueError(f"{name}은 true/false 값이어야 합니다: {raw!r}")
+
+
+ADAPTIVE_TRAIN_ANCHORS = _bool_env("ADAPTIVE_TRAIN_ANCHORS", common_config.ADAPTIVE_TRAIN_ANCHORS)
+
+
+def _parse_peak_hours(
+    name: str,
+    default: tuple[tuple[int, int], ...],
+) -> tuple[tuple[int, int], ...]:
+    """평일 또는 휴일 피크 시간대 구간 목록을 환경변수 또는 common_config에서 파싱한다."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return common_config._parse_peak_hours(name, raw, default)
+
+
+WEEKDAY_PEAK_HOURS = _parse_peak_hours("WEEKDAY_PEAK_HOURS", common_config.WEEKDAY_PEAK_HOURS)
+HOLIDAY_PEAK_HOURS = _parse_peak_hours("HOLIDAY_PEAK_HOURS", common_config.HOLIDAY_PEAK_HOURS)
+
 
 
 # 2025 전체 d1/h12 실측에서 native train+valid Dataset을 동시에 유지한 채 첫

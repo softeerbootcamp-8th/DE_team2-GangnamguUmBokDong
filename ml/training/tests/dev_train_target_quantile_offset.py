@@ -50,7 +50,7 @@ def _seed_rental_table(n_each: int = 8) -> None:
                 "temp": 20.0,
                 "precip": 0.0,
                 "pop_total": 1000.0,
-                "minute": 0,
+                "minute": 480,
                 "dow": 0,
                 "is_holiday": 0,
                 "day": day_index(date(2025, 1, day_of_month)),

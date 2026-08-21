@@ -276,7 +276,8 @@ def train_target(
     _append_progress_log(
         f"[{model_name}] 학습 시작 — window={config.TRAIN_WINDOW_START.isoformat()}~"
         f"{config.TRAIN_WINDOW_END.isoformat()}, divisor={config.TRAIN_DAY_DIVISOR}, "
-        f"max_horizon={config.MAX_TRAIN_HORIZON}, peak_rss={_peak_rss_mb():.0f}MB"
+        f"train_horizons={list(config.TRAIN_HORIZONS)}, adaptive_anchors={config.ADAPTIVE_TRAIN_ANCHORS}, "
+        f"peak_rss={_peak_rss_mb():.0f}MB"
     )
     if config.LGB_NUM_MACHINES > 1:
         raise NotImplementedError(
@@ -288,7 +289,7 @@ def train_target(
 
     feature_columns = _FEATURE_COLUMNS_BY_MODEL[model_name]
     table_path = _TRAINING_TABLE_BY_MODEL[model_name]
-    filters = [("horizon", "<=", config.MAX_TRAIN_HORIZON)]
+    filters = [("horizon", "in", list(config.TRAIN_HORIZONS))]
 
     train_dates, valid_dates, test_dates = _dates_for_split(config.TRAIN_WINDOW_START, config.TRAIN_WINDOW_END)
     if not train_dates or not valid_dates or not test_dates:
@@ -300,7 +301,7 @@ def train_target(
         )
     _append_progress_log(
         f"[{model_name}] 날짜 확정 — train {len(train_dates)}개, valid {len(valid_dates)}개, "
-        f"test {len(test_dates)}개, max_horizon={config.MAX_TRAIN_HORIZON}"
+        f"test {len(test_dates)}개, train_horizons={list(config.TRAIN_HORIZONS)}"
     )
 
     # station_categories는 train/valid/test 전체 날짜에서 한 번만 뽑는다 — 세 split
@@ -342,6 +343,10 @@ def train_target(
                 "train_window_end": config.TRAIN_WINDOW_END.isoformat(),
                 "train_day_divisor": config.TRAIN_DAY_DIVISOR,
                 "max_train_horizon": config.MAX_TRAIN_HORIZON,
+                "train_horizons": str(list(config.TRAIN_HORIZONS)),
+                "adaptive_train_anchors": config.ADAPTIVE_TRAIN_ANCHORS,
+                "weekday_peak_hours": str([list(p) for p in config.WEEKDAY_PEAK_HOURS]),
+                "holiday_peak_hours": str([list(p) for p in config.HOLIDAY_PEAK_HOURS]),
                 "valid_days_of_month": sorted(config.VALID_DAYS_OF_MONTH),
                 "test_days_of_month": sorted(config.TEST_DAYS_OF_MONTH),
                 "profile_name": common_config.PROFILE_NAME,

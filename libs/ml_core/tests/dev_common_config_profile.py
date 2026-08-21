@@ -501,3 +501,29 @@ def test_profile_registry_push_fetch_list_round_trip(tmp_path, monkeypatch):
 def test_profile_registry_rejects_reserved_builtin_name():
     with pytest.raises(ValueError, match="예약된 내장 프로필"):
         profile_registry.push_profile(common_config.BUILTIN_PROFILE_NAME, common_config._DEFAULT_PROFILE)
+
+
+def test_peak_hours_parsing_and_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_parse_peak_hours의 다양한 입력(문자열, JSON, 리스트, 결측값) 파싱을 검증한다."""
+    default = ((7, 10), (17, 21))
+
+    # 기본값
+    assert common_config._parse_peak_hours("TEST_PEAK", None, default) == default
+
+    # 리스트 / 튜플 형태
+    assert common_config._parse_peak_hours("TEST_PEAK", [[8, 10], [18, 20]], default) == ((8, 10), (18, 20))
+
+    # 문자열 다양한 구분자 (-, :, ~)
+    assert common_config._parse_peak_hours("TEST_PEAK", "8-10, 18:20, 21~23", default) == ((8, 10), (18, 20), (21, 23))
+
+    # JSON 문자열
+    assert common_config._parse_peak_hours("TEST_PEAK", "[[13, 19]]", default) == ((13, 19),)
+
+    # 비활성화 (none, empty)
+    assert common_config._parse_peak_hours("TEST_PEAK", "none", default) == ()
+    assert common_config._parse_peak_hours("TEST_PEAK", "", default) == ()
+
+    # 유효하지 않은 범위
+    with pytest.raises(ValueError, match="0 <= start < end <= 24"):
+        common_config._parse_peak_hours("TEST_PEAK", "20-10", default)
+

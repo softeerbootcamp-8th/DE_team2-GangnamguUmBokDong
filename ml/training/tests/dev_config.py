@@ -88,3 +88,41 @@ def test_unique_archive_date_embeds_given_date_but_differs_across_calls():
     assert a != b
     assert a.startswith("2026-08-19-")
     assert b.startswith("2026-08-19-")
+
+
+def test_train_horizons_default_and_parsing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """TRAIN_HORIZONS 기본값(8개 스파스: 1,2,3,4,5,6,9,12)과 환경변수 파싱을 검증한다."""
+    assert config.TRAIN_HORIZONS == (1, 2, 3, 4, 5, 6, 9, 12)
+
+    monkeypatch.setenv("TRAIN_HORIZONS", "1,2,3,4")
+    assert config._parse_train_horizons() == (1, 2, 3, 4)
+
+    monkeypatch.setenv("TRAIN_HORIZONS", "invalid")
+    with pytest.raises(ValueError, match="정수여야 합니다"):
+        config._parse_train_horizons()
+
+
+def test_adaptive_train_anchors_default():
+    """ADAPTIVE_TRAIN_ANCHORS 기본값이 True인지 검증한다."""
+    assert config.ADAPTIVE_TRAIN_ANCHORS is True
+
+
+def test_peak_hours_default_and_parsing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """WEEKDAY_PEAK_HOURS 및 HOLIDAY_PEAK_HOURS 기본값과 환경변수 파싱을 검증한다."""
+    assert config.WEEKDAY_PEAK_HOURS == ((7, 21),)
+    assert config.HOLIDAY_PEAK_HOURS == ((8, 21),)
+
+    monkeypatch.setenv("WEEKDAY_PEAK_HOURS", "8-10, 18-20")
+    assert config._parse_peak_hours("WEEKDAY_PEAK_HOURS", config.WEEKDAY_PEAK_HOURS) == ((8, 10), (18, 20))
+
+    monkeypatch.setenv("HOLIDAY_PEAK_HOURS", "12:18")
+    assert config._parse_peak_hours("HOLIDAY_PEAK_HOURS", config.HOLIDAY_PEAK_HOURS) == ((12, 18),)
+
+    monkeypatch.setenv("HOLIDAY_PEAK_HOURS", "none")
+    assert config._parse_peak_hours("HOLIDAY_PEAK_HOURS", config.HOLIDAY_PEAK_HOURS) == ()
+
+    monkeypatch.setenv("WEEKDAY_PEAK_HOURS", "25-10")
+    with pytest.raises(ValueError, match="0 <= start < end <= 24"):
+        config._parse_peak_hours("WEEKDAY_PEAK_HOURS", config.WEEKDAY_PEAK_HOURS)
+
+

@@ -38,11 +38,102 @@ import os
 import tempfile
 from collections import OrderedDict
 from collections.abc import Callable
+from datetime import date
 
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
 from core import s3 as s3_io
+from ml_core.day_index import day_index
+from ml_core.holidays_kr import korean_holidays
+from ml_core.profile_contract import DEFAULT_HOLIDAY_PEAK_HOURS, DEFAULT_WEEKDAY_PEAK_HOURS
+
+from . import config
+
+
+def _is_in_peak_hours(minutes: np.ndarray, peak_hours: tuple[tuple[int, int], ...]) -> np.ndarray:
+    """주어진 경과분(0~1439) 배열이 피크 시간대 구간 중 하나에 속하는지 판별한다."""
+    if not peak_hours:
+        return np.zeros_like(minutes, dtype=bool)
+    mask = np.zeros_like(minutes, dtype=bool)
+    for start_h, end_h in peak_hours:
+        mask |= (minutes >= start_h * 60) & (minutes < end_h * 60)
+    return mask
+
+
+def _is_holiday_date(dt: date) -> bool:
+    """주어진 날짜가 주말(토/일)이거나 대한민국 공휴일인지 판별한다."""
+    if dt.weekday() >= 5:
+        return True
+    try:
+        return dt.isoformat() in korean_holidays(dt.year)
+    except Exception:
+        return False
+
+
+def _adaptive_anchor_mask(
+    minute_series: pd.Series,
+    is_night_day: bool,
+    is_holiday: bool = False,
+    weekday_peak_hours: tuple[tuple[int, int], ...] = DEFAULT_WEEKDAY_PEAK_HOURS,
+    holiday_peak_hours: tuple[tuple[int, int], ...] = DEFAULT_HOLIDAY_PEAK_HOURS,
+) -> np.ndarray:
+    """시간대별 가변 앵커링 불리언 마스크를 계산한다.
+
+    - 피크 시간대(평일: weekday_peak_hours, 휴일: holiday_peak_hours): 20분 단위 전체 앵커 (minute % 20 == 0)
+    - 평시 시간대: 60분 단위 정시 앵커 (minute % 60 == 0)
+    - 심야 시간대(00~06시, minute < 360): 3일에 1번(is_night_day=True)만 60분 단위 정시 앵커 (minute % 60 == 0)
+
+    args:
+        minute_series: 자정 기준 경과분(0~1439) Series
+        is_night_day: 심야 앵커를 포함할 날짜인지 여부(3일에 1회)
+        is_holiday: 주말 또는 공휴일 여부
+        weekday_peak_hours: 평일 피크 시간대 구간 목록
+        holiday_peak_hours: 휴일 피크 시간대 구간 목록
+    returns:
+        np.ndarray: 유효 앵커 여부 불리언 마스크 배열
+    """
+    minutes = minute_series.to_numpy()
+    peak_hours = holiday_peak_hours if is_holiday else weekday_peak_hours
+    peak_mask = _is_in_peak_hours(minutes, peak_hours)
+
+    night_mask = minutes < 360
+    regular_mask = ~peak_mask & ~night_mask
+
+    valid_peak = peak_mask & (minutes % 20 == 0)
+    valid_regular = regular_mask & (minutes % 60 == 0)
+    valid_night = (night_mask & (minutes % 60 == 0)) if is_night_day else np.zeros_like(night_mask, dtype=bool)
+
+    return valid_peak | valid_regular | valid_night
+
+
+def _apply_adaptive_anchor_filter(df: pd.DataFrame, date_str: str) -> pd.DataFrame:
+    """시간대별 가변 앵커링 필터를 적용해 유효한 앵커 행만 남긴다.
+
+    args:
+        df: 날짜 파티션 DataFrame
+        date_str: 파티션 날짜 문자열("YYYY-MM-DD")
+    returns:
+        pd.DataFrame: 가변 앵커 필터가 적용된 DataFrame
+    """
+    if "minute" not in df.columns:
+        return df
+    try:
+        dt = date.fromisoformat(date_str)
+        is_night_day = day_index(dt) % 3 == 0
+        is_holiday = _is_holiday_date(dt)
+    except Exception:
+        is_night_day = True
+        is_holiday = False
+
+    mask = _adaptive_anchor_mask(
+        df["minute"],
+        is_night_day=is_night_day,
+        is_holiday=is_holiday,
+        weekday_peak_hours=config.WEEKDAY_PEAK_HOURS,
+        holiday_peak_hours=config.HOLIDAY_PEAK_HOURS,
+    )
+    return df[mask]
 
 
 class ChunkCache:
@@ -105,25 +196,60 @@ def _feature_frame_to_float64(
     return arr
 
 
-def _read_date_chunk(table_path: str, date_str: str, columns: list[str], filters: list[tuple] | None) -> pd.DataFrame:
+def _read_date_chunk(
+    table_path: str,
+    date_str: str,
+    columns: list[str],
+    filters: list[tuple] | None,
+    adaptive_anchors: bool | None = None,
+) -> pd.DataFrame:
     """날짜 하나(`date=YYYY-MM-DD/` 파티션)만 읽어 pandas DataFrame으로 반환한다.
 
     `core.s3.list_keys()`/`read_parquet_many()`를 그대로 재사용한다(새 S3 접근 계층을
     만들지 않음) — `core.s3._read_parquet_by_dates()`가 여러 날짜에 걸쳐 하는 일을
     날짜 하나로 좁힌 버전이다.
+
+    `adaptive_anchors`가 True(기본값 config.ADAPTIVE_TRAIN_ANCHORS)이면 피크(20분)/
+    평시(60분)/심야(3일 1회 60분) 가변 앵커링 필터를 적용한다.
     """
     part_keys = _list_date_part_keys(table_path, date_str)
     if not part_keys:
         raise FileNotFoundError(f"S3에 이 날짜 파티션이 없음: {table_path}/date={date_str}/")
+
+    use_adaptive = config.ADAPTIVE_TRAIN_ANCHORS if adaptive_anchors is None else adaptive_anchors
+    read_columns = list(columns)
+    temp_minute_added = False
+    if use_adaptive and "minute" not in read_columns:
+        first_bytes = s3_io.get_object_bytes(part_keys[0])
+        if first_bytes is not None:
+            import io
+            import pyarrow.parquet as pq
+
+            try:
+                schema_names = pq.read_schema(io.BytesIO(first_bytes)).names
+                if "minute" in schema_names:
+                    read_columns.append("minute")
+                    temp_minute_added = True
+            except Exception:
+                pass
+
     tables = [
-        t for t in s3_io.read_parquet_many(part_keys, columns=columns, as_pandas=False, filters=filters) if t is not None
+        t for t in s3_io.read_parquet_many(part_keys, columns=read_columns, as_pandas=False, filters=filters) if t is not None
     ]
     if not tables:
         raise FileNotFoundError(f"S3에 이 날짜 파티션에 데이터가 없음(filters 이후 0행): {table_path}/date={date_str}/")
-    combined = s3_io.concat_compatible_tables(tables, required_columns=columns)
+    combined = s3_io.concat_compatible_tables(tables, required_columns=read_columns)
     del tables
     df = combined.to_pandas(self_destruct=True, split_blocks=True)
     del combined
+
+    if use_adaptive and "minute" in df.columns:
+        df = _apply_adaptive_anchor_filter(df, date_str)
+        if temp_minute_added:
+            df = df[[c for c in columns if c in df.columns]]
+
+    if df.empty:
+        raise FileNotFoundError(f"S3에 이 날짜 파티션에 데이터가 없음(filters/adaptive anchors 이후 0행): {table_path}/date={date_str}/")
     return df
 
 
