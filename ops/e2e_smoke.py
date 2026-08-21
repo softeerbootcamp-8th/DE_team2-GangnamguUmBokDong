@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
+import tarfile
+import tempfile
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -116,7 +120,43 @@ def _airflow_port() -> str:
     return "8080"
 
 
-def run(timeout_seconds: int) -> int:
+def _stage_model_bundle(archive: Path) -> str:
+    """Host tar.gz를 검증 가능한 repo staging에 안전하게 풀고 container 경로를 반환한다."""
+    archive = archive.expanduser().resolve()
+    if not archive.is_file():
+        raise RuntimeError(f"모델 번들이 없습니다: {archive}")
+    digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+    stage_root = _ROOT / "data" / "local-e2e-models"
+    target = stage_root / digest
+    ready = target / ".ready"
+    if not ready.is_file():
+        stage_root.mkdir(parents=True, exist_ok=True)
+        temporary = Path(tempfile.mkdtemp(prefix=f".{digest}.", dir=stage_root))
+        try:
+            with tarfile.open(archive, "r:gz") as bundle:
+                members = bundle.getmembers()
+                if not members:
+                    raise RuntimeError("모델 번들이 비어 있습니다.")
+                for member in members:
+                    destination = (temporary / member.name).resolve()
+                    if temporary not in destination.parents or not (
+                        member.isdir() or member.isfile()
+                    ):
+                        raise RuntimeError(f"안전하지 않은 모델 번들 항목입니다: {member.name}")
+                bundle.extractall(temporary)
+            roots = [path for path in temporary.iterdir() if path.is_dir()]
+            if len(roots) != 1 or not (roots[0] / "SHA256SUMS").is_file():
+                raise RuntimeError("모델 번들은 SHA256SUMS를 가진 단일 디렉터리여야 합니다.")
+            (temporary / ".ready").write_text(roots[0].name, encoding="utf-8")
+            temporary.rename(target)
+        finally:
+            if temporary.exists():
+                shutil.rmtree(temporary)
+    bundle_name = ready.read_text(encoding="utf-8").strip()
+    return f"/workspace/data/local-e2e-models/{digest}/{bundle_name}"
+
+
+def run(timeout_seconds: int, *, model_bundle: Path | None = None) -> int:
     """Fixture를 준비하고 paused 운영 DAG를 test run으로 실행한다."""
     compose = _compose_command()
     running = subprocess.run(
@@ -149,13 +189,18 @@ def run(timeout_seconds: int) -> int:
             f"--window-start {shlex.quote(station_source_text)}"
         ),
     )
-    print(f"[e2e] fixture 준비: window={window_text}", flush=True)
+    container_bundle = _stage_model_bundle(model_bundle) if model_bundle else None
+    model_label = "issue-175-prototype" if container_bundle else "generated-fixture"
+    print(f"[e2e] fixture 준비: window={window_text} model={model_label}", flush=True)
+    bundle_argument = (
+        f" --model-bundle {shlex.quote(container_bundle)}" if container_bundle else ""
+    )
     _compose_exec(
         compose,
         (
             "cd /workspace/loader && env -u VIRTUAL_ENV "
             "LOCAL_E2E_ALLOW_FIXTURE=1 uv run --frozen python local_e2e.py seed "
-            f"--logical-dttm {shlex.quote(window_text)}"
+            f"--logical-dttm {shlex.quote(window_text)}{bundle_argument}"
         ),
     )
 
@@ -188,6 +233,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Smoke runner CLI 인자를 파싱한다."""
     parser = argparse.ArgumentParser(description="로컬 Airflow E2E smoke를 실행한다.")
     parser.add_argument("--timeout-seconds", type=int, default=900)
+    parser.add_argument(
+        "--model-bundle",
+        type=Path,
+        default=os.environ.get("E2E_MODEL_BUNDLE"),
+        help="#175 tar.gz 경로(E2E_MODEL_BUNDLE로도 지정 가능)",
+    )
     return parser.parse_args(argv)
 
 
@@ -198,7 +249,7 @@ def main(argv: list[str] | None = None) -> int:
         print("--timeout-seconds는 양수여야 합니다.", file=sys.stderr)
         return 2
     try:
-        return run(args.timeout_seconds)
+        return run(args.timeout_seconds, model_bundle=args.model_bundle)
     except (
         OSError,
         subprocess.CalledProcessError,

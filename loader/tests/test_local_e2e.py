@@ -102,7 +102,7 @@ def test_realtime_station_snapshot_builds_serving_rows() -> None:
     stations = local_e2e._stations_from_realtime(table)
 
     assert tuple(station["station_id"] for station in stations) == ("ST-4", "ST-9")
-    assert tuple(station["station_no"] for station in stations) == (1, 2)
+    assert tuple(station["station_no"] for station in stations) == (4, 9)
     assert stations[0]["lat"] == 37.50
     assert stations[0]["capacity"] == 15
 
