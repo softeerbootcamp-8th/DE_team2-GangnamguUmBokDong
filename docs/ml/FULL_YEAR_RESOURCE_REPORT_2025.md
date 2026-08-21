@@ -121,10 +121,17 @@ OS, Airflow scheduler/worker, Docker, collector 동시 실행 여유가 거의 �
    backfill/compaction 포함 동시 soak test를 수행한다.
 2. 동시 실행이 필수라면 `t4g.xlarge` 16GiB 또는 상시 EC2 두 대를 요청한다.
 
-또한 로컬 검증은 x86_64였고 t4g는 arm64다. ECR image, LightGBM, PyArrow,
-psycopg/native wheel을 arm64로 build/test하거나 multi-arch image를 게시해야 한다.
-T4g의 CPU credit 특성상 장시간 compaction을 상시 서버에서 돌리는 것도 분리하는
-편이 안전하다.
+로컬 실측은 x86_64였고 t4g는 arm64이므로 PR CI에 네이티브
+`ubuntu-24.04-arm` gate를 추가했다. Airflow/collector/inference/training을 포함한
+uv lock 해석과 model runtime 테스트, Airflow/MLflow image의 `linux/arm64` build를
+통과해야 배포할 수 있다. 다만 CI는 t4g의 8GiB/CPU credit 조건을 재현하지 않으므로
+실제 인스턴스 soak는 별도로 남는다. T4g의 CPU credit 특성상 장시간 compaction을
+상시 서버에서 돌리는 것도 분리하는 편이 안전하다.
+
+운영 t4g에서는 amd64-only인 로컬 `postgis/postgis:16-3.5` 컨테이너를 실행하지
+않고 할당된 `db.t4g.medium` RDS에 접속한다. ECR에는 CI가 검증한
+`linux/arm64` Airflow/MLflow 이미지를 게시하며, 로컬 Compose 전체를 그대로 EC2에
+복제하는 방식은 지원하지 않는다.
 
 AWS 공식 사양:
 
@@ -133,15 +140,22 @@ AWS 공식 사양:
 
 ### 학습 EC2
 
-`r6i.2xlarge`(8 vCPU/64GiB, x86_64, EBS-only) 1대를 필요할 때만 켜는 안을
-요청한다. 근거는 32GB급에서 두 모델 모두 LightGBM round 시작 전에 system
+`r6g.2xlarge`(8 vCPU/64GiB, Arm Graviton2, EBS-only) 1대를 필요할 때만 켜는 안을
+요청한다. 상시 `t4g.large`와 같은 Graviton2 아키텍처에서 학습·재로드·추론까지
+검증해 x86 전용 경로를 만들지 않기 위함이다. 메모리 증설 근거는 32GB급에서 두
+모델 모두 LightGBM round 시작 전에 system
 29.28GiB와 swap을 소진했고, 관측 peak가 최종 peak의 하한이라는 점이다.
 최소 100GiB gp3 scratch를 붙이고 rental/return을 순차 실행한다. 첫 실행에서도
 동일한 3GiB guard를 유지하며 64GiB를 넘으면 그 manifest로 다음 증설을 판단한다.
 
+`r6g.2xlarge`가 대상 리전에 없거나 승인 정책상 최신 세대만 가능하면 같은 Arm64
+계약의 `r7g.2xlarge`(8 vCPU/64GiB)를 대안으로 요청한다. x86 `r6i.2xlarge`는
+Graviton 계열을 사용할 수 없다는 별도 사유가 확인될 때만 차선이다.
+
 AWS 공식 사양:
 
-- <https://aws.amazon.com/ec2/instance-types/r6i/>
+- <https://aws.amazon.com/ec2/instance-types/r6g/>
+- <https://aws.amazon.com/ec2/instance-types/r7g/>
 - <https://docs.aws.amazon.com/ec2/latest/instancetypes/mo.html>
 
 현재 LightGBM 설정은 CPU 학습이며 허용된 AWS 타입에도 GPU가 없다. 로컬 GPU
@@ -187,7 +201,7 @@ feature, profile, 모델 smoke archive, resource manifest는 삭제하지 않았
 
 ## 64GiB 실행 판정 기준
 
-첫 x86_64 64GiB 실행은 아래 조건을 동시에 만족해야 완료로 인정한다.
+첫 Arm64 Graviton 64GiB 실행은 아래 조건을 동시에 만족해야 완료로 인정한다.
 
 1. `TRAIN_WINDOW_START/END=2025-01-01/2025-12-31`, `TRAIN_DAY_DIVISOR=1`,
    `MAX_TRAIN_HORIZON=12`, g20/r20/a20이며 rental/return을 순차 실행한다.
@@ -211,7 +225,7 @@ valid 상주가 다시 병목일 때만 별도 프로필로 사용하고, 이 �
 
 ## 남은 작업
 
-1. 승인된 64GiB x86_64 EC2에서 `d1/h12`, 기본 800 rounds로 rental/return을
+1. 승인된 64GiB Arm64 EC2에서 `d1/h12`, 기본 800 rounds로 rental/return을
    순차 완주하고 metrics/resource manifest를 보존한다.
 2. 전체 artifact 16개를 새 process에서 재로드하고 profile/source fingerprint를
    확인한다.
