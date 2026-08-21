@@ -12,6 +12,7 @@ const HEIGHT = 220;
 const MARGIN = { top: 16, right: 16, bottom: 24, left: 32 };
 const PLOT_WIDTH = WIDTH - MARGIN.left - MARGIN.right;
 const PLOT_HEIGHT = HEIGHT - MARGIN.top - MARGIN.bottom;
+const X_TICK_COUNT = 5;
 
 // 대여가 늘면 재고가 부족해지고(공급필요, 빨강), 반납이 늘면 재고가 넘친다
 // (회수필요, 파랑) — 지도 마커의 방향별 색과 같은 의미로 맞춘다.
@@ -22,6 +23,19 @@ const SERIES = [
 
 function formatTime(iso: string): string {
   return formatIsoTime(iso, { hour: "2-digit", minute: "2-digit" });
+}
+
+function tickIndices(length: number): number[] {
+  if (length <= 1) return [0];
+
+  const tickCount = Math.min(X_TICK_COUNT, length);
+  return Array.from(
+    new Set(
+      Array.from({ length: tickCount }, (_, index) =>
+        Math.round((index / (tickCount - 1)) * (length - 1)),
+      ),
+    ),
+  );
 }
 
 export function ForecastChart({ points }: Props) {
@@ -35,6 +49,7 @@ export function ForecastChart({ points }: Props) {
   const xAt = (i: number) => MARGIN.left + (i / (points.length - 1)) * PLOT_WIDTH;
   const yAt = (v: number) => MARGIN.top + (1 - v / maxY) * PLOT_HEIGHT;
   const yTicks = [0, Math.round(maxY / 2), Math.round(maxY)];
+  const xTicks = tickIndices(points.length);
   const last = points[points.length - 1];
   const criticalIndex = points.findIndex((p) => p.action_type !== "normal");
   const criticalPoint = criticalIndex >= 0 ? points[criticalIndex] : null;
@@ -89,6 +104,19 @@ export function ForecastChart({ points }: Props) {
               {tick}
             </text>
           </g>
+        ))}
+
+        {xTicks.map((index, tickIndex) => (
+          <text
+            key={points[index].predicted_dttm}
+            x={xAt(index)}
+            y={HEIGHT - 5}
+            textAnchor={tickIndex === 0 ? "start" : tickIndex === xTicks.length - 1 ? "end" : "middle"}
+            fontSize={11}
+            fill="var(--text-muted)"
+          >
+            {formatTime(points[index].predicted_dttm)}
+          </text>
         ))}
 
         {SERIES.map((series) => {

@@ -3,12 +3,11 @@
 from typing import Literal
 from uuid import UUID
 
+import queries
 from core.db import fetch_one
 from core.forecast import enrich_forecast_points
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-
-import queries
 from schemas import (
     Alert,
     DispatchCenter,
@@ -21,7 +20,7 @@ from schemas import (
     WeatherResponse,
 )
 
-RouteStatusFilter = Literal["proposed", "dispatched", "completed"]
+RouteStatusFilter = Literal["proposed", "dispatched", "completed", "cancelled"]
 
 app = FastAPI(title="GangnamguUmBokDong API")
 
@@ -207,4 +206,11 @@ def dispatch_route(route_id: UUID) -> dict:
 def complete_route(route_id: UUID) -> dict:
     """route를 dispatched에서 completed로 guarded 전이한다."""
     result = queries.complete_route(route_id, queries.now_utc())
+    return _route_transition_response(route_id, result, "dispatched")
+
+
+@app.post("/routes/{route_id}/cancel", response_model=Route)
+def cancel_route(route_id: UUID) -> dict:
+    """route를 dispatched에서 cancelled로 guarded 전이한다."""
+    result = queries.cancel_route(route_id, queries.now_utc())
     return _route_transition_response(route_id, result, "dispatched")
