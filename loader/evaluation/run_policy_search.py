@@ -13,6 +13,7 @@ from pathlib import Path
 from gold.rebalance_policy import LEGACY_REBALANCE_POLICY, risk_band_policy
 
 from .aggregate_policy_results import aggregate_results, write_aggregate
+from .quantile_policy import QuantileQuantityPolicy
 from .run_policy_backtest import PolicyVariant, run_policy_backtest, write_result
 
 
@@ -25,6 +26,9 @@ def build_policy_variants(
     pickup_cooldown_minutes: tuple[int, ...],
     max_stops: tuple[int, ...],
     include_legacy: bool,
+    include_quantile: bool = False,
+    quantile_minimum_bikes: tuple[int, ...] = (1,),
+    quantile_minimum_empty_docks: tuple[int, ...] = (1,),
 ) -> tuple[PolicyVariant, ...]:
     """제한된 Cartesian 후보군을 결정적인 이름과 순서로 만든다."""
     variants = []
@@ -64,6 +68,39 @@ def build_policy_variants(
                 policy_config=config,
             )
         )
+    if include_quantile:
+        for horizon, ratio, bikes, docks, fraction, cooldown, stop_limit in product(
+            protection_hours,
+            minimum_stock_ratios,
+            quantile_minimum_bikes,
+            quantile_minimum_empty_docks,
+            max_pickup_stock_fractions,
+            pickup_cooldown_minutes,
+            max_stops,
+        ):
+            variants.append(
+                PolicyVariant(
+                    name=(
+                        f"quantile_guard_h{horizon}_r{round(ratio * 100):02d}_"
+                        f"b{bikes:02d}_d{docks:02d}_"
+                        f"f{round(fraction * 100):03d}_"
+                        f"cd{cooldown:03d}_s{stop_limit}"
+                    ),
+                    max_stops_per_route=stop_limit,
+                    policy_config=risk_band_policy(
+                        protection_horizon_hours=horizon,
+                        minimum_stock_ratio=ratio,
+                        uncertainty_z=0.0,
+                        max_pickup_stock_fraction=fraction,
+                        pickup_cooldown_minutes=cooldown,
+                    ),
+                    quantile_policy=QuantileQuantityPolicy(
+                        horizon_hours=horizon,
+                        minimum_bikes=bikes,
+                        minimum_empty_docks=docks,
+                    ),
+                )
+            )
     result = tuple(variants)
     if len(result) > 64:
         raise ValueError(
@@ -107,6 +144,19 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=[0],
     )
     parser.add_argument("--include-legacy", action="store_true")
+    parser.add_argument("--include-quantile", action="store_true")
+    parser.add_argument(
+        "--quantile-minimum-bikes",
+        nargs="+",
+        type=int,
+        default=[1],
+    )
+    parser.add_argument(
+        "--quantile-minimum-empty-docks",
+        nargs="+",
+        type=int,
+        default=[1],
+    )
     parser.add_argument(
         "--bootstrap-dir",
         type=Path,
@@ -171,6 +221,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         pickup_cooldown_minutes=tuple(dict.fromkeys(args.pickup_cooldown_minutes)),
         max_stops=tuple(dict.fromkeys(args.max_stops)),
         include_legacy=args.include_legacy,
+        include_quantile=args.include_quantile,
+        quantile_minimum_bikes=tuple(dict.fromkeys(args.quantile_minimum_bikes)),
+        quantile_minimum_empty_docks=tuple(
+            dict.fromkeys(args.quantile_minimum_empty_docks)
+        ),
     )
     print(f"정책 후보 {len(variants)}개", flush=True)
     documents = []

@@ -4,7 +4,12 @@ from datetime import UTC, date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from evaluation.backtest_contract import EvaluationContract
-from evaluation.historical_inputs import HistoricalStation, PredictionAudit
+from evaluation.historical_inputs import (
+    DemandForecastQuantiles,
+    HistoricalStation,
+    PointInTimeForecast,
+    PredictionAudit,
+)
 from evaluation.policy_simulator import simulate_no_rebalance, simulate_policy
 from evaluation.rebalance_backtest import RentalTrip
 from gold.demand import DemandForecastRecord
@@ -73,7 +78,21 @@ def _forecast(anchor, stock, successful):
         model_bundle_sha256="0" * 64,
         station_count=2,
     )
-    return tuple(rows), audit
+    quantiles = tuple(
+        DemandForecastQuantiles(
+            base_dttm=row.base_dttm,
+            sta_id=row.sta_id,
+            predicted_dttm=row.predicted_dttm,
+            rental_p10=float(row.predicted_rent_cnt),
+            rental_p50=float(row.predicted_rent_cnt),
+            rental_p90=float(row.predicted_rent_cnt),
+            return_p10=float(row.predicted_rtn_cnt),
+            return_p50=float(row.predicted_rtn_cnt),
+            return_p90=float(row.predicted_rtn_cnt),
+        )
+        for row in rows
+    )
+    return PointInTimeForecast(tuple(rows), quantiles, audit)
 
 
 def test_no_rebalance_removes_return_of_failed_rental() -> None:

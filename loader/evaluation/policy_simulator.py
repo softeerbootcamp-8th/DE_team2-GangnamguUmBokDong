@@ -10,7 +10,6 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from gold.demand import DemandForecastRecord
 from gold.rebalance_policy import (
     LEGACY_REBALANCE_POLICY,
     RebalancePolicyConfig,
@@ -34,12 +33,13 @@ from gold.urgency import (
 )
 
 from .backtest_contract import EvaluationContract
-from .historical_inputs import HistoricalStation, PredictionAudit
+from .historical_inputs import HistoricalStation, PointInTimeForecast, PredictionAudit
+from .quantile_policy import QuantileQuantityPolicy, quantile_bike_quantities
 from .rebalance_backtest import RentalTrip
 
 ForecastProvider = Callable[
     [datetime, Mapping[int, int], Sequence[RentalTrip]],
-    tuple[tuple[DemandForecastRecord, ...], PredictionAudit],
+    PointInTimeForecast,
 ]
 SEOUL = ZoneInfo("Asia/Seoul")
 
@@ -171,12 +171,18 @@ def simulate_policy(
     max_stops_per_route: int,
     movement_budget: int | None,
     policy_config: RebalancePolicyConfig = LEGACY_REBALANCE_POLICY,
+    quantile_policy: QuantileQuantityPolicy | None = None,
 ) -> SimulationMetrics:
     """동일 수요에서 5분 재계획·진행 작업 coverage·트럭 복귀를 재생한다."""
     if contract.approval_delay_minutes != 0:
         raise ValueError("현재 검증 시나리오는 자동 승인 지연 0분만 지원합니다.")
     if type(policy_config) is not RebalancePolicyConfig:
         raise ValueError("policy_config는 RebalancePolicyConfig여야 합니다.")
+    if (
+        quantile_policy is not None
+        and type(quantile_policy) is not QuantileQuantityPolicy
+    ):
+        raise ValueError("quantile_policy 타입이 잘못됐습니다.")
     start = datetime.combine(
         contract.target_date,
         datetime.min.time(),
@@ -337,11 +343,13 @@ def simulate_policy(
         stock_history[occurred_at] = dict(stock)
         if forecast_provider is None:
             continue
-        records, prediction_audit = forecast_provider(
+        forecast = forecast_provider(
             occurred_at,
             stock,
             successful_trips,
         )
+        records = forecast.demand
+        prediction_audit = forecast.audit
         base_utc = occurred_at.astimezone(UTC)
         supported_ids = tuple(
             sorted(
@@ -389,6 +397,26 @@ def simulate_policy(
             ),
             policy_config=policy_config,
         )
+        quantile_quantities = (
+            None
+            if quantile_policy is None
+            else quantile_bike_quantities(
+                urgency=urgency.records,
+                current_stock={
+                    station.station_id: stock[station.station_no]
+                    for station in selected.values()
+                    if station.station_id in supported_ids
+                },
+                capacities={
+                    station.station_id: station.capacity
+                    for station in selected.values()
+                    if station.station_id in supported_ids
+                },
+                forecasts=forecast.quantiles,
+                policy=quantile_policy,
+                max_pickup_stock_fraction=policy_config.max_pickup_stock_fraction,
+            )
+        )
         active_routes = tuple(
             ExistingRoute(
                 route_id=job.route_id,
@@ -422,7 +450,11 @@ def simulate_policy(
                     sta_id=row.sta_id,
                     urgency_score=row.urgency_score,
                     action_type=row.rebalance_need_type_cd,
-                    bike_qty=row.bike_qty,
+                    bike_qty=(
+                        row.bike_qty
+                        if quantile_quantities is None
+                        else quantile_quantities[row.sta_id]
+                    ),
                 )
                 for row in urgency.records
             ),
@@ -463,6 +495,7 @@ def simulate_policy(
                 service_minutes=contract.service_minutes_per_stop,
                 transfer_limit=remaining_budget,
                 policy_config=policy_config,
+                quantile_policy=quantile_policy,
             )
             if job is None:
                 continue
@@ -545,7 +578,14 @@ def simulate_policy(
     )
     return SimulationMetrics(
         policy=policy,
-        policy_configuration=policy_config.audit_document(),
+        policy_configuration=(
+            policy_config.audit_document()
+            if quantile_policy is None
+            else {
+                **policy_config.audit_document(),
+                "quantity_override": quantile_policy.audit_document(),
+            }
+        ),
         window_start=start.isoformat(),
         window_end=end.isoformat(),
         observed_requests=observed_requests,
@@ -607,6 +647,7 @@ def _schedule_job(
     service_minutes: float,
     transfer_limit: int | None,
     policy_config: RebalancePolicyConfig,
+    quantile_policy: QuantileQuantityPolicy | None,
 ) -> ActiveJob | None:
     """planner 경로를 예산에 맞춰 완결 수량으로 자르고 센터 복귀까지 예약한다."""
     by_id = {station.station_id: station for station in stations.values()}
@@ -660,7 +701,18 @@ def _schedule_job(
                 action=stop.route_action_type_cd,
                 planned_quantity=quantity,
                 minimum_station_stock=(
-                    math.ceil(station.capacity * policy_config.execution_reserve_ratio)
+                    (
+                        max(
+                            quantile_policy.minimum_bikes,
+                            math.ceil(
+                                station.capacity * policy_config.execution_reserve_ratio
+                            ),
+                        )
+                        if quantile_policy is not None
+                        else math.ceil(
+                            station.capacity * policy_config.execution_reserve_ratio
+                        )
+                    )
                     if stop.route_action_type_cd == "pickup"
                     else 0
                 ),

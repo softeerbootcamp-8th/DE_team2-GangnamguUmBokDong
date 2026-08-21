@@ -85,6 +85,60 @@ class PredictionAudit:
     station_count: int
 
 
+@dataclass(frozen=True, slots=True)
+class DemandForecastQuantiles:
+    """한 대여소·horizon의 대여·반납 q10·q50·q90 예측을 표현한다."""
+
+    base_dttm: datetime
+    sta_id: str
+    predicted_dttm: datetime
+    rental_p10: float
+    rental_p50: float
+    rental_p90: float
+    return_p10: float
+    return_p50: float
+    return_p90: float
+
+    def __post_init__(self) -> None:
+        """시각·식별자·비음수 quantile 순서를 검증한다."""
+        if self.base_dttm.tzinfo is None or self.predicted_dttm.tzinfo is None:
+            raise ValueError("quantile forecast 시각은 timezone-aware여야 합니다.")
+        if not self.sta_id:
+            raise ValueError("quantile forecast sta_id는 nonblank여야 합니다.")
+        for values, name in (
+            (
+                (self.rental_p10, self.rental_p50, self.rental_p90),
+                "rental",
+            ),
+            (
+                (self.return_p10, self.return_p50, self.return_p90),
+                "return",
+            ),
+        ):
+            if any(not math.isfinite(value) or value < 0 for value in values):
+                raise ValueError(f"{name} quantile은 finite nonnegative여야 합니다.")
+            if values != tuple(sorted(values)):
+                raise ValueError(f"{name} quantile은 q10 <= q50 <= q90이어야 합니다.")
+
+
+@dataclass(frozen=True, slots=True)
+class PointInTimeForecast:
+    """Gold 평균 예측과 정책 실험용 quantile, 입력 감사를 함께 보관한다."""
+
+    demand: tuple[DemandForecastRecord, ...]
+    quantiles: tuple[DemandForecastQuantiles, ...]
+    audit: PredictionAudit
+
+    def __post_init__(self) -> None:
+        """평균과 quantile의 대여소·예측시각 표면이 exact한지 검증한다."""
+        demand_keys = tuple((row.sta_id, row.predicted_dttm) for row in self.demand)
+        quantile_keys = tuple(
+            (row.sta_id, row.predicted_dttm) for row in self.quantiles
+        )
+        if demand_keys != quantile_keys:
+            raise ValueError("평균과 quantile forecast 표면이 다릅니다.")
+
+
 class PopulationNowcast:
     """대상일보다 앞선 자료만으로 만든 격자·시간별 생활인구 추정치를 제공한다."""
 
@@ -148,7 +202,9 @@ def load_station_master_from_s3(
         if item["Key"].endswith(".parquet") and item.get("Size", 0) > 0
     )
     if not keys:
-        raise FileNotFoundError(f"station master Parquet이 없습니다: s3://{bucket}/{prefix}")
+        raise FileNotFoundError(
+            f"station master Parquet이 없습니다: s3://{bucket}/{prefix}"
+        )
     frames = []
     for key in keys:
         payload = client.get_object(Bucket=bucket, Key=key)["Body"].read()
@@ -192,7 +248,9 @@ def read_weather_history(path: Path) -> tuple[WeatherObservation, ...]:
     with path.open("r", encoding="cp949", newline="") as stream:
         for row in csv.DictReader(stream):
             try:
-                observed_at = datetime.strptime(row["일시"], "%Y-%m-%d %H:%M")
+                observed_at = datetime.strptime(  # noqa: DTZ007
+                    row["일시"], "%Y-%m-%d %H:%M"
+                )
                 temperature = float(row["기온(°C)"])
                 raw_precipitation = row.get("강수량(mm)", "").strip()
                 precipitation = float(raw_precipitation) if raw_precipitation else 0.0
@@ -242,13 +300,12 @@ def build_population_nowcast(
             raise ValueError("생활인구 required hour 날짜가 target_dates와 다릅니다.")
         if any(
             not hours
-            or any(
-                type(hour) is not int or not 0 <= hour <= 23
-                for hour in hours
-            )
+            or any(type(hour) is not int or not 0 <= hour <= 23 for hour in hours)
             for hours in required_hours_by_date.values()
         ):
-            raise ValueError("생활인구 required hour는 날짜별 0..23의 nonempty 집합이어야 합니다.")
+            raise ValueError(
+                "생활인구 required hour는 날짜별 0..23의 nonempty 집합이어야 합니다."
+            )
     values: dict[tuple[date, int, str], float] = {}
     source_dates_by_target: dict[date, tuple[date, ...]] = {}
     cache: dict[date, dict[tuple[int, str], float]] = {}
@@ -281,7 +338,9 @@ def build_population_nowcast(
                 key = (hour, grid_id)
                 weighted = [
                     (frame.get(key), weight)
-                    for frame, weight in zip(candidate_values, POPULATION_WEIGHTS, strict=True)
+                    for frame, weight in zip(
+                        candidate_values, POPULATION_WEIGHTS, strict=True
+                    )
                     if frame.get(key) is not None
                 ]
                 if weighted:
@@ -361,7 +420,7 @@ def predict_point_in_time(
     weather_cutoff: datetime,
     population: PopulationNowcast,
     model: ModelBundle,
-) -> tuple[tuple[DemandForecastRecord, ...], PredictionAudit]:
+) -> PointInTimeForecast:
     """동일 anchor lag와 point-in-time 외생변수로 실제 고정 모델을 채점한다."""
     if anchor.tzinfo is None:
         raise ValueError("anchor는 timezone-aware여야 합니다.")
@@ -415,39 +474,60 @@ def predict_point_in_time(
     frame = pd.DataFrame(rows)
     rental_frame = frame.astype(RENTAL_FEATURE_COLUMN_DTYPES)
     return_frame = frame.astype(RETURN_FEATURE_COLUMN_DTYPES)
-    with use_pinned_scoring_models(
-        {"rental": model.rental, "return": model.returned}
-    ):
+    with use_pinned_scoring_models({"rental": model.rental, "return": model.returned}):
         rental_prediction = predict(
             rental_frame,
             "rental",
             exposure_col="rental_exposure",
-        )["pred_mean"].to_numpy()
-        return_prediction = predict(return_frame, "return")["pred_mean"].to_numpy()
+        )
+        return_prediction = predict(return_frame, "return")
     base_utc = anchor.astimezone(UTC)
     records = []
-    for row, rental_mean, return_mean in zip(
+    quantiles = []
+    for row, rental_result, return_result in zip(
         rows,
-        rental_prediction,
-        return_prediction,
+        rental_prediction.to_dict("records"),
+        return_prediction.to_dict("records"),
         strict=True,
     ):
         horizon = int(row["horizon"])
+        predicted_dttm = base_utc + timedelta(hours=horizon)
         records.append(
             DemandForecastRecord(
                 base_dttm=base_utc,
                 sta_id=str(row["station_id"]),
-                predicted_dttm=base_utc + timedelta(hours=horizon),
-                predicted_rent_cnt=round(float(rental_mean)),
-                predicted_rtn_cnt=round(float(return_mean)),
+                predicted_dttm=predicted_dttm,
+                predicted_rent_cnt=round(float(rental_result["pred_mean"])),
+                predicted_rtn_cnt=round(float(return_result["pred_mean"])),
             )
         )
-    records.sort(key=lambda row: (row.sta_id.encode("utf-8"), row.predicted_dttm))
+        quantiles.append(
+            DemandForecastQuantiles(
+                base_dttm=base_utc,
+                sta_id=str(row["station_id"]),
+                predicted_dttm=predicted_dttm,
+                rental_p10=float(rental_result["pred_p10"]),
+                rental_p50=float(rental_result["pred_p50"]),
+                rental_p90=float(rental_result["pred_p90"]),
+                return_p10=float(return_result["pred_p10"]),
+                return_p50=float(return_result["pred_p50"]),
+                return_p90=float(return_result["pred_p90"]),
+            )
+        )
+    combined = sorted(
+        zip(records, quantiles, strict=True),
+        key=lambda pair: (pair[0].sta_id.encode("utf-8"), pair[0].predicted_dttm),
+    )
+    records = [pair[0] for pair in combined]
+    quantiles = [pair[1] for pair in combined]
     population_dates = tuple(
         sorted(
             {
                 day.isoformat()
-                for target_date in {anchor.date(), (anchor + timedelta(hours=11)).date()}
+                for target_date in {
+                    anchor.date(),
+                    (anchor + timedelta(hours=11)).date(),
+                }
                 for day in population.source_dates(target_date)
             }
         )
@@ -465,7 +545,7 @@ def predict_point_in_time(
         model_bundle_sha256=model.bundle_sha256,
         station_count=len(supported),
     )
-    return tuple(records), audit
+    return PointInTimeForecast(tuple(records), tuple(quantiles), audit)
 
 
 def _lag_counts(
@@ -479,13 +559,12 @@ def _lag_counts(
     rental: dict[int, int] = {}
     returned: dict[int, int] = {}
     for trip in successful_trips:
-        if (
-            rental_start <= trip.rented_at < rental_end
-            and trip.returned_at <= anchor
-        ):
+        if rental_start <= trip.rented_at < rental_end and trip.returned_at <= anchor:
             rental[trip.rent_station_no] = rental.get(trip.rent_station_no, 0) + 1
         if return_start <= trip.returned_at < anchor:
-            returned[trip.return_station_no] = returned.get(trip.return_station_no, 0) + 1
+            returned[trip.return_station_no] = (
+                returned.get(trip.return_station_no, 0) + 1
+            )
     return rental, returned
 
 

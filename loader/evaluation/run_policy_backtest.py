@@ -12,7 +12,6 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from gold.demand import DemandForecastRecord
 from gold.rebalance_policy import LEGACY_REBALANCE_POLICY, RebalancePolicyConfig
 from gold.rebalance_route import DispatchCenterTopology
 
@@ -25,7 +24,7 @@ from .historical_inputs import (
     HORIZON_COUNT,
     HistoricalStation,
     ModelBundle,
-    PredictionAudit,
+    PointInTimeForecast,
     build_population_nowcast,
     latest_published_weather,
     load_model_bundle,
@@ -40,6 +39,7 @@ from .legacy_baseline import (
     replay_legacy_timing,
 )
 from .policy_simulator import SimulationMetrics, simulate_no_rebalance, simulate_policy
+from .quantile_policy import QuantileQuantityPolicy
 from .rebalance_backtest import (
     RentalTrip,
     StockObservation,
@@ -89,6 +89,7 @@ class PolicyVariant:
     name: str
     max_stops_per_route: int
     policy_config: RebalancePolicyConfig
+    quantile_policy: QuantileQuantityPolicy | None = None
 
     def __post_init__(self) -> None:
         """정책 이름·대여소 상한·설정 타입을 검증한다."""
@@ -101,6 +102,11 @@ class PolicyVariant:
             raise ValueError("policy variant max stops는 2..32767이어야 합니다.")
         if type(self.policy_config) is not RebalancePolicyConfig:
             raise ValueError("policy variant config 타입이 잘못됐습니다.")
+        if (
+            self.quantile_policy is not None
+            and type(self.quantile_policy) is not QuantileQuantityPolicy
+        ):
+            raise ValueError("policy variant quantile config 타입이 잘못됐습니다.")
 
 
 @dataclass(frozen=True, slots=True)
@@ -296,7 +302,7 @@ def run_policy_backtest(
         anchor: datetime,
         stock: Mapping[int, int],
         successful_trips: Sequence[RentalTrip],
-    ) -> tuple[tuple[DemandForecastRecord, ...], PredictionAudit]:
+    ) -> PointInTimeForecast:
         """한 tick의 게시 가능 날씨와 나우캐스트 인구로 모델을 실행한다."""
         contract = contracts[0]
         cutoff = anchor - timedelta(minutes=contract.weather_publication_lag_minutes)
@@ -360,6 +366,7 @@ def run_policy_backtest(
                 max_stops_per_route=variant.max_stops_per_route,
                 movement_budget=legacy.balanced_movement_budget,
                 policy_config=variant.policy_config,
+                quantile_policy=variant.quantile_policy,
             )
             for variant in variants
         )

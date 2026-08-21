@@ -13,6 +13,7 @@ def test_policy_search_grid_is_deterministic_and_named_by_parameters() -> None:
         pickup_cooldown_minutes=(0,),
         max_stops=(5,),
         include_legacy=True,
+        include_quantile=True,
     )
     assert tuple(variant.name for variant in variants) == (
         "legacy_s5",
@@ -20,7 +21,10 @@ def test_policy_search_grid_is_deterministic_and_named_by_parameters() -> None:
         "risk_h2_r20_z1282_f100_cd000_s5",
         "risk_h3_r20_z0000_f100_cd000_s5",
         "risk_h3_r20_z1282_f100_cd000_s5",
+        "quantile_guard_h2_r20_b01_d01_f100_cd000_s5",
+        "quantile_guard_h3_r20_b01_d01_f100_cd000_s5",
     )
     assert all(
         variant.policy_config.exclusive_pickup_station for variant in variants[1:]
     )
+    assert variants[-1].quantile_policy is not None
