@@ -432,10 +432,14 @@ route publication은 현재 station·demand·stock tuple과 urgency input의 동
 
 publisher staging은 manifest의 차량 초기 적재량 0과 `TRUCK_CAPACITY` config version을
 사용한다. visit 순 pickup은 더하고 dropoff는 빼며 running load가 매 단계 `0..capacity`여야
-한다. 마지막 양수 잔량은 허용한다. route coverage는 dispatched 전부와 urgency stock
-anchor 이후 완료되어 아직 후속 stock에 반영되지 않은 completed route 및 정렬 stop을
-포함한다. route/stop DML은 BEFORE STATEMENT에서 topology shared→route lock을 잡고,
-dispatch 전이는 활성 센터와 active/same-center stop을 다시 검증한다.
+한다. DB는 과거 경로 호환을 위해 stop 1개 이상과 마지막 양수 잔량을 허용하지만,
+`route-v2`가 새로 만드는 proposed 작업은 pickup·dropoff를 모두 포함한 2~8개 대여소이며
+두 action의 합계가 같아 마지막 적재량이 0이다. 활성 센터별 proposed 작업은 최대 3개다.
+짝이 맞지 않거나 제한 밖인 수요는 버리지 않고 다음 batch 후보로 남긴다. route coverage는
+dispatched 전부와 urgency stock anchor 이후 완료되어 아직 후속 stock에 반영되지 않은
+completed route 및 정렬 stop을 포함한다. route/stop DML은 BEFORE STATEMENT에서 topology
+shared→route lock을 잡고, dispatch 전이는 활성 센터와 active/same-center stop을 다시
+검증한다.
 
 ## 보존·publication 요약
 

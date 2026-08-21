@@ -592,8 +592,11 @@ _REGISTRY = {
             _role("urgency_publication_manifest"),
         ),
         parameter_names=(
+            "max_routes_per_center",
+            "max_stops_per_route",
             "route_algorithm_version",
             "route_coverage_sha256",
+            "route_work_unit_config_version",
             "truck_capacity",
             "truck_capacity_config_version",
         ),

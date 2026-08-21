@@ -540,36 +540,40 @@ route producer는 urgency parquet의 `bike_qty`, Gold `station.dispatch_center_i
 입력 재고에 반영되지 않은 route stop의 netting 수량을 읽는다. coverage는 모든
 `dispatched`와 `completed_dttm > urgency가 사용한 stock anchor`인 completed route다.
 completion 이후의 stock snapshot이 확인되면 그 completed route는 coverage에서 빠진다.
-현 코드는 dispatched만 제외하므로([routes.py](../../rebalance/routes.py#L47-L84]) 이를
-고쳐야 한다. 목표 전환에서는
-`core.regions.nearest_region` 대신 station FK를 사용한다.
+센터 배정은 `core.regions.nearest_region` 같은 좌표 재계산이 아니라 station FK를 사용한다.
 urgency 판단의 `retrieval_needed`는 차량 `pickup`, `supply_needed`는 `dropoff`로만
 변환한다. `normal` 또는 `bike_qty<=0` 행은 route 후보에서 제외한다.
 
 한 계산 batch의 헤더와 stop은 하나의 aggregate다.
 
-1. route·stop 두 산출물의 route ID 집합, stop 최소 1개, 연속 `visit_no`, active station,
-   header와 같은 station center, action, 양수 수량을 staging에서 검증한다.
+1. route·stop 두 산출물의 route ID 집합, 연속 `visit_no`, active station, header와 같은
+   station center, action, 양수 수량을 staging에서 검증한다.
 2. 차량 초기 적재량은 0이다. visit 순서대로 pickup은 더하고 dropoff는 빼며 매 단계
-   running load가 `0..TRUCK_CAPACITY`인지 검증한다. 마지막 양수 잔량은 다음 cycle용으로
-   허용한다. 현 producer의 `capacity - picked` dropoff 한도는 음수 적재 경로를 만들 수
-   있으므로 `dropoff 합계 <= picked 합계`로 수정한다.
+   running load가 `0..TRUCK_CAPACITY`인지 검증한다. `route-v2`가 생성하는 proposed 작업은
+   pickup과 dropoff를 각각 하나 이상 포함하고 합계가 정확히 같아 마지막 적재량이 0이다.
+   작업당 대여소는 2~8개, 활성 센터별 proposed 작업은 최대 3개다. 짝이 맞지 않거나 제한
+   밖인 수요는 작업으로 만들지 않고 다음 batch 후보로 남긴다.
+   8개 상한은 대시보드와 같은 직선거리×1.25·도심 18km/h·정차 4분·자전거 1대당 30초
+   산식으로 후보를 비교해, 평균 120분과 배치별 p90 150분 이내에서 처리량을 가장 크게
+   유지하는 값으로 정한다. 변경할 때는 동일 산식으로 재실험하고 fingerprint parameter를
+   함께 갱신한다.
 3. 한 transaction에서 기존 `proposed` route만 삭제하고 cascade로 stop을 지운다.
 4. 새 헤더와 모든 stop을 함께 삽입한다. 빈 batch도 유효하며 기존 proposed를 비운다.
 5. `dispatched`, `completed` 이력은 publisher가 수정·삭제하지 않는다.
 6. API 상태 전이는 `proposed→dispatched→completed`와 일시를 지킨다.
 
-현재 producer도 헤더와 stop을 별도 S3 객체로 쓴다
-([routes_main.py](../../rebalance/routes_main.py#L29-L45)). RDS loader는 두 객체를 읽더라도
-반드시 [publication-contract-v1.md](publication-contract-v1.md)의 두 output artifact와
-station/demand/stock/urgency dependency, route coverage, truck capacity parameter를 가진 성공 manifest
-하나로 묶는다. route ID는 같은
+producer는 헤더와 stop을 별도 S3 객체로 쓰되
+[publication-contract-v1.md](publication-contract-v1.md)의 두 output artifact와
+station/demand/stock/urgency dependency, route coverage, truck capacity·작업 단위 parameter를
+가진 성공 manifest 하나로 묶는다. route ID는 같은
 logical/revision·정렬 센터·route ordinal의 UUIDv5다. namespace는
 `d0d59897-9e72-541f-bb05-bd3d113c2639`로 고정한다. UUID name은 `publication_key`, UTC
 logical time, integer revision, `dispatch_center_id`, 1-based `route_ordinal`을 위 공통
-규칙으로 직렬화한 JSON bytes다. center는 ID 오름차순, pickup/dropoff 후보는 각각
-`(urgency_score DESC, sta_id ASC)`, 최근접 선택은 `(distance, sta_id ASC)`로 동률을 깨고
-그 결과의 생성 순서로 center 내 ordinal을 부여한다. publisher는 topology shared→route
+규칙으로 직렬화한 JSON bytes다. center는 ID 오름차순이며 최고 긴급 pickup을 작업 anchor로
+고정한다. 추가 후보는 `(urgency_score + 1) / (anchor 거리 km + 1)` 내림차순으로 묶고,
+pickup은 센터에서 시작한 최근접 순서, dropoff는 마지막 pickup 위치에서 이어지는 최근접
+순서로 정렬한다. 모든 동률은 urgency·distance·station ID로 결정적으로 해소하고 생성
+순서로 center 내 ordinal을 부여한다. publisher는 topology shared→route
 operation lock 안에서 publication dependency와 coverage를 재계산하고 다르면
 reject/recompute한다.
 route가 직접 고정한 station·demand·stock state와 urgency publication input의 동명

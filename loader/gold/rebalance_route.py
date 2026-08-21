@@ -59,10 +59,13 @@ from .state import (
     read_state_manifest,
 )
 
-ROUTE_ALGORITHM_VERSION = "route-v1"
+ROUTE_ALGORITHM_VERSION = "route-v2"
 TRUCK_CAPACITY = 20
 TRUCK_CAPACITY_CONFIG_VERSION = "truck-capacity-v1"
 INITIAL_TRUCK_LOAD = 0
+MAX_STOPS_PER_ROUTE = 8
+MAX_ROUTES_PER_CENTER = 3
+ROUTE_WORK_UNIT_CONFIG_VERSION = "route-work-unit-v1"
 ROUTE_PUBLISHER_VERSION = "gold-route-publisher-v1"
 _MAX_DATABASE_REVISION = 2_147_483_647
 
@@ -140,7 +143,7 @@ class StationRouteTopology:
 
 @dataclass(frozen=True, slots=True)
 class RouteUrgencyInput:
-    """urgency artifact에서 route-v1이 소비하는 최소 typed 필드를 표현한다."""
+    """urgency artifact에서 route-v2가 소비하는 최소 typed 필드를 표현한다."""
 
     sta_id: str
     urgency_score: float
@@ -514,7 +517,7 @@ def plan_rebalance_routes(
     urgency: tuple[RouteUrgencyInput, ...],
     route_coverage: RouteCoverageDocument,
 ) -> RebalanceRoutePlan:
-    """route-v1 정렬·coverage·용량 계약으로 proposed aggregate를 계산한다.
+    """route-v2 완결 작업·coverage·용량 계약으로 proposed aggregate를 계산한다.
 
     ``normal``과 ``bike_qty<=0`` 행은 route 후보가 아니므로 이 순수 planner는
     topology 존재를 요구하지 않는다. urgency 기대 집합의 완전성은 publication
@@ -552,10 +555,48 @@ def plan_rebalance_routes(
             candidate for candidate in candidates if candidate.action == "dropoff"
         ]
         ordinal = 1
-        while pickups:
-            selected_pickups, pickups = _take_by_priority(pickups, TRUCK_CAPACITY)
+        while (
+            pickups
+            and dropoffs
+            and ordinal <= MAX_ROUTES_PER_CENTER
+        ):
+            anchor_candidate = pickups[0]
+            route_pickups = _rank_for_route(
+                pickups,
+                anchor=anchor_candidate,
+                keep_anchor_first=True,
+            )
+            route_dropoffs = _rank_for_route(
+                dropoffs,
+                anchor=anchor_candidate,
+            )
+            split = _choose_balanced_stop_split(route_pickups, route_dropoffs)
+            if split is None:
+                break
+            pickup_stop_limit, dropoff_stop_limit, transfer_qty = split
+            selected_pickups, pickup_remainder = _take_by_priority(
+                route_pickups,
+                transfer_qty,
+                stop_limit=pickup_stop_limit,
+            )
+            selected_dropoffs, dropoff_remainder = _take_by_priority(
+                route_dropoffs,
+                transfer_qty,
+                stop_limit=dropoff_stop_limit,
+            )
+            pickups = sorted(pickup_remainder, key=_candidate_priority)
+            dropoffs = sorted(dropoff_remainder, key=_candidate_priority)
             picked_qty = sum(stop.bike_cnt for stop in selected_pickups)
-            selected_dropoffs, dropoffs = _take_by_priority(dropoffs, picked_qty)
+            dropped_qty = sum(stop.bike_cnt for stop in selected_dropoffs)
+            if (
+                picked_qty != transfer_qty
+                or dropped_qty != transfer_qty
+                or len(selected_pickups) + len(selected_dropoffs)
+                > MAX_STOPS_PER_ROUTE
+            ):
+                raise ContractViolation(
+                    "route-v2 작업 단위 선택이 완결 수량·stop 제한을 위반했습니다."
+                )
             route_id = str(route_uuid_v5(center_id, logical, revision_no, ordinal))
             routes.append(
                 RebalanceRoute(
@@ -741,6 +782,12 @@ def publish_rebalance_route(
             Parameter(
                 "truck_capacity_config_version",
                 TRUCK_CAPACITY_CONFIG_VERSION,
+            ),
+            Parameter("max_stops_per_route", str(MAX_STOPS_PER_ROUTE)),
+            Parameter("max_routes_per_center", str(MAX_ROUTES_PER_CENTER)),
+            Parameter(
+                "route_work_unit_config_version",
+                ROUTE_WORK_UNIT_CONFIG_VERSION,
             ),
         ),
     )
@@ -985,7 +1032,7 @@ def _plan_from_snapshots(
     database_snapshot: RouteDatabaseSnapshot,
     urgency_snapshot: RouteUrgencySnapshot,
 ) -> RebalanceRoutePlan:
-    """Typed urgency와 DB snapshot을 pure route-v1 planner 입력으로 바꾼다."""
+    """Typed urgency와 DB snapshot을 pure route-v2 planner 입력으로 바꾼다."""
     return plan_rebalance_routes(
         logical_dttm=logical_dttm,
         revision_no=revision_no,
@@ -1615,20 +1662,62 @@ def _candidate_priority(candidate: _Candidate) -> tuple[float, bytes]:
     return (-candidate.urgency_score, _utf8_key(candidate.sta_id))
 
 
+def _rank_for_route(
+    candidates: list[_Candidate],
+    *,
+    anchor: _Candidate,
+    keep_anchor_first: bool = False,
+) -> list[_Candidate]:
+    """최고 긴급 pickup 주변의 처리효율 순으로 한 작업 후보를 정렬한다.
+
+    첫 pickup은 전체 긴급도 순서를 유지한다. 추가 stop은 긴급도가 높고 anchor에
+    가까울수록 앞서는 (urgency + 1) / (distance + 1) 점수를 사용한다.
+    """
+
+    def route_score(candidate: _Candidate) -> tuple[float, float, float, bytes]:
+        """후보의 긴급도·거리 결합 정렬 key를 반환한다."""
+        distance = _haversine_km(
+            anchor.longitude,
+            anchor.latitude,
+            candidate.longitude,
+            candidate.latitude,
+        )
+        efficiency = (candidate.urgency_score + 1.0) / (distance + 1.0)
+        return (
+            -efficiency,
+            -candidate.urgency_score,
+            distance,
+            _utf8_key(candidate.sta_id),
+        )
+
+    ranked = sorted(candidates, key=route_score)
+    if not keep_anchor_first:
+        return ranked
+    return [anchor, *(candidate for candidate in ranked if candidate != anchor)]
+
+
 def _take_by_priority(
     candidates: list[_Candidate],
     limit: int,
+    *,
+    stop_limit: int | None = None,
 ) -> tuple[tuple[_SelectedStop, ...], list[_Candidate]]:
     """후보 우선순위를 보존하며 양수 limit까지 수량을 배정한다."""
     if type(limit) is not int or limit < 0:
         raise ContractViolation("route selection limit은 0 이상 integer여야 합니다.")
+    if stop_limit is not None and (
+        type(stop_limit) is not int or stop_limit < 0
+    ):
+        raise ContractViolation("route stop limit은 0 이상 integer여야 합니다.")
     if limit == 0 or not candidates:
         return (), list(candidates)
     selected: list[_SelectedStop] = []
     remaining: list[_Candidate] = []
     available = limit
     for candidate in candidates:
-        if available == 0:
+        if available == 0 or (
+            stop_limit is not None and len(selected) >= stop_limit
+        ):
             remaining.append(candidate)
             continue
         quantity = min(candidate.remaining_qty, available)
@@ -1648,15 +1737,63 @@ def _take_by_priority(
     return tuple(selected), remaining
 
 
+def _choose_balanced_stop_split(
+    pickups: list[_Candidate],
+    dropoffs: list[_Candidate],
+) -> tuple[int, int, int] | None:
+    """최대 8개 대여소로 가장 많은 수량을 완결할 stop 배분을 고른다.
+
+    pickup과 dropoff에 각각 한 자리를 보장하고, 처리 가능 수량이 같으면 더 적은
+    대여소와 더 높은 긴급도 합을 우선한다. 후보 목록은 이미 경로 효율 순으로
+    정렬되어 있으므로 각 action의 앞쪽 N개만 비교해도 결정적이다.
+    """
+    if not pickups or not dropoffs:
+        return None
+    best: tuple[tuple[int, int, float, int, int], tuple[int, int, int]] | None = None
+    max_pickup_stops = min(len(pickups), MAX_STOPS_PER_ROUTE - 1)
+    for pickup_stop_limit in range(1, max_pickup_stops + 1):
+        max_dropoff_stops = min(
+            len(dropoffs),
+            MAX_STOPS_PER_ROUTE - pickup_stop_limit,
+        )
+        pickup_candidates = pickups[:pickup_stop_limit]
+        pickup_capacity = sum(item.remaining_qty for item in pickup_candidates)
+        for dropoff_stop_limit in range(1, max_dropoff_stops + 1):
+            dropoff_candidates = dropoffs[:dropoff_stop_limit]
+            transfer_qty = min(
+                TRUCK_CAPACITY,
+                pickup_capacity,
+                sum(item.remaining_qty for item in dropoff_candidates),
+            )
+            if transfer_qty <= 0:
+                continue
+            stop_count = pickup_stop_limit + dropoff_stop_limit
+            urgency_sum = sum(
+                item.urgency_score
+                for item in (*pickup_candidates, *dropoff_candidates)
+            )
+            key = (
+                transfer_qty,
+                -stop_count,
+                urgency_sum,
+                -pickup_stop_limit,
+                -dropoff_stop_limit,
+            )
+            value = (pickup_stop_limit, dropoff_stop_limit, transfer_qty)
+            if best is None or key > best[0]:
+                best = (key, value)
+    return None if best is None else best[1]
+
+
 def _nearest_stops(
     pickups: tuple[_SelectedStop, ...],
     dropoffs: tuple[_SelectedStop, ...],
     *,
     start: tuple[float, float],
 ) -> tuple[_SelectedStop, ...]:
-    """센터 기준으로 pickup과 dropoff를 각각 최근접 순서로 만든다."""
-    pickup_order, _ = _nearest_order(pickups, start=start)
-    dropoff_order, _ = _nearest_order(dropoffs, start=start)
+    """센터부터 pickup을 거쳐 dropoff까지 이어지는 최근접 순서를 만든다."""
+    pickup_order, pickup_end = _nearest_order(pickups, start=start)
+    dropoff_order, _ = _nearest_order(dropoffs, start=pickup_end)
     return pickup_order + dropoff_order
 
 

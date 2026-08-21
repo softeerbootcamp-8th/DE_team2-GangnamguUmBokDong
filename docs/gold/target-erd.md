@@ -444,7 +444,10 @@ cascade된다.
 2. 각 route에 stop이 하나 이상 있고 `visit_no`가 중복 없이 1..N으로 이어지는지
    검증한다.
 3. 차량 초기 적재량은 0이다. visit 순서대로 pickup은 더하고 dropoff는 빼며 모든 중간
-   적재량이 manifest의 `0..TRUCK_CAPACITY`인지 검증한다. 마지막 양수 잔량은 허용한다.
+   적재량이 manifest의 `0..TRUCK_CAPACITY`인지 검증한다. DB는 과거 경로 호환을 위해
+   마지막 양수 잔량을 허용한다. 다만 `route-v2`의 새 proposed 작업은 pickup·dropoff 합계가
+   같아 마지막 적재량이 0이며, pickup·dropoff를 모두 포함한 2~8개 대여소로 제한한다.
+   활성 센터별 proposed 작업은 최대 3개이고 제한 밖 수요는 다음 batch 후보로 남긴다.
 4. 한 transaction에서 기존 `proposed` route만 삭제하고 새 헤더를 모두
    `proposed`로 삽입한 뒤 모든 stop을 삽입한다.
 5. 지연 constraint trigger가 commit 시 각 route의 1..N stop을 다시 검사한다. 실패하면
@@ -456,8 +459,8 @@ urgency `retrieval_needed`는 차량 `pickup`, `supply_needed`는 `dropoff`로�
 `normal`과 `bike_qty<=0`은 route 후보에서 제외한다.
 
 header·stop 객체는 두 URI·byte SHA-256·행 수, urgency artifact hash,
-truck capacity config version, topology dependency와 계산 시 읽은 route coverage를 가진 성공 manifest
-하나로 묶는다. route ID는 같은 logical time·revision·정렬된 센터·route ordinal에서
+truck capacity·작업 단위 config version, topology dependency와 계산 시 읽은 route coverage를
+가진 성공 manifest 하나로 묶는다. route ID는 같은 logical time·revision·정렬된 센터·route ordinal에서
 고정 namespace `d0d59897-9e72-541f-bb05-bd3d113c2639`의 UUIDv5로 결정한다. UUID name의
 canonical JSON bytes와 회귀 UUID는
 [publication-contract-v1.md](publication-contract-v1.md), center/candidate/distance 동률 정렬은
