@@ -360,3 +360,50 @@ def test_route_response_preserves_external_aliases(
     assert payload["proposed_at"] == "2026-08-20T01:00:00Z"
     assert payload["stops"][0]["visit_order"] == 1
     assert payload["stops"][0]["action"] == "pickup"
+
+
+def _unreachable_db(*_args, **_kwargs):
+    """DB 연결 실패를 흉내낸다."""
+    raise RuntimeError("database is down")
+
+
+def test_healthz_stays_ok_while_database_is_down(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """생존 신호는 DB를 조회하지 않는다.
+
+    조회하면 RDS 순단이 컨테이너 재시작 루프로 번진다.
+    """
+    monkeypatch.setattr(main, "fetch_one", _unreachable_db)
+
+    response = client.get("/healthz")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+
+
+def test_readyz_ok_when_database_reachable(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DB에 연결되면 준비 완료를 반환한다."""
+    monkeypatch.setattr(main, "fetch_one", lambda *_args, **_kwargs: {"ok": 1})
+
+    response = client.get("/readyz")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ready"}
+
+
+def test_readyz_503_when_database_unreachable(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DB에 연결할 수 없으면 503과 명시적 사유를 반환한다."""
+    monkeypatch.setattr(main, "fetch_one", _unreachable_db)
+
+    response = client.get("/readyz")
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "database_unavailable"

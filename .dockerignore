@@ -1,0 +1,57 @@
+# Docker 빌드 컨텍스트에서 제외할 것.
+#
+# compose의 build context가 저장소 루트(`context: ../..`)라서, 아무것도 걸러내지
+# 않으면 매 빌드가 20GB를 데몬으로 전송한다(data/ 15GB, .venv 합계 4.7GB).
+#
+# 실제로 컨텍스트에서 읽는 파일은 다음뿐이다:
+#   - Dockerfile.airflow : ops/compose/airflow-entrypoint.sh
+#   - Dockerfile.mlflow  : 없음 (pip install만)
+#   - Dockerfile.web     : apps/web 소스, ops/nginx/
+# 나머지 저장소 코드는 이미지에 굽지 않고 런타임에 /workspace로 bind mount한다.
+
+# --- 버전 관리 ---
+.git
+.github
+
+# --- 원천 데이터 (레포 루트 15GB+) ---
+data
+**/*.csv
+**/*.parquet
+**/*.db
+
+# --- 학습 산출물 — 운영은 S3에서 읽는다 ---
+models
+
+# --- 파이썬 가상환경·캐시 (합계 4.7GB) ---
+**/.venv
+**/__pycache__
+**/*.pyc
+**/*.egg-info
+**/.pytest_cache
+**/.ruff_cache
+
+# --- Node — Dockerfile.web이 npm ci로 새로 설치한다 ---
+**/node_modules
+apps/web/dist
+**/.vite
+
+# --- 인프라·시크릿 ---
+terraform
+.env
+.env.local
+
+# --- 문서·기타 ---
+docs
+**/*.md
+architecture.png
+**/.DS_Store
+.claude
+.superpowers
+dev
+
+# --- Airflow 런타임 산출물 ---
+airflow/logs
+airflow/airflow.cfg
+airflow/*.pid
+airflow/standalone_admin_password.txt
+**/*.log

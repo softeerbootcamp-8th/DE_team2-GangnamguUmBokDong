@@ -58,13 +58,23 @@ _DEFAULT_PROFILE = profile_contract.DEFAULT_PROFILE
 
 
 def _s3_client(timeout_seconds: float):
-    return boto3.client(
-        "s3",
-        endpoint_url=os.environ.get("S3_ENDPOINT_URL") or None,
-        aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID", "minioadmin"),
-        aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY", "minioadmin"),
-        config=BotoConfig(connect_timeout=timeout_seconds, read_timeout=timeout_seconds, retries={"max_attempts": 1}),
-    )
+    """프로필 조회용 S3 클라이언트를 만든다.
+
+    `core.s3._client()`와 같은 규칙으로 분기한다 — `S3_ENDPOINT_URL`이 있으면 MinIO로
+    보고 환경변수 자격증명을 명시하고, 없으면 실제 AWS S3로 보고 boto3 credential
+    chain에 맡긴다(자격증명을 명시하면 instance profile / EMR 실행 역할을 조회하지 않는다).
+    """
+    config = BotoConfig(connect_timeout=timeout_seconds, read_timeout=timeout_seconds, retries={"max_attempts": 1})
+    endpoint_url = os.environ.get("S3_ENDPOINT_URL") or None
+    if endpoint_url:
+        return boto3.client(
+            "s3",
+            endpoint_url=endpoint_url,
+            aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID", "minioadmin"),
+            aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY", "minioadmin"),
+            config=config,
+        )
+    return boto3.client("s3", config=config)
 
 
 def _fetch_profile_from_s3(name: str, timeout_seconds: float = 2.0) -> dict | None:

@@ -1,0 +1,169 @@
+# 운영(AWS EC2) 전용 Compose 구성.
+#
+# docker-compose.yml의 override가 아니라 **독립 파일**이다. Compose의 병합 규칙상
+# `depends_on`은 union으로 합쳐져 제거할 수 없어서, override 방식으로는 postgres·minio가
+# 딸려 올라온다. 독립 파일로 두면 로컬 개발 파일을 한 줄도 건드리지 않는다.
+#
+# 로컬과 달라지는 점:
+#   - postgres/postgres-schema-check  → RDS (외부)
+#   - minio/minio-init                → 실제 S3 (instance profile 인증)
+#   - web(Vite dev server)            → Dockerfile.web(정적 번들 + nginx)
+#
+# 실행:
+#   docker compose --env-file /opt/app/.env -f ops/compose/docker-compose.prod.yml up -d --build
+#
+# `--env-file`이 반드시 필요하다. 아래 `${VAR:?}` 보간은 셸/--env-file에서만 읽히고
+# 서비스의 `env_file:` 키에서는 읽히지 않는다(그건 컨테이너 런타임 주입 전용).
+
+name: gng-ubd-prod
+
+x-airflow-common: &airflow-common
+  build:
+    context: ../..
+    dockerfile: ops/compose/Dockerfile.airflow
+  env_file:
+    - ${PROD_ENV_FILE:-/opt/app/.env}
+  environment: &airflow-env
+    AIRFLOW_HOME: /workspace/airflow
+    PYTHONPATH: /workspace/airflow
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: ${AIRFLOW__DATABASE__SQL_ALCHEMY_CONN:?RDS airflow DB 연결 문자열이 필요합니다}
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-webserver:8080/execution/
+    AIRFLOW__CORE__AUTH_MANAGER: airflow.api_fastapi.auth.managers.simple.simple_auth_manager.SimpleAuthManager
+    AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_USERS: ${AIRFLOW_ADMIN_USER:-admin}:admin
+    # 로컬 compose에는 base64 리터럴이 하드코딩돼 있다. 운영은 반드시 주입받는다.
+    AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW_JWT_SECRET:?AIRFLOW_JWT_SECRET이 필요합니다}
+    AIRFLOW__API__BASE_URL: ${AIRFLOW_API_BASE_URL:-http://localhost:8080}
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    # 데이터와 모델이 준비되기 전에 파이프라인이 돌며 실패 로그만 쌓는 것을 막는다.
+    # 준비가 끝나면 UI에서 station_master → weather_3h → weather_10min → realtime_5min 순으로 unpause.
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    # t4g.large(8GB)에서 BashOperator subprocess가 pandas/pyarrow(+LightGBM)를 들고
+    # 뜬다 — 프로세스당 400MB~1.2GB다. LocalExecutor 기본 parallelism 32는 위험하다.
+    AIRFLOW__CORE__PARALLELISM: "3"
+    AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG: "2"
+    # BashOperator subprocess(collector/normalizer/nowcaster/ml/loader)가 쓰는 값.
+    DATABASE_URL: ${DATABASE_URL:?RDS app DB 연결 문자열이 필요합니다}
+    # 빈 문자열이면 core.s3가 `or None`으로 처리해 실제 AWS S3로 간다.
+    # AWS_ACCESS_KEY_ID/SECRET은 **절대 정의하지 않는다** — 정의하면 boto3가
+    # EC2 instance profile을 조회하지 않아 S3 접근이 전부 403이 된다.
+    S3_ENDPOINT_URL: ""
+    # TZ는 설정하지 않는다. airflow/orchestration/templates.py가 KST(+09:00)를
+    # 명시적으로 계산해 S3 키를 만들기 때문에, 컨테이너 TZ를 바꾸면 키 계약이 깨진다.
+  volumes:
+    - ../..:/workspace
+    - airflow-module-venvs:/opt/venvs/modules
+  logging: &default-logging
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+services:
+  # 1회성: airflow DB 마이그레이션 + 모듈 venv 6개 예열.
+  # 첫 실행은 10~20분 걸린다 — 멈춘 게 아니다.
+  airflow-init:
+    <<: *airflow-common
+    command: ["init"]
+    restart: "no"
+
+  airflow-webserver:
+    <<: *airflow-common
+    command: ["api-server"]
+    restart: unless-stopped
+    # 외부 노출은 보안 그룹(admin_cidrs)으로 통제한다. SSM 포트 포워딩으로도 접근 가능.
+    ports:
+      - "8080:8080"
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: ["scheduler"]
+    restart: unless-stopped
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-dag-processor:
+    <<: *airflow-common
+    command: ["dag-processor"]
+    restart: unless-stopped
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+  api:
+    build:
+      context: ../..
+      dockerfile: ops/compose/Dockerfile.airflow
+    command:
+      - bash
+      - -lc
+      - cd /workspace/apps/api && env -u VIRTUAL_ENV uv run --frozen uvicorn main:app --host 0.0.0.0 --port 8000
+    env_file:
+      - ${PROD_ENV_FILE:-/opt/app/.env}
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?RDS app DB 연결 문자열이 필요합니다}
+      S3_ENDPOINT_URL: ""
+      # nginx가 같은 오리진으로 프록시하므로 CORS는 사실상 무의미하지만 방어선으로 좁힌다.
+      API_CORS_ORIGINS: ${API_CORS_ORIGINS:-*}
+    # 호스트에 포트를 열지 않는다 — web(nginx)이 compose 네트워크 안에서만 접근한다.
+    restart: unless-stopped
+    volumes:
+      - ../..:/workspace
+    healthcheck:
+      # 이미지에 curl이 없다(python:3.11-slim + libgomp1). 파이썬으로 확인한다.
+      # /healthz는 DB를 보지 않으므로 RDS 순단이 재시작 루프를 만들지 않는다.
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; urllib.request.urlopen("http://localhost:8000/healthz")
+      interval: 15s
+      timeout: 5s
+      start_period: 120s
+      retries: 5
+    logging: *default-logging
+
+  web:
+    build:
+      context: ../..
+      dockerfile: ops/compose/Dockerfile.web
+      args:
+        VITE_API_BASE: /api
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    depends_on:
+      api:
+        condition: service_healthy
+    logging: *default-logging
+
+  mlflow:
+    build:
+      context: ../..
+      dockerfile: ops/compose/Dockerfile.mlflow
+    # MLFLOW_S3_ENDPOINT_URL과 AWS 자격증명을 주지 않는다 — instance profile을 쓴다.
+    # 학습 EC2가 사설 IP로 이 서버에 붙으므로 0.0.0.0에 바인드하고 SG로 통제한다.
+    command:
+      - sh
+      - -lc
+      - >-
+        mlflow server --host 0.0.0.0 --port 5000
+        --backend-store-uri "$${MLFLOW_BACKEND_STORE_URI}"
+        --artifacts-destination "s3://$${S3_BUCKET}/mlflow-artifacts"
+        --serve-artifacts
+    env_file:
+      - ${PROD_ENV_FILE:-/opt/app/.env}
+    environment:
+      MLFLOW_BACKEND_STORE_URI: ${MLFLOW_BACKEND_STORE_URI:?RDS mlflow DB 연결 문자열이 필요합니다}
+      S3_BUCKET: ${S3_BUCKET:?}
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+    logging: *default-logging
+
+volumes:
+  airflow-module-venvs:

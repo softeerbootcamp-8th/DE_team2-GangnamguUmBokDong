@@ -4,7 +4,7 @@ set -Eeuo pipefail
 umask 077
 
 readonly REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
-readonly POSTGIS_IMAGE="postgis/postgis:16-3.5"
+readonly POSTGIS_IMAGE="postgis/postgis:16-3.4"
 readonly SSOT_COMMIT="eadf79f925eb64386d009af71fe36854d9e56dc5"
 readonly -a SSOT_FILES=(
     "docs/gold/target-schema.sql"
@@ -450,7 +450,7 @@ git -C "${REPO_ROOT}" diff --check HEAD --
 begin_step "DB bootstrap fail-closed 단위 검증"
 bash "${REPO_ROOT}/ops/postgres/tests/test_bootstrap.sh"
 
-begin_step "격리된 PostGIS 16-3.5 시작"
+begin_step "격리된 PostGIS 16-3.4 시작"
 container_id="$(
     docker run --detach --rm \
         --name "${CONTAINER_NAME}" \

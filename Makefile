@@ -140,3 +140,190 @@ e2e-preflight:
 
 e2e-smoke:
 	@python3 ops/e2e_smoke.py
+
+# ===========================================================================
+# 운영 배포 (AWS)
+#
+# 실행 위치가 둘로 나뉜다:
+#   deploy-*  → 상시 EC2 안에서 실행 (SSM 세션으로 접속한 뒤)
+#   그 외      → 로컬에서 실행 (terraform 출력과 aws CLI 사용)
+#
+# 로컬 타겟은 MFA 세션이 필요하다. AWS_PROFILE=mfa를 지정하거나 export 해둘 것.
+# ===========================================================================
+
+TF                 = terraform -chdir=terraform
+PROD_ENV          ?= /opt/app/.env
+PROD_COMPOSE       = docker compose --env-file $(PROD_ENV) -f ops/compose/docker-compose.prod.yml
+
+# psql 컨테이너는 debian 기반을 쓴다 — alpine에는 bash가 없는데 우리 스크립트가
+# bash 문법(`[[ ]]`, 배열, here-string)을 쓴다. postgres:16은 multi-arch라 Graviton에서도 돈다.
+PSQL_IMAGE        ?= postgres:16
+
+# SSM 대신 SSH를 쓴다(계정 정책상 SSM 전면 거부). 공개키만 AWS에 등록되어 있다.
+SSH_KEY           ?= ~/.ssh/gng-ubd
+
+EMR_STAGE          = .emr-stage
+EMR_RELEASE       ?= emr-7.9.0
+EMR_INSTANCE_TYPE ?= m5.xlarge
+EMR_INSTANCE_COUNT?= 3
+
+.PHONY: deploy-env deploy-db-bootstrap deploy-db-check deploy-seed-models \
+        deploy-up deploy-down deploy-ps deploy-logs deploy-restart deploy-resync deploy-smoke \
+        train-start train-stop train-status tunnel-airflow tunnel-mlflow \
+        ssh-app ssh-train allow-my-ip \
+        emr-package emr-features emr-status
+
+# --- 상시 EC2 안에서 실행 ---
+
+# S3(SSE-KMS)의 설정 객체를 내려받아 /opt/app/.env를 만든다. 설정을 바꾼 뒤 다시 실행한다.
+deploy-env:
+	@S3_BUCKET=$${S3_BUCKET:-$$(grep -m1 '^S3_BUCKET=' $(PROD_ENV) 2>/dev/null | cut -d= -f2)}; \
+	if [ -z "$$S3_BUCKET" ]; then \
+		echo "S3_BUCKET을 알 수 없습니다. S3_BUCKET=<버킷> make deploy-env 로 실행하세요." >&2; exit 1; \
+	fi; \
+	S3_BUCKET="$$S3_BUCKET" bash ops/deploy/render_env.sh
+
+# 최초 1회. DB 3개 생성 + Gold PostGIS baseline 적용. PostGIS 3.4가 없으면 exit 78로 멈춘다.
+deploy-db-bootstrap:
+	@set -a; . $(PROD_ENV); set +a; \
+	docker run --rm \
+	  -e PGHOST -e PGPORT -e PGPASSWORD -e PGSSLMODE \
+	  -e POSTGRES_USER -e POSTGRES_APP_DB -e POSTGRES_AIRFLOW_DB -e POSTGRES_MLFLOW_DB \
+	  -e GOLD_SCHEMA_FILE=/opt/gold/target-schema.sql \
+	  -v "$(PWD)/ops/postgres:/opt/scripts:ro" \
+	  -v "$(PWD)/docs/gold/target-schema.sql:/opt/gold/target-schema.sql:ro" \
+	  $(PSQL_IMAGE) bash /opt/scripts/bootstrap_rds.sh
+
+# 로컬 compose의 postgres-schema-check와 같은 스크립트를 RDS 대상으로 재사용한다.
+# 관계 10 / 함수 18 / 트리거 35 / GiST 3 / ACL을 전부 확인한다.
+deploy-db-check:
+	@set -a; . $(PROD_ENV); set +a; \
+	docker run --rm \
+	  -e PGHOST -e PGPORT -e PGPASSWORD -e PGSSLMODE \
+	  -e POSTGRES_USER -e POSTGRES_APP_DB -e POSTGRES_AIRFLOW_DB \
+	  -e GOLD_SCHEMA_CHECK_FILE=/opt/scripts/check_gold_schema.sql \
+	  -v "$(PWD)/ops/postgres:/opt/scripts:ro" \
+	  $(PSQL_IMAGE) bash /opt/scripts/check_gold_schema.sh
+
+# 최초 1회. 로컬 compose의 minio-init이 하던 일을 대신한다 — 빠뜨리면 ml/inference가
+# champion 포인터를 못 찾아 조용히 실패한다.
+deploy-seed-models:
+	@set -a; . $(PROD_ENV); set +a; \
+	aws s3 sync models/ "s3://$$S3_BUCKET/$${MODELS_PREFIX:-models}/"
+
+deploy-up:
+	$(PROD_COMPOSE) up -d --build
+
+deploy-down:
+	$(PROD_COMPOSE) down
+
+deploy-ps:
+	$(PROD_COMPOSE) ps
+
+deploy-logs:
+	$(PROD_COMPOSE) logs -f --tail=200
+
+deploy-restart:
+	$(PROD_COMPOSE) restart
+
+# bind mount 방식이라 코드는 git pull만으로 반영되지만 **의존성은 아니다**.
+# uv.lock이 바뀐 커밋을 받았으면 반드시 실행할 것.
+deploy-resync:
+	$(PROD_COMPOSE) run --rm airflow-init
+
+deploy-smoke:
+	@set -e; \
+	echo "[smoke] web";        curl -fsS -o /dev/null localhost/ && echo "  ok"; \
+	echo "[smoke] api health"; curl -fsS localhost/api/healthz && echo; \
+	echo "[smoke] api ready";  curl -fsS localhost/api/readyz  && echo; \
+	echo "[smoke] stations";   curl -fsS localhost/api/stations | head -c 200; echo; \
+	echo "[smoke] airflow";    curl -fsS -o /dev/null -w '  http %{http_code}\n' localhost:8080/
+
+# --- 로컬에서 실행 ---
+
+# SSM은 이 계정에서 전면 거부다(StartSession·SendCommand·DescribeInstanceInformation).
+# SSH가 유일한 접속 수단이라 22만 admin_cidrs로 열고, UI는 로컬 포트 포워딩으로 본다.
+ssh-app:
+	@ssh -i $(SSH_KEY) ec2-user@$$($(TF) output -raw app_public_ip)
+
+# 학습 EC2는 인터넷에 22를 열지 않는다. 상시 EC2를 bastion으로 경유한다.
+# ProxyJump는 각 홉 인증을 로컬에서 하므로 개인키를 bastion에 두지 않아도 된다.
+ssh-train:
+	@ssh -i $(SSH_KEY) -J ec2-user@$$($(TF) output -raw app_public_ip) \
+	  ec2-user@$$($(TF) output -raw train_private_ip)
+
+# 8080/5000을 SG에 열지 않고 SSH 터널로 본다. 종료는 Ctrl+C.
+tunnel-airflow:
+	@echo "http://localhost:8080 에서 Airflow UI (종료: Ctrl+C)"; \
+	ssh -i $(SSH_KEY) -N -L 8080:localhost:8080 ec2-user@$$($(TF) output -raw app_public_ip)
+
+tunnel-mlflow:
+	@echo "http://localhost:5000 에서 MLflow UI (종료: Ctrl+C)"; \
+	ssh -i $(SSH_KEY) -N -L 5000:localhost:5000 ec2-user@$$($(TF) output -raw app_public_ip)
+
+# 접속 IP가 바뀌었을 때. 현재 공인 IP로 admin_cidrs를 다시 쓰고 SG 규칙만 갱신한다(10초 내외).
+allow-my-ip:
+	@IP=$$(curl -fsS https://checkip.amazonaws.com | tr -d '\n'); \
+	printf 'admin_cidrs = ["%s/32"]\n' "$$IP" > terraform/admin_cidrs.auto.tfvars; \
+	echo "admin_cidrs = $$IP/32"; \
+	$(TF) apply -auto-approve
+
+train-start:
+	@aws ec2 start-instances --instance-ids $$($(TF) output -raw train_instance_id)
+
+# 학습이 끝나면 반드시 실행할 것. 정지 중에는 EBS 요금만 나간다.
+train-stop:
+	@aws ec2 stop-instances --instance-ids $$($(TF) output -raw train_instance_id)
+
+train-status:
+	@aws ec2 describe-instances --instance-ids $$($(TF) output -raw train_instance_id) \
+	  --query 'Reservations[0].Instances[0].[InstanceId,InstanceType,State.Name]' --output text
+
+# EMR 노드가 PYTHONPATH로 쓸 레포 패키지를 묶어 올린다.
+# core/ml_core/feature_engine 세 패키지 루트가 tar 최상위에 오도록 배치한다.
+emr-package:
+	@rm -rf $(EMR_STAGE) && mkdir -p $(EMR_STAGE)
+	@cp -R libs/core/src/core   $(EMR_STAGE)/core
+	@cp -R libs/ml_core         $(EMR_STAGE)/ml_core
+	@cp -R ml/feature_engine    $(EMR_STAGE)/feature_engine
+	@find $(EMR_STAGE) \( -name '.venv' -o -name '__pycache__' -o -name '.ruff_cache' \
+	    -o -name 'tests' -o -name '.pytest_cache' \) -prune -exec rm -rf {} + 2>/dev/null || true
+	@tar -czf $(EMR_STAGE)/pyfiles.tar.gz -C $(EMR_STAGE) core ml_core feature_engine
+	@set -a; . $(PROD_ENV) 2>/dev/null || true; set +a; \
+	BUCKET=$${S3_BUCKET:-$$($(TF) output -raw s3_bucket)}; \
+	aws s3 cp $(EMR_STAGE)/pyfiles.tar.gz "s3://$$BUCKET/emr/pyfiles.tar.gz"; \
+	aws s3 cp ops/emr/bootstrap.sh        "s3://$$BUCKET/emr/bootstrap.sh"; \
+	echo "업로드 완료: s3://$$BUCKET/emr/"
+	@rm -rf $(EMR_STAGE)
+
+# transient 클러스터를 띄워 피처마트 2단계를 돌리고 스스로 종료시킨다.
+# --auto-terminate가 없으면 잡이 끝나도 클러스터가 계속 과금된다.
+# for-use-with-amazon-emr-managed-policies 태그는 AmazonEMRServicePolicy_v2의 요구사항이다.
+emr-features:
+	@BUCKET=$$($(TF) output -raw s3_bucket); \
+	SUBNET=$$($(TF) output -raw subnet_id); \
+	SERVICE_ROLE=$$($(TF) output -raw emr_service_role); \
+	PROFILE=$$($(TF) output -raw emr_instance_profile); \
+	PY=/usr/bin/python3.11; \
+	CONF="--conf spark.pyspark.python=$$PY --conf spark.pyspark.driver.python=$$PY \
+	      --conf spark.executorEnv.PYTHONPATH=/opt/gng \
+	      --conf spark.yarn.appMasterEnv.PYTHONPATH=/opt/gng"; \
+	aws emr create-cluster \
+	  --name "$${EMR_NAME:-gng-ubd-features}" \
+	  --release-label $(EMR_RELEASE) \
+	  --applications Name=Spark \
+	  --log-uri "s3://$$BUCKET/emr/logs/" \
+	  --service-role "$$SERVICE_ROLE" \
+	  --ec2-attributes SubnetId=$$SUBNET,InstanceProfile=$$PROFILE \
+	  --instance-type $(EMR_INSTANCE_TYPE) --instance-count $(EMR_INSTANCE_COUNT) \
+	  --bootstrap-actions Path="s3://$$BUCKET/emr/bootstrap.sh",Args=["$$BUCKET"] \
+	  --tags for-use-with-amazon-emr-managed-policies=true \
+	  --auto-terminate \
+	  --steps \
+	    Type=Spark,Name=run_pipeline,ActionOnFailure=TERMINATE_CLUSTER,Args=[--deploy-mode,cluster,$$CONF,/opt/gng/feature_engine/spark/run_pipeline.py] \
+	    Type=Spark,Name=multi_horizon,ActionOnFailure=TERMINATE_CLUSTER,Args=[--deploy-mode,cluster,$$CONF,/opt/gng/feature_engine/spark/build_multi_horizon_features.py]
+
+# 잡이 끝난 뒤 클러스터가 정말 사라졌는지 확인한다. 남아 있으면 계속 과금된다.
+emr-status:
+	@aws emr list-clusters --active --query 'Clusters[].[Id,Name,Status.State]' --output text; \
+	echo "(출력이 없으면 활성 클러스터 없음)"
