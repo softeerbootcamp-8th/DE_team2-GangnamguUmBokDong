@@ -10,9 +10,20 @@ URGENCY_SCORING_CONFIG_VERSION = "urgency-scoring-v1"
 
 # 현행 urgency reader가 anchor-25분부터 anchor-5분까지 읽는 과거 window의
 # 시간 방향을 byte contract로 고정한다. 현재 anchor는 별도
-# stock_publication_manifest가 소유하므로 전체 계산 window 수는 6개다.
+# stock_publication_manifest가 소유하므로 전체 계산 window 수는 최대 6개다
+# ("최대"인 이유는 아래 MIN_WINDOWS 주석 참고 — 실제로 쓴 수는 publication
+# parameter의 stock_window_count에 그때그때 기록된다).
 URGENCY_STOCK_HISTORY_OFFSETS_MINUTES = (-25, -20, -15, -10, -5)
 URGENCY_STOCK_WINDOW_COUNT = len(URGENCY_STOCK_HISTORY_OFFSETS_MINUTES) + 1
+
+# 위 5개 offset 전부를 필수로 요구하면 5분 tick 하나가 빠지는 순간 그 시각을
+# 참조하는 25분 동안 urgency 게시가 전부 실패한다 — 지나간 실시간 스냅샷은
+# 소급 수집이 불가능하므로 복구 수단도 없다(2026-08-22 운영 중 실측: scheduler가
+# tick 2개를 건너뛰어 50분간 실패). 추세 계산(_trend_time_to_critical_v1)은
+# 현재 anchor 1점을 포함해 2점부터 성립하므로 5개는 수학적 필요가 아니다.
+# 그래서 "없는 window는 건너뛰되, 있는데 빠뜨리는 것은 금지"로 완화하고,
+# 이 하한 미만이면 단발성 결측이 아닌 수집 장애로 보아 실패시킨다.
+URGENCY_STOCK_HISTORY_MIN_WINDOWS = 2
 
 RESPONSE_LAG_MIN = 30  # 트럭 출동~도착 소요시간
 HALF_LIFE_MIN = 60  # 대응 여유시간이 이만큼 늘어날 때마다 시급성 점수가 절반이 됨

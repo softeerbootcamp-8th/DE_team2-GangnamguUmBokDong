@@ -13,6 +13,21 @@ WEATHER_3H_CRON = "0 */3 * * *"
 # 확인해 필요하면 조정한다.
 DAILY_CRON = "0 3 * * *"
 
+# station_master는 DAILY_CRON(03:00)을 쓰면 안 된다. 03:00은 REALTIME_5MIN_CRON의
+# 5분 격자에 정확히 걸리므로 두 DAG이 동시에 시작하고, station_master가 약 88초 뒤
+# bike_station_master authority를 게시한다. 그 시각이 realtime_5min 같은 tick의
+# prepare_serving_plan(고정)과 finalize_serving_release(재검증) 사이에 들어가면
+# "locked station master authority가 바뀌었습니다"로 그 tick의 Gold 게시가 실패한다
+# (2026-08-22 실측: 06:15 tick, prepare 06:15:46 종료 -> master 게시 06:18:01 ->
+# finalize 06:18:23 실패). 이건 버그가 아니라 의도된 방어라 코드로 우회하지 않고
+# 시각을 비켜놓는다.
+#
+# 03:04를 고른 이유: tick 하나가 약 3분 45초라 03:00 tick은 03:03:45에 끝나고
+# 03:05 tick은 아직 시작 전이다. 03:02는 03:00 tick의 finalize 창(03:02:20~03:03:00)과
+# 여전히 겹칠 수 있어 부족하다. **tick 소요가 다시 5분에 가까워지면 이 여유가
+# 사라지므로 그때 다시 계산해야 한다.**
+STATION_MASTER_CRON = "4 3 * * *"
+
 # D-6 대여이력 재수집 후 같은 날짜의 silver를 archive로 묶는 배치.
 COMPACTION_CRON = "30 4 * * *"
 
@@ -46,7 +61,12 @@ NORMALIZER_EXECUTION_TIMEOUT = timedelta(seconds=300)
 COMPACTION_EXECUTION_TIMEOUT = timedelta(seconds=900)
 # 실측 데이터 없음(placeholder) — 로컬에서 --all-stations 1회 실행 시간을 재본 뒤 조정.
 INFERENCE_EXECUTION_TIMEOUT = timedelta(seconds=300)
-DB_LOADER_EXECUTION_TIMEOUT = timedelta(seconds=120)
+# AWS 실측: prepare_serving_plan(serving_cli.py prepare)이 station/stock/weather
+# projection과 여러 S3 put/readback을 순차로 하는데, 로컬 MinIO가 아니라 실제 AWS
+# S3·RDS 네트워크 왕복이 되니 콜드 스타트(재사용할 이전 산출물이 없는 최초 실행)
+# 기준 165초가 걸렸다(2026-08-21, CPU는 21초뿐이라 대부분 네트워크 I/O 대기).
+# 기존 120초는 이 실측 전의 placeholder였다 — 여유를 두고 300초로 올린다.
+DB_LOADER_EXECUTION_TIMEOUT = timedelta(seconds=300)
 WEATHER_MANIFEST_WAIT_TIMEOUT_SECONDS = 30
 WEATHER_MANIFEST_POKE_INTERVAL_SECONDS = 2
 # 실측 데이터 없음(placeholder) — S3 tick 5~6개 + 예측 결과 1개만 읽는 순수 계산이라

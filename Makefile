@@ -181,15 +181,17 @@ PROD_COMPOSE       = docker compose --env-file $(PROD_ENV) -f ops/compose/docker
 # bash 문법(`[[ ]]`, 배열, here-string)을 쓴다. postgres:16은 multi-arch라 Graviton에서도 돈다.
 PSQL_IMAGE        ?= postgres:16
 
-# SSM 대신 SSH를 쓴다(계정 정책상 SSM 전면 거부). 공개키만 AWS에 등록되어 있다.
-SSH_KEY           ?= ~/.ssh/gng-ubd
+# SSM 대신 SSH를 쓴다(계정 정책상 SSM 전면 거부). 키페어는 terraform이 만들지 않고
+# `aws ec2 create-key-pair`로 AWS가 직접 발급한다(terraform/variables.tf의
+# ssh_key_name 참고) — 그 결과물이 이 개인키 파일이다.
+SSH_KEY           ?= ~/.ssh/gng-ubd-admin.pem
 
 EMR_STAGE          = .emr-stage
 EMR_RELEASE       ?= emr-7.9.0
 EMR_INSTANCE_TYPE ?= m5.xlarge
 EMR_INSTANCE_COUNT?= 3
 
-.PHONY: deploy-env deploy-db-bootstrap deploy-db-check deploy-seed-models \
+.PHONY: deploy-env deploy-secrets deploy-db-bootstrap deploy-db-check deploy-seed-models \
         deploy-up deploy-down deploy-ps deploy-logs deploy-restart deploy-resync deploy-smoke \
         train-start train-stop train-status tunnel-airflow tunnel-mlflow \
         ssh-app ssh-train allow-my-ip \
@@ -283,12 +285,43 @@ tunnel-mlflow:
 	@echo "http://localhost:5000 에서 MLflow UI (종료: Ctrl+C)"; \
 	ssh -i $(SSH_KEY) -N -L 5000:localhost:5000 ec2-user@$$($(TF) output -raw app_public_ip)
 
+# config/prod.env(terraform 산출물)에는 API 키를 안 넣는다 — 이 타겟이 그 나머지를
+# 채운다. 값은 SEOUL_OPENAPI_KEY/KMA_APIHUB_KEY 환경변수로 주거나, 생략하면 로컬
+# .env(레포 루트)에서 읽는다. 평문 파일은 업로드 후 즉시 지운다.
+deploy-secrets:
+	@S3_BUCKET=$${S3_BUCKET:?S3_BUCKET을 알 수 없습니다. S3_BUCKET=<버킷> make deploy-secrets 로 실행하세요.}; \
+	SEOUL_OPENAPI_KEY=$${SEOUL_OPENAPI_KEY:-$$(grep -m1 '^SEOUL_OPENAPI_KEY=' .env 2>/dev/null | cut -d= -f2-)}; \
+	KMA_APIHUB_KEY=$${KMA_APIHUB_KEY:-$$(grep -m1 '^KMA_APIHUB_KEY=' .env 2>/dev/null | cut -d= -f2-)}; \
+	if [ -z "$$SEOUL_OPENAPI_KEY" ] || [ -z "$$KMA_APIHUB_KEY" ]; then \
+		echo "SEOUL_OPENAPI_KEY/KMA_APIHUB_KEY를 찾을 수 없습니다. 환경변수로 주거나 .env에 채워두세요." >&2; exit 1; \
+	fi; \
+	tmp=$$(mktemp); \
+	trap 'rm -f "$$tmp"' EXIT; \
+	printf 'SEOUL_OPENAPI_KEY=%s\nKMA_APIHUB_KEY=%s\n' "$$SEOUL_OPENAPI_KEY" "$$KMA_APIHUB_KEY" > "$$tmp"; \
+	aws s3 cp "$$tmp" "s3://$$S3_BUCKET/config/secrets.env"
+
 # 접속 IP가 바뀌었을 때. 현재 공인 IP로 admin_cidrs를 다시 쓰고 SG 규칙만 갱신한다(10초 내외).
+# 자기 공인 IP를 admin_cidrs에 **추가**한다. 덮어쓰면 팀원 한 명이 실행할 때마다
+# 나머지 전원이 SSH에서 끊긴다. apply는 SG만 -target으로 좁힌다 — 전체 apply는
+# 의도적으로 제외해둔 학습 EC2까지 만들어버린다.
 allow-my-ip:
 	@IP=$$(curl -fsS https://checkip.amazonaws.com | tr -d '\n'); \
-	printf 'admin_cidrs = ["%s/32"]\n' "$$IP" > terraform/admin_cidrs.auto.tfvars; \
-	echo "admin_cidrs = $$IP/32"; \
-	$(TF) apply -auto-approve
+	$(MAKE) --no-print-directory allow-ip IP="$$IP"
+
+# 다른 사람의 IP를 대신 열어줄 때 쓴다. 팀원이 AWS 자격증명 없이도 접속할 수 있게
+# 하려면 관리자가 이 타깃으로 추가한다.
+allow-ip:
+	@test -n "$(IP)" || { echo "IP=<공인 IP> 를 지정하세요." >&2; exit 2; }
+	@python3 ops/deploy/merge_admin_cidrs.py "$(IP)/32"
+	@$(TF) apply -auto-approve \
+	  -target=aws_security_group.app -target=aws_security_group.train
+
+# 더 이상 접속하지 않는 IP를 목록에서 뺀다. 열어둔 채 방치하지 않기 위한 짝이다.
+revoke-ip:
+	@test -n "$(IP)" || { echo "IP=<공인 IP> 를 지정하세요." >&2; exit 2; }
+	@python3 ops/deploy/merge_admin_cidrs.py --remove "$(IP)/32"
+	@$(TF) apply -auto-approve \
+	  -target=aws_security_group.app -target=aws_security_group.train
 
 train-start:
 	@aws ec2 start-instances --instance-ids $$($(TF) output -raw train_instance_id)

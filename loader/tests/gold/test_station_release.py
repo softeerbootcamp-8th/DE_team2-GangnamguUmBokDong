@@ -256,6 +256,57 @@ def test_postgis_distance_callback_uses_geography_and_exact_boundary() -> None:
     assert all("::geography" in statement for statement in cursor.statements)
 
 
+def test_postgis_distance_batch_uses_one_round_trip_and_keeps_input_order() -> None:
+    """쌍 여러 개를 한 번의 query로 재고 입력 순서를 그대로 유지한다."""
+    cursor = _DistanceCursor((10.0, 20.0, 30.0))
+    distance = _postgis_distance(cursor)  # type: ignore[arg-type]
+
+    values = distance.batch(
+        (
+            ((127.0, 37.5), (127.001, 37.5)),
+            ((127.0, 37.5), (127.002, 37.5)),
+            ((127.0, 37.5), (127.003, 37.5)),
+        )
+    )
+
+    assert values == (10.0, 20.0, 30.0)
+    assert len(cursor.statements) == 1
+    assert "unnest(" in cursor.statements[0]
+    assert "WITH ORDINALITY" in cursor.statements[0]
+    assert "ORDER BY t.ord" in cursor.statements[0]
+    assert cursor.parameters == [
+        (
+            [127.0, 127.0, 127.0],
+            [37.5, 37.5, 37.5],
+            [127.001, 127.002, 127.003],
+            [37.5, 37.5, 37.5],
+        )
+    ]
+
+
+def test_postgis_distance_batch_rejects_result_count_mismatch() -> None:
+    """batch 결과 수가 입력과 다르면 조용히 넘기지 않고 계약 위반으로 멈춘다."""
+    cursor = _DistanceCursor((10.0,))
+    distance = _postgis_distance(cursor)  # type: ignore[arg-type]
+
+    with pytest.raises(ContractViolation):
+        distance.batch(
+            (
+                ((127.0, 37.5), (127.001, 37.5)),
+                ((127.0, 37.5), (127.002, 37.5)),
+            )
+        )
+
+
+def test_postgis_distance_batch_skips_query_for_empty_input() -> None:
+    """빈 입력에는 query를 던지지 않는다."""
+    cursor = _DistanceCursor(())
+    distance = _postgis_distance(cursor)  # type: ignore[arg-type]
+
+    assert distance.batch(()) == ()
+    assert cursor.statements == []
+
+
 def test_direct_prior_payload_uses_actual_immutable_bytes() -> None:
     """prior projection을 재직렬화하지 않고 manifest URI·SHA actual bytes를 사용한다."""
     actual = b"prior-parquet-from-an-older-pyarrow-version"
@@ -291,14 +342,25 @@ class _DistanceCursor:
         """거리 결과 순서를 복사한다."""
         self.values = list(values)
         self.statements: list[str] = []
+        self.parameters: list[object] = []
+        self.batch_size = 0
 
-    def execute(self, statement: str, _parameters: object) -> None:
-        """SQL을 기록한다."""
+    def execute(self, statement: str, parameters: object) -> None:
+        """SQL과 parameter를 기록하고 batch 입력 길이를 기억한다."""
         self.statements.append(statement)
+        self.parameters.append(parameters)
+        if isinstance(parameters, tuple) and parameters and type(parameters[0]) is list:
+            self.batch_size = len(parameters[0])
 
     def fetchone(self) -> tuple[float]:
         """다음 거리 결과를 반환한다."""
         return (self.values.pop(0),)
+
+    def fetchall(self) -> list[tuple[float]]:
+        """batch query가 요청한 개수만큼 거리 결과를 반환한다."""
+        rows = [(value,) for value in self.values[: self.batch_size]]
+        del self.values[: self.batch_size]
+        return rows
 
 
 class _RouteCleanupCursor:

@@ -350,6 +350,7 @@ def test_calculation_inputs_fix_history_roles_to_oldest_first_offsets() -> None:
     with pytest.raises(ContractViolation, match="시각 순서"):
         UrgencyCalculationInputs(
             active_stations=inputs.active_stations,
+            history_offsets_minutes=inputs.history_offsets_minutes,
             history_windows=swapped,
             current_stock=inputs.current_stock,
             demand=inputs.demand,
@@ -442,7 +443,7 @@ def test_history_ref_must_be_exact_window_latest_correction() -> None:
             Key=uri.removeprefix(f"s3://{BUCKET}/"),
             Body=revision_zero.canonical_bytes,
         )
-        references.append((uri, revision_zero.sha256))
+        references.append((offset, uri, revision_zero.sha256))
         if offset == -25:
             revision_one = _source_manifest(
                 logical,
@@ -464,18 +465,130 @@ def test_history_ref_must_be_exact_window_latest_correction() -> None:
         _validate_history_catalog(catalog, inputs, BASE)
 
 
+def test_missing_history_window_is_tolerated_when_it_truly_does_not_exist() -> None:
+    """수집되지 않은 tick은 건너뛰고 게시할 수 있다 — 소급 수집이 불가능하기 때문이다."""
+    client = boto3.client("s3", region_name="us-east-1")
+    store = S3ImmutableObjectStore(client)
+    references = []
+    for offset in (-25, -20, -15, -10, -5):
+        if offset == -15:
+            continue  # tick 하나가 아예 실행되지 않은 상황을 재현한다.
+        logical = BASE + timedelta(minutes=offset)
+        manifest = _source_manifest(
+            logical,
+            0,
+            f"s3://{BUCKET}/silver/sha256={'1' * 64}.parquet",
+            "1" * 64,
+            1,
+        )
+        uri = _authority_uri(manifest)
+        client.put_object(
+            Bucket=BUCKET,
+            Key=uri.removeprefix(f"s3://{BUCKET}/"),
+            Body=manifest.canonical_bytes,
+        )
+        references.append((offset, uri, manifest.sha256))
+    catalog = S3SourceSnapshotCatalog(client, store, bucket=BUCKET)
+
+    inputs = _stock_history_input_artifacts(tuple(references))
+    _validate_history_catalog(catalog, inputs, BASE)
+
+    assert tuple(offset for offset, _ in inputs) == (-25, -20, -10, -5)
+    assert [artifact.role for _, artifact in inputs] == [
+        "stock_history_manifest_m25",
+        "stock_history_manifest_m20",
+        "stock_history_manifest_m10",
+        "stock_history_manifest_m05",
+    ]
+
+
+def test_omitting_an_existing_history_window_is_rejected() -> None:
+    """실제로 존재하는 window를 빠뜨리면 같은 anchor에서 결과가 갈리므로 거부한다."""
+    client = boto3.client("s3", region_name="us-east-1")
+    store = S3ImmutableObjectStore(client)
+    references = []
+    for offset in (-25, -20, -15, -10, -5):
+        logical = BASE + timedelta(minutes=offset)
+        manifest = _source_manifest(
+            logical,
+            0,
+            f"s3://{BUCKET}/silver/sha256={'1' * 64}.parquet",
+            "1" * 64,
+            1,
+        )
+        uri = _authority_uri(manifest)
+        client.put_object(
+            Bucket=BUCKET,
+            Key=uri.removeprefix(f"s3://{BUCKET}/"),
+            Body=manifest.canonical_bytes,
+        )
+        if offset == -15:
+            continue  # S3에는 있지만 caller가 ref에서 뺀 상황.
+        references.append((offset, uri, manifest.sha256))
+    catalog = S3SourceSnapshotCatalog(client, store, bucket=BUCKET)
+    inputs = _stock_history_input_artifacts(tuple(references))
+
+    with pytest.raises(ContractViolation, match="빠뜨렸습니다"):
+        _validate_history_catalog(catalog, inputs, BASE)
+
+
+def test_history_below_minimum_window_count_is_rejected() -> None:
+    """단발성 결측이 아니라 수집 장애 수준이면 조용히 저품질 게시하지 않는다."""
+    with pytest.raises(ContractViolation, match="하한 미만"):
+        _stock_history_input_artifacts(
+            ((-5, f"s3://{BUCKET}/authority/a.json", "1" * 64),)
+        )
+
+
+def test_history_refs_must_stay_oldest_first_without_duplicates() -> None:
+    """offset 순서가 뒤바뀌거나 중복되면 입력 단계에서 거부한다."""
+    reference = f"s3://{BUCKET}/authority/a.json"
+    with pytest.raises(ContractViolation, match="oldest-first"):
+        _stock_history_input_artifacts(
+            ((-5, reference, "1" * 64), (-25, reference, "1" * 64))
+        )
+    with pytest.raises(ContractViolation, match="oldest-first"):
+        _stock_history_input_artifacts(
+            ((-25, reference, "1" * 64), (-25, reference, "1" * 64))
+        )
+
+
+def test_history_offset_outside_scoring_config_is_rejected() -> None:
+    """scoring config에 없는 offset은 받지 않는다."""
+    with pytest.raises(ContractViolation, match="scoring config"):
+        _stock_history_input_artifacts(
+            (
+                (-30, f"s3://{BUCKET}/authority/a.json", "1" * 64),
+                (-5, f"s3://{BUCKET}/authority/b.json", "1" * 64),
+            )
+        )
+
+
+def test_projection_is_computable_from_partial_history() -> None:
+    """window 2개만 있어도 추세가 성립해 게시 가능한 projection이 나온다."""
+    inputs = _calculation_inputs(
+        history_station_ids=("ST-1",), history_offsets=(-10, -5)
+    )
+
+    projection = compute_urgency_projection(inputs)
+
+    assert projection.expected_sta_ids == ("ST-1",)
+    assert len(projection.records) == 1
+
+
 def _calculation_inputs(
     *,
     history_station_ids: tuple[str, ...],
+    history_offsets: tuple[int, ...] = (-25, -20, -15, -10, -5),
 ) -> UrgencyCalculationInputs:
-    """Pure production scoring 테스트용 exact 6-window 입력을 만든다."""
+    """Pure production scoring 테스트용 6-window 입력을 만든다."""
     active = (ActiveStation("ST-1", 20, 127.0, 37.5, "center"),)
     history = tuple(
         tuple(
             StockHistoryPoint(station_id, BASE + timedelta(minutes=offset), 2)
             for station_id in history_station_ids
         )
-        for offset in (-25, -20, -15, -10, -5)
+        for offset in history_offsets
     )
     current = (StationStockRecord("ST-1", BASE, 1),)
     demand = tuple(
@@ -488,7 +601,9 @@ def _calculation_inputs(
         )
         for horizon in range(1, 13)
     )
-    return UrgencyCalculationInputs(active, history, current, demand, BASE)
+    return UrgencyCalculationInputs(
+        active, history_offsets, history, current, demand, BASE
+    )
 
 
 def _load_legacy_urgency_module() -> ModuleType:

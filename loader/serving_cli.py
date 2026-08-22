@@ -150,6 +150,31 @@ def prepare(
     return {"plan": _ref(artifact.uri, artifact.byte_sha256)}
 
 
+def _stock_history_refs(
+    source_catalog: Any, anchor: datetime
+) -> tuple[tuple[tuple[int, str, str], ...], tuple[int, ...]]:
+    """가용한 stock history window만 골라 offset·URI·SHA로 만든다.
+
+    지나간 5분 tick의 실시간 스냅샷은 소급 수집이 불가능하다. tick 하나가 빠졌을
+    때 25분 내내 urgency를 실패시키는 대신, 없는 window는 건너뛰고 무엇이 빠졌는지
+    보고한다. 빠뜨린 window가 실제로 부재한지는 publish_station_urgency가
+    다시 검증하므로, 여기서 조용히 누락시켜도 통과되지는 않는다.
+    """
+    refs: list[tuple[int, str, str]] = []
+    missing: list[int] = []
+    for offset in URGENCY_STOCK_HISTORY_OFFSETS_MINUTES:
+        try:
+            artifact = source_catalog.exact_window(
+                BIKE_STATION_REALTIME_SOURCE_ID,
+                anchor + timedelta(minutes=offset),
+            )
+        except ContractViolation:
+            missing.append(offset)
+            continue
+        refs.append((offset, artifact.uri, artifact.byte_sha256))
+    return tuple(refs), tuple(missing)
+
+
 def _load_inference_eligible_station_ids(
     client: Any, bucket: str
 ) -> tuple[tuple[str, ...], tuple[tuple[str, str], ...]]:
@@ -272,19 +297,15 @@ def urgency(
     anchor = manifests["station_stock"].logical_dttm
     if any(manifest.logical_dttm != anchor for manifest in manifests.values()):
         raise ContractViolation("finalize release ref의 logical_dttm이 섞였습니다.")
-    history_refs = tuple(
-        (
-            artifact.uri,
-            artifact.byte_sha256,
+    history_refs, missing_offsets = _stock_history_refs(source_catalog, anchor)
+    if missing_offsets:
+        print(
+            "Urgency stock history 결측 window: "
+            f"offsets={list(missing_offsets)} "
+            f"used={len(history_refs)}/"
+            f"{len(URGENCY_STOCK_HISTORY_OFFSETS_MINUTES)}",
+            file=sys.stderr,
         )
-        for artifact in (
-            source_catalog.exact_window(
-                BIKE_STATION_REALTIME_SOURCE_ID,
-                anchor + timedelta(minutes=offset),
-            )
-            for offset in URGENCY_STOCK_HISTORY_OFFSETS_MINUTES
-        )
-    )
     with get_connection() as connection:
         execution = publish_station_urgency(
             connection,

@@ -475,8 +475,18 @@ def _choose_master_values_and_point(
             )
         )
     approved_keys: list[tuple[str, str]] = []
-    for comparison_cd, candidate_point, reference_point in comparisons:
-        meters = _checked_distance(distance_meters, candidate_point, reference_point)
+    # 비교 쌍은 최대 2개이고 승인 판정에 앞서 전부 필요하지 않을 수도 있지만,
+    # 쌍마다 RDS를 왕복하지 않도록 한 번에 계산한다 — 값은 스칼라 경로와 같다.
+    comparison_meters = _checked_distances(
+        distance_meters,
+        tuple(
+            (candidate_point, reference_point)
+            for _, candidate_point, reference_point in comparisons
+        ),
+    )
+    for meters, (comparison_cd, candidate_point, reference_point) in zip(
+        comparison_meters, comparisons, strict=True
+    ):
         if meters <= RELOCATION_THRESHOLD_M:
             continue
         key = (station_id, comparison_cd)
@@ -556,19 +566,47 @@ def _nearest_active_center(
     distance_meters: Callable[[float, float, float, float], float],
 ) -> str:
     """geography 거리 최소 center를, 동률이면 ID UTF-8 순으로 선택한다."""
+    meters = _checked_distances(
+        distance_meters,
+        tuple(
+            ((longitude, latitude), (center.longitude, center.latitude))
+            for center in centers
+        ),
+    )
     ranked = [
         (
-            _checked_distance(
-                distance_meters,
-                (longitude, latitude),
-                (center.longitude, center.latitude),
-            ),
+            value,
             center.dispatch_center_id.encode("utf-8"),
             center.dispatch_center_id,
         )
-        for center in centers
+        for value, center in zip(meters, centers, strict=True)
     ]
     return min(ranked)[2]
+
+
+def _checked_distances(
+    distance_meters: Callable[[float, float, float, float], float],
+    pairs: tuple[tuple[tuple[float, float], tuple[float, float]], ...],
+) -> tuple[float, ...]:
+    """Point 쌍 목록의 거리를 계산하고 스칼라 경로와 같은 계약으로 검증한다.
+
+    callback이 `batch`를 노출하면(PostGIS 경로) 한 번의 round trip으로 묶어
+    계산한다 — 쌍마다 SQL을 던지면 prepare_serving_plan이 RDS 왕복 대기로만
+    151초를 쓴다(2026-08-22 실측). `batch`가 없는 callback(테스트 stub·
+    `_haversine_meters`)은 기존과 동일하게 순차 계산한다.
+    """
+    batch = getattr(distance_meters, "batch", None)
+    if batch is None:
+        return tuple(
+            _checked_distance(distance_meters, candidate, reference)
+            for candidate, reference in pairs
+        )
+    values = batch(pairs)
+    if len(values) != len(pairs):
+        raise ContractViolation("distance_meters batch 결과 수가 입력과 다릅니다.")
+    for value in values:
+        _validate_distance(value)
+    return tuple(float(value) for value in values)
 
 
 def _checked_distance(
@@ -583,9 +621,14 @@ def _checked_distance(
         reference_point[0],
         reference_point[1],
     )
+    _validate_distance(value)
+    return float(value)
+
+
+def _validate_distance(value: Any) -> None:
+    """거리 값이 유한 비음수 meter인지 검증한다."""
     if type(value) not in {int, float} or not math.isfinite(float(value)) or value < 0:
         raise ContractViolation("distance_meters 결과는 유한 비음수여야 합니다.")
-    return float(value)
 
 
 def _haversine_meters(

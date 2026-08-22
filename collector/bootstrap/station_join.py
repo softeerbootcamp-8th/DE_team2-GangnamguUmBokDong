@@ -48,6 +48,8 @@ from zoneinfo import ZoneInfo
 
 import httpx
 
+from bootstrap.globbing import glob_normalized
+
 logger = logging.getLogger(__name__)
 
 _BASE_URL = "http://openapi.seoul.go.kr:8088"
@@ -177,7 +179,9 @@ def _read_history_ids(csv_dir: Path) -> tuple[dict[str, str], list[str]]:
     # 현재 매핑값이 어느 파일(기간)에서 왔는지 — 충돌 로그에 시점을 남기기 위한 것.
     origin: dict[str, str] = {}
     trail: dict[str, list[str]] = {}
-    for path in sorted(csv_dir.glob(_HISTORY_PATTERN)):
+    # csv_source.glob_normalized 참고: macOS는 파일명을 NFD로 저장해 Path.glob()의
+    # NFC 패턴이 조용히 0건 매칭된다. 여기서도 같은 문제라 같은 방식으로 우회한다.
+    for path in glob_normalized(csv_dir, _HISTORY_PATTERN):
         # "...대여이력 정보_2501.csv" -> "2501"
         period = path.stem.rsplit("_", 1)[-1]
         with path.open(encoding=_HISTORY_ENCODING, errors="replace", newline="") as handle:

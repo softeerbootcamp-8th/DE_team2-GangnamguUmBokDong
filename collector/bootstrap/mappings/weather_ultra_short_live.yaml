@@ -44,7 +44,9 @@ encoding: cp949
 
 # `data/`에 따릉이 대여이력 CSV가 함께 있고, 그 파일명의 YYMM(2606)이 요청 범위와
 # 겹치면 열려서 `일시` 컬럼이 없어 죽는다. 이 소스의 파일만 고른다.
-file_pattern: "weather_realtime_*.csv"
+# raw-data 배포본은 기상자료개방포털 원본 파일명(OBS_ASOS_TIM_<추출시각>.csv)
+# 그대로다 — 파일명에 YYMM 조각이 없어 csv_source가 전체를 읽는다(경고 로그 남음).
+file_pattern: "OBS_ASOS_TIM_*.csv"
 
 # ASOS는 이 컬럼들의 빈값을 실제 결측으로 쓴다(WSD·VEC 각 31건). `\N` 같은 별도
 # 표기는 없어서 na_values는 비운다.

@@ -36,8 +36,8 @@ from core.scoring_config import (
     SEVERITY_SCALE,
     SUPPLY_LOW_STOCK_RATIO,
     URGENCY_SCORING_CONFIG_VERSION,
+    URGENCY_STOCK_HISTORY_MIN_WINDOWS,
     URGENCY_STOCK_HISTORY_OFFSETS_MINUTES,
-    URGENCY_STOCK_WINDOW_COUNT,
 )
 from core.source_snapshot import SourceSnapshotStatus
 from psycopg import Connection, Cursor
@@ -257,6 +257,7 @@ class UrgencyCalculationInputs:
     """검증된 topology·과거/현재 재고·Gold demand 계산 입력을 묶는다."""
 
     active_stations: tuple[ActiveStation, ...]
+    history_offsets_minutes: tuple[int, ...]
     history_windows: tuple[tuple[StockHistoryPoint, ...], ...]
     current_stock: tuple[StationStockRecord, ...]
     demand: tuple[DemandForecastRecord, ...]
@@ -275,9 +276,31 @@ class UrgencyCalculationInputs:
         active_ids = tuple(item.sta_id for item in self.active_stations)
         if active_ids != _station_ids(active_ids, "active station IDs"):
             raise ContractViolation("active station은 sta_id UTF-8 순이어야 합니다.")
+        offsets = self.history_offsets_minutes
+        allowed = set(URGENCY_STOCK_HISTORY_OFFSETS_MINUTES)
+        if (
+            type(offsets) is not tuple
+            or any(type(offset) is not int for offset in offsets)
+            or not set(offsets).issubset(allowed)
+            or offsets
+            != tuple(
+                offset
+                for offset in URGENCY_STOCK_HISTORY_OFFSETS_MINUTES
+                if offset in offsets
+            )
+        ):
+            raise ContractViolation(
+                "history_offsets_minutes는 scoring config offset의 "
+                "중복 없는 oldest-first 부분집합이어야 합니다."
+            )
+        if len(offsets) < URGENCY_STOCK_HISTORY_MIN_WINDOWS:
+            raise ContractViolation(
+                "stock history window가 하한 미만입니다: "
+                f"actual={len(offsets)} min={URGENCY_STOCK_HISTORY_MIN_WINDOWS}"
+            )
         if (
             type(self.history_windows) is not tuple
-            or len(self.history_windows) != len(URGENCY_STOCK_HISTORY_OFFSETS_MINUTES)
+            or len(self.history_windows) != len(offsets)
             or any(type(window) is not tuple for window in self.history_windows)
             or any(
                 type(point) is not StockHistoryPoint
@@ -286,13 +309,9 @@ class UrgencyCalculationInputs:
             )
         ):
             raise ContractViolation(
-                "stock history는 exact 5개 point tuple window여야 합니다."
+                "stock history는 offset 수와 같은 point tuple window여야 합니다."
             )
-        for offset, window in zip(
-            URGENCY_STOCK_HISTORY_OFFSETS_MINUTES,
-            self.history_windows,
-            strict=True,
-        ):
+        for offset, window in zip(offsets, self.history_windows, strict=True):
             ids = tuple(point.sta_id for point in window)
             if ids != _station_ids(ids, "stock history station IDs"):
                 raise ContractViolation(
@@ -505,17 +524,24 @@ def publish_station_urgency(
     object_store: ImmutableObjectStore,
     *,
     source_catalog: S3SourceSnapshotCatalog,
-    stock_history_manifest_refs: tuple[tuple[str, str], ...],
+    stock_history_manifest_refs: tuple[tuple[int, str, str], ...],
     serving_release_manifest_refs: Mapping[str, tuple[str, str]],
     object_base_uri: str,
     publisher_version: str = URGENCY_PUBLISHER_VERSION,
 ) -> PublicationExecution:
-    """Exact 5개 history와 committed Gold stock·demand로 urgency를 원자 게시한다.
+    """가용 history와 committed Gold stock·demand로 urgency를 원자 게시한다.
 
-    과거 source manifest는 ``anchor-25..-5분`` oldest-first로 받고, 현재 재고와
-    demand는 각각 잠길 Gold publication state가 가리키는 actual manifest·output을
-    사용한다. 계산 결과 ``urgency_output``도 immutable input으로 먼저 고정하고
-    공통 evidence verifier가 재계산 결과와 대조한 뒤 target/state를 함께 바꾼다.
+    과거 source manifest는 ``(offset분, uri, sha256)``을 ``anchor-25..-5분``
+    oldest-first로 받는다. 5개 전부가 아니어도 되지만 **존재하는 window를
+    빠뜨리는 것은 금지**한다 — `_validate_history_catalog`가 빠진 offset마다
+    실제로 authority window가 없음을 증명하고서야 통과시키므로, 같은 anchor에서
+    결과가 갈리지 않는다. 하한은 `URGENCY_STOCK_HISTORY_MIN_WINDOWS`이고 그
+    미만이면 단발성 결측이 아닌 수집 장애로 보아 실패시킨다.
+
+    현재 재고와 demand는 각각 잠길 Gold publication state가 가리키는 actual
+    manifest·output을 사용한다. 계산 결과 ``urgency_output``도 immutable input으로
+    먼저 고정하고 공통 evidence verifier가 재계산 결과와 대조한 뒤 target/state를
+    함께 바꾼다.
     """
     if type(source_catalog) is not S3SourceSnapshotCatalog:
         raise ContractViolation("source_catalog는 S3SourceSnapshotCatalog여야 합니다.")
@@ -551,7 +577,7 @@ def publish_station_urgency(
     active_stations = _load_active_stations(connection)
     input_artifacts = (
         demand_input,
-        *history_inputs,
+        *(artifact for _offset, artifact in history_inputs),
         stock_input,
     )
     input_payloads = {
@@ -604,7 +630,14 @@ def publish_station_urgency(
         parameters=(
             Parameter("expected_sta_id_sha256", expected_ids.sha256),
             Parameter("scoring_config_version", URGENCY_SCORING_CONFIG_VERSION),
-            Parameter("stock_window_count", str(URGENCY_STOCK_WINDOW_COUNT)),
+            # 결측 window를 허용하므로 상수가 아니라 실제로 쓴 수와 offset을
+            # 남긴다 — 같은 anchor에서 degraded 게시와 완전 게시가 같은
+            # fingerprint를 갖지 않게 하려면 이 값이 입력에 들어가야 한다.
+            Parameter("stock_window_count", str(len(history_inputs) + 1)),
+            Parameter(
+                "stock_history_offsets",
+                ",".join(str(offset) for offset, _ in history_inputs),
+            ),
         ),
         outputs=outputs,
     )
@@ -687,6 +720,7 @@ def publish_station_urgency(
         locked_projection = compute_urgency_projection(
             UrgencyCalculationInputs(
                 active_stations=locked_active,
+                history_offsets_minutes=calculation.history_offsets_minutes,
                 history_windows=calculation.history_windows,
                 current_stock=calculation.current_stock,
                 demand=calculation.demand,
@@ -712,6 +746,7 @@ def publish_station_urgency(
             raise ContractViolation("urgency EMPTY evidence key가 다릅니다.")
         locked = UrgencyCalculationInputs(
             active_stations=_active_stations_locked(cursor),
+            history_offsets_minutes=calculation.history_offsets_minutes,
             history_windows=calculation.history_windows,
             current_stock=calculation.current_stock,
             demand=calculation.demand,
@@ -744,29 +779,53 @@ def publish_station_urgency(
 
 
 def _stock_history_input_artifacts(
-    references: tuple[tuple[str, str], ...],
-) -> tuple[InputArtifact, ...]:
-    """Oldest-first URI·SHA 다섯 쌍을 canonical history input role로 만든다."""
-    if (
-        type(references) is not tuple
-        or len(references) != len(URGENCY_STOCK_HISTORY_OFFSETS_MINUTES)
-        or any(
-            type(reference) is not tuple
-            or len(reference) != 2
-            or any(type(value) is not str for value in reference)
-            for reference in references
-        )
+    references: tuple[tuple[int, str, str], ...],
+) -> tuple[tuple[int, InputArtifact], ...]:
+    """Oldest-first offset·URI·SHA 세 쌍을 canonical history input role로 만든다.
+
+    offset은 `URGENCY_STOCK_HISTORY_OFFSETS_MINUTES`의 부분집합이면 되고, 실제로
+    존재하지 않는 window는 빠질 수 있다. 다만 role을 위치 index가 아니라 offset에서
+    유도해 어떤 window가 쓰였는지 manifest만 봐도 드러나게 한다.
+    """
+    if type(references) is not tuple or any(
+        type(reference) is not tuple
+        or len(reference) != 3
+        or type(reference[0]) is not int
+        or any(type(value) is not str or not value for value in reference[1:])
+        for reference in references
     ):
         raise ContractViolation(
-            "stock history manifest URI·SHA tuple이 정확히 5개 필요합니다."
+            "stock history ref는 offset·URI·SHA tuple이어야 합니다."
+        )
+    offsets = tuple(offset for offset, _uri, _sha in references)
+    allowed = set(URGENCY_STOCK_HISTORY_OFFSETS_MINUTES)
+    if not set(offsets).issubset(allowed):
+        raise ContractViolation(
+            "stock history offset이 scoring config 집합 밖입니다: "
+            f"{sorted(set(offsets) - allowed)}"
+        )
+    if offsets != tuple(
+        offset for offset in URGENCY_STOCK_HISTORY_OFFSETS_MINUTES if offset in offsets
+    ):
+        raise ContractViolation(
+            "stock history ref는 중복 없이 oldest-first 순이어야 합니다."
+        )
+    if len(offsets) < URGENCY_STOCK_HISTORY_MIN_WINDOWS:
+        raise ContractViolation(
+            "stock history window가 하한 미만입니다: "
+            f"actual={len(offsets)} min={URGENCY_STOCK_HISTORY_MIN_WINDOWS} "
+            f"of {len(URGENCY_STOCK_HISTORY_OFFSETS_MINUTES)}"
         )
     return tuple(
-        InputArtifact(
-            byte_sha256=byte_sha256,
-            role=f"stock_history_manifest_{index:02d}",
-            uri=uri,
+        (
+            offset,
+            InputArtifact(
+                byte_sha256=byte_sha256,
+                role=f"stock_history_manifest_m{abs(offset):02d}",
+                uri=uri,
+            ),
         )
-        for index, (uri, byte_sha256) in enumerate(references, start=1)
+        for offset, uri, byte_sha256 in references
     )
 
 
@@ -821,21 +880,35 @@ def _validate_serving_release_state_refs(
 
 def _validate_history_catalog(
     source_catalog: S3SourceSnapshotCatalog,
-    history_inputs: tuple[InputArtifact, ...],
+    history_inputs: tuple[tuple[int, InputArtifact], ...],
     anchor: datetime,
 ) -> None:
-    """각 history ref가 exact window의 최신 contiguous correction인지 확인한다."""
+    """각 history ref가 exact window의 최신 correction인지, 결측은 실제 부재인지 본다."""
     if type(source_catalog) is not S3SourceSnapshotCatalog:
         raise ContractViolation("source_catalog는 S3SourceSnapshotCatalog여야 합니다.")
     base = _utc_dttm(anchor, "urgency anchor")
-    for artifact, offset in zip(
-        history_inputs,
-        URGENCY_STOCK_HISTORY_OFFSETS_MINUTES,
-        strict=True,
-    ):
+    artifact_by_offset = dict(history_inputs)
+    for offset in URGENCY_STOCK_HISTORY_OFFSETS_MINUTES:
+        logical = base + timedelta(minutes=offset)
+        artifact = artifact_by_offset.get(offset)
+        if artifact is None:
+            # 빠진 window는 "실제로 없다"를 증명해야 통과시킨다. 존재하는데
+            # 빠뜨린 경우를 허용하면 같은 시각에 서로 다른 결과가 나올 수 있어
+            # 재현성이 깨진다.
+            try:
+                available = source_catalog.exact_window(
+                    BIKE_STATION_REALTIME_SOURCE_ID,
+                    logical,
+                )
+            except ContractViolation:
+                continue
+            raise ContractViolation(
+                "존재하는 stock history window를 빠뜨렸습니다: "
+                f"offset={offset} uri={available.uri}"
+            )
         latest = source_catalog.exact_window(
             BIKE_STATION_REALTIME_SOURCE_ID,
-            base + timedelta(minutes=offset),
+            logical,
         )
         if (latest.uri, latest.byte_sha256) != (
             artifact.uri,
@@ -881,7 +954,7 @@ def _calculation_inputs_from_manifests(
     demand_manifest: PublicationManifest,
     stock_state: PublicationStateRecord,
     stock_manifest: PublicationManifest,
-    history_inputs: tuple[InputArtifact, ...],
+    history_inputs: tuple[tuple[int, InputArtifact], ...],
     payloads: Mapping[str, bytes],
 ) -> UrgencyCalculationInputs:
     """Linked publication과 history actual bytes를 typed scoring 입력으로 연다."""
@@ -901,14 +974,11 @@ def _calculation_inputs_from_manifests(
             payloads,
             expected_logical_dttm=base + timedelta(minutes=offset),
         )
-        for artifact, offset in zip(
-            history_inputs,
-            URGENCY_STOCK_HISTORY_OFFSETS_MINUTES,
-            strict=True,
-        )
+        for offset, artifact in history_inputs
     )
     return UrgencyCalculationInputs(
         active_stations=active_stations,
+        history_offsets_minutes=tuple(offset for offset, _ in history_inputs),
         history_windows=history_windows,
         current_stock=current_stock,
         demand=demand,

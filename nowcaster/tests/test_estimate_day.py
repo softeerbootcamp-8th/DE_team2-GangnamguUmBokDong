@@ -1,5 +1,7 @@
 """estimate_day.py: 격자·시간대(H_DNG_CD/CELL_ID/TT)별로 후보 주차 archive를 조인해 추정 테이블을 만든다."""
 
+from datetime import date
+
 import pandas as pd
 import pytest
 
@@ -78,6 +80,106 @@ class TestHistoricalAverage:
 
     def test_returns_none_when_no_frames_available(self):
         assert estimate_day.historical_average([None, None]) is None
+
+
+class TestHistoricalAverageOverDates:
+    def test_matches_historical_average_result(self):
+        frames_by_date = {
+            1: _frame([{"H_DNG_CD": "H1", "CELL_ID": "C1", "TT": "10", "SPOP": 100.0}]),
+            2: None,
+            3: _frame([{"H_DNG_CD": "H1", "CELL_ID": "C1", "TT": "10", "SPOP": 300.0}]),
+        }
+        calls = []
+
+        def read_frame(d):
+            calls.append(d)
+            return frames_by_date[d]
+
+        result = estimate_day.historical_average_over_dates([1, 2, 3], read_frame)
+
+        assert result.loc[("H1", "C1", "10")]["SPOP"] == 200.0
+        # 날짜당 정확히 한 번만 읽는다 — 리스트로 미리 다 모아두지 않는다.
+        assert calls == [1, 2, 3]
+
+    def test_returns_none_when_no_dates_have_data(self):
+        assert estimate_day.historical_average_over_dates([1, 2], lambda d: None) is None
+
+
+class TestHistoricalAverageCached:
+    def _fake_cache_store(self):
+        """load_cache/save_cache 계약을 지키는 인메모리 캐시 저장소를 만든다."""
+        store = {}
+
+        def load_cache(pattern):
+            if pattern not in store:
+                return None, None, []
+            return store[pattern]
+
+        def save_cache(pattern, sum_df, count_df, included):
+            store[pattern] = (sum_df, count_df, included)
+
+        return store, load_cache, save_cache
+
+    def test_first_call_reads_every_date_and_populates_cache(self):
+        d1, d2 = date(2026, 1, 5), date(2026, 1, 12)
+        frames = {
+            d1: _frame([{"H_DNG_CD": "H1", "CELL_ID": "C1", "TT": "10", "SPOP": 100.0}]),
+            d2: _frame([{"H_DNG_CD": "H1", "CELL_ID": "C1", "TT": "10", "SPOP": 300.0}]),
+        }
+        calls = []
+
+        def read_frame(d):
+            calls.append(d)
+            return frames[d]
+
+        store, load_cache, save_cache = self._fake_cache_store()
+        result = estimate_day.historical_average_cached("weekday", [d1, d2], read_frame, load_cache, save_cache)
+
+        assert result.loc[("H1", "C1", "10")]["SPOP"] == 200.0
+        assert sorted(calls) == [d1, d2]
+        assert sorted(store["weekday"][2]) == [d1.isoformat(), d2.isoformat()]
+
+    def test_second_call_only_reads_dates_not_yet_cached(self):
+        d1, d2 = date(2026, 1, 5), date(2026, 1, 12)
+        frames = {
+            d1: _frame([{"H_DNG_CD": "H1", "CELL_ID": "C1", "TT": "10", "SPOP": 100.0}]),
+            d2: _frame([{"H_DNG_CD": "H1", "CELL_ID": "C1", "TT": "10", "SPOP": 300.0}]),
+        }
+        store, load_cache, save_cache = self._fake_cache_store()
+
+        def read_frame_first(d):
+            return frames[d]
+
+        estimate_day.historical_average_cached("weekday", [d1], read_frame_first, load_cache, save_cache)
+
+        calls = []
+
+        def read_frame_second(d):
+            calls.append(d)
+            return frames[d]
+
+        result = estimate_day.historical_average_cached(
+            "weekday", [d1, d2], read_frame_second, load_cache, save_cache
+        )
+
+        # d1은 이미 캐시에 있으니 다시 읽지 않고 d2만 새로 읽는다.
+        assert calls == [d2]
+        assert result.loc[("H1", "C1", "10")]["SPOP"] == 200.0
+
+    def test_no_new_dates_does_not_call_save_cache(self):
+        d1 = date(2026, 1, 5)
+        store, load_cache, save_cache_calls = self._fake_cache_store()
+
+        def read_frame(d):
+            return _frame([{"H_DNG_CD": "H1", "CELL_ID": "C1", "TT": "10", "SPOP": 100.0}])
+
+        estimate_day.historical_average_cached("weekday", [d1], read_frame, load_cache, save_cache_calls)
+        save_calls = []
+        estimate_day.historical_average_cached(
+            "weekday", [d1], read_frame, load_cache, lambda *a: save_calls.append(a)
+        )
+
+        assert save_calls == []
 
 
 class TestBuildNowcastTableUsesHistoricalAverage:

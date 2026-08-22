@@ -1465,6 +1465,46 @@ def _postgis_distance(cursor: Cursor[tuple[Any, ...]]) -> Any:
             raise ContractViolation("PostGIS ST_Distance 결과가 없습니다.")
         return float(row[0])
 
+    def batch(
+        pairs: tuple[tuple[tuple[float, float], tuple[float, float]], ...],
+    ) -> tuple[float, ...]:
+        """Point 쌍 여러 개의 거리를 한 번의 round trip으로 반환한다.
+
+        `distance`와 완전히 같은 geography 식을 쓰므로 값이 달라지지 않는다.
+        정류소 하나당 배차센터 12개를 개별 쿼리로 재는 구조가
+        prepare_serving_plan 175초 중 151초를 RDS 왕복 대기로 소모했다
+        (2026-08-22 실측, 106,626 round trip). `unnest ... WITH ORDINALITY`로
+        입력 순서를 보장해 호출부가 그대로 index로 대응시킬 수 있게 한다.
+        """
+        if not pairs:
+            return ()
+        cursor.execute(
+            """
+            SELECT ST_Distance(
+                ST_SetSRID(ST_MakePoint(t.lon_a, t.lat_a), 4326)::geography,
+                ST_SetSRID(ST_MakePoint(t.lon_b, t.lat_b), 4326)::geography
+            )
+            FROM unnest(
+                %s::float8[], %s::float8[], %s::float8[], %s::float8[]
+            ) WITH ORDINALITY AS t(lon_a, lat_a, lon_b, lat_b, ord)
+            ORDER BY t.ord
+            """,
+            (
+                [candidate[0] for candidate, _ in pairs],
+                [candidate[1] for candidate, _ in pairs],
+                [reference[0] for _, reference in pairs],
+                [reference[1] for _, reference in pairs],
+            ),
+        )
+        rows = cursor.fetchall()
+        if len(rows) != len(pairs):
+            raise ContractViolation(
+                "PostGIS ST_Distance batch 결과 수가 입력과 다릅니다: "
+                f"expected={len(pairs)} actual={len(rows)}"
+            )
+        return tuple(float(row[0]) for row in rows)
+
+    distance.batch = batch  # type: ignore[attr-defined]
     return distance
 
 
