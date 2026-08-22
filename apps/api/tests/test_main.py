@@ -473,3 +473,66 @@ def test_dismiss_maps_not_found_wrong_status_and_duplicate(
 
     assert response.status_code == status_code
     assert response.json()["detail"] == detail
+
+
+def test_restore_returns_new_proposed_route(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """restore는 취소된 작업을 복제한 새 후보를 201로 돌려준다."""
+    restored = _route("proposed")
+    restored["route_id"] = "55555555-5555-4555-8555-555555555555"
+    restored["restored_from_route_id"] = str(ROUTE_ID)
+    monkeypatch.setattr(
+        queries,
+        "restore_route",
+        lambda _route_id, _now, _new_route_id: restored,
+    )
+
+    response = client.post(f"/routes/{ROUTE_ID}/restore")
+
+    assert response.status_code == 201
+    assert response.json()["route_id"] == "55555555-5555-4555-8555-555555555555"
+    assert response.json()["status"] == "proposed"
+    assert response.json()["restored_from_route_id"] == str(ROUTE_ID)
+
+
+@pytest.mark.parametrize(
+    "result,status_code,detail",
+    [
+        (queries.RouteTransitionResult.NOT_FOUND, 404, f"route {ROUTE_ID} not found"),
+        (
+            queries.RouteTransitionResult.WRONG_STATUS,
+            409,
+            f"route {ROUTE_ID} is not in cancelled status",
+        ),
+        (
+            queries.RouteTransitionResult.ALREADY_DISMISSED,
+            409,
+            f"route {ROUTE_ID} is already dismissed",
+        ),
+        (
+            queries.RouteTransitionResult.CONSTRAINT_CONFLICT,
+            409,
+            "route_restore_conflict",
+        ),
+    ],
+)
+def test_restore_maps_not_found_wrong_status_and_conflicts(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    result: queries.RouteTransitionResult,
+    status_code: int,
+    detail: str,
+) -> None:
+    """restore는 404·상태 409·삭제 409·constraint 409를 명시적으로 매핑한다."""
+    monkeypatch.setattr(
+        queries,
+        "restore_route",
+        lambda _route_id, _now, _new_route_id: result,
+    )
+
+    response = client.post(f"/routes/{ROUTE_ID}/restore")
+
+    assert response.status_code == status_code
+    assert response.json()["detail"] == detail

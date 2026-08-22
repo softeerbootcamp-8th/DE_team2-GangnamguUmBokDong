@@ -694,3 +694,72 @@ def dismiss_route(
             return route
     except CheckViolation:
         return RouteTransitionResult.CONSTRAINT_CONFLICT
+
+
+def restore_route(
+    route_id: UUID,
+    now: datetime,
+    new_route_id: UUID,
+) -> dict[str, Any] | RouteTransitionResult:
+    """취소된 route의 stop을 복제해 새 proposed route를 만든다.
+
+    제자리 전이 대신 복제를 쓰는 이유는 proposed_dttm이 immutable이라
+    되돌린 작업이 후보 창(최근 10분)을 통과하지 못하기 때문이다. 원본은
+    cancelled로 남아 취소 이력이 지워지지 않는다.
+    """
+    try:
+        with (
+            get_connection() as connection,
+            connection.cursor(row_factory=dict_row) as cursor,
+        ):
+            cursor.execute(
+                """
+                SELECT dispatch_center_id, route_status_cd, dismissed_dttm
+                  FROM rebalance_route
+                 WHERE route_id = %(route_id)s
+                   FOR SHARE
+                """,
+                {"route_id": route_id},
+            )
+            origin = cursor.fetchone()
+            if origin is None:
+                return RouteTransitionResult.NOT_FOUND
+            if origin["dismissed_dttm"] is not None:
+                return RouteTransitionResult.ALREADY_DISMISSED
+            if origin["route_status_cd"] != "cancelled":
+                return RouteTransitionResult.WRONG_STATUS
+
+            cursor.execute(
+                """
+                INSERT INTO rebalance_route (
+                    route_id, dispatch_center_id, route_status_cd,
+                    proposed_dttm, restored_from_route_id
+                ) VALUES (
+                    %(new_route_id)s, %(dispatch_center_id)s, 'proposed',
+                    %(now)s, %(route_id)s
+                )
+                """,
+                {
+                    "new_route_id": new_route_id,
+                    "dispatch_center_id": origin["dispatch_center_id"],
+                    "now": now,
+                    "route_id": route_id,
+                },
+            )
+            cursor.execute(
+                """
+                INSERT INTO rebalance_route_stop (
+                    route_id, visit_no, sta_id, route_action_type_cd, bike_cnt
+                )
+                SELECT %(new_route_id)s, visit_no, sta_id, route_action_type_cd, bike_cnt
+                  FROM rebalance_route_stop
+                 WHERE route_id = %(route_id)s
+                """,
+                {"new_route_id": new_route_id, "route_id": route_id},
+            )
+            route = _fetch_route_with_cursor(cursor, new_route_id)
+            if route is None:
+                raise RuntimeError("복제 직후 route aggregate를 찾을 수 없습니다.")
+            return route
+    except CheckViolation:
+        return RouteTransitionResult.CONSTRAINT_CONFLICT

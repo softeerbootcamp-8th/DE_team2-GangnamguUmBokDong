@@ -1,7 +1,7 @@
 """Gold PostGIS 대시보드 API endpoint를 제공한다."""
 
 from typing import Literal
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import queries
 from core.db import fetch_one
@@ -224,3 +224,10 @@ def dismiss_route(route_id: UUID) -> dict:
     """종료된 route를 작업 현황 목록에서만 감춘다."""
     result = queries.dismiss_route(route_id, queries.now_utc())
     return _route_transition_response(route_id, result, "completed or cancelled")
+
+
+@app.post("/routes/{route_id}/restore", response_model=Route, status_code=201)
+def restore_route(route_id: UUID) -> dict:
+    """취소된 route를 복제해 새 작업 후보로 되돌린다."""
+    result = queries.restore_route(route_id, queries.now_utc(), uuid4())
+    return _route_transition_response(route_id, result, "cancelled", "route_restore_conflict")
