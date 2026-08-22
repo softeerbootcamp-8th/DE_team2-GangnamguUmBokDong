@@ -3,7 +3,7 @@ import { api } from "../api";
 import type { DispatchCenter } from "../api";
 import { formatClock, formatIsoTime } from "../format";
 import { RegionTabs } from "./RegionTabs";
-import logo from "../../assets/logo_transparent.png";
+import logo from "../../assets/ubd_logo.png";
 
 const STATUS_POLL_INTERVAL_MS = 30_000;
 
