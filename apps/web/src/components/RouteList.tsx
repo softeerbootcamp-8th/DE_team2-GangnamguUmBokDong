@@ -1,19 +1,7 @@
 import { Check, CheckCheck, CircleX, Clock3, Play, Route as RouteIcon, Timer } from "lucide-react";
-import { useMemo, useState } from "react";
+import { useMemo } from "react";
 import type { Alert, DispatchCenter, Route, RouteStatus } from "../api";
-import { formatIsoTime } from "../format";
-import { alertScoreMap, estimateRoute, formatRouteDuration, routeKind, routePriority } from "../routeOperations";
-import { RegionTabs } from "./RegionTabs";
-
-type RouteTab = "all" | RouteStatus;
-
-const TABS: { key: RouteTab; label: string }[] = [
-  { key: "all", label: "전체" },
-  { key: "proposed", label: "승인 대기" },
-  { key: "dispatched", label: "작업중" },
-  { key: "completed", label: "완료" },
-  { key: "cancelled", label: "취소" },
-];
+import { alertScoreMap, estimateRoute, formatRouteDuration, isVisibleWorkRoute, routeKind, routePriority } from "../routeOperations";
 
 const STATUS_META: Record<
   RouteStatus,
@@ -29,11 +17,9 @@ interface Props {
   routes: Route[];
   alerts: Alert[];
   regions: DispatchCenter[];
-  selectedRegion: string;
   selectedRouteId: string | null;
   busyRouteId: string | null;
   transitionError: string | null;
-  onRegionChange: (region: string) => void;
   onSelect: (route: Route) => void;
   onDispatch: (route: Route) => void;
   onComplete: (route: Route) => void;
@@ -54,17 +40,15 @@ export function RouteList({
   routes,
   alerts,
   regions,
-  selectedRegion,
   selectedRouteId,
   busyRouteId,
   transitionError,
-  onRegionChange,
   onSelect,
   onDispatch,
   onComplete,
   onCancel,
 }: Props) {
-  const [tab, setTab] = useState<RouteTab>("all");
+  const now = Date.now();
   const priorityScores = useMemo(() => alertScoreMap(alerts), [alerts]);
   const ordered = useMemo(() => {
     const statusOrder: Record<RouteStatus, number> = {
@@ -74,126 +58,134 @@ export function RouteList({
       cancelled: 3,
     };
     return routes
-      .filter((route) => tab === "all" || route.status === tab)
+      .filter((route) => isVisibleWorkRoute(route, now))
       .map((route) => ({
         route,
         estimate: estimateRoute(route, regions),
         priority: routePriority(route, priorityScores),
       }))
       .sort((left, right) => {
-        if (tab === "all" && statusOrder[left.route.status] !== statusOrder[right.route.status]) {
+        if (statusOrder[left.route.status] !== statusOrder[right.route.status]) {
           return statusOrder[left.route.status] - statusOrder[right.route.status];
         }
         if (right.priority !== left.priority) return right.priority - left.priority;
         return left.route.route_id.localeCompare(right.route.route_id);
       });
-  }, [routes, tab, regions, priorityScores]);
+  }, [routes, regions, priorityScores, now]);
+  const candidates = ordered.filter(({ route }) => route.status === "proposed");
+  const operations = ordered.filter(({ route }) => route.status !== "proposed");
+
+  function renderRouteCard({ route, estimate, priority }: (typeof ordered)[number]) {
+    const status = STATUS_META[route.status];
+    const StatusIcon = status.icon;
+    const isSelected = route.route_id === selectedRouteId;
+    const isBusy = route.route_id === busyRouteId;
+    const transitionsBlocked = busyRouteId !== null;
+    const hasActions = route.status === "proposed" || route.status === "dispatched";
+    return (
+      <li key={route.route_id}>
+        <article
+          className={`route-card${isSelected ? " selected" : ""}${hasActions ? " has-actions" : ""}`}
+          aria-current={isSelected ? "true" : undefined}
+        >
+          <button type="button" className="route-card-main" onClick={() => onSelect(route)}>
+            <span className={`route-status-icon ${status.className}`} aria-hidden="true">
+              <StatusIcon size={16} />
+            </span>
+            <span className="route-card-copy">
+              <span className="route-card-title">
+                <RouteIcon size={15} aria-hidden="true" />
+                {route.region} {routeKind(route)}
+              </span>
+              <span className="route-card-summary">{routeSummary(route)}</span>
+              <span className="route-card-meta">
+                <span>현재 우선도 {Math.round(priority)}</span>
+                {estimate && (
+                  <span title="직선거리×1.25, 도심 18km/h, 정차 4분, 자전거 1대당 30초 기준">
+                    <Timer size={11} aria-hidden="true" />
+                    예상 {estimate.distanceKm.toFixed(1)}km · 약 {formatRouteDuration(estimate.durationMinutes)}
+                  </span>
+                )}
+              </span>
+            </span>
+          </button>
+
+          <div className="route-card-actions">
+            {route.status === "proposed" && (
+              <button
+                type="button"
+                className="route-action primary icon-only"
+                disabled={transitionsBlocked}
+                onClick={() => onDispatch(route)}
+                aria-label={isBusy ? "처리 중" : "승인"}
+                title={isBusy ? "승인 처리 중" : "작업 승인"}
+              >
+                <Check size={14} aria-hidden="true" />
+              </button>
+            )}
+            {route.status === "dispatched" && (
+              <>
+                <button
+                  type="button"
+                  className="route-action primary icon-only"
+                  disabled={transitionsBlocked}
+                  onClick={() => onComplete(route)}
+                  aria-label="완료"
+                  title="작업 완료"
+                >
+                  <CheckCheck size={14} aria-hidden="true" />
+                </button>
+                <button
+                  type="button"
+                  className="route-action danger icon-only"
+                  disabled={transitionsBlocked}
+                  onClick={() => onCancel(route)}
+                  aria-label="취소"
+                  title="작업 취소"
+                >
+                  <CircleX size={14} aria-hidden="true" />
+                </button>
+              </>
+            )}
+          </div>
+        </article>
+      </li>
+    );
+  }
 
   return (
     <div className="route-list-wrap">
-      <RegionTabs regions={regions} selectedRegion={selectedRegion} onChange={onRegionChange} />
-
-      <div className="filter-tab-row" role="tablist" aria-label="작업 상태">
-        {TABS.map((item) => (
-          <button
-            key={item.key}
-            type="button"
-            role="tab"
-            aria-selected={tab === item.key}
-            className={`alert-tab${tab === item.key ? " active" : ""}`}
-            onClick={() => setTab(item.key)}
-          >
-            {item.label}
-          </button>
-        ))}
-      </div>
-
       {transitionError && (
         <p className="route-transition-error" role="status">
           {transitionError}
         </p>
       )}
 
-      {ordered.length === 0 ? (
-        <p className="empty-state">해당 상태의 작업이 없습니다.</p>
-      ) : (
-        <ul className="route-list">
-          {ordered.map(({ route, estimate, priority }) => {
-            const status = STATUS_META[route.status];
-            const StatusIcon = status.icon;
-            const isSelected = route.route_id === selectedRouteId;
-            const isBusy = route.route_id === busyRouteId;
-            const transitionsBlocked = busyRouteId !== null;
-            return (
-              <li key={route.route_id}>
-                <article
-                  className={`route-card${isSelected ? " selected" : ""}`}
-                  aria-current={isSelected ? "true" : undefined}
-                >
-                  <button type="button" className="route-card-main" onClick={() => onSelect(route)}>
-                    <span className={`route-status-icon ${status.className}`} aria-hidden="true">
-                      <StatusIcon size={16} />
-                    </span>
-                    <span className="route-card-copy">
-                      <span className="route-card-title">
-                        <RouteIcon size={15} aria-hidden="true" />
-                        {route.region} {routeKind(route)}
-                      </span>
-                      <span className="route-card-summary">{routeSummary(route)}</span>
-                      <span className="route-card-meta">
-                        <span>현재 우선도 {Math.round(priority)}</span>
-                        {estimate && (
-                          <span title="직선거리×1.25, 도심 18km/h, 정차 4분, 자전거 1대당 30초 기준">
-                            <Timer size={11} aria-hidden="true" />
-                            예상 {estimate.distanceKm.toFixed(1)}km · 약 {formatRouteDuration(estimate.durationMinutes)}
-                          </span>
-                        )}
-                        <span>제안 {formatIsoTime(route.proposed_at, { hour: "2-digit", minute: "2-digit" })}</span>
-                      </span>
-                    </span>
-                  </button>
+      <div className="route-workspace">
+        <section className="route-column" aria-labelledby="candidate-routes-heading">
+          <h3 id="candidate-routes-heading">
+            <span>작업 후보</span>
+            <strong>{candidates.length}</strong>
+          </h3>
+          {candidates.length === 0 ? (
+            <p className="empty-state">작업 후보가 없습니다.</p>
+          ) : (
+            <ul className="route-column-list">{candidates.map(renderRouteCard)}</ul>
+          )}
+        </section>
 
-                  <div className="route-card-actions">
-                    {route.status === "proposed" && (
-                      <button
-                        type="button"
-                        className="route-action primary"
-                        disabled={transitionsBlocked}
-                        onClick={() => onDispatch(route)}
-                      >
-                        <Check size={14} aria-hidden="true" />
-                        {isBusy ? "처리 중" : "승인"}
-                      </button>
-                    )}
-                    {route.status === "dispatched" && (
-                      <>
-                        <button
-                          type="button"
-                          className="route-action primary"
-                          disabled={transitionsBlocked}
-                          onClick={() => onComplete(route)}
-                        >
-                          <CheckCheck size={14} aria-hidden="true" />
-                          완료
-                        </button>
-                        <button
-                          type="button"
-                          className="route-action danger"
-                          disabled={transitionsBlocked}
-                          onClick={() => onCancel(route)}
-                        >
-                          <CircleX size={14} aria-hidden="true" />
-                          취소
-                        </button>
-                      </>
-                    )}
-                  </div>
-                </article>
-              </li>
-            );
-          })}
-        </ul>
-      )}
+        <section className="route-column" aria-labelledby="active-routes-heading">
+          <h3 id="active-routes-heading">
+            <span>작업 현황</span>
+            <strong>{operations.length}</strong>
+          </h3>
+          {operations.length === 0 ? (
+            <p className="empty-state">진행되었거나 종료된 작업이 없습니다.</p>
+          ) : (
+            <ul className="route-column-list">{operations.map(renderRouteCard)}</ul>
+          )}
+        </section>
+      </div>
     </div>
   );
 }

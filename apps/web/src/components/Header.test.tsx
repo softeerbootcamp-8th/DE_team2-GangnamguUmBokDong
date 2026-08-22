@@ -27,7 +27,7 @@ describe("Header status polling", () => {
     apiMock.status
       .mockResolvedValueOnce({ base_dttm: "2026-08-20T00:00:00Z" })
       .mockRejectedValueOnce(new Error("network unavailable"));
-    render(<Header />);
+    render(<Header regions={[]} selectedRegion="all" stationsUpdatedAt={null} onRegionChange={vi.fn()} />);
     await act(async () => {
       await Promise.resolve();
       await Promise.resolve();
@@ -49,7 +49,7 @@ describe("Header status polling", () => {
       resolveOld = resolve;
     });
     apiMock.status.mockReturnValueOnce(oldRequest).mockRejectedValueOnce(new Error("network unavailable"));
-    render(<Header />);
+    render(<Header regions={[]} selectedRegion="all" stationsUpdatedAt={null} onRegionChange={vi.fn()} />);
     expect(screen.getByText("예측 시각 -")).not.toBeNull();
 
     await act(async () => {

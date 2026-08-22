@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { Alert, DispatchCenter, Route } from "./api";
-import { alertScoreMap, estimateRoute, formatRouteDuration, isRebalanceRoute, routeKind, routePriority } from "./routeOperations";
+import { alertScoreMap, estimateRoute, formatRouteDuration, isRebalanceRoute, isVisibleWorkRoute, routeKind, routePriority } from "./routeOperations";
 
 const CENTERS: DispatchCenter[] = [{ region: "강남", lat: 37.5, lon: 127.0 }];
 const ROUTE: Route = {
@@ -39,5 +39,13 @@ describe("routeOperations", () => {
       stops: ROUTE.stops.map((stop) => stop.action === "dropoff" ? { ...stop, bike_cnt: 2 } : stop),
     })).toBe(false);
     expect(routeKind(ROUTE)).toBe("재배치");
+  });
+
+  it("완료되지 않은 제안은 최근 10분 이내일 때만 표시한다", () => {
+    const now = Date.parse("2026-08-21T03:10:00Z");
+
+    expect(isVisibleWorkRoute(ROUTE, now)).toBe(true);
+    expect(isVisibleWorkRoute({ ...ROUTE, proposed_at: "2026-08-21T02:59:59Z" }, now)).toBe(false);
+    expect(isVisibleWorkRoute({ ...ROUTE, status: "dispatched" }, now)).toBe(true);
   });
 });

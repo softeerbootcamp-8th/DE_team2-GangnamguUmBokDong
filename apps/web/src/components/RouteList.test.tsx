@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Alert, DispatchCenter, Route } from "../api";
 import { RouteList } from "./RouteList";
 import { RouteStopRail } from "./RouteStopRail";
@@ -77,11 +77,9 @@ function renderRouteList(overrides: Partial<React.ComponentProps<typeof RouteLis
     routes: ROUTES,
     alerts: ALERTS,
     regions: REGIONS,
-    selectedRegion: "all",
     selectedRouteId: null,
     busyRouteId: null,
     transitionError: null,
-    onRegionChange: vi.fn(),
     onSelect: vi.fn(),
     onDispatch: vi.fn(),
     onComplete: vi.fn(),
@@ -92,18 +90,23 @@ function renderRouteList(overrides: Partial<React.ComponentProps<typeof RouteLis
   return props;
 }
 
-afterEach(cleanup);
+beforeEach(() => {
+  vi.useFakeTimers();
+  vi.setSystemTime(new Date("2026-08-21T03:05:00Z"));
+});
+
+afterEach(() => {
+  cleanup();
+  vi.useRealTimers();
+});
 
 describe("RouteList", () => {
-  it("권역 선택과 상태 탭 필터를 연결한다", () => {
-    const props = renderRouteList();
-
-    fireEvent.click(screen.getByRole("button", { name: "영남" }));
-    expect(props.onRegionChange).toHaveBeenCalledWith("영남");
-
-    fireEvent.click(screen.getByRole("tab", { name: "승인 대기" }));
+  it("작업 상태별 2열 목록을 표시한다", () => {
+    renderRouteList();
+    expect(screen.getByRole("heading", { name: /작업 후보/ })).not.toBeNull();
+    expect(screen.getByRole("heading", { name: /작업 현황/ })).not.toBeNull();
     expect(screen.getByText("대여소 2곳 · 회수 2대 · 공급 2대")).not.toBeNull();
-    expect(screen.queryByText("대여소 0곳 · 회수 0대 · 공급 0대")).toBeNull();
+    expect(screen.getByText("대여소 0곳 · 회수 0대 · 공급 0대")).not.toBeNull();
   });
 
   it("작업 상태에 맞는 승인·완료·취소 동작을 호출한다", () => {
@@ -116,6 +119,15 @@ describe("RouteList", () => {
     expect(props.onDispatch).toHaveBeenCalledWith(ROUTES[0]);
     expect(props.onComplete).toHaveBeenCalledWith(ROUTES[1]);
     expect(props.onCancel).toHaveBeenCalledWith(ROUTES[1]);
+  });
+
+  it("10분이 지난 미승인 제안은 작업 후보에서 제외한다", () => {
+    renderRouteList({
+      routes: [{ ...ROUTES[0], proposed_at: "2026-08-21T02:54:59Z" }],
+    });
+
+    expect(screen.getByText("작업 후보가 없습니다.")).not.toBeNull();
+    expect(screen.queryByRole("button", { name: "승인" })).toBeNull();
   });
 });
 

@@ -5,6 +5,8 @@ const ROAD_DISTANCE_FACTOR = 1.25;
 const URBAN_TRUCK_SPEED_KMH = 18;
 const STOP_SERVICE_MINUTES = 4;
 const BIKE_HANDLING_MINUTES = 0.5;
+const CANDIDATE_MAX_AGE_MS = 10 * 60 * 1000;
+const CANDIDATE_FUTURE_GRACE_MS = 5 * 60 * 1000;
 
 interface Point {
   lat: number;
@@ -79,6 +81,14 @@ export function isRebalanceRoute(route: Route): boolean {
     .filter((stop) => stop.action === "dropoff")
     .reduce((total, stop) => total + stop.bike_cnt, 0);
   return pickupQuantity > 0 && pickupQuantity === dropoffQuantity;
+}
+
+export function isVisibleWorkRoute(route: Route, nowMs: number = Date.now()): boolean {
+  if (route.status !== "proposed") return true;
+  const proposedAt = Date.parse(route.proposed_at);
+  return Number.isFinite(proposedAt)
+    && proposedAt >= nowMs - CANDIDATE_MAX_AGE_MS
+    && proposedAt <= nowMs + CANDIDATE_FUTURE_GRACE_MS;
 }
 
 export function routeKind(route: Route): "재배치" | "센터 회수" | "센터 공급" {
