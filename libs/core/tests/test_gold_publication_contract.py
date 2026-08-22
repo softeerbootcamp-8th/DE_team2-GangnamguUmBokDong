@@ -391,17 +391,20 @@ def test_registry_matches_all_ten_ssot_publication_keys() -> None:
             ("station", "station_demand_forecast", "station_stock"),
             (
                 "demand_publication_manifest",
-                "stock_history_manifest_01",
-                "stock_history_manifest_02",
-                "stock_history_manifest_03",
-                "stock_history_manifest_04",
-                "stock_history_manifest_05",
+                # 위치 index가 아니라 offset(분)에서 유도한다. 결측 window가
+                # 허용되므로 어떤 window를 썼는지 role로 드러나야 한다.
+                "stock_history_manifest_m05",
+                "stock_history_manifest_m10",
+                "stock_history_manifest_m15",
+                "stock_history_manifest_m20",
+                "stock_history_manifest_m25",
                 "stock_publication_manifest",
                 "urgency_output",
             ),
             (
                 "expected_sta_id_sha256",
                 "scoring_config_version",
+                "stock_history_offsets",
                 "stock_window_count",
             ),
             ("station_urgency",),

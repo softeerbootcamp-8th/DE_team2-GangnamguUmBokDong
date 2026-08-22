@@ -11,6 +11,7 @@ from enum import StrEnum
 from types import MappingProxyType
 from typing import Any, cast
 
+from ..scoring_config import URGENCY_STOCK_HISTORY_OFFSETS_MINUTES
 from .canonical import (
     canonical_json_bytes,
     format_utc_dttm,
@@ -560,17 +561,24 @@ _REGISTRY = {
         dependencies=("station", "station_demand_forecast", "station_stock"),
         input_roles=(
             _role("demand_publication_manifest"),
-            _role("stock_history_manifest_01"),
-            _role("stock_history_manifest_02"),
-            _role("stock_history_manifest_03"),
-            _role("stock_history_manifest_04"),
-            _role("stock_history_manifest_05"),
+            # role을 위치 index가 아니라 offset에서 유도한다. 어떤 window를 썼는지
+            # manifest만 봐도 드러나고, 이름을 손으로 나열하면 scoring config가
+            # 바뀔 때 조용히 어긋난다. minimum=0인 이유는 지나간 5분 tick의 실시간
+            # 스냅샷이 소급 수집 불가라 window 하나가 영구히 없을 수 있기 때문이다
+            # (하한은 URGENCY_STOCK_HISTORY_MIN_WINDOWS로 gold/urgency.py가 본다).
+            # input_roles는 role 이름 오름차순이어야 하므로 m05..m25 순으로 낸다
+            # (offset 자체는 -25가 먼저인 oldest-first다).
+            *(
+                _role(f"stock_history_manifest_m{abs(offset):02d}", minimum=0)
+                for offset in sorted(URGENCY_STOCK_HISTORY_OFFSETS_MINUTES, reverse=True)
+            ),
             _role("stock_publication_manifest"),
             _role("urgency_output"),
         ),
         parameter_names=(
             "expected_sta_id_sha256",
             "scoring_config_version",
+            "stock_history_offsets",
             "stock_window_count",
         ),
         output_targets=(("station_urgency", "station_urgency"),),
