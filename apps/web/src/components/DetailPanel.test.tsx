@@ -95,7 +95,7 @@ function renderDetail(onFocusEvent = vi.fn()) {
 }
 
 describe("DetailPanel stale state", () => {
-  it("대여소명·주소·도넛 재고와 재고 갱신시각만 표시한다", async () => {
+  it("대여소명·주소와 도넛 재고만 표시한다", async () => {
     renderDetail();
     await settleRequests();
 
@@ -104,7 +104,7 @@ describe("DetailPanel stale state", () => {
     expect(screen.getByRole("img", { name: "현재 자전거 3대, 거치대 10대" })).not.toBeNull();
     expect(screen.queryByText("현재 자전거")).toBeNull();
     expect(screen.queryByText("30% 이용 가능")).toBeNull();
-    expect(screen.getByText("재고 갱신")).not.toBeNull();
+    expect(screen.queryByText("재고 갱신")).toBeNull();
   });
 
   it("station polling 실패 뒤 이전 상세를 지운다", async () => {

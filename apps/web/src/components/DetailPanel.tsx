@@ -241,10 +241,6 @@ export function DetailPanel({ stationId, stationPoint, onFocusEvent }: Props) {
                 </div>
               </div>
 
-              <p className="station-stock-updated">
-                <span>재고 갱신</span>
-                <time dateTime={detail.base_dttm}>{formatIsoTime(detail.base_dttm)}</time>
-              </p>
             </div>
           )
         ) : tab === "events" ? (

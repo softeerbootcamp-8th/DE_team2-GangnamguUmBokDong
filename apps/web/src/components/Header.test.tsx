@@ -46,7 +46,7 @@ describe("Header status polling", () => {
       await Promise.resolve();
       await Promise.resolve();
     });
-    expect(screen.getByText(/^예측 시각 /).textContent).not.toBe("예측 시각 -");
+    expect(screen.getByText(/^기준 시각 /).textContent).not.toBe("기준 시각 -");
 
     await act(async () => {
       vi.advanceTimersByTime(30_000);
@@ -54,7 +54,7 @@ describe("Header status polling", () => {
       await Promise.resolve();
     });
 
-    expect(screen.getByText("예측 시각 갱신 실패")).not.toBeNull();
+    expect(screen.getByText("기준 시각 갱신 실패")).not.toBeNull();
   });
 
   it("초기 loading과 실패를 구분하고 느린 이전 성공을 무시한다", async () => {
@@ -64,14 +64,14 @@ describe("Header status polling", () => {
     });
     apiMock.status.mockReturnValueOnce(oldRequest).mockRejectedValueOnce(new Error("network unavailable"));
     render(<Header regions={[]} selectedRegion="all" stationsUpdatedAt={null} onRegionChange={vi.fn()} />);
-    expect(screen.getByText("예측 시각 -")).not.toBeNull();
+    expect(screen.getByText("기준 시각 -")).not.toBeNull();
 
     await act(async () => {
       vi.advanceTimersByTime(30_000);
       await Promise.resolve();
       await Promise.resolve();
     });
-    expect(screen.getByText("예측 시각 갱신 실패")).not.toBeNull();
+    expect(screen.getByText("기준 시각 갱신 실패")).not.toBeNull();
 
     resolveOld({ base_dttm: "2026-08-20T00:00:00Z" });
     await act(async () => {
@@ -79,6 +79,6 @@ describe("Header status polling", () => {
       await Promise.resolve();
     });
 
-    expect(screen.getByText("예측 시각 갱신 실패")).not.toBeNull();
+    expect(screen.getByText("기준 시각 갱신 실패")).not.toBeNull();
   });
 });
