@@ -42,11 +42,11 @@ _ROUTE_ARTIFACT_SET_BYTES = (
 _ROUTE_ARTIFACT_SET_SHA256 = (
     "576eec2c53f1be8985ce531f512f4f4014fe05879d1f53714128dd774d8abf87"
 )
-_ROUTE_INPUT_SHA256 = "0de0cd4437f089bec16b778cf927c1fef732cd349dca7533a465100b94c5454e"
+_ROUTE_INPUT_SHA256 = "28fb19c7b43c003042c2564d62b8e735e9ac2df4852e6b0591dee05d6a10dbf0"
 _ID_SET_BYTES = b'{"ids":["ST-1","ST-2"],"schema_version":"gold-id-set-v1"}'
 _ID_SET_SHA256 = "a080d2f47ea7c4d0f5d27704264ed23d5a93ec525dd12544812f81b3519fa52f"
 _ROUTE_MANIFEST_SHA256 = (
-    "01b04e4af53f338184842157ac269915b1be70e45073d1f12b35184e598a49cf"
+    "003d0cbcfe90537d1fd9562bf36e62e00f80391e1b6954e777f14985de5d8545"
 )
 
 
@@ -132,6 +132,7 @@ def _route_input_fingerprint() -> InputFingerprint:
     parameters = (
         Parameter("max_routes_per_center", "3"),
         Parameter("max_stops_per_route", "8"),
+        Parameter("rebalance_policy_config", "{}"),
         Parameter("truck_capacity_config_version", "truck-capacity-v1"),
         Parameter("truck_capacity", "20"),
         Parameter(
@@ -233,6 +234,7 @@ def _demand_fingerprint() -> InputFingerprint:
         ),
         (
             Parameter("rounding_mode", "roundTiesToEven"),
+            Parameter("quantile_policy_decision", "{}"),
             Parameter("horizon_count", "12"),
             Parameter("expected_sta_id_sha256", _ID_SET_SHA256),
         ),
@@ -354,7 +356,12 @@ def test_registry_matches_all_ten_ssot_publication_keys() -> None:
         "station_demand_forecast": (
             ("station",),
             ("inference_output", "rental_model_manifest", "return_model_manifest"),
-            ("expected_sta_id_sha256", "horizon_count", "rounding_mode"),
+            (
+                "expected_sta_id_sha256",
+                "horizon_count",
+                "quantile_policy_decision",
+                "rounding_mode",
+            ),
             ("station_demand_forecast",),
             ("station_demand_forecast",),
             "station_demand_forecast",
@@ -401,6 +408,8 @@ def test_registry_matches_all_ten_ssot_publication_keys() -> None:
             ),
             (
                 "expected_sta_id_sha256",
+                "quantile_policy_decision",
+                "rebalance_policy_config",
                 "scoring_config_version",
                 "stock_window_count",
             ),
@@ -421,6 +430,7 @@ def test_registry_matches_all_ten_ssot_publication_keys() -> None:
             (
                 "max_routes_per_center",
                 "max_stops_per_route",
+                "rebalance_policy_config",
                 "route_algorithm_version",
                 "route_coverage_sha256",
                 "route_work_unit_config_version",

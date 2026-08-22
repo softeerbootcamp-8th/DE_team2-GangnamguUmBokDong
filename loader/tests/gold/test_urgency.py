@@ -22,7 +22,6 @@ from core.source_snapshot import (
     SourceSnapshotStatus,
     build_source_snapshot_manifest,
 )
-
 from gold.common import parquet_bytes
 from gold.demand import DemandForecastRecord
 from gold.rebalance_policy import risk_band_policy
@@ -35,6 +34,7 @@ from gold.urgency import (
     UrgencyCalculationInputs,
     UrgencyProjection,
     UrgencyRecord,
+    _bike_qty_quantile_guard_v3,
     _bike_qty_risk_band_v2,
     _bike_qty_v1,
     _history_window_from_manifest,
@@ -458,6 +458,44 @@ def test_risk_band_pickup_limits_single_decision_stock_fraction() -> None:
             policy,
         )
         == 8
+    )
+
+
+def test_quantile_guard_limits_validated_target_with_q10_q90_safety_band() -> None:
+    """검증된 목표 수량을 tail 안전량과 회수 상한으로 제한한다."""
+    forecasts = [
+        DemandForecastRecord(
+            base_dttm=BASE,
+            sta_id="ST-1",
+            predicted_dttm=BASE + timedelta(hours=horizon),
+            predicted_rent_cnt=0,
+            predicted_rtn_cnt=0,
+            predicted_rent_p10=0.0,
+            predicted_rent_p50=0.0,
+            predicted_rent_p90=5.0,
+            predicted_rtn_p10=0.0,
+            predicted_rtn_p50=0.0,
+            predicted_rtn_p90=1.0,
+        )
+        for horizon in (1, 2)
+    ]
+    policy = risk_band_policy(
+        protection_horizon_hours=2,
+        minimum_stock_ratio=0.2,
+        uncertainty_z=0.0,
+        max_pickup_stock_fraction=0.15,
+    )
+
+    assert (
+        _bike_qty_quantile_guard_v3(
+            40,
+            10,
+            "retrieval_needed",
+            forecasts,
+            policy,
+            desired_quantity=30,
+        )
+        == 6
     )
 
 

@@ -44,6 +44,12 @@ def _prediction(
         target_dttm=target or base + timedelta(hours=horizon - 1),
         rental_pred_mean=rental,
         return_pred_mean=returned,
+        rental_pred_p10=0.0,
+        rental_pred_p50=1.0,
+        rental_pred_p90=2.0,
+        return_pred_p10=0.0,
+        return_pred_p50=1.0,
+        return_pred_p90=2.0,
     )
 
 
@@ -96,7 +102,7 @@ def test_projection_accepts_plan_expected_subset_of_active_model_support() -> No
 def _inference_authority_payload(
     station_ids: tuple[str, ...] = ("ST-1",),
 ) -> bytes:
-    """Core contract로 canonical 7-column inference authority bytes를 만든다."""
+    """Core contract로 canonical 13-column inference authority bytes를 만든다."""
     local_base = BASE + timedelta(hours=9)
     rows = []
     for station_id in station_ids:
@@ -110,8 +116,13 @@ def _inference_authority_payload(
                     "minute": target.minute,
                     "horizon": horizon,
                     "rental_pred_mean": float(horizon) + 0.5,
+                    "rental_pred_p10": float(horizon),
+                    "rental_pred_p50": float(horizon) + 0.5,
+                    "rental_pred_p90": float(horizon) + 1.0,
                     "return_pred_mean": float(horizon) + 1.5,
-                    "rental_pred_p50": 999.0,
+                    "return_pred_p10": float(horizon) + 1.0,
+                    "return_pred_p50": float(horizon) + 1.5,
+                    "return_pred_p90": float(horizon) + 2.0,
                 }
             )
     table = canonicalize_inference_output_table(
@@ -138,6 +149,12 @@ def test_inference_authority_adapter_uses_core_exact_schema_and_utc_anchor() -> 
         target_dttm=BASE,
         rental_pred_mean=1.5,
         return_pred_mean=2.5,
+        rental_pred_p10=1.0,
+        rental_pred_p50=1.5,
+        rental_pred_p90=2.0,
+        return_pred_p10=2.0,
+        return_pred_p50=2.5,
+        return_pred_p90=3.0,
     )
     assert records[-1].target_dttm == BASE + timedelta(hours=11)
 
@@ -196,6 +213,12 @@ def test_prediction_wraps_datetime_overflow_as_contract_failure() -> None:
             target_dttm=datetime.max.replace(tzinfo=UTC),
             rental_pred_mean=1.0,
             return_pred_mean=1.0,
+            rental_pred_p10=0.0,
+            rental_pred_p50=1.0,
+            rental_pred_p90=2.0,
+            return_pred_p10=0.0,
+            return_pred_p50=1.0,
+            return_pred_p90=2.0,
         )
 
 
@@ -354,9 +377,15 @@ def test_fixed_schema_parquet_round_trip_is_exact() -> None:
             pa.field("base_dttm", pa.timestamp("us", tz="UTC"), nullable=False),
             pa.field("sta_id", pa.string(), nullable=False),
             pa.field("predicted_dttm", pa.timestamp("us", tz="UTC"), nullable=False),
-            pa.field("predicted_rent_cnt", pa.int32(), nullable=False),
-            pa.field("predicted_rtn_cnt", pa.int32(), nullable=False),
-        )
+                pa.field("predicted_rent_cnt", pa.int32(), nullable=False),
+                pa.field("predicted_rtn_cnt", pa.int32(), nullable=False),
+                pa.field("predicted_rent_p10", pa.float64(), nullable=True),
+                pa.field("predicted_rent_p50", pa.float64(), nullable=True),
+                pa.field("predicted_rent_p90", pa.float64(), nullable=True),
+                pa.field("predicted_rtn_p10", pa.float64(), nullable=True),
+                pa.field("predicted_rtn_p50", pa.float64(), nullable=True),
+                pa.field("predicted_rtn_p90", pa.float64(), nullable=True),
+            )
     )
     assert (
         demand_records_from_parquet(

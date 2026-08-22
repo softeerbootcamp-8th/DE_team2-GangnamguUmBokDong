@@ -50,12 +50,17 @@ from .common import (
     publish_verified,
     read_parquet_bytes,
 )
+from .rebalance_policy import (
+    QuantilePolicyDecision,
+    decide_quantile_policy,
+    fallback_quantile_policy,
+)
 from .state import load_dependencies
 from .versioning import PublicationCandidate, allocate_revision
 
 HORIZON_COUNT = 12
 POSTGRES_INTEGER_MAX = 2_147_483_647
-DEMAND_PUBLISHER_VERSION = "gold-demand-publisher-v1"
+DEMAND_PUBLISHER_VERSION = "gold-demand-publisher-v2"
 ROUNDING_MODE = "roundTiesToEven"
 _STATION_ID = re.compile(r"ST-[0-9]+\Z")
 _DEMAND_FORECAST_SCHEMA = pa.schema(
@@ -65,6 +70,12 @@ _DEMAND_FORECAST_SCHEMA = pa.schema(
         pa.field("predicted_dttm", pa.timestamp("us", tz="UTC"), nullable=False),
         pa.field("predicted_rent_cnt", pa.int32(), nullable=False),
         pa.field("predicted_rtn_cnt", pa.int32(), nullable=False),
+        pa.field("predicted_rent_p10", pa.float64(), nullable=True),
+        pa.field("predicted_rent_p50", pa.float64(), nullable=True),
+        pa.field("predicted_rent_p90", pa.float64(), nullable=True),
+        pa.field("predicted_rtn_p10", pa.float64(), nullable=True),
+        pa.field("predicted_rtn_p50", pa.float64(), nullable=True),
+        pa.field("predicted_rtn_p90", pa.float64(), nullable=True),
     )
 )
 
@@ -81,6 +92,7 @@ class DemandInferenceSnapshot:
     return_support_sta_ids: tuple[str, ...]
     expected_sta_ids: tuple[str, ...]
     predictions: tuple[DemandPredictionRecord, ...]
+    quantile_policy_decision: QuantilePolicyDecision
 
     def __post_init__(self) -> None:
         """Snapshot field가 exact typed contract와 canonical station 집합인지 검증한다."""
@@ -110,11 +122,13 @@ class DemandInferenceSnapshot:
             raise ContractViolation(
                 "inference predictions는 DemandPredictionRecord tuple이어야 합니다."
             )
+        if type(self.quantile_policy_decision) is not QuantilePolicyDecision:
+            raise ContractViolation("quantile policy decision 타입이 잘못됐습니다.")
 
 
 @dataclass(frozen=True, slots=True)
 class DemandPredictionRecord:
-    """Gold 변환 직전의 typed inference mean 예측 행을 표현한다."""
+    """Gold 변환 직전의 typed inference 평균·분위수 예측 행을 표현한다."""
 
     base_dttm: datetime
     station_id: str
@@ -122,6 +136,12 @@ class DemandPredictionRecord:
     target_dttm: datetime
     rental_pred_mean: float
     return_pred_mean: float
+    rental_pred_p10: float | None = None
+    rental_pred_p50: float | None = None
+    rental_pred_p90: float | None = None
+    return_pred_p10: float | None = None
+    return_pred_p50: float | None = None
+    return_pred_p90: float | None = None
 
     def __post_init__(self) -> None:
         """source의 base·horizon·구간 시작시각·float64 계약을 검증한다."""
@@ -143,6 +163,24 @@ class DemandPredictionRecord:
             )
         _prediction_mean(self.rental_pred_mean, "rental_pred_mean")
         _prediction_mean(self.return_pred_mean, "return_pred_mean")
+        rental_quantiles = (
+            self.rental_pred_p10,
+            self.rental_pred_p50,
+            self.rental_pred_p90,
+        )
+        return_quantiles = (
+            self.return_pred_p10,
+            self.return_pred_p50,
+            self.return_pred_p90,
+        )
+        if (all(value is None for value in rental_quantiles)) != (
+            all(value is None for value in return_quantiles)
+        ):
+            raise ContractViolation(
+                "대여·반납 inference quantile은 함께 존재하거나 함께 없어야 합니다."
+            )
+        _prediction_quantiles(rental_quantiles, "rental", allow_missing=True)
+        _prediction_quantiles(return_quantiles, "return", allow_missing=True)
 
 
 @dataclass(frozen=True, slots=True)
@@ -154,6 +192,12 @@ class DemandForecastRecord:
     predicted_dttm: datetime
     predicted_rent_cnt: int
     predicted_rtn_cnt: int
+    predicted_rent_p10: float | None = None
+    predicted_rent_p50: float | None = None
+    predicted_rent_p90: float | None = None
+    predicted_rtn_p10: float | None = None
+    predicted_rtn_p50: float | None = None
+    predicted_rtn_p90: float | None = None
 
     def __post_init__(self) -> None:
         """target DDL의 key·시간·PostgreSQL INTEGER 계약을 검증한다."""
@@ -166,6 +210,36 @@ class DemandForecastRecord:
             raise ContractViolation("predicted_dttm은 base_dttm 후여야 합니다.")
         _postgres_nonnegative_integer(self.predicted_rent_cnt, "predicted_rent_cnt")
         _postgres_nonnegative_integer(self.predicted_rtn_cnt, "predicted_rtn_cnt")
+        rental_quantiles = (
+            self.predicted_rent_p10,
+            self.predicted_rent_p50,
+            self.predicted_rent_p90,
+        )
+        return_quantiles = (
+            self.predicted_rtn_p10,
+            self.predicted_rtn_p50,
+            self.predicted_rtn_p90,
+        )
+        if (all(value is None for value in rental_quantiles)) != (
+            all(value is None for value in return_quantiles)
+        ):
+            raise ContractViolation(
+                "대여·반납 quantile은 함께 존재하거나 함께 없어야 합니다."
+            )
+        if any(value is not None for value in (*rental_quantiles, *return_quantiles)):
+            _prediction_quantiles(rental_quantiles, "predicted_rent")
+            _prediction_quantiles(return_quantiles, "predicted_rtn")
+
+    @property
+    def serving_values(self) -> tuple[datetime, str, datetime, int, int]:
+        """평균 정수만 보존하는 PostgreSQL serving projection 값을 반환한다."""
+        return (
+            self.base_dttm,
+            self.sta_id,
+            self.predicted_dttm,
+            self.predicted_rent_cnt,
+            self.predicted_rtn_cnt,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -303,6 +377,12 @@ def build_demand_projection(
             predicted_rtn_cnt=_round_prediction(
                 prediction.return_pred_mean, "return_pred_mean"
             ),
+            predicted_rent_p10=prediction.rental_pred_p10,
+            predicted_rent_p50=prediction.rental_pred_p50,
+            predicted_rent_p90=prediction.rental_pred_p90,
+            predicted_rtn_p10=prediction.return_pred_p10,
+            predicted_rtn_p50=prediction.return_pred_p50,
+            predicted_rtn_p90=prediction.return_pred_p90,
         )
         for prediction in sorted(
             predictions,
@@ -330,6 +410,12 @@ def demand_records_to_parquet(
                 "predicted_dttm": record.predicted_dttm,
                 "predicted_rent_cnt": record.predicted_rent_cnt,
                 "predicted_rtn_cnt": record.predicted_rtn_cnt,
+                "predicted_rent_p10": record.predicted_rent_p10,
+                "predicted_rent_p50": record.predicted_rent_p50,
+                "predicted_rent_p90": record.predicted_rent_p90,
+                "predicted_rtn_p10": record.predicted_rtn_p10,
+                "predicted_rtn_p50": record.predicted_rtn_p50,
+                "predicted_rtn_p90": record.predicted_rtn_p90,
             }
             for record in records
         ],
@@ -413,6 +499,10 @@ def publish_station_demand_forecast(
         parameters=(
             Parameter("expected_sta_id_sha256", expected_ids.sha256),
             Parameter("horizon_count", str(HORIZON_COUNT)),
+            Parameter(
+                "quantile_policy_decision",
+                snapshot.quantile_policy_decision.canonical_json,
+            ),
             Parameter("rounding_mode", ROUNDING_MODE),
         ),
         outputs=outputs,
@@ -456,6 +546,17 @@ def publish_station_demand_forecast(
             verified,
             active_sta_ids=active_sta_ids,
         )
+        parameters = {
+            item.name: item.value
+            for item in publication.input_fingerprint.parameters
+        }
+        if (
+            parameters["quantile_policy_decision"]
+            != verified.quantile_policy_decision.canonical_json
+        ):
+            raise ContractViolation(
+                "demand quantile policy decision이 pinned model metrics와 다릅니다."
+            )
         _validate_demand_artifact(publication, payloads, expected)
         return {"base_dttm": tuple(record.base_dttm for record in expected.records)}
 
@@ -542,6 +643,12 @@ def demand_predictions_from_inference_parquet(
             ),
             rental_pred_mean=row["rental_pred_mean"],
             return_pred_mean=row["return_pred_mean"],
+            rental_pred_p10=row["rental_pred_p10"],
+            rental_pred_p50=row["rental_pred_p50"],
+            rental_pred_p90=row["rental_pred_p90"],
+            return_pred_p10=row["return_pred_p10"],
+            return_pred_p50=row["return_pred_p50"],
+            return_pred_p90=row["return_pred_p90"],
         )
         for row in table.to_pylist()
     )
@@ -649,7 +756,10 @@ def _build_inference_snapshot(
         manifest.return_model_manifest,
         return_model_payload,
     )
-    del rental_model, return_model
+    quantile_policy_decision = decide_quantile_policy(
+        _model_metrics_payload(object_store, rental_model),
+        _model_metrics_payload(object_store, return_model),
+    )
     expected_ids = _read_id_set_artifact(
         object_store,
         manifest.expected_sta_ids,
@@ -674,6 +784,14 @@ def _build_inference_snapshot(
             expected_base_dttm=manifest.logical_dttm,
             expected_sta_ids=expected_ids,
         )
+    if predictions and any(
+        record.rental_pred_p10 is None or record.return_pred_p10 is None
+        for record in predictions
+    ):
+        quantile_policy_decision = fallback_quantile_policy(
+            quantile_policy_decision,
+            "inference_quantiles_missing",
+        )
     if len(predictions) != manifest.counts.actual_row_count:
         raise ContractViolation(
             "inference prediction actual row count가 manifest counts와 다릅니다."
@@ -695,7 +813,22 @@ def _build_inference_snapshot(
         return_support_sta_ids=return_support,
         expected_sta_ids=expected_ids,
         predictions=predictions,
+        quantile_policy_decision=quantile_policy_decision,
     )
+
+
+def _model_metrics_payload(
+    object_store: ImmutableObjectStore,
+    manifest: ModelSnapshotManifest,
+) -> bytes:
+    """Model manifest가 pin한 metrics artifact actual bytes를 읽는다."""
+    artifacts = tuple(
+        artifact for artifact in manifest.artifacts if artifact.role == "metrics"
+    )
+    if len(artifacts) != 1:
+        raise ContractViolation("model metrics artifact가 정확히 하나 필요합니다.")
+    artifact = artifacts[0]
+    return object_store.read_bytes(artifact.uri, artifact.byte_sha256)
 
 
 def _model_snapshot_from_payload(
@@ -928,8 +1061,9 @@ def _reconcile_demand_records(
          ORDER BY sta_id COLLATE "C", predicted_dttm
         """
     )
-    actual = tuple(DemandForecastRecord(*row) for row in cursor.fetchall())
-    if actual != records:
+    actual = tuple(cursor.fetchall())
+    expected = tuple(record.serving_values for record in records)
+    if actual != expected:
         raise ContractViolation(
             "station_demand_forecast full reconcile readback이 staging과 다릅니다."
         )
@@ -1011,6 +1145,26 @@ def _prediction_mean(value: object, name: str) -> float:
     if type(value) is not float or not math.isfinite(value) or value < 0.0:
         raise ContractViolation(f"{name}은 finite·비음수 float64여야 합니다.")
     return value
+
+
+def _prediction_quantiles(
+    values: tuple[float | None, float | None, float | None],
+    name: str,
+    *,
+    allow_missing: bool = False,
+) -> tuple[float, float, float] | tuple[None, None, None]:
+    """q10·q50·q90을 finite nonnegative 비감소 float tuple로 검증한다."""
+    if allow_missing and all(value is None for value in values):
+        return (None, None, None)
+    if any(value is None for value in values):
+        raise ContractViolation(f"{name} quantile은 세 값이 모두 필요합니다.")
+    normalized = tuple(
+        _prediction_mean(value, f"{name}_p{quantile}")
+        for value, quantile in zip(values, (10, 50, 90), strict=True)
+    )
+    if normalized != tuple(sorted(normalized)):
+        raise ContractViolation(f"{name} quantile은 p10 <= p50 <= p90이어야 합니다.")
+    return normalized
 
 
 def _round_prediction(value: float, name: str) -> int:

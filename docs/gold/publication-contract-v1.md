@@ -84,12 +84,12 @@ version을 올린다. `manifest` role은 해당 upstream manifest의 실제 byte
 | `dispatch_center` | 없음 | `dispatch_center_seed` | `center_seed_version`, `expected_center_count` |
 | `station` | `dispatch_center`, `weather_grid` | `bike_station_master_manifest`, `station_realtime_window_set`, 조건부 `station_previous_projection`, 조건부 `station_relocation_approval` | `center_assignment_version`, `grid_conversion_version`, `station_policy_version` |
 | `station_stock` | 없음; `station`과 같은 release | `bike_station_realtime_manifest` | `station_stock_policy_version` |
-| `station_demand_forecast` | `station` | `inference_output`, `rental_model_manifest`, `return_model_manifest` | `expected_sta_id_sha256`, `horizon_count`, `rounding_mode` |
+| `station_demand_forecast` | `station` | `inference_output`, `rental_model_manifest`, `return_model_manifest` | `expected_sta_id_sha256`, `horizon_count`, `quantile_policy_decision`, `rounding_mode` |
 | `weather_forecast` | `station`, `weather_grid` | `short_term_manifest`, `ultra_short_manifest` | `forecast_hour_count`, `resolver_version` |
 | `event:cultural_event` | 없음 | `cultural_event_manifest` | `event_identity_version`, `event_policy_version` |
 | `event:performance_event` | 없음 | `performance_event_manifest`, `stadium_coordinate_seed` | `event_policy_version`, `stadium_coordinate_version` |
-| `station_urgency` | `station`, `station_demand_forecast`, `station_stock` | `demand_publication_manifest`, `stock_publication_manifest`, `stock_history_manifest_01` … `stock_history_manifest_05`, `urgency_output` | `expected_sta_id_sha256`, `scoring_config_version`, `stock_window_count` |
-| `rebalance_route` | `dispatch_center`, `station`, `station_demand_forecast`, `station_stock`, `station_urgency` | `route_coverage`, `urgency_publication_manifest` | `route_algorithm_version`, `route_coverage_sha256`, `truck_capacity`, `truck_capacity_config_version` |
+| `station_urgency` | `station`, `station_demand_forecast`, `station_stock` | `demand_publication_manifest`, `stock_publication_manifest`, `stock_history_manifest_01` … `stock_history_manifest_05`, `urgency_output` | `expected_sta_id_sha256`, `quantile_policy_decision`, `rebalance_policy_config`, `scoring_config_version`, `stock_window_count` |
+| `rebalance_route` | `dispatch_center`, `station`, `station_demand_forecast`, `station_stock`, `station_urgency` | `route_coverage`, `urgency_publication_manifest` | `max_routes_per_center`, `max_stops_per_route`, `rebalance_policy_config`, `route_algorithm_version`, `route_coverage_sha256`, `route_work_unit_config_version`, `truck_capacity`, `truck_capacity_config_version` |
 
 표의 dependency 집합은 정확히 그 key들이며 각 role과 parameter는 정확히 한 번 나온다.
 `stock_history_manifest_01 … stock_history_manifest_05`는 suffix `01`, `02`, `03`, `04`,

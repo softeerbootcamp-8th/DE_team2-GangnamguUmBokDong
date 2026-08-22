@@ -429,7 +429,7 @@ def _complete_output_table(
     logical_dttm: datetime,
     expected_sta_ids: IdSet,
 ) -> pa.Table:
-    """Legacy batch result를 exact complete 7-column authority table로 바꾼다."""
+    """Legacy batch result를 exact complete 13-column authority table로 바꾼다."""
     if type(outcome) is not dict:
         raise InferencePublicationError("inference predictor 결과는 dict여야 합니다.")
     failed = outcome.get("failed")
@@ -459,7 +459,13 @@ def _complete_output_table(
                     "minute": result["minute"],
                     "horizon": result["horizon"],
                     "rental_pred_mean": result["rental"]["pred_mean"],
+                    "rental_pred_p10": result["rental"].get("pred_p10"),
+                    "rental_pred_p50": result["rental"].get("pred_p50"),
+                    "rental_pred_p90": result["rental"].get("pred_p90"),
                     "return_pred_mean": result["return"]["pred_mean"],
+                    "return_pred_p10": result["return"].get("pred_p10"),
+                    "return_pred_p50": result["return"].get("pred_p50"),
+                    "return_pred_p90": result["return"].get("pred_p90"),
                 }
             )
     except (KeyError, TypeError) as exc:

@@ -212,6 +212,11 @@ Authoritative realtime window는 station·stock 두 key를 함께 claim한 한 t
 
 ## station_demand_forecast
 
+Immutable Gold demand artifact는 아래 PostgreSQL serving 컬럼 외에도 대여·반납별
+`predicted_*_p10`, `predicted_*_p50`, `predicted_*_p90` float64를 보존한다. 여섯 값은
+모두 존재하거나 모두 null이어야 하며, 존재할 때는 p10 ≤ p50 ≤ p90을 만족한다.
+Serving 표는 기존 API·대시보드 호환을 위해 반올림 평균 수량만 적재한다.
+
 최신 완전 예측 snapshot의 대여소·대상시각 한 건이다.
 
 | 컬럼 | 타입 | Null/키 | 원천·변환 | 의미 |

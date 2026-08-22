@@ -10,6 +10,184 @@ from typing import Any
 from core.gold_publication import ContractViolation
 
 _QUANTITY_STRATEGIES = frozenset({"legacy", "risk_band"})
+QUANTILE_POLICY_TARGET_COVERAGE = 0.8
+QUANTILE_POLICY_MAX_COVERAGE_ERROR = 0.05
+QUANTILE_POLICY_GATE_VERSION = "rebalance-quantile-quality-gate-v1"
+QUANTILE_GUARD_VERSION = "rebalance-quantile-guard-v1"
+
+
+@dataclass(frozen=True, slots=True)
+class QuantilePolicyDecision:
+    """모델 calibration 근거로 quantile 수량 사용 여부를 고정한다."""
+
+    version: str
+    selected_strategy: str
+    fallback_strategy: str
+    target_coverage: float
+    max_coverage_error: float
+    rental_coverage: float | None
+    return_coverage: float | None
+    reasons: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        """결정 문서의 버전·전략·수치·사유를 검증한다."""
+        if self.version != QUANTILE_POLICY_GATE_VERSION:
+            raise ContractViolation("quantile policy gate version이 다릅니다.")
+        if self.selected_strategy not in {"quantile_guard", "risk_band"}:
+            raise ContractViolation("quantile selected strategy가 잘못됐습니다.")
+        if self.fallback_strategy != "risk_band":
+            raise ContractViolation("quantile fallback strategy는 risk_band여야 합니다.")
+        for value, name in (
+            (self.target_coverage, "target_coverage"),
+            (self.max_coverage_error, "max_coverage_error"),
+        ):
+            if type(value) is not float or not math.isfinite(value) or not 0.0 < value < 1.0:
+                raise ContractViolation(f"{name}은 0..1 finite float여야 합니다.")
+        for value, name in (
+            (self.rental_coverage, "rental_coverage"),
+            (self.return_coverage, "return_coverage"),
+        ):
+            if value is not None and (
+                type(value) is not float
+                or not math.isfinite(value)
+                or not 0.0 <= value <= 1.0
+            ):
+                raise ContractViolation(f"{name}은 null 또는 0..1 finite float여야 합니다.")
+        if type(self.reasons) is not tuple or any(
+            type(reason) is not str or not reason for reason in self.reasons
+        ):
+            raise ContractViolation("quantile policy reasons는 nonblank string tuple이어야 합니다.")
+        if (self.selected_strategy == "quantile_guard") != (not self.reasons):
+            raise ContractViolation("quantile strategy와 fallback reason이 모순됩니다.")
+
+    def audit_document(self) -> dict[str, Any]:
+        """Publication fingerprint에 남길 canonical 판단 근거를 반환한다."""
+        return {
+            "fallback_strategy": self.fallback_strategy,
+            "quantile_guard": {
+                "horizon_hours": 2,
+                "minimum_bikes": 1,
+                "minimum_empty_docks": 1,
+                "q50_role": "preserved_for_diagnostics",
+                "target_quantity": "validated_risk_band_quantity",
+                "version": QUANTILE_GUARD_VERSION,
+            },
+            "max_coverage_error": self.max_coverage_error,
+            "reasons": list(self.reasons),
+            "rental_coverage": self.rental_coverage,
+            "return_coverage": self.return_coverage,
+            "selected_strategy": self.selected_strategy,
+            "target_coverage": self.target_coverage,
+            "version": self.version,
+        }
+
+    @property
+    def canonical_json(self) -> str:
+        """판단 근거를 정렬된 compact JSON 문자열로 반환한다."""
+        return json.dumps(
+            self.audit_document(),
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+
+
+def decide_quantile_policy(
+    rental_metrics_payload: bytes,
+    return_metrics_payload: bytes,
+) -> QuantilePolicyDecision:
+    """두 모델의 pinned test coverage가 의사결정 기준을 통과하는지 판정한다."""
+    coverages: dict[str, float | None] = {}
+    reasons: list[str] = []
+    for model_name, payload in (
+        ("rental", rental_metrics_payload),
+        ("return", return_metrics_payload),
+    ):
+        coverage: float | None = None
+        try:
+            document = json.loads(payload)
+            raw = document["p10_p90_coverage_calibrated_test"]
+            if type(raw) not in {int, float} or type(raw) is bool:
+                raise ValueError
+            coverage = float(raw)
+            if not math.isfinite(coverage) or not 0.0 <= coverage <= 1.0:
+                raise ValueError
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError, UnicodeDecodeError):
+            reasons.append(f"{model_name}_calibration_metric_missing_or_invalid")
+        else:
+            if (
+                abs(coverage - QUANTILE_POLICY_TARGET_COVERAGE)
+                > QUANTILE_POLICY_MAX_COVERAGE_ERROR
+            ):
+                reasons.append(f"{model_name}_coverage_out_of_policy_range")
+        coverages[model_name] = coverage
+    return QuantilePolicyDecision(
+        version=QUANTILE_POLICY_GATE_VERSION,
+        selected_strategy="risk_band" if reasons else "quantile_guard",
+        fallback_strategy="risk_band",
+        target_coverage=QUANTILE_POLICY_TARGET_COVERAGE,
+        max_coverage_error=QUANTILE_POLICY_MAX_COVERAGE_ERROR,
+        rental_coverage=coverages["rental"],
+        return_coverage=coverages["return"],
+        reasons=tuple(reasons),
+    )
+
+
+def parse_quantile_policy_decision(value: str) -> QuantilePolicyDecision:
+    """Fingerprint의 canonical quantile 판단 JSON을 typed 값으로 복원한다."""
+    try:
+        document = json.loads(value)
+        decision = QuantilePolicyDecision(
+            version=document["version"],
+            selected_strategy=document["selected_strategy"],
+            fallback_strategy=document["fallback_strategy"],
+            target_coverage=document["target_coverage"],
+            max_coverage_error=document["max_coverage_error"],
+            rental_coverage=document["rental_coverage"],
+            return_coverage=document["return_coverage"],
+            reasons=tuple(document["reasons"]),
+        )
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ContractViolation("quantile policy decision JSON이 잘못됐습니다.") from exc
+    if decision.canonical_json != value:
+        raise ContractViolation("quantile policy decision은 canonical JSON이어야 합니다.")
+    return decision
+
+
+def fallback_quantile_policy(
+    decision: QuantilePolicyDecision,
+    reason: str,
+) -> QuantilePolicyDecision:
+    """기존 calibration 감사값을 보존하며 추가 결측 사유로 fallback한다."""
+    if type(decision) is not QuantilePolicyDecision:
+        raise ContractViolation("quantile fallback 원본 decision 타입이 잘못됐습니다.")
+    if type(reason) is not str or not reason:
+        raise ContractViolation("quantile fallback reason은 nonblank여야 합니다.")
+    reasons = decision.reasons
+    if reason not in reasons:
+        reasons = (*reasons, reason)
+    return QuantilePolicyDecision(
+        version=decision.version,
+        selected_strategy="risk_band",
+        fallback_strategy=decision.fallback_strategy,
+        target_coverage=decision.target_coverage,
+        max_coverage_error=decision.max_coverage_error,
+        rental_coverage=decision.rental_coverage,
+        return_coverage=decision.return_coverage,
+        reasons=reasons,
+    )
+
+
+FALLBACK_QUANTILE_POLICY_DECISION = QuantilePolicyDecision(
+    version=QUANTILE_POLICY_GATE_VERSION,
+    selected_strategy="risk_band",
+    fallback_strategy="risk_band",
+    target_coverage=QUANTILE_POLICY_TARGET_COVERAGE,
+    max_coverage_error=QUANTILE_POLICY_MAX_COVERAGE_ERROR,
+    rental_coverage=None,
+    return_coverage=None,
+    reasons=("quantile_decision_not_supplied",),
+)
 
 
 @dataclass(frozen=True, slots=True)

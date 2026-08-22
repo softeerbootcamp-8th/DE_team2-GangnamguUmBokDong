@@ -1494,10 +1494,9 @@ def _validate_target_records_locked(
              ORDER BY sta_id COLLATE "C", predicted_dttm
             """
         )
-        actual_demand = tuple(
-            demand_publisher.DemandForecastRecord(*row) for row in cursor.fetchall()
-        )
-        if actual_demand != demand_records:
+        actual_demand = tuple(cursor.fetchall())
+        expected_demand = tuple(record.serving_values for record in demand_records)
+        if actual_demand != expected_demand:
             raise ContractViolation(
                 "replay demand target이 sealed projection과 다릅니다."
             )

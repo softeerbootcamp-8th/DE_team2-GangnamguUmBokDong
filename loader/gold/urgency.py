@@ -59,7 +59,10 @@ from .common import (
 from .demand import DemandForecastRecord, demand_records_from_parquet
 from .rebalance_policy import (
     DEFAULT_REBALANCE_POLICY,
+    FALLBACK_QUANTILE_POLICY_DECISION,
+    QuantilePolicyDecision,
     RebalancePolicyConfig,
+    parse_quantile_policy_decision,
 )
 from .source_catalog import S3SourceSnapshotCatalog
 from .state import (
@@ -79,7 +82,7 @@ _SERVING_RELEASE_KEYS = frozenset(
     {"station", "station_demand_forecast", "station_stock"}
 )
 BIKE_STATION_REALTIME_SOURCE_ID = "bike_station_realtime"
-URGENCY_PUBLISHER_VERSION = "gold-urgency-publisher-v1"
+URGENCY_PUBLISHER_VERSION = "gold-urgency-publisher-v2"
 _URGENCY_SCHEMA = pa.schema(
     (
         pa.field("sta_id", pa.string(), nullable=False),
@@ -265,6 +268,9 @@ class UrgencyCalculationInputs:
     current_stock: tuple[StationStockRecord, ...]
     demand: tuple[DemandForecastRecord, ...]
     base_dttm: datetime
+    quantile_policy_decision: QuantilePolicyDecision = (
+        FALLBACK_QUANTILE_POLICY_DECISION
+    )
 
     def __post_init__(self) -> None:
         """모든 입력의 타입·순서·window 수·anchor를 재검증한다."""
@@ -327,6 +333,8 @@ class UrgencyCalculationInputs:
             raise ContractViolation("demand는 DemandForecastRecord tuple이어야 합니다.")
         if any(item.base_dttm != base for item in self.demand):
             raise ContractViolation("demand row가 urgency anchor와 다릅니다.")
+        if type(self.quantile_policy_decision) is not QuantilePolicyDecision:
+            raise ContractViolation("quantile policy decision 타입이 잘못됐습니다.")
 
 
 def build_urgency_projection(
@@ -441,6 +449,13 @@ def compute_urgency_projection(
             points,
             inputs.base_dttm,
         )
+        risk_band_quantity = _bike_qty_risk_band_v2(
+            current,
+            station.hold_cnt,
+            action_type,
+            points,
+            policy_config,
+        )
         computed.append(
             UrgencyRecord(
                 sta_id=station_id,
@@ -456,12 +471,18 @@ def compute_urgency_projection(
                         points,
                     )
                     if policy_config.quantity_strategy == "legacy"
-                    else _bike_qty_risk_band_v2(
-                        current,
-                        station.hold_cnt,
-                        action_type,
-                        points,
-                        policy_config,
+                    else (
+                        _bike_qty_quantile_guard_v3(
+                            current,
+                            station.hold_cnt,
+                            action_type,
+                            forecasts,
+                            policy_config,
+                            desired_quantity=risk_band_quantity,
+                        )
+                        if inputs.quantile_policy_decision.selected_strategy
+                        == "quantile_guard"
+                        else risk_band_quantity
                     )
                 ),
             )
@@ -627,6 +648,10 @@ def publish_station_urgency(
                 "rebalance_policy_config",
                 DEFAULT_REBALANCE_POLICY.canonical_json,
             ),
+            Parameter(
+                "quantile_policy_decision",
+                calculation.quantile_policy_decision.canonical_json,
+            ),
             Parameter("scoring_config_version", URGENCY_SCORING_CONFIG_VERSION),
             Parameter("stock_window_count", str(URGENCY_STOCK_WINDOW_COUNT)),
         ),
@@ -677,6 +702,17 @@ def publish_station_urgency(
             history_inputs=history_inputs,
             payloads=payloads,
         )
+        parameters = {
+            item.name: item.value
+            for item in publication.input_fingerprint.parameters
+        }
+        if (
+            parameters["quantile_policy_decision"]
+            != verified_calculation.quantile_policy_decision.canonical_json
+        ):
+            raise ContractViolation(
+                "urgency quantile policy decision이 demand 근거와 다릅니다."
+            )
         verified_projection = compute_urgency_projection(verified_calculation)
         _validate_urgency_payloads(
             publication,
@@ -715,6 +751,7 @@ def publish_station_urgency(
                 current_stock=calculation.current_stock,
                 demand=calculation.demand,
                 base_dttm=calculation.base_dttm,
+                quantile_policy_decision=calculation.quantile_policy_decision,
             )
         )
         if locked_projection != projection:
@@ -740,6 +777,7 @@ def publish_station_urgency(
             current_stock=calculation.current_stock,
             demand=calculation.demand,
             base_dttm=calculation.base_dttm,
+            quantile_policy_decision=calculation.quantile_policy_decision,
         )
         empty_projection = compute_urgency_projection(locked)
         validate_id_set_parameter(
@@ -916,7 +954,10 @@ def _calculation_inputs_from_manifests(
         raise ContractViolation(
             "demand·stock publication manifest가 urgency anchor와 다릅니다."
         )
-    demand = _demand_records_from_manifest(object_store, demand_manifest)
+    demand, quantile_policy_decision = _demand_records_from_manifest(
+        object_store,
+        demand_manifest,
+    )
     current_stock = _stock_records_from_manifest(object_store, stock_manifest)
     history_windows = tuple(
         _history_window_from_manifest(
@@ -937,6 +978,7 @@ def _calculation_inputs_from_manifests(
         current_stock=current_stock,
         demand=demand,
         base_dttm=base,
+        quantile_policy_decision=quantile_policy_decision,
     )
 
 
@@ -972,7 +1014,7 @@ def _manifest_uri_sha(uri: str) -> str:
 def _demand_records_from_manifest(
     object_store: ImmutableObjectStore,
     manifest: PublicationManifest,
-) -> tuple[DemandForecastRecord, ...]:
+) -> tuple[tuple[DemandForecastRecord, ...], QuantilePolicyDecision]:
     """Demand manifest의 actual fingerprint·output bytes를 완전 projection으로 읽는다."""
     fingerprint_payload = object_store.read_bytes(
         manifest.input_fingerprint_uri,
@@ -984,6 +1026,10 @@ def _demand_records_from_manifest(
         "station_demand_forecast",
     )
     validate_input_fingerprint("station_demand_forecast", fingerprint)
+    parameters = {item.name: item.value for item in fingerprint.parameters}
+    quantile_policy_decision = parse_quantile_policy_decision(
+        parameters["quantile_policy_decision"]
+    )
     if not manifest.artifacts:
         if manifest.published_row_cnt != 0:
             raise ContractViolation("EMPTY demand manifest row count가 0이 아닙니다.")
@@ -992,7 +1038,7 @@ def _demand_records_from_manifest(
             fingerprint,
             build_id_set(()),
         )
-        return ()
+        return (), quantile_policy_decision
     artifact = _single_output_artifact(manifest, "station_demand_forecast")
     payload = object_store.read_bytes(artifact.uri, artifact.byte_sha256)
     table = read_parquet_bytes(payload)
@@ -1014,7 +1060,7 @@ def _demand_records_from_manifest(
         fingerprint,
         build_id_set(station_ids),
     )
-    return records
+    return records, quantile_policy_decision
 
 
 def _stock_records_from_manifest(
@@ -1212,8 +1258,9 @@ def _validate_dependency_targets_locked(
          ORDER BY sta_id COLLATE "C", predicted_dttm
         """
     )
-    demand = tuple(DemandForecastRecord(*row) for row in cursor.fetchall())
-    if demand != calculation.demand or len(demand) != demand_state.published_row_cnt:
+    demand = tuple(cursor.fetchall())
+    expected_demand = tuple(record.serving_values for record in calculation.demand)
+    if demand != expected_demand or len(demand) != demand_state.published_row_cnt:
         raise ContractViolation(
             "locked Gold demand가 immutable dependency output과 다릅니다."
         )
@@ -1499,6 +1546,67 @@ def _bike_qty_risk_band_v2(
         )
         needed = max(0, math.ceil(minimum_stock - min(lower_path)))
         return min(needed, max(0, hold_cnt - current))
+    return 0
+
+
+def _bike_qty_quantile_guard_v3(
+    current: int,
+    hold_cnt: int,
+    action_type: str,
+    forecasts: list[DemandForecastRecord],
+    policy_config: RebalancePolicyConfig,
+    *,
+    desired_quantity: int,
+) -> int:
+    """검증된 목표 수량을 q10·q90 재고 경로의 안전 범위로 제한한다."""
+    if type(desired_quantity) is not int or desired_quantity < 0:
+        raise ContractViolation("quantile guard desired quantity가 잘못됐습니다.")
+    horizon = forecasts[: policy_config.protection_horizon_hours]
+    if len(horizon) != policy_config.protection_horizon_hours:
+        raise ContractViolation("quantile guard 보호 horizon이 부족합니다.")
+    if any(
+        value is None
+        for row in horizon
+        for value in (
+            row.predicted_rent_p10,
+            row.predicted_rent_p50,
+            row.predicted_rent_p90,
+            row.predicted_rtn_p10,
+            row.predicted_rtn_p50,
+            row.predicted_rtn_p90,
+        )
+    ):
+        raise ContractViolation(
+            "quantile guard가 선택됐지만 Gold demand quantile이 없습니다."
+        )
+    lower_path = [float(current)]
+    upper_path = [float(current)]
+    for row in horizon:
+        rental_p10 = float(row.predicted_rent_p10)
+        rental_p90 = float(row.predicted_rent_p90)
+        return_p10 = float(row.predicted_rtn_p10)
+        return_p90 = float(row.predicted_rtn_p90)
+        lower_path.extend(
+            (
+                lower_path[-1] - rental_p90,
+                lower_path[-1] - rental_p90 + return_p10,
+            )
+        )
+        upper_path.extend(
+            (
+                upper_path[-1] + return_p90,
+                upper_path[-1] + return_p90 - rental_p10,
+            )
+        )
+    if action_type == "retrieval_needed":
+        safe_stock = max(0, math.floor(min(lower_path) - 1))
+        concentration_limit = math.floor(
+            current * policy_config.max_pickup_stock_fraction
+        )
+        return min(current, desired_quantity, safe_stock, concentration_limit)
+    if action_type == "supply_needed":
+        safe_room = max(0, math.floor(hold_cnt - 1 - max(upper_path)))
+        return min(desired_quantity, safe_room, max(0, hold_cnt - current))
     return 0
 
 

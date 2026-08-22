@@ -513,7 +513,12 @@ _REGISTRY = {
             _role("rental_model_manifest"),
             _role("return_model_manifest"),
         ),
-        parameter_names=("expected_sta_id_sha256", "horizon_count", "rounding_mode"),
+        parameter_names=(
+            "expected_sta_id_sha256",
+            "horizon_count",
+            "quantile_policy_decision",
+            "rounding_mode",
+        ),
         output_targets=(("station_demand_forecast", "station_demand_forecast"),),
         representative_target="station_demand_forecast",
         empty_policy=EmptyPolicy.CONDITIONAL,
@@ -570,6 +575,8 @@ _REGISTRY = {
         ),
         parameter_names=(
             "expected_sta_id_sha256",
+            "quantile_policy_decision",
+            "rebalance_policy_config",
             "scoring_config_version",
             "stock_window_count",
         ),
@@ -594,6 +601,7 @@ _REGISTRY = {
         parameter_names=(
             "max_routes_per_center",
             "max_stops_per_route",
+            "rebalance_policy_config",
             "route_algorithm_version",
             "route_coverage_sha256",
             "route_work_unit_config_version",

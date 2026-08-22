@@ -35,7 +35,7 @@ from .model_snapshot import (
     validate_model_snapshot_manifest,
 )
 
-INFERENCE_SNAPSHOT_MANIFEST_SCHEMA_VERSION = "ml-inference-snapshot-manifest-v1"
+INFERENCE_SNAPSHOT_MANIFEST_SCHEMA_VERSION = "ml-inference-snapshot-manifest-v2"
 """Gold ``inference_output`` role이 가리키는 manifest schema version이다."""
 
 INFERENCE_HORIZON_COUNT = 12
@@ -48,9 +48,30 @@ INFERENCE_OUTPUT_COLUMN_NAMES = (
     "minute",
     "horizon",
     "rental_pred_mean",
+    "rental_pred_p10",
+    "rental_pred_p50",
+    "rental_pred_p90",
     "return_pred_mean",
+    "return_pred_p10",
+    "return_pred_p50",
+    "return_pred_p90",
 )
 """Gold demand가 소비하는 inference output의 exact column 순서다."""
+
+_INFERENCE_OUTPUT_REQUIRED_COLUMN_NAMES = (
+    "station_id",
+    "date",
+    "hour",
+    "minute",
+    "horizon",
+    "rental_pred_mean",
+    "return_pred_mean",
+)
+_INFERENCE_OUTPUT_QUANTILE_COLUMN_NAMES = tuple(
+    name
+    for name in INFERENCE_OUTPUT_COLUMN_NAMES
+    if name not in _INFERENCE_OUTPUT_REQUIRED_COLUMN_NAMES
+)
 
 INFERENCE_OUTPUT_ARROW_SCHEMA = pa.schema(
     (
@@ -60,7 +81,13 @@ INFERENCE_OUTPUT_ARROW_SCHEMA = pa.schema(
         pa.field("minute", pa.uint8(), nullable=False),
         pa.field("horizon", pa.uint8(), nullable=False),
         pa.field("rental_pred_mean", pa.float64(), nullable=False),
+        pa.field("rental_pred_p10", pa.float64(), nullable=True),
+        pa.field("rental_pred_p50", pa.float64(), nullable=True),
+        pa.field("rental_pred_p90", pa.float64(), nullable=True),
         pa.field("return_pred_mean", pa.float64(), nullable=False),
+        pa.field("return_pred_p10", pa.float64(), nullable=True),
+        pa.field("return_pred_p50", pa.float64(), nullable=True),
+        pa.field("return_pred_p90", pa.float64(), nullable=True),
     )
 )
 """Inference authority Parquet의 metadata 없는 exact non-null Arrow schema다."""
@@ -397,7 +424,7 @@ def canonicalize_inference_output_table(
     logical_dttm: datetime,
     expected_sta_ids: IdSet,
 ) -> pa.Table:
-    """Producer row를 Gold가 소비하는 7-column authority로 정규화한다.
+    """Producer row를 Gold가 소비하는 13-column authority로 정규화한다.
 
     Extra producer metadata column은 authority에서 제외하고, station×12
     완전성과 KST target time을 검증한 뒤 station UTF-8 byte·horizon
@@ -419,18 +446,33 @@ def canonicalize_inference_output_table(
             "inference output column name은 중복될 수 없습니다."
         )
     missing = tuple(
-        name for name in INFERENCE_OUTPUT_COLUMN_NAMES if name not in column_names
+        name
+        for name in _INFERENCE_OUTPUT_REQUIRED_COLUMN_NAMES
+        if name not in column_names
     )
     if missing:
         raise InferenceSnapshotContractError(
             f"inference output에 필수 column이 없습니다: {missing}"
         )
 
+    present_quantiles = tuple(
+        name in column_names for name in _INFERENCE_OUTPUT_QUANTILE_COLUMN_NAMES
+    )
+    if any(present_quantiles) and not all(present_quantiles):
+        raise InferenceSnapshotContractError(
+            "inference output quantile column은 6개가 모두 있거나 모두 없어야 합니다."
+        )
+    if not any(present_quantiles):
+        for name in _INFERENCE_OUTPUT_QUANTILE_COLUMN_NAMES:
+            arrow_table = arrow_table.append_column(
+                name,
+                pa.nulls(arrow_table.num_rows, type=pa.float64()),
+            )
     selected = arrow_table.select(INFERENCE_OUTPUT_COLUMN_NAMES)
     null_columns = tuple(
         name
         for name, column in zip(selected.column_names, selected.columns, strict=True)
-        if column.null_count
+        if name in _INFERENCE_OUTPUT_REQUIRED_COLUMN_NAMES and column.null_count
     )
     if null_columns:
         raise InferenceSnapshotContractError(
@@ -487,6 +529,18 @@ def canonicalize_inference_output_table(
                 "logical_dttm + (horizon - 1)시간이어야 합니다."
             )
 
+        rental_quantiles = _require_quantiles_or_none(
+            tuple(raw[f"rental_pred_p{quantile}"] for quantile in (10, 50, 90)),
+            f"inference output row {index} rental",
+        )
+        return_quantiles = _require_quantiles_or_none(
+            tuple(raw[f"return_pred_p{quantile}"] for quantile in (10, 50, 90)),
+            f"inference output row {index} return",
+        )
+        if (rental_quantiles[0] is None) != (return_quantiles[0] is None):
+            raise InferenceSnapshotContractError(
+                "대여·반납 quantile은 함께 존재하거나 함께 없어야 합니다."
+            )
         records.append(
             {
                 "station_id": station_id,
@@ -498,10 +552,16 @@ def canonicalize_inference_output_table(
                     raw["rental_pred_mean"],
                     f"inference output row {index} rental_pred_mean",
                 ),
+                "rental_pred_p10": rental_quantiles[0],
+                "rental_pred_p50": rental_quantiles[1],
+                "rental_pred_p90": rental_quantiles[2],
                 "return_pred_mean": _require_prediction(
                     raw["return_pred_mean"],
                     f"inference output row {index} return_pred_mean",
                 ),
+                "return_pred_p10": return_quantiles[0],
+                "return_pred_p50": return_quantiles[1],
+                "return_pred_p90": return_quantiles[2],
             }
         )
 
@@ -1098,7 +1158,7 @@ def _to_arrow_table(value: pa.Table | pd.DataFrame) -> pa.Table:
 
 
 def _require_exact_output_schema(table: pa.Table) -> None:
-    """Arrow table이 metadata 없는 exact 7-column non-null schema인지 확인한다."""
+    """Arrow table이 exact 13-column mean non-null·quantile nullable schema인지 확인한다."""
     if type(table) is not pa.Table:
         raise InferenceSnapshotContractError(
             "inference output authority는 exact pyarrow.Table이어야 합니다."
@@ -1108,11 +1168,14 @@ def _require_exact_output_schema(table: pa.Table) -> None:
         check_metadata=True,
     ):
         raise InferenceSnapshotContractError(
-            "inference output Arrow schema가 exact 7-column contract와 다릅니다."
+            "inference output Arrow schema가 exact 13-column contract와 다릅니다."
         )
-    if any(column.null_count for column in table.columns):
+    if any(
+        table.column(name).null_count
+        for name in _INFERENCE_OUTPUT_REQUIRED_COLUMN_NAMES
+    ):
         raise InferenceSnapshotContractError(
-            "inference output authority column은 null을 가질 수 없습니다."
+            "inference output authority 필수 column은 null을 가질 수 없습니다."
         )
 
 
@@ -1148,10 +1211,22 @@ def _require_canonical_output_order(table: pa.Table) -> None:
             raw["rental_pred_mean"],
             f"inference output row {index} rental_pred_mean",
         )
+        rental_quantiles = _require_quantiles_or_none(
+            tuple(raw[f"rental_pred_p{quantile}"] for quantile in (10, 50, 90)),
+            f"inference output row {index} rental",
+        )
         _require_prediction(
             raw["return_pred_mean"],
             f"inference output row {index} return_pred_mean",
         )
+        return_quantiles = _require_quantiles_or_none(
+            tuple(raw[f"return_pred_p{quantile}"] for quantile in (10, 50, 90)),
+            f"inference output row {index} return",
+        )
+        if (rental_quantiles[0] is None) != (return_quantiles[0] is None):
+            raise InferenceSnapshotContractError(
+                "대여·반납 quantile은 함께 존재하거나 함께 없어야 합니다."
+            )
         keys.append((station_id.encode("utf-8"), horizon))
         horizons_by_station.setdefault(station_id, set()).add(horizon)
 
@@ -1211,6 +1286,28 @@ def _require_prediction(value: Any, label: str) -> float:
             f"{label}은 finite nonnegative float64여야 합니다."
         )
     return 0.0 if normalized == 0 else normalized
+
+
+def _require_quantiles_or_none(
+    values: tuple[Any, Any, Any],
+    label: str,
+) -> tuple[float | None, float | None, float | None]:
+    """q10·q50·q90 전부 결측 또는 finite nonnegative 비감소 값을 검증한다."""
+    if all(value is None for value in values):
+        return (None, None, None)
+    if any(value is None for value in values):
+        raise InferenceSnapshotContractError(
+            f"{label} quantile은 세 값이 모두 있거나 모두 없어야 합니다."
+        )
+    normalized = tuple(
+        _require_prediction(value, f"{label}_p{quantile}")
+        for value, quantile in zip(values, (10, 50, 90), strict=True)
+    )
+    if normalized != tuple(sorted(normalized)):
+        raise InferenceSnapshotContractError(
+            f"{label} quantile은 p10 <= p50 <= p90이어야 합니다."
+        )
+    return normalized
 
 
 def _require_exact_object(

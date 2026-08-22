@@ -175,8 +175,13 @@ def _producer_output_frame(
                     "minute": target.minute,
                     "horizon": horizon,
                     "rental_pred_mean": horizon + 0.25,
+                    "rental_pred_p10": horizon - 0.25,
+                    "rental_pred_p50": horizon + 0.10,
+                    "rental_pred_p90": horizon + 0.50,
                     "return_pred_mean": horizon + 0.75,
-                    "rental_pred_p10": 0.0,
+                    "return_pred_p10": float(horizon),
+                    "return_pred_p50": horizon + 0.50,
+                    "return_pred_p90": horizon + 1.00,
                     "lag_data_freshness": 1.0,
                 }
             )
@@ -265,7 +270,7 @@ def test_inference_manifest_has_stable_exact_canonical_bytes() -> None:
         b'2222222222222222222222222222222222222222222222222222222222222222",'
         b'"uri":"s3://fixture/model-manifests/return/'
         b'sha256=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc.json"},'
-        b'"revision_no":0,"schema_version":"ml-inference-snapshot-manifest-v1",'
+        b'"revision_no":0,"schema_version":"ml-inference-snapshot-manifest-v2",'
         b'"serving_plan":{"byte_sha256":"9999999999999999999999999999999999999999999999999999999999999999",'
         b'"uri":"s3://fixture/serving-plans/'
         b'sha256=9999999999999999999999999999999999999999999999999999999999999999.json"},'
@@ -552,7 +557,7 @@ def test_manifest_bytes_become_gold_inference_output_not_raw_parquet() -> None:
     assert artifact.uri == uri
 
 
-def test_output_table_canonicalizes_exact_seven_columns_and_round_trips() -> None:
+def test_output_table_canonicalizes_exact_thirteen_columns_and_round_trips() -> None:
     """Producer extra metadata를 제외하고 exact Arrow authority를 Parquet으로 읽는다."""
     expected_ids = build_id_set(("ST-2", "ST-1"))
 
@@ -641,7 +646,7 @@ def test_output_table_rejects_partial_duplicate_time_or_nonfinite_prediction(
 
 
 def test_output_parser_rejects_extra_schema_and_noncanonical_row_order() -> None:
-    """Stored Parquet은 exact 7 columns과 canonical station/horizon order를 유지한다."""
+    """Stored Parquet은 exact 13 columns과 canonical station/horizon order를 유지한다."""
     expected_ids = build_id_set(("ST-1", "ST-2"))
     table = canonicalize_inference_output_table(
         _producer_output_frame(),
@@ -707,7 +712,7 @@ def test_schema_and_horizon_constants_are_disk_contract() -> None:
     """Inference manifest schema와 12 horizon을 회귀 고정한다."""
     assert (
         INFERENCE_SNAPSHOT_MANIFEST_SCHEMA_VERSION
-        == "ml-inference-snapshot-manifest-v1"
+        == "ml-inference-snapshot-manifest-v2"
     )
     assert INFERENCE_HORIZON_COUNT == 12
     assert INFERENCE_OUTPUT_COLUMN_NAMES == (
@@ -717,7 +722,13 @@ def test_schema_and_horizon_constants_are_disk_contract() -> None:
         "minute",
         "horizon",
         "rental_pred_mean",
+        "rental_pred_p10",
+        "rental_pred_p50",
+        "rental_pred_p90",
         "return_pred_mean",
+        "return_pred_p10",
+        "return_pred_p50",
+        "return_pred_p90",
     )
     assert INFERENCE_OUTPUT_ARROW_SCHEMA == pa.schema(
         (
@@ -727,6 +738,44 @@ def test_schema_and_horizon_constants_are_disk_contract() -> None:
             pa.field("minute", pa.uint8(), nullable=False),
             pa.field("horizon", pa.uint8(), nullable=False),
             pa.field("rental_pred_mean", pa.float64(), nullable=False),
+            pa.field("rental_pred_p10", pa.float64(), nullable=True),
+            pa.field("rental_pred_p50", pa.float64(), nullable=True),
+            pa.field("rental_pred_p90", pa.float64(), nullable=True),
             pa.field("return_pred_mean", pa.float64(), nullable=False),
+            pa.field("return_pred_p10", pa.float64(), nullable=True),
+            pa.field("return_pred_p50", pa.float64(), nullable=True),
+            pa.field("return_pred_p90", pa.float64(), nullable=True),
+        )
+    )
+
+
+def test_output_table_normalizes_missing_quantiles_for_mean_fallback() -> None:
+    """분위수 6개가 모두 없으면 nullable authority로 정규화해 평균 serving을 유지한다."""
+    frame = _producer_output_frame().drop(
+        columns=[
+            "rental_pred_p10",
+            "rental_pred_p50",
+            "rental_pred_p90",
+            "return_pred_p10",
+            "return_pred_p50",
+            "return_pred_p90",
+        ]
+    )
+
+    table = canonicalize_inference_output_table(
+        frame,
+        logical_dttm=LOGICAL_DTTM,
+        expected_sta_ids=build_id_set(("ST-1", "ST-2")),
+    )
+
+    assert all(
+        table.column(name).null_count == table.num_rows
+        for name in (
+            "rental_pred_p10",
+            "rental_pred_p50",
+            "rental_pred_p90",
+            "return_pred_p10",
+            "return_pred_p50",
+            "return_pred_p90",
         )
     )

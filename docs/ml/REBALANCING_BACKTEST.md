@@ -223,6 +223,21 @@ crosswalk로 이 오류를 교정한 뒤 전부 다시 계산한 값이며, 교�
 추후 quantile을 운영에 쓰려면 재고 경로 또는 시간 내 수요에 맞춰 별도로 calibration
 한 뒤 다시 검증해야 한다.
 
+운영 파이프라인은 이 판단 때문에 분위수를 버리지는 않는다. Inference authority와
+Gold immutable demand artifact가 대여·반납의 mean·q10·q50·q90을 그대로 보존한다.
+q 6개가 모두 없으면 평균 예측은 계속 게시하고, 일부만 있거나 q10 > q50 > q90 순서가
+깨지면 계약 위반으로 거부한다. PostgreSQL serving 표는 대시보드 호환을 위해 기존의
+반올림 평균 수량만 유지한다.
+
+수량 정책은 두 model manifest가 고정한 test `P10~P90` calibrated coverage가 각각
+목표 80%에서 ±5%p 이내일 때만 세 번째 후보인 quantile guard를 활성화한다. 이때도
+검증된 20% 정책의 목표 수량은 유지하고 q10·q90은 물리적 안전 범위로만 사용한다.
+q50은 손실 없이 보존하되 직접 목표로 쓰지 않는다. 현재 임시 모델의 coverage는 대여
+90.69%, 반납 91.29%이므로 gate를 통과하지 못하며, fingerprint에는 두
+`coverage_out_of_policy_range` 사유와 20% risk-band fallback이 기록된다. 향후 모델을
+재학습·보정해 같은 gate를 통과하면 파이프라인 코드를 다시 바꾸지 않고 guard 후보를
+재검증할 수 있다.
+
 최종 guard 후보는 `run_policy_search`에 `--include-quantile`을 추가하고
 `--quantile-minimum-bikes 1 --quantile-minimum-empty-docks 1`로 재현한다. 결과 JSON의
 `quantity_override`에는 q 경로와 물리 reserve가 기록된다.
