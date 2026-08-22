@@ -454,3 +454,36 @@ def test_route_lifecycle_and_constraint_error_mapping(database_url: str) -> None
     response = TestClient(main.app).post(f"/routes/{CONFLICT_ROUTE_ID}/dispatch")
     assert response.status_code == 409
     assert response.json()["detail"] == "route_transition_conflict"
+
+
+def test_dispatch_rejects_route_sharing_station_with_dispatched(
+    database_url: str,
+) -> None:
+    """진행 중 경로와 대여소가 겹치는 경로는 승인되지 않고, 종료 후에는 승인된다."""
+    now = datetime.now(UTC)
+    _seed_serving_fixture(database_url, now)
+
+    dispatched = queries.dispatch_route(ROUTE_ID, now)
+    assert isinstance(dispatched, dict)
+
+    assert (
+        queries.dispatch_route(CONFLICT_ROUTE_ID, now + timedelta(seconds=1))
+        is queries.RouteTransitionResult.STATION_CONFLICT
+    )
+    response = TestClient(main.app).post(f"/routes/{CONFLICT_ROUTE_ID}/dispatch")
+    assert response.status_code == 409
+    assert response.json()["detail"] == "route_station_conflict"
+
+    with psycopg.connect(database_url) as connection:
+        row = connection.execute(
+            "SELECT route_status_cd FROM rebalance_route WHERE route_id = %s",
+            (CONFLICT_ROUTE_ID,),
+        ).fetchone()
+    assert row is not None
+    assert row[0] == "proposed"
+
+    completed = queries.complete_route(ROUTE_ID, now + timedelta(seconds=2))
+    assert isinstance(completed, dict)
+    unblocked = queries.dispatch_route(CONFLICT_ROUTE_ID, now + timedelta(seconds=3))
+    assert isinstance(unblocked, dict)
+    assert unblocked["status"] == "dispatched"

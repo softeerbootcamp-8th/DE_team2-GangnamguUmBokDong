@@ -1355,6 +1355,12 @@ body {
   line-height: 1.4;
 }
 
+.route-card-conflict {
+  color: color-mix(in srgb, var(--status-warning) 65%, var(--text-primary));
+  font-size: 11px;
+  line-height: 16px;
+}
+
 /* 처리 중인 버튼은 다른 disabled 버튼과 구분되도록 흐려지지 않게 둔다. */
 .route-action.is-busy:disabled {
   cursor: progress;

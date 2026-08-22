@@ -133,6 +133,40 @@ describe("RouteList", () => {
     expect(screen.getByRole("button", { name: "처리 중" })).not.toBeNull();
     expect(screen.queryByRole("button", { name: "승인" })).toBeNull();
   });
+
+  it("진행 중 작업과 대여소가 겹치는 후보는 승인을 막고 이유를 보여준다", () => {
+    // 겹침 판정은 실제로 fetchAllRoutes의 isRebalanceRoute 필터를 통과한 route만
+    // 받으므로, pickup·dropoff가 균형 잡힌(재배치) 모양으로 맞춘다.
+    const props = renderRouteList({
+      routes: [
+        ROUTES[0],
+        { ...ROUTES[1], region: "강남", stops: ROUTES[0].stops },
+      ],
+    });
+
+    const blocked = screen.getByRole("button", { name: "승인 불가" });
+    expect(blocked.hasAttribute("disabled")).toBe(true);
+    expect(screen.getByText("진행 중 '강남 재배치'와 대여소 2곳 겹침")).not.toBeNull();
+
+    fireEvent.click(blocked);
+    expect(props.onDispatch).not.toHaveBeenCalled();
+  });
+
+  it("승인이 막힌 후보도 카드 선택과 진행 중 작업의 완료·취소는 그대로 동작한다", () => {
+    const running = { ...ROUTES[1], region: "강남", stops: ROUTES[0].stops };
+    const props = renderRouteList({ routes: [ROUTES[0], running] });
+
+    // 카드 제목은 아이콘과 텍스트 노드가 섞여 있어 요약 줄을 눌러 카드 본문 클릭을 낸다.
+    // 후보(ROUTES[0])와 진행 중(running)이 같은 stops 모양을 쓰므로 요약 줄이 같다.
+    // 후보 카드는 candidate 섹션이 먼저 렌더되어 첫 번째로 잡힌다.
+    fireEvent.click(screen.getAllByText("대여소 2곳 · 회수 2대 · 공급 2대")[0]);
+    fireEvent.click(screen.getByRole("button", { name: "완료" }));
+    fireEvent.click(screen.getByRole("button", { name: "취소" }));
+
+    expect(props.onSelect).toHaveBeenCalledWith(ROUTES[0]);
+    expect(props.onComplete).toHaveBeenCalledWith(running);
+    expect(props.onCancel).toHaveBeenCalledWith(running);
+  });
 });
 
 describe("RouteStopRail", () => {
