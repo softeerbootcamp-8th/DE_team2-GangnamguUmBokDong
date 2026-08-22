@@ -391,17 +391,18 @@ def test_registry_matches_all_ten_ssot_publication_keys() -> None:
             ("station", "station_demand_forecast", "station_stock"),
             (
                 "demand_publication_manifest",
-                "stock_history_manifest_01",
-                "stock_history_manifest_02",
-                "stock_history_manifest_03",
-                "stock_history_manifest_04",
-                "stock_history_manifest_05",
+                "stock_history_manifest_m05",
+                "stock_history_manifest_m10",
+                "stock_history_manifest_m15",
+                "stock_history_manifest_m20",
+                "stock_history_manifest_m25",
                 "stock_publication_manifest",
                 "urgency_output",
             ),
             (
                 "expected_sta_id_sha256",
                 "scoring_config_version",
+                "stock_history_offsets",
                 "stock_window_count",
             ),
             ("station_urgency",),
@@ -447,6 +448,31 @@ def test_registry_matches_all_ten_ssot_publication_keys() -> None:
             spec.empty_policy,
         )
         assert actual == expected_contract
+
+
+def test_station_urgency_history_offset_roles_allow_zero_or_one_each() -> None:
+    """urgency의 고정 offset role은 결측을 허용하되 중복은 금지한다."""
+    cardinalities = {
+        role.role: (role.minimum, role.maximum)
+        for role in PUBLICATION_REGISTRY["station_urgency"].input_roles
+    }
+
+    assert {
+        role: cardinalities[role]
+        for role in (
+            "stock_history_manifest_m05",
+            "stock_history_manifest_m10",
+            "stock_history_manifest_m15",
+            "stock_history_manifest_m20",
+            "stock_history_manifest_m25",
+        )
+    } == {
+        "stock_history_manifest_m05": (0, 1),
+        "stock_history_manifest_m10": (0, 1),
+        "stock_history_manifest_m15": (0, 1),
+        "stock_history_manifest_m20": (0, 1),
+        "stock_history_manifest_m25": (0, 1),
+    }
 
 
 def test_station_conditional_roles_allow_zero_or_one_each() -> None:

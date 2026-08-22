@@ -88,19 +88,20 @@ version을 올린다. `manifest` role은 해당 upstream manifest의 실제 byte
 | `weather_forecast` | `station`, `weather_grid` | `short_term_manifest`, `ultra_short_manifest` | `forecast_hour_count`, `resolver_version` |
 | `event:cultural_event` | 없음 | `cultural_event_manifest` | `event_identity_version`, `event_policy_version` |
 | `event:performance_event` | 없음 | `performance_event_manifest`, `stadium_coordinate_seed` | `event_policy_version`, `stadium_coordinate_version` |
-| `station_urgency` | `station`, `station_demand_forecast`, `station_stock` | `demand_publication_manifest`, `stock_publication_manifest`, `stock_history_manifest_01` … `stock_history_manifest_05`, `urgency_output` | `expected_sta_id_sha256`, `scoring_config_version`, `stock_window_count` |
+| `station_urgency` | `station`, `station_demand_forecast`, `station_stock` | `demand_publication_manifest`, `stock_publication_manifest`, 선택적 `stock_history_manifest_m25`, `m20`, `m15`, `m10`, `m05`, `urgency_output` | `expected_sta_id_sha256`, `scoring_config_version`, `stock_history_offsets`, `stock_window_count` |
 | `rebalance_route` | `dispatch_center`, `station`, `station_demand_forecast`, `station_stock`, `station_urgency` | `route_coverage`, `urgency_publication_manifest` | `route_algorithm_version`, `route_coverage_sha256`, `truck_capacity`, `truck_capacity_config_version` |
 
 표의 dependency 집합은 정확히 그 key들이며 각 role과 parameter는 정확히 한 번 나온다.
-`stock_history_manifest_01 … stock_history_manifest_05`는 suffix `01`, `02`, `03`, `04`,
-`05` 다섯 role을 뜻하며 현재 window는 `stock_publication_manifest`가 소유한다.
-시간 방향은 기존 25분 lookback reader와 동일한 오래된 순서다. urgency logical time을
-`t`라고 할 때 `01=t-25분`, `02=t-20분`, `03=t-15분`, `04=t-10분`,
-`05=t-5분`이고 `stock_publication_manifest=t`다. 따라서
-`stock_window_count`의 exact 값은 과거 다섯 window와 현재 하나를 합친 문자열 `"6"`이다.
-다섯 과거 source manifest는 모두 authoritative complete snapshot이어야 한다. 다만 각
+`stock_history_manifest_m25 … stock_history_manifest_m05`는 suffix가 urgency logical
+time `t`로부터의 실제 분 offset을 뜻한다. 예를 들어 `m25=t-25분`, `m05=t-5분`이고
+현재 window는 `stock_publication_manifest=t`가 소유한다. 과거 role은 각각 0개 또는
+1개이며, publisher는 최소 2개를 요구하고 전달되지 않은 offset의 authority가 실제로
+없는지 검증한다. 따라서 `stock_window_count`는 사용한 과거 window 수와 현재 하나를
+합친 값이다. 사용한 과거 source manifest는 모두 authoritative complete snapshot이어야 한다. 다만 각
 snapshot 자체가 완전하다면 신규 station이 과거 일부 snapshot에 존재하지 않는 것은
 허용하며, station별 추세는 존재하는 과거 point와 current point로 계산한다.
+`stock_history_offsets`는 실제 사용한 offset을 oldest-first 쉼표 문자열로 기록한다
+(예: `-25,-20,-10,-5`).
 
 `scoring_config_version`의 최초 exact 값은 `urgency-scoring-v1`이다. 이 version은
 `RESPONSE_LAG_MIN=30`, `HALF_LIFE_MIN=60`, `FIRST_FORECAST_MIN=60`,
