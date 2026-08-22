@@ -195,9 +195,17 @@ class TrainingCheckpointManager:
             )
         observed = state.get("contract_sha256")
         if observed != self.contract_sha256 and not self._is_explicitly_compatible(state):
+            observed_contract = state.get("contract")
+            observed_code_fingerprint = (
+                observed_contract.get("code_fingerprint")
+                if isinstance(observed_contract, dict)
+                else None
+            )
             raise CheckpointContractMismatchError(
                 "checkpoint 계약이 현재 학습과 다릅니다: "
-                f"key={self.state_key}, expected={self.contract_sha256}, observed={observed}"
+                f"key={self.state_key}, expected={self.contract_sha256}, observed={observed}, "
+                f"observed_code_fingerprint={observed_code_fingerprint!r}, "
+                f"compatible_code_fingerprints={sorted(self.compatible_code_fingerprints)!r}"
             )
         return state
 
