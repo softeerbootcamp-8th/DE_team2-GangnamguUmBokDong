@@ -485,6 +485,7 @@ def build_lazy_dataset(
     on_chunk_loaded: Callable[[str, int], None] | None = None,
     on_prepass_complete: Callable[[int, int], None] | None = None,
     dataset_params: dict | None = None,
+    keep_raw_data: bool = False,
 ) -> tuple[lgb.Dataset, np.ndarray, np.ndarray | None]:
     """train 또는 valid 하나를 Sequence 기반 `lgb.Dataset`으로 만든다.
 
@@ -501,6 +502,8 @@ def build_lazy_dataset(
         dataset_params: Dataset construct 시점에 고정돼야 하는 LightGBM 파라미터.
             `max_bin`/`min_data_in_leaf` 등이 이후 `lgb.train()`에서 뒤늦게 바뀌어
             거부되거나 다른 binning을 쓰지 않도록 학습 파라미터를 함께 넘긴다.
+        keep_raw_data: checkpoint Booster를 `init_model`로 이어 학습할 때 LightGBM이
+            원본 Sequence에 predictor를 연결할 수 있도록 보존할지 여부.
     returns:
         tuple[lgb.Dataset, np.ndarray, np.ndarray | None]: (construct()까지 끝난 Dataset, y, exposure)
     raises:
@@ -534,6 +537,7 @@ def build_lazy_dataset(
         feature_name=feature_columns,
         categorical_feature=cat_idx,
         params=dataset_params,
+        free_raw_data=not keep_raw_data,
     )
     dataset.construct()
     # construct()는 label/init_score를 native Dataset handle에 복사한 뒤 다시 numpy

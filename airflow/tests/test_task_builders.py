@@ -87,6 +87,42 @@ def test_module_task_rejects_unsafe_environment_name(dag) -> None:
         )
 
 
+def test_module_task_records_resource_profile_per_task_instance(dag) -> None:
+    """공통 모듈 task가 실행 식별자·동시성·process peak manifest를 남긴다."""
+    task = build_module_task(dag, "profiled", COLLECTOR_DIR, "printf 'done'")
+
+    assert "/workspace/ops/resource_probe.py" in task.bash_command
+    assert (
+        "/workspace/airflow/resource-profiles/{{ dag.dag_id }}/{{ run_id }}/"
+        "{{ task.task_id }}/map-{{ ti.map_index }}/try-{{ ti.try_number }}.json"
+        in task.bash_command
+    )
+    for metadata in (
+        "dag_id={{ dag.dag_id }}",
+        "run_id={{ run_id }}",
+        "task_id={{ task.task_id }}",
+        "try_number={{ ti.try_number }}",
+        "map_index={{ ti.map_index }}",
+        "parallelism=${AIRFLOW__CORE__PARALLELISM:-3}",
+        "max_active_tasks_per_dag=${AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG:-2}",
+    ):
+        assert f'--metadata "{metadata}"' in task.bash_command
+    assert "--sample-seconds" in task.bash_command
+    assert "printf 'done'" in task.bash_command
+    assert "__AIRFLOW_RESOURCE_PROBE_COMMAND__" in task.bash_command
+
+
+def test_module_task_rejects_resource_probe_delimiter(dag) -> None:
+    """Heredoc 경계를 바꿀 수 있는 예약 구분자를 모듈 명령에서 거부한다."""
+    with pytest.raises(ValueError, match="예약 구분자"):
+        build_module_task(
+            dag,
+            "unsafe_profile_command",
+            COLLECTOR_DIR,
+            "echo __AIRFLOW_RESOURCE_PROBE_COMMAND__",
+        )
+
+
 def test_normalizer_task_contract(dag) -> None:
     """Population normalizer는 기존 frozen project와 all-success 계약을 유지한다."""
     task = build_normalizer_task(dag)

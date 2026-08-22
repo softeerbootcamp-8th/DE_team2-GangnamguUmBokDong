@@ -33,6 +33,7 @@ data/
 
 # Airflow (AIRFLOW_HOME=airflow/ 로 컨테이너에서 생성되는 런타임 산출물)
 airflow/logs/
+airflow/resource-profiles/
 airflow/airflow.cfg
 airflow/airflow-webserver.pid
 airflow/webserver_config.py
