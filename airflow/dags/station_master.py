@@ -3,14 +3,14 @@
 import pendulum
 from airflow import DAG
 
-from config.schedules import CATCHUP, DAILY_CRON, MAX_ACTIVE_RUNS, TIMEZONE
+from config.schedules import CATCHUP, MAX_ACTIVE_RUNS, STATION_MASTER_CRON, TIMEZONE
 from config.sources import STATION_MASTER_SOURCE
 from orchestration.collector_task import build_collector_task
 from orchestration.normalizer_task import build_station_master_enrichment_task
 
 with DAG(
     dag_id="station_master",
-    schedule=DAILY_CRON,
+    schedule=STATION_MASTER_CRON,
     start_date=pendulum.datetime(2026, 8, 17, tz=TIMEZONE),
     catchup=CATCHUP,
     max_active_runs=MAX_ACTIVE_RUNS,

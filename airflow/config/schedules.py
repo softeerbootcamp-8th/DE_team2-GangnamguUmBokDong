@@ -13,6 +13,21 @@ WEATHER_3H_CRON = "0 */3 * * *"
 # 확인해 필요하면 조정한다.
 DAILY_CRON = "0 3 * * *"
 
+# station_master는 DAILY_CRON(03:00)을 쓰면 안 된다. 03:00은 REALTIME_5MIN_CRON의
+# 5분 격자에 정확히 걸리므로 두 DAG이 동시에 시작하고, station_master가 약 88초 뒤
+# bike_station_master authority를 게시한다. 그 시각이 realtime_5min 같은 tick의
+# prepare_serving_plan(고정)과 finalize_serving_release(재검증) 사이에 들어가면
+# "locked station master authority가 바뀌었습니다"로 그 tick의 Gold 게시가 실패한다
+# (2026-08-22 실측: 06:15 tick, prepare 06:15:46 종료 -> master 게시 06:18:01 ->
+# finalize 06:18:23 실패). 이건 버그가 아니라 의도된 방어라 코드로 우회하지 않고
+# 시각을 비켜놓는다.
+#
+# 03:04를 고른 이유: tick 하나가 약 3분 45초라 03:00 tick은 03:03:45에 끝나고
+# 03:05 tick은 아직 시작 전이다. 03:02는 03:00 tick의 finalize 창(03:02:20~03:03:00)과
+# 여전히 겹칠 수 있어 부족하다. **tick 소요가 다시 5분에 가까워지면 이 여유가
+# 사라지므로 그때 다시 계산해야 한다.**
+STATION_MASTER_CRON = "4 3 * * *"
+
 # D-6 대여이력 재수집 후 같은 날짜의 silver를 archive로 묶는 배치.
 COMPACTION_CRON = "30 4 * * *"
 
