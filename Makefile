@@ -301,11 +301,27 @@ deploy-secrets:
 	aws s3 cp "$$tmp" "s3://$$S3_BUCKET/config/secrets.env"
 
 # 접속 IP가 바뀌었을 때. 현재 공인 IP로 admin_cidrs를 다시 쓰고 SG 규칙만 갱신한다(10초 내외).
+# 자기 공인 IP를 admin_cidrs에 **추가**한다. 덮어쓰면 팀원 한 명이 실행할 때마다
+# 나머지 전원이 SSH에서 끊긴다. apply는 SG만 -target으로 좁힌다 — 전체 apply는
+# 의도적으로 제외해둔 학습 EC2까지 만들어버린다.
 allow-my-ip:
 	@IP=$$(curl -fsS https://checkip.amazonaws.com | tr -d '\n'); \
-	printf 'admin_cidrs = ["%s/32"]\n' "$$IP" > terraform/admin_cidrs.auto.tfvars; \
-	echo "admin_cidrs = $$IP/32"; \
-	$(TF) apply -auto-approve
+	$(MAKE) --no-print-directory allow-ip IP="$$IP"
+
+# 다른 사람의 IP를 대신 열어줄 때 쓴다. 팀원이 AWS 자격증명 없이도 접속할 수 있게
+# 하려면 관리자가 이 타깃으로 추가한다.
+allow-ip:
+	@test -n "$(IP)" || { echo "IP=<공인 IP> 를 지정하세요." >&2; exit 2; }
+	@python3 ops/deploy/merge_admin_cidrs.py "$(IP)/32"
+	@$(TF) apply -auto-approve \
+	  -target=aws_security_group.app -target=aws_security_group.train
+
+# 더 이상 접속하지 않는 IP를 목록에서 뺀다. 열어둔 채 방치하지 않기 위한 짝이다.
+revoke-ip:
+	@test -n "$(IP)" || { echo "IP=<공인 IP> 를 지정하세요." >&2; exit 2; }
+	@python3 ops/deploy/merge_admin_cidrs.py --remove "$(IP)/32"
+	@$(TF) apply -auto-approve \
+	  -target=aws_security_group.app -target=aws_security_group.train
 
 train-start:
 	@aws ec2 start-instances --instance-ids $$($(TF) output -raw train_instance_id)
