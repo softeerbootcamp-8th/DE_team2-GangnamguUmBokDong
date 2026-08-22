@@ -1,4 +1,4 @@
-import type { Alert, DispatchCenter, Route } from "./api";
+import type { DispatchCenter, Route } from "./api";
 
 const EARTH_RADIUS_KM = 6371;
 const ROAD_DISTANCE_FACTOR = 1.25;
@@ -52,17 +52,6 @@ export function estimateRoute(route: Route, centers: DispatchCenter[]): RouteEst
     distanceKm: Math.round(distanceKm * 10) / 10,
     durationMinutes: Math.max(5, Math.ceil(rawDurationMinutes / 5) * 5),
   };
-}
-
-export function alertScoreMap(alerts: Alert[]): Map<string, number> {
-  return new Map(alerts.map((alert) => [alert.sta_id, alert.urgency_score]));
-}
-
-export function routePriority(route: Route, scoresByStation: ReadonlyMap<string, number>): number {
-  return route.stops.reduce(
-    (highest, stop) => Math.max(highest, scoresByStation.get(stop.sta_id) ?? 0),
-    0,
-  );
 }
 
 export function formatRouteDuration(minutes: number): string {

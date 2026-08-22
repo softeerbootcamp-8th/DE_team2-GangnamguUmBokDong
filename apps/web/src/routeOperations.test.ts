@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import type { Alert, DispatchCenter, Route } from "./api";
-import { alertScoreMap, estimateRoute, formatRouteDuration, isRebalanceRoute, isVisibleWorkRoute, routeKind, routePriority } from "./routeOperations";
+import type { DispatchCenter, Route } from "./api";
+import { estimateRoute, formatRouteDuration, isRebalanceRoute, isVisibleWorkRoute, routeKind } from "./routeOperations";
 
 const CENTERS: DispatchCenter[] = [{ region: "강남", lat: 37.5, lon: 127.0 }];
 const ROUTE: Route = {
@@ -16,11 +16,6 @@ const ROUTE: Route = {
     { visit_order: 2, sta_id: "ST-2", sta_nm: "공급", lat: 37.52, lon: 127.02, action: "dropoff", bike_cnt: 4 },
   ],
 };
-const ALERTS: Alert[] = [
-  { sta_id: "ST-1", sta_nm: "회수", action_type: "retrieval_needed", urgency_score: 63, minutes_until_critical: 30, region: "강남" },
-  { sta_id: "ST-2", sta_nm: "공급", action_type: "supply_needed", urgency_score: 91, minutes_until_critical: 8, region: "강남" },
-];
-
 describe("routeOperations", () => {
   it("센터 왕복 거리와 작업 시간을 보정해 5분 단위로 추정한다", () => {
     const estimate = estimateRoute(ROUTE, CENTERS);
@@ -31,8 +26,7 @@ describe("routeOperations", () => {
     expect(formatRouteDuration(310)).toBe("5시간 10분");
   });
 
-  it("작업 내 가장 높은 현재 긴급도를 우선도로 사용한다", () => {
-    expect(routePriority(ROUTE, alertScoreMap(ALERTS))).toBe(91);
+  it("재배치 경로와 센터 경로를 구분한다", () => {
     expect(isRebalanceRoute(ROUTE)).toBe(true);
     expect(isRebalanceRoute({
       ...ROUTE,

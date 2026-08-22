@@ -1,7 +1,7 @@
 import { Check, CheckCheck, CircleX, Clock3, Play, Route as RouteIcon, Timer } from "lucide-react";
 import { useMemo } from "react";
-import type { Alert, DispatchCenter, Route, RouteStatus } from "../api";
-import { alertScoreMap, estimateRoute, formatRouteDuration, isVisibleWorkRoute, routeKind, routePriority } from "../routeOperations";
+import type { DispatchCenter, Route, RouteStatus } from "../api";
+import { estimateRoute, formatRouteDuration, isVisibleWorkRoute, routeKind } from "../routeOperations";
 
 const STATUS_META: Record<
   RouteStatus,
@@ -15,7 +15,6 @@ const STATUS_META: Record<
 
 interface Props {
   routes: Route[];
-  alerts: Alert[];
   regions: DispatchCenter[];
   selectedRouteId: string | null;
   busyRouteId: string | null;
@@ -38,7 +37,6 @@ function routeSummary(route: Route): string {
 
 export function RouteList({
   routes,
-  alerts,
   regions,
   selectedRouteId,
   busyRouteId,
@@ -49,33 +47,18 @@ export function RouteList({
   onCancel,
 }: Props) {
   const now = Date.now();
-  const priorityScores = useMemo(() => alertScoreMap(alerts), [alerts]);
-  const ordered = useMemo(() => {
-    const statusOrder: Record<RouteStatus, number> = {
-      dispatched: 0,
-      proposed: 1,
-      completed: 2,
-      cancelled: 3,
-    };
+  const items = useMemo(() => {
     return routes
       .filter((route) => isVisibleWorkRoute(route, now))
       .map((route) => ({
         route,
         estimate: estimateRoute(route, regions),
-        priority: routePriority(route, priorityScores),
-      }))
-      .sort((left, right) => {
-        if (statusOrder[left.route.status] !== statusOrder[right.route.status]) {
-          return statusOrder[left.route.status] - statusOrder[right.route.status];
-        }
-        if (right.priority !== left.priority) return right.priority - left.priority;
-        return left.route.route_id.localeCompare(right.route.route_id);
-      });
-  }, [routes, regions, priorityScores, now]);
-  const candidates = ordered.filter(({ route }) => route.status === "proposed");
-  const operations = ordered.filter(({ route }) => route.status !== "proposed");
+      }));
+  }, [routes, regions, now]);
+  const candidates = items.filter(({ route }) => route.status === "proposed");
+  const operations = items.filter(({ route }) => route.status !== "proposed");
 
-  function renderRouteCard({ route, estimate, priority }: (typeof ordered)[number]) {
+  function renderRouteCard({ route, estimate }: (typeof items)[number]) {
     const status = STATUS_META[route.status];
     const StatusIcon = status.icon;
     const isSelected = route.route_id === selectedRouteId;
@@ -99,7 +82,6 @@ export function RouteList({
               </span>
               <span className="route-card-summary">{routeSummary(route)}</span>
               <span className="route-card-meta">
-                <span>현재 우선도 {Math.round(priority)}</span>
                 {estimate && (
                   <span title="직선거리×1.25, 도심 18km/h, 정차 4분, 자전거 1대당 30초 기준">
                     <Timer size={11} aria-hidden="true" />

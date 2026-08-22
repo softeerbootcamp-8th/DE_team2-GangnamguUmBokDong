@@ -363,7 +363,6 @@ export default function App() {
                       ) : (
                         <RouteList
                           routes={routes}
-                          alerts={filteredAlerts}
                           regions={regionCenters}
                           selectedRouteId={selectedRouteId}
                           busyRouteId={busyRouteId}

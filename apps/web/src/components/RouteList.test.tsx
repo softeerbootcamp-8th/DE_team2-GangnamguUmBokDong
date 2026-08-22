@@ -2,32 +2,13 @@
 
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { Alert, DispatchCenter, Route } from "../api";
+import type { DispatchCenter, Route } from "../api";
 import { RouteList } from "./RouteList";
 import { RouteStopRail } from "./RouteStopRail";
 
 const REGIONS: DispatchCenter[] = [
   { region: "강남", lat: 37.5, lon: 127.03 },
   { region: "영남", lat: 37.51, lon: 127.04 },
-];
-
-const ALERTS: Alert[] = [
-  {
-    sta_id: "ST-1",
-    sta_nm: "첫 번째 대여소",
-    action_type: "retrieval_needed",
-    urgency_score: 82,
-    minutes_until_critical: 12,
-    region: "강남",
-  },
-  {
-    sta_id: "ST-2",
-    sta_nm: "두 번째 대여소",
-    action_type: "supply_needed",
-    urgency_score: 75,
-    minutes_until_critical: 20,
-    region: "강남",
-  },
 ];
 
 const ROUTES: Route[] = [
@@ -75,7 +56,6 @@ const ROUTES: Route[] = [
 function renderRouteList(overrides: Partial<React.ComponentProps<typeof RouteList>> = {}) {
   const props: React.ComponentProps<typeof RouteList> = {
     routes: ROUTES,
-    alerts: ALERTS,
     regions: REGIONS,
     selectedRouteId: null,
     busyRouteId: null,
