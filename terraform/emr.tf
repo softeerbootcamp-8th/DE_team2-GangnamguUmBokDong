@@ -50,8 +50,11 @@ resource "aws_iam_role_policy_attachment" "emr_ec2_data" {
   policy_arn = aws_iam_policy.data_access.arn
 }
 
-# 잡이 실패했을 때 마스터 노드에 들어가 확인하기 위한 것. classic을 택한 주요 이점 중
-# 하나이고, SSH 키 없이 Session Manager로 접속할 수 있다.
+# 잡이 실패했을 때 마스터 노드에 들어가 확인하기 위해 붙여둔 정책이지만, 이 계정은
+# SSM(StartSession·SendCommand·DescribeInstanceInformation)이 SCP로 전면 거부라
+# 실제로는 동작하지 않는다(2026-08-21 실측, terraform.tfvars.example 참고). 마스터
+# 노드 디버깅은 --ec2-attributes에 KeyName을 지정해 SSH로 접속하거나, 상시 EC2를
+# bastion으로 한 ProxyJump를 쓸 것.
 resource "aws_iam_role_policy_attachment" "emr_ec2_ssm" {
   role       = aws_iam_role.emr_ec2.name
   policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"

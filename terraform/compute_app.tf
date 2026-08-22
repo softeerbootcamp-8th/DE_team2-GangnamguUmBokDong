@@ -26,7 +26,7 @@ resource "aws_iam_instance_profile" "app" {
 }
 
 resource "aws_instance" "app" {
-  key_name               = aws_key_pair.main.key_name
+  key_name               = var.ssh_key_name
   ami                    = data.aws_ami.al2023_arm64.id
   instance_type          = var.app_instance_type
   subnet_id              = aws_subnet.public[0].id

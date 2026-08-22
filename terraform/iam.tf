@@ -78,12 +78,9 @@ data "aws_ami" "al2023_arm64" {
   }
 }
 
-# EC2 접속용 키페어. 공개키만 올라간다.
+# EC2 접속용 키페어는 terraform이 만들지 않는다. `aws ec2 create-key-pair`로 AWS가
+# 개인키를 직접 생성하게 하고(`var.ssh_key_name` 참고), 그 이름을 컴퓨트 리소스가
+# 직접 참조한다.
 #
 # key_name은 RunInstances 시점에만 지정할 수 있는 불변 속성이라(cloud-init이 첫 부팅에
 # 메타데이터에서 읽어 authorized_keys에 쓴다), 나중에 붙이려면 인스턴스를 재생성해야 한다.
-resource "aws_key_pair" "main" {
-  provider   = aws.untagged
-  key_name   = "${var.project}-key"
-  public_key = file(pathexpand(var.ssh_public_key_path))
-}

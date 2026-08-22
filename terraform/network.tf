@@ -79,10 +79,12 @@ resource "aws_security_group" "app" {
   tags = { Name = "${var.project}-app" }
 }
 
-# 학습 EC2. 인바운드 규칙이 하나도 없어 퍼블릭 IP가 있어도 도달 불가.
+# 학습 EC2. 인터넷에서 인바운드로 도달 가능한 규칙은 없다 — 유일한 인바운드는 아래
+# train_ssh_from_app(상시 EC2 SG에서만 22번). SSM이 이 계정에서 전면 거부라
+# 접속은 상시 EC2를 bastion으로 한 SSH ProxyJump로만 한다(make ssh-train).
 resource "aws_security_group" "train" {
   name        = "${var.project}-train"
-  description = "Training EC2. No inbound rules; access via SSM Session Manager only"
+  description = "Training EC2. No internet-facing inbound; SSH via bastion only"
   vpc_id      = aws_vpc.main.id
 
   tags = { Name = "${var.project}-train" }

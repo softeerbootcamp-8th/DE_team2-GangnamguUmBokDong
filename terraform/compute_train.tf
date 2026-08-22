@@ -33,12 +33,13 @@ resource "aws_iam_instance_profile" "train" {
 }
 
 resource "aws_instance" "train" {
-  key_name      = aws_key_pair.main.key_name
+  key_name      = var.ssh_key_name
   ami           = data.aws_ami.al2023_arm64.id
   instance_type = var.train_instance_type
   subnet_id     = aws_subnet.public[0].id
-  # sg-train에는 인바운드 규칙이 하나도 없다. 퍼블릭 IP가 있어도 외부에서 도달할 수 없고,
-  # 접속은 SSM Session Manager로만 한다.
+  # sg-train은 인터넷을 향한 인바운드가 없다. 퍼블릭 IP가 있어도 외부에서 직접 도달할
+  # 수 없고, 접속은 상시 EC2를 bastion으로 한 SSH ProxyJump(make ssh-train)로만 한다 —
+  # SSM은 이 계정 SCP가 전면 거부한다.
   vpc_security_group_ids = [aws_security_group.train.id]
   iam_instance_profile   = aws_iam_instance_profile.train.name
 

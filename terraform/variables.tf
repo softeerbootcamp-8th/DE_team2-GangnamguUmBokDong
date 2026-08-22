@@ -63,10 +63,16 @@ variable "app_instance_type" {
     상시 EC2. Airflow 3종 + API + nginx + MLflow가 상주하고(~2.1GB) 그 위에
     BashOperator subprocess가 프로세스당 400MB~1.2GB로 뜬다. Graviton을 쓰는 이유는
     전 모듈 uv.lock에 aarch64 휠이 있어서다(LightGBM 포함).
-    리허설에서 swap을 실제로 쓰기 시작하면 t4g.xlarge로 올린다 — 같은 계열이라 in-place다.
+    2026-08-22 실측으로 t4g.xlarge로 올렸다 — 병목은 메모리가 아니라 vCPU였다.
+    t4g.large(2 vCPU)에서 realtime_5min 한 tick이 530초 걸려 5분 주기를 못 맞췄고,
+    그중 149초는 연산이 아니라 prepare_serving_plan 완료 후 run_inference가
+    시작되기까지의 순수 큐잉이었다(load average 1.88/2코어, scheduler 컨테이너
+    단독 134% CPU). tick이 밀리면 Airflow가 5분 tick을 건너뛰고, 그러면
+    publish_station_urgency의 -5·-10·-15·-20·-25분 게시 요건이 영구히 깨진다.
+    같은 Graviton 계열이라 stop → 변경 → start로 in-place 처리되고 EBS가 유지된다.
   EOT
   type        = string
-  default     = "t4g.large"
+  default     = "t4g.xlarge"
 }
 
 variable "train_instance_type" {
@@ -107,10 +113,12 @@ variable "rds_instance_class" {
 
 variable "rds_engine_version" {
   description = <<-EOT
-    정찰로 확인한 사용 가능 버전은 16.9~16.14다. 어느 마이너가 PostGIS 3.5를 주는지는
-    API로 알 수 없어 최신부터 시도한다 — ops/postgres/check_gold_schema.sql이 정확히
-    3.5를 요구하므로, 생성 직후 pg_available_extension_versions로 확인하고 없으면
-    16.13 → 16.12 순으로 내려가며 재생성한다(데이터가 없어 재생성이 싸다).
+    정찰로 확인한 사용 가능 버전은 16.9~16.14다. 16.14가 PostGIS 3.4.6을 제공함을
+    실측했고(2026-08-21), ops/postgres/check_gold_schema.sql이 정확히 3.4를 요구하도록
+    맞춰뒀다(로컬 postgis/postgis:16-3.4와 동일 조합). rds_engine_version을 바꿀 때는
+    생성 직후 pg_available_extension_versions로 3.4 가용성을 다시 확인할 것 —
+    없으면 버전을 올리고 3.4보다 높은 버전만 있으면 내려서 재생성한다
+    (데이터가 없는 시점이면 재생성이 싸다).
   EOT
   type        = string
   default     = "16.14"
@@ -128,15 +136,19 @@ variable "s3_bucket_name" {
   default     = "gng-ubd-s3-bucket"
 }
 
-variable "ssh_public_key_path" {
+variable "ssh_key_name" {
   description = <<-EOT
-    EC2에 등록할 SSH 공개키 경로.
+    EC2에 등록할 SSH 키페어 이름.
 
     SSM Session Manager가 이 계정에서 전면 거부되어(StartSession·SendCommand·
-    DescribeInstanceInformation 모두) SSH가 유일한 접속 수단이다. 로컬에서 만든
-    키의 **공개키만** 등록하므로 개인키는 AWS를 거치지 않는다:
-      ssh-keygen -t ed25519 -f ~/.ssh/gng-ubd
+    DescribeInstanceInformation 모두) SSH가 유일한 접속 수단이다. 키페어는
+    terraform이 관리하지 않는다 — `aws ec2 create-key-pair`로 AWS가 개인키를
+    직접 생성하게 하고(응답 KeyMaterial을 그 순간에만 받을 수 있다), 그 키페어
+    이름만 여기에 지정한다:
+      aws ec2 create-key-pair --key-name gng-ubd-admin --key-type ed25519 \
+        --query 'KeyMaterial' --output text > ~/.ssh/gng-ubd-admin.pem
+      chmod 600 ~/.ssh/gng-ubd-admin.pem
   EOT
   type        = string
-  default     = "~/.ssh/gng-ubd.pub"
+  default     = "gng-ubd-admin"
 }
