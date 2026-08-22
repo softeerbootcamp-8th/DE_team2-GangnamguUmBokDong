@@ -426,3 +426,50 @@ def test_route_response_exposes_dismiss_and_restore_fields(
     assert response.status_code == 200
     assert response.json()["dismissed_at"] == "2026-08-20T01:05:00Z"
     assert response.json()["restored_from_route_id"] == "44444444-4444-4444-8444-444444444444"
+
+
+def test_dismiss_returns_dismissed_route(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """dismiss는 종료된 작업에 삭제 시각을 채운 응답을 돌려준다."""
+    route = _route("completed")
+    route["dismissed_at"] = NOW
+    monkeypatch.setattr(queries, "dismiss_route", lambda _route_id, _now: route)
+
+    response = client.post(f"/routes/{ROUTE_ID}/dismiss")
+
+    assert response.status_code == 200
+    assert response.json()["dismissed_at"] == "2026-08-20T01:05:00Z"
+
+
+@pytest.mark.parametrize(
+    "result,status_code,detail",
+    [
+        (queries.RouteTransitionResult.NOT_FOUND, 404, f"route {ROUTE_ID} not found"),
+        (
+            queries.RouteTransitionResult.WRONG_STATUS,
+            409,
+            f"route {ROUTE_ID} is not in completed or cancelled status",
+        ),
+        (
+            queries.RouteTransitionResult.ALREADY_DISMISSED,
+            409,
+            f"route {ROUTE_ID} is already dismissed",
+        ),
+    ],
+)
+def test_dismiss_maps_not_found_wrong_status_and_duplicate(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    result: queries.RouteTransitionResult,
+    status_code: int,
+    detail: str,
+) -> None:
+    """dismiss는 404·상태 409·중복 409를 명시적으로 매핑한다."""
+    monkeypatch.setattr(queries, "dismiss_route", lambda _route_id, _now: result)
+
+    response = client.post(f"/routes/{ROUTE_ID}/dismiss")
+
+    assert response.status_code == status_code
+    assert response.json()["detail"] == detail

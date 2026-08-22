@@ -181,6 +181,7 @@ def _route_transition_response(
     route_id: UUID,
     result: dict | queries.RouteTransitionResult,
     expected_status: str,
+    conflict_detail: str = "route_transition_conflict",
 ) -> dict:
     """DB 독립 route 전이 결과를 HTTP 오류 또는 응답으로 변환한다."""
     if result is queries.RouteTransitionResult.NOT_FOUND:
@@ -190,8 +191,10 @@ def _route_transition_response(
             status_code=409,
             detail=f"route {route_id} is not in {expected_status} status",
         )
+    if result is queries.RouteTransitionResult.ALREADY_DISMISSED:
+        raise HTTPException(status_code=409, detail=f"route {route_id} is already dismissed")
     if result is queries.RouteTransitionResult.CONSTRAINT_CONFLICT:
-        raise HTTPException(status_code=409, detail="route_transition_conflict")
+        raise HTTPException(status_code=409, detail=conflict_detail)
     return result
 
 
@@ -214,3 +217,10 @@ def cancel_route(route_id: UUID) -> dict:
     """route를 dispatched에서 cancelled로 guarded 전이한다."""
     result = queries.cancel_route(route_id, queries.now_utc())
     return _route_transition_response(route_id, result, "dispatched")
+
+
+@app.post("/routes/{route_id}/dismiss", response_model=Route)
+def dismiss_route(route_id: UUID) -> dict:
+    """종료된 route를 작업 현황 목록에서만 감춘다."""
+    result = queries.dismiss_route(route_id, queries.now_utc())
+    return _route_transition_response(route_id, result, "completed or cancelled")

@@ -64,6 +64,7 @@ class RouteTransitionResult(StrEnum):
     NOT_FOUND = "not_found"
     WRONG_STATUS = "wrong_status"
     CONSTRAINT_CONFLICT = "constraint_conflict"
+    ALREADY_DISMISSED = "already_dismissed"
 
 
 def now_utc() -> datetime:
@@ -649,3 +650,47 @@ def cancel_route(
         next_status="cancelled",
         timestamp_column="cancelled_dttm",
     )
+
+
+def dismiss_route(
+    route_id: UUID,
+    now: datetime,
+) -> dict[str, Any] | RouteTransitionResult:
+    """종료된 route를 목록에서만 감춘다. 행과 이력은 그대로 남긴다."""
+    try:
+        with (
+            get_connection() as connection,
+            connection.cursor(row_factory=dict_row) as cursor,
+        ):
+            cursor.execute(
+                """
+                UPDATE rebalance_route
+                   SET dismissed_dttm = %(now)s
+                 WHERE route_id = %(route_id)s
+                   AND route_status_cd IN ('completed', 'cancelled')
+                   AND dismissed_dttm IS NULL
+                RETURNING route_id
+                """,
+                {"route_id": route_id, "now": now},
+            )
+            if cursor.fetchone() is None:
+                cursor.execute(
+                    """
+                    SELECT dismissed_dttm
+                      FROM rebalance_route
+                     WHERE route_id = %(route_id)s
+                    """,
+                    {"route_id": route_id},
+                )
+                existing = cursor.fetchone()
+                if existing is None:
+                    return RouteTransitionResult.NOT_FOUND
+                if existing["dismissed_dttm"] is not None:
+                    return RouteTransitionResult.ALREADY_DISMISSED
+                return RouteTransitionResult.WRONG_STATUS
+            route = _fetch_route_with_cursor(cursor, route_id)
+            if route is None:
+                raise RuntimeError("삭제 직후 route aggregate를 찾을 수 없습니다.")
+            return route
+    except CheckViolation:
+        return RouteTransitionResult.CONSTRAINT_CONFLICT

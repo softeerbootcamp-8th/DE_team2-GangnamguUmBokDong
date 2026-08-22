@@ -529,3 +529,29 @@ def test_dismissed_routes_leave_the_list_but_stay_fetchable(database_url: str) -
     assert fetched is not None
     assert fetched["dismissed_at"] == now + timedelta(seconds=2)
     assert fetched["restored_from_route_id"] is None
+
+
+def test_dismiss_route_guards_status_and_duplicates(database_url: str) -> None:
+    """dismiss는 종료된 작업만 한 번 삭제하고 나머지는 결과값으로 거부한다."""
+    now = datetime.now(UTC)
+    _seed_serving_fixture(database_url, now)
+
+    assert queries.dismiss_route(ROUTE_ID, now) is queries.RouteTransitionResult.WRONG_STATUS
+
+    queries.dispatch_route(ROUTE_ID, now)
+    assert (
+        queries.dismiss_route(ROUTE_ID, now + timedelta(seconds=1))
+        is queries.RouteTransitionResult.WRONG_STATUS
+    )
+
+    queries.complete_route(ROUTE_ID, now + timedelta(seconds=1))
+    dismissed = queries.dismiss_route(ROUTE_ID, now + timedelta(seconds=2))
+    assert isinstance(dismissed, dict)
+    assert dismissed["status"] == "completed"
+    assert dismissed["dismissed_at"] == now + timedelta(seconds=2)
+
+    assert (
+        queries.dismiss_route(ROUTE_ID, now + timedelta(seconds=3))
+        is queries.RouteTransitionResult.ALREADY_DISMISSED
+    )
+    assert queries.dismiss_route(MISSING_ROUTE_ID, now) is queries.RouteTransitionResult.NOT_FOUND
