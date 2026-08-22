@@ -40,8 +40,8 @@ x-airflow-common: &airflow-common
     AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
     # t4g.large(8GB)에서 BashOperator subprocess가 pandas/pyarrow(+LightGBM)를 들고
     # 뜬다 — 프로세스당 400MB~1.2GB다. LocalExecutor 기본 parallelism 32는 위험하다.
-    AIRFLOW__CORE__PARALLELISM: "3"
-    AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG: "2"
+    AIRFLOW__CORE__PARALLELISM: ${AIRFLOW__CORE__PARALLELISM:-3}
+    AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG: ${AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG:-2}
     # BashOperator subprocess(collector/normalizer/nowcaster/ml/loader)가 쓰는 값.
     DATABASE_URL: ${DATABASE_URL:?RDS app DB 연결 문자열이 필요합니다}
     # 빈 문자열이면 core.s3가 `or None`으로 처리해 실제 AWS S3로 간다.
