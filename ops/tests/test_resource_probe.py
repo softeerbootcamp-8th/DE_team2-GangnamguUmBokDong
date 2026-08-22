@@ -26,12 +26,21 @@ def test_profiled_command_records_process_tree_and_filesystem(tmp_path: Path):
 
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert return_code == 0
-    assert manifest["schema_version"] == "resource-profile-v1"
+    assert manifest["schema_version"] == "resource-profile-v2"
     assert manifest["status"] == "succeeded"
     assert manifest["exit_code"] == 0
     assert manifest["sample_count"] >= 2
     assert manifest["peak_process_tree_rss_bytes"] >= 8 * 1024 * 1024
+    assert manifest["peak_process_tree_rss_plus_swap_bytes"] >= manifest["peak_process_tree_rss_bytes"]
+    assert manifest["peak_process_tree_pss_plus_swap_pss_bytes"] > 0
+    assert manifest["peak_process_tree_logical_memory_sample"]["observed_at"]
     assert manifest["peak_system_memory_used_bytes"] > 0
+    assert manifest["peak_system_memory_plus_swap_used_bytes"] > 0
+    assert manifest["peak_system_logical_memory_sample"]["observed_at"]
+    assert set(manifest["memory_pressure_total_stall_delta_us"]) == {"some", "full"}
+    if manifest["cgroup_memory_at_start"]:
+        assert manifest["peak_cgroup_memory_plus_swap_bytes"] > 0
+        assert manifest["peak_cgroup_logical_memory_sample"]["observed_at"]
     assert manifest["metadata"] == {"commit_sha": "abc123"}
     filesystem = manifest["filesystems"][str(tmp_path)]
     assert filesystem["start_available_bytes"] > 0
