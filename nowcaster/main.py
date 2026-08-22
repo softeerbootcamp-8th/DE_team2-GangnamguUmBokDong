@@ -68,9 +68,20 @@ def run_estimate(today: date) -> int:
         # 2-2. 1차 폴백용 5~8주 전 확장 후보 데이터 로드
         extended_frames = [_read_archive_as_frame(d) for d in holiday.extended_candidate_dates(target)]
 
-        # 2-3. 2차 폴백용 과거 전체 동일 패턴 일자들의 격자별 전체 평균 계산
+        # 2-3. 2차 폴백용 과거 전체 동일 패턴 일자들의 격자별 전체 평균 계산.
+        # 패턴(평일/휴일)별로 캐시된 누적 합/카운트에 새로 추가된 날짜만 더한다 —
+        # 매번 전체를 다시 읽으면 archive가 쌓일수록 실행 시간이 계속 늘어난다
+        # (2026-08 실측: 594일 backfill 직후 한 번 실행에 약 20분,
+        # estimate_day.historical_average_cached 참고).
+        pattern = "special" if holiday.is_special_day(target) else "weekday"
         historical_dates = [d for d in storage.list_archive_dates() if holiday.matches_target_pattern(d, target)]
-        historical_avg = estimate_day.historical_average([_read_archive_as_frame(d) for d in historical_dates])
+        historical_avg = estimate_day.historical_average_cached(
+            pattern,
+            historical_dates,
+            _read_archive_as_frame,
+            storage.read_historical_cache,
+            storage.write_historical_cache,
+        )
         historical_avg_frame = historical_avg.reset_index() if historical_avg is not None else None
 
         # 2-4. 가중평균 및 다단계 폴백을 적용하여 최종 나우캐스팅 추정 테이블 생성

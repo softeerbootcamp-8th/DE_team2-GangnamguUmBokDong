@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable, Iterable
+from datetime import date
+
 # pyrefly: ignore [missing-import]
 import numpy as np
 import pandas as pd
@@ -30,6 +33,99 @@ def historical_average(frames: list[pd.DataFrame | None]) -> pd.DataFrame | None
     combined = pd.concat(present, ignore_index=True)
     value_cols = [c for c in VALUE_COLS if c in combined.columns]
     return combined.groupby(KEY_COLS)[value_cols].mean()
+
+
+_RunningSumCount = tuple[pd.DataFrame, pd.DataFrame]
+
+
+def _accumulate(running: _RunningSumCount | None, frame: pd.DataFrame | None) -> _RunningSumCount | None:
+    """하루치 프레임을 누적 합/카운트에 더한다. 프레임이 비었으면 누적을 그대로 반환한다."""
+    if frame is None or frame.empty:
+        return running
+    value_cols = [c for c in VALUE_COLS if c in frame.columns]
+    keyed = frame.set_index(KEY_COLS)[value_cols]
+    count = keyed.notna().astype("int64")
+    values = keyed.fillna(0.0)
+    if running is None:
+        return values, count
+    running_sum, running_count = running
+    return running_sum.add(values, fill_value=0.0), running_count.add(count, fill_value=0)
+
+
+def _finalize(running: _RunningSumCount | None) -> pd.DataFrame | None:
+    """누적 합/카운트에서 평균 DataFrame을 만든다. 누적이 없으면 None."""
+    if running is None:
+        return None
+    running_sum, running_count = running
+    return running_sum / running_count.where(running_count > 0)
+
+
+def historical_average_over_dates(
+    dates: Iterable[date], read_frame: Callable[[date], pd.DataFrame | None]
+) -> pd.DataFrame | None:
+    """`historical_average`와 같은 결과를 날짜 하나씩 읽어 누적 합/카운트로 계산한다.
+
+    `historical_average([read_frame(d) for d in dates])`와 동치이지만, 매칭되는
+    과거 날짜 전체를 리스트로 한꺼번에 메모리에 올리지 않는다 — 같은 요일/휴일
+    패턴에 맞는 날짜가 (인구 격자처럼 하루 수십MB인 소스에서) 수십~수백 개에
+    달하면 리스트 컴프리헨션이 그 개수만큼 프레임을 동시에 들고 있어 OOM이 난다
+    (2026-08 실측: 이 태스크가 exit 137로 SIGKILL됨). 읽은 프레임은 러닝 합/카운트에
+    반영한 직후 버려서, 상주 메모리가 날짜 수와 무관하게 격자 하나치 크기로 고정된다.
+
+    캐시 없이 매번 전체를 다시 읽으므로 archive가 커질수록 이 함수 자체의 실행
+    시간은 계속 늘어난다 — 실행 시간까지 archive 크기와 무관하게 만들려면
+    `historical_average_cached`를 쓴다.
+    """
+    running: _RunningSumCount | None = None
+    for target in dates:
+        running = _accumulate(running, read_frame(target))
+    return _finalize(running)
+
+
+def historical_average_cached(
+    pattern: str,
+    dates: Iterable[date],
+    read_frame: Callable[[date], pd.DataFrame | None],
+    load_cache: Callable[[str], tuple[pd.DataFrame | None, pd.DataFrame | None, list[str]]],
+    save_cache: Callable[[str, pd.DataFrame, pd.DataFrame, list[str]], None],
+) -> pd.DataFrame | None:
+    """캐시된 누적 합/카운트에 새로 추가된 날짜만 더해 과거 전체 평균을 유지한다.
+
+    `historical_average_over_dates`는 매번 매칭되는 날짜 전체를 다시 읽는다 —
+    archive가 쌓일수록(하루에 1개씩 늘어남) 이 함수의 실행 시간도 계속 늘어난다
+    (2026-08 실측: 594일 backfill 직후 한 번 실행에 약 20분, 매칭 날짜 약 420개
+    x 대상일 7개 ≈ 2,900회 S3 읽기). 패턴(평일/휴일)별로 누적 합/카운트와 "이미
+    반영한 날짜" 목록을 S3에 캐시해두고, 다음 실행부터는 그 목록에 없는 날짜만
+    읽어 누적한다 — 정상 운영(하루 1개씩 archive가 늘어나는 상황)에서는 실행마다
+    새로 읽는 날짜가 보통 0~1개뿐이라 archive 크기와 무관하게 빨라진다.
+
+    args:
+        pattern: 캐시를 구분하는 키(예: "weekday"/"special"). 호출부가 정한다 —
+            이 함수는 패턴이 무엇을 의미하는지 모른다.
+        dates: 이번 호출에서 유효한, 그 패턴에 매칭되는 전체 날짜 집합(현재
+            archive 기준). 캐시에 없는 날짜만 실제로 읽는다.
+        read_frame: 날짜 하나의 아카이브를 읽는 함수.
+        load_cache: `pattern`으로 (누적 합, 누적 카운트, 반영한 날짜 문자열 목록)을
+            읽는 함수. 캐시가 없으면 (None, None, [])를 반환해야 한다.
+        save_cache: `pattern`, 갱신된 누적 합/카운트, 갱신된 날짜 문자열 목록을
+            받아 저장하는 함수. 새로 반영한 날짜가 하나도 없으면 호출되지 않는다.
+    """
+    dates = sorted(set(dates))
+    cached_sum, cached_count, included = load_cache(pattern)
+    included_dates = {date.fromisoformat(d) for d in included}
+    new_dates = [d for d in dates if d not in included_dates]
+
+    running: _RunningSumCount | None = (cached_sum, cached_count) if cached_sum is not None else None
+    for target in new_dates:
+        running = _accumulate(running, read_frame(target))
+        # 그 날짜에 데이터가 없어도(read_frame이 None) "확인은 했다"로 기록한다 —
+        # 그러지 않으면 데이터 없는 날짜를 실행마다 계속 다시 시도하게 된다.
+        included_dates.add(target)
+
+    if new_dates and running is not None:
+        save_cache(pattern, running[0], running[1], sorted(d.isoformat() for d in included_dates))
+
+    return _finalize(running)
 
 
 def _prep(frames: list[pd.DataFrame | None], suffix_prefix: str) -> list[pd.DataFrame]:
