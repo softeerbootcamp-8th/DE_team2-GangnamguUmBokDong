@@ -97,6 +97,8 @@ class Route(BaseModel):
     dispatched_at: datetime | None
     completed_at: datetime | None
     cancelled_at: datetime | None
+    dismissed_at: datetime | None
+    restored_from_route_id: str | None
     stops: list[RouteStop]
 
 

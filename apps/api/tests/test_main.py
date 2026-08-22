@@ -89,6 +89,8 @@ def _route(status: str = "proposed") -> dict:
         "dispatched_at": NOW if status in {"dispatched", "completed", "cancelled"} else None,
         "completed_at": NOW if status == "completed" else None,
         "cancelled_at": NOW if status == "cancelled" else None,
+        "dismissed_at": None,
+        "restored_from_route_id": None,
         "stops": [
             {
                 "visit_order": 1,
@@ -407,3 +409,20 @@ def test_readyz_503_when_database_unreachable(
 
     assert response.status_code == 503
     assert response.json()["detail"] == "database_unavailable"
+
+
+def test_route_response_exposes_dismiss_and_restore_fields(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """route 응답은 삭제 시각과 복제 원본을 그대로 노출한다."""
+    route = _route("cancelled")
+    route["dismissed_at"] = NOW
+    route["restored_from_route_id"] = "44444444-4444-4444-8444-444444444444"
+    monkeypatch.setattr(queries, "fetch_route", lambda _route_id: route)
+
+    response = client.get(f"/routes/{ROUTE_ID}")
+
+    assert response.status_code == 200
+    assert response.json()["dismissed_at"] == "2026-08-20T01:05:00Z"
+    assert response.json()["restored_from_route_id"] == "44444444-4444-4444-8444-444444444444"

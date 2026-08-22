@@ -508,3 +508,24 @@ def test_dismiss_columns_reject_active_routes_and_transition_writes(database_url
                 """,
                 {"other": CONFLICT_ROUTE_ID, "route_id": ROUTE_ID},
             )
+
+
+def test_dismissed_routes_leave_the_list_but_stay_fetchable(database_url: str) -> None:
+    """삭제한 route는 목록에서 빠지지만 단건 조회로는 계속 읽힌다."""
+    now = datetime.now(UTC)
+    _seed_serving_fixture(database_url, now)
+
+    queries.dispatch_route(ROUTE_ID, now)
+    queries.complete_route(ROUTE_ID, now + timedelta(seconds=1))
+    with psycopg.connect(database_url) as connection:
+        connection.execute(
+            "UPDATE rebalance_route SET dismissed_dttm = %(now)s WHERE route_id = %(route_id)s",
+            {"now": now + timedelta(seconds=2), "route_id": ROUTE_ID},
+        )
+
+    # fixture는 ROUTE_ID와 CONFLICT_ROUTE_ID 둘을 시드한다. 삭제한 쪽만 빠져야 한다.
+    assert {route["route_id"] for route in queries.fetch_routes()} == {str(CONFLICT_ROUTE_ID)}
+    fetched = queries.fetch_route(ROUTE_ID)
+    assert fetched is not None
+    assert fetched["dismissed_at"] == now + timedelta(seconds=2)
+    assert fetched["restored_from_route_id"] is None

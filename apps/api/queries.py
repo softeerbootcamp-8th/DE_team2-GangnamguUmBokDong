@@ -477,7 +477,9 @@ def _route_aggregate_query(where_clause: str, page_clause: str = "") -> str:
                    route.proposed_dttm AS proposed_at,
                    route.dispatched_dttm AS dispatched_at,
                    route.completed_dttm AS completed_at,
-                   route.cancelled_dttm AS cancelled_at
+                   route.cancelled_dttm AS cancelled_at,
+                   route.dismissed_dttm AS dismissed_at,
+                   route.restored_from_route_id::text AS restored_from_route_id
               FROM rebalance_route AS route
               JOIN dispatch_center AS center USING (dispatch_center_id)
              {where_clause}
@@ -491,6 +493,8 @@ def _route_aggregate_query(where_clause: str, page_clause: str = "") -> str:
                page.dispatched_at,
                page.completed_at,
                page.cancelled_at,
+               page.dismissed_at,
+               page.restored_from_route_id,
                COALESCE(stops.items, '[]'::jsonb) AS stops
           FROM route_page AS page
           LEFT JOIN LATERAL (
@@ -521,7 +525,9 @@ def fetch_routes(
     offset: int = 0,
 ) -> list[dict[str, Any]]:
     """bounded filter와 결정적 순서로 route aggregate 목록을 반환한다."""
-    conditions: list[str] = []
+    # 삭제한 작업은 목록에서 제외한다. 단건 조회(fetch_route)는 선택 중인 항목이
+    # 갑자기 404가 되지 않도록 이 필터를 걸지 않는다.
+    conditions: list[str] = ["route.dismissed_dttm IS NULL"]
     params: dict[str, Any] = {"limit": limit, "offset": offset}
     if region is not None:
         conditions.append("center.dispatch_center_nm = %(region)s")
