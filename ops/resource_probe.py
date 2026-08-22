@@ -229,6 +229,14 @@ def _write_manifest(path: Path, manifest: dict) -> None:
     os.replace(temporary, path)
 
 
+def _signal_process_group(process: subprocess.Popen, signum: int) -> None:
+    """살아 있는 대상 process group에 종료 신호를 전달한다."""
+    try:
+        os.killpg(process.pid, signum)
+    except ProcessLookupError:
+        pass
+
+
 def _initial_manifest(
     *,
     label: str,
@@ -438,6 +446,18 @@ def run_profiled_command(
 
     interrupted_signal: int | None = None
     memory_guard_triggered = False
+    previous_handlers: dict[int, signal.Handlers] = {}
+
+    def forward_signal(signum: int, _frame) -> None:
+        """Wrapper 종료 신호를 기록하고 대상 process group에 즉시 전달한다."""
+        nonlocal interrupted_signal
+        if interrupted_signal is None:
+            interrupted_signal = signum
+        _signal_process_group(process, signum)
+
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        previous_handlers[signum] = signal.getsignal(signum)
+        signal.signal(signum, forward_signal)
     try:
         while process.poll() is None:
             sample = _sample_manifest(
@@ -461,26 +481,38 @@ def run_profiled_command(
                 )
                 manifest["status"] = "terminating_resource_guard"
                 _write_manifest(manifest_path, manifest)
-                os.killpg(process.pid, signal.SIGTERM)
+                _signal_process_group(process, signal.SIGTERM)
                 try:
                     process.wait(timeout=10)
                 except subprocess.TimeoutExpired:
-                    os.killpg(process.pid, signal.SIGKILL)
+                    _signal_process_group(process, signal.SIGKILL)
                     process.wait()
                 break
             _write_manifest(manifest_path, manifest)
+            if interrupted_signal is not None:
+                manifest["status"] = "terminating_signal"
+                _write_manifest(manifest_path, manifest)
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    _signal_process_group(process, signal.SIGKILL)
+                    process.wait()
+                break
             try:
                 process.wait(timeout=sample_seconds)
             except subprocess.TimeoutExpired:
                 pass
     except KeyboardInterrupt:
         interrupted_signal = signal.SIGINT
-        os.killpg(process.pid, signal.SIGINT)
+        _signal_process_group(process, signal.SIGINT)
         try:
             process.wait(timeout=10)
         except subprocess.TimeoutExpired:
-            os.killpg(process.pid, signal.SIGKILL)
+            _signal_process_group(process, signal.SIGKILL)
             process.wait()
+    finally:
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
 
     return_code = process.wait()
     final_sample = _sample_manifest(
@@ -516,7 +548,7 @@ def run_profiled_command(
     _write_manifest(manifest_path, manifest)
     if memory_guard_triggered:
         return 75
-    return 130 if interrupted_signal is not None else return_code
+    return 128 + interrupted_signal if interrupted_signal is not None else return_code
 
 
 def _metadata(values: list[str]) -> dict[str, str]:
