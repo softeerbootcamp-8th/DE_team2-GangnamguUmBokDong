@@ -80,6 +80,8 @@ export interface Route {
   dispatched_at: string | null;
   completed_at: string | null;
   cancelled_at: string | null;
+  dismissed_at: string | null;
+  restored_from_route_id: string | null;
   stops: RouteStop[];
 }
 
@@ -193,4 +195,6 @@ export const api = {
   dispatchRoute: (routeId: string) => postJson<Route>(`/routes/${routeId}/dispatch`),
   completeRoute: (routeId: string) => postJson<Route>(`/routes/${routeId}/complete`),
   cancelRoute: (routeId: string) => postJson<Route>(`/routes/${routeId}/cancel`),
+  dismissRoute: (routeId: string) => postJson<Route>(`/routes/${routeId}/dismiss`),
+  restoreRoute: (routeId: string) => postJson<Route>(`/routes/${routeId}/restore`),
 };

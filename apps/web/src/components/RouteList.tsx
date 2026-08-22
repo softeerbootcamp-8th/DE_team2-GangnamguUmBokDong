@@ -1,4 +1,15 @@
-import { Check, CheckCheck, CircleX, Clock3, Loader2, Play, Route as RouteIcon, Timer } from "lucide-react";
+import {
+  Check,
+  CheckCheck,
+  CircleX,
+  Clock3,
+  Loader2,
+  Play,
+  RotateCcw,
+  Route as RouteIcon,
+  Timer,
+  Trash2,
+} from "lucide-react";
 import { useMemo } from "react";
 import type { DispatchCenter, Route, RouteStatus } from "../api";
 import { estimateRoute, formatRouteDuration, groupWorkRoutes, routeKind } from "../routeOperations";
@@ -23,6 +34,8 @@ interface Props {
   onDispatch: (route: Route) => void;
   onComplete: (route: Route) => void;
   onCancel: (route: Route) => void;
+  onDismiss: (route: Route) => void;
+  onRestore: (route: Route) => void;
 }
 
 function routeSummary(route: Route): string {
@@ -45,6 +58,8 @@ export function RouteList({
   onDispatch,
   onComplete,
   onCancel,
+  onDismiss,
+  onRestore,
 }: Props) {
   const { candidates, operations, hiddenCandidateCount, hiddenOperationCount } = useMemo(
     () => groupWorkRoutes(routes, { keepRouteId: selectedRouteId }),
@@ -56,6 +71,12 @@ export function RouteList({
     return byRouteId;
   }, [routes, regions]);
 
+  function confirmDismiss(route: Route) {
+    // 삭제하면 화면에서 다시 꺼낼 방법이 없다. 실수 한 번을 막는 값이 크다.
+    if (!window.confirm("이 작업을 목록에서 삭제할까요? 되돌릴 수 없습니다.")) return;
+    onDismiss(route);
+  }
+
   function renderRouteCard(route: Route) {
     const estimate = estimates.get(route.route_id) ?? null;
     const status = STATUS_META[route.status];
@@ -63,11 +84,10 @@ export function RouteList({
     const isSelected = route.route_id === selectedRouteId;
     const isBusy = route.route_id === busyRouteId;
     const transitionsBlocked = busyRouteId !== null;
-    const hasActions = route.status === "proposed" || route.status === "dispatched";
     return (
       <li key={route.route_id}>
         <article
-          className={`route-card${isSelected ? " selected" : ""}${hasActions ? " has-actions" : ""}`}
+          className={`route-card${isSelected ? " selected" : ""} has-actions`}
           aria-current={isSelected ? "true" : undefined}
         >
           <button type="button" className="route-card-main" onClick={() => onSelect(route)}>
@@ -129,6 +149,46 @@ export function RouteList({
                   title="작업 취소"
                 >
                   <CircleX size={14} aria-hidden="true" />
+                </button>
+              </>
+            )}
+            {route.status === "completed" && (
+              <button
+                type="button"
+                className={`route-action danger icon-only${isBusy ? " is-busy" : ""}`}
+                disabled={transitionsBlocked}
+                onClick={() => confirmDismiss(route)}
+                aria-label={isBusy ? "처리 중" : "삭제"}
+                title={isBusy ? "처리 중" : "작업 삭제"}
+              >
+                {isBusy
+                  ? <Loader2 size={14} aria-hidden="true" className="route-action-spinner" />
+                  : <Trash2 size={14} aria-hidden="true" />}
+              </button>
+            )}
+            {route.status === "cancelled" && (
+              <>
+                <button
+                  type="button"
+                  className={`route-action primary icon-only${isBusy ? " is-busy" : ""}`}
+                  disabled={transitionsBlocked}
+                  onClick={() => onRestore(route)}
+                  aria-label={isBusy ? "처리 중" : "되돌리기"}
+                  title={isBusy ? "처리 중" : "작업 후보로 되돌리기"}
+                >
+                  {isBusy
+                    ? <Loader2 size={14} aria-hidden="true" className="route-action-spinner" />
+                    : <RotateCcw size={14} aria-hidden="true" />}
+                </button>
+                <button
+                  type="button"
+                  className="route-action danger icon-only"
+                  disabled={transitionsBlocked}
+                  onClick={() => confirmDismiss(route)}
+                  aria-label="삭제"
+                  title="작업 삭제"
+                >
+                  <Trash2 size={14} aria-hidden="true" />
                 </button>
               </>
             )}

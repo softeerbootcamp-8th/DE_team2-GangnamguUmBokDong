@@ -20,6 +20,8 @@ const ROUTES: Route[] = [
     dispatched_at: null,
     completed_at: null,
     cancelled_at: null,
+    dismissed_at: null,
+    restored_from_route_id: null,
     stops: [
       {
         visit_order: 1,
@@ -49,6 +51,8 @@ const ROUTES: Route[] = [
     dispatched_at: "2026-08-21T02:05:00Z",
     completed_at: null,
     cancelled_at: null,
+    dismissed_at: null,
+    restored_from_route_id: null,
     stops: [],
   },
 ];
@@ -64,6 +68,8 @@ function renderRouteList(overrides: Partial<React.ComponentProps<typeof RouteLis
     onDispatch: vi.fn(),
     onComplete: vi.fn(),
     onCancel: vi.fn(),
+    onDismiss: vi.fn(),
+    onRestore: vi.fn(),
     ...overrides,
   };
   render(<RouteList {...props} />);
@@ -99,6 +105,58 @@ describe("RouteList", () => {
     expect(props.onDispatch).toHaveBeenCalledWith(ROUTES[0]);
     expect(props.onComplete).toHaveBeenCalledWith(ROUTES[1]);
     expect(props.onCancel).toHaveBeenCalledWith(ROUTES[1]);
+  });
+
+  it("완료된 작업에는 삭제 버튼만, 취소된 작업에는 되돌리기와 삭제 버튼을 준다", () => {
+    renderRouteList({
+      routes: [
+        { ...ROUTES[1], route_id: "done", status: "completed", completed_at: "2026-08-21T02:30:00Z" },
+        {
+          ...ROUTES[1],
+          route_id: "aborted",
+          status: "cancelled",
+          cancelled_at: "2026-08-21T02:40:00Z",
+        },
+      ],
+    });
+
+    expect(screen.getAllByRole("button", { name: "삭제" })).toHaveLength(2);
+    expect(screen.getAllByRole("button", { name: "되돌리기" })).toHaveLength(1);
+  });
+
+  it("삭제는 확인을 받은 뒤에만 호출한다", () => {
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(false);
+    const props = renderRouteList({
+      routes: [
+        { ...ROUTES[1], route_id: "done", status: "completed", completed_at: "2026-08-21T02:30:00Z" },
+      ],
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "삭제" }));
+    expect(props.onDismiss).not.toHaveBeenCalled();
+
+    confirmSpy.mockReturnValue(true);
+    fireEvent.click(screen.getByRole("button", { name: "삭제" }));
+    expect(props.onDismiss).toHaveBeenCalledTimes(1);
+
+    confirmSpy.mockRestore();
+  });
+
+  it("되돌리기는 확인 없이 바로 호출한다", () => {
+    const props = renderRouteList({
+      routes: [
+        {
+          ...ROUTES[1],
+          route_id: "aborted",
+          status: "cancelled",
+          cancelled_at: "2026-08-21T02:40:00Z",
+        },
+      ],
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "되돌리기" }));
+
+    expect(props.onRestore).toHaveBeenCalledTimes(1);
   });
 
   it("최신 제안보다 10분 이상 오래된 미승인 제안은 후보에서 제외한다", () => {
