@@ -321,3 +321,72 @@ def test_nearest_center_tie_breaks_by_utf8_id() -> None:
     )
     [record] = _build(centers=centers, distance_meters=lambda *_: 1.0).records
     assert record.dispatch_center_id == "CENTER-A"
+
+
+def test_batch_capable_distance_callback_replaces_per_pair_calls() -> None:
+    """callback이 batch를 노출하면 쌍마다 스칼라로 부르지 않고 묶어서 부른다."""
+    centers = (
+        DispatchCenterReference("CENTER-B", 127.06, 37.53, True),
+        DispatchCenterReference("CENTER-A", 127.03, 37.50, True),
+    )
+    scalar_calls: list[tuple[float, float, float, float]] = []
+    batch_calls: list[tuple[tuple[tuple[float, float], tuple[float, float]], ...]] = []
+
+    def distance(
+        longitude_a: float, latitude_a: float, longitude_b: float, latitude_b: float
+    ) -> float:
+        """스칼라 경로가 쓰이면 기록해 배치 우회를 잡아낸다."""
+        scalar_calls.append((longitude_a, latitude_a, longitude_b, latitude_b))
+        return 1.0
+
+    def batch(
+        pairs: tuple[tuple[tuple[float, float], tuple[float, float]], ...],
+    ) -> tuple[float, ...]:
+        """center 순서대로 거리를 돌려준다 — CENTER-A가 더 가깝다."""
+        batch_calls.append(pairs)
+        return tuple(2.0 if index == 0 else 1.0 for index in range(len(pairs)))
+
+    distance.batch = batch  # type: ignore[attr-defined]
+
+    [record] = _build(centers=centers, distance_meters=distance).records
+
+    assert record.dispatch_center_id == "CENTER-A"
+    assert scalar_calls == []
+    # relocation 비교 쌍 1회 + center 12개(여기선 2개) 1회 = 정류소당 2회.
+    # 쌍마다 부르면 3회가 된다.
+    assert len(batch_calls) == 2
+    assert batch_calls[-1] == (
+        ((record.longitude, record.latitude), (127.06, 37.53)),
+        ((record.longitude, record.latitude), (127.03, 37.50)),
+    )
+
+
+def test_batch_distance_result_count_mismatch_is_rejected() -> None:
+    """batch가 입력보다 적게 돌려주면 조용히 넘기지 않는다."""
+    centers = (
+        DispatchCenterReference("CENTER-B", 127.06, 37.53, True),
+        DispatchCenterReference("CENTER-A", 127.03, 37.50, True),
+    )
+
+    def distance(*_: float) -> float:
+        """스칼라 경로는 이 테스트에서 쓰이지 않는다."""
+        return 1.0
+
+    distance.batch = lambda pairs: (1.0,)  # type: ignore[attr-defined]
+
+    with pytest.raises(ContractViolation):
+        _build(centers=centers, distance_meters=distance)
+
+
+def test_batch_distance_rejects_non_finite_values() -> None:
+    """batch 결과도 스칼라와 같은 유한 비음수 계약을 통과해야 한다."""
+    centers = (DispatchCenterReference("CENTER-A", 127.03, 37.50, True),)
+
+    def distance(*_: float) -> float:
+        """스칼라 경로는 이 테스트에서 쓰이지 않는다."""
+        return 1.0
+
+    distance.batch = lambda pairs: (float("nan"),) * len(pairs)  # type: ignore[attr-defined]
+
+    with pytest.raises(ContractViolation):
+        _build(centers=centers, distance_meters=distance)
