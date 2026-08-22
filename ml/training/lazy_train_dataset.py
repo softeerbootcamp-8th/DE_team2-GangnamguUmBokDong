@@ -377,6 +377,91 @@ def _open_unlinked_memmap(file_obj, row_count: int) -> np.memmap:
     return mapped
 
 
+def _empty_unlinked_memmap(prefix: str, row_count: int) -> np.memmap:
+    """지정한 길이의 삭제 예약된 float64 scratch 배열을 만든다."""
+    file_obj = tempfile.NamedTemporaryFile(prefix=prefix, suffix=".bin", delete=False)
+    path = file_obj.name
+    try:
+        file_obj.truncate(row_count * np.dtype(np.float64).itemsize)
+        return _open_unlinked_memmap(file_obj, row_count)
+    except Exception:
+        if not file_obj.closed:
+            file_obj.close()
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+class LazySequenceDataset(lgb.Dataset):
+    """날짜 Sequence를 chunk 단위 init score로 이어 학습하는 Dataset이다.
+
+    LightGBM의 기본 continuation 경로는 ``data=[Sequence, ...]``를 하나의 NumPy
+    배열로 바꾸려 한다. 날짜마다 행 수가 다른 운영 데이터에서는 실패하고, 억지로
+    합치면 전체 feature 원본이 동시에 상주한다. 이 클래스는 이전 Booster의 raw
+    score를 날짜별로 계산해 disk-backed 1차원 배열에 이어 쓰고 native Dataset에
+    복사한다. 원래 init score(exposure offset)가 있으면 이전 tree raw score에 더해
+    중단 전 학습 의미를 그대로 복원한다.
+    """
+
+    _resume_base_init_score: np.ndarray | None = None
+
+    def _set_init_score_by_predictor(self, predictor, data, used_indices):
+        """lazy Sequence 목록은 전체 결합 없이 predictor init score를 설정한다."""
+        if predictor is None or used_indices is not None or not (
+            isinstance(data, list)
+            and data
+            and all(isinstance(chunk, _DatePartitionSequence) for chunk in data)
+        ):
+            return super()._set_init_score_by_predictor(predictor, data, used_indices)
+        if predictor.num_class != 1:
+            raise NotImplementedError(
+                "lazy checkpoint 재개는 현재 단일 출력 모델만 지원합니다: "
+                f"num_class={predictor.num_class}"
+            )
+
+        num_data = self.num_data()
+        init_score = _empty_unlinked_memmap("bike-resume-init-score-", num_data)
+        base_init_score = self._resume_base_init_score
+        if base_init_score is not None and len(base_init_score) != num_data:
+            raise ValueError(
+                "재개용 base init score 행 수가 Dataset과 다릅니다: "
+                f"base={len(base_init_score):,}, dataset={num_data:,}"
+            )
+
+        offset = 0
+        try:
+            for chunk in data:
+                feature_arr = chunk[:]
+                chunk_size = len(feature_arr)
+                stop = offset + chunk_size
+                raw_score = np.asarray(
+                    predictor.predict(feature_arr, raw_score=True),
+                    dtype=np.float64,
+                ).ravel()
+                if len(raw_score) != chunk_size:
+                    raise ValueError(
+                        "재개 predictor 결과 행 수가 날짜 chunk와 다릅니다: "
+                        f"predictions={len(raw_score):,}, chunk={chunk_size:,}"
+                    )
+                init_score[offset:stop] = raw_score
+                if base_init_score is not None:
+                    init_score[offset:stop] += base_init_score[offset:stop]
+                offset = stop
+                del feature_arr, raw_score
+            if offset != num_data:
+                raise ValueError(
+                    "재개 init score 행 수가 Dataset과 다릅니다: "
+                    f"predictions={offset:,}, dataset={num_data:,}"
+                )
+            self.set_init_score(init_score)
+            self.init_score = None
+            return self
+        finally:
+            del init_score
+
+
 def _stream_prepass_arrays(
     table_path: str,
     dates: list[str],
@@ -529,7 +614,7 @@ def build_lazy_dataset(
     ]
     init_score = _log_memmap(exposure) if exposure is not None else None
     cat_idx = [feature_columns.index("station_no")]
-    dataset = lgb.Dataset(
+    dataset = LazySequenceDataset(
         data=sequences,
         label=y,
         init_score=init_score,
@@ -548,7 +633,10 @@ def build_lazy_dataset(
     # `lgb.train()`은 이미 구성된 handle을 직접 사용한다.
     dataset.label = None
     dataset.init_score = None
-    del init_score
+    if keep_raw_data:
+        dataset._resume_base_init_score = init_score
+    else:
+        del init_score
     return dataset, y, exposure
 
 

@@ -247,6 +247,162 @@ def test_build_lazy_dataset_training_matches_eager_training():
     assert np.allclose(eager_booster.predict(eager_arr), lazy_booster.predict(eager_arr))
 
 
+def test_lazy_dataset_resume_matches_uninterrupted_with_unequal_chunks():
+    """서로 다른 길이의 날짜 chunk도 전체 결합 없이 동일한 모델로 이어 학습한다."""
+    path = "processed_v2/test/lazy_resume"
+    rng = np.random.default_rng(17)
+    resume_dates = ["2026-02-01", "2026-02-02", "2026-02-03"]
+    for day_index, (date_str, row_count) in enumerate(
+        zip(resume_dates, [75, 120, 45], strict=True)
+    ):
+        x1 = rng.normal(loc=day_index, size=row_count).astype(np.float32)
+        x2 = rng.normal(size=row_count).astype(np.float32)
+        frame = pd.DataFrame({
+            "station_no": rng.integers(1, 5, size=row_count, dtype=np.int16),
+            "x1": x1,
+            "x2": x2,
+            "y": np.maximum(0, np.rint(4 + 1.5 * x1 - 0.7 * x2)).astype(np.int16),
+        })
+        s3_io.write_parquet(frame, f"{path}/date={date_str}/part-0000.parquet")
+
+    params = {
+        "objective": "poisson",
+        "metric": "poisson",
+        "learning_rate": 0.08,
+        "num_leaves": 7,
+        "min_data_in_leaf": 5,
+        "verbosity": -1,
+        "num_threads": 1,
+        "seed": 19,
+    }
+
+    first_set, _, _ = build_lazy_dataset(
+        path,
+        resume_dates,
+        FEATURE_COLUMNS,
+        STATION_DTYPE,
+        None,
+        "y",
+        None,
+        ChunkCache(),
+        dataset_params=params,
+        keep_raw_data=True,
+    )
+    first_booster = lgb.train(params, first_set, num_boost_round=4)
+
+    resume_set, _, _ = build_lazy_dataset(
+        path,
+        resume_dates,
+        FEATURE_COLUMNS,
+        STATION_DTYPE,
+        None,
+        "y",
+        None,
+        ChunkCache(),
+        dataset_params=params,
+        keep_raw_data=True,
+    )
+    resumed = lgb.train(params, resume_set, num_boost_round=3, init_model=first_booster)
+
+    full_set, _, _ = build_lazy_dataset(
+        path,
+        resume_dates,
+        FEATURE_COLUMNS,
+        STATION_DTYPE,
+        None,
+        "y",
+        None,
+        ChunkCache(),
+        dataset_params=params,
+    )
+    uninterrupted = lgb.train(params, full_set, num_boost_round=7)
+    eager_arr = s3_io.read_parquet(
+        path,
+        columns=FEATURE_COLUMNS,
+        dates=resume_dates,
+    )
+    feature_arr = np.column_stack([
+        eager_arr["station_no"].astype(STATION_DTYPE).cat.codes.to_numpy(dtype=np.float64),
+        eager_arr["x1"].to_numpy(dtype=np.float64),
+        eager_arr["x2"].to_numpy(dtype=np.float64),
+    ])
+
+    assert resumed.current_iteration() == uninterrupted.current_iteration() == 7
+    np.testing.assert_allclose(
+        resumed.predict(feature_arr),
+        uninterrupted.predict(feature_arr),
+        rtol=1e-12,
+        atol=1e-12,
+    )
+
+
+def test_lazy_dataset_resume_preserves_exposure_init_score():
+    """Poisson 재개 시 이전 tree score와 원래 exposure offset을 함께 복원한다."""
+    path = "processed_v2/test/lazy_resume_exposure"
+    rng = np.random.default_rng(23)
+    resume_dates = ["2026-03-01", "2026-03-02"]
+    for day_index, (date_str, row_count) in enumerate(
+        zip(resume_dates, [90, 130], strict=True)
+    ):
+        x1 = rng.normal(loc=day_index, size=row_count).astype(np.float32)
+        x2 = rng.normal(size=row_count).astype(np.float32)
+        exposure = rng.uniform(0.2, 1.0, size=row_count).astype(np.float32)
+        frame = pd.DataFrame({
+            "station_no": rng.integers(1, 5, size=row_count, dtype=np.int16),
+            "x1": x1,
+            "x2": x2,
+            "y": rng.poisson(exposure * np.exp(1.0 + 0.2 * x1)).astype(np.int16),
+            "exposure": exposure,
+        })
+        s3_io.write_parquet(frame, f"{path}/date={date_str}/part-0000.parquet")
+
+    params = {
+        "objective": "poisson",
+        "metric": "poisson",
+        "learning_rate": 0.08,
+        "num_leaves": 7,
+        "min_data_in_leaf": 5,
+        "verbosity": -1,
+        "num_threads": 1,
+        "seed": 29,
+    }
+
+    def dataset(keep_raw_data: bool):
+        """같은 exposure 계약의 새 lazy Dataset을 만든다."""
+        return build_lazy_dataset(
+            path,
+            resume_dates,
+            FEATURE_COLUMNS,
+            STATION_DTYPE,
+            None,
+            "y",
+            "exposure",
+            ChunkCache(),
+            dataset_params=params,
+            keep_raw_data=keep_raw_data,
+        )[0]
+
+    first_booster = lgb.train(params, dataset(True), num_boost_round=4)
+    resumed = lgb.train(params, dataset(True), num_boost_round=3, init_model=first_booster)
+    uninterrupted = lgb.train(params, dataset(False), num_boost_round=7)
+
+    resumed_dump = resumed.dump_model()
+    uninterrupted_dump = uninterrupted.dump_model()
+    assert resumed_dump["tree_info"] == uninterrupted_dump["tree_info"]
+    feature_frame = s3_io.read_parquet(path, columns=FEATURE_COLUMNS, dates=resume_dates)
+    feature_arr = np.column_stack([
+        feature_frame["station_no"].astype(STATION_DTYPE).cat.codes.to_numpy(dtype=np.float64),
+        feature_frame["x1"].to_numpy(dtype=np.float64),
+        feature_frame["x2"].to_numpy(dtype=np.float64),
+    ])
+    np.testing.assert_allclose(
+        resumed.predict(feature_arr),
+        uninterrupted.predict(feature_arr),
+        rtol=1e-12,
+        atol=1e-12,
+    )
+
+
 def test_predict_over_dates_matches_per_date_eager_predict():
     """predict_over_dates()가 청크(날짜) 단위로 predict한 결과를 이어붙인 것이,
     각 날짜를 직접 eager로 읽어 predict한 것과 순서·값 모두 일치하는지."""
@@ -487,7 +643,5 @@ def test_apply_adaptive_anchor_filter_applies_holiday_peak_hours_on_weekday_holi
 
     # 휴일 심야 대상일 총 50행 (평일 심야 52행과 구별)
     assert len(selected_minutes) == 50
-
-
 
 

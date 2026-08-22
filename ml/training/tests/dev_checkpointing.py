@@ -45,7 +45,12 @@ def checkpoint_store(monkeypatch):
     return objects
 
 
-def _manager(contract: dict, *, interval: int = 3) -> checkpointing.TrainingCheckpointManager:
+def _manager(
+    contract: dict,
+    *,
+    interval: int = 3,
+    compatible_code_fingerprints: frozenset[str] = frozenset(),
+) -> checkpointing.TrainingCheckpointManager:
     """테스트용 checkpoint manager를 생성한다."""
     return checkpointing.TrainingCheckpointManager(
         "models/archive/dt=test/profile",
@@ -54,6 +59,7 @@ def _manager(contract: dict, *, interval: int = 3) -> checkpointing.TrainingChec
         contract,
         interval,
         True,
+        compatible_code_fingerprints,
     )
 
 
@@ -138,6 +144,36 @@ def test_contract_mismatch_rejects_resume(checkpoint_store):
     )
     with pytest.raises(checkpointing.CheckpointContractMismatchError):
         _manager({"dataset": "v2"}).load("models/final.txt")
+
+
+def test_explicit_code_compatibility_requires_all_other_contract_fields_to_match(
+    checkpoint_store,
+):
+    """명시한 이전 코드라도 데이터·파라미터 계약 변화는 재개하지 않는다."""
+    old_contract = {
+        "dataset": "fixed",
+        "params": {"num_leaves": 7},
+        "code_fingerprint": "old-code",
+    }
+    old_manager = _manager(old_contract)
+    old_manager._write_state(status="in_progress", completed_iterations=0)
+
+    compatible_contract = {**old_contract, "code_fingerprint": "resume-fix"}
+    state = _manager(
+        compatible_contract,
+        compatible_code_fingerprints=frozenset({"old-code"}),
+    ).load("models/final.txt")
+    assert state.completed_iterations == 0
+
+    changed_data_contract = {
+        **compatible_contract,
+        "params": {"num_leaves": 15},
+    }
+    with pytest.raises(checkpointing.CheckpointContractMismatchError):
+        _manager(
+            changed_data_contract,
+            compatible_code_fingerprints=frozenset({"old-code"}),
+        ).load("models/final.txt")
 
 
 def test_resume_aware_early_stopping_preserves_best_score_and_patience():
