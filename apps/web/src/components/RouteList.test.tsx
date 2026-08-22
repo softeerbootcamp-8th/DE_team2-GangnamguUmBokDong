@@ -101,12 +101,36 @@ describe("RouteList", () => {
     expect(props.onCancel).toHaveBeenCalledWith(ROUTES[1]);
   });
 
-  it("10분이 지난 미승인 제안은 작업 후보에서 제외한다", () => {
+  it("최신 제안보다 10분 이상 오래된 미승인 제안은 후보에서 제외한다", () => {
     renderRouteList({
-      routes: [{ ...ROUTES[0], proposed_at: "2026-08-21T02:54:59Z" }],
+      routes: [
+        { ...ROUTES[0], route_id: "recent", proposed_at: "2026-08-21T03:00:00Z" },
+        { ...ROUTES[0], route_id: "stale", proposed_at: "2026-08-21T02:49:00Z" },
+      ],
     });
 
-    expect(screen.getByText("작업 후보가 없습니다.")).not.toBeNull();
+    expect(screen.getAllByRole("button", { name: "승인" })).toHaveLength(1);
+  });
+
+  it("진행 중인 작업이 종료된 작업보다 위에 표시된다", () => {
+    renderRouteList({
+      routes: [
+        { ...ROUTES[1], route_id: "closed", status: "completed", proposed_at: "2026-08-21T03:00:00Z" },
+        { ...ROUTES[1], route_id: "running", status: "dispatched", proposed_at: "2026-08-21T01:00:00Z" },
+      ],
+    });
+
+    // 완료 버튼은 dispatched 카드에만 있으므로, 현황 열 첫 카드가 진행 중인지로 확인한다.
+    const operationCards = screen.getByRole("heading", { name: /작업 현황/ })
+      .parentElement!.querySelectorAll("li");
+    expect(operationCards).toHaveLength(2);
+    expect(operationCards[0].querySelector('button[aria-label="완료"]')).not.toBeNull();
+  });
+
+  it("처리 중인 작업은 버튼에 진행 상태를 표시한다", () => {
+    renderRouteList({ busyRouteId: ROUTES[0].route_id });
+
+    expect(screen.getByRole("button", { name: "처리 중" })).not.toBeNull();
     expect(screen.queryByRole("button", { name: "승인" })).toBeNull();
   });
 });

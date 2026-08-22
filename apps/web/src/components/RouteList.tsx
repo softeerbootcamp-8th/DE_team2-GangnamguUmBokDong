@@ -1,7 +1,7 @@
-import { Check, CheckCheck, CircleX, Clock3, Play, Route as RouteIcon, Timer } from "lucide-react";
+import { Check, CheckCheck, CircleX, Clock3, Loader2, Play, Route as RouteIcon, Timer } from "lucide-react";
 import { useMemo } from "react";
 import type { DispatchCenter, Route, RouteStatus } from "../api";
-import { estimateRoute, formatRouteDuration, isVisibleWorkRoute, routeKind } from "../routeOperations";
+import { estimateRoute, formatRouteDuration, groupWorkRoutes, routeKind } from "../routeOperations";
 
 const STATUS_META: Record<
   RouteStatus,
@@ -46,19 +46,18 @@ export function RouteList({
   onComplete,
   onCancel,
 }: Props) {
-  const now = Date.now();
-  const items = useMemo(() => {
-    return routes
-      .filter((route) => isVisibleWorkRoute(route, now))
-      .map((route) => ({
-        route,
-        estimate: estimateRoute(route, regions),
-      }));
-  }, [routes, regions, now]);
-  const candidates = items.filter(({ route }) => route.status === "proposed");
-  const operations = items.filter(({ route }) => route.status !== "proposed");
+  const { candidates, operations, hiddenCandidateCount, hiddenOperationCount } = useMemo(
+    () => groupWorkRoutes(routes, { keepRouteId: selectedRouteId }),
+    [routes, selectedRouteId],
+  );
+  const estimates = useMemo(() => {
+    const byRouteId = new Map<string, ReturnType<typeof estimateRoute>>();
+    routes.forEach((route) => byRouteId.set(route.route_id, estimateRoute(route, regions)));
+    return byRouteId;
+  }, [routes, regions]);
 
-  function renderRouteCard({ route, estimate }: (typeof items)[number]) {
+  function renderRouteCard(route: Route) {
+    const estimate = estimates.get(route.route_id) ?? null;
     const status = STATUS_META[route.status];
     const StatusIcon = status.icon;
     const isSelected = route.route_id === selectedRouteId;
@@ -96,26 +95,30 @@ export function RouteList({
             {route.status === "proposed" && (
               <button
                 type="button"
-                className="route-action primary icon-only"
+                className={`route-action primary icon-only${isBusy ? " is-busy" : ""}`}
                 disabled={transitionsBlocked}
                 onClick={() => onDispatch(route)}
                 aria-label={isBusy ? "처리 중" : "승인"}
                 title={isBusy ? "승인 처리 중" : "작업 승인"}
               >
-                <Check size={14} aria-hidden="true" />
+                {isBusy
+                  ? <Loader2 size={14} aria-hidden="true" className="route-action-spinner" />
+                  : <Check size={14} aria-hidden="true" />}
               </button>
             )}
             {route.status === "dispatched" && (
               <>
                 <button
                   type="button"
-                  className="route-action primary icon-only"
+                  className={`route-action primary icon-only${isBusy ? " is-busy" : ""}`}
                   disabled={transitionsBlocked}
                   onClick={() => onComplete(route)}
-                  aria-label="완료"
-                  title="작업 완료"
+                  aria-label={isBusy ? "처리 중" : "완료"}
+                  title={isBusy ? "처리 중" : "작업 완료"}
                 >
-                  <CheckCheck size={14} aria-hidden="true" />
+                  {isBusy
+                    ? <Loader2 size={14} aria-hidden="true" className="route-action-spinner" />
+                    : <CheckCheck size={14} aria-hidden="true" />}
                 </button>
                 <button
                   type="button"
@@ -154,6 +157,9 @@ export function RouteList({
           ) : (
             <ul className="route-column-list">{candidates.map(renderRouteCard)}</ul>
           )}
+          {hiddenCandidateCount > 0 && (
+            <p className="column-note">기한이 지난 제안 {hiddenCandidateCount}건은 표시하지 않습니다.</p>
+          )}
         </section>
 
         <section className="route-column" aria-labelledby="active-routes-heading">
@@ -164,7 +170,12 @@ export function RouteList({
           {operations.length === 0 ? (
             <p className="empty-state">진행되었거나 종료된 작업이 없습니다.</p>
           ) : (
-            <ul className="route-column-list">{operations.map(renderRouteCard)}</ul>
+            <>
+              <ul className="route-column-list">{operations.map(renderRouteCard)}</ul>
+              {hiddenOperationCount > 0 && (
+                <p className="column-note">이전 종료 작업 {hiddenOperationCount}건은 표시하지 않습니다.</p>
+              )}
+            </>
           )}
         </section>
       </div>

@@ -1,6 +1,6 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { DispatchCenter, Route } from "./api";
-import { estimateRoute, formatRouteDuration, isRebalanceRoute, isVisibleWorkRoute, routeKind } from "./routeOperations";
+import { estimateRoute, formatRouteDuration, groupWorkRoutes, isRebalanceRoute, routeKind } from "./routeOperations";
 
 const CENTERS: DispatchCenter[] = [{ region: "강남", lat: 37.5, lon: 127.0 }];
 const ROUTE: Route = {
@@ -35,11 +35,84 @@ describe("routeOperations", () => {
     expect(routeKind(ROUTE)).toBe("재배치");
   });
 
-  it("완료되지 않은 제안은 최근 10분 이내일 때만 표시한다", () => {
-    const now = Date.parse("2026-08-21T03:10:00Z");
+  it("최신 제안 기준 10분 이내의 미승인 제안만 후보로 남긴다", () => {
+    const fresh = { ...ROUTE, route_id: "fresh", proposed_at: "2026-08-21T03:00:00Z" };
+    const stale = { ...ROUTE, route_id: "stale", proposed_at: "2026-08-21T02:49:00Z" };
 
-    expect(isVisibleWorkRoute(ROUTE, now)).toBe(true);
-    expect(isVisibleWorkRoute({ ...ROUTE, proposed_at: "2026-08-21T02:59:59Z" }, now)).toBe(false);
-    expect(isVisibleWorkRoute({ ...ROUTE, status: "dispatched" }, now)).toBe(true);
+    const groups = groupWorkRoutes([stale, fresh]);
+
+    expect(groups.candidates.map((route) => route.route_id)).toEqual(["fresh"]);
+    expect(groups.hiddenCandidateCount).toBe(1);
+    expect(groups.operations).toEqual([]);
+  });
+
+  it("브라우저 시계가 틀어져도 최신 후보를 숨기지 않는다", () => {
+    // 시스템 시계를 하루 앞으로 옮겨도 판정 기준은 응답의 proposed_at이다.
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-22T03:00:00Z"));
+    try {
+      expect(groupWorkRoutes([ROUTE]).candidates).toHaveLength(1);
+      vi.setSystemTime(new Date("2026-08-20T03:00:00Z"));
+      expect(groupWorkRoutes([ROUTE]).candidates).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("proposed_at을 해석할 수 없으면 숨기지 않고 후보로 노출한다", () => {
+    const broken = { ...ROUTE, route_id: "broken", proposed_at: "not-a-date" };
+
+    expect(groupWorkRoutes([broken]).candidates.map((route) => route.route_id)).toEqual(["broken"]);
+  });
+
+  it("선택 중인 제안은 후보 창을 벗어나도 유지한다", () => {
+    const fresh = { ...ROUTE, route_id: "fresh", proposed_at: "2026-08-21T03:00:00Z" };
+    const stale = { ...ROUTE, route_id: "stale", proposed_at: "2026-08-21T02:49:00Z" };
+
+    const groups = groupWorkRoutes([stale, fresh], { keepRouteId: "stale" });
+
+    expect(groups.candidates.map((route) => route.route_id)).toEqual(["fresh", "stale"]);
+  });
+
+  it("작업 현황은 진행 중 작업을 종료 작업보다 위에 둔다", () => {
+    const dispatched = {
+      ...ROUTE,
+      route_id: "dispatched",
+      status: "dispatched" as const,
+      proposed_at: "2026-08-21T01:00:00Z",
+    };
+    const completed = {
+      ...ROUTE,
+      route_id: "completed",
+      status: "completed" as const,
+      proposed_at: "2026-08-21T02:00:00Z",
+    };
+    const cancelled = {
+      ...ROUTE,
+      route_id: "cancelled",
+      status: "cancelled" as const,
+      proposed_at: "2026-08-21T03:00:00Z",
+    };
+
+    const groups = groupWorkRoutes([cancelled, completed, dispatched]);
+
+    expect(groups.operations.map((route) => route.route_id))
+      .toEqual(["dispatched", "completed", "cancelled"]);
+  });
+
+  it("종료 작업은 상한까지만 남기고 나머지 개수를 알린다", () => {
+    const closed = Array.from({ length: 35 }, (_, index) => ({
+      ...ROUTE,
+      route_id: `closed-${index}`,
+      status: "completed" as const,
+      proposed_at: new Date(Date.UTC(2026, 7, 21, 3, index)).toISOString(),
+    }));
+
+    const groups = groupWorkRoutes(closed);
+
+    expect(groups.operations).toHaveLength(30);
+    expect(groups.hiddenOperationCount).toBe(5);
+    // 최근 것부터 남는다.
+    expect(groups.operations[0].route_id).toBe("closed-34");
   });
 });

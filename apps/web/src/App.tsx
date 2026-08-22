@@ -11,7 +11,7 @@ import { RouteList } from "./components/RouteList";
 import { RouteStopRail } from "./components/RouteStopRail";
 import { StationMap } from "./components/StationMap";
 import { StockPanel } from "./components/StockPanel";
-import { isRebalanceRoute, isVisibleWorkRoute } from "./routeOperations";
+import { candidateReferenceMs, isFreshCandidate, isRebalanceRoute } from "./routeOperations";
 import { ResizableHandle, ResizablePanel, ResizablePanelGroup } from "@/components/ui/resizable";
 
 const POLL_INTERVAL_MS = 15_000;
@@ -23,7 +23,9 @@ type ListMode = "routes" | "stations";
 type RouteTransition = "dispatch" | "complete" | "cancel";
 
 function preferredRoute(routes: Route[]): Route | null {
+  const referenceMs = candidateReferenceMs(routes);
   return routes.find((route) => route.status === "dispatched")
+    ?? routes.find((route) => isFreshCandidate(route, referenceMs))
     ?? routes.find((route) => route.status === "proposed")
     ?? routes[0]
     ?? null;
@@ -40,9 +42,9 @@ async function fetchAllRoutes(region: string): Promise<Route[]> {
     });
     page.forEach((route) => routesById.set(route.route_id, route));
     if (page.length < ROUTE_PAGE_SIZE) {
-      return [...routesById.values()]
-        .filter(isRebalanceRoute)
-        .filter((route) => isVisibleWorkRoute(route));
+      // 신선도 필터는 RouteList에서만 적용한다. 여기서 걸러내면 선택 중인
+      // 제안이 후보 창을 벗어나는 순간 재선택이 돌아 지도와 상세가 튄다.
+      return [...routesById.values()].filter(isRebalanceRoute);
     }
     offset += page.length;
   }

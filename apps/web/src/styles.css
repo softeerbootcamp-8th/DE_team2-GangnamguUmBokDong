@@ -8,7 +8,7 @@
   src:
     local("SeoulAlrim Medium"),
     local("서울알림체 Medium"),
-    url("/fonts/seoul-alrim/SeoulAlrim-Medium.otf") format("opentype");
+    url("/fonts/seoul-alrim/SeoulAlrim-Medium.woff2") format("woff2");
   font-display: swap;
   font-style: normal;
   font-weight: 500;
@@ -19,7 +19,7 @@
   src:
     local("SeoulAlrim Bold"),
     local("서울알림체 Bold"),
-    url("/fonts/seoul-alrim/SeoulAlrim-Bold.otf") format("opentype");
+    url("/fonts/seoul-alrim/SeoulAlrim-Bold.woff2") format("woff2");
   font-display: swap;
   font-style: normal;
   font-weight: 700;
@@ -30,7 +30,7 @@
   src:
     local("SeoulAlrim ExtraBold"),
     local("서울알림체 ExtraBold"),
-    url("/fonts/seoul-alrim/SeoulAlrim-ExtraBold.otf") format("opentype");
+    url("/fonts/seoul-alrim/SeoulAlrim-ExtraBold.woff2") format("woff2");
   font-display: swap;
   font-style: normal;
   font-weight: 800;
@@ -41,7 +41,7 @@
   src:
     local("SeoulAlrim Heavy"),
     local("서울알림체 Heavy"),
-    url("/fonts/seoul-alrim/SeoulAlrim-Heavy.otf") format("opentype");
+    url("/fonts/seoul-alrim/SeoulAlrim-Heavy.woff2") format("woff2");
   font-display: swap;
   font-style: normal;
   font-weight: 900;
@@ -349,18 +349,6 @@ body {
   min-width: 0;
 }
 
-.alert-list {
-  list-style: none;
-  margin: 0;
-  padding: 0 8px 4px 0;
-  display: flex;
-  flex-direction: column;
-  flex: 1;
-  min-height: 0;
-  overflow-y: auto;
-  scrollbar-gutter: stable;
-  gap: 6px;
-}
 
 .alert-item {
   display: flex;
@@ -504,20 +492,6 @@ body {
   gap: 8px;
   height: 100%;
   min-height: 0;
-}
-
-.filter-tab-row {
-  display: flex;
-  gap: 4px;
-  flex-wrap: nowrap;
-  align-items: center;
-  overflow: hidden;
-  flex: none;
-}
-
-.filter-tab-row .alert-tab {
-  flex: none;
-  white-space: nowrap;
 }
 
 .route-workspace,
@@ -969,7 +943,6 @@ body {
   scrollbar-gutter: stable;
 }
 
-.alert-list,
 .alert-column-list,
 .route-column-list,
 .route-stop-sequence,
@@ -978,7 +951,6 @@ body {
   scrollbar-width: thin;
 }
 
-.alert-list::-webkit-scrollbar,
 .alert-column-list::-webkit-scrollbar,
 .route-column-list::-webkit-scrollbar,
 .detail-panel-content::-webkit-scrollbar {
@@ -989,7 +961,6 @@ body {
   height: 9px;
 }
 
-.alert-list::-webkit-scrollbar-track,
 .alert-column-list::-webkit-scrollbar-track,
 .route-column-list::-webkit-scrollbar-track,
 .route-stop-sequence::-webkit-scrollbar-track,
@@ -997,7 +968,6 @@ body {
   background: transparent;
 }
 
-.alert-list::-webkit-scrollbar-thumb,
 .alert-column-list::-webkit-scrollbar-thumb,
 .route-column-list::-webkit-scrollbar-thumb,
 .route-stop-sequence::-webkit-scrollbar-thumb,
@@ -1008,7 +978,6 @@ body {
   background-clip: padding-box;
 }
 
-.alert-list::-webkit-scrollbar-thumb:hover,
 .alert-column-list::-webkit-scrollbar-thumb:hover,
 .route-column-list::-webkit-scrollbar-thumb:hover,
 .route-stop-sequence::-webkit-scrollbar-thumb:hover,
@@ -1376,4 +1345,42 @@ body {
 }
 .leaflet-container {
   z-index: 0 !important;
+}
+
+.column-note {
+  flex: none;
+  margin: 6px 0 0;
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+/* 처리 중인 버튼은 다른 disabled 버튼과 구분되도록 흐려지지 않게 둔다. */
+.route-action.is-busy:disabled {
+  cursor: progress;
+  opacity: 1;
+}
+
+.route-action-spinner {
+  animation: route-action-spin 0.9s linear infinite;
+}
+
+@keyframes route-action-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .route-action-spinner {
+    animation: none;
+  }
+}
+
+.station-stock-basis {
+  margin: 8px 0 0;
+  text-align: center;
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
 }
