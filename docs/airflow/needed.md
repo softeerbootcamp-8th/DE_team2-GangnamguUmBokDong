@@ -138,7 +138,8 @@ React 대시보드(`apps/web`)는 다음 API를 호출한다.
 | 데이터 준비 상태 | `GET /status` | `station_demand_forecast`의 공통 `base_dttm` | 대시보드가 보여주는 예측의 기준 시각 및 freshness 판정 |
 
 API는 stale/misaligned 데이터를 조용히 섞지 않는다. 현재 재고·수요예측은 보통
-10분, 날씨는 45분, 행사는 36시간 freshness를 적용하며, 예측과 재고의
+10분, 날씨는 발표 주기 기준(초단기예보 2시간, 단기예보 4시간), 행사는 36시간
+freshness를 적용하며, 예측과 재고의
 `base_dttm`이 다르거나 미래 12개 시점이 완전하지 않으면 503을 반환한다. 즉 화면에
 값이 보인다면 최소한 같은 release 기준시각과 완전성 검사를 통과한 데이터다.
 
