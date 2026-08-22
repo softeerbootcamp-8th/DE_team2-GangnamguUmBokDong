@@ -51,6 +51,7 @@ dev
 
 # --- Airflow 런타임 산출물 ---
 airflow/logs
+airflow/resource-profiles
 airflow/airflow.cfg
 airflow/*.pid
 airflow/standalone_admin_password.txt

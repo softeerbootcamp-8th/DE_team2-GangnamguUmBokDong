@@ -61,3 +61,27 @@ def test_local_and_production_use_same_airflow_concurrency_contract():
     env_example = _ENV_EXAMPLE_PATH.read_text(encoding="utf-8")
     assert "AIRFLOW__CORE__PARALLELISM=3" in env_example
     assert "AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG=2" in env_example
+
+
+def test_local_and_production_enable_same_resource_probe_sampling():
+    """개발·배포의 task resource probe가 같은 관측 주기를 사용한다."""
+    local = yaml.safe_load(_COMPOSE_PATH.read_text(encoding="utf-8"))
+    production = yaml.safe_load(_PROD_COMPOSE_PATH.read_text(encoding="utf-8"))
+    expected = "${AIRFLOW_RESOURCE_PROBE_SAMPLE_SECONDS:-1}"
+
+    for service_name in _AIRFLOW_SERVICES:
+        assert (
+            local["services"][service_name]["environment"][
+                "AIRFLOW_RESOURCE_PROBE_SAMPLE_SECONDS"
+            ]
+            == expected
+        )
+    assert (
+        production["x-airflow-common"]["environment"][
+            "AIRFLOW_RESOURCE_PROBE_SAMPLE_SECONDS"
+        ]
+        == expected
+    )
+    assert "AIRFLOW_RESOURCE_PROBE_SAMPLE_SECONDS=1" in _ENV_EXAMPLE_PATH.read_text(
+        encoding="utf-8"
+    )
