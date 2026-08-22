@@ -257,6 +257,19 @@ PEAK_ANCHOR_TICK_MINUTES = int(os.environ.get("PEAK_ANCHOR_TICK_MINUTES", getatt
 # stopping은 쓸 수 없으므로 기본값은 False이며 실행 manifest에 반드시 기록한다.
 LGB_DEFER_VALID_DATASET = _bool_env("LGB_DEFER_VALID_DATASET")
 
+# 장시간 전체 학습은 한 boosting phase가 수 시간 걸릴 수 있다. 0이면 기존 동작처럼
+# round checkpoint를 만들지 않고, 양수면 해당 round 간격마다 현재 Booster와 상태
+# 포인터를 immutable archive 아래에 저장한다. 재개는 명시적으로 켜야 하며, 데이터·
+# 프로필·코드 fingerprint가 달라진 checkpoint는 조용히 사용하지 않고 실패한다.
+TRAIN_CHECKPOINT_INTERVAL_ROUNDS = int(os.environ.get("TRAIN_CHECKPOINT_INTERVAL_ROUNDS", "0"))
+if TRAIN_CHECKPOINT_INTERVAL_ROUNDS < 0:
+    raise ValueError(
+        "TRAIN_CHECKPOINT_INTERVAL_ROUNDS는 0 이상이어야 합니다: "
+        f"{TRAIN_CHECKPOINT_INTERVAL_ROUNDS}"
+    )
+TRAIN_RESUME_FROM_CHECKPOINT = _bool_env("TRAIN_RESUME_FROM_CHECKPOINT")
+TRAIN_CHECKPOINT_ENABLED = TRAIN_CHECKPOINT_INTERVAL_ROUNDS > 0 or TRAIN_RESUME_FROM_CHECKPOINT
+
 # MLflow(ops/compose의 mlflow 서비스, ml_core.mlflow_tracking이 접속을 담당)에
 # 이 실험 이름으로 run을 남긴다 — divisor/horizon 조합을 바꿔가며 여러 번 학습을
 # 시도할 때(2026-08 OOM 대응 이력) 같은 실험 아래 run들을 나란히 비교하기 위함.
