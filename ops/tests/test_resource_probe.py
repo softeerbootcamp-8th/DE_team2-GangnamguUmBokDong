@@ -1,7 +1,11 @@
 """장시간 실행 resource manifest가 성공·실패 증거를 보존하는지 검증한다."""
 
 import json
+import os
+import signal
+import subprocess
 import sys
+import time
 from pathlib import Path
 
 from ops import resource_probe
@@ -26,12 +30,21 @@ def test_profiled_command_records_process_tree_and_filesystem(tmp_path: Path):
 
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert return_code == 0
-    assert manifest["schema_version"] == "resource-profile-v1"
+    assert manifest["schema_version"] == "resource-profile-v2"
     assert manifest["status"] == "succeeded"
     assert manifest["exit_code"] == 0
     assert manifest["sample_count"] >= 2
     assert manifest["peak_process_tree_rss_bytes"] >= 8 * 1024 * 1024
+    assert manifest["peak_process_tree_rss_plus_swap_bytes"] >= manifest["peak_process_tree_rss_bytes"]
+    assert manifest["peak_process_tree_pss_plus_swap_pss_bytes"] > 0
+    assert manifest["peak_process_tree_logical_memory_sample"]["observed_at"]
     assert manifest["peak_system_memory_used_bytes"] > 0
+    assert manifest["peak_system_memory_plus_swap_used_bytes"] > 0
+    assert manifest["peak_system_logical_memory_sample"]["observed_at"]
+    assert set(manifest["memory_pressure_total_stall_delta_us"]) == {"some", "full"}
+    if manifest["cgroup_memory_at_start"]:
+        assert manifest["peak_cgroup_memory_plus_swap_bytes"] > 0
+        assert manifest["peak_cgroup_logical_memory_sample"]["observed_at"]
     assert manifest["metadata"] == {"commit_sha": "abc123"}
     filesystem = manifest["filesystems"][str(tmp_path)]
     assert filesystem["start_available_bytes"] > 0
@@ -110,3 +123,46 @@ def test_memory_guard_terminates_only_profiled_process_group(
     assert manifest["memory_guard"]["triggered"] is True
     assert manifest["memory_guard"]["triggered_available_bytes"] == gib
     assert manifest["termination_signal"] == 15
+
+
+def test_wrapper_sigterm_is_forwarded_to_profiled_process_group(tmp_path: Path):
+    """Airflow가 wrapper를 종료하면 자식 명령도 남지 않고 manifest가 완결된다."""
+    manifest_path = tmp_path / "sigterm.json"
+    child_pid_path = tmp_path / "child.pid"
+    child_code = (
+        "import os,time; "
+        f"open({str(child_pid_path)!r}, 'w').write(str(os.getpid())); "
+        "time.sleep(30)"
+    )
+    wrapper = subprocess.Popen(
+        [
+            sys.executable,
+            str(Path(resource_probe.__file__).resolve()),
+            "--manifest",
+            str(manifest_path),
+            "--label",
+            "test-sigterm",
+            "--sample-seconds",
+            "0.02",
+            "--",
+            sys.executable,
+            "-c",
+            child_code,
+        ]
+    )
+    deadline = time.monotonic() + 5
+    child_pid: int | None = None
+    while child_pid is None and time.monotonic() < deadline:
+        try:
+            child_pid = int(child_pid_path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, ValueError):
+            time.sleep(0.01)
+    assert child_pid is not None
+
+    os.kill(wrapper.pid, signal.SIGTERM)
+
+    assert wrapper.wait(timeout=5) == 143
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["status"] == "signaled"
+    assert manifest["termination_signal"] == signal.SIGTERM
+    assert not Path(f"/proc/{child_pid}").exists()

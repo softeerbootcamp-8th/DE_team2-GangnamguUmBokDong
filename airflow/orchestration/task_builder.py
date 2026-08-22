@@ -28,6 +28,39 @@ from config.schedules import (
 # 동일하게 성립한다.
 REPO_ROOT = Path(__file__).resolve().parents[2]
 _MODULE_UV_ENV_ROOT = "/opt/venvs/modules"
+_RESOURCE_PROBE_PATH = "/workspace/ops/resource_probe.py"
+_RESOURCE_PROFILE_ROOT = "/workspace/airflow/resource-profiles"
+_RESOURCE_COMMAND_DELIMITER = "__AIRFLOW_RESOURCE_PROBE_COMMAND__"
+
+
+def _profiled_bash_command(command: str) -> str:
+    """모듈 명령을 task instance별 resource probe 실행으로 감싼다."""
+    if _RESOURCE_COMMAND_DELIMITER in command:
+        raise ValueError("bash_command에 resource probe 예약 구분자를 사용할 수 없습니다.")
+    manifest = (
+        f"{_RESOURCE_PROFILE_ROOT}/{{{{ dag.dag_id }}}}/{{{{ run_id }}}}/"
+        "{{ task.task_id }}/map-{{ ti.map_index }}/try-{{ ti.try_number }}.json"
+    )
+    return (
+        f"/usr/local/bin/python3 {_RESOURCE_PROBE_PATH} "
+        f'--manifest "{manifest}" '
+        '--label "{{ dag.dag_id }}.{{ task.task_id }}" '
+        '--sample-seconds "${AIRFLOW_RESOURCE_PROBE_SAMPLE_SECONDS:-1}" '
+        '--filesystem-path /workspace '
+        '--metadata "dag_id={{ dag.dag_id }}" '
+        '--metadata "run_id={{ run_id }}" '
+        '--metadata "task_id={{ task.task_id }}" '
+        '--metadata "try_number={{ ti.try_number }}" '
+        '--metadata "map_index={{ ti.map_index }}" '
+        '--metadata "executor=${AIRFLOW__CORE__EXECUTOR:-LocalExecutor}" '
+        '--metadata "parallelism=${AIRFLOW__CORE__PARALLELISM:-3}" '
+        '--metadata "max_active_tasks_per_dag='
+        '${AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG:-2}" '
+        f"-- /bin/bash -c \"$(cat <<'{_RESOURCE_COMMAND_DELIMITER}'\n"
+        f"{command}\n"
+        f"{_RESOURCE_COMMAND_DELIMITER}\n"
+        ')"'
+    )
 
 
 def build_module_task(
@@ -60,11 +93,12 @@ def build_module_task(
             "uv_environment_name은 lowercase 영숫자와 하이픈만 허용합니다."
         )
     project_environment = f"{_MODULE_UV_ENV_ROOT}/{environment_name}"
+    profiled_command = _profiled_bash_command(bash_command)
     arguments: dict[str, Any] = {
         "task_id": task_id,
         "bash_command": (
             "env -u VIRTUAL_ENV "
-            f"UV_PROJECT_ENVIRONMENT={project_environment} {bash_command}"
+            f"UV_PROJECT_ENVIRONMENT={project_environment} {profiled_command}"
         ),
         "cwd": module_dir,
         "retries": retries,

@@ -253,6 +253,21 @@ stopping과 conformal correction이 같은 anchor 정보를 간접 공유해 낙
 `training_progress.log`)를 tail — 날짜 청크 하나가 로드될 때마다(및 사전 스캔
 파일 완료마다) 그 시점 peak RSS를 남긴다(표준출력과 별개 채널).
 
+### 장시간 boosting checkpoint
+
+`TRAIN_CHECKPOINT_INTERVAL_ROUNDS=N`과 `TRAIN_RESUME_FROM_CHECKPOINT=true`를
+사용하면 Poisson/Q10/Q50/Q90 phase마다 N round 간격의 Booster와 작은 state
+pointer를 immutable model archive 아래에 남긴다. state는 Booster 업로드가 끝난
+뒤에만 갱신되어 중간 업로드를 재개 대상으로 선택하지 않는다. 학습 데이터·split·
+effective profile·LightGBM 파라미터·핵심 코드 fingerprint가 기존 state와 모두
+같을 때만 재개한다.
+
+재개 시 Dataset은 다시 구성해야 하지만 완료된 boosting round는 반복하지 않는다.
+validation을 사용하는 경로는 최고 점수, 최고 iteration, patience 상태도 함께
+복원한다. 완전히 끝난 phase는 최종 Booster를 다시 로드해 건너뛰고 평가와 metrics는
+현재 프로세스에서 다시 계산한다. 부분 checkpoint는 serving release가 참조하지
+않으므로 중단된 실행이 현재 서빙 모델을 바꾸지 않는다.
+
 **범위 밖(2026-08 기준)**: 분산 학습(`LGB_TREE_LEARNER`≠"serial")은 아직 이
 지연 로딩과 연동되지 않았다 — `train_target()`이 `LGB_NUM_MACHINES>1`이면
 바로 `NotImplementedError`를 낸다(station_no 샤딩을 날짜별 로더 안에서 다시

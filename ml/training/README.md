@@ -74,6 +74,9 @@ S3 아카이브 prefix(`{MODELS_ARCHIVE_PREFIX}/dt={MODEL_ARCHIVE_DATE}/{ML_PROF
 | `MAX_TRAIN_HORIZON` | 제한 없음(`HORIZON_COUNT`) | 읽는 시점에 `horizon <= 이 값`으로도 한 번 더 줄인다 — 그래도 OOM이면 낮출 것(단, 그 이상 horizon 예측 품질은 검증 안 됨) |
 | `SPLIT_EMBARGO_DAYS` | horizon/target에서 계산(현재 `1`) | 같은 anchor가 train/valid/test에 걸치지 않도록 평가일 앞뒤에서 purge할 날짜 수. 계산된 최소값보다 낮출 수 없음 |
 | `LGB_DEFER_VALID_DATASET` | `false` | `true`면 native valid Dataset을 학습 중 상주시키지 않고 고정 round 학습 뒤 valid 전체를 streaming 평가/conformal에 사용. 날짜·horizon은 유지하지만 early stopping은 사용하지 않음 |
+| `LGB_HISTOGRAM_POOL_SIZE` | profile 값 | LightGBM histogram cache 상한(MiB). 낮추면 tree/데이터 계약은 유지하면서 메모리 대신 재계산 시간이 늘어남 |
+| `TRAIN_CHECKPOINT_INTERVAL_ROUNDS` | `0` | 양수면 Poisson/Q10/Q50/Q90별로 해당 round 간격마다 Booster checkpoint를 archive 아래에 저장. 전체 학습은 `25` 권장 |
+| `TRAIN_RESUME_FROM_CHECKPOINT` | `false` | `true`면 동일 `MODEL_ARCHIVE_DATE`의 마지막 정상 checkpoint 또는 완료 phase를 재사용. 데이터·프로필·코드 계약이 다르면 즉시 실패 |
 
 `SERVING_TICK_MINUTES`는 위 학습 설정과 별개인 5분 고정 코드 계약이며 환경변수
 dial이 아니다. 따라서 기본 모델은 **g20/r20/a20으로 학습하고 5분마다 추론**한다.
@@ -121,6 +124,31 @@ TRAIN_DAY_DIVISOR=2 ./training/.venv/bin/python -m training.train_rental_model
 모델의 7~12시간 예측 품질은 검증되지 않는다. 과거 문서의
 `TRAIN_SAMPLE_FRAC`/`VALID_SAMPLE_FRAC`/`TEST_SAMPLE_FRAC`는 실제 로더에 적용되지
 않던 가짜 dial이라 제거했으며, 설정하면 이제 즉시 오류를 낸다.
+
+## 중단 후 checkpoint 재개
+
+장시간 전체 학습은 고정된 `MODEL_ARCHIVE_DATE`와 checkpoint 옵션을 함께 사용한다.
+
+```bash
+export MODEL_ARCHIVE_DATE=2026-08-21-full-year-checkpoint-v1
+export TRAIN_CHECKPOINT_INTERVAL_ROUNDS=25
+export TRAIN_RESUME_FROM_CHECKPOINT=true
+./training/.venv/bin/python -m training.train_rental_model
+./training/.venv/bin/python -m training.train_return_model
+```
+
+checkpoint는 `{archive_prefix}/_checkpoints/{rental,return}/{poisson,q10,q50,q90}/`
+아래에 저장된다. Booster object를 먼저 올리고 `state.json`을 마지막에 갱신하므로
+업로드 도중 종료돼도 이전 정상 round만 재개 대상으로 남는다. 각 state에는 데이터
+경로·split 날짜·feature·effective profile·LightGBM 파라미터·핵심 코드 bytes의
+fingerprint가 들어간다. 재실행 설정이나 코드가 바뀌면 기존 checkpoint를 조용히
+섞지 않고 실패한다.
+
+validation early stopping의 이전 최고 점수와 patience도 state에 함께 저장하므로
+round checkpoint 재개 전후의 종료 판단을 이어간다. 완전히 끝난 phase는 최종 모델을
+다시 로드해 건너뛰며, 네 phase 이후 평가·conformal·metrics는 다시 계산한다.
+checkpoint와 일부 Booster가 있어도 serving release pointer를 게시하기 전에는 운영
+서빙에 노출되지 않는다.
 
 feature 행렬은 날짜별 `lgb.Sequence`로 지연 로드하고, label/exposure prepass도
 날짜별로 읽어 삭제 예약된 로컬 scratch memmap에 이어 쓴다. 따라서 전체 기간의

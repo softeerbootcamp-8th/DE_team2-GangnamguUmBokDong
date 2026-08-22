@@ -24,6 +24,7 @@ import sys
 import time
 from collections.abc import Callable
 from datetime import UTC, date, datetime
+from pathlib import Path
 from typing import Any
 
 import lightgbm as lgb
@@ -42,7 +43,7 @@ from ml_core.model_contract import (
 )
 from ml_core.paths import archive_models_prefix, model_json_key, model_key
 
-from . import config, lazy_train_dataset
+from . import checkpointing, config, lazy_train_dataset
 
 __all__ = [
     "RENTAL_FEATURE_COLUMNS",
@@ -288,6 +289,176 @@ def _conformal_correction(y_valid: np.ndarray, lower: np.ndarray, upper: np.ndar
     return float(np.quantile(scores, q_level))
 
 
+def _phase_checkpoint_contract(
+    model_name: str,
+    phase_name: str,
+    target_col: str,
+    exposure_col: str | None,
+    table_path: str,
+    feature_columns: list[str],
+    train_dates: list[str],
+    valid_dates: list[str],
+    filters: list[tuple],
+    lgb_params: dict[str, Any],
+) -> dict[str, Any]:
+    """중단된 phase를 안전하게 재개하기 위한 학습 계약을 만든다."""
+    code_fingerprint = checkpointing.runtime_code_fingerprint(
+        [
+            Path(__file__),
+            Path(checkpointing.__file__),
+            Path(config.__file__),
+            Path(lazy_train_dataset.__file__),
+            Path(common_config.__file__),
+        ]
+    )
+    return {
+        "model_name": model_name,
+        "phase_name": phase_name,
+        "target_col": target_col,
+        "exposure_col": exposure_col,
+        "table_path": table_path,
+        "feature_columns": feature_columns,
+        "train_dates": train_dates,
+        "valid_dates": valid_dates,
+        "filters": filters,
+        "effective_profile": common_config.effective_profile(),
+        "lgb_params": lgb_params,
+        "num_boost_round": config.LGB_NUM_BOOST_ROUND,
+        "early_stopping_rounds": config.LGB_EARLY_STOPPING_ROUNDS,
+        "defer_valid_dataset": config.LGB_DEFER_VALID_DATASET,
+        "code_fingerprint": code_fingerprint,
+    }
+
+
+def _train_phase_with_checkpoint(
+    *,
+    model_name: str,
+    phase_name: str,
+    target_col: str,
+    exposure_col: str | None,
+    table_path: str,
+    feature_columns: list[str],
+    train_dates: list[str],
+    valid_dates: list[str],
+    filters: list[tuple],
+    params: dict[str, Any],
+    train_set: lgb.Dataset,
+    valid_set: lgb.Dataset | None,
+    final_model_key: str,
+    models_prefix: str,
+    is_primary: bool,
+) -> lgb.Booster:
+    """한 LightGBM phase를 학습하고 opt-in 시 checkpoint를 관리한다.
+
+    Checkpoint 옵션이 모두 꺼진 기본 경로는 기존 LightGBM callback과 업로드 순서를
+    그대로 사용한다. 따라서 checkpoint용 fingerprint 계산이나 S3 state 접근도 하지
+    않는다.
+    """
+    if not config.TRAIN_CHECKPOINT_ENABLED:
+        callbacks: list[Callable[[Any], None]] = [
+            lgb.log_evaluation(0),
+            _lgb_mlflow_progress_callback(model_name, phase_name, log_interval=5),
+        ]
+        if valid_set is not None:
+            callbacks.insert(
+                0,
+                lgb.early_stopping(config.LGB_EARLY_STOPPING_ROUNDS, verbose=False),
+            )
+        booster = lgb.train(
+            params,
+            train_set,
+            num_boost_round=config.LGB_NUM_BOOST_ROUND,
+            valid_sets=None if valid_set is None else [valid_set],
+            callbacks=callbacks,
+        )
+        if is_primary:
+            model_io.stage_and_upload_booster(booster, final_model_key, log_to_mlflow=True)
+        return booster
+
+    contract = _phase_checkpoint_contract(
+        model_name,
+        phase_name,
+        target_col,
+        exposure_col,
+        table_path,
+        feature_columns,
+        train_dates,
+        valid_dates,
+        filters,
+        params,
+    )
+    manager = checkpointing.TrainingCheckpointManager(
+        models_prefix,
+        model_name,
+        phase_name,
+        contract,
+        config.TRAIN_CHECKPOINT_INTERVAL_ROUNDS,
+        config.TRAIN_RESUME_FROM_CHECKPOINT,
+    )
+    resume_state = manager.load(final_model_key)
+    if resume_state.phase_completed:
+        if resume_state.booster is None:
+            raise RuntimeError(f"완료 checkpoint에 Booster가 없습니다: {model_name}/{phase_name}")
+        print(
+            f"  [{model_name}][{phase_name}] 완료 checkpoint 재사용 "
+            f"({resume_state.completed_iterations} rounds)",
+            flush=True,
+        )
+        return resume_state.booster
+
+    completed_iterations = resume_state.completed_iterations
+    remaining_rounds = config.LGB_NUM_BOOST_ROUND - completed_iterations
+    if completed_iterations > 0:
+        print(
+            f"  [{model_name}][{phase_name}] round {completed_iterations}부터 재개 "
+            f"(남은 최대 {max(remaining_rounds, 0)} rounds)",
+            flush=True,
+        )
+    callbacks: list[Callable[[Any], None]] = [
+        lgb.log_evaluation(0),
+        _lgb_mlflow_progress_callback(model_name, phase_name, log_interval=5),
+    ]
+    resume_aware_early_stopping = None
+    if valid_set is not None:
+        resume_aware_early_stopping = checkpointing.ResumeAwareEarlyStopping(
+            config.LGB_EARLY_STOPPING_ROUNDS,
+            resume_state.early_stopping_state,
+        )
+        callbacks.append(resume_aware_early_stopping)
+    if config.TRAIN_CHECKPOINT_INTERVAL_ROUNDS > 0:
+        callbacks.append(
+            manager.callback(
+                resume_aware_early_stopping.snapshot
+                if resume_aware_early_stopping is not None
+                else None
+            )
+        )
+    try:
+        if remaining_rounds <= 0:
+            if resume_state.booster is None:
+                raise RuntimeError(
+                    f"남은 round가 없지만 재개 Booster가 없습니다: {model_name}/{phase_name}"
+                )
+            booster = resume_state.booster
+        else:
+            booster = lgb.train(
+                params,
+                train_set,
+                num_boost_round=remaining_rounds,
+                valid_sets=None if valid_set is None else [valid_set],
+                init_model=resume_state.booster,
+                callbacks=callbacks,
+            )
+        if is_primary:
+            model_io.stage_and_upload_booster(booster, final_model_key, log_to_mlflow=True)
+            manager.mark_completed(booster, final_model_key)
+        return booster
+    except Exception as exc:
+        if is_primary:
+            manager.mark_failed(f"{type(exc).__name__}: {exc}")
+        raise
+
+
 def train_target(
     target_col: str,
     model_name: str,
@@ -413,6 +584,8 @@ def train_target(
                 "lgb_num_boost_round": config.LGB_NUM_BOOST_ROUND,
                 "lgb_early_stopping_rounds": config.LGB_EARLY_STOPPING_ROUNDS,
                 "lgb_defer_valid_dataset": config.LGB_DEFER_VALID_DATASET,
+                "train_checkpoint_interval_rounds": config.TRAIN_CHECKPOINT_INTERVAL_ROUNDS,
+                "train_resume_from_checkpoint": config.TRAIN_RESUME_FROM_CHECKPOINT,
                 **lgb_params,
             })
             s3_io.write_json(station_categories_path(model_name, models_prefix), station_categories)
@@ -431,6 +604,7 @@ def train_target(
         train_set, y_train, exposure_train = lazy_train_dataset.build_lazy_dataset(
             table_path, train_dates, feature_columns, station_dtype, filters, target_col, exposure_col, cache,
             dataset_params=lgb_params,
+            keep_raw_data=config.TRAIN_CHECKPOINT_ENABLED,
             on_chunk_loaded=_chunk_progress(model_name, "train"),
             on_prepass_complete=_progress_on_complete(f"{model_name}-train-label-prepass"),
         )
@@ -453,6 +627,7 @@ def train_target(
             valid_set, y_valid, exposure_valid = lazy_train_dataset.build_lazy_dataset(
                 table_path, valid_dates, feature_columns, station_dtype, filters, target_col, exposure_col, cache,
                 dataset_params=lgb_params,
+                keep_raw_data=config.TRAIN_CHECKPOINT_ENABLED,
                 reference=train_set, on_chunk_loaded=_chunk_progress(model_name, "valid"),
                 on_prepass_complete=_progress_on_complete(f"{model_name}-valid-label-prepass"),
             )
@@ -474,26 +649,23 @@ def train_target(
             mlflow.set_tag("training_stage", f"[{model_name}] 1/4 Poisson Boosting")
         except Exception:
             pass
-        poisson_callbacks = [
-            lgb.log_evaluation(0),
-            _lgb_mlflow_progress_callback(model_name, "poisson", log_interval=5),
-        ]
-        if valid_set is not None:
-            poisson_callbacks.insert(
-                0,
-                lgb.early_stopping(config.LGB_EARLY_STOPPING_ROUNDS, verbose=False),
-            )
-        booster = lgb.train(
-            poisson_params,
-            train_set,
-            num_boost_round=config.LGB_NUM_BOOST_ROUND,
-            valid_sets=None if valid_set is None else [valid_set],
-            callbacks=poisson_callbacks,
+        booster = _train_phase_with_checkpoint(
+            model_name=model_name,
+            phase_name="poisson",
+            target_col=target_col,
+            exposure_col=exposure_col,
+            table_path=table_path,
+            feature_columns=feature_columns,
+            train_dates=train_dates,
+            valid_dates=valid_dates,
+            filters=filters,
+            params=poisson_params,
+            train_set=train_set,
+            valid_set=valid_set,
+            final_model_key=model_key(model_name, "poisson", models_prefix),
+            models_prefix=models_prefix,
+            is_primary=is_primary,
         )
-        if is_primary:
-            model_io.stage_and_upload_booster(
-                booster, model_key(model_name, "poisson", models_prefix), log_to_mlflow=True
-            )
 
         # 2) Quantile P10/P50/P90 (exposure offset 미적용 — quantile loss는 offset 해석이 표준적이지 않음)
         #
@@ -524,6 +696,7 @@ def train_target(
             train_set_q, _, _ = lazy_train_dataset.build_lazy_dataset(
                 table_path, train_dates, feature_columns, station_dtype, filters, target_col, None, cache,
                 dataset_params=lgb_params,
+                keep_raw_data=config.TRAIN_CHECKPOINT_ENABLED,
                 on_chunk_loaded=_chunk_progress(model_name, "train-quantile"),
                 on_prepass_complete=_progress_on_complete(f"{model_name}-train-quantile-label-prepass"),
             )
@@ -533,6 +706,7 @@ def train_target(
                 valid_set_q, _, _ = lazy_train_dataset.build_lazy_dataset(
                     table_path, valid_dates, feature_columns, station_dtype, filters, target_col, None, cache,
                     dataset_params=lgb_params,
+                    keep_raw_data=config.TRAIN_CHECKPOINT_ENABLED,
                     reference=train_set_q, on_chunk_loaded=_chunk_progress(model_name, "valid-quantile"),
                     on_prepass_complete=_progress_on_complete(f"{model_name}-valid-quantile-label-prepass"),
                 )
@@ -545,26 +719,23 @@ def train_target(
             except Exception:
                 pass
             q_params = {**lgb_params, **_distributed_params(), "objective": "quantile", "alpha": alpha}
-            q_callbacks = [
-                lgb.log_evaluation(0),
-                _lgb_mlflow_progress_callback(model_name, q_alpha_name, log_interval=5),
-            ]
-            if valid_set_q is not None:
-                q_callbacks.insert(
-                    0,
-                    lgb.early_stopping(config.LGB_EARLY_STOPPING_ROUNDS, verbose=False),
-                )
-            q_booster = lgb.train(
-                q_params,
-                train_set_q,
-                num_boost_round=config.LGB_NUM_BOOST_ROUND,
-                valid_sets=None if valid_set_q is None else [valid_set_q],
-                callbacks=q_callbacks,
+            q_booster = _train_phase_with_checkpoint(
+                model_name=model_name,
+                phase_name=q_alpha_name,
+                target_col=target_col,
+                exposure_col=None,
+                table_path=table_path,
+                feature_columns=feature_columns,
+                train_dates=train_dates,
+                valid_dates=valid_dates,
+                filters=filters,
+                params=q_params,
+                train_set=train_set_q,
+                valid_set=valid_set_q,
+                final_model_key=model_key(model_name, q_alpha_name, models_prefix),
+                models_prefix=models_prefix,
+                is_primary=is_primary,
             )
-            if is_primary:
-                model_io.stage_and_upload_booster(
-                    q_booster, model_key(model_name, f"q{int(alpha * 100)}", models_prefix), log_to_mlflow=True
-                )
             quantile_boosters[alpha] = q_booster
             q_iteration = q_booster.best_iteration or q_booster.current_iteration()
             print(f"  [q{int(alpha * 100)}] best_iter={q_iteration}")
