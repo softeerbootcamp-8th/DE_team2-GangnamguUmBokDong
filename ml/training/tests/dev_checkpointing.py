@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import lightgbm as lgb
 import numpy as np
 import pytest
+from lightgbm.basic import EvalResult
 
 from training import checkpointing, train_common
 
@@ -212,6 +213,35 @@ def test_resume_aware_early_stopping_preserves_best_score_and_patience():
             resumed(env(iteration, score))
 
     assert uninterrupted_stop.value.best_iteration == resumed_stop.value.best_iteration == 2
+
+
+def test_resume_aware_early_stopping_supports_lightgbm_47_eval_result():
+    """LightGBM 4.7 EvalResult의 동적 길이와 무관하게 저장 점수를 복원한다."""
+    item = EvalResult("valid_0", "l2", 8.5, False, None)
+    callback = checkpointing.ResumeAwareEarlyStopping(
+        5,
+        {
+            "dataset_name": "valid_0",
+            "metric_name": "l2",
+            "higher_is_better": False,
+            "best_iteration": 3,
+            "best_score": 7.25,
+        },
+    )
+    env = SimpleNamespace(
+        iteration=4,
+        end_iteration=20,
+        evaluation_result_list=[item],
+    )
+
+    callback(env)
+
+    restored = callback.best_score_list[0]
+    assert restored.dataset_name == "valid_0"
+    assert restored.metric_name == "l2"
+    assert restored.metric_value == 7.25
+    assert restored.maximize is False
+    assert restored.metric_std_dev is None
 
 
 def test_state_pointer_updates_only_after_booster_upload(monkeypatch):

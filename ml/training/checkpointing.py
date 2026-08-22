@@ -56,11 +56,17 @@ class ResumeAwareEarlyStopping:
     @staticmethod
     def _with_metric_value(item: Any, value: float) -> Any:
         """LightGBM evaluation tuple의 metric 값만 교체한다."""
-        if hasattr(item, "_replace"):
-            return item._replace(metric_value=value)
-        values = list(item)
-        values[2] = value
-        return type(item)(values) if type(item) is tuple else type(item)(*values)
+        if hasattr(item, "_fields") and hasattr(item, "dataset_name"):
+            fields = {
+                "dataset_name": item.dataset_name,
+                "metric_name": item.metric_name,
+                "metric_value": value,
+                "maximize": item.maximize,
+            }
+            if "metric_std_dev" in item._fields:
+                fields["metric_std_dev"] = item.metric_std_dev
+            return type(item)(**fields)
+        return (item[0], item[1], value, item[3])
 
     def _initialize(self, item: Any, iteration: int) -> None:
         """첫 evaluation 또는 저장된 상태에서 최고 점수를 초기화한다."""
