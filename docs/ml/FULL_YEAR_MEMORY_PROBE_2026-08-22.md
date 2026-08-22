@@ -87,3 +87,67 @@ swap calibration 속도를 단순 비례하면 수십 시간이 필요하다. �
 calibration archive는
 `models/archive/dt=2026-08-22-memory-probe-r5-v1/full-year-memory-safe/`이며
 5-round 모델이므로 운영 모델이 아니다. serving release pointer는 변경하지 않았다.
+
+## 후속 실험: 평일 피크를 07–10시·17–21시로 제한
+
+모델 개발자가 제안한 평일 피크 구간을 실제로 적용해 같은 2025년 window와 split,
+horizon, LightGBM 옵션으로 5-round calibration을 다시 실행했다. 변경한 값은
+`WEEKDAY_PEAK_HOURS=7-10,17-21` 하나이며 휴일 피크 `08–21시`는 유지했다.
+
+이 실험은 순수한 메모리 옵션 비교가 아니다. 평일 10–17시 anchor를 train/valid/test
+모두에서 제외하므로 학습 표본 분포와 모델 계약이 바뀐다. 따라서 아래 결과는 해당
+후보 계약의 실행 가능성 근거이며, 기존 운영 후보와 동일한 모델로 간주할 수 없다.
+
+### 실행 조건과 행 수
+
+다른 로컬 작업이 없는 상태에서 Airflow·Postgres·API·웹 컨테이너를 정지하고 MinIO와
+격리 학습 컨테이너만 유지했다. cgroup RAM 21GiB, swap 40GiB, system available 3GiB
+guard와 임시 40GiB host swap은 기존 실측과 동일하게 적용했다. MLflow만 별도 server
+대신 격리된 file store를 사용했다.
+
+| split | 기존 평일 07–21시 | 평일 07–10시·17–21시 | 감소 |
+|---|---:|---:|---:|
+| train | 323,200,260 | 259,607,534 | 19.676% |
+| valid | 24,816,397 | 20,264,471 | 18.342% |
+| test | 23,424,950 | 18,261,544 | 22.042% |
+
+평일만 축소했기 때문에 주말·공휴일에는 기존 휴일 피크 구간의 anchor가 그대로 남는다.
+두 모델 모두 네 objective와 valid/test streaming 평가를 완료했고 cgroup OOM event와
+3GiB guard 발동은 0건이었다.
+
+### 실측 결과
+
+| 모델 | 결과 | cgroup RAM+swap peak | process PSS+SwapPSS peak | 최소 stack WSL RAM+swap peak | 시간 |
+|---|---|---:|---:|---:|---:|
+| rental | succeeded | 25.587GiB | 23.600GiB | 33.816GiB | 11분 30초 |
+| return | succeeded | 22.090GiB | 21.709GiB | 31.653GiB | 6분 37초 |
+
+기존 실측 대비 cgroup peak는 rental `34.843 → 25.587GiB`(-26.56%), return
+`34.144 → 22.090GiB`(-35.30%)로 줄었다. cgroup 값은 같은 한도 안의 학습 process를
+측정하므로 직접 비교할 수 있다. 반면 WSL 전체 값은 이번에 다른 서비스를 내린 최소
+stack 결과여서 기존 전체 Docker stack 수치와 직접적인 서비스 비용 비교로 쓰면 안 된다.
+
+rental peak는 cgroup RAM 21.000GiB와 swap 4.587GiB가 동시에 사용된 값이다. WSL
+전체 swap peak는 7.459GiB여서 기본 8GiB swap만으로도 관측값상 들어가지만 여유가
+약 0.54GiB뿐이다. allocator·MinIO cache·Windows/WSL 변동을 고려하면 8GiB만으로
+장시간 800 rounds를 실행하는 것은 안전하다고 판정하지 않는다. 현재 32GiB WSL을
+유지한다면 다른 서비스를 내리고 총 swap을 최소 16GiB 이상 확보하는 편이 실용적이다.
+
+첫 boosting round에서 최대 native Dataset·gradient/hessian·histogram buffer가
+할당됐고 이어진 Q10/Q50/Q90와 전체 평가가 이를 넘지 않았다. 따라서 800 rounds도
+같은 메모리 등급에서 실행될 가능성이 높다. 다만 이번 실험은 800 rounds의 wall time과
+절대 최대 bytes, 그리고 변경된 시간 표본의 예측 품질을 검증하지 않았다. 운영 후보로
+채택하려면 800-round rental/return을 완주한 뒤 기존 모델과 동일한 독립 test/backtest로
+평일 피크와 비피크 품질을 모두 비교해야 한다.
+
+증거 파일:
+
+- `data/issue163-full-year/resource/memory-probe-rental-r5-weekday-0710-1721-v1.json`
+- `data/issue163-full-year/resource/memory-probe-return-r5-weekday-0710-1721-v1.json`
+- `data/issue163-full-year/logs/memory-probe-rental-r5-weekday-0710-1721-v1.log`
+- `data/issue163-full-year/logs/memory-probe-return-r5-weekday-0710-1721-v1.log`
+
+calibration archive는
+`models/archive/dt=2026-08-22-memory-probe-r5-weekday-0710-1721-v1/full-year-memory-safe/`
+이다. 56개 객체(체크포인트·최종 5-round Booster·metrics·profile 등)가 생성됐고,
+serving release pointer는 기존 generation 1을 유지해 이 archive를 가리키지 않는다.
