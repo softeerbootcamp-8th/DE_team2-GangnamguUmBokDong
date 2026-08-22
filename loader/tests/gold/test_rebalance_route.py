@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
@@ -126,6 +127,7 @@ def _plan(
     urgency: tuple[RouteUrgencyInput, ...],
     revision_no: int = 0,
     coverage=None,
+    max_stops_per_route: int = MAX_STOPS_PER_ROUTE,
 ) -> RebalanceRoutePlan:
     """공통 anchor로 pure route planner를 실행한다."""
     return plan_rebalance_routes(
@@ -135,6 +137,7 @@ def _plan(
         stations=stations,
         urgency=urgency,
         route_coverage=coverage or _empty_coverage(),
+        max_stops_per_route=max_stops_per_route,
     )
 
 
@@ -147,6 +150,26 @@ def test_route_constants_match_publication_contract() -> None:
     assert MAX_STOPS_PER_ROUTE == 8
     assert MAX_ROUTES_PER_CENTER == 3
     assert ROUTE_WORK_UNIT_CONFIG_VERSION == "route-work-unit-v1"
+
+
+def test_planner_can_override_stop_limit_for_offline_evaluation() -> None:
+    """게시 기본값을 바꾸지 않고 순수 planner의 stop 상한을 좁혀 비교한다."""
+    stations = tuple(_station(f"ST-{index}") for index in range(1, 9))
+    urgency = tuple(
+        _urgency(f"ST-{index}", "retrieval_needed", 1) for index in range(1, 5)
+    ) + tuple(_urgency(f"ST-{index}", "supply_needed", 1) for index in range(5, 9))
+
+    plan = _plan(
+        stations=stations,
+        urgency=urgency,
+        max_stops_per_route=5,
+    )
+    route_stop_counts = Counter(stop.route_id for stop in plan.route_stops)
+
+    assert route_stop_counts
+    assert max(route_stop_counts.values()) <= 5
+    with pytest.raises(ContractViolation, match="max_stops_per_route"):
+        _plan(stations=stations, urgency=urgency, max_stops_per_route=1)
 
 
 def test_empty_plan_excludes_normal_and_nonpositive_quantities() -> None:
@@ -541,10 +564,14 @@ def test_dropoff_is_limited_by_actual_pickup_per_route() -> None:
     for route in plan.routes:
         stops = [stop for stop in plan.route_stops if stop.route_id == route.route_id]
         picked = sum(
-            stop.bike_cnt for stop in stops if stop.route_action_type_cd == "pickup"
+            stop.bike_cnt
+            for stop in stops
+            if stop.route_action_type_cd == "pickup"
         )
         dropped = sum(
-            stop.bike_cnt for stop in stops if stop.route_action_type_cd == "dropoff"
+            stop.bike_cnt
+            for stop in stops
+            if stop.route_action_type_cd == "dropoff"
         )
         assert dropped == picked <= TRUCK_CAPACITY
     assert (
@@ -593,14 +620,10 @@ def test_work_unit_has_at_most_eight_stops_and_center_route_cap() -> None:
         stops = [stop for stop in plan.route_stops if stop.route_id == route.route_id]
         assert 2 <= len(stops) <= MAX_STOPS_PER_ROUTE
         picked = sum(
-            stop.bike_cnt
-            for stop in stops
-            if stop.route_action_type_cd == "pickup"
+            stop.bike_cnt for stop in stops if stop.route_action_type_cd == "pickup"
         )
         dropped = sum(
-            stop.bike_cnt
-            for stop in stops
-            if stop.route_action_type_cd == "dropoff"
+            stop.bike_cnt for stop in stops if stop.route_action_type_cd == "dropoff"
         )
         assert picked == dropped > 0
 

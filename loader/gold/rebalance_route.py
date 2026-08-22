@@ -516,6 +516,7 @@ def plan_rebalance_routes(
     stations: tuple[StationRouteTopology, ...],
     urgency: tuple[RouteUrgencyInput, ...],
     route_coverage: RouteCoverageDocument,
+    max_stops_per_route: int = MAX_STOPS_PER_ROUTE,
 ) -> RebalanceRoutePlan:
     """route-v2 완결 작업·coverage·용량 계약으로 proposed aggregate를 계산한다.
 
@@ -525,6 +526,8 @@ def plan_rebalance_routes(
     """
     logical = _utc_dttm(logical_dttm, "logical_dttm")
     _nonnegative_integer(revision_no, "revision_no")
+    if type(max_stops_per_route) is not int or not 2 <= max_stops_per_route <= 32767:
+        raise ContractViolation("max_stops_per_route는 2..32767 integer여야 합니다.")
     if type(route_coverage) is not RouteCoverageDocument:
         raise ContractViolation("route_coverage는 RouteCoverageDocument여야 합니다.")
     if route_coverage.stock_anchor_dttm != logical:
@@ -570,7 +573,11 @@ def plan_rebalance_routes(
                 dropoffs,
                 anchor=anchor_candidate,
             )
-            split = _choose_balanced_stop_split(route_pickups, route_dropoffs)
+            split = _choose_balanced_stop_split(
+                route_pickups,
+                route_dropoffs,
+                max_stops_per_route=max_stops_per_route,
+            )
             if split is None:
                 break
             pickup_stop_limit, dropoff_stop_limit, transfer_qty = split
@@ -591,8 +598,7 @@ def plan_rebalance_routes(
             if (
                 picked_qty != transfer_qty
                 or dropped_qty != transfer_qty
-                or len(selected_pickups) + len(selected_dropoffs)
-                > MAX_STOPS_PER_ROUTE
+                or len(selected_pickups) + len(selected_dropoffs) > max_stops_per_route
             ):
                 raise ContractViolation(
                     "route-v2 작업 단위 선택이 완결 수량·stop 제한을 위반했습니다."
@@ -1740,8 +1746,10 @@ def _take_by_priority(
 def _choose_balanced_stop_split(
     pickups: list[_Candidate],
     dropoffs: list[_Candidate],
+    *,
+    max_stops_per_route: int = MAX_STOPS_PER_ROUTE,
 ) -> tuple[int, int, int] | None:
-    """최대 8개 대여소로 가장 많은 수량을 완결할 stop 배분을 고른다.
+    """설정된 대여소 상한으로 가장 많은 수량을 완결할 stop 배분을 고른다.
 
     pickup과 dropoff에 각각 한 자리를 보장하고, 처리 가능 수량이 같으면 더 적은
     대여소와 더 높은 긴급도 합을 우선한다. 후보 목록은 이미 경로 효율 순으로
@@ -1749,12 +1757,14 @@ def _choose_balanced_stop_split(
     """
     if not pickups or not dropoffs:
         return None
+    if type(max_stops_per_route) is not int or not 2 <= max_stops_per_route <= 32767:
+        raise ContractViolation("max_stops_per_route는 2..32767 integer여야 합니다.")
     best: tuple[tuple[int, int, float, int, int], tuple[int, int, int]] | None = None
-    max_pickup_stops = min(len(pickups), MAX_STOPS_PER_ROUTE - 1)
+    max_pickup_stops = min(len(pickups), max_stops_per_route - 1)
     for pickup_stop_limit in range(1, max_pickup_stops + 1):
         max_dropoff_stops = min(
             len(dropoffs),
-            MAX_STOPS_PER_ROUTE - pickup_stop_limit,
+            max_stops_per_route - pickup_stop_limit,
         )
         pickup_candidates = pickups[:pickup_stop_limit]
         pickup_capacity = sum(item.remaining_qty for item in pickup_candidates)
