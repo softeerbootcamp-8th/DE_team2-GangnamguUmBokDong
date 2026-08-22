@@ -65,7 +65,7 @@ export function Header({ regions, selectedRegion, stationsUpdatedAt, onRegionCha
       </span>
       <div className="app-header-times">
         <span>현재 시각 {formatClock(now)}</span>
-        <span>기준 시각 {stationsUpdatedAt ? formatClock(stationsUpdatedAt) : "-"}</span>
+        <span>조회 시각 {stationsUpdatedAt ? formatClock(stationsUpdatedAt) : "-"}</span>
         <span className={statusError ? "status-error" : undefined}>
           예측 시각 {statusError ? "갱신 실패" : predictedAt ? formatIsoTime(predictedAt, { hour: "2-digit", minute: "2-digit" }) : "-"}
         </span>

@@ -14,6 +14,7 @@ vi.mock("../api", async (importOriginal) => {
 beforeEach(() => {
   vi.useFakeTimers();
   vi.clearAllMocks();
+  apiMock.status.mockReset().mockResolvedValue({ base_dttm: "2026-08-20T00:00:00Z" });
 });
 
 afterEach(() => {
@@ -23,6 +24,19 @@ afterEach(() => {
 });
 
 describe("Header status polling", () => {
+  it("대여소 polling 성공 시각을 조회 시각으로 표시한다", () => {
+    render(
+      <Header
+        regions={[]}
+        selectedRegion="all"
+        stationsUpdatedAt={new Date("2026-08-20T00:05:00Z")}
+        onRegionChange={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText(/^조회 시각 /)).not.toBeNull();
+  });
+
   it("status 실패 뒤 이전 성공 시각을 지운다", async () => {
     apiMock.status
       .mockResolvedValueOnce({ base_dttm: "2026-08-20T00:00:00Z" })

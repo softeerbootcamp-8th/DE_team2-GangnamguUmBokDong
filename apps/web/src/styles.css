@@ -523,9 +523,8 @@ body {
 
 .route-column > h3 strong,
 .alert-column > h3 strong {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
+  display: inline-grid;
+  place-items: center;
   min-width: 22px;
   height: 22px;
   padding: 0 6px;
@@ -534,6 +533,7 @@ body {
   color: var(--text-secondary);
   font-size: 10px;
   font-variant-numeric: tabular-nums;
+  line-height: 1;
 }
 
 .route-column-list,
