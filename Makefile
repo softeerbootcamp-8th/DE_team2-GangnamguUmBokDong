@@ -302,8 +302,16 @@ deploy-secrets:
 
 # 접속 IP가 바뀌었을 때. 현재 공인 IP로 admin_cidrs를 다시 쓰고 SG 규칙만 갱신한다(10초 내외).
 # 자기 공인 IP를 admin_cidrs에 **추가**한다. 덮어쓰면 팀원 한 명이 실행할 때마다
-# 나머지 전원이 SSH에서 끊긴다. apply는 SG만 -target으로 좁힌다 — 전체 apply는
-# 의도적으로 제외해둔 학습 EC2까지 만들어버린다.
+# 나머지 전원이 SSH에서 끊긴다.
+#
+# -target은 반드시 아래 세 규칙 리소스여야 한다. 규칙은 aws_security_group 안에
+# 인라인으로 있지 않고 for_each = toset(var.admin_cidrs)인 별도
+# aws_vpc_security_group_ingress_rule이다(terraform/network.tf 참고). 그래서
+# -target=aws_security_group.app은 규칙을 하나도 포함하지 않아 terraform이
+# "No changes"로 끝나고, -target=aws_security_group.train은 SG 교체를 유발해
+# app SG의 5000번 규칙이 그걸 참조하는 탓에 DependencyViolation으로 실패한다
+# (2026-08-22 실측, 둘 다 겪었다). 전체 apply도 금지다 — 의도적으로 제외해둔
+# 학습 EC2까지 만들어버린다.
 allow-my-ip:
 	@IP=$$(curl -fsS https://checkip.amazonaws.com | tr -d '\n'); \
 	$(MAKE) --no-print-directory allow-ip IP="$$IP"
@@ -314,14 +322,18 @@ allow-ip:
 	@test -n "$(IP)" || { echo "IP=<공인 IP> 를 지정하세요." >&2; exit 2; }
 	@python3 ops/deploy/merge_admin_cidrs.py "$(IP)/32"
 	@$(TF) apply -auto-approve \
-	  -target=aws_security_group.app -target=aws_security_group.train
+	  -target='aws_vpc_security_group_ingress_rule.app_ssh' \
+	  -target='aws_vpc_security_group_ingress_rule.app_airflow_ui' \
+	  -target='aws_vpc_security_group_ingress_rule.app_mlflow_ui'
 
 # 더 이상 접속하지 않는 IP를 목록에서 뺀다. 열어둔 채 방치하지 않기 위한 짝이다.
 revoke-ip:
 	@test -n "$(IP)" || { echo "IP=<공인 IP> 를 지정하세요." >&2; exit 2; }
 	@python3 ops/deploy/merge_admin_cidrs.py --remove "$(IP)/32"
 	@$(TF) apply -auto-approve \
-	  -target=aws_security_group.app -target=aws_security_group.train
+	  -target='aws_vpc_security_group_ingress_rule.app_ssh' \
+	  -target='aws_vpc_security_group_ingress_rule.app_airflow_ui' \
+	  -target='aws_vpc_security_group_ingress_rule.app_mlflow_ui'
 
 train-start:
 	@aws ec2 start-instances --instance-ids $$($(TF) output -raw train_instance_id)
