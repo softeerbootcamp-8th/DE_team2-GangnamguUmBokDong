@@ -116,6 +116,17 @@ def test_future_lgb_profile_keys_survive_effective_params():
     assert params["num_leaves"] == common_config._DEFAULT_PROFILE["LGB_PARAMS_COMMON"]["num_leaves"]
 
 
+def test_histogram_pool_size_can_be_overridden_for_memory_safe_training(monkeypatch):
+    """대규모 학습의 histogram cache 제한을 실행 계약에 명시적으로 반영한다."""
+    monkeypatch.setenv("LGB_HISTOGRAM_POOL_SIZE", "128")
+
+    params = common_config._build_lgb_params(
+        {**common_config._DEFAULT_PROFILE["LGB_PARAMS_COMMON"], "histogram_pool_size": 512.0}
+    )
+
+    assert params["histogram_pool_size"] == 128.0
+
+
 def test_load_profile_propagates_explicit_s3_failure(monkeypatch):
     monkeypatch.setenv("ML_PROFILE", "remote")
 
@@ -593,4 +604,3 @@ def test_s3_client_with_endpoint_passes_explicit_credentials(monkeypatch):
     assert fake.kwargs["endpoint_url"] == "http://minio:9000"
     assert fake.kwargs["aws_access_key_id"] == "local-key"
     assert fake.kwargs["aws_secret_access_key"] == "local-secret"
-

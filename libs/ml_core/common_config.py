@@ -555,6 +555,15 @@ def _build_lgb_params(profile_params: dict) -> dict:
             "num_threads": _int_env("LGB_NUM_THREADS", profile_params.get("num_threads", 0)),
         }
     )
+    # 대규모 단일 머신 학습은 Dataset 자체뿐 아니라 boosting 시작 시 만드는
+    # histogram cache가 RAM 안전선을 넘길 수 있다. 이 값은 tree 탐색 결과나
+    # 데이터 범위를 줄이지 않고 cache 재사용량(속도↔메모리)만 조절하므로,
+    # 원격 profile을 복제하지 않아도 실행 manifest에 남는 명시적 override를 둔다.
+    if "histogram_pool_size" in profile_params or "LGB_HISTOGRAM_POOL_SIZE" in os.environ:
+        params["histogram_pool_size"] = _float_env(
+            "LGB_HISTOGRAM_POOL_SIZE",
+            profile_params.get("histogram_pool_size", -1.0),
+        )
     return params
 
 
