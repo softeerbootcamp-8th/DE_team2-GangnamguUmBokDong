@@ -20,7 +20,7 @@ const ROUTE_POLL_INTERVAL_MS = 30_000;
 const ROUTE_PAGE_SIZE = 500;
 const ALL_REGIONS = "all";
 type ListMode = "routes" | "stations";
-type RouteTransition = "dispatch" | "complete" | "cancel";
+type RouteTransition = "dispatch" | "complete" | "cancel" | "dismiss" | "restore";
 
 function preferredRoute(routes: Route[]): Route | null {
   const referenceMs = candidateReferenceMs(routes);
@@ -284,6 +284,25 @@ export default function App() {
     setBusyRouteId(route.route_id);
     setRouteTransitionError(null);
     try {
+      if (transition === "dismiss") {
+        const dismissed = await api.dismissRoute(route.route_id);
+        routeMutationGenerationRef.current += 1;
+        setRoutes((current) => current.filter((item) => item.route_id !== dismissed.route_id));
+        if (selectedRouteIdRef.current === dismissed.route_id) {
+          selectedRouteIdRef.current = null;
+          setSelectedRouteId(null);
+        }
+        return;
+      }
+      if (transition === "restore") {
+        // 되돌리기는 원본을 그대로 두고 새 후보를 만든다. 새 후보의 proposed_at이
+        // 현재 시각이라 후보 창을 통과하고, 바로 선택해 지도에 띄운다.
+        const restored = await api.restoreRoute(route.route_id);
+        routeMutationGenerationRef.current += 1;
+        setRoutes((current) => [...current, restored]);
+        selectRoute(restored);
+        return;
+      }
       const updated = transition === "dispatch"
         ? await api.dispatchRoute(route.route_id)
         : transition === "complete"
@@ -373,6 +392,8 @@ export default function App() {
                           onDispatch={(route) => void transitionRoute(route, "dispatch")}
                           onComplete={(route) => void transitionRoute(route, "complete")}
                           onCancel={(route) => void transitionRoute(route, "cancel")}
+                          onDismiss={(route) => void transitionRoute(route, "dismiss")}
+                          onRestore={(route) => void transitionRoute(route, "restore")}
                         />
                       ) : alertsError ? (
                         <p className="empty-state" role="status">대여소 우선순위를 갱신하지 못했습니다.</p>
