@@ -153,12 +153,17 @@ def test_explicit_code_compatibility_requires_all_other_contract_fields_to_match
     old_contract = {
         "dataset": "fixed",
         "params": {"num_leaves": 7},
+        "filters": [["horizon", "in", [1, 2]]],
         "code_fingerprint": "old-code",
     }
     old_manager = _manager(old_contract)
     old_manager._write_state(status="in_progress", completed_iterations=0)
 
-    compatible_contract = {**old_contract, "code_fingerprint": "resume-fix"}
+    compatible_contract = {
+        **old_contract,
+        "filters": [("horizon", "in", [1, 2])],
+        "code_fingerprint": "resume-fix",
+    }
     state = _manager(
         compatible_contract,
         compatible_code_fingerprints=frozenset({"old-code"}),

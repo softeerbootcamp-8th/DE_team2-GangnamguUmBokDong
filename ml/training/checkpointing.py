@@ -223,7 +223,7 @@ class TrainingCheckpointManager:
         observed_without_code = {
             key: value for key, value in observed_contract.items() if key != "code_fingerprint"
         }
-        if observed_without_code != expected_without_code:
+        if canonical_sha256(observed_without_code) != canonical_sha256(expected_without_code):
             return False
         print(
             "checkpoint의 이전 코드 fingerprint를 명시적 호환 목록으로 재사용합니다: "
