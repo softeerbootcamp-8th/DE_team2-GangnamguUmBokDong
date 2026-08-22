@@ -61,7 +61,15 @@ def test_realtime_uses_single_coordinated_publication_chain() -> None:
 
 def test_station_and_weather_schedules_are_collector_only() -> None:
     """Topology/weather standalone Gold authority가 scheduled DAG를 우회하지 못한다."""
-    assert set(station_master_dag.dag.task_ids) == {"collect_bike_station_master"}
+    # enrich_station_master는 Silver(station_master_enriched)를 만드는 normalizer라
+    # 이 계약(Gold 우회 금지)에 걸리지 않는다. 태스크 수를 세는 대신 아래에서
+    # gold_cli 호출이 없음을 직접 확인한다.
+    assert set(station_master_dag.dag.task_ids) == {
+        "collect_bike_station_master",
+        "enrich_station_master",
+    }
+    for task in station_master_dag.dag.tasks:
+        assert "gold_cli.py" not in task.bash_command
     assert set(weather_10min_dag.dag.task_ids) == {
         "collect_weather_ultra_short_live",
         "collect_weather_ultra_short_forecast",
@@ -76,4 +84,10 @@ def test_station_master_daily_collector_contract() -> None:
 
     assert "--source bike_station_master" in task.bash_command
     assert task.upstream_task_ids == set()
-    assert task.downstream_task_ids == set()
+    # 수집 직후 같은 스냅샷을 Silver로 보강한다. realtime_5min의
+    # prepare_serving_plan이 silver/station_master_enriched를 필수로 읽으므로,
+    # 이 태스크가 어느 DAG에도 없으면 그 경로가 영구히 비어 파이프라인이 멈춘다.
+    assert task.downstream_task_ids == {"enrich_station_master"}
+    enrichment = station_master_dag.dag.get_task("enrich_station_master")
+    assert "station_master.py" in enrichment.bash_command
+    assert enrichment.downstream_task_ids == set()
