@@ -181,15 +181,17 @@ PROD_COMPOSE       = docker compose --env-file $(PROD_ENV) -f ops/compose/docker
 # bash 문법(`[[ ]]`, 배열, here-string)을 쓴다. postgres:16은 multi-arch라 Graviton에서도 돈다.
 PSQL_IMAGE        ?= postgres:16
 
-# SSM 대신 SSH를 쓴다(계정 정책상 SSM 전면 거부). 공개키만 AWS에 등록되어 있다.
-SSH_KEY           ?= ~/.ssh/gng-ubd
+# SSM 대신 SSH를 쓴다(계정 정책상 SSM 전면 거부). 키페어는 terraform이 만들지 않고
+# `aws ec2 create-key-pair`로 AWS가 직접 발급한다(terraform/variables.tf의
+# ssh_key_name 참고) — 그 결과물이 이 개인키 파일이다.
+SSH_KEY           ?= ~/.ssh/gng-ubd-admin.pem
 
 EMR_STAGE          = .emr-stage
 EMR_RELEASE       ?= emr-7.9.0
 EMR_INSTANCE_TYPE ?= m5.xlarge
 EMR_INSTANCE_COUNT?= 3
 
-.PHONY: deploy-env deploy-db-bootstrap deploy-db-check deploy-seed-models \
+.PHONY: deploy-env deploy-secrets deploy-db-bootstrap deploy-db-check deploy-seed-models \
         deploy-up deploy-down deploy-ps deploy-logs deploy-restart deploy-resync deploy-smoke \
         train-start train-stop train-status tunnel-airflow tunnel-mlflow \
         ssh-app ssh-train allow-my-ip \
@@ -282,6 +284,21 @@ tunnel-airflow:
 tunnel-mlflow:
 	@echo "http://localhost:5000 에서 MLflow UI (종료: Ctrl+C)"; \
 	ssh -i $(SSH_KEY) -N -L 5000:localhost:5000 ec2-user@$$($(TF) output -raw app_public_ip)
+
+# config/prod.env(terraform 산출물)에는 API 키를 안 넣는다 — 이 타겟이 그 나머지를
+# 채운다. 값은 SEOUL_OPENAPI_KEY/KMA_APIHUB_KEY 환경변수로 주거나, 생략하면 로컬
+# .env(레포 루트)에서 읽는다. 평문 파일은 업로드 후 즉시 지운다.
+deploy-secrets:
+	@S3_BUCKET=$${S3_BUCKET:?S3_BUCKET을 알 수 없습니다. S3_BUCKET=<버킷> make deploy-secrets 로 실행하세요.}; \
+	SEOUL_OPENAPI_KEY=$${SEOUL_OPENAPI_KEY:-$$(grep -m1 '^SEOUL_OPENAPI_KEY=' .env 2>/dev/null | cut -d= -f2-)}; \
+	KMA_APIHUB_KEY=$${KMA_APIHUB_KEY:-$$(grep -m1 '^KMA_APIHUB_KEY=' .env 2>/dev/null | cut -d= -f2-)}; \
+	if [ -z "$$SEOUL_OPENAPI_KEY" ] || [ -z "$$KMA_APIHUB_KEY" ]; then \
+		echo "SEOUL_OPENAPI_KEY/KMA_APIHUB_KEY를 찾을 수 없습니다. 환경변수로 주거나 .env에 채워두세요." >&2; exit 1; \
+	fi; \
+	tmp=$$(mktemp); \
+	trap 'rm -f "$$tmp"' EXIT; \
+	printf 'SEOUL_OPENAPI_KEY=%s\nKMA_APIHUB_KEY=%s\n' "$$SEOUL_OPENAPI_KEY" "$$KMA_APIHUB_KEY" > "$$tmp"; \
+	aws s3 cp "$$tmp" "s3://$$S3_BUCKET/config/secrets.env"
 
 # 접속 IP가 바뀌었을 때. 현재 공인 IP로 admin_cidrs를 다시 쓰고 SG 규칙만 갱신한다(10초 내외).
 allow-my-ip:
