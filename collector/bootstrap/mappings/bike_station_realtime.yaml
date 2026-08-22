@@ -24,7 +24,9 @@ kind: csv
 encoding: cp949
 
 # `--csv-dir`에 대여이력 CSV·기상 CSV가 함께 있다. 이 소스의 파일만 고른다.
-file_pattern: "대여소별 공공자전거 대여가능 수량*.csv"
+# raw-data 배포본은 파일명이 "data_YYMM.csv"로 재배포되어 있어 그 이름에 맞춘다
+# (열린데이터광장 원본 파일명은 "대여소별 공공자전거 대여가능 수량*.csv"였다).
+file_pattern: "data_*.csv"
 
 # 실측 빈값이 0건이고 `\N` 같은 별도 결측 표기도 없다.
 na_values: []

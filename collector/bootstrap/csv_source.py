@@ -43,6 +43,7 @@ from pathlib import Path
 import pyarrow as pa
 
 from bootstrap.config import BootstrapConfig
+from bootstrap.globbing import glob_normalized
 from bootstrap.station_join import StationMap
 from core.wind import wind_components
 
@@ -115,7 +116,7 @@ def read_by_date(
     na_values = set(cfg.na_values)
     batches: dict[date, list[pa.RecordBatch]] = defaultdict(list)
 
-    for path in sorted(csv_dir.glob(cfg.file_pattern)):
+    for path in glob_normalized(csv_dir, cfg.file_pattern):
         overlaps = _file_overlaps_range(path, months)
         if overlaps is False:
             logger.info(
