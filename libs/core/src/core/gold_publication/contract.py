@@ -560,17 +560,21 @@ _REGISTRY = {
         dependencies=("station", "station_demand_forecast", "station_stock"),
         input_roles=(
             _role("demand_publication_manifest"),
-            _role("stock_history_manifest_01"),
-            _role("stock_history_manifest_02"),
-            _role("stock_history_manifest_03"),
-            _role("stock_history_manifest_04"),
-            _role("stock_history_manifest_05"),
+            # 과거 5분 tick은 수집 장애로 일부가 없을 수 있다. role에 실제 offset을
+            # 고정해 중간 window가 빠져도 나머지 role의 시간 의미가 바뀌지 않게 한다.
+            # 전체 최소 window 수와 실제 부재 여부는 urgency publisher가 검증한다.
+            _role("stock_history_manifest_m05", minimum=0),
+            _role("stock_history_manifest_m10", minimum=0),
+            _role("stock_history_manifest_m15", minimum=0),
+            _role("stock_history_manifest_m20", minimum=0),
+            _role("stock_history_manifest_m25", minimum=0),
             _role("stock_publication_manifest"),
             _role("urgency_output"),
         ),
         parameter_names=(
             "expected_sta_id_sha256",
             "scoring_config_version",
+            "stock_history_offsets",
             "stock_window_count",
         ),
         output_targets=(("station_urgency", "station_urgency"),),

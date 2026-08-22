@@ -409,7 +409,7 @@ def test_history_null_parking_is_station_observation_absence() -> None:
     )
     artifact = InputArtifact(
         byte_sha256=manifest.sha256,
-        role="stock_history_manifest_01",
+        role="stock_history_manifest_m25",
         uri=manifest_uri,
     )
 
