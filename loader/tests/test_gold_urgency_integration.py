@@ -20,6 +20,7 @@ from core.gold_publication import (
     build_id_set,
     sha256_hex,
 )
+from core.scoring_config import URGENCY_STOCK_HISTORY_OFFSETS_MINUTES
 from core.source_snapshot import (
     SourceSnapshotCounts,
     SourceSnapshotStatus,
@@ -197,7 +198,7 @@ def _publish(
     connection: Connection[Any],
     store: S3ImmutableObjectStore,
     source_catalog: S3SourceSnapshotCatalog,
-    history: tuple[tuple[str, str], ...],
+    history: tuple[tuple[int, str, str], ...],
 ) -> Any:
     """Fixture의 five-window identities로 urgency publisher를 실행한다."""
     release_refs = {}
@@ -221,10 +222,10 @@ def _put_history_manifests(
     anchor: datetime,
     *,
     historical: int,
-) -> tuple[tuple[str, str], ...]:
+) -> tuple[tuple[int, str, str], ...]:
     """t-25..-5분 complete realtime source manifest와 Silver를 기록한다."""
     references = []
-    for offset in (-25, -20, -15, -10, -5):
+    for offset in URGENCY_STOCK_HISTORY_OFFSETS_MINUTES:
         logical_dttm = anchor + timedelta(minutes=offset)
         silver = parquet_bytes(
             pa.table(
@@ -256,7 +257,7 @@ def _put_history_manifests(
             expected_sha256=manifest.sha256,
             require_canonical_json=True,
         )
-        references.append((manifest_uri, manifest.sha256))
+        references.append((offset, manifest_uri, manifest.sha256))
     return tuple(references)
 
 

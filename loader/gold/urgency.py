@@ -720,6 +720,7 @@ def publish_station_urgency(
         locked_projection = compute_urgency_projection(
             UrgencyCalculationInputs(
                 active_stations=locked_active,
+                history_offsets_minutes=calculation.history_offsets_minutes,
                 history_windows=calculation.history_windows,
                 current_stock=calculation.current_stock,
                 demand=calculation.demand,
@@ -745,6 +746,7 @@ def publish_station_urgency(
             raise ContractViolation("urgency EMPTY evidence key가 다릅니다.")
         locked = UrgencyCalculationInputs(
             active_stations=_active_stations_locked(cursor),
+            history_offsets_minutes=calculation.history_offsets_minutes,
             history_windows=calculation.history_windows,
             current_stock=calculation.current_stock,
             demand=calculation.demand,

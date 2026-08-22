@@ -10,6 +10,8 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from core.scoring_config import URGENCY_STOCK_HISTORY_OFFSETS_MINUTES
+
 from gold.demand import DemandForecastRecord
 from gold.rebalance_route import (
     DispatchCenterTopology,
@@ -88,7 +90,7 @@ class JobAudit:
     planned_bikes: int
     moved_bikes: int
     stop_count: int
-    stops: tuple["StopAudit", ...]
+    stops: tuple[StopAudit, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -335,7 +337,8 @@ def simulate_policy(
             if station.station_id in supported_ids
         )
         history_windows = []
-        for offset in (-25, -20, -15, -10, -5):
+        # 리터럴로 두면 scoring config가 바뀔 때 조용히 어긋난다.
+        for offset in URGENCY_STOCK_HISTORY_OFFSETS_MINUTES:
             history_time = occurred_at + timedelta(minutes=offset)
             snapshot = stock_history.get(history_time)
             history_windows.append(
@@ -356,6 +359,7 @@ def simulate_policy(
                 active_stations=tuple(
                     row for row in active_station_rows if row.sta_id in supported_ids
                 ),
+                history_offsets_minutes=URGENCY_STOCK_HISTORY_OFFSETS_MINUTES,
                 history_windows=tuple(history_windows),
                 current_stock=current_stock,
                 demand=records,
