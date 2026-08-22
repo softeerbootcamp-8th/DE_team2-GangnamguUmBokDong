@@ -278,10 +278,10 @@ def _put_urgency_publication(
         *tuple(
             InputArtifact(
                 str(index) * 64,
-                f"stock_history_manifest_{index:02d}",
+                f"stock_history_manifest_m{offset:02d}",
                 _object_uri(f"urgency/history/{index}", str(index) * 64, "json"),
             )
-            for index in range(1, 6)
+            for index, offset in enumerate((5, 10, 15, 20, 25), start=1)
         ),
         InputArtifact(
             "e" * 64,
@@ -297,6 +297,7 @@ def _put_urgency_publication(
         (
             Parameter("expected_sta_id_sha256", expected_ids.sha256),
             Parameter("scoring_config_version", "urgency-scoring-v1"),
+            Parameter("stock_history_offsets", "-25,-20,-15,-10,-5"),
             Parameter("stock_window_count", "6"),
         ),
     )

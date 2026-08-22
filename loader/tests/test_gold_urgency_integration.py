@@ -108,11 +108,11 @@ def test_urgency_publish_replay_correction_rollback_stale_and_empty(
         for artifact in first.evidence[0].input_fingerprint.input_artifacts
     ) == (
         "demand_publication_manifest",
-        "stock_history_manifest_01",
-        "stock_history_manifest_02",
-        "stock_history_manifest_03",
-        "stock_history_manifest_04",
-        "stock_history_manifest_05",
+        "stock_history_manifest_m05",
+        "stock_history_manifest_m10",
+        "stock_history_manifest_m15",
+        "stock_history_manifest_m20",
+        "stock_history_manifest_m25",
         "stock_publication_manifest",
         "urgency_output",
     )
