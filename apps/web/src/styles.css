@@ -3,10 +3,56 @@
 @import "shadcn/tailwind.css";
 @import "@fontsource-variable/geist";
 
+@font-face {
+  font-family: "SeoulAlrimWeb";
+  src:
+    local("SeoulAlrim Medium"),
+    local("서울알림체 Medium"),
+    url("/fonts/seoul-alrim/SeoulAlrim-Medium.otf") format("opentype");
+  font-display: swap;
+  font-style: normal;
+  font-weight: 500;
+}
+
+@font-face {
+  font-family: "SeoulAlrimWeb";
+  src:
+    local("SeoulAlrim Bold"),
+    local("서울알림체 Bold"),
+    url("/fonts/seoul-alrim/SeoulAlrim-Bold.otf") format("opentype");
+  font-display: swap;
+  font-style: normal;
+  font-weight: 700;
+}
+
+@font-face {
+  font-family: "SeoulAlrimWeb";
+  src:
+    local("SeoulAlrim ExtraBold"),
+    local("서울알림체 ExtraBold"),
+    url("/fonts/seoul-alrim/SeoulAlrim-ExtraBold.otf") format("opentype");
+  font-display: swap;
+  font-style: normal;
+  font-weight: 800;
+}
+
+@font-face {
+  font-family: "SeoulAlrimWeb";
+  src:
+    local("SeoulAlrim Heavy"),
+    local("서울알림체 Heavy"),
+    url("/fonts/seoul-alrim/SeoulAlrim-Heavy.otf") format("opentype");
+  font-display: swap;
+  font-style: normal;
+  font-weight: 900;
+}
+
 @custom-variant dark (&:is(.dark *));
 
 :root {
   color-scheme: light;
+  --dashboard-font: "SeoulAlrimWeb", "Geist Variable", system-ui,
+    -apple-system, "Segoe UI", sans-serif;
   --page-plane: #f9f9f7;
   --surface-1: #fcfcfb;
   --text-primary: #0b0b0b;
@@ -74,7 +120,7 @@ body {
   margin: 0;
   background: var(--page-plane);
   color: var(--text-primary);
-  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  font-family: var(--dashboard-font);
 }
 
 .dashboard {
@@ -1205,7 +1251,7 @@ body {
 
 @theme inline {
   --font-heading: var(--font-sans);
-  --font-sans: 'Geist Variable', sans-serif;
+  --font-sans: var(--dashboard-font);
   --color-sidebar-ring: var(--sidebar-ring);
   --color-sidebar-border: var(--sidebar-border);
   --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
