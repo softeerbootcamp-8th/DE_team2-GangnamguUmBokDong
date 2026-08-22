@@ -154,6 +154,7 @@ function deferred<T>() {
 
 beforeEach(() => {
   vi.useFakeTimers();
+  vi.setSystemTime(new Date("2026-08-20T00:05:00Z"));
   vi.clearAllMocks();
   apiMock.alerts.mockResolvedValue(ALERTS);
   apiMock.forecast.mockResolvedValue(FORECAST);
@@ -278,7 +279,7 @@ describe("App polling state", () => {
     });
 
     expect(screen.getByTestId("map-alerts").textContent).toBe("");
-    fireEvent.click(screen.getByRole("button", { name: "대여소 보기" }));
+    fireEvent.click(screen.getByRole("button", { name: "대여소" }));
     expect(screen.getByText("대여소 우선순위를 갱신하지 못했습니다.")).not.toBeNull();
   });
 

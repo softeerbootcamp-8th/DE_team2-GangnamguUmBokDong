@@ -471,7 +471,7 @@ function StationMarkers({
       {selectedRoute && selectedRoutePositions.length > 1 && (
         <Polyline
           positions={selectedRoutePositions}
-          pathOptions={{ color: "#405260", weight: 5, opacity: 0.9, lineCap: "round", lineJoin: "round" }}
+          pathOptions={{ color: "#78909c", weight: 4, opacity: 0.62, lineCap: "round", lineJoin: "round" }}
           interactive={false}
         />
       )}

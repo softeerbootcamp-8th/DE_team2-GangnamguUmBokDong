@@ -211,18 +211,40 @@ export function DetailPanel({ stationId, stationPoint, onFocusEvent }: Props) {
           ) : !detail ? (
             <p className="empty-state">불러오는 중...</p>
           ) : (
-            <dl className="detail-grid">
-              <dt>대여소명</dt>
-              <dd>{detail.sta_nm}</dd>
-              <dt>주소</dt>
-              <dd>{detail.sta_addr}</dd>
-              <dt>현재 자전거 수</dt>
-              <dd>
-                {detail.parking_bike_tot_cnt} / {detail.hold_cnt}대 ({Math.round(detail.shared_rate * 100)}%)
-              </dd>
-              <dt>갱신 시각</dt>
-              <dd>{formatIsoTime(detail.base_dttm)}</dd>
-            </dl>
+            <div className="station-info">
+              <header className="station-info-header">
+                <h3>{detail.sta_nm}</h3>
+                <p>{detail.sta_addr}</p>
+              </header>
+
+              <div className="station-stock-card">
+                <div
+                  className="stock-donut"
+                  role="img"
+                  aria-label={`현재 자전거 ${detail.parking_bike_tot_cnt}대, 거치대 ${detail.hold_cnt}대`}
+                >
+                  <svg viewBox="0 0 42 42" aria-hidden="true">
+                    <circle className="stock-donut-track" cx="21" cy="21" r="16" />
+                    <circle
+                      className="stock-donut-value"
+                      cx="21"
+                      cy="21"
+                      r="16"
+                      pathLength="100"
+                      strokeDasharray={`${Math.min(100, Math.max(0, Math.round(detail.shared_rate * 100)))} 100`}
+                    />
+                  </svg>
+                  <span className="stock-donut-number">
+                    <strong>{detail.parking_bike_tot_cnt}</strong>
+                    <small>/ {detail.hold_cnt}대</small>
+                  </span>
+                </div>
+              </div>
+
+              <p className="station-stock-basis">
+                갱신 시각 {formatIsoTime(detail.base_dttm)}
+              </p>
+            </div>
           )
         ) : tab === "events" ? (
           eventsError ? (
