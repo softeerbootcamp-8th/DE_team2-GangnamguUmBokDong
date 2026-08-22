@@ -587,10 +587,14 @@ CREATE TABLE rebalance_route (
     dispatched_dttm TIMESTAMPTZ,
     completed_dttm TIMESTAMPTZ,
     cancelled_dttm TIMESTAMPTZ,
+    dismissed_dttm TIMESTAMPTZ,
+    restored_from_route_id UUID,
     created_dttm TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     updated_dttm TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     CONSTRAINT rebalance_route_dispatch_center_fk FOREIGN KEY (dispatch_center_id)
         REFERENCES dispatch_center (dispatch_center_id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+    CONSTRAINT rebalance_route_restored_from_fk FOREIGN KEY (restored_from_route_id)
+        REFERENCES rebalance_route (route_id) ON UPDATE RESTRICT ON DELETE RESTRICT,
     CONSTRAINT rebalance_route_status_ck CHECK (
         (route_status_cd = 'proposed'
             AND dispatched_dttm IS NULL AND completed_dttm IS NULL
@@ -616,6 +620,15 @@ CREATE TABLE rebalance_route (
         AND (cancelled_dttm IS NULL OR (
             isfinite(cancelled_dttm) AND cancelled_dttm >= dispatched_dttm
         ))
+    ),
+    CONSTRAINT rebalance_route_dismiss_ck CHECK (
+        dismissed_dttm IS NULL
+        OR (isfinite(dismissed_dttm)
+            AND route_status_cd IN ('completed', 'cancelled')
+            AND dismissed_dttm >= COALESCE(completed_dttm, cancelled_dttm))
+    ),
+    CONSTRAINT rebalance_route_restored_from_self_ck CHECK (
+        restored_from_route_id IS NULL OR restored_from_route_id <> route_id
     ),
     CONSTRAINT rebalance_route_metadata_dttm_ck CHECK (
         isfinite(created_dttm) AND isfinite(updated_dttm)
@@ -745,11 +758,13 @@ DECLARE
 BEGIN
     IF NEW.route_id IS DISTINCT FROM OLD.route_id
        OR NEW.dispatch_center_id IS DISTINCT FROM OLD.dispatch_center_id
-       OR NEW.proposed_dttm IS DISTINCT FROM OLD.proposed_dttm THEN
-        RAISE EXCEPTION 'rebalance route identity, center, and proposal time are immutable'
+       OR NEW.proposed_dttm IS DISTINCT FROM OLD.proposed_dttm
+       OR NEW.restored_from_route_id IS DISTINCT FROM OLD.restored_from_route_id THEN
+        RAISE EXCEPTION 'rebalance route identity, center, proposal time, and restore origin are immutable'
             USING ERRCODE = '23514';
     END IF;
 
+    -- dismissed_dttm은 상태 전이 없이 바뀌는 유일한 컬럼이다. 같은 상태일 때만 허용한다.
     IF OLD.route_status_cd = NEW.route_status_cd THEN
         IF ROW(NEW.dispatched_dttm, NEW.completed_dttm, NEW.cancelled_dttm)
            IS DISTINCT FROM
@@ -758,6 +773,12 @@ BEGIN
                 USING ERRCODE = '23514';
         END IF;
         RETURN NEW;
+    END IF;
+
+    -- 완료·취소 처리와 목록 삭제가 한 UPDATE에 섞이지 않게 막는다.
+    IF NEW.dismissed_dttm IS DISTINCT FROM OLD.dismissed_dttm THEN
+        RAISE EXCEPTION 'rebalance route dismissal cannot change during a status transition'
+            USING ERRCODE = '23514';
     END IF;
 
     IF OLD.route_status_cd = 'proposed' AND NEW.route_status_cd = 'dispatched' THEN

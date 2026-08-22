@@ -17,6 +17,7 @@ DATABASE_URL_ENV = "GOLD_API_TEST_DATABASE_URL"
 ROUTE_ID = UUID("11111111-1111-4111-8111-111111111111")
 CONFLICT_ROUTE_ID = UUID("22222222-2222-4222-8222-222222222222")
 CANCEL_ROUTE_ID = UUID("33333333-3333-4333-8333-333333333333")
+MISSING_ROUTE_ID = UUID("99999999-9999-4999-8999-999999999999")
 
 
 @pytest.fixture
@@ -454,3 +455,56 @@ def test_route_lifecycle_and_constraint_error_mapping(database_url: str) -> None
     response = TestClient(main.app).post(f"/routes/{CONFLICT_ROUTE_ID}/dispatch")
     assert response.status_code == 409
     assert response.json()["detail"] == "route_transition_conflict"
+
+
+def test_dismiss_columns_reject_active_routes_and_transition_writes(database_url: str) -> None:
+    """dismissed_dttm은 종료 작업에서만 채워지고 상태 전이 중에는 바뀌지 못한다."""
+    now = datetime.now(UTC)
+    _seed_serving_fixture(database_url, now)
+
+    # proposed 상태에는 dismissed_dttm을 채울 수 없다.
+    with psycopg.connect(database_url) as connection:
+        with pytest.raises(psycopg.errors.CheckViolation):
+            connection.execute(
+                "UPDATE rebalance_route SET dismissed_dttm = %(now)s WHERE route_id = %(route_id)s",
+                {"now": now, "route_id": ROUTE_ID},
+            )
+
+    # dispatched -> completed 전이와 dismiss를 한 UPDATE에 섞을 수 없다.
+    queries.dispatch_route(ROUTE_ID, now)
+    with psycopg.connect(database_url) as connection:
+        with pytest.raises(psycopg.errors.CheckViolation):
+            connection.execute(
+                """
+                UPDATE rebalance_route
+                   SET route_status_cd = 'completed',
+                       completed_dttm = %(now)s,
+                       dismissed_dttm = %(now)s
+                 WHERE route_id = %(route_id)s
+                """,
+                {"now": now + timedelta(seconds=1), "route_id": ROUTE_ID},
+            )
+
+    # completed 상태에서는 단독 UPDATE로 dismiss할 수 있고, 다시 해제할 수도 있다.
+    queries.complete_route(ROUTE_ID, now + timedelta(seconds=1))
+    with psycopg.connect(database_url) as connection:
+        connection.execute(
+            "UPDATE rebalance_route SET dismissed_dttm = %(now)s WHERE route_id = %(route_id)s",
+            {"now": now + timedelta(seconds=2), "route_id": ROUTE_ID},
+        )
+        connection.execute(
+            "UPDATE rebalance_route SET dismissed_dttm = NULL WHERE route_id = %(route_id)s",
+            {"route_id": ROUTE_ID},
+        )
+
+    # restored_from_route_id는 INSERT 이후 바꿀 수 없다.
+    with psycopg.connect(database_url) as connection:
+        with pytest.raises(psycopg.errors.CheckViolation):
+            connection.execute(
+                """
+                UPDATE rebalance_route
+                   SET restored_from_route_id = %(other)s
+                 WHERE route_id = %(route_id)s
+                """,
+                {"other": CONFLICT_ROUTE_ID, "route_id": ROUTE_ID},
+            )

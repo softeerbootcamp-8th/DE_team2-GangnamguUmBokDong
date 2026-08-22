@@ -7,7 +7,7 @@ CI_INTEGRATION_PROJECTS := loader
 PLATFORM_COMPOSE := $(shell bash ops/compose/platform_args.sh)
 COMPOSE = docker compose $(if $(wildcard .env),--env-file .env,) -f ops/compose/docker-compose.yml $(PLATFORM_COMPOSE)
 
-.PHONY: sync-all sync-ci-unit lint test-gold-bootstrap test-gold-transition-available test test-ci test-ci-unit test-ci-integration bootstrap up down logs ps migrate-route-cancellation seed bootstrap-gold-seeds seed-e2e e2e-preflight e2e-smoke
+.PHONY: sync-all sync-ci-unit lint test-gold-bootstrap test-gold-transition-available test test-ci test-ci-unit test-ci-integration bootstrap up down logs ps migrate-route-cancellation migrate-route-dismiss-restore seed bootstrap-gold-seeds seed-e2e e2e-preflight e2e-smoke
 
 E2E_LOGICAL_DTTM ?= $(shell TZ=Asia/Seoul date '+%Y-%m-%dT%H:%M:00+09:00' | awk -F: '{ printf "%s:%02d:00+09:00\n", $$1, int($$2 / 5) * 5 }')
 E2E_STATION_SOURCE_DTTM ?= $(shell python3 ops/e2e_time.py station-source '$(E2E_LOGICAL_DTTM)')
@@ -121,6 +121,11 @@ migrate-route-cancellation:
 	@$(COMPOSE) exec -T postgres \
 		psql -v ON_ERROR_STOP=1 -U "$${POSTGRES_USER:-postgres}" -d "$${POSTGRES_APP_DB:-app}" \
 		< ops/postgres/migrations/130_add_route_cancellation.sql
+
+migrate-route-dismiss-restore:
+	@$(COMPOSE) exec -T postgres \
+		psql -v ON_ERROR_STOP=1 -U "$${POSTGRES_USER:-postgres}" -d "$${POSTGRES_APP_DB:-app}" \
+		< ops/postgres/migrations/131_add_route_dismiss_and_restore.sql
 
 seed:
 	@echo "[gold-postgis] make seed는 weather grid seed_version/effective_dttm SSOT 확정 전이라 비활성화되었습니다." >&2
