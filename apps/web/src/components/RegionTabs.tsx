@@ -10,24 +10,18 @@ interface Props {
 
 export function RegionTabs({ regions, selectedRegion, onChange }: Props) {
   return (
-    <div className="filter-tab-row region-filter-row" role="group" aria-label="권역 필터">
-      <button
-        type="button"
-        className={`alert-tab${selectedRegion === ALL_REGIONS ? " active" : ""}`}
-        onClick={() => onChange(ALL_REGIONS)}
-      >
-        전체 권역
-      </button>
+    <select
+      className="region-select"
+      aria-label="권역 선택"
+      value={selectedRegion}
+      onChange={(event) => onChange(event.target.value)}
+    >
+      <option value={ALL_REGIONS}>전체 권역</option>
       {regions.map((center) => (
-        <button
-          key={center.region}
-          type="button"
-          className={`alert-tab${selectedRegion === center.region ? " active" : ""}`}
-          onClick={() => onChange(center.region)}
-        >
+        <option key={center.region} value={center.region}>
           {center.region}
-        </button>
+        </option>
       ))}
-    </div>
+    </select>
   );
 }

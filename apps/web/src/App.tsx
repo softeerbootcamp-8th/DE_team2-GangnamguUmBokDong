@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { List, Route as RouteIcon } from "lucide-react";
 import { api } from "./api";
-import type { Alert, DispatchCenter, ForecastResponse, Route, StationFilter, StationSummary } from "./api";
+import type { Alert, DispatchCenter, ForecastResponse, Route, StationSummary } from "./api";
 import { AlertList } from "./components/AlertList";
 import { DetailPanel } from "./components/DetailPanel";
 import type { FocusedEvent } from "./components/DetailPanel";
@@ -11,8 +11,7 @@ import { RouteList } from "./components/RouteList";
 import { RouteStopRail } from "./components/RouteStopRail";
 import { StationMap } from "./components/StationMap";
 import { StockPanel } from "./components/StockPanel";
-import { formatClock } from "./format";
-import { isRebalanceRoute } from "./routeOperations";
+import { candidateReferenceMs, isFreshCandidate, isRebalanceRoute } from "./routeOperations";
 import { ResizableHandle, ResizablePanel, ResizablePanelGroup } from "@/components/ui/resizable";
 
 const POLL_INTERVAL_MS = 15_000;
@@ -24,7 +23,9 @@ type ListMode = "routes" | "stations";
 type RouteTransition = "dispatch" | "complete" | "cancel";
 
 function preferredRoute(routes: Route[]): Route | null {
+  const referenceMs = candidateReferenceMs(routes);
   return routes.find((route) => route.status === "dispatched")
+    ?? routes.find((route) => isFreshCandidate(route, referenceMs))
     ?? routes.find((route) => route.status === "proposed")
     ?? routes[0]
     ?? null;
@@ -41,6 +42,8 @@ async function fetchAllRoutes(region: string): Promise<Route[]> {
     });
     page.forEach((route) => routesById.set(route.route_id, route));
     if (page.length < ROUTE_PAGE_SIZE) {
+      // 신선도 필터는 RouteList에서만 적용한다. 여기서 걸러내면 선택 중인
+      // 제안이 후보 창을 벗어나는 순간 재선택이 돌아 지도와 상세가 튄다.
       return [...routesById.values()].filter(isRebalanceRoute);
     }
     offset += page.length;
@@ -69,7 +72,6 @@ export default function App() {
   const [forecast, setForecast] = useState<ForecastResponse | null>(null);
   const [forecastError, setForecastError] = useState<Error | null>(null);
   const forecastRequestGenerationRef = useRef(0);
-  const [stationFilter, setStationFilter] = useState<StationFilter>("supply_needed");
   const [selectedRegion, setSelectedRegion] = useState<string>(ALL_REGIONS);
   const [regionCenters, setRegionCenters] = useState<DispatchCenter[]>([]);
   const [focusedEvent, setFocusedEvent] = useState<FocusedEvent | null>(null);
@@ -299,7 +301,12 @@ export default function App() {
 
   return (
     <div className="flex h-screen flex-col gap-3 bg-background p-3 text-foreground">
-      <Header />
+      <Header
+        regions={regionCenters}
+        selectedRegion={selectedRegion}
+        stationsUpdatedAt={stationsUpdatedAt}
+        onRegionChange={changeRegion}
+      />
       <div className="flex-1 overflow-hidden">
         <ResizablePanelGroup orientation="vertical" className="rounded-lg border bg-background">
           <ResizablePanel defaultSize={64} minSize={36}>
@@ -311,9 +318,6 @@ export default function App() {
                       <span className="map-panel-title">
                         <h2>{selectedRoute ? "작업 경로 지도" : "대여소 지도"}</h2>
                       </span>
-                      <span className="text-xs text-muted-foreground">
-                        기준 시각 {stationsUpdatedAt ? formatClock(stationsUpdatedAt) : "-"}
-                      </span>
                     </div>
                     <div className="relative min-h-0 flex-1 overflow-hidden rounded-md border">
                       <div className="absolute inset-0 z-0">
@@ -323,7 +327,7 @@ export default function App() {
                           selectedStationId={selectedStationId}
                           stationFocusRequest={stationFocusRequest}
                           onSelect={selectStation}
-                          mapFilterMode={stationFilter}
+                          mapFilterMode="all"
                           regionCenters={regionCenters}
                           selectedRegion={selectedRegion}
                           focusedEvent={focusedEvent}
@@ -342,14 +346,16 @@ export default function App() {
                 <div className="flex h-full min-h-0 min-w-0 flex-col bg-card px-4 py-2">
                   <section className="flex h-full min-h-0 min-w-0 flex-col gap-2">
                     <div className="work-list-header">
-                      <h2>{listMode === "routes" ? "재배치 작업" : "대여소 우선순위"}</h2>
+                      <div className="work-list-title-group">
+                        <h2>{listMode === "routes" ? "재배치 작업" : "대여소 우선순위"}</h2>
+                      </div>
                       <button
                         type="button"
                         className="list-mode-toggle"
                         onClick={() => changeListMode(listMode === "routes" ? "stations" : "routes")}
                       >
                         {listMode === "routes" ? <List size={15} /> : <RouteIcon size={15} />}
-                        {listMode === "routes" ? "대여소 보기" : "작업 보기"}
+                        {listMode === "routes" ? "대여소" : "작업"}
                       </button>
                     </div>
 
@@ -359,13 +365,10 @@ export default function App() {
                       ) : (
                         <RouteList
                           routes={routes}
-                          alerts={filteredAlerts}
                           regions={regionCenters}
-                          selectedRegion={selectedRegion}
                           selectedRouteId={selectedRouteId}
                           busyRouteId={busyRouteId}
                           transitionError={routeTransitionError}
-                          onRegionChange={changeRegion}
                           onSelect={selectRoute}
                           onDispatch={(route) => void transitionRoute(route, "dispatch")}
                           onComplete={(route) => void transitionRoute(route, "complete")}
@@ -376,12 +379,7 @@ export default function App() {
                       ) : (
                         <AlertList
                           alerts={filteredAlerts}
-                          regions={regionCenters}
-                          selectedRegion={selectedRegion}
-                          filter={stationFilter}
                           selectedStationId={selectedStationId}
-                          onRegionChange={changeRegion}
-                          onFilterChange={setStationFilter}
                           onSelect={selectStation}
                         />
                       )}

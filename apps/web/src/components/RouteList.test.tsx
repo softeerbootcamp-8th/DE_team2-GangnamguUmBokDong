@@ -1,33 +1,14 @@
 // @vitest-environment jsdom
 
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
-import type { Alert, DispatchCenter, Route } from "../api";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { DispatchCenter, Route } from "../api";
 import { RouteList } from "./RouteList";
 import { RouteStopRail } from "./RouteStopRail";
 
 const REGIONS: DispatchCenter[] = [
   { region: "강남", lat: 37.5, lon: 127.03 },
   { region: "영남", lat: 37.51, lon: 127.04 },
-];
-
-const ALERTS: Alert[] = [
-  {
-    sta_id: "ST-1",
-    sta_nm: "첫 번째 대여소",
-    action_type: "retrieval_needed",
-    urgency_score: 82,
-    minutes_until_critical: 12,
-    region: "강남",
-  },
-  {
-    sta_id: "ST-2",
-    sta_nm: "두 번째 대여소",
-    action_type: "supply_needed",
-    urgency_score: 75,
-    minutes_until_critical: 20,
-    region: "강남",
-  },
 ];
 
 const ROUTES: Route[] = [
@@ -75,13 +56,10 @@ const ROUTES: Route[] = [
 function renderRouteList(overrides: Partial<React.ComponentProps<typeof RouteList>> = {}) {
   const props: React.ComponentProps<typeof RouteList> = {
     routes: ROUTES,
-    alerts: ALERTS,
     regions: REGIONS,
-    selectedRegion: "all",
     selectedRouteId: null,
     busyRouteId: null,
     transitionError: null,
-    onRegionChange: vi.fn(),
     onSelect: vi.fn(),
     onDispatch: vi.fn(),
     onComplete: vi.fn(),
@@ -92,18 +70,23 @@ function renderRouteList(overrides: Partial<React.ComponentProps<typeof RouteLis
   return props;
 }
 
-afterEach(cleanup);
+beforeEach(() => {
+  vi.useFakeTimers();
+  vi.setSystemTime(new Date("2026-08-21T03:05:00Z"));
+});
+
+afterEach(() => {
+  cleanup();
+  vi.useRealTimers();
+});
 
 describe("RouteList", () => {
-  it("권역 선택과 상태 탭 필터를 연결한다", () => {
-    const props = renderRouteList();
-
-    fireEvent.click(screen.getByRole("button", { name: "영남" }));
-    expect(props.onRegionChange).toHaveBeenCalledWith("영남");
-
-    fireEvent.click(screen.getByRole("tab", { name: "승인 대기" }));
+  it("작업 상태별 2열 목록을 표시한다", () => {
+    renderRouteList();
+    expect(screen.getByRole("heading", { name: /작업 후보/ })).not.toBeNull();
+    expect(screen.getByRole("heading", { name: /작업 현황/ })).not.toBeNull();
     expect(screen.getByText("대여소 2곳 · 회수 2대 · 공급 2대")).not.toBeNull();
-    expect(screen.queryByText("대여소 0곳 · 회수 0대 · 공급 0대")).toBeNull();
+    expect(screen.getByText("대여소 0곳 · 회수 0대 · 공급 0대")).not.toBeNull();
   });
 
   it("작업 상태에 맞는 승인·완료·취소 동작을 호출한다", () => {
@@ -116,6 +99,39 @@ describe("RouteList", () => {
     expect(props.onDispatch).toHaveBeenCalledWith(ROUTES[0]);
     expect(props.onComplete).toHaveBeenCalledWith(ROUTES[1]);
     expect(props.onCancel).toHaveBeenCalledWith(ROUTES[1]);
+  });
+
+  it("최신 제안보다 10분 이상 오래된 미승인 제안은 후보에서 제외한다", () => {
+    renderRouteList({
+      routes: [
+        { ...ROUTES[0], route_id: "recent", proposed_at: "2026-08-21T03:00:00Z" },
+        { ...ROUTES[0], route_id: "stale", proposed_at: "2026-08-21T02:49:00Z" },
+      ],
+    });
+
+    expect(screen.getAllByRole("button", { name: "승인" })).toHaveLength(1);
+  });
+
+  it("진행 중인 작업이 종료된 작업보다 위에 표시된다", () => {
+    renderRouteList({
+      routes: [
+        { ...ROUTES[1], route_id: "closed", status: "completed", proposed_at: "2026-08-21T03:00:00Z" },
+        { ...ROUTES[1], route_id: "running", status: "dispatched", proposed_at: "2026-08-21T01:00:00Z" },
+      ],
+    });
+
+    // 완료 버튼은 dispatched 카드에만 있으므로, 현황 열 첫 카드가 진행 중인지로 확인한다.
+    const operationCards = screen.getByRole("heading", { name: /작업 현황/ })
+      .parentElement!.querySelectorAll("li");
+    expect(operationCards).toHaveLength(2);
+    expect(operationCards[0].querySelector('button[aria-label="완료"]')).not.toBeNull();
+  });
+
+  it("처리 중인 작업은 버튼에 진행 상태를 표시한다", () => {
+    renderRouteList({ busyRouteId: ROUTES[0].route_id });
+
+    expect(screen.getByRole("button", { name: "처리 중" })).not.toBeNull();
+    expect(screen.queryByRole("button", { name: "승인" })).toBeNull();
   });
 });
 

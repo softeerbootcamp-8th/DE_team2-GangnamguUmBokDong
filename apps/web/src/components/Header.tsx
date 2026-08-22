@@ -1,11 +1,20 @@
 import { useEffect, useState } from "react";
 import { api } from "../api";
+import type { DispatchCenter } from "../api";
 import { formatClock, formatIsoTime } from "../format";
-import logo from "../../assets/logo_transparent.png";
+import { RegionTabs } from "./RegionTabs";
+import logo from "../../assets/ubd_logo.png";
 
 const STATUS_POLL_INTERVAL_MS = 30_000;
 
-export function Header() {
+interface Props {
+  regions: DispatchCenter[];
+  selectedRegion: string;
+  stationsUpdatedAt: Date | null;
+  onRegionChange: (region: string) => void;
+}
+
+export function Header({ regions, selectedRegion, stationsUpdatedAt, onRegionChange }: Props) {
   const [now, setNow] = useState(new Date());
   const [predictedAt, setPredictedAt] = useState<string | null>(null);
   const [statusError, setStatusError] = useState(false);
@@ -48,11 +57,17 @@ export function Header() {
       <span className="app-header-title">
         <img src={logo} alt="" className="app-header-logo" />
         <h1>서울특별시 따릉이 재배치 대시보드</h1>
+        <RegionTabs
+          regions={regions}
+          selectedRegion={selectedRegion}
+          onChange={onRegionChange}
+        />
       </span>
       <div className="app-header-times">
         <span>현재 시각 {formatClock(now)}</span>
+        <span>조회 시각 {stationsUpdatedAt ? formatClock(stationsUpdatedAt) : "-"}</span>
         <span className={statusError ? "status-error" : undefined}>
-          예측 시각 {statusError ? "갱신 실패" : predictedAt ? formatIsoTime(predictedAt, { hour: "2-digit", minute: "2-digit" }) : "-"}
+          기준 시각 {statusError ? "갱신 실패" : predictedAt ? formatIsoTime(predictedAt, { hour: "2-digit", minute: "2-digit" }) : "-"}
         </span>
       </div>
     </header>
