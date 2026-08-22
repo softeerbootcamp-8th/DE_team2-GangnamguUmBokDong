@@ -616,7 +616,7 @@ body {
 
 .route-card-main {
   display: flex;
-  align-items: flex-start;
+  align-items: center;
   flex: 1;
   gap: 9px;
   min-width: 0;
@@ -679,12 +679,14 @@ body {
   color: var(--text-primary);
   font-size: 13px;
   font-weight: 650;
+  line-height: 18px;
 }
 
 .route-card-summary,
 .route-card-meta {
   color: var(--text-secondary);
   font-size: 11px;
+  line-height: 16px;
 }
 
 .route-card-summary {
@@ -696,7 +698,6 @@ body {
 .route-card-meta {
   display: flex;
   flex-wrap: wrap;
-  min-height: 26px;
   gap: 8px;
   color: var(--text-muted);
 }

@@ -81,14 +81,14 @@ export function RouteList({
                 {route.region} {routeKind(route)}
               </span>
               <span className="route-card-summary">{routeSummary(route)}</span>
-              <span className="route-card-meta">
-                {estimate && (
+              {estimate && (
+                <span className="route-card-meta">
                   <span title="직선거리×1.25, 도심 18km/h, 정차 4분, 자전거 1대당 30초 기준">
                     <Timer size={11} aria-hidden="true" />
                     예상 {estimate.distanceKm.toFixed(1)}km · 약 {formatRouteDuration(estimate.durationMinutes)}
                   </span>
-                )}
-              </span>
+                </span>
+              )}
             </span>
           </button>
 
