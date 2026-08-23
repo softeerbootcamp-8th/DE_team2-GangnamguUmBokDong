@@ -190,7 +190,7 @@ class TestAllSourcesLoad:
 
         assert config.adapter_params["poi_start"] == 1
         assert config.adapter_params["poi_end"] == 121
-        assert config.adapter_params["concurrency"] == 4
+        assert config.adapter_params["concurrency"] == 8
         assert config.adapter_params["root_key_literal"] is True
         assert config.adapter_params["flatten_forecast"] is True
 
