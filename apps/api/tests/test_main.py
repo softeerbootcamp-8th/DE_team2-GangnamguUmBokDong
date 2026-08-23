@@ -314,11 +314,6 @@ def test_route_query_parameters_and_uuid_are_validated_before_db(
             409,
             "route_transition_conflict",
         ),
-        (
-            queries.RouteTransitionResult.STATION_CONFLICT,
-            409,
-            "route_station_conflict",
-        ),
     ],
 )
 def test_dispatch_maps_not_found_state_and_constraints(
@@ -480,39 +475,32 @@ def test_dismiss_maps_not_found_wrong_status_and_duplicate(
     assert response.json()["detail"] == detail
 
 
-def test_restore_returns_new_proposed_route(
+def test_restore_returns_same_dispatched_route(
     client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """restore가 실제로 복제했으면 새 후보를 201로 돌려준다."""
-    restored = _route("proposed")
-    restored["restored_from_route_id"] = str(ROUTE_ID)
-
-    def _restore(_route_id: UUID, _now: datetime, new_route_id: UUID) -> dict:
-        return {**restored, "route_id": str(new_route_id)}
-
-    monkeypatch.setattr(queries, "restore_route", _restore)
+    """restore는 route ID를 유지하고 취소 작업을 진행 중으로 돌린다."""
+    restored = _route("dispatched")
+    monkeypatch.setattr(queries, "restore_route", lambda _route_id: restored)
 
     response = client.post(f"/routes/{ROUTE_ID}/restore")
 
-    assert response.status_code == 201
-    assert response.json()["route_id"] != str(ROUTE_ID)
-    assert response.json()["status"] == "proposed"
-    assert response.json()["restored_from_route_id"] == str(ROUTE_ID)
+    assert response.status_code == 200
+    assert response.json()["route_id"] == str(ROUTE_ID)
+    assert response.json()["status"] == "dispatched"
+    assert response.json()["cancelled_at"] is None
 
 
-def test_restore_returns_existing_candidate_with_200(
+def test_restore_retry_returns_same_route_with_200(
     client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """이미 대기 중인 후보를 재사용했으면 201이 아니라 200으로 알린다."""
-    reused = _route("proposed")
-    reused["route_id"] = "55555555-5555-4555-8555-555555555555"
-    reused["restored_from_route_id"] = str(ROUTE_ID)
+    """이미 진행 중인 작업의 restore 재요청도 같은 응답을 돌려준다."""
+    restored = _route("dispatched")
     monkeypatch.setattr(
         queries,
         "restore_route",
-        lambda _route_id, _now, _new_route_id: reused,
+        lambda _route_id: restored,
     )
 
     first = client.post(f"/routes/{ROUTE_ID}/restore")
@@ -521,7 +509,7 @@ def test_restore_returns_existing_candidate_with_200(
     assert first.status_code == 200
     assert second.status_code == 200
     assert first.json() == second.json()
-    assert first.json()["route_id"] == "55555555-5555-4555-8555-555555555555"
+    assert first.json()["route_id"] == str(ROUTE_ID)
 
 
 @pytest.mark.parametrize(
@@ -556,7 +544,7 @@ def test_restore_maps_not_found_wrong_status_and_conflicts(
     monkeypatch.setattr(
         queries,
         "restore_route",
-        lambda _route_id, _now, _new_route_id: result,
+        lambda _route_id: result,
     )
 
     response = client.post(f"/routes/{ROUTE_ID}/restore")

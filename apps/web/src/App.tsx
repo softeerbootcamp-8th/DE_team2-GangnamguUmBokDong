@@ -12,6 +12,7 @@ import { RouteStopRail } from "./components/RouteStopRail";
 import { StationMap } from "./components/StationMap";
 import { StockPanel } from "./components/StockPanel";
 import { candidateReferenceMs, isFreshCandidate, isRebalanceRoute, routeTransitionMessage } from "./routeOperations";
+import { updateRoutesWithMotion } from "./routeCardMotion";
 import { ResizableHandle, ResizablePanel, ResizablePanelGroup } from "@/components/ui/resizable";
 
 const POLL_INTERVAL_MS = 15_000;
@@ -60,6 +61,7 @@ export default function App() {
   const [routesError, setRoutesError] = useState(false);
   const [routesInitialized, setRoutesInitialized] = useState(false);
   const routeMutationGenerationRef = useRef(0);
+  const routeViewGenerationRef = useRef(0);
   const [listMode, setListMode] = useState<ListMode>("routes");
   const [selectedRouteId, setSelectedRouteId] = useState<string | null>(null);
   const selectedRouteIdRef = useRef<string | null>(null);
@@ -172,12 +174,12 @@ export default function App() {
         setRoutes(data);
         setRoutesError(false);
         setRoutesInitialized(true);
-        if (data.some((route) => route.route_id === selectedRouteIdRef.current)) return;
         if (listMode !== "routes") {
           selectedRouteIdRef.current = null;
           setSelectedRouteId(null);
           return;
         }
+        if (data.some((route) => route.route_id === selectedRouteIdRef.current)) return;
 
         const nextRoute = preferredRoute(data);
         selectedRouteIdRef.current = nextRoute?.route_id ?? null;
@@ -260,6 +262,7 @@ export default function App() {
 
   function changeRegion(region: string) {
     if (region === selectedRegion) return;
+    routeViewGenerationRef.current += 1;
     setSelectedRegion(region);
     setRouteTransitionError(null);
     selectedRouteIdRef.current = null;
@@ -267,6 +270,7 @@ export default function App() {
   }
 
   function changeListMode(mode: ListMode) {
+    routeViewGenerationRef.current += 1;
     setListMode(mode);
     setRouteTransitionError(null);
     if (mode === "stations") {
@@ -280,6 +284,7 @@ export default function App() {
 
   async function transitionRoute(route: Route, transition: RouteTransition) {
     if (busyRouteId) return;
+    const routeViewGeneration = routeViewGenerationRef.current;
     routeMutationGenerationRef.current += 1;
     setBusyRouteId(route.route_id);
     setRouteTransitionError(null);
@@ -287,7 +292,8 @@ export default function App() {
       if (transition === "dismiss") {
         const dismissed = await api.dismissRoute(route.route_id);
         routeMutationGenerationRef.current += 1;
-        setRoutes((current) => current.filter((item) => item.route_id !== dismissed.route_id));
+        await updateRoutesWithMotion(null, () => setRoutes((current) =>
+          current.filter((item) => item.route_id !== dismissed.route_id)));
         if (selectedRouteIdRef.current === dismissed.route_id) {
           selectedRouteIdRef.current = null;
           setSelectedRouteId(null);
@@ -295,17 +301,17 @@ export default function App() {
         return;
       }
       if (transition === "restore") {
-        // 되돌리기는 원본을 그대로 두고 새 후보를 만든다. 새 후보의 proposed_at이
-        // 현재 시각이라 후보 창을 통과하고, 바로 선택해 지도에 띄운다.
-        // 이미 대기 중인 후보가 있으면 서버가 그 후보를 그대로 돌려준다. 목록에
-        // 있던 항목이면 중복으로 넣지 않고 갱신한다.
+        // 되돌리기는 route ID를 유지한 채 취소된 작업을 다시 진행 중으로 바꾼다.
         const restored = await api.restoreRoute(route.route_id);
         routeMutationGenerationRef.current += 1;
-        setRoutes((current) => [
-          ...current.filter((item) => item.route_id !== restored.route_id),
-          restored,
-        ]);
-        selectRoute(restored);
+        // 요청 중 목록 모드나 권역이 바뀌었다면 이전 화면의 응답을 적용하지 않는다.
+        if (routeViewGeneration !== routeViewGenerationRef.current) return;
+        await updateRoutesWithMotion(restored.route_id, () => {
+          setRoutes((current) => current.map((item) =>
+            item.route_id === restored.route_id ? restored : item));
+          selectedRouteIdRef.current = restored.route_id;
+          setSelectedRouteId(restored.route_id);
+        });
         return;
       }
       const updated = transition === "dispatch"
@@ -314,7 +320,12 @@ export default function App() {
           ? await api.completeRoute(route.route_id)
           : await api.cancelRoute(route.route_id);
       routeMutationGenerationRef.current += 1;
-      setRoutes((current) => current.map((item) => item.route_id === updated.route_id ? updated : item));
+      await updateRoutesWithMotion(updated.route_id, () => {
+        setRoutes((current) => current.map((item) =>
+          item.route_id === updated.route_id ? updated : item));
+        selectedRouteIdRef.current = updated.route_id;
+        setSelectedRouteId(updated.route_id);
+      });
     } catch (error) {
       routeMutationGenerationRef.current += 1;
       setRouteTransitionError(routeTransitionMessage(error));
