@@ -107,6 +107,13 @@ describe("RouteList", () => {
     expect(props.onCancel).toHaveBeenCalledWith(ROUTES[1]);
   });
 
+  it("카드마다 현재 상태에 해당하는 시각만 표시한다", () => {
+    renderRouteList();
+
+    expect(screen.getByText(/기준 .*12:00/)).not.toBeNull();
+    expect(screen.getByText(/승인 .*11:05/)).not.toBeNull();
+  });
+
   it("완료된 작업에는 삭제 버튼만, 취소된 작업에는 되돌리기와 삭제 버튼을 준다", () => {
     renderRouteList({
       routes: [

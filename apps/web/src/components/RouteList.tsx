@@ -29,6 +29,18 @@ const STATUS_META: Record<
   cancelled: { className: "cancelled", icon: CircleX },
 };
 
+const KST_DATE = new Intl.DateTimeFormat("ko-KR", {
+  timeZone: "Asia/Seoul",
+  month: "numeric",
+  day: "numeric",
+});
+const KST_TIME = new Intl.DateTimeFormat("ko-KR", {
+  timeZone: "Asia/Seoul",
+  hour: "2-digit",
+  minute: "2-digit",
+  hourCycle: "h23",
+});
+
 interface Props {
   routes: Route[];
   regions: DispatchCenter[];
@@ -51,6 +63,22 @@ function routeSummary(route: Route): string {
     .filter((stop) => stop.action === "dropoff")
     .reduce((total, stop) => total + stop.bike_cnt, 0);
   return `대여소 ${route.stops.length}곳 · 회수 ${pickup}대 · 공급 ${dropoff}대`;
+}
+
+function routeStateTime(route: Route, now = new Date()): string | null {
+  const stateTime = route.status === "proposed"
+    ? { label: "기준", value: route.proposed_at }
+    : route.status === "dispatched"
+      ? { label: "승인", value: route.dispatched_at }
+      : route.status === "completed"
+        ? { label: "완료", value: route.completed_at }
+        : { label: "취소", value: route.cancelled_at };
+  if (stateTime.value === null) return null;
+  const parsed = new Date(stateTime.value);
+  if (!Number.isFinite(parsed.getTime())) return null;
+  const day = KST_DATE.format(parsed);
+  const dayPrefix = day === KST_DATE.format(now) ? "" : `${day} `;
+  return `${stateTime.label} ${dayPrefix}${KST_TIME.format(parsed)}`;
 }
 
 export function RouteList({
@@ -89,6 +117,7 @@ export function RouteList({
     const isSelected = route.route_id === selectedRouteId;
     const isBusy = route.route_id === busyRouteId;
     const transitionsBlocked = busyRouteId !== null;
+    const stateTime = routeStateTime(route);
     return (
       <li key={route.route_id}>
         <article
@@ -105,12 +134,15 @@ export function RouteList({
                 {route.region} {routeKind(route)}
               </span>
               <span className="route-card-summary">{routeSummary(route)}</span>
-              {estimate && (
+              {(estimate || stateTime) && (
                 <span className="route-card-meta">
-                  <span title="직선거리×1.25, 도심 18km/h, 정차 4분, 자전거 1대당 30초 기준">
-                    <Timer size={11} aria-hidden="true" />
-                    예상 {estimate.distanceKm.toFixed(1)}km · 약 {formatRouteDuration(estimate.durationMinutes)}
-                  </span>
+                  {estimate && (
+                    <span title="직선거리×1.25, 도심 18km/h, 정차 4분, 자전거 1대당 30초 기준">
+                      <Timer size={11} aria-hidden="true" />
+                      예상 {estimate.distanceKm.toFixed(1)}km · 약 {formatRouteDuration(estimate.durationMinutes)}
+                    </span>
+                  )}
+                  {stateTime && <span>{stateTime}</span>}
                 </span>
               )}
             </span>
