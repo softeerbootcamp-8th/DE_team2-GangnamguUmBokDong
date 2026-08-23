@@ -394,6 +394,7 @@ def _train_phase_with_checkpoint(
         contract,
         config.TRAIN_CHECKPOINT_INTERVAL_ROUNDS,
         config.TRAIN_RESUME_FROM_CHECKPOINT,
+        compatible_code_fingerprints=config.TRAIN_RESUME_COMPATIBLE_CODE_FINGERPRINTS,
     )
     resume_state = manager.load(final_model_key)
     if resume_state.phase_completed:

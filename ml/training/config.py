@@ -269,6 +269,14 @@ if TRAIN_CHECKPOINT_INTERVAL_ROUNDS < 0:
     )
 TRAIN_RESUME_FROM_CHECKPOINT = _bool_env("TRAIN_RESUME_FROM_CHECKPOINT")
 TRAIN_CHECKPOINT_ENABLED = TRAIN_CHECKPOINT_INTERVAL_ROUNDS > 0 or TRAIN_RESUME_FROM_CHECKPOINT
+# 재개 구현 자체의 수정처럼 데이터/모델 의미를 바꾸지 않는 배포에서만 이전
+# fingerprint를 쉼표로 명시한다. checkpoint manager가 code_fingerprint를 제외한
+# 계약 전체가 byte-equivalent인지 다시 확인하므로 일반적인 코드 변경 우회 수단이 아니다.
+TRAIN_RESUME_COMPATIBLE_CODE_FINGERPRINTS = frozenset(
+    value.strip()
+    for value in os.environ.get("TRAIN_RESUME_COMPATIBLE_CODE_FINGERPRINTS", "").split(",")
+    if value.strip()
+)
 
 # MLflow(ops/compose의 mlflow 서비스, ml_core.mlflow_tracking이 접속을 담당)에
 # 이 실험 이름으로 run을 남긴다 — divisor/horizon 조합을 바꿔가며 여러 번 학습을
