@@ -73,7 +73,7 @@
 | 위와 동일 | `GET /stations/{sta_id}` | station 존재·활성·fresh stock | 대여소명, 주소, 현재 자전거 수, 갱신 시각 |
 | `station_demand_forecast` | `GET /status` | 전체 행이 하나의 공통 base인지, base가 10분 이내인지 | 헤더의 `예측 시각` |
 | `station_demand_forecast` + `station_stock` | `GET /stations/{sta_id}/forecast` | station별 정확히 12시간, 공통 base, 미래 target, 같은 base의 fresh stock을 확인하고 누적 대여·반납으로 예측 재고 계산 | 대여·반납 예측 그래프, 재고 예측 그래프 |
-| `weather_forecast` + `station.weather_grid_id` | `GET /stations/{sta_id}/weather` | 다음 정시부터 정확히 12행인지, 각 행이 45분 freshness 안인지 확인 | 대여소 상세의 주변 날씨 |
+| `weather_forecast` + `station.weather_grid_id` | `GET /stations/{sta_id}/weather` | 다음 정시부터 정확히 12행인지, 각 행의 발표 시각(`base_dttm`)이 제품별 freshness(초단기 2시간, 단기 4시간) 안인지 확인 | 대여소 상세의 주변 날씨 |
 | `event` + `station` PostGIS geometry | `GET /stations/{sta_id}/events` | 반경 1.5km, 종료되지 않은 행사, 36시간 freshness, 거리 계산 | 주변 행사 탭과 지도 포커스 |
 | `station_urgency` + station/stock/center | `GET /alerts` | urgency와 stock anchor 일치, 10분 freshness, 최신 correction 순서 확인 | 작업 우선순위 목록과 부족/회수 지도 필터 |
 | `rebalance_route` + `rebalance_route_stop` | `GET /routes` | 센터·상태별 필터와 stop 집계 | 재배치 작업 경로 |
@@ -87,7 +87,7 @@
 | inference 또는 finalize 실패 | 새 Gold release는 게시되지 않고 이전 정상 release가 남음 | 이전 demand/stock base가 10분을 넘으면 `/status`·`/forecast`는 503 또는 조회 불가 | `예측 시각 갱신 실패`; 프론트는 이전 예측을 지움 |
 | urgency 실패 | 이전 urgency가 남음 | anchor/freshness 조건을 만족하지 않으면 `/alerts`가 빈 목록 | 작업 우선순위가 비거나 갱신 실패 표시 |
 | station polling/API 자체 실패 | 브라우저에는 이전 station 상태가 있었음 | 네트워크/서버 오류 | 현재 프론트는 station·선택·예측·상세를 모두 지움 |
-| 날씨가 45분 이상 오래됨 | 이전 weather projection은 RDS에 남음 | `/weather`가 503 `weather_not_ready` | 날씨 패널이 갱신 중 상태로 바뀜 |
+| 날씨 발표가 제품별 허용 age(초단기 2시간, 단기 4시간)보다 오래됨 | 이전 weather projection은 RDS에 남음 | `/weather`가 503 `weather_not_ready` | 날씨 패널이 갱신 중 상태로 바뀜 |
 
 현재 화면은 오래된 운영 판단을 막기 위해 fail-closed로 동작한다. 즉 RDS의 마지막 정상 데이터가 물리적으로 삭제된 것은 아니어도, freshness를 넘으면 API가 제공하지 않고 프론트도 이전 성공값을 유지하지 않는다.
 

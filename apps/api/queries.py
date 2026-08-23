@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -15,11 +16,21 @@ from psycopg.rows import dict_row
 
 STOCK_FRESHNESS = timedelta(minutes=10)
 DEMAND_FRESHNESS = timedelta(minutes=10)
-WEATHER_FRESHNESS = timedelta(minutes=45)
+ULTRA_SHORT_FRESHNESS = timedelta(hours=2)
+SHORT_TERM_FRESHNESS = timedelta(hours=4)
 EVENT_FRESHNESS = timedelta(hours=36)
 FUTURE_TOLERANCE = timedelta(minutes=5)
 FORECAST_HOUR_COUNT = 12
 NEARBY_EVENT_RADIUS_KM = 1.5
+# 날씨 freshness는 DB 기록 시각이 아니라 기상청 발표 시각(base_dttm)으로 판정한다.
+# 게시 파이프라인은 값이 바뀐 행만 다시 쓰므로 DB 기록 시각은 발표 주기보다 오래
+# 멈춰 있을 수 있다. 임계값은 각 제품의 발표 주기(초단기 1시간, 단기 3시간)에
+# 한 주기만큼의 여유를 더한 값이다.
+WEATHER_FRESHNESS_BY_PRODUCT = {
+    "ultra_short": ULTRA_SHORT_FRESHNESS,
+    "short_term": SHORT_TERM_FRESHNESS,
+}
+_WEATHER_LINEAGE_KEYS = frozenset({"base_dttm", "source_product_cd"})
 
 
 class ForecastState(StrEnum):
@@ -65,6 +76,7 @@ class RouteTransitionResult(StrEnum):
     WRONG_STATUS = "wrong_status"
     CONSTRAINT_CONFLICT = "constraint_conflict"
     ALREADY_DISMISSED = "already_dismissed"
+    STATION_CONFLICT = "station_conflict"
 
 
 def now_utc() -> datetime:
@@ -375,7 +387,8 @@ def _read_weather_snapshot(
                    wf.precipitation_amount,
                    wf.humidity,
                    wf.wind_speed,
-                   wf.updated_dttm
+                   wf.source_product_cd,
+                   wf.base_dttm
               FROM station AS s
               JOIN weather_forecast AS wf USING (weather_grid_id)
              CROSS JOIN horizon AS h
@@ -408,17 +421,23 @@ def fetch_weather(
     if (
         len(rows) != hours
         or [row["forecast_dttm"] for row in rows] != expected_targets
-        or any(
-            not _is_fresh(row["updated_dttm"], now, WEATHER_FRESHNESS) for row in rows
-        )
+        or any(not _is_forecast_issue_fresh(row, now) for row in rows)
     ):
         return WeatherResult(WeatherState.WEATHER_NOT_READY)
 
     points = tuple(
-        {key: value for key, value in row.items() if key != "updated_dttm"}
+        {key: value for key, value in row.items() if key not in _WEATHER_LINEAGE_KEYS}
         for row in rows
     )
     return WeatherResult(WeatherState.READY, points)
+
+
+def _is_forecast_issue_fresh(row: dict[str, Any], now: datetime) -> bool:
+    """예보 행의 발표 시각이 그 제품의 허용 age 안인지 확인한다."""
+    max_age = WEATHER_FRESHNESS_BY_PRODUCT.get(row["source_product_cd"])
+    if max_age is None:
+        return False
+    return _is_fresh(row["base_dttm"], now, max_age)
 
 
 def fetch_regions() -> list[dict[str, Any]]:
@@ -564,6 +583,34 @@ def fetch_route(route_id: UUID) -> dict[str, Any] | None:
     )
 
 
+_STATION_CONFLICT_SQL = """
+SELECT count(DISTINCT candidate_stop.sta_id) AS conflict_cnt
+  FROM rebalance_route_stop AS candidate_stop
+  JOIN rebalance_route_stop AS active_stop USING (sta_id)
+  JOIN rebalance_route AS active_route
+       ON active_route.route_id = active_stop.route_id
+ WHERE candidate_stop.route_id = %(route_id)s
+   AND active_route.route_id <> %(route_id)s
+   AND active_route.route_status_cd = 'dispatched'
+"""
+
+
+def _station_conflict_guard(
+    cursor: Cursor[dict[str, Any]],
+    route_id: UUID,
+) -> RouteTransitionResult | None:
+    """진행 중 경로와 대여소가 겹치면 STATION_CONFLICT를 반환한다.
+
+    같은 대여소에 트럭 두 대가 배정되는 것을 막는다. 자기 경로는 이미 dispatched로
+    바뀐 뒤라 제외한다.
+    """
+    cursor.execute(_STATION_CONFLICT_SQL, {"route_id": route_id})
+    row = cursor.fetchone()
+    if row is not None and row["conflict_cnt"] > 0:
+        return RouteTransitionResult.STATION_CONFLICT
+    return None
+
+
 def _transition_route(
     route_id: UUID,
     now: datetime,
@@ -571,8 +618,15 @@ def _transition_route(
     expected_status: str,
     next_status: str,
     timestamp_column: str,
+    guard: Callable[[Cursor[dict[str, Any]], UUID], RouteTransitionResult | None]
+    | None = None,
 ) -> dict[str, Any] | RouteTransitionResult:
-    """guarded update와 aggregate 재조회를 같은 transaction에서 수행한다."""
+    """guarded update와 aggregate 재조회를 같은 transaction에서 수행한다.
+
+    guard는 UPDATE 뒤에 실행한다. rebalance_route 쓰기가 statement trigger로
+    route operation advisory lock을 잡으므로, UPDATE 전에 읽으면 lock 없이 읽어
+    동시 전이가 서로를 놓칠 수 있다.
+    """
     try:
         with (
             get_connection() as connection,
@@ -602,6 +656,11 @@ def _transition_route(
                 if cursor.fetchone() is None:
                     return RouteTransitionResult.NOT_FOUND
                 return RouteTransitionResult.WRONG_STATUS
+            if guard is not None:
+                blocked = guard(cursor, route_id)
+                if blocked is not None:
+                    connection.rollback()
+                    return blocked
             route = _fetch_route_with_cursor(cursor, route_id)
             if route is None:
                 raise RuntimeError("상태 전이 직후 route aggregate를 찾을 수 없습니다.")
@@ -621,6 +680,7 @@ def dispatch_route(
         expected_status="proposed",
         next_status="dispatched",
         timestamp_column="dispatched_dttm",
+        guard=_station_conflict_guard,
     )
 
 

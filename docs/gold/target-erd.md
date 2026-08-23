@@ -292,8 +292,8 @@ publisher는 topology shared lock 안에서 활성 격자 fingerprint와 입력 
 같은 Gold 테이블에 독립 upsert하거나 일부 격자만 먼저 노출하는 방식은 금지한다.
 
 대여소의 향후 12시간 날씨 조회는 이미 물리화한 격자 FK를 사용한다. API는 미래 12행이
-아니거나 반환 12행의 `min(updated_dttm)`이 `now-45분..now+5분` 범위 밖이면 일부 결과 대신
-`503 weather_not_ready`를 반환한다.
+아니거나 어느 행의 `base_dttm`이 제품별 허용 age(초단기예보 2시간, 단기예보 4시간)
+또는 `now+5분`을 벗어나면 일부 결과 대신 `503 weather_not_ready`를 반환한다.
 
 ```sql
 WITH horizon AS (
@@ -307,7 +307,9 @@ SELECT wf.forecast_dttm,
        wf.precipitation_prob,
        wf.precipitation_amount,
        wf.humidity,
-       wf.wind_speed
+       wf.wind_speed,
+       wf.source_product_cd,
+       wf.base_dttm
   FROM station AS s
   JOIN weather_forecast AS wf USING (weather_grid_id)
  CROSS JOIN horizon AS h

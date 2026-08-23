@@ -11,7 +11,7 @@ import { RouteList } from "./components/RouteList";
 import { RouteStopRail } from "./components/RouteStopRail";
 import { StationMap } from "./components/StationMap";
 import { StockPanel } from "./components/StockPanel";
-import { candidateReferenceMs, isFreshCandidate, isRebalanceRoute } from "./routeOperations";
+import { candidateReferenceMs, isFreshCandidate, isRebalanceRoute, routeTransitionMessage } from "./routeOperations";
 import { ResizableHandle, ResizablePanel, ResizablePanelGroup } from "@/components/ui/resizable";
 
 const POLL_INTERVAL_MS = 15_000;
@@ -317,7 +317,7 @@ export default function App() {
       setRoutes((current) => current.map((item) => item.route_id === updated.route_id ? updated : item));
     } catch (error) {
       routeMutationGenerationRef.current += 1;
-      setRouteTransitionError(error instanceof Error ? error.message : "작업 상태를 변경하지 못했습니다.");
+      setRouteTransitionError(routeTransitionMessage(error));
     } finally {
       setBusyRouteId(null);
     }

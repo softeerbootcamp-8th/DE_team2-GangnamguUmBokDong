@@ -193,6 +193,8 @@ def _route_transition_response(
         )
     if result is queries.RouteTransitionResult.ALREADY_DISMISSED:
         raise HTTPException(status_code=409, detail=f"route {route_id} is already dismissed")
+    if result is queries.RouteTransitionResult.STATION_CONFLICT:
+        raise HTTPException(status_code=409, detail="route_station_conflict")
     if result is queries.RouteTransitionResult.CONSTRAINT_CONFLICT:
         raise HTTPException(status_code=409, detail=conflict_detail)
     return result

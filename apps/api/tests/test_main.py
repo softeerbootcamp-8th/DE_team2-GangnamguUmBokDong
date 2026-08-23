@@ -314,6 +314,11 @@ def test_route_query_parameters_and_uuid_are_validated_before_db(
             409,
             "route_transition_conflict",
         ),
+        (
+            queries.RouteTransitionResult.STATION_CONFLICT,
+            409,
+            "route_station_conflict",
+        ),
     ],
 )
 def test_dispatch_maps_not_found_state_and_constraints(
