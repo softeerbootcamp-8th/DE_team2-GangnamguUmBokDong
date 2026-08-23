@@ -56,11 +56,17 @@ class ResumeAwareEarlyStopping:
     @staticmethod
     def _with_metric_value(item: Any, value: float) -> Any:
         """LightGBM evaluation tuple의 metric 값만 교체한다."""
-        if hasattr(item, "_replace"):
-            return item._replace(metric_value=value)
-        values = list(item)
-        values[2] = value
-        return type(item)(values) if type(item) is tuple else type(item)(*values)
+        if hasattr(item, "_fields") and hasattr(item, "dataset_name"):
+            fields = {
+                "dataset_name": item.dataset_name,
+                "metric_name": item.metric_name,
+                "metric_value": value,
+                "maximize": item.maximize,
+            }
+            if "metric_std_dev" in item._fields:
+                fields["metric_std_dev"] = item.metric_std_dev
+            return type(item)(**fields)
+        return (item[0], item[1], value, item[3])
 
     def _initialize(self, item: Any, iteration: int) -> None:
         """첫 evaluation 또는 저장된 상태에서 최고 점수를 초기화한다."""
@@ -164,6 +170,7 @@ class TrainingCheckpointManager:
         contract: dict[str, Any],
         interval_rounds: int,
         resume_enabled: bool,
+        compatible_code_fingerprints: frozenset[str] = frozenset(),
     ) -> None:
         """checkpoint 경로와 현재 계약 fingerprint를 초기화한다."""
         self.models_prefix = models_prefix.rstrip("/")
@@ -173,6 +180,7 @@ class TrainingCheckpointManager:
         self.contract_sha256 = canonical_sha256(contract)
         self.interval_rounds = interval_rounds
         self.resume_enabled = resume_enabled
+        self.compatible_code_fingerprints = compatible_code_fingerprints
         self.root = f"{self.models_prefix}/_checkpoints/{model_name}/{phase_name}"
         self.state_key = f"{self.root}/state.json"
         self.latest_iteration = 0
@@ -192,12 +200,43 @@ class TrainingCheckpointManager:
                 f"schema={state.get('schema_version')!r}"
             )
         observed = state.get("contract_sha256")
-        if observed != self.contract_sha256:
+        if observed != self.contract_sha256 and not self._is_explicitly_compatible(state):
+            observed_contract = state.get("contract")
+            observed_code_fingerprint = (
+                observed_contract.get("code_fingerprint")
+                if isinstance(observed_contract, dict)
+                else None
+            )
             raise CheckpointContractMismatchError(
                 "checkpoint 계약이 현재 학습과 다릅니다: "
-                f"key={self.state_key}, expected={self.contract_sha256}, observed={observed}"
+                f"key={self.state_key}, expected={self.contract_sha256}, observed={observed}, "
+                f"observed_code_fingerprint={observed_code_fingerprint!r}, "
+                f"compatible_code_fingerprints={sorted(self.compatible_code_fingerprints)!r}"
             )
         return state
+
+    def _is_explicitly_compatible(self, state: dict[str, Any]) -> bool:
+        """명시 허용한 이전 코드이며 나머지 계약이 같을 때만 재개를 허용한다."""
+        observed_contract = state.get("contract")
+        if not isinstance(observed_contract, dict):
+            return False
+        observed_fingerprint = observed_contract.get("code_fingerprint")
+        if observed_fingerprint not in self.compatible_code_fingerprints:
+            return False
+        expected_without_code = {
+            key: value for key, value in self.contract.items() if key != "code_fingerprint"
+        }
+        observed_without_code = {
+            key: value for key, value in observed_contract.items() if key != "code_fingerprint"
+        }
+        if canonical_sha256(observed_without_code) != canonical_sha256(expected_without_code):
+            return False
+        print(
+            "checkpoint의 이전 코드 fingerprint를 명시적 호환 목록으로 재사용합니다: "
+            f"key={self.state_key}, fingerprint={observed_fingerprint}",
+            flush=True,
+        )
+        return True
 
     def load(self, final_model_key: str) -> ResumeState:
         """마지막 정상 checkpoint 또는 완료된 최종 Booster를 로드한다."""

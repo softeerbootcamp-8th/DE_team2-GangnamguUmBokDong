@@ -1,7 +1,14 @@
 import { Check, CheckCheck, CircleX, Clock3, Loader2, Play, Route as RouteIcon, Timer } from "lucide-react";
 import { useMemo } from "react";
 import type { DispatchCenter, Route, RouteStatus } from "../api";
-import { estimateRoute, formatRouteDuration, groupWorkRoutes, routeKind } from "../routeOperations";
+import {
+  buildStationConflicts,
+  describeStationConflict,
+  estimateRoute,
+  formatRouteDuration,
+  groupWorkRoutes,
+  routeKind,
+} from "../routeOperations";
 
 const STATUS_META: Record<
   RouteStatus,
@@ -55,6 +62,7 @@ export function RouteList({
     routes.forEach((route) => byRouteId.set(route.route_id, estimateRoute(route, regions)));
     return byRouteId;
   }, [routes, regions]);
+  const stationConflicts = useMemo(() => buildStationConflicts(routes), [routes]);
 
   function renderRouteCard(route: Route) {
     const estimate = estimates.get(route.route_id) ?? null;
@@ -63,6 +71,10 @@ export function RouteList({
     const isSelected = route.route_id === selectedRouteId;
     const isBusy = route.route_id === busyRouteId;
     const transitionsBlocked = busyRouteId !== null;
+    // 진행 중 작업이 점유한 대여소를 다시 배차하지 않도록 승인만 막는다.
+    // 카드 선택은 남겨 둔다 — 운영자가 지도에서 어느 대여소가 겹치는지 봐야 한다.
+    const conflict = stationConflicts.get(route.route_id) ?? null;
+    const conflictReason = conflict === null ? null : describeStationConflict(conflict);
     const hasActions = route.status === "proposed" || route.status === "dispatched";
     return (
       <li key={route.route_id}>
@@ -80,6 +92,9 @@ export function RouteList({
                 {route.region} {routeKind(route)}
               </span>
               <span className="route-card-summary">{routeSummary(route)}</span>
+              {conflictReason && (
+                <span className="route-card-conflict">{conflictReason}</span>
+              )}
               {estimate && (
                 <span className="route-card-meta">
                   <span title="직선거리×1.25, 도심 18km/h, 정차 4분, 자전거 1대당 30초 기준">
@@ -96,10 +111,10 @@ export function RouteList({
               <button
                 type="button"
                 className={`route-action primary icon-only${isBusy ? " is-busy" : ""}`}
-                disabled={transitionsBlocked}
+                disabled={transitionsBlocked || conflictReason !== null}
                 onClick={() => onDispatch(route)}
-                aria-label={isBusy ? "처리 중" : "승인"}
-                title={isBusy ? "승인 처리 중" : "작업 승인"}
+                aria-label={isBusy ? "처리 중" : conflictReason ? "승인 불가" : "승인"}
+                title={isBusy ? "승인 처리 중" : (conflictReason ?? "작업 승인")}
               >
                 {isBusy
                   ? <Loader2 size={14} aria-hidden="true" className="route-action-spinner" />

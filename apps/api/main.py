@@ -190,6 +190,8 @@ def _route_transition_response(
             status_code=409,
             detail=f"route {route_id} is not in {expected_status} status",
         )
+    if result is queries.RouteTransitionResult.STATION_CONFLICT:
+        raise HTTPException(status_code=409, detail="route_station_conflict")
     if result is queries.RouteTransitionResult.CONSTRAINT_CONFLICT:
         raise HTTPException(status_code=409, detail="route_transition_conflict")
     return result
