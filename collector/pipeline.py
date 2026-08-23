@@ -603,16 +603,39 @@ def execute_window(
         # 축소·재정렬돼 옛 Bronze payload와 새 total이 섞인 상태를 완결로 오인한다.
         # 초과분을 임의로 자를 근거도 없으므로 Silver를 쓰지 않고 force 재수집이
         # 필요한 명시적 fetch 실패로 남긴다.
-        logger.error(
-            "stage=bronze_written status=failed failure_reason=fetch_error "
-            f"reason=fetched_exceeds_expected parts={parts_summary} "
-            f"rows={fetched_rows} expected={expected_total}"
+        #
+        # 단, 행이 쌓이기만 하는 소스는 진행 중인 window를 조회할 때 API가 같은
+        # 본문 안에서 list_total_count보다 많은 row를 주는 일이 있다(실측: 대여이력
+        # rows=989 expected=988). 그 초과분은 잘린 데이터가 아니라 카운트 계산과
+        # 직렬화 사이에 들어온 실제 레코드이므로, max_overfetch_ratio를 연 소스는
+        # 경고만 남기고 통과시킨다. 페이지 중복 병합 같은 진짜 사고는 최소 +100%라
+        # 작은 허용치로도 계속 걸린다.
+        allowed_total = expected_total * (1 + config.quality.max_overfetch_ratio)
+        if fetched_rows > allowed_total:
+            logger.error(
+                "stage=bronze_written status=failed failure_reason=fetch_error "
+                f"reason=fetched_exceeds_expected parts={parts_summary} "
+                f"rows={fetched_rows} expected={expected_total} "
+                f"allowed={allowed_total:.0f}"
+            )
+            return _finish(
+                failure_reason=FailureReason.FETCH_ERROR,
+                missing=missing,
+                counts=Counts(expected=expected_total, fetched=fetched_rows),
+            )
+        logger.warning(
+            f"stage=bronze_written reason=fetched_exceeds_expected_within_tolerance "
+            f"parts={parts_summary} rows={fetched_rows} expected={expected_total} "
+            f"allowed={allowed_total:.0f}"
         )
-        return _finish(
-            failure_reason=FailureReason.FETCH_ERROR,
-            missing=missing,
-            counts=Counts(expected=expected_total, fetched=fetched_rows),
+        # 허용치 안의 초과는 "카운트가 뒤처졌다"고 판정한 것이므로, 실제 행 수를 이
+        # window의 cardinality로 확정한다. Gold의 SUCCEEDED 계약이 expected==fetched를
+        # 요구하기도 한다(core.source_snapshot._validate_succeeded).
+        expected_total = fetched_rows
+        ratio = _missing_ratio(
+            len(missing_keys), expected_total, fetched_rows, len(chunks)
         )
+        missing = _build_missing(missing_keys, expected_total, fetched_rows)
 
     if ratio > config.quality.max_missing_ratio:
         # 완결도 게이트 초과 — silver를 쓰지 않고 fetch_error로 끝낸다. stage는
