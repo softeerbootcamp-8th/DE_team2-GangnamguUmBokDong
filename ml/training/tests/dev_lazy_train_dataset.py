@@ -645,3 +645,136 @@ def test_apply_adaptive_anchor_filter_applies_holiday_peak_hours_on_weekday_holi
     assert len(selected_minutes) == 50
 
 
+
+
+def test_resumed_dataset_reused_by_next_phase_has_no_leftover_init_score():
+    """재개한 phase의 init score가 같은 Dataset을 재사용하는 다음 phase로 새지 않는다.
+
+    `train_common.train_target()`은 메모리 때문에 train/valid Dataset 하나를 q10/q50/q90
+    (반납 모델은 poisson까지) 여러 phase에서 돌려쓴다. LightGBM은 phase가 바뀔 때
+    `_set_predictor(None)` → `_set_init_score_by_predictor(None, ...)`로 native field를
+    0으로 되돌리는데, 그 분기는 Python-side `self.init_score`가 살아 있을 때만 동작한다.
+    재개 경로가 메모리 때문에 그 사본을 비우므로 직접 되돌리지 않으면 앞 phase의 raw
+    score가 다음 phase의 offset으로 남는다.
+    """
+    path = "processed_v2/test/lazy_resume_phase_reuse"
+    rng = np.random.default_rng(31)
+    resume_dates = ["2026-04-01", "2026-04-02"]
+    for day_index, (date_str, row_count) in enumerate(
+        zip(resume_dates, [80, 110], strict=True)
+    ):
+        x1 = rng.normal(loc=day_index, size=row_count).astype(np.float32)
+        x2 = rng.normal(size=row_count).astype(np.float32)
+        frame = pd.DataFrame({
+            "station_no": rng.integers(1, 5, size=row_count, dtype=np.int16),
+            "x1": x1,
+            "x2": x2,
+            "y": np.maximum(0, np.rint(6 + 2.0 * x1 - 0.5 * x2)).astype(np.int16),
+        })
+        s3_io.write_parquet(frame, f"{path}/date={date_str}/part-0000.parquet")
+
+    base = {
+        "learning_rate": 0.08,
+        "num_leaves": 7,
+        "min_data_in_leaf": 5,
+        "verbosity": -1,
+        "num_threads": 1,
+        "seed": 37,
+    }
+    poisson_params = {**base, "objective": "poisson", "metric": "poisson"}
+    # 다음 phase — train_common의 q10에 해당한다(offset 해석이 없는 objective).
+    quantile_params = {**base, "objective": "quantile", "alpha": 0.1, "metric": "quantile"}
+
+    def dataset(keep_raw_data: bool):
+        return build_lazy_dataset(
+            path,
+            resume_dates,
+            FEATURE_COLUMNS,
+            STATION_DTYPE,
+            None,
+            "y",
+            None,
+            ChunkCache(),
+            dataset_params=base,
+            keep_raw_data=keep_raw_data,
+        )[0]
+
+    checkpoint = lgb.train(poisson_params, dataset(True), num_boost_round=4)
+
+    # 한 Dataset을 poisson 재개 → quantile 순으로 돌려쓴다(운영 재사용 패턴).
+    shared_set = dataset(True)
+    lgb.train(poisson_params, shared_set, num_boost_round=3, init_model=checkpoint)
+    after_resume = lgb.train(quantile_params, shared_set, num_boost_round=5)
+
+    # 재개를 거치지 않은 깨끗한 Dataset의 같은 quantile phase.
+    clean = lgb.train(quantile_params, dataset(True), num_boost_round=5)
+
+    assert after_resume.dump_model()["tree_info"] == clean.dump_model()["tree_info"]
+    feature_frame = s3_io.read_parquet(path, columns=FEATURE_COLUMNS, dates=resume_dates)
+    feature_arr = np.column_stack([
+        feature_frame["station_no"].astype(STATION_DTYPE).cat.codes.to_numpy(dtype=np.float64),
+        feature_frame["x1"].to_numpy(dtype=np.float64),
+        feature_frame["x2"].to_numpy(dtype=np.float64),
+    ])
+    np.testing.assert_allclose(
+        after_resume.predict(feature_arr),
+        clean.predict(feature_arr),
+        rtol=1e-12,
+        atol=1e-12,
+    )
+
+
+def test_resumed_dataset_reuse_restores_original_exposure_offset():
+    """exposure offset이 있는 Dataset을 재개 후 재사용하면 원래 offset으로 되돌아간다."""
+    path = "processed_v2/test/lazy_resume_reuse_exposure"
+    rng = np.random.default_rng(41)
+    resume_dates = ["2026-05-01", "2026-05-02"]
+    for day_index, (date_str, row_count) in enumerate(
+        zip(resume_dates, [95, 105], strict=True)
+    ):
+        x1 = rng.normal(loc=day_index, size=row_count).astype(np.float32)
+        x2 = rng.normal(size=row_count).astype(np.float32)
+        exposure = rng.uniform(0.2, 1.0, size=row_count).astype(np.float32)
+        frame = pd.DataFrame({
+            "station_no": rng.integers(1, 5, size=row_count, dtype=np.int16),
+            "x1": x1,
+            "x2": x2,
+            "y": rng.poisson(exposure * np.exp(1.0 + 0.2 * x1)).astype(np.int16),
+            "exposure": exposure,
+        })
+        s3_io.write_parquet(frame, f"{path}/date={date_str}/part-0000.parquet")
+
+    params = {
+        "objective": "poisson",
+        "metric": "poisson",
+        "learning_rate": 0.08,
+        "num_leaves": 7,
+        "min_data_in_leaf": 5,
+        "verbosity": -1,
+        "num_threads": 1,
+        "seed": 43,
+    }
+
+    def dataset():
+        return build_lazy_dataset(
+            path,
+            resume_dates,
+            FEATURE_COLUMNS,
+            STATION_DTYPE,
+            None,
+            "y",
+            "exposure",
+            ChunkCache(),
+            dataset_params=params,
+            keep_raw_data=True,
+        )[0]
+
+    checkpoint = lgb.train(params, dataset(), num_boost_round=4)
+
+    shared_set = dataset()
+    lgb.train(params, shared_set, num_boost_round=3, init_model=checkpoint)
+    # 재개 init score가 걷히고 log(exposure) offset만 남아야 처음부터 학습한 것과 같다.
+    after_resume = lgb.train(params, shared_set, num_boost_round=6)
+    clean = lgb.train(params, dataset(), num_boost_round=6)
+
+    assert after_resume.dump_model()["tree_info"] == clean.dump_model()["tree_info"]

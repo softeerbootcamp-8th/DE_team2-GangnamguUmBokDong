@@ -406,9 +406,12 @@ class LazySequenceDataset(lgb.Dataset):
     """
 
     _resume_base_init_score: np.ndarray | None = None
+    _resume_init_score_attached: bool = False
 
     def _set_init_score_by_predictor(self, predictor, data, used_indices):
         """lazy Sequence 목록은 전체 결합 없이 predictor init score를 설정한다."""
+        if predictor is None and used_indices is None and self._resume_init_score_attached:
+            return self._reset_resume_init_score()
         if predictor is None or used_indices is not None or not (
             isinstance(data, list)
             and data
@@ -455,11 +458,33 @@ class LazySequenceDataset(lgb.Dataset):
                     "재개 init score 행 수가 Dataset과 다릅니다: "
                     f"predictions={offset:,}, dataset={num_data:,}"
                 )
-            self.set_init_score(init_score)
+            # `set_init_score()`는 native field에 쓴 뒤 `self.init_score`에 전체 길이
+            # float64 사본을 되읽는다(800M행이면 ~6.4GB). 여기는 lgb.train() 안이라
+            # train/valid native storage가 이미 둘 다 상주한 시점이므로 그 사본이
+            # 곧바로 peak를 밀어올린다. native field에만 직접 쓴다.
+            self.set_field("init_score", init_score)
             self.init_score = None
+            self._resume_init_score_attached = True
             return self
         finally:
             del init_score
+
+    def _reset_resume_init_score(self):
+        """phase가 바뀌어 predictor가 떨어질 때 재개용 init score를 걷어낸다.
+
+        LightGBM 기본 구현은 ``self.init_score``가 살아 있을 때만 native field를
+        0으로 덮는다(`Dataset._set_init_score_by_predictor`의 ``elif`` 분기). 위에서
+        메모리 때문에 Python 사본을 비워두므로 그 경로가 그대로 통과해버리고,
+        ``train_set``/``valid_set``을 phase 간 재사용하는 `train_common.train_target`
+        에서는 앞 phase의 raw score가 다음 phase의 offset으로 남는다(예: q10을
+        체크포인트에서 재개하면 q50/q90이 q10 예측 위에서 학습된다). 재사용 전에
+        직접 원상복구한다 — 원래 offset(대여 poisson의 log(exposure))이 있으면 그
+        값으로, 없으면 field 자체를 비운다.
+        """
+        self.set_field("init_score", self._resume_base_init_score)
+        self.init_score = None
+        self._resume_init_score_attached = False
+        return self
 
 
 def _stream_prepass_arrays(
