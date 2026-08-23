@@ -15,6 +15,8 @@
 
 from __future__ import annotations
 
+from datetime import timedelta
+
 import pendulum
 from airflow.providers.standard.operators.empty import EmptyOperator
 from airflow.task.trigger_rule import TriggerRule
@@ -54,6 +56,13 @@ from airflow import DAG
 _ULTRA_WEATHER_SOURCES = (WEATHER_10MIN_SOURCE, WEATHER_ULTRA_SHORT_FORECAST_SOURCE)
 _FULL_WEATHER_SOURCES = _ULTRA_WEATHER_SOURCES + (WEATHER_3H_SOURCE,)
 
+# 구 wait_for_weather_manifests 센서가 최대 30초만 기다리고 soft_fail로 넘어가던 것과
+# 같은 상한이다. 재시도 없이(retries=0) 30초 안에 못 끝나면 바로 실패시켜서, 날씨
+# collector가 자기 재시도 정책(기본 240초 x 3회)대로 붙잡고 있느라 뒤의
+# prepare_serving_plan~publish_rebalance_route 체인 전체를 최대 13분까지 묶어두는
+# 일을 막는다. 실측 KMA 호출은 12~13초대라 30초면 넉넉하다.
+_WEATHER_COLLECTOR_TIMEOUT = timedelta(seconds=30)
+
 
 def _build_realtime_tick_dag(dag_id: str, cron: str, weather_source_ids: tuple[str, ...]) -> DAG:
     """공통 realtime 체인을 만들고, 주어지면 날씨 collector를 prepare 앞에 직접 묶는다."""
@@ -75,7 +84,13 @@ def _build_realtime_tick_dag(dag_id: str, cron: str, weather_source_ids: tuple[s
         prepare_upstream = [collector_tasks["bike_station_realtime"]]
         if weather_source_ids:
             weather_tasks = [
-                build_collector_task(dag, source_id) for source_id in weather_source_ids
+                build_collector_task(
+                    dag,
+                    source_id,
+                    retries=0,
+                    execution_timeout=_WEATHER_COLLECTOR_TIMEOUT,
+                )
+                for source_id in weather_source_ids
             ]
             # ALL_DONE 게이트: 날씨 수집이 실패해도(FAILED) 이 게이트는 항상 성공으로
             # 끝나므로, prepare의 NONE_FAILED_MIN_ONE_SUCCESS를 위반하지 않는다 — 이전

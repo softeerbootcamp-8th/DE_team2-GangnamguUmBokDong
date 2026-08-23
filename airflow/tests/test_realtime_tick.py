@@ -161,9 +161,10 @@ def test_weather_variant_folds_collectors_and_gate_before_prepare(
     for source in expected_weather_sources:
         task = target_dag.get_task(f"collect_{source}")
         assert f"--source {source}" in task.bash_command
-        timeout = EXECUTION_TIMEOUT_OVERRIDES.get(source)
-        if timeout is not None:
-            assert task.execution_timeout == timeout
+        # 재시도 없이 30초 안에 실패시킨다 — 옛 wait_for_weather_manifests 센서의
+        # 30초 상한을 재현한다. 그래야 KMA가 느려도 게이트가 오래 안 막힌다.
+        assert task.retries == 0
+        assert task.execution_timeout == timedelta(seconds=30)
 
 
 @pytest.mark.parametrize("target_dag", _ALL_DAGS)
