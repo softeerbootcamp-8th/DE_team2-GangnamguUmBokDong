@@ -23,11 +23,11 @@ const ALL_REGIONS = "all";
 type ListMode = "routes" | "stations";
 type RouteTransition = "dispatch" | "complete" | "cancel" | "dismiss" | "restore";
 
-function revealRouteCard(routeId: string | null) {
+function revealRouteCard(routeId: string | null, behavior: ScrollBehavior) {
   if (routeId === null) return;
   const card = [...document.querySelectorAll<HTMLElement>("[data-route-id]")]
     .find((element) => element.dataset.routeId === routeId);
-  card?.scrollIntoView?.({ block: "nearest", inline: "nearest" });
+  card?.scrollIntoView?.({ behavior, block: "nearest", inline: "nearest" });
 }
 
 async function updateRoutesWithMotion(routeId: string | null, update: () => void) {
@@ -35,7 +35,7 @@ async function updateRoutesWithMotion(routeId: string | null, update: () => void
   const startViewTransition = document.startViewTransition?.bind(document);
   const applyUpdate = () => {
     flushSync(update);
-    revealRouteCard(routeId);
+    revealRouteCard(routeId, reducedMotion ? "auto" : "smooth");
   };
   if (!startViewTransition || reducedMotion) {
     applyUpdate();

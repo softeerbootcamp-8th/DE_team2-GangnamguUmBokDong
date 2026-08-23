@@ -577,6 +577,7 @@ body {
   border-radius: 9px;
   background: var(--surface-1);
   transition: border-color 120ms ease, background-color 120ms ease;
+  scroll-margin-block: 10px;
 }
 
 .route-card:hover {

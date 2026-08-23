@@ -252,7 +252,11 @@ describe("App polling state", () => {
     await settleRequests();
 
     expect(startViewTransition).toHaveBeenCalledTimes(1);
-    expect(scrollIntoView).toHaveBeenCalledWith({ block: "nearest", inline: "nearest" });
+    expect(scrollIntoView).toHaveBeenCalledWith({
+      behavior: "smooth",
+      block: "nearest",
+      inline: "nearest",
+    });
     expect(screen.getByRole("button", { name: "완료" })).not.toBeNull();
     Object.defineProperty(document, "startViewTransition", {
       configurable: true,
