@@ -686,8 +686,7 @@ CREATE INDEX rebalance_route_proposed_dttm_idx
     ON rebalance_route (proposed_dttm DESC);
 CREATE INDEX rebalance_route_stop_station_idx
     ON rebalance_route_stop (sta_id);
--- 같은 취소 작업을 여러 번 되돌려도 아직 승인되지 않은 복제본은 하나만 남긴다.
--- 복제본이 dispatched로 넘어가면 슬롯이 풀려 원본을 다시 되돌릴 수 있다.
+-- 과거 복제 방식으로 생성된 데이터의 무결성을 유지하기 위한 호환 index다.
 CREATE UNIQUE INDEX rebalance_route_restore_open_uk
     ON rebalance_route (restored_from_route_id)
  WHERE restored_from_route_id IS NOT NULL
@@ -787,11 +786,19 @@ BEGIN
             USING ERRCODE = '23514';
     END IF;
 
-    IF OLD.route_status_cd = 'proposed' AND NEW.route_status_cd = 'dispatched' THEN
-        IF NEW.dispatched_dttm IS NULL
-           OR NEW.completed_dttm IS NOT NULL
-           OR NEW.cancelled_dttm IS NOT NULL THEN
-            RAISE EXCEPTION 'proposed -> dispatched requires only dispatched_dttm'
+    IF NEW.route_status_cd = 'dispatched'
+       AND OLD.route_status_cd IN ('proposed', 'cancelled') THEN
+        IF OLD.route_status_cd = 'proposed' THEN
+            IF NEW.dispatched_dttm IS NULL
+               OR NEW.completed_dttm IS NOT NULL
+               OR NEW.cancelled_dttm IS NOT NULL THEN
+                RAISE EXCEPTION 'proposed -> dispatched requires only dispatched_dttm'
+                    USING ERRCODE = '23514';
+            END IF;
+        ELSIF NEW.dispatched_dttm IS DISTINCT FROM OLD.dispatched_dttm
+              OR NEW.completed_dttm IS NOT NULL
+              OR NEW.cancelled_dttm IS NOT NULL THEN
+            RAISE EXCEPTION 'cancelled -> dispatched must preserve dispatched_dttm and clear cancelled_dttm'
                 USING ERRCODE = '23514';
         END IF;
 

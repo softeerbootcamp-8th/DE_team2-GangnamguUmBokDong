@@ -107,6 +107,13 @@ describe("RouteList", () => {
     expect(props.onCancel).toHaveBeenCalledWith(ROUTES[1]);
   });
 
+  it("카드마다 현재 상태에 해당하는 시각만 표시한다", () => {
+    renderRouteList();
+
+    expect(screen.getByText(/기준 .*12:00/)).not.toBeNull();
+    expect(screen.getByText(/승인 .*11:05/)).not.toBeNull();
+  });
+
   it("완료된 작업에는 삭제 버튼만, 취소된 작업에는 되돌리기와 삭제 버튼을 준다", () => {
     renderRouteList({
       routes: [
@@ -192,9 +199,7 @@ describe("RouteList", () => {
     expect(screen.queryByRole("button", { name: "승인" })).toBeNull();
   });
 
-  it("진행 중 작업과 대여소가 겹치는 후보는 승인을 막고 이유를 보여준다", () => {
-    // 겹침 판정은 실제로 fetchAllRoutes의 isRebalanceRoute 필터를 통과한 route만
-    // 받으므로, pickup·dropoff가 균형 잡힌(재배치) 모양으로 맞춘다.
+  it("진행 중 작업과 대여소가 겹치는 후보도 승인할 수 있다", () => {
     const props = renderRouteList({
       routes: [
         ROUTES[0],
@@ -202,15 +207,13 @@ describe("RouteList", () => {
       ],
     });
 
-    const blocked = screen.getByRole("button", { name: "승인 불가" });
-    expect(blocked.hasAttribute("disabled")).toBe(true);
-    expect(screen.getByText("진행 중 '강남 재배치'와 대여소 2곳 겹침")).not.toBeNull();
-
-    fireEvent.click(blocked);
-    expect(props.onDispatch).not.toHaveBeenCalled();
+    const approval = screen.getByRole("button", { name: "승인" });
+    expect(approval.hasAttribute("disabled")).toBe(false);
+    fireEvent.click(approval);
+    expect(props.onDispatch).toHaveBeenCalledWith(ROUTES[0]);
   });
 
-  it("승인이 막힌 후보도 카드 선택과 진행 중 작업의 완료·취소는 그대로 동작한다", () => {
+  it("겹치는 후보의 카드 선택과 진행 중 작업의 완료·취소는 그대로 동작한다", () => {
     const running = { ...ROUTES[1], region: "강남", stops: ROUTES[0].stops };
     const props = renderRouteList({ routes: [ROUTES[0], running] });
 

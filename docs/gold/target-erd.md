@@ -432,6 +432,7 @@ stateDiagram-v2
     proposed --> dispatched
     dispatched --> completed
     dispatched --> cancelled
+    cancelled --> dispatched
 ```
 
 route ID·센터·제안 일시는 불변이고, 상태 전이 없이 lifecycle 일시를 바꿀 수 없다.
