@@ -244,7 +244,7 @@ describe("App polling state", () => {
     confirmSpy.mockRestore();
   });
 
-  it("취소된 작업을 되돌리면 새 후보가 목록에 붙는다", async () => {
+  it("취소된 작업을 되돌리면 같은 작업이 진행 중으로 바뀐다", async () => {
     const cancelled: Route = {
       ...ROUTES[0],
       status: "cancelled",
@@ -253,10 +253,9 @@ describe("App polling state", () => {
     };
     const restored: Route = {
       ...ROUTES[0],
-      route_id: "99999999-9999-4999-8999-999999999999",
-      status: "proposed",
-      proposed_at: "2026-08-20T00:03:00Z",
-      restored_from_route_id: ROUTES[0].route_id,
+      status: "dispatched",
+      dispatched_at: "2026-08-20T00:01:00Z",
+      cancelled_at: null,
     };
     apiMock.stations.mockResolvedValue(STATIONS);
     apiMock.routes.mockResolvedValue([cancelled]);
@@ -269,7 +268,10 @@ describe("App polling state", () => {
     await settleRequests();
 
     expect(apiMock.restoreRoute).toHaveBeenCalledWith(cancelled.route_id);
-    expect(screen.getByRole("button", { name: "승인" })).not.toBeNull();
+    expect(screen.getByRole("button", { name: "완료" })).not.toBeNull();
+    expect(screen.getByRole("button", { name: "취소" })).not.toBeNull();
+    expect(screen.queryByRole("button", { name: "승인" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "되돌리기" })).toBeNull();
   });
 
   it("되돌리기 요청 중 대여소 모드로 바꾸면 이전 응답을 선택하지 않는다", async () => {
@@ -281,10 +283,9 @@ describe("App polling state", () => {
     };
     const restored: Route = {
       ...ROUTES[0],
-      route_id: "99999999-9999-4999-8999-999999999999",
-      status: "proposed",
-      proposed_at: "2026-08-20T00:03:00Z",
-      restored_from_route_id: cancelled.route_id,
+      status: "dispatched",
+      dispatched_at: "2026-08-20T00:01:00Z",
+      cancelled_at: null,
     };
     const pendingRestore = deferred<Route>();
     apiMock.stations.mockResolvedValue(STATIONS);
@@ -311,10 +312,9 @@ describe("App polling state", () => {
     };
     const restored: Route = {
       ...ROUTES[0],
-      route_id: "99999999-9999-4999-8999-999999999999",
-      status: "proposed",
-      proposed_at: "2026-08-20T00:03:00Z",
-      restored_from_route_id: cancelled.route_id,
+      status: "dispatched",
+      dispatched_at: "2026-08-20T00:01:00Z",
+      cancelled_at: null,
     };
     const pendingRestore = deferred<Route>();
     apiMock.stations.mockResolvedValue(STATIONS);
@@ -332,35 +332,32 @@ describe("App polling state", () => {
     expect(screen.getByTestId("map-route").textContent).toBe("none");
   });
 
-  it("이미 대기 중인 후보를 다시 돌려받아도 목록에 중복으로 쌓이지 않는다", async () => {
+  it("되돌린 작업은 기존 카드를 갱신하고 중복 카드를 만들지 않는다", async () => {
     const cancelled: Route = {
       ...ROUTES[0],
       status: "cancelled",
       dispatched_at: "2026-08-20T00:01:00Z",
       cancelled_at: "2026-08-20T00:02:00Z",
     };
-    const reused: Route = {
+    const restored: Route = {
       ...ROUTES[0],
-      route_id: "99999999-9999-4999-8999-999999999999",
-      status: "proposed",
-      proposed_at: "2026-08-20T00:03:00Z",
-      restored_from_route_id: ROUTES[0].route_id,
+      status: "dispatched",
+      dispatched_at: "2026-08-20T00:01:00Z",
+      cancelled_at: null,
     };
     apiMock.stations.mockResolvedValue(STATIONS);
     apiMock.routes.mockResolvedValue([cancelled]);
-    // 서버는 두 번째 되돌리기에도 같은 후보를 돌려준다.
-    apiMock.restoreRoute.mockResolvedValue(reused);
+    apiMock.restoreRoute.mockResolvedValue(restored);
     render(<App />);
     await settleRequests();
     await settleRequests();
 
     fireEvent.click(screen.getByRole("button", { name: "되돌리기" }));
     await settleRequests();
-    fireEvent.click(screen.getByRole("button", { name: "되돌리기" }));
-    await settleRequests();
 
-    expect(apiMock.restoreRoute).toHaveBeenCalledTimes(2);
-    expect(screen.getAllByRole("button", { name: "승인" })).toHaveLength(1);
+    expect(apiMock.restoreRoute).toHaveBeenCalledTimes(1);
+    expect(screen.getAllByRole("button", { name: "완료" })).toHaveLength(1);
+    expect(document.querySelectorAll(".route-card")).toHaveLength(1);
   });
 
   it("대여소 선택을 바꾸는 즉시 이전 forecast를 지운다", async () => {

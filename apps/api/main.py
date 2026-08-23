@@ -1,7 +1,7 @@
 """Gold PostGIS 대시보드 API endpoint를 제공한다."""
 
 from typing import Literal
-from uuid import UUID, uuid4
+from uuid import UUID
 
 import queries
 from core.db import fetch_one
@@ -193,8 +193,6 @@ def _route_transition_response(
         )
     if result is queries.RouteTransitionResult.ALREADY_DISMISSED:
         raise HTTPException(status_code=409, detail=f"route {route_id} is already dismissed")
-    if result is queries.RouteTransitionResult.STATION_CONFLICT:
-        raise HTTPException(status_code=409, detail="route_station_conflict")
     if result is queries.RouteTransitionResult.CONSTRAINT_CONFLICT:
         raise HTTPException(status_code=409, detail=conflict_detail)
     return result
@@ -229,14 +227,8 @@ def dismiss_route(route_id: UUID) -> dict:
 
 
 @app.post("/routes/{route_id}/restore", response_model=Route)
-def restore_route(route_id: UUID, response: Response) -> dict:
-    """취소된 route를 복제해 새 작업 후보로 되돌린다.
-
-    되돌리기는 idempotent하다. 이미 대기 중인 후보가 있으면 새로 만들지 않고
-    그 후보를 200으로 돌려주고, 실제로 복제했을 때만 201을 쓴다.
-    """
-    new_route_id = uuid4()
-    result = queries.restore_route(route_id, queries.now_utc(), new_route_id)
+def restore_route(route_id: UUID) -> dict:
+    """취소된 route를 같은 작업의 진행 중 상태로 되돌린다."""
+    result = queries.restore_route(route_id)
     route = _route_transition_response(route_id, result, "cancelled", "route_restore_conflict")
-    response.status_code = 201 if route["route_id"] == str(new_route_id) else 200
     return route

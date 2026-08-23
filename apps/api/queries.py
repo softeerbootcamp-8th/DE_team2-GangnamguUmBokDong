@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -76,7 +75,6 @@ class RouteTransitionResult(StrEnum):
     WRONG_STATUS = "wrong_status"
     CONSTRAINT_CONFLICT = "constraint_conflict"
     ALREADY_DISMISSED = "already_dismissed"
-    STATION_CONFLICT = "station_conflict"
 
 
 def now_utc() -> datetime:
@@ -545,9 +543,18 @@ def fetch_routes(
     offset: int = 0,
 ) -> list[dict[str, Any]]:
     """bounded filter와 결정적 순서로 route aggregate 목록을 반환한다."""
-    # 삭제한 작업은 목록에서 제외한다. 단건 조회(fetch_route)는 선택 중인 항목이
-    # 갑자기 404가 되지 않도록 이 필터를 걸지 않는다.
-    conditions: list[str] = ["route.dismissed_dttm IS NULL"]
+    # 삭제한 작업과 과거 복제 방식으로 이미 후속 route가 생긴 원본은 목록에서
+    # 제외한다. 단건 조회(fetch_route)는 감사 이력을 읽을 수 있도록 유지한다.
+    conditions: list[str] = [
+        "route.dismissed_dttm IS NULL",
+        """
+        NOT EXISTS (
+            SELECT 1
+              FROM rebalance_route AS restored_route
+             WHERE restored_route.restored_from_route_id = route.route_id
+        )
+        """,
+    ]
     params: dict[str, Any] = {"limit": limit, "offset": offset}
     if region is not None:
         conditions.append("center.dispatch_center_nm = %(region)s")
@@ -583,34 +590,6 @@ def fetch_route(route_id: UUID) -> dict[str, Any] | None:
     )
 
 
-_STATION_CONFLICT_SQL = """
-SELECT count(DISTINCT candidate_stop.sta_id) AS conflict_cnt
-  FROM rebalance_route_stop AS candidate_stop
-  JOIN rebalance_route_stop AS active_stop USING (sta_id)
-  JOIN rebalance_route AS active_route
-       ON active_route.route_id = active_stop.route_id
- WHERE candidate_stop.route_id = %(route_id)s
-   AND active_route.route_id <> %(route_id)s
-   AND active_route.route_status_cd = 'dispatched'
-"""
-
-
-def _station_conflict_guard(
-    cursor: Cursor[dict[str, Any]],
-    route_id: UUID,
-) -> RouteTransitionResult | None:
-    """진행 중 경로와 대여소가 겹치면 STATION_CONFLICT를 반환한다.
-
-    같은 대여소에 트럭 두 대가 배정되는 것을 막는다. 자기 경로는 이미 dispatched로
-    바뀐 뒤라 제외한다.
-    """
-    cursor.execute(_STATION_CONFLICT_SQL, {"route_id": route_id})
-    row = cursor.fetchone()
-    if row is not None and row["conflict_cnt"] > 0:
-        return RouteTransitionResult.STATION_CONFLICT
-    return None
-
-
 def _transition_route(
     route_id: UUID,
     now: datetime,
@@ -618,15 +597,8 @@ def _transition_route(
     expected_status: str,
     next_status: str,
     timestamp_column: str,
-    guard: Callable[[Cursor[dict[str, Any]], UUID], RouteTransitionResult | None]
-    | None = None,
 ) -> dict[str, Any] | RouteTransitionResult:
-    """guarded update와 aggregate 재조회를 같은 transaction에서 수행한다.
-
-    guard는 UPDATE 뒤에 실행한다. rebalance_route 쓰기가 statement trigger로
-    route operation advisory lock을 잡으므로, UPDATE 전에 읽으면 lock 없이 읽어
-    동시 전이가 서로를 놓칠 수 있다.
-    """
+    """guarded update와 aggregate 재조회를 같은 transaction에서 수행한다."""
     try:
         with (
             get_connection() as connection,
@@ -656,11 +628,6 @@ def _transition_route(
                 if cursor.fetchone() is None:
                     return RouteTransitionResult.NOT_FOUND
                 return RouteTransitionResult.WRONG_STATUS
-            if guard is not None:
-                blocked = guard(cursor, route_id)
-                if blocked is not None:
-                    connection.rollback()
-                    return blocked
             route = _fetch_route_with_cursor(cursor, route_id)
             if route is None:
                 raise RuntimeError("상태 전이 직후 route aggregate를 찾을 수 없습니다.")
@@ -680,7 +647,6 @@ def dispatch_route(
         expected_status="proposed",
         next_status="dispatched",
         timestamp_column="dispatched_dttm",
-        guard=_station_conflict_guard,
     )
 
 
@@ -756,46 +722,13 @@ def dismiss_route(
         return RouteTransitionResult.CONSTRAINT_CONFLICT
 
 
-def _reused_restore_candidate(
-    cursor: Cursor[dict[str, Any]],
-    route_id: UUID,
-) -> dict[str, Any] | RouteTransitionResult:
-    """이미 대기 중인 복제본을 찾아 되돌리기 재요청을 idempotent하게 만든다."""
-    cursor.execute(
-        """
-        SELECT route_id
-          FROM rebalance_route
-         WHERE restored_from_route_id = %(route_id)s
-           AND route_status_cd = 'proposed'
-        """,
-        {"route_id": route_id},
-    )
-    reused = cursor.fetchone()
-    if reused is None:
-        # unique index는 걸렸는데 후보가 없다면 다른 transaction이 방금 그 후보를
-        # 출동 처리한 것이다. 다시 시도하면 새 후보를 만들 수 있으므로 conflict로 알린다.
-        return RouteTransitionResult.CONSTRAINT_CONFLICT
-    route = _fetch_route_with_cursor(cursor, reused["route_id"])
-    if route is None:
-        raise RuntimeError("재사용할 route aggregate를 찾을 수 없습니다.")
-    return route
-
-
 def restore_route(
     route_id: UUID,
-    now: datetime,
-    new_route_id: UUID,
 ) -> dict[str, Any] | RouteTransitionResult:
-    """취소된 route의 stop을 복제해 새 proposed route를 만든다.
+    """취소된 route를 동일 ID의 dispatched 상태로 원자 복원한다.
 
-    제자리 전이 대신 복제를 쓰는 이유는 proposed_dttm이 immutable이라
-    되돌린 작업이 후보 창(최근 10분)을 통과하지 못하기 때문이다. 원본은
-    cancelled로 남아 취소 이력이 지워지지 않는다.
-
-    같은 원본을 여러 번 되돌려도 아직 승인되지 않은 복제본은 하나만 남는다.
-    rebalance_route_restore_open_uk가 이를 DB에서 보장하므로 동시 요청도 막힌다.
-    이미 대기 중인 복제본이 있으면 실패시키지 않고 그 후보를 그대로 반환한다.
-    거절하면 후보 창을 벗어나 화면에서 사라진 복제본을 다시 불러올 방법이 없다.
+    취소 시각만 비우고 최초 승인 시각과 stop은 보존한다. 같은 요청이 재시도되어
+    이미 dispatched라면 현재 route를 반환해 idempotent하게 처리한다.
     """
     try:
         with (
@@ -804,60 +737,35 @@ def restore_route(
         ):
             cursor.execute(
                 """
-                SELECT dispatch_center_id, route_status_cd, dismissed_dttm
-                  FROM rebalance_route
+                UPDATE rebalance_route
+                   SET route_status_cd = 'dispatched',
+                       cancelled_dttm = NULL
                  WHERE route_id = %(route_id)s
-                   FOR SHARE
+                   AND route_status_cd = 'cancelled'
+                   AND dismissed_dttm IS NULL
+                RETURNING route_id
                 """,
                 {"route_id": route_id},
             )
-            origin = cursor.fetchone()
-            if origin is None:
-                return RouteTransitionResult.NOT_FOUND
-            if origin["dismissed_dttm"] is not None:
-                return RouteTransitionResult.ALREADY_DISMISSED
-            if origin["route_status_cd"] != "cancelled":
-                return RouteTransitionResult.WRONG_STATUS
-
-            cursor.execute(
-                """
-                INSERT INTO rebalance_route (
-                    route_id, dispatch_center_id, route_status_cd,
-                    proposed_dttm, restored_from_route_id
-                ) VALUES (
-                    %(new_route_id)s, %(dispatch_center_id)s, 'proposed',
-                    %(now)s, %(route_id)s
-                )
-                ON CONFLICT (restored_from_route_id)
-                    WHERE restored_from_route_id IS NOT NULL
-                      AND route_status_cd = 'proposed'
-                    DO NOTHING
-                RETURNING route_id
-                """,
-                {
-                    "new_route_id": new_route_id,
-                    "dispatch_center_id": origin["dispatch_center_id"],
-                    "now": now,
-                    "route_id": route_id,
-                },
-            )
             if cursor.fetchone() is None:
-                return _reused_restore_candidate(cursor, route_id)
-
-            cursor.execute(
-                """
-                INSERT INTO rebalance_route_stop (
-                    route_id, visit_no, sta_id, route_action_type_cd, bike_cnt
+                cursor.execute(
+                    """
+                    SELECT route_status_cd, dismissed_dttm
+                      FROM rebalance_route
+                     WHERE route_id = %(route_id)s
+                    """,
+                    {"route_id": route_id},
                 )
-                SELECT %(new_route_id)s, visit_no, sta_id, route_action_type_cd, bike_cnt
-                  FROM rebalance_route_stop
-                 WHERE route_id = %(route_id)s
-                """,
-                {"new_route_id": new_route_id, "route_id": route_id},
-            )
-            route = _fetch_route_with_cursor(cursor, new_route_id)
+                existing = cursor.fetchone()
+                if existing is None:
+                    return RouteTransitionResult.NOT_FOUND
+                if existing["dismissed_dttm"] is not None:
+                    return RouteTransitionResult.ALREADY_DISMISSED
+                if existing["route_status_cd"] != "dispatched":
+                    return RouteTransitionResult.WRONG_STATUS
+            route = _fetch_route_with_cursor(cursor, route_id)
             if route is None:
-                raise RuntimeError("복제 직후 route aggregate를 찾을 수 없습니다.")
+                raise RuntimeError("복원 직후 route aggregate를 찾을 수 없습니다.")
             return route
     except CheckViolation:
         return RouteTransitionResult.CONSTRAINT_CONFLICT

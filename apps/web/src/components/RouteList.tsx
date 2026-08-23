@@ -13,8 +13,6 @@ import {
 import { useMemo } from "react";
 import type { DispatchCenter, Route, RouteStatus } from "../api";
 import {
-  buildStationConflicts,
-  describeStationConflict,
   estimateRoute,
   formatRouteDuration,
   groupWorkRoutes,
@@ -77,7 +75,6 @@ export function RouteList({
     routes.forEach((route) => byRouteId.set(route.route_id, estimateRoute(route, regions)));
     return byRouteId;
   }, [routes, regions]);
-  const stationConflicts = useMemo(() => buildStationConflicts(routes), [routes]);
 
   function confirmDismiss(route: Route) {
     // 삭제하면 화면에서 다시 꺼낼 방법이 없다. 실수 한 번을 막는 값이 크다.
@@ -92,10 +89,6 @@ export function RouteList({
     const isSelected = route.route_id === selectedRouteId;
     const isBusy = route.route_id === busyRouteId;
     const transitionsBlocked = busyRouteId !== null;
-    // 진행 중 작업이 점유한 대여소를 다시 배차하지 않도록 승인만 막는다.
-    // 카드 선택은 남겨 둔다 — 운영자가 지도에서 어느 대여소가 겹치는지 봐야 한다.
-    const conflict = stationConflicts.get(route.route_id) ?? null;
-    const conflictReason = conflict === null ? null : describeStationConflict(conflict);
     return (
       <li key={route.route_id}>
         <article
@@ -112,9 +105,6 @@ export function RouteList({
                 {route.region} {routeKind(route)}
               </span>
               <span className="route-card-summary">{routeSummary(route)}</span>
-              {conflictReason && (
-                <span className="route-card-conflict">{conflictReason}</span>
-              )}
               {estimate && (
                 <span className="route-card-meta">
                   <span title="직선거리×1.25, 도심 18km/h, 정차 4분, 자전거 1대당 30초 기준">
@@ -131,10 +121,10 @@ export function RouteList({
               <button
                 type="button"
                 className={`route-action primary icon-only${isBusy ? " is-busy" : ""}`}
-                disabled={transitionsBlocked || conflictReason !== null}
+                disabled={transitionsBlocked}
                 onClick={() => onDispatch(route)}
-                aria-label={isBusy ? "처리 중" : conflictReason ? "승인 불가" : "승인"}
-                title={isBusy ? "승인 처리 중" : (conflictReason ?? "작업 승인")}
+                aria-label={isBusy ? "처리 중" : "승인"}
+                title={isBusy ? "승인 처리 중" : "작업 승인"}
               >
                 {isBusy
                   ? <Loader2 size={14} aria-hidden="true" className="route-action-spinner" />
@@ -189,7 +179,7 @@ export function RouteList({
                   disabled={transitionsBlocked}
                   onClick={() => onRestore(route)}
                   aria-label={isBusy ? "처리 중" : "되돌리기"}
-                  title={isBusy ? "처리 중" : "작업 후보로 되돌리기"}
+                  title={isBusy ? "처리 중" : "작업 중으로 되돌리기"}
                 >
                   {isBusy
                     ? <Loader2 size={14} aria-hidden="true" className="route-action-spinner" />

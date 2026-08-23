@@ -1,7 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { DispatchCenter, Route } from "./api";
-import { ApiError } from "./api";
-import { buildStationConflicts, describeStationConflict, estimateRoute, formatRouteDuration, groupWorkRoutes, isRebalanceRoute, routeKind, routeTransitionMessage } from "./routeOperations";
+import { estimateRoute, formatRouteDuration, groupWorkRoutes, isRebalanceRoute, routeKind, routeTransitionMessage } from "./routeOperations";
 
 const CENTERS: DispatchCenter[] = [{ region: "강남", lat: 37.5, lon: 127.0 }];
 const ROUTE: Route = {
@@ -17,21 +16,6 @@ const ROUTE: Route = {
   stops: [
     { visit_order: 1, sta_id: "ST-1", sta_nm: "회수", lat: 37.51, lon: 127.01, action: "pickup", bike_cnt: 4 },
     { visit_order: 2, sta_id: "ST-2", sta_nm: "공급", lat: 37.52, lon: 127.02, action: "dropoff", bike_cnt: 4 },
-  ],
-};
-
-const DISPATCHED: Route = {
-  route_id: "22222222-2222-4222-8222-222222222222",
-  region: "강남",
-  status: "dispatched",
-  proposed_at: "2026-08-21T02:00:00Z",
-  dispatched_at: "2026-08-21T02:05:00Z",
-  completed_at: null,
-  cancelled_at: null,
-  dismissed_at: null,
-  restored_from_route_id: null,
-  stops: [
-    { visit_order: 1, sta_id: "ST-2", sta_nm: "공급", lat: 37.52, lon: 127.02, action: "dropoff", bike_cnt: 4 },
   ],
 };
 
@@ -154,51 +138,10 @@ describe("routeOperations", () => {
     expect(groups.operations[0].route_id).toBe("closed-34");
   });
 
-  it("진행 중 경로와 대여소가 겹치는 후보만 겹침으로 표시한다", () => {
-    const other = { ...ROUTE, route_id: "no-overlap", stops: [
-      { visit_order: 1, sta_id: "ST-9", sta_nm: "무관", lat: 37.5, lon: 127.0, action: "pickup" as const, bike_cnt: 1 },
-    ] };
+  it("상태 전이 오류는 원인을 감추지 않고 표시한다", () => {
+    const error = new Error("작업 전이 실패");
 
-    const conflicts = buildStationConflicts([ROUTE, DISPATCHED, other]);
-
-    expect(conflicts.get(ROUTE.route_id)).toEqual({ blockingRoutes: [DISPATCHED], stationCount: 1 });
-    expect(conflicts.has("no-overlap")).toBe(false);
-    expect(conflicts.has(DISPATCHED.route_id)).toBe(false);
-  });
-
-  it("완료·취소된 경로는 겹침 판정에서 제외한다", () => {
-    const completed = { ...DISPATCHED, route_id: "done", status: "completed" as const };
-    const cancelled = { ...DISPATCHED, route_id: "void", status: "cancelled" as const };
-
-    expect(buildStationConflicts([ROUTE, completed, cancelled]).size).toBe(0);
-  });
-
-  it("stop이 없는 후보는 겹치지 않는다", () => {
-    const empty = { ...ROUTE, route_id: "empty", stops: [] };
-
-    expect(buildStationConflicts([empty, DISPATCHED]).has("empty")).toBe(false);
-  });
-
-  it("겹치는 진행 중 작업 수에 따라 안내 문구를 만든다", () => {
-    const second = { ...DISPATCHED, route_id: "second", region: "영남", stops: [
-      { visit_order: 1, sta_id: "ST-1", sta_nm: "회수", lat: 37.51, lon: 127.01, action: "pickup" as const, bike_cnt: 1 },
-    ] };
-
-    const one = buildStationConflicts([ROUTE, DISPATCHED]).get(ROUTE.route_id);
-    const two = buildStationConflicts([ROUTE, DISPATCHED, second]).get(ROUTE.route_id);
-
-    if (!one || !two) throw new Error("겹침 판정 결과가 필요합니다.");
-    expect(describeStationConflict(one)).toBe("진행 중 '강남 센터 공급'과 대여소 1곳 겹침");
-    expect(two.stationCount).toBe(2);
-    expect(describeStationConflict(two)).toBe("진행 중 작업 2건과 대여소 2곳 겹침");
-  });
-
-  it("대여소 겹침 409만 운영자용 문구로 바꾸고 나머지는 원문을 남긴다", () => {
-    const conflict = new ApiError("/routes/x/dispatch", 409, "route_station_conflict");
-    const other = new ApiError("/routes/x/dispatch", 409, "route_transition_conflict");
-
-    expect(routeTransitionMessage(conflict)).toBe("진행 중 작업과 대여소가 겹쳐 승인할 수 없습니다.");
-    expect(routeTransitionMessage(other)).toBe(other.message);
+    expect(routeTransitionMessage(error)).toBe(error.message);
     expect(routeTransitionMessage("문자열")).toBe("작업 상태를 변경하지 못했습니다.");
   });
 });

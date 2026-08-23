@@ -563,129 +563,55 @@ def test_dismiss_route_guards_status_and_duplicates(database_url: str) -> None:
     assert queries.dismiss_route(MISSING_ROUTE_ID, now) is queries.RouteTransitionResult.NOT_FOUND
 
 
-def test_restore_route_clones_cancelled_route_into_new_candidate(database_url: str) -> None:
-    """restore는 취소된 route의 stop을 그대로 복제한 새 proposed route를 만든다."""
+def test_restore_route_returns_cancelled_route_to_dispatched(database_url: str) -> None:
+    """restore는 취소된 동일 route를 작업 중으로 되돌리고 stop을 보존한다."""
     now = datetime.now(UTC)
     _seed_serving_fixture(database_url, now)
 
     assert (
-        queries.restore_route(ROUTE_ID, now, uuid4())
+        queries.restore_route(ROUTE_ID)
         is queries.RouteTransitionResult.WRONG_STATUS
     )
 
     queries.dispatch_route(ROUTE_ID, now)
     queries.cancel_route(ROUTE_ID, now + timedelta(seconds=1))
+    cancelled = queries.fetch_route(ROUTE_ID)
+    assert cancelled is not None
 
-    new_route_id = uuid4()
-    restored = queries.restore_route(ROUTE_ID, now + timedelta(seconds=2), new_route_id)
+    restored = queries.restore_route(ROUTE_ID)
     assert isinstance(restored, dict)
-    assert restored["route_id"] == str(new_route_id)
-    assert restored["status"] == "proposed"
-    assert restored["proposed_at"] == now + timedelta(seconds=2)
-    assert restored["restored_from_route_id"] == str(ROUTE_ID)
+    assert restored["route_id"] == str(ROUTE_ID)
+    assert restored["status"] == "dispatched"
+    assert restored["dispatched_at"] == now
+    assert restored["cancelled_at"] is None
+    assert restored["restored_from_route_id"] is None
     assert restored["dismissed_at"] is None
+    assert restored["stops"] == cancelled["stops"]
 
-    origin = queries.fetch_route(ROUTE_ID)
-    assert origin is not None
-    assert origin["status"] == "cancelled"
-    assert restored["stops"] == origin["stops"]
+    # 네트워크 재시도는 새 작업을 만들지 않고 현재 작업을 그대로 반환한다.
+    assert queries.restore_route(ROUTE_ID) == restored
+    with psycopg.connect(database_url) as connection:
+        route_count = connection.execute("SELECT count(*) FROM rebalance_route").fetchone()
+        assert route_count is not None
+        assert route_count[0] == 2
 
     assert (
-        queries.restore_route(MISSING_ROUTE_ID, now, uuid4())
+        queries.restore_route(MISSING_ROUTE_ID)
         is queries.RouteTransitionResult.NOT_FOUND
     )
 
 
-def test_restore_route_keeps_one_open_candidate_per_origin(database_url: str) -> None:
-    """같은 원본을 여러 번 되돌려도 대기 중인 후보는 하나만 남는다."""
-    now = datetime.now(UTC)
-    _seed_serving_fixture(database_url, now)
-
-    queries.dispatch_route(ROUTE_ID, now)
-    queries.cancel_route(ROUTE_ID, now + timedelta(seconds=1))
-
-    first = queries.restore_route(ROUTE_ID, now + timedelta(seconds=2), uuid4())
-    assert isinstance(first, dict)
-
-    # 두 번째 요청은 새 후보를 만들지 않고 대기 중인 후보를 그대로 돌려준다.
-    second = queries.restore_route(ROUTE_ID, now + timedelta(seconds=3), uuid4())
-    assert isinstance(second, dict)
-    assert second["route_id"] == first["route_id"]
-    assert second["proposed_at"] == first["proposed_at"]
-    assert second["stops"] == first["stops"]
-
-    with psycopg.connect(database_url) as connection:
-        clone_count = connection.execute(
-            """
-            SELECT count(*)
-              FROM rebalance_route
-             WHERE restored_from_route_id = %(route_id)s
-            """,
-            {"route_id": ROUTE_ID},
-        ).fetchone()
-        assert clone_count is not None
-        assert clone_count[0] == 1
-
-    # 후보가 출동으로 넘어가면 슬롯이 풀려 원본을 다시 되돌릴 수 있다.
-    clone_id = UUID(first["route_id"])
-    queries.dispatch_route(clone_id, now + timedelta(seconds=4))
-    third = queries.restore_route(ROUTE_ID, now + timedelta(seconds=5), uuid4())
-    assert isinstance(third, dict)
-    assert third["route_id"] != first["route_id"]
-    assert third["status"] == "proposed"
-    assert third["stops"] == first["stops"]
-
-    # 우회 INSERT도 DB가 막는다. 중복 방지는 애플리케이션 규칙이 아니다.
-    with (
-        psycopg.connect(database_url) as connection,
-        pytest.raises(psycopg.errors.UniqueViolation),
-    ):
-        connection.execute(
-            """
-            INSERT INTO rebalance_route (
-                route_id, dispatch_center_id, route_status_cd,
-                proposed_dttm, restored_from_route_id
-            )
-            SELECT %(new_route_id)s, dispatch_center_id, 'proposed',
-                   %(now)s, %(route_id)s
-              FROM rebalance_route
-             WHERE route_id = %(route_id)s
-            """,
-            {
-                "new_route_id": uuid4(),
-                "now": now + timedelta(seconds=6),
-                "route_id": ROUTE_ID,
-            },
-        )
-
-def test_dispatch_rejects_route_sharing_station_with_dispatched(
+def test_dispatch_allows_routes_sharing_station(
     database_url: str,
 ) -> None:
-    """진행 중 경로와 대여소가 겹치는 경로는 승인되지 않고, 종료 후에는 승인된다."""
+    """planner가 수량을 분할한 경로는 대여소가 겹쳐도 각각 승인할 수 있다."""
     now = datetime.now(UTC)
     _seed_serving_fixture(database_url, now)
 
-    dispatched = queries.dispatch_route(ROUTE_ID, now)
-    assert isinstance(dispatched, dict)
+    first = queries.dispatch_route(ROUTE_ID, now)
+    second = queries.dispatch_route(CONFLICT_ROUTE_ID, now + timedelta(seconds=1))
 
-    assert (
-        queries.dispatch_route(CONFLICT_ROUTE_ID, now + timedelta(seconds=1))
-        is queries.RouteTransitionResult.STATION_CONFLICT
-    )
-    response = TestClient(main.app).post(f"/routes/{CONFLICT_ROUTE_ID}/dispatch")
-    assert response.status_code == 409
-    assert response.json()["detail"] == "route_station_conflict"
-
-    with psycopg.connect(database_url) as connection:
-        row = connection.execute(
-            "SELECT route_status_cd FROM rebalance_route WHERE route_id = %s",
-            (CONFLICT_ROUTE_ID,),
-        ).fetchone()
-    assert row is not None
-    assert row[0] == "proposed"
-
-    completed = queries.complete_route(ROUTE_ID, now + timedelta(seconds=2))
-    assert isinstance(completed, dict)
-    unblocked = queries.dispatch_route(CONFLICT_ROUTE_ID, now + timedelta(seconds=3))
-    assert isinstance(unblocked, dict)
-    assert unblocked["status"] == "dispatched"
+    assert isinstance(first, dict)
+    assert isinstance(second, dict)
+    assert first["status"] == "dispatched"
+    assert second["status"] == "dispatched"

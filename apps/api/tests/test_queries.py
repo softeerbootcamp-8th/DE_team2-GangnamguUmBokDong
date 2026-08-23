@@ -485,6 +485,7 @@ def test_fetch_routes_builds_bounded_single_statement_aggregate(
     assert "page.route_id::text AS route_id" in normalized
     assert "ORDER BY route.proposed_dttm DESC, route.route_id ASC" in normalized
     assert "ORDER BY stop.visit_no" in normalized
+    assert "restored_route.restored_from_route_id = route.route_id" in normalized
     assert "LIMIT %(limit)s OFFSET %(offset)s" in normalized
     assert captured["params"] == {
         "limit": 20,
@@ -515,17 +516,6 @@ def test_fetch_route_casts_uuid_to_text_in_one_statement(
     assert "route.route_id = %(route_id)s" in normalized
     assert "rebalance_routes" not in normalized
     assert captured["params"] == {"route_id": ROUTE_ID}
-
-
-def test_station_conflict_sql_excludes_self_and_closed_routes() -> None:
-    """겹침 검사는 자기 경로를 빼고 dispatched 경로만 본다."""
-    normalized = " ".join(queries._STATION_CONFLICT_SQL.split())
-
-    assert "count(DISTINCT candidate_stop.sta_id) AS conflict_cnt" in normalized
-    assert "FROM rebalance_route_stop AS candidate_stop" in normalized
-    assert "JOIN rebalance_route_stop AS active_stop USING (sta_id)" in normalized
-    assert "active_route.route_id <> %(route_id)s" in normalized
-    assert "active_route.route_status_cd = 'dispatched'" in normalized
 
 
 class _TransitionCursor:
@@ -583,9 +573,7 @@ def test_dispatch_updates_and_reads_aggregate_in_same_transaction(
 ) -> None:
     """dispatch guarded update와 aggregate 조회는 같은 connection/cursor를 사용한다."""
     route = {"route_id": str(ROUTE_ID), "status": "dispatched", "stops": []}
-    cursor = _TransitionCursor(
-        [{"route_id": ROUTE_ID}, {"conflict_cnt": 0}, route]
-    )
+    cursor = _TransitionCursor([{"route_id": ROUTE_ID}, route])
     connection = _TransitionConnection(cursor)
     monkeypatch.setattr(queries, "get_connection", lambda: connection)
 
@@ -593,26 +581,10 @@ def test_dispatch_updates_and_reads_aggregate_in_same_transaction(
 
     assert result == route
     assert connection.cursor_calls == 1
-    assert len(cursor.statements) == 3
+    assert len(cursor.statements) == 2
     assert "UPDATE rebalance_route" in cursor.statements[0]
     assert "route_status_cd = %(expected_status)s" in cursor.statements[0]
-    assert "rebalance_route_stop AS candidate_stop" in cursor.statements[1]
-    assert "rebalance_route_stop AS stop" in cursor.statements[2]
-
-
-def test_dispatch_rolls_back_and_skips_aggregate_on_station_conflict(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """겹침 guard가 걸리면 rollback 후 aggregate 조회 없이 STATION_CONFLICT를 반환한다."""
-    cursor = _TransitionCursor([{"route_id": ROUTE_ID}, {"conflict_cnt": 1}])
-    connection = _TransitionConnection(cursor)
-    monkeypatch.setattr(queries, "get_connection", lambda: connection)
-
-    result = queries.dispatch_route(ROUTE_ID, NOW)
-
-    assert result is queries.RouteTransitionResult.STATION_CONFLICT
-    assert connection.rollback_calls == 1
-    assert len(cursor.statements) == 2
+    assert "rebalance_route_stop AS stop" in cursor.statements[1]
 
 
 def test_cancel_sets_cancelled_timestamp_in_same_transaction(
@@ -629,6 +601,23 @@ def test_cancel_sets_cancelled_timestamp_in_same_transaction(
     assert result == route
     assert "cancelled_dttm" in cursor.statements[0]
     assert "route_status_cd = %(expected_status)s" in cursor.statements[0]
+
+
+def test_restore_clears_cancelled_timestamp_without_cloning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """restore는 동일 route를 dispatched로 바꾸고 충돌 검사 뒤 재조회한다."""
+    route = {"route_id": str(ROUTE_ID), "status": "dispatched", "stops": []}
+    cursor = _TransitionCursor([{"route_id": ROUTE_ID}, route])
+    connection = _TransitionConnection(cursor)
+    monkeypatch.setattr(queries, "get_connection", lambda: connection)
+
+    result = queries.restore_route(ROUTE_ID)
+
+    assert result == route
+    assert "cancelled_dttm = NULL" in cursor.statements[0]
+    assert "INSERT INTO rebalance_route" not in "\n".join(cursor.statements)
+    assert len(cursor.statements) == 2
 
 
 @pytest.mark.parametrize(

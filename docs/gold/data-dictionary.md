@@ -399,8 +399,9 @@ batch가 소유하므로 Gold에 중복 저장하지 않는다. route producer�
 
 상태는 `proposed`, `dispatched`, `completed`, `cancelled`다. INSERT는 활성 센터의
 `proposed`만 허용한다. 전이는 `proposed→dispatched→completed` 또는
-`proposed→dispatched→cancelled`만 허용하며 각 전이 일시는 한 번만 설정한다. ID,
-센터, 제안일시, 이미 설정한 lifecycle 일시는 불변이다. 삭제는 `proposed`만 가능하다.
+`proposed→dispatched↔cancelled`만 허용한다. 취소를 되돌릴 때는 동일 route의
+`cancelled_dttm`만 비우고 최초 `dispatched_dttm`을 보존한다. ID, 센터, 제안일시는
+불변이다. 삭제는 `proposed`만 가능하다.
 모든 일시는 유한하고 완료 시 `proposed_dttm <= dispatched_dttm <= completed_dttm`,
 취소 시 `proposed_dttm <= dispatched_dttm <= cancelled_dttm` 순서다.
 UUIDv5 namespace는 `d0d59897-9e72-541f-bb05-bd3d113c2639`다. name의 정확한 canonical JSON과
