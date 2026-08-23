@@ -462,6 +462,34 @@ def test_alerts_serve_one_last_known_good_snapshot_until_expiry(
 
     with psycopg.connect(database_url) as connection:
         connection.execute(
+            "UPDATE station SET is_active = false WHERE sta_id = 'ST-1'"
+        )
+    assert queries.fetch_alerts(base_dttm + timedelta(minutes=15)) == []
+
+    with psycopg.connect(database_url) as connection:
+        connection.execute(
+            "UPDATE station SET is_active = true WHERE sta_id = 'ST-1'"
+        )
+        connection.execute(
+            """
+            UPDATE dispatch_center
+               SET is_active = false
+             WHERE dispatch_center_id = 'test_center'
+            """
+        )
+    assert queries.fetch_alerts(base_dttm + timedelta(minutes=15)) == []
+
+    with psycopg.connect(database_url) as connection:
+        connection.execute(
+            """
+            UPDATE dispatch_center
+               SET is_active = true
+             WHERE dispatch_center_id = 'test_center'
+            """
+        )
+
+    with psycopg.connect(database_url) as connection:
+        connection.execute(
             """
             UPDATE gold_meta.publication_state
                SET logical_dttm = %(next_anchor)s,

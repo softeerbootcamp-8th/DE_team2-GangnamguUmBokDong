@@ -456,6 +456,8 @@ def test_fetch_alerts_uses_complete_publication_state_snapshot(
     assert "authority.published_row_cnt = ( SELECT COUNT(*) FROM urgency_snapshot )" in normalized
     assert "JOIN station_stock" not in normalized
     assert "s.last_seen_dttm" not in normalized
+    assert "s.is_active" in normalized
+    assert "center.is_active" in normalized
     assert "ORDER BY urgency.urgency_score DESC, s.sta_id ASC" in normalized
     assert "rebalance_need_type_cd AS action_type" in normalized
     assert "critical_remaining_min AS minutes_until_critical" in normalized

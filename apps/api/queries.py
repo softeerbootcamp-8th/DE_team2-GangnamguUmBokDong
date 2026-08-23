@@ -508,8 +508,10 @@ def fetch_alerts(now: datetime) -> list[dict[str, Any]]:
             ON urgency.base_dttm = authority.logical_dttm
           JOIN station AS s
             ON s.sta_id = urgency.sta_id
+           AND s.is_active
           JOIN dispatch_center AS center
             ON center.dispatch_center_id = s.dispatch_center_id
+           AND center.is_active
          ORDER BY urgency.urgency_score DESC, s.sta_id ASC
         """,
         {
