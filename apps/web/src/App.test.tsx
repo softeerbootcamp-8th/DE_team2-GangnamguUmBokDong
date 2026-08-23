@@ -198,6 +198,36 @@ describe("App polling state", () => {
     expect(apiMock.dispatchRoute).toHaveBeenCalledWith(ROUTES[0].route_id);
   });
 
+  it("상태가 바뀌는 작업 카드를 view transition으로 이동한다", async () => {
+    const startViewTransition = vi.fn((update: () => void) => {
+      update();
+      return {
+        finished: Promise.resolve(),
+        ready: Promise.resolve(),
+        updateCallbackDone: Promise.resolve(),
+        skipTransition: vi.fn(),
+      };
+    });
+    Object.defineProperty(document, "startViewTransition", {
+      configurable: true,
+      value: startViewTransition,
+    });
+    apiMock.stations.mockResolvedValue(STATIONS);
+    render(<App />);
+    await settleRequests();
+    await settleRequests();
+
+    fireEvent.click(screen.getByRole("button", { name: "승인" }));
+    await settleRequests();
+
+    expect(startViewTransition).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("button", { name: "완료" })).not.toBeNull();
+    Object.defineProperty(document, "startViewTransition", {
+      configurable: true,
+      value: undefined,
+    });
+  });
+
   it("승인 전에 시작한 polling 응답이 승인 완료 상태를 덮지 못한다", async () => {
     const staleRoutes = deferred<Route[]>();
     apiMock.stations.mockResolvedValue(STATIONS);

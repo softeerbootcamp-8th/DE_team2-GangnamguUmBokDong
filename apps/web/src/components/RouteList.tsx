@@ -123,6 +123,7 @@ export function RouteList({
         <article
           className={`route-card${isSelected ? " selected" : ""} has-actions`}
           aria-current={isSelected ? "true" : undefined}
+          style={{ viewTransitionName: `route-${route.route_id.replace(/-/g, "")}` }}
         >
           <button type="button" className="route-card-main" onClick={() => onSelect(route)}>
             <span className={`route-status-icon ${status.className}`} aria-hidden="true">

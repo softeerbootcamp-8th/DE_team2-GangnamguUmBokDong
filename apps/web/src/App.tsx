@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { flushSync } from "react-dom";
 import { List, Route as RouteIcon } from "lucide-react";
 import { api } from "./api";
 import type { Alert, DispatchCenter, ForecastResponse, Route, StationSummary } from "./api";
@@ -21,6 +22,16 @@ const ROUTE_PAGE_SIZE = 500;
 const ALL_REGIONS = "all";
 type ListMode = "routes" | "stations";
 type RouteTransition = "dispatch" | "complete" | "cancel" | "dismiss" | "restore";
+
+function updateRoutesWithMotion(update: () => void) {
+  const reducedMotion = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false;
+  const startViewTransition = document.startViewTransition?.bind(document);
+  if (!startViewTransition || reducedMotion) {
+    update();
+    return;
+  }
+  startViewTransition(() => flushSync(update));
+}
 
 function preferredRoute(routes: Route[]): Route | null {
   const referenceMs = candidateReferenceMs(routes);
@@ -291,7 +302,8 @@ export default function App() {
       if (transition === "dismiss") {
         const dismissed = await api.dismissRoute(route.route_id);
         routeMutationGenerationRef.current += 1;
-        setRoutes((current) => current.filter((item) => item.route_id !== dismissed.route_id));
+        updateRoutesWithMotion(() => setRoutes((current) =>
+          current.filter((item) => item.route_id !== dismissed.route_id)));
         if (selectedRouteIdRef.current === dismissed.route_id) {
           selectedRouteIdRef.current = null;
           setSelectedRouteId(null);
@@ -304,8 +316,8 @@ export default function App() {
         routeMutationGenerationRef.current += 1;
         // 요청 중 목록 모드나 권역이 바뀌었다면 이전 화면의 응답을 적용하지 않는다.
         if (routeViewGeneration !== routeViewGenerationRef.current) return;
-        setRoutes((current) => current.map((item) =>
-          item.route_id === restored.route_id ? restored : item));
+        updateRoutesWithMotion(() => setRoutes((current) => current.map((item) =>
+          item.route_id === restored.route_id ? restored : item)));
         selectRoute(restored);
         return;
       }
@@ -315,7 +327,8 @@ export default function App() {
           ? await api.completeRoute(route.route_id)
           : await api.cancelRoute(route.route_id);
       routeMutationGenerationRef.current += 1;
-      setRoutes((current) => current.map((item) => item.route_id === updated.route_id ? updated : item));
+      updateRoutesWithMotion(() => setRoutes((current) => current.map((item) =>
+        item.route_id === updated.route_id ? updated : item)));
     } catch (error) {
       routeMutationGenerationRef.current += 1;
       setRouteTransitionError(routeTransitionMessage(error));
