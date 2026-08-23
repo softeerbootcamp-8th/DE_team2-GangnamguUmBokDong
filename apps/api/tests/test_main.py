@@ -89,6 +89,8 @@ def _route(status: str = "proposed") -> dict:
         "dispatched_at": NOW if status in {"dispatched", "completed", "cancelled"} else None,
         "completed_at": NOW if status == "completed" else None,
         "cancelled_at": NOW if status == "cancelled" else None,
+        "dismissed_at": None,
+        "restored_from_route_id": None,
         "stops": [
             {
                 "visit_order": 1,
@@ -412,3 +414,152 @@ def test_readyz_503_when_database_unreachable(
 
     assert response.status_code == 503
     assert response.json()["detail"] == "database_unavailable"
+
+
+def test_route_response_exposes_dismiss_and_restore_fields(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """route 응답은 삭제 시각과 복제 원본을 그대로 노출한다."""
+    route = _route("cancelled")
+    route["dismissed_at"] = NOW
+    route["restored_from_route_id"] = "44444444-4444-4444-8444-444444444444"
+    monkeypatch.setattr(queries, "fetch_route", lambda _route_id: route)
+
+    response = client.get(f"/routes/{ROUTE_ID}")
+
+    assert response.status_code == 200
+    assert response.json()["dismissed_at"] == "2026-08-20T01:05:00Z"
+    assert response.json()["restored_from_route_id"] == "44444444-4444-4444-8444-444444444444"
+
+
+def test_dismiss_returns_dismissed_route(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """dismiss는 종료된 작업에 삭제 시각을 채운 응답을 돌려준다."""
+    route = _route("completed")
+    route["dismissed_at"] = NOW
+    monkeypatch.setattr(queries, "dismiss_route", lambda _route_id, _now: route)
+
+    response = client.post(f"/routes/{ROUTE_ID}/dismiss")
+
+    assert response.status_code == 200
+    assert response.json()["dismissed_at"] == "2026-08-20T01:05:00Z"
+
+
+@pytest.mark.parametrize(
+    "result,status_code,detail",
+    [
+        (queries.RouteTransitionResult.NOT_FOUND, 404, f"route {ROUTE_ID} not found"),
+        (
+            queries.RouteTransitionResult.WRONG_STATUS,
+            409,
+            f"route {ROUTE_ID} is not in completed or cancelled status",
+        ),
+        (
+            queries.RouteTransitionResult.ALREADY_DISMISSED,
+            409,
+            f"route {ROUTE_ID} is already dismissed",
+        ),
+    ],
+)
+def test_dismiss_maps_not_found_wrong_status_and_duplicate(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    result: queries.RouteTransitionResult,
+    status_code: int,
+    detail: str,
+) -> None:
+    """dismiss는 404·상태 409·중복 409를 명시적으로 매핑한다."""
+    monkeypatch.setattr(queries, "dismiss_route", lambda _route_id, _now: result)
+
+    response = client.post(f"/routes/{ROUTE_ID}/dismiss")
+
+    assert response.status_code == status_code
+    assert response.json()["detail"] == detail
+
+
+def test_restore_returns_new_proposed_route(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """restore가 실제로 복제했으면 새 후보를 201로 돌려준다."""
+    restored = _route("proposed")
+    restored["restored_from_route_id"] = str(ROUTE_ID)
+
+    def _restore(_route_id: UUID, _now: datetime, new_route_id: UUID) -> dict:
+        return {**restored, "route_id": str(new_route_id)}
+
+    monkeypatch.setattr(queries, "restore_route", _restore)
+
+    response = client.post(f"/routes/{ROUTE_ID}/restore")
+
+    assert response.status_code == 201
+    assert response.json()["route_id"] != str(ROUTE_ID)
+    assert response.json()["status"] == "proposed"
+    assert response.json()["restored_from_route_id"] == str(ROUTE_ID)
+
+
+def test_restore_returns_existing_candidate_with_200(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """이미 대기 중인 후보를 재사용했으면 201이 아니라 200으로 알린다."""
+    reused = _route("proposed")
+    reused["route_id"] = "55555555-5555-4555-8555-555555555555"
+    reused["restored_from_route_id"] = str(ROUTE_ID)
+    monkeypatch.setattr(
+        queries,
+        "restore_route",
+        lambda _route_id, _now, _new_route_id: reused,
+    )
+
+    first = client.post(f"/routes/{ROUTE_ID}/restore")
+    second = client.post(f"/routes/{ROUTE_ID}/restore")
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first.json() == second.json()
+    assert first.json()["route_id"] == "55555555-5555-4555-8555-555555555555"
+
+
+@pytest.mark.parametrize(
+    "result,status_code,detail",
+    [
+        (queries.RouteTransitionResult.NOT_FOUND, 404, f"route {ROUTE_ID} not found"),
+        (
+            queries.RouteTransitionResult.WRONG_STATUS,
+            409,
+            f"route {ROUTE_ID} is not in cancelled status",
+        ),
+        (
+            queries.RouteTransitionResult.ALREADY_DISMISSED,
+            409,
+            f"route {ROUTE_ID} is already dismissed",
+        ),
+        (
+            queries.RouteTransitionResult.CONSTRAINT_CONFLICT,
+            409,
+            "route_restore_conflict",
+        ),
+    ],
+)
+def test_restore_maps_not_found_wrong_status_and_conflicts(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    result: queries.RouteTransitionResult,
+    status_code: int,
+    detail: str,
+) -> None:
+    """restore는 404·상태 409·삭제 409·constraint 409를 명시적으로 매핑한다."""
+    monkeypatch.setattr(
+        queries,
+        "restore_route",
+        lambda _route_id, _now, _new_route_id: result,
+    )
+
+    response = client.post(f"/routes/{ROUTE_ID}/restore")
+
+    assert response.status_code == status_code
+    assert response.json()["detail"] == detail
