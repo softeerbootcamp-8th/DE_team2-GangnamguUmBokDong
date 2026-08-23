@@ -201,7 +201,8 @@ EMR_RELEASE       ?= emr-7.9.0
 EMR_INSTANCE_TYPE ?= m5.xlarge
 EMR_INSTANCE_COUNT?= 3
 
-.PHONY: deploy-env deploy-secrets deploy-db-bootstrap deploy-db-check deploy-seed-models \
+.PHONY: deploy-env deploy-secrets deploy-db-bootstrap deploy-db-check \
+        deploy-migrate-route-restore-uniqueness deploy-seed-models \
         deploy-up deploy-down deploy-ps deploy-logs deploy-restart deploy-resync deploy-smoke \
         train-start train-stop train-status tunnel-airflow tunnel-mlflow \
         ssh-app ssh-train allow-my-ip \
@@ -238,6 +239,18 @@ deploy-db-check:
 	  -e GOLD_SCHEMA_CHECK_FILE=/opt/scripts/check_gold_schema.sql \
 	  -v "$(PWD)/ops/postgres:/opt/scripts:ro" \
 	  $(PSQL_IMAGE) bash /opt/scripts/check_gold_schema.sh
+
+# 되돌리기 중복 방지 unique index를 RDS에 적용한다. 이미 있으면 아무 일도 하지 않는다.
+# **새 API 코드를 올리기 전에** 실행해야 한다. queries.restore_route의 ON CONFLICT가
+# 이 index를 arbiter로 추론하므로, index가 없으면 되돌리기 요청이 그대로 실패한다.
+deploy-migrate-route-restore-uniqueness:
+	@set -a; . $(PROD_ENV); set +a; \
+	docker run --rm \
+	  -e PGHOST -e PGPORT -e PGPASSWORD -e PGSSLMODE \
+	  -v "$(PWD)/ops/postgres/migrations:/opt/migrations:ro" \
+	  $(PSQL_IMAGE) \
+	  psql -v ON_ERROR_STOP=1 -U "$$POSTGRES_USER" -d "$$POSTGRES_APP_DB" \
+	       -f /opt/migrations/132_add_route_restore_uniqueness.sql
 
 # 최초 1회. 로컬 compose의 minio-init이 하던 일을 대신한다 — 빠뜨리면 ml/inference가
 # champion 포인터를 못 찾아 조용히 실패한다.
