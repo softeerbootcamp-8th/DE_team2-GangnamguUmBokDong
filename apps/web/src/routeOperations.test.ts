@@ -65,6 +65,25 @@ describe("routeOperations", () => {
     expect(groups.operations).toEqual([]);
   });
 
+  it("복원 후보가 기존 게시 후보의 신선도 기준을 밀어내지 않는다", () => {
+    const published = {
+      ...ROUTE,
+      route_id: "published",
+      proposed_at: "2026-08-21T03:00:00Z",
+    };
+    const restored = {
+      ...ROUTE,
+      route_id: "restored",
+      proposed_at: "2026-08-21T07:00:00Z",
+      restored_from_route_id: "cancelled-origin",
+    };
+
+    const groups = groupWorkRoutes([published, restored]);
+
+    expect(groups.candidates.map((route) => route.route_id)).toEqual(["restored", "published"]);
+    expect(groups.hiddenCandidateCount).toBe(0);
+  });
+
   it("브라우저 시계가 틀어져도 최신 후보를 숨기지 않는다", () => {
     // 시스템 시계를 하루 앞으로 옮겨도 판정 기준은 응답의 proposed_at이다.
     vi.useFakeTimers();

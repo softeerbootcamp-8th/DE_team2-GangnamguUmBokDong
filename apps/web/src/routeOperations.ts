@@ -88,19 +88,24 @@ function proposedAtMs(route: Route): number | null {
 }
 
 /**
- * 후보 신선도의 기준 시각. 브라우저 시계가 아니라 응답에 담긴 가장 최근
- * proposed_at을 쓴다. 운영 PC 시계가 몇 분 틀어져도 방금 생성된 후보가
- * 아무 안내 없이 전부 사라지는 일이 없어야 한다.
+ * 후보 신선도의 기준 시각. 파이프라인이 게시한 일반 후보 중 가장 최근
+ * proposed_at을 쓰고, 일반 후보가 없을 때만 복원 후보 시각을 쓴다.
+ * 수동 복원 후보의 현재 시각이 기존 게시 후보를 한꺼번에 숨기면 안 된다.
  */
 export function candidateReferenceMs(routes: Route[]): number | null {
-  let latest: number | null = null;
+  let latestPublished: number | null = null;
+  let latestRestored: number | null = null;
   for (const route of routes) {
     if (route.status !== "proposed") continue;
     const ms = proposedAtMs(route);
     if (ms === null) continue;
-    if (latest === null || ms > latest) latest = ms;
+    if (route.restored_from_route_id === null) {
+      if (latestPublished === null || ms > latestPublished) latestPublished = ms;
+    } else if (latestRestored === null || ms > latestRestored) {
+      latestRestored = ms;
+    }
   }
-  return latest;
+  return latestPublished ?? latestRestored;
 }
 
 export function isFreshCandidate(route: Route, referenceMs: number | null): boolean {
