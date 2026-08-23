@@ -201,7 +201,7 @@ EMR_RELEASE       ?= emr-7.9.0
 EMR_INSTANCE_TYPE ?= m5.xlarge
 EMR_INSTANCE_COUNT?= 3
 
-.PHONY: deploy-env deploy-secrets deploy-db-bootstrap deploy-db-check \
+.PHONY: deploy-env deploy-secrets deploy-nginx-auth deploy-db-bootstrap deploy-db-check \
         deploy-migrate-route-restore-uniqueness deploy-seed-models \
         deploy-up deploy-down deploy-ps deploy-logs deploy-restart deploy-resync deploy-smoke \
         train-start train-stop train-status tunnel-airflow tunnel-mlflow \
@@ -217,6 +217,18 @@ deploy-env:
 		echo "S3_BUCKET을 알 수 없습니다. S3_BUCKET=<버킷> make deploy-env 로 실행하세요." >&2; exit 1; \
 	fi; \
 	S3_BUCKET="$$S3_BUCKET" bash ops/deploy/render_env.sh
+
+# /opt/app/.env(NGINX_BASIC_AUTH_USER/PASSWORD)로 nginx 계정 파일을 만든다.
+# 경로는 docker-compose.prod.yml의 web volume 기본값(PROD_NGINX_HTPASSWD)과 맞춘다.
+# deploy-env 다음에 실행한다. 계정을 바꾼 뒤에도 이걸 다시 실행하고 web만 재시작하면 된다:
+#   make deploy-nginx-auth && $(PROD_COMPOSE) up -d --force-recreate web
+PROD_NGINX_HTPASSWD ?= /opt/app/ops/nginx/.htpasswd
+deploy-nginx-auth:
+	@set -a; . $(PROD_ENV); set +a; \
+	mkdir -p "$$(dirname "$(PROD_NGINX_HTPASSWD)")"; \
+	NGINX_BASIC_AUTH_USER="$$NGINX_BASIC_AUTH_USER" \
+	NGINX_BASIC_AUTH_PASSWORD="$$NGINX_BASIC_AUTH_PASSWORD" \
+	bash ops/nginx/generate_htpasswd.sh "$(PROD_NGINX_HTPASSWD)"
 
 # 최초 1회. DB 3개 생성 + Gold PostGIS baseline 적용. PostGIS 3.4가 없으면 exit 78로 멈춘다.
 deploy-db-bootstrap:

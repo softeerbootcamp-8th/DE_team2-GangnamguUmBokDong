@@ -10,6 +10,9 @@ __pycache__/
 .env
 .env.local
 
+# nginx basic auth 계정 파일 — 비밀번호 해시라도 git에 남기지 않는다.
+ops/nginx/.htpasswd
+
 # Node (apps/web)
 node_modules/
 dist/
