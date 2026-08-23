@@ -17,7 +17,7 @@ with DAG(
     tags=["collector", "daily", "station"],
 ) as dag:
     collect_station_master = build_collector_task(dag, STATION_MASTER_SOURCE)
-    # realtime_5min의 prepare_serving_plan/run_inference가 silver/station_master_enriched를
+    # realtime tick DAG들의 prepare_serving_plan/run_inference가 silver/station_master_enriched를
     # 필수로 읽는다 — 이 태스크가 없으면 그 경로가 매번 "S3에 없음"으로 실패한다
     # (2026-08-21 AWS 최초 배포에서 실제로 발견됨. enrich_station_master_task 빌더는
     # 있었는데 어느 DAG에도 연결돼 있지 않았다).
