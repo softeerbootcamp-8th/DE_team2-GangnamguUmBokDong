@@ -11,6 +11,7 @@ from enum import StrEnum
 from types import MappingProxyType
 from typing import Any, cast
 
+from ..scoring_config import URGENCY_STOCK_HISTORY_OFFSETS_MINUTES
 from .canonical import (
     canonical_json_bytes,
     format_utc_dttm,
@@ -560,14 +561,17 @@ _REGISTRY = {
         dependencies=("station", "station_demand_forecast", "station_stock"),
         input_roles=(
             _role("demand_publication_manifest"),
-            # 과거 5분 tick은 수집 장애로 일부가 없을 수 있다. role에 실제 offset을
-            # 고정해 중간 window가 빠져도 나머지 role의 시간 의미가 바뀌지 않게 한다.
-            # 전체 최소 window 수와 실제 부재 여부는 urgency publisher가 검증한다.
-            _role("stock_history_manifest_m05", minimum=0),
-            _role("stock_history_manifest_m10", minimum=0),
-            _role("stock_history_manifest_m15", minimum=0),
-            _role("stock_history_manifest_m20", minimum=0),
-            _role("stock_history_manifest_m25", minimum=0),
+            # role을 위치 index가 아니라 offset에서 유도한다. 어떤 window를 썼는지
+            # manifest만 봐도 드러나고, 이름을 손으로 나열하면 scoring config가
+            # 바뀔 때 조용히 어긋난다. minimum=0인 이유는 지나간 5분 tick의 실시간
+            # 스냅샷이 소급 수집 불가라 window 하나가 영구히 없을 수 있기 때문이다
+            # (하한은 URGENCY_STOCK_HISTORY_MIN_WINDOWS로 gold/urgency.py가 본다).
+            # input_roles는 role 이름 오름차순이어야 하므로 m05..m25 순으로 낸다
+            # (offset 자체는 -25가 먼저인 oldest-first다).
+            *(
+                _role(f"stock_history_manifest_m{abs(offset):02d}", minimum=0)
+                for offset in sorted(URGENCY_STOCK_HISTORY_OFFSETS_MINUTES, reverse=True)
+            ),
             _role("stock_publication_manifest"),
             _role("urgency_output"),
         ),

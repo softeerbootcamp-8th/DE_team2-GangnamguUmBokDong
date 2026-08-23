@@ -11,8 +11,8 @@ adapter_params:
   flatten_forecast: true
   poi_start: 1
   poi_end: 121
-  # 5분마다 POI 121개를 각각 호출하므로 4개씩 병렬 조회한다.
-  concurrency: 4
+  # 5분마다 POI 121개를 각각 호출하므로 병렬 조회한다.
+  concurrency: 8
 schedule: {interval: 5m}
 storage:
   bronze_format: json

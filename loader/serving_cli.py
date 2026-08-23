@@ -11,7 +11,6 @@ from contextlib import redirect_stdout
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from urllib.parse import urlsplit
-from zoneinfo import ZoneInfo
 
 import boto3
 import pyarrow.parquet as pq
@@ -23,7 +22,6 @@ from core.gold_publication import (
     parse_publication_manifest,
 )
 from core.inference_catalog import S3InferenceRevisionCatalog
-from core.source_snapshot import SourceSnapshotStatus
 from gold.rebalance_route import publish_rebalance_route
 from gold.serving_plan import (
     SourceLookbacks,
@@ -48,35 +46,6 @@ _ULTRA_SHORT_LOOKBACK = timedelta(hours=6)
 _FINAL_KEYS = frozenset(
     {"station", "station_demand_forecast", "station_stock", "weather_forecast"}
 )
-_SHORT_TERM_SOURCE_ID = "weather_short_term_forecast"
-_ULTRA_SHORT_SOURCE_ID = "weather_ultra_short_forecast"
-
-
-def weather_sources_ready(logical_dttm: datetime) -> bool:
-    """해당 schedule 경계에 새로 발행될 날씨 authority가 준비됐는지 반환한다.
-
-    10분 경계가 아닌 realtime tick에는 새 초단기예보가 예정되지 않아 즉시 준비된
-    것으로 본다. 3시간 경계에는 초단기·단기예보 두 authority를 모두 요구한다.
-    """
-    logical = _utc_dttm(logical_dttm)
-    kst = logical.astimezone(ZoneInfo("Asia/Seoul"))
-    if kst.minute % 10 != 0:
-        return True
-    _bucket, _client, _object_store, source_catalog = _runtime()
-    required = [_ULTRA_SHORT_SOURCE_ID]
-    if kst.minute == 0 and kst.hour % 3 == 0:
-        required.append(_SHORT_TERM_SOURCE_ID)
-    try:
-        artifacts = tuple(
-            source_catalog.exact_window(source_id, logical) for source_id in required
-        )
-    except ContractViolation:
-        return False
-    return all(
-        artifact.manifest.status
-        in {SourceSnapshotStatus.SUCCEEDED, SourceSnapshotStatus.EMPTY}
-        for artifact in artifacts
-    )
 
 
 def prepare(
@@ -479,9 +448,6 @@ def _parser() -> argparse.ArgumentParser:
     prepare_parser.add_argument("--relocation-approval-uri")
     prepare_parser.add_argument("--relocation-approval-sha256")
 
-    weather_parser = commands.add_parser("weather-ready")
-    weather_parser.add_argument("--logical-dttm", required=True)
-
     final_parser = commands.add_parser("finalize")
     final_parser.add_argument("--plan-uri", required=True)
     final_parser.add_argument("--plan-sha256", required=True)
@@ -502,12 +468,6 @@ def _parser() -> argparse.ArgumentParser:
 def main() -> int:
     """Subcommand를 실행하고 마지막 stdout 한 줄에 compact JSON ref만 쓴다."""
     args = _parser().parse_args()
-    if args.command == "weather-ready":
-        try:
-            return 0 if weather_sources_ready(_parse_dttm(args.logical_dttm)) else 1
-        except Exception as exc:  # noqa: BLE001 - Sensor poke 경계다.
-            print(f"Weather readiness check failed: {exc}", file=sys.stderr)
-            return 1
     try:
         with redirect_stdout(sys.stderr):
             if args.command == "prepare":

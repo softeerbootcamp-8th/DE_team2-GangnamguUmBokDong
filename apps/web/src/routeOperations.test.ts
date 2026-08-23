@@ -12,6 +12,8 @@ const ROUTE: Route = {
   dispatched_at: null,
   completed_at: null,
   cancelled_at: null,
+  dismissed_at: null,
+  restored_from_route_id: null,
   stops: [
     { visit_order: 1, sta_id: "ST-1", sta_nm: "회수", lat: 37.51, lon: 127.01, action: "pickup", bike_cnt: 4 },
     { visit_order: 2, sta_id: "ST-2", sta_nm: "공급", lat: 37.52, lon: 127.02, action: "dropoff", bike_cnt: 4 },
@@ -26,6 +28,8 @@ const DISPATCHED: Route = {
   dispatched_at: "2026-08-21T02:05:00Z",
   completed_at: null,
   cancelled_at: null,
+  dismissed_at: null,
+  restored_from_route_id: null,
   stops: [
     { visit_order: 1, sta_id: "ST-2", sta_nm: "공급", lat: 37.52, lon: 127.02, action: "dropoff", bike_cnt: 4 },
   ],

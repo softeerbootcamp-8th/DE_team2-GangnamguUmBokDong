@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 from datetime import UTC, datetime, timedelta
-from uuid import UUID
+from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
 
 import main
@@ -17,6 +17,7 @@ DATABASE_URL_ENV = "GOLD_API_TEST_DATABASE_URL"
 ROUTE_ID = UUID("11111111-1111-4111-8111-111111111111")
 CONFLICT_ROUTE_ID = UUID("22222222-2222-4222-8222-222222222222")
 CANCEL_ROUTE_ID = UUID("33333333-3333-4333-8333-333333333333")
+MISSING_ROUTE_ID = UUID("99999999-9999-4999-8999-999999999999")
 
 
 @pytest.fixture
@@ -540,6 +541,207 @@ def test_route_lifecycle_and_constraint_error_mapping(database_url: str) -> None
     assert response.status_code == 409
     assert response.json()["detail"] == "route_transition_conflict"
 
+
+def test_dismiss_columns_reject_active_routes_and_transition_writes(database_url: str) -> None:
+    """dismissed_dttm은 종료 작업에서만 채워지고 상태 전이 중에는 바뀌지 못한다."""
+    now = datetime.now(UTC)
+    _seed_serving_fixture(database_url, now)
+
+    # proposed 상태에는 dismissed_dttm을 채울 수 없다.
+    with (
+        psycopg.connect(database_url) as connection,
+        pytest.raises(psycopg.errors.CheckViolation),
+    ):
+        connection.execute(
+            "UPDATE rebalance_route SET dismissed_dttm = %(now)s WHERE route_id = %(route_id)s",
+            {"now": now, "route_id": ROUTE_ID},
+        )
+
+    # dispatched -> completed 전이와 dismiss를 한 UPDATE에 섞을 수 없다.
+    queries.dispatch_route(ROUTE_ID, now)
+    with (
+        psycopg.connect(database_url) as connection,
+        pytest.raises(psycopg.errors.CheckViolation),
+    ):
+        connection.execute(
+            """
+            UPDATE rebalance_route
+               SET route_status_cd = 'completed',
+                   completed_dttm = %(now)s,
+                   dismissed_dttm = %(now)s
+             WHERE route_id = %(route_id)s
+            """,
+            {"now": now + timedelta(seconds=1), "route_id": ROUTE_ID},
+        )
+
+    # completed 상태에서는 단독 UPDATE로 dismiss할 수 있고, 다시 해제할 수도 있다.
+    queries.complete_route(ROUTE_ID, now + timedelta(seconds=1))
+    with psycopg.connect(database_url) as connection:
+        connection.execute(
+            "UPDATE rebalance_route SET dismissed_dttm = %(now)s WHERE route_id = %(route_id)s",
+            {"now": now + timedelta(seconds=2), "route_id": ROUTE_ID},
+        )
+        connection.execute(
+            "UPDATE rebalance_route SET dismissed_dttm = NULL WHERE route_id = %(route_id)s",
+            {"route_id": ROUTE_ID},
+        )
+
+    # restored_from_route_id는 INSERT 이후 바꿀 수 없다.
+    with (
+        psycopg.connect(database_url) as connection,
+        pytest.raises(psycopg.errors.CheckViolation),
+    ):
+        connection.execute(
+            """
+            UPDATE rebalance_route
+               SET restored_from_route_id = %(other)s
+             WHERE route_id = %(route_id)s
+            """,
+            {"other": CONFLICT_ROUTE_ID, "route_id": ROUTE_ID},
+        )
+
+
+def test_dismissed_routes_leave_the_list_but_stay_fetchable(database_url: str) -> None:
+    """삭제한 route는 목록에서 빠지지만 단건 조회로는 계속 읽힌다."""
+    now = datetime.now(UTC)
+    _seed_serving_fixture(database_url, now)
+
+    queries.dispatch_route(ROUTE_ID, now)
+    queries.complete_route(ROUTE_ID, now + timedelta(seconds=1))
+    with psycopg.connect(database_url) as connection:
+        connection.execute(
+            "UPDATE rebalance_route SET dismissed_dttm = %(now)s WHERE route_id = %(route_id)s",
+            {"now": now + timedelta(seconds=2), "route_id": ROUTE_ID},
+        )
+
+    # fixture는 ROUTE_ID와 CONFLICT_ROUTE_ID 둘을 시드한다. 삭제한 쪽만 빠져야 한다.
+    assert {route["route_id"] for route in queries.fetch_routes()} == {str(CONFLICT_ROUTE_ID)}
+    fetched = queries.fetch_route(ROUTE_ID)
+    assert fetched is not None
+    assert fetched["dismissed_at"] == now + timedelta(seconds=2)
+    assert fetched["restored_from_route_id"] is None
+
+
+def test_dismiss_route_guards_status_and_duplicates(database_url: str) -> None:
+    """dismiss는 종료된 작업만 한 번 삭제하고 나머지는 결과값으로 거부한다."""
+    now = datetime.now(UTC)
+    _seed_serving_fixture(database_url, now)
+
+    assert queries.dismiss_route(ROUTE_ID, now) is queries.RouteTransitionResult.WRONG_STATUS
+
+    queries.dispatch_route(ROUTE_ID, now)
+    assert (
+        queries.dismiss_route(ROUTE_ID, now + timedelta(seconds=1))
+        is queries.RouteTransitionResult.WRONG_STATUS
+    )
+
+    queries.complete_route(ROUTE_ID, now + timedelta(seconds=1))
+    dismissed = queries.dismiss_route(ROUTE_ID, now + timedelta(seconds=2))
+    assert isinstance(dismissed, dict)
+    assert dismissed["status"] == "completed"
+    assert dismissed["dismissed_at"] == now + timedelta(seconds=2)
+
+    assert (
+        queries.dismiss_route(ROUTE_ID, now + timedelta(seconds=3))
+        is queries.RouteTransitionResult.ALREADY_DISMISSED
+    )
+    assert queries.dismiss_route(MISSING_ROUTE_ID, now) is queries.RouteTransitionResult.NOT_FOUND
+
+
+def test_restore_route_clones_cancelled_route_into_new_candidate(database_url: str) -> None:
+    """restore는 취소된 route의 stop을 그대로 복제한 새 proposed route를 만든다."""
+    now = datetime.now(UTC)
+    _seed_serving_fixture(database_url, now)
+
+    assert (
+        queries.restore_route(ROUTE_ID, now, uuid4())
+        is queries.RouteTransitionResult.WRONG_STATUS
+    )
+
+    queries.dispatch_route(ROUTE_ID, now)
+    queries.cancel_route(ROUTE_ID, now + timedelta(seconds=1))
+
+    new_route_id = uuid4()
+    restored = queries.restore_route(ROUTE_ID, now + timedelta(seconds=2), new_route_id)
+    assert isinstance(restored, dict)
+    assert restored["route_id"] == str(new_route_id)
+    assert restored["status"] == "proposed"
+    assert restored["proposed_at"] == now + timedelta(seconds=2)
+    assert restored["restored_from_route_id"] == str(ROUTE_ID)
+    assert restored["dismissed_at"] is None
+
+    origin = queries.fetch_route(ROUTE_ID)
+    assert origin is not None
+    assert origin["status"] == "cancelled"
+    assert restored["stops"] == origin["stops"]
+
+    assert (
+        queries.restore_route(MISSING_ROUTE_ID, now, uuid4())
+        is queries.RouteTransitionResult.NOT_FOUND
+    )
+
+
+def test_restore_route_keeps_one_open_candidate_per_origin(database_url: str) -> None:
+    """같은 원본을 여러 번 되돌려도 대기 중인 후보는 하나만 남는다."""
+    now = datetime.now(UTC)
+    _seed_serving_fixture(database_url, now)
+
+    queries.dispatch_route(ROUTE_ID, now)
+    queries.cancel_route(ROUTE_ID, now + timedelta(seconds=1))
+
+    first = queries.restore_route(ROUTE_ID, now + timedelta(seconds=2), uuid4())
+    assert isinstance(first, dict)
+
+    # 두 번째 요청은 새 후보를 만들지 않고 대기 중인 후보를 그대로 돌려준다.
+    second = queries.restore_route(ROUTE_ID, now + timedelta(seconds=3), uuid4())
+    assert isinstance(second, dict)
+    assert second["route_id"] == first["route_id"]
+    assert second["proposed_at"] == first["proposed_at"]
+    assert second["stops"] == first["stops"]
+
+    with psycopg.connect(database_url) as connection:
+        clone_count = connection.execute(
+            """
+            SELECT count(*)
+              FROM rebalance_route
+             WHERE restored_from_route_id = %(route_id)s
+            """,
+            {"route_id": ROUTE_ID},
+        ).fetchone()
+        assert clone_count is not None
+        assert clone_count[0] == 1
+
+    # 후보가 출동으로 넘어가면 슬롯이 풀려 원본을 다시 되돌릴 수 있다.
+    clone_id = UUID(first["route_id"])
+    queries.dispatch_route(clone_id, now + timedelta(seconds=4))
+    third = queries.restore_route(ROUTE_ID, now + timedelta(seconds=5), uuid4())
+    assert isinstance(third, dict)
+    assert third["route_id"] != first["route_id"]
+    assert third["status"] == "proposed"
+    assert third["stops"] == first["stops"]
+
+    # 우회 INSERT도 DB가 막는다. 중복 방지는 애플리케이션 규칙이 아니다.
+    with (
+        psycopg.connect(database_url) as connection,
+        pytest.raises(psycopg.errors.UniqueViolation),
+    ):
+        connection.execute(
+            """
+            INSERT INTO rebalance_route (
+                route_id, dispatch_center_id, route_status_cd,
+                proposed_dttm, restored_from_route_id
+            )
+            SELECT %(new_route_id)s, dispatch_center_id, 'proposed',
+                   %(now)s, %(route_id)s
+              FROM rebalance_route
+             WHERE route_id = %(route_id)s
+            """,
+            {
+                "new_route_id": uuid4(),
+                "now": now + timedelta(seconds=6),
+                "route_id": ROUTE_ID,
+            },
+        )
 
 def test_dispatch_rejects_route_sharing_station_with_dispatched(
     database_url: str,

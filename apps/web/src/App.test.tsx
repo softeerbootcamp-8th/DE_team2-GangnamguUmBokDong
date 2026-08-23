@@ -19,6 +19,8 @@ const apiMock = vi.hoisted(() => ({
   dispatchRoute: vi.fn(),
   completeRoute: vi.fn(),
   cancelRoute: vi.fn(),
+  dismissRoute: vi.fn(),
+  restoreRoute: vi.fn(),
 }));
 
 vi.mock("./api", async (importOriginal) => {
@@ -115,6 +117,8 @@ const ROUTES: Route[] = [
     dispatched_at: null,
     completed_at: null,
     cancelled_at: null,
+    dismissed_at: null,
+    restored_from_route_id: null,
     stops: [
       {
         visit_order: 1,
@@ -208,6 +212,88 @@ describe("App polling state", () => {
 
     expect(screen.queryByRole("button", { name: "승인" })).toBeNull();
     expect(screen.getByRole("button", { name: "완료" })).not.toBeNull();
+  });
+
+  it("완료된 작업을 삭제하면 목록에서 즉시 사라진다", async () => {
+    const completed: Route = {
+      ...ROUTES[0],
+      status: "completed",
+      dispatched_at: "2026-08-20T00:01:00Z",
+      completed_at: "2026-08-20T00:02:00Z",
+    };
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
+    apiMock.stations.mockResolvedValue(STATIONS);
+    apiMock.routes.mockResolvedValue([completed]);
+    apiMock.dismissRoute.mockResolvedValue({ ...completed, dismissed_at: "2026-08-20T00:03:00Z" });
+    render(<App />);
+    await settleRequests();
+    await settleRequests();
+
+    fireEvent.click(screen.getByRole("button", { name: "삭제" }));
+    await settleRequests();
+
+    expect(apiMock.dismissRoute).toHaveBeenCalledWith(completed.route_id);
+    expect(screen.queryByRole("button", { name: "삭제" })).toBeNull();
+    confirmSpy.mockRestore();
+  });
+
+  it("취소된 작업을 되돌리면 새 후보가 목록에 붙는다", async () => {
+    const cancelled: Route = {
+      ...ROUTES[0],
+      status: "cancelled",
+      dispatched_at: "2026-08-20T00:01:00Z",
+      cancelled_at: "2026-08-20T00:02:00Z",
+    };
+    const restored: Route = {
+      ...ROUTES[0],
+      route_id: "99999999-9999-4999-8999-999999999999",
+      status: "proposed",
+      proposed_at: "2026-08-20T00:03:00Z",
+      restored_from_route_id: ROUTES[0].route_id,
+    };
+    apiMock.stations.mockResolvedValue(STATIONS);
+    apiMock.routes.mockResolvedValue([cancelled]);
+    apiMock.restoreRoute.mockResolvedValue(restored);
+    render(<App />);
+    await settleRequests();
+    await settleRequests();
+
+    fireEvent.click(screen.getByRole("button", { name: "되돌리기" }));
+    await settleRequests();
+
+    expect(apiMock.restoreRoute).toHaveBeenCalledWith(cancelled.route_id);
+    expect(screen.getByRole("button", { name: "승인" })).not.toBeNull();
+  });
+
+  it("이미 대기 중인 후보를 다시 돌려받아도 목록에 중복으로 쌓이지 않는다", async () => {
+    const cancelled: Route = {
+      ...ROUTES[0],
+      status: "cancelled",
+      dispatched_at: "2026-08-20T00:01:00Z",
+      cancelled_at: "2026-08-20T00:02:00Z",
+    };
+    const reused: Route = {
+      ...ROUTES[0],
+      route_id: "99999999-9999-4999-8999-999999999999",
+      status: "proposed",
+      proposed_at: "2026-08-20T00:03:00Z",
+      restored_from_route_id: ROUTES[0].route_id,
+    };
+    apiMock.stations.mockResolvedValue(STATIONS);
+    apiMock.routes.mockResolvedValue([cancelled]);
+    // 서버는 두 번째 되돌리기에도 같은 후보를 돌려준다.
+    apiMock.restoreRoute.mockResolvedValue(reused);
+    render(<App />);
+    await settleRequests();
+    await settleRequests();
+
+    fireEvent.click(screen.getByRole("button", { name: "되돌리기" }));
+    await settleRequests();
+    fireEvent.click(screen.getByRole("button", { name: "되돌리기" }));
+    await settleRequests();
+
+    expect(apiMock.restoreRoute).toHaveBeenCalledTimes(2);
+    expect(screen.getAllByRole("button", { name: "승인" })).toHaveLength(1);
   });
 
   it("대여소 선택을 바꾸는 즉시 이전 forecast를 지운다", async () => {

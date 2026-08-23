@@ -391,6 +391,8 @@ def test_registry_matches_all_ten_ssot_publication_keys() -> None:
             ("station", "station_demand_forecast", "station_stock"),
             (
                 "demand_publication_manifest",
+                # 위치 index가 아니라 offset(분)에서 유도한다. 결측 window가
+                # 허용되므로 어떤 window를 썼는지 role로 드러나야 한다.
                 "stock_history_manifest_m05",
                 "stock_history_manifest_m10",
                 "stock_history_manifest_m15",
