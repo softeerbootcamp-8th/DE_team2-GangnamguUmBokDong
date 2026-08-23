@@ -23,29 +23,52 @@ const ALL_REGIONS = "all";
 type ListMode = "routes" | "stations";
 type RouteTransition = "dispatch" | "complete" | "cancel" | "dismiss" | "restore";
 
-function revealRouteCard(routeId: string | null, behavior: ScrollBehavior) {
-  if (routeId === null) return;
-  const card = [...document.querySelectorAll<HTMLElement>("[data-route-id]")]
-    .find((element) => element.dataset.routeId === routeId);
-  card?.scrollIntoView?.({ behavior, block: "nearest", inline: "nearest" });
+function routeCard(routeId: string | null): HTMLElement | null {
+  if (routeId === null) return null;
+  return [...document.querySelectorAll<HTMLElement>("[data-route-id]")]
+    .find((element) => element.dataset.routeId === routeId) ?? null;
+}
+
+function revealRouteCard(card: HTMLElement | null, behavior: ScrollBehavior) {
+  const list = card?.closest<HTMLElement>(".route-column-list");
+  if (!card || !list) return;
+  const targetTop = card.offsetTop - ((list.clientHeight - card.offsetHeight) / 2);
+  list.scrollTo?.({ top: Math.max(0, targetTop), behavior });
 }
 
 async function updateRoutesWithMotion(routeId: string | null, update: () => void) {
   const reducedMotion = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false;
-  const startViewTransition = document.startViewTransition?.bind(document);
-  const applyUpdate = () => {
-    flushSync(update);
-    revealRouteCard(routeId, reducedMotion ? "auto" : "smooth");
-  };
-  if (!startViewTransition || reducedMotion) {
-    applyUpdate();
+  const previousPosition = routeCard(routeId)?.getBoundingClientRect() ?? null;
+  flushSync(update);
+  const card = routeCard(routeId);
+  revealRouteCard(card, reducedMotion ? "auto" : "smooth");
+  if (reducedMotion || !card?.animate) {
     return;
   }
-  const transition = startViewTransition(applyUpdate);
+  const nextPosition = card.getBoundingClientRect();
+  const horizontalOffset = previousPosition === null
+    ? 0
+    : Math.max(-24, Math.min(24, previousPosition.left - nextPosition.left));
+  const verticalOffset = previousPosition === null
+    ? -12
+    : Math.max(-18, Math.min(18, previousPosition.top - nextPosition.top));
+  const animation = card.animate(
+    [
+      {
+        opacity: 0.68,
+        transform: `translate(${horizontalOffset}px, ${verticalOffset}px) scale(0.985)`,
+      },
+      { opacity: 1, transform: "translate(0, 0) scale(1)" },
+    ],
+    {
+      duration: 480,
+      easing: "cubic-bezier(0.22, 1, 0.36, 1)",
+    },
+  );
   try {
-    await transition.finished;
+    await animation.finished;
   } catch {
-    // 브라우저가 다른 전환으로 대체해도 상태 변경은 이미 적용됐으므로 그대로 끝낸다.
+    // 연속 조작으로 애니메이션이 교체돼도 상태 변경은 이미 적용됐다.
   }
 }
 

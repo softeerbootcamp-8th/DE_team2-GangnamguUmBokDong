@@ -224,24 +224,16 @@ describe("App polling state", () => {
       .toBeNull();
   });
 
-  it("상태가 바뀌는 작업 카드를 view transition으로 이동한다", async () => {
-    const scrollIntoView = vi.fn();
-    Object.defineProperty(HTMLElement.prototype, "scrollIntoView", {
+  it("상태가 바뀐 실제 카드 DOM을 목록 안에서 애니메이션한다", async () => {
+    const scrollTo = vi.fn();
+    const animate = vi.fn(() => ({ finished: Promise.resolve() }));
+    Object.defineProperty(HTMLElement.prototype, "scrollTo", {
       configurable: true,
-      value: scrollIntoView,
+      value: scrollTo,
     });
-    const startViewTransition = vi.fn((update: () => void) => {
-      update();
-      return {
-        finished: Promise.resolve(),
-        ready: Promise.resolve(),
-        updateCallbackDone: Promise.resolve(),
-        skipTransition: vi.fn(),
-      };
-    });
-    Object.defineProperty(document, "startViewTransition", {
+    Object.defineProperty(HTMLElement.prototype, "animate", {
       configurable: true,
-      value: startViewTransition,
+      value: animate,
     });
     apiMock.stations.mockResolvedValue(STATIONS);
     render(<App />);
@@ -251,14 +243,17 @@ describe("App polling state", () => {
     fireEvent.click(screen.getByRole("button", { name: "승인" }));
     await settleRequests();
 
-    expect(startViewTransition).toHaveBeenCalledTimes(1);
-    expect(scrollIntoView).toHaveBeenCalledWith({
+    expect(animate).toHaveBeenCalledTimes(1);
+    expect(scrollTo).toHaveBeenCalledWith({
       behavior: "smooth",
-      block: "nearest",
-      inline: "nearest",
+      top: 0,
     });
     expect(screen.getByRole("button", { name: "완료" })).not.toBeNull();
-    Object.defineProperty(document, "startViewTransition", {
+    Object.defineProperty(HTMLElement.prototype, "animate", {
+      configurable: true,
+      value: undefined,
+    });
+    Object.defineProperty(HTMLElement.prototype, "scrollTo", {
       configurable: true,
       value: undefined,
     });
