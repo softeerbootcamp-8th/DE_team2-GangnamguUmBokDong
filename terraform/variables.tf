@@ -63,16 +63,24 @@ variable "app_instance_type" {
     상시 EC2. Airflow 3종 + API + nginx + MLflow가 상주하고(~2.1GB) 그 위에
     BashOperator subprocess가 프로세스당 400MB~1.2GB로 뜬다. Graviton을 쓰는 이유는
     전 모듈 uv.lock에 aarch64 휠이 있어서다(LightGBM 포함).
-    2026-08-22 실측으로 t4g.xlarge로 올렸다 — 병목은 메모리가 아니라 vCPU였다.
-    t4g.large(2 vCPU)에서 realtime_5min 한 tick이 530초 걸려 5분 주기를 못 맞췄고,
+    2026-08-22에 t4g.large -> xlarge -> large로 다시 내렸다. 그 사이 실측 기록:
+
+    t4g.large(2 vCPU)에서 realtime_5min 한 tick이 530초로 5분 주기를 못 맞췄고,
     그중 149초는 연산이 아니라 prepare_serving_plan 완료 후 run_inference가
     시작되기까지의 순수 큐잉이었다(load average 1.88/2코어, scheduler 컨테이너
-    단독 134% CPU). tick이 밀리면 Airflow가 5분 tick을 건너뛰고, 그러면
-    publish_station_urgency의 -5·-10·-15·-20·-25분 게시 요건이 영구히 깨진다.
-    같은 Graviton 계열이라 stop → 변경 → start로 in-place 처리되고 EBS가 유지된다.
+    단독 134% CPU). xlarge로 올리면 그 큐잉이 0.1초로 사라졌지만
+    prepare_serving_plan 자체는 184 -> 175초로 거의 안 줄었다 — 그건 CPU가 아니라
+    PostGIS 거리 쿼리를 좌표 쌍마다 왕복한 탓이었고(106,626회), 배치 쿼리로 고쳐
+    36초가 됐다. 그 결과 tick이 226초가 되어 large로 되돌릴 여유가 생겼다.
+
+    **되돌린 뒤 확인할 것**: tick이 300초에 가까워지면 Airflow가 5분 tick을
+    건너뛰고, 그러면 publish_station_urgency의 -5·-10·-15·-20·-25분 요건이
+    깨진 window를 참조하는 25분간 실패한다(소급 복구 불가). 그때는 다시 xlarge로
+    올린다 — 같은 Graviton 계열이라 stop -> 변경 -> start로 in-place 처리되고
+    EBS가 유지된다.
   EOT
   type        = string
-  default     = "t4g.xlarge"
+  default     = "t4g.large"
 }
 
 variable "train_instance_type" {
