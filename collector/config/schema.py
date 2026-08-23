@@ -127,6 +127,15 @@ class Quality(BaseModel):
     max_missing_ratio: float = Field(default=0.0, ge=0, le=1)
     allow_empty: bool = False
 
+    # 소스가 알려준 전체 건수보다 실제 받은 행이 많을 때 용인할 비율.
+    #
+    # 기본값 0은 "한 행이라도 초과하면 실패"다 — snapshot 성격의 소스에서는 초과가
+    # 곧 옛 payload와 새 total이 섞였다는 뜻이라 그대로 막아야 한다. 반대로 행이
+    # 쌓이기만 하는 소스(대여이력)는 진행 중인 window를 조회할 때 API가 같은 본문
+    # 안에서 list_total_count보다 많은 row를 주는 일이 있다. 그 초과분은 누락이
+    # 아니라 카운트 계산과 직렬화 사이에 들어온 실제 레코드이므로 소스별로 열어준다.
+    max_overfetch_ratio: float = Field(default=0.0, ge=0, le=1)
+
 
 class Fetch(BaseModel):
     """API 호출할 때, 얼마나 오랫동안 시도할지 설정하는 모델"""

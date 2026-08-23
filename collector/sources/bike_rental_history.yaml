@@ -41,6 +41,13 @@ quality:
   max_missing_ratio: 0.05
   allow_empty: false
 
+  # 진행 중인 시간대를 조회하면 API가 같은 본문 안에서 list_total_count보다 많은
+  # row를 주는 일이 있다(실측 2026-08-23: rows=989 expected=988, 하루 5회 이상).
+  # 대여이력은 행이 쌓이기만 하므로 그 초과분은 누락이 아니라 카운트 계산과 직렬화
+  # 사이에 들어온 실제 레코드다. 1%면 피크(17페이지, 약 17,000건)에서 170행까지
+  # 열어주는 셈이고, 페이지 중복 병합 같은 진짜 사고는 최소 +100%라 계속 걸린다.
+  max_overfetch_ratio: 0.01
+
 backfill:
   enabled: true
   max_age: 7d

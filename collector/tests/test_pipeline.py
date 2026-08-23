@@ -346,6 +346,76 @@ class TestMissingRatioGate:
         assert result.counts.fetched == 4
         assert result.artifacts.silver is None
 
+    def test_overfetch_within_tolerance_succeeds_for_append_only_source(
+        self,
+        scripted_adapter,
+        client,
+        monkeypatch,
+    ):
+        """카운트가 행 배열보다 하나 뒤처진 응답을 fetch 실패로 만들지 않는다.
+
+        서울 API는 진행 중인 시간대를 조회하면 같은 본문 안에서 list_total_count가
+        row 배열보다 적은 값을 주는 일이 있다(레코드 하나가 카운트 계산과 직렬화
+        사이에 들어온 경우). 대여이력처럼 행이 쌓이기만 하는 소스에서 그 초과분은
+        누락이 아니라 더 최신인 실제 레코드다.
+        """
+        scripted_adapter.results = [[
+            FetchResult(key="a", payload=_chunk("a"), error=None, expected_total=100)
+        ]]
+        monkeypatch.setattr(
+            scripted_adapter,
+            "normalize",
+            staticmethod(lambda chunks, config: [{"k": str(i)} for i in range(101)]),
+        )
+        config = _config(
+            quality=Quality(
+                max_drop_ratio=1.0,
+                max_missing_ratio=0.0,
+                allow_empty=True,
+                max_overfetch_ratio=0.01,
+            )
+        )
+
+        result = pipeline.execute_window(config, WINDOW_START, client=client)
+
+        assert result.failure_reason is None
+        assert result.artifacts.silver is not None
+        # 카운트가 아니라 실제 행 배열을 이 window의 cardinality로 확정한다.
+        # Gold의 SUCCEEDED 계약도 expected==fetched를 요구한다.
+        assert result.counts.expected == 101
+        assert result.counts.fetched == 101
+        assert result.missing.rows == 0
+
+    def test_overfetch_beyond_tolerance_still_fails(
+        self,
+        scripted_adapter,
+        client,
+        monkeypatch,
+    ):
+        """허용치를 넘는 초과는 여전히 막는다 — 페이지 중복 병합 같은 진짜 사고다."""
+        scripted_adapter.results = [[
+            FetchResult(key="a", payload=_chunk("a"), error=None, expected_total=100)
+        ]]
+        monkeypatch.setattr(
+            scripted_adapter,
+            "normalize",
+            staticmethod(lambda chunks, config: [{"k": str(i)} for i in range(200)]),
+        )
+        config = _config(
+            quality=Quality(
+                max_drop_ratio=1.0,
+                max_missing_ratio=0.0,
+                allow_empty=True,
+                max_overfetch_ratio=0.01,
+            )
+        )
+
+        result = pipeline.execute_window(config, WINDOW_START, client=client)
+
+        assert result.status == RunStatus.FAILED
+        assert result.failure_reason == FailureReason.FETCH_ERROR
+        assert result.artifacts.silver is None
+
 
 class TestFatalAbortsImmediately:
     def test_fatal_skips_gate_and_fails_with_fetch_error(
