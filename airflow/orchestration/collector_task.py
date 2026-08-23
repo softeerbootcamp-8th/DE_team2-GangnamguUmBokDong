@@ -7,8 +7,14 @@
 
 from __future__ import annotations
 
+from datetime import timedelta
+
 from airflow.task.trigger_rule import TriggerRule
-from config.schedules import DEFAULT_EXECUTION_TIMEOUT, EXECUTION_TIMEOUT_OVERRIDES
+from config.schedules import (
+    DEFAULT_EXECUTION_TIMEOUT,
+    DEFAULT_RETRIES,
+    EXECUTION_TIMEOUT_OVERRIDES,
+)
 
 from orchestration.task_builder import REPO_ROOT, build_module_task
 from orchestration.templates import (
@@ -20,8 +26,16 @@ from orchestration.templates import (
 COLLECTOR_DIR = str(REPO_ROOT / "collector")
 
 
-def build_collector_task(dag, source_id: str):
-    timeout = EXECUTION_TIMEOUT_OVERRIDES.get(source_id, DEFAULT_EXECUTION_TIMEOUT)
+def build_collector_task(
+    dag,
+    source_id: str,
+    *,
+    retries: int = DEFAULT_RETRIES,
+    execution_timeout: timedelta | None = None,
+):
+    timeout = execution_timeout or EXECUTION_TIMEOUT_OVERRIDES.get(
+        source_id, DEFAULT_EXECUTION_TIMEOUT
+    )
     cmd = f"uv run --frozen python main.py --source {source_id} --window-start {KST_WINDOW_START}"
     return build_module_task(
         dag,
@@ -29,6 +43,7 @@ def build_collector_task(dag, source_id: str):
         COLLECTOR_DIR,
         cmd,
         execution_timeout=timeout,
+        retries=retries,
     )
 
 

@@ -94,13 +94,19 @@ def _filter_grid_rows_for_hour(grid_table: pa.Table, hour: int) -> dict[str, mer
             )
         return text
 
+    # 하루치 테이블(25만 행대)을 매 target(최대 13개)마다 통째로 to_pylist하면 비용이
+    # 13배로 쌓인다. TT 컬럼만 먼저 pylist로 훑어 대상 시각 행의 인덱스를 추리고,
+    # 전체 컬럼 변환은 그 부분집합에만 적용한다 — TT 검증은 여전히 전 행에 적용된다.
+    matching_indices = [
+        index
+        for index, raw in enumerate(grid_table.column("TT").to_pylist())
+        if _parse_hour(raw) == hour
+    ]
+
     spop_by_cell: dict[str, float] = {}
     ages_by_cell: dict[str, dict[str, float]] = {}
     h_dng_codes_by_cell: dict[str, set[str]] = {}
-    for row in grid_table.to_pylist():
-        if _parse_hour(row.get("TT")) != hour:
-            continue
-
+    for row in grid_table.take(matching_indices).to_pylist():
         cell_id = _required_text(row.get("CELL_ID"), "CELL_ID")
         h_dng_cd = _required_text(row.get("H_DNG_CD"), "H_DNG_CD", ascii_digits=True)
         spop_by_cell[cell_id] = spop_by_cell.get(cell_id, 0.0) + float(row["SPOP"] or 0.0)

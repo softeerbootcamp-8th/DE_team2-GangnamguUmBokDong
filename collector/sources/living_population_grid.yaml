@@ -1,7 +1,12 @@
 source_id: living_population_grid
 description: "\uC11C\uC6B8 \uC0DD\uD65C\uC778\uAD6C(250m)"
 adapter: seoul_openapi
-adapter_params: {service: Se250MSpopLocalResd, page_size: 1000, root_key: Se250MSpopLocalResd.row}
+adapter_params:
+  service: Se250MSpopLocalResd
+  page_size: 1000
+  root_key: Se250MSpopLocalResd.row
+  # 254페이지를 순차로 돌면 페이지당 실측 지연(0.5~0.7s대) 기준 2~3분이 걸린다.
+  concurrency: 8
 schedule: {interval: 1d}
 storage:
   bronze_format: json

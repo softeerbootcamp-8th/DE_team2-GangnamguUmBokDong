@@ -6,16 +6,32 @@ from datetime import timedelta
 
 TIMEZONE = "Asia/Seoul"
 
-REALTIME_5MIN_CRON = "*/5 * * * *"
-WEATHER_10MIN_CRON = "*/10 * * * *"
-WEATHER_3H_CRON = "0 */3 * * *"
+# realtime tick(5분 격자)을 날씨 필요 여부에 따라 4개 cron으로 쪼갠다 — 이전에는
+# 매 tick마다 `wait_for_weather_manifests` 센서가 날씨 authority가 준비됐는지
+# 폴링했는데(워커 슬롯이 3개뿐인 인스턴스에서 슬롯을 붙잡는 비용이 있었다), 서울시
+# 초단기/단기예보가 필요한 시각은 애초에 분·시 나머지 연산으로 고정돼 있어(구
+# loader/serving_cli.py의 weather_sources_ready 참고, 지금은 제거됨) 런타임에 물어볼
+# 필요 없이 스케줄 자체로 나눌 수 있다. 이 4개 cron의 합집합은 예전 REALTIME_5MIN_CRON
+# (`*/5 * * * *`)의 매 5분 tick과 정확히 같다 — 겹치거나 빠지는 tick이 없어야 한다.
+#
+# - 분%10 != 0: 날씨 없음(초단기예보가 발행되는 시각이 아니라 체크 자체가 무의미)
+# - 분 in {10,20,30,40,50} (매시): 초단기실황·예보만
+# - 분 == 0, 시%3 != 0: 초단기실황·예보만 (분=0이 3시간 경계가 아닌 시각)
+# - 분 == 0, 시%3 == 0: 초단기실황·예보 + 단기예보 (3시간 경계, 구 WEATHER_3H_CRON과 동일 시각)
+REALTIME_TICK_CRON = "5,15,25,35,45,55 * * * *"
+REALTIME_TICK_ULTRA_WEATHER_CRON = "10,20,30,40,50 * * * *"
+REALTIME_TICK_ULTRA_WEATHER_ON_HOUR_CRON = (
+    "0 1,2,4,5,7,8,10,11,13,14,16,17,19,20,22,23 * * *"
+)
+REALTIME_TICK_FULL_WEATHER_CRON = "0 0,3,6,9,12,15,18,21 * * *"
 # living_population_grid는 그날 데이터를 하루 1개 파일로 발행한다 — 실제 발행 시각을
 # 확인해 필요하면 조정한다.
 DAILY_CRON = "0 3 * * *"
 
-# station_master는 DAILY_CRON(03:00)을 쓰면 안 된다. 03:00은 REALTIME_5MIN_CRON의
-# 5분 격자에 정확히 걸리므로 두 DAG이 동시에 시작하고, station_master가 약 88초 뒤
-# bike_station_master authority를 게시한다. 그 시각이 realtime_5min 같은 tick의
+# station_master는 DAILY_CRON(03:00)을 쓰면 안 된다. 03:00은 realtime tick 격자
+# (지금은 REALTIME_TICK_FULL_WEATHER_CRON, 3시간 경계)에 정확히 걸리므로 두 DAG이
+# 동시에 시작하고, station_master가 약 88초 뒤 bike_station_master authority를
+# 게시한다. 그 시각이 realtime tick의
 # prepare_serving_plan(고정)과 finalize_serving_release(재검증) 사이에 들어가면
 # "locked station master authority가 바뀌었습니다"로 그 tick의 Gold 게시가 실패한다
 # (2026-08-22 실측: 06:15 tick, prepare 06:15:46 종료 -> master 게시 06:18:01 ->
@@ -67,8 +83,6 @@ INFERENCE_EXECUTION_TIMEOUT = timedelta(seconds=300)
 # 기준 165초가 걸렸다(2026-08-21, CPU는 21초뿐이라 대부분 네트워크 I/O 대기).
 # 기존 120초는 이 실측 전의 placeholder였다 — 여유를 두고 300초로 올린다.
 DB_LOADER_EXECUTION_TIMEOUT = timedelta(seconds=300)
-WEATHER_MANIFEST_WAIT_TIMEOUT_SECONDS = 30
-WEATHER_MANIFEST_POKE_INTERVAL_SECONDS = 2
 # 실측 데이터 없음(placeholder) — S3 tick 5~6개 + 예측 결과 1개만 읽는 순수 계산이라
 # 추론보다는 가볍게 잡았다. 로컬에서 1회 실행 시간을 재본 뒤 조정.
 URGENCY_EXECUTION_TIMEOUT = timedelta(seconds=180)

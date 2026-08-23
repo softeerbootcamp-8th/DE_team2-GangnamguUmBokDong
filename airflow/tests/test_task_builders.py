@@ -30,7 +30,6 @@ from orchestration.serving_task import (
     LOADER_DIR,
     build_finalize_serving_task,
     build_prepare_serving_task,
-    build_weather_manifest_sensor,
 )
 from orchestration.task_builder import REPO_ROOT, build_module_task
 from orchestration.templates import (
@@ -165,23 +164,6 @@ def test_prepare_task_emits_json_and_uses_templated_env(dag) -> None:
     assert task.output_processor('{"plan":{"uri":"s3://b/k"}}') == {
         "plan": {"uri": "s3://b/k"}
     }
-
-
-def test_weather_sensor_uses_loader_cli_and_bounded_soft_timeout(dag) -> None:
-    """날씨 Sensor는 2초 poke·30초 soft timeout으로 Loader CLI를 호출한다."""
-    task = build_weather_manifest_sensor(dag)
-
-    assert "serving_cli.py weather-ready" in task.bash_command
-    assert task.bash_command.startswith(
-        "env -u VIRTUAL_ENV UV_PROJECT_ENVIRONMENT=/opt/venvs/modules/loader "
-    )
-    assert f"uv run --project {LOADER_DIR}" in task.bash_command
-    assert task.poke_interval == 2
-    assert task.timeout == 30
-    assert task.soft_fail is True
-    assert task.mode == "poke"
-    assert task.retries == 0
-    assert "astimezone" in task.bash_command
 
 
 def test_inference_task_consumes_only_plan_ref_json(dag) -> None:
