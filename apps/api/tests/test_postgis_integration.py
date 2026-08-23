@@ -48,6 +48,7 @@ def _truncate_targets(database_url: str) -> None:
                 station,
                 dispatch_center,
                 weather_grid
+                ,gold_meta.publication_state
             CASCADE
             """
         )
@@ -315,6 +316,28 @@ def _seed_serving_fixture(database_url: str, now: datetime) -> datetime:
             """,
             {"base_dttm": base_dttm},
         )
+        connection.execute(
+            """
+            INSERT INTO gold_meta.publication_state (
+                publication_key,
+                logical_dttm,
+                revision_no,
+                manifest_uri,
+                artifact_set_sha256,
+                input_fingerprint_sha256,
+                published_row_cnt
+            ) VALUES (
+                'station_urgency',
+                %(base_dttm)s,
+                0,
+                's3://test/station_urgency/manifest.json',
+                repeat('a', 64),
+                repeat('b', 64),
+                1
+            )
+            """,
+            {"base_dttm": base_dttm},
+        )
         _executemany(
             connection,
             """
@@ -386,6 +409,68 @@ def test_serving_queries_use_real_postgis_and_fresh_projection(
     assert len(alerts) == 1
     assert alerts[0]["action_type"] == "retrieval_needed"
     assert alerts[0]["minutes_until_critical"] == 15
+    assert alerts[0]["base_dttm"] == base_dttm
+    assert alerts[0]["data_status"] == "fresh"
+    assert 0 <= alerts[0]["age_minutes"] <= 10
+
+
+def test_alerts_serve_one_last_known_good_snapshot_until_expiry(
+    database_url: str,
+) -> None:
+    """새 tick과 비정상 타-anchor 행을 섞지 않고 LKG 전체 set만 제공한다."""
+    now = datetime.now(UTC).replace(second=0, microsecond=0)
+    base_dttm = _seed_serving_fixture(database_url, now)
+    next_anchor = base_dttm + timedelta(minutes=5)
+
+    with psycopg.connect(database_url) as connection:
+        connection.execute(
+            """
+            UPDATE station
+               SET last_seen_dttm = %(next_anchor)s
+             WHERE sta_id = 'ST-1'
+            """,
+            {"next_anchor": next_anchor},
+        )
+        connection.execute(
+            """
+            INSERT INTO station_stock (sta_id, base_dttm, parking_bike_tot_cnt)
+            VALUES ('ST-1', %(next_anchor)s, 11)
+            ON CONFLICT (sta_id) DO UPDATE
+            SET base_dttm = EXCLUDED.base_dttm,
+                parking_bike_tot_cnt = EXCLUDED.parking_bike_tot_cnt
+            """,
+            {"next_anchor": next_anchor},
+        )
+        connection.execute(
+            """
+            INSERT INTO station_urgency (
+                sta_id, base_dttm, urgency_score,
+                critical_remaining_min, rebalance_need_type_cd
+            ) VALUES ('ST-2', %(next_anchor)s, 99.0, 1, 'supply_needed')
+            """,
+            {"next_anchor": next_anchor},
+        )
+
+    alerts = queries.fetch_alerts(base_dttm + timedelta(minutes=15))
+    assert [alert["sta_id"] for alert in alerts] == ["ST-1"]
+    assert {alert["base_dttm"] for alert in alerts} == {base_dttm}
+    assert {alert["data_status"] for alert in alerts} == {"stale"}
+    assert alerts[0]["age_minutes"] == pytest.approx(15.0)
+
+    assert queries.fetch_alerts(base_dttm + timedelta(minutes=20))
+    assert queries.fetch_alerts(base_dttm + timedelta(minutes=20, seconds=1)) == []
+
+    with psycopg.connect(database_url) as connection:
+        connection.execute(
+            """
+            UPDATE gold_meta.publication_state
+               SET logical_dttm = %(next_anchor)s,
+                   published_row_cnt = 2
+             WHERE publication_key = 'station_urgency'
+            """,
+            {"next_anchor": next_anchor},
+        )
+    assert queries.fetch_alerts(next_anchor) == []
 
     routes = queries.fetch_routes(status="proposed", limit=1)
     assert len(routes) == 1
