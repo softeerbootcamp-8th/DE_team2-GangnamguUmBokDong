@@ -479,22 +479,44 @@ def test_restore_returns_new_proposed_route(
     client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """restore는 취소된 작업을 복제한 새 후보를 201로 돌려준다."""
+    """restore가 실제로 복제했으면 새 후보를 201로 돌려준다."""
     restored = _route("proposed")
-    restored["route_id"] = "55555555-5555-4555-8555-555555555555"
     restored["restored_from_route_id"] = str(ROUTE_ID)
-    monkeypatch.setattr(
-        queries,
-        "restore_route",
-        lambda _route_id, _now, _new_route_id: restored,
-    )
+
+    def _restore(_route_id: UUID, _now: datetime, new_route_id: UUID) -> dict:
+        return {**restored, "route_id": str(new_route_id)}
+
+    monkeypatch.setattr(queries, "restore_route", _restore)
 
     response = client.post(f"/routes/{ROUTE_ID}/restore")
 
     assert response.status_code == 201
-    assert response.json()["route_id"] == "55555555-5555-4555-8555-555555555555"
+    assert response.json()["route_id"] != str(ROUTE_ID)
     assert response.json()["status"] == "proposed"
     assert response.json()["restored_from_route_id"] == str(ROUTE_ID)
+
+
+def test_restore_returns_existing_candidate_with_200(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """이미 대기 중인 후보를 재사용했으면 201이 아니라 200으로 알린다."""
+    reused = _route("proposed")
+    reused["route_id"] = "55555555-5555-4555-8555-555555555555"
+    reused["restored_from_route_id"] = str(ROUTE_ID)
+    monkeypatch.setattr(
+        queries,
+        "restore_route",
+        lambda _route_id, _now, _new_route_id: reused,
+    )
+
+    first = client.post(f"/routes/{ROUTE_ID}/restore")
+    second = client.post(f"/routes/{ROUTE_ID}/restore")
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first.json() == second.json()
+    assert first.json()["route_id"] == "55555555-5555-4555-8555-555555555555"
 
 
 @pytest.mark.parametrize(

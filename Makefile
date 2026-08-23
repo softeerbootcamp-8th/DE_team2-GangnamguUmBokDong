@@ -127,6 +127,11 @@ migrate-route-dismiss-restore:
 		psql -v ON_ERROR_STOP=1 -U "$${POSTGRES_USER:-postgres}" -d "$${POSTGRES_APP_DB:-app}" \
 		< ops/postgres/migrations/131_add_route_dismiss_and_restore.sql
 
+migrate-route-restore-uniqueness:
+	@$(COMPOSE) exec -T postgres \
+		psql -v ON_ERROR_STOP=1 -U "$${POSTGRES_USER:-postgres}" -d "$${POSTGRES_APP_DB:-app}" \
+		< ops/postgres/migrations/132_add_route_restore_uniqueness.sql
+
 seed:
 	@echo "[gold-postgis] make seed는 weather grid seed_version/effective_dttm SSOT 확정 전이라 비활성화되었습니다." >&2
 	@echo "[gold-postgis] 승인된 값으로 loader/gold_cli.py의 seed:dispatch_center, seed:weather_grid를 명시적으로 실행하세요." >&2

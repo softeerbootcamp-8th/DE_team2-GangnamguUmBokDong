@@ -6,7 +6,7 @@ from uuid import UUID, uuid4
 import queries
 from core.db import fetch_one
 from core.forecast import enrich_forecast_points
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
 from schemas import (
     Alert,
@@ -226,8 +226,15 @@ def dismiss_route(route_id: UUID) -> dict:
     return _route_transition_response(route_id, result, "completed or cancelled")
 
 
-@app.post("/routes/{route_id}/restore", response_model=Route, status_code=201)
-def restore_route(route_id: UUID) -> dict:
-    """취소된 route를 복제해 새 작업 후보로 되돌린다."""
-    result = queries.restore_route(route_id, queries.now_utc(), uuid4())
-    return _route_transition_response(route_id, result, "cancelled", "route_restore_conflict")
+@app.post("/routes/{route_id}/restore", response_model=Route)
+def restore_route(route_id: UUID, response: Response) -> dict:
+    """취소된 route를 복제해 새 작업 후보로 되돌린다.
+
+    되돌리기는 idempotent하다. 이미 대기 중인 후보가 있으면 새로 만들지 않고
+    그 후보를 200으로 돌려주고, 실제로 복제했을 때만 201을 쓴다.
+    """
+    new_route_id = uuid4()
+    result = queries.restore_route(route_id, queries.now_utc(), new_route_id)
+    route = _route_transition_response(route_id, result, "cancelled", "route_restore_conflict")
+    response.status_code = 201 if route["route_id"] == str(new_route_id) else 200
+    return route

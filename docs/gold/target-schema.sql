@@ -686,6 +686,12 @@ CREATE INDEX rebalance_route_proposed_dttm_idx
     ON rebalance_route (proposed_dttm DESC);
 CREATE INDEX rebalance_route_stop_station_idx
     ON rebalance_route_stop (sta_id);
+-- 같은 취소 작업을 여러 번 되돌려도 아직 승인되지 않은 복제본은 하나만 남긴다.
+-- 복제본이 dispatched로 넘어가면 슬롯이 풀려 원본을 다시 되돌릴 수 있다.
+CREATE UNIQUE INDEX rebalance_route_restore_open_uk
+    ON rebalance_route (restored_from_route_id)
+ WHERE restored_from_route_id IS NOT NULL
+   AND route_status_cd = 'proposed';
 
 DO $$
 DECLARE

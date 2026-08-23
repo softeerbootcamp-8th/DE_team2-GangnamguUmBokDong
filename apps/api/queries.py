@@ -696,6 +696,31 @@ def dismiss_route(
         return RouteTransitionResult.CONSTRAINT_CONFLICT
 
 
+def _reused_restore_candidate(
+    cursor: Cursor[dict[str, Any]],
+    route_id: UUID,
+) -> dict[str, Any] | RouteTransitionResult:
+    """이미 대기 중인 복제본을 찾아 되돌리기 재요청을 idempotent하게 만든다."""
+    cursor.execute(
+        """
+        SELECT route_id
+          FROM rebalance_route
+         WHERE restored_from_route_id = %(route_id)s
+           AND route_status_cd = 'proposed'
+        """,
+        {"route_id": route_id},
+    )
+    reused = cursor.fetchone()
+    if reused is None:
+        # unique index는 걸렸는데 후보가 없다면 다른 transaction이 방금 그 후보를
+        # 출동 처리한 것이다. 다시 시도하면 새 후보를 만들 수 있으므로 conflict로 알린다.
+        return RouteTransitionResult.CONSTRAINT_CONFLICT
+    route = _fetch_route_with_cursor(cursor, reused["route_id"])
+    if route is None:
+        raise RuntimeError("재사용할 route aggregate를 찾을 수 없습니다.")
+    return route
+
+
 def restore_route(
     route_id: UUID,
     now: datetime,
@@ -706,6 +731,11 @@ def restore_route(
     제자리 전이 대신 복제를 쓰는 이유는 proposed_dttm이 immutable이라
     되돌린 작업이 후보 창(최근 10분)을 통과하지 못하기 때문이다. 원본은
     cancelled로 남아 취소 이력이 지워지지 않는다.
+
+    같은 원본을 여러 번 되돌려도 아직 승인되지 않은 복제본은 하나만 남는다.
+    rebalance_route_restore_open_uk가 이를 DB에서 보장하므로 동시 요청도 막힌다.
+    이미 대기 중인 복제본이 있으면 실패시키지 않고 그 후보를 그대로 반환한다.
+    거절하면 후보 창을 벗어나 화면에서 사라진 복제본을 다시 불러올 방법이 없다.
     """
     try:
         with (
@@ -738,6 +768,11 @@ def restore_route(
                     %(new_route_id)s, %(dispatch_center_id)s, 'proposed',
                     %(now)s, %(route_id)s
                 )
+                ON CONFLICT (restored_from_route_id)
+                    WHERE restored_from_route_id IS NOT NULL
+                      AND route_status_cd = 'proposed'
+                    DO NOTHING
+                RETURNING route_id
                 """,
                 {
                     "new_route_id": new_route_id,
@@ -746,6 +781,9 @@ def restore_route(
                     "route_id": route_id,
                 },
             )
+            if cursor.fetchone() is None:
+                return _reused_restore_candidate(cursor, route_id)
+
             cursor.execute(
                 """
                 INSERT INTO rebalance_route_stop (
