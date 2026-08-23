@@ -175,6 +175,7 @@ def test_route_publish_replay_coverage_correction_stale_empty_and_rollback(
     assert _proposed_rows(gold_connection) == (corrected_routes, corrected_stops)
 
     empty_anchor = anchor + timedelta(minutes=10)
+    _advance_route_input_states(gold_connection, empty_anchor)
     empty_uri, empty_sha = _put_urgency_publication(
         gold_connection,
         store,
@@ -189,6 +190,30 @@ def test_route_publish_replay_coverage_correction_stale_empty_and_rollback(
     assert _route_state(gold_connection) == (empty_anchor, 0, 0)
     assert _proposed_rows(gold_connection) == ((), ())
     assert _terminal_rows(gold_connection) == terminal_before
+
+
+def test_route_rejects_last_known_good_urgency_after_current_inputs_advance(
+    gold_connection: Connection[Any],
+) -> None:
+    """Dashboard용 stale urgency는 current route 입력으로 재사용하지 않는다."""
+    store = S3ImmutableObjectStore(boto3.client("s3", region_name="us-east-1"))
+    anchor = datetime.now(UTC).replace(second=0, microsecond=0) - timedelta(minutes=30)
+    _insert_topology_and_dependency_states(gold_connection, anchor)
+    manifest_uri, manifest_sha = _put_urgency_publication(
+        gold_connection,
+        store,
+        logical_dttm=anchor,
+        revision_no=0,
+        pickup_qty=5,
+        dropoff_qty=5,
+    )
+    _advance_route_input_states(gold_connection, anchor + timedelta(minutes=5))
+
+    with pytest.raises(
+        route_module.ContractViolation,
+        match="같은 anchor의 urgency만 사용할 수",
+    ):
+        _publish(gold_connection, store, manifest_uri, manifest_sha)
 
 
 def test_concurrent_same_route_publication_is_publish_plus_replay(
@@ -518,6 +543,24 @@ def _advance_route_state_logical(
                SET logical_dttm = %s,
                    revision_no = 0
              WHERE publication_key = 'rebalance_route'
+            """,
+            (logical_dttm,),
+        )
+
+
+def _advance_route_input_states(
+    connection: Connection[Any],
+    logical_dttm: datetime,
+) -> None:
+    """Route 안전성 fixture의 current stock/demand anchor를 함께 전진시킨다."""
+    with connection.transaction(), connection.cursor() as cursor:
+        cursor.execute(
+            """
+            UPDATE gold_meta.publication_state
+               SET logical_dttm = %s
+             WHERE publication_key IN (
+                 'station_stock', 'station_demand_forecast'
+             )
             """,
             (logical_dttm,),
         )

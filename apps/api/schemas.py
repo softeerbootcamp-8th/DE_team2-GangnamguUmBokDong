@@ -55,6 +55,9 @@ class Alert(BaseModel):
     urgency_score: float
     minutes_until_critical: int
     region: str
+    base_dttm: datetime
+    data_status: Literal["fresh", "stale"]
+    age_minutes: float
 
 
 class StatusResponse(BaseModel):
