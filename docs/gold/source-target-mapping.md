@@ -597,7 +597,7 @@ advisory lock을 얻는 구현은 교착 위험 때문에 금지한다.
 | `GET /stations/{sta_id}/forecast` | `station` + `station_stock` + `station_demand_forecast` | `predicted_rtn_cnt→predicted_return_cnt`; `predicted_bikes`·action은 API 파생 | 모델 미지원은 404, fresh stock 없으면 503, 정확히 future 12행 |
 | `GET /status` | `station_demand_forecast` | 공통 `base_dttm` | projection이 없으면 `503 forecast_not_ready` |
 | `GET /stations/{sta_id}/events` | `station` + `event` | Point 거리→2자리 `distance_km`; API config→`radius_km`; 이름·장소·날짜 alias | missing/inactive station 404; KST 오늘·36시간 freshness |
-| `GET /stations/{sta_id}/weather?hours=12` | `station.weather_grid_id` + `weather_forecast` | 정시별 기온·강수·습도·풍속·상태 | 미래 12행 미만 또는 `min(updated_dttm)`이 now-45분..now+5분 밖이면 503; 실황·source lineage 미노출 |
+| `GET /stations/{sta_id}/weather?hours=12` | `station.weather_grid_id` + `weather_forecast` | 정시별 기온·강수·습도·풍속·상태 | 미래 12행 미만 또는 어느 행의 `base_dttm`이 제품별 허용 age(초단기 2시간, 단기 4시간)·now+5분 밖이면 503; 실황·source lineage 미노출 |
 | `GET /regions` | `dispatch_center` | 센터명→`region`, Point→`lat/lon` | Python 상수 제거, 활성 센터만 반환 |
 | `GET /alerts` | `station_urgency` + same-anchor `station_stock` + active `station` + active `dispatch_center` | need code→`action_type`, critical minutes alias | stock과 urgency base 일치; `(urgency_score DESC, sta_id ASC)` |
 | route 조회·상태 변경 API | `rebalance_route` + `rebalance_route_stop` + `station` + `dispatch_center` | UUID→문자열, 표준 컬럼→기존 응답 alias | 같은 snapshot; `(proposed_dttm DESC, route_id ASC)` 페이지 정렬 |

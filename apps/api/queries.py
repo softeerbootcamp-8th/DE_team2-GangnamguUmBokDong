@@ -16,11 +16,21 @@ from psycopg.rows import dict_row
 
 STOCK_FRESHNESS = timedelta(minutes=10)
 DEMAND_FRESHNESS = timedelta(minutes=10)
-WEATHER_FRESHNESS = timedelta(minutes=45)
+ULTRA_SHORT_FRESHNESS = timedelta(hours=2)
+SHORT_TERM_FRESHNESS = timedelta(hours=4)
 EVENT_FRESHNESS = timedelta(hours=36)
 FUTURE_TOLERANCE = timedelta(minutes=5)
 FORECAST_HOUR_COUNT = 12
 NEARBY_EVENT_RADIUS_KM = 1.5
+# 날씨 freshness는 DB 기록 시각이 아니라 기상청 발표 시각(base_dttm)으로 판정한다.
+# 게시 파이프라인은 값이 바뀐 행만 다시 쓰므로 DB 기록 시각은 발표 주기보다 오래
+# 멈춰 있을 수 있다. 임계값은 각 제품의 발표 주기(초단기 1시간, 단기 3시간)에
+# 한 주기만큼의 여유를 더한 값이다.
+WEATHER_FRESHNESS_BY_PRODUCT = {
+    "ultra_short": ULTRA_SHORT_FRESHNESS,
+    "short_term": SHORT_TERM_FRESHNESS,
+}
+_WEATHER_LINEAGE_KEYS = frozenset({"base_dttm", "source_product_cd"})
 
 
 class ForecastState(StrEnum):
@@ -376,7 +386,8 @@ def _read_weather_snapshot(
                    wf.precipitation_amount,
                    wf.humidity,
                    wf.wind_speed,
-                   wf.updated_dttm
+                   wf.source_product_cd,
+                   wf.base_dttm
               FROM station AS s
               JOIN weather_forecast AS wf USING (weather_grid_id)
              CROSS JOIN horizon AS h
@@ -409,17 +420,23 @@ def fetch_weather(
     if (
         len(rows) != hours
         or [row["forecast_dttm"] for row in rows] != expected_targets
-        or any(
-            not _is_fresh(row["updated_dttm"], now, WEATHER_FRESHNESS) for row in rows
-        )
+        or any(not _is_forecast_issue_fresh(row, now) for row in rows)
     ):
         return WeatherResult(WeatherState.WEATHER_NOT_READY)
 
     points = tuple(
-        {key: value for key, value in row.items() if key != "updated_dttm"}
+        {key: value for key, value in row.items() if key not in _WEATHER_LINEAGE_KEYS}
         for row in rows
     )
     return WeatherResult(WeatherState.READY, points)
+
+
+def _is_forecast_issue_fresh(row: dict[str, Any], now: datetime) -> bool:
+    """예보 행의 발표 시각이 그 제품의 허용 age 안인지 확인한다."""
+    max_age = WEATHER_FRESHNESS_BY_PRODUCT.get(row["source_product_cd"])
+    if max_age is None:
+        return False
+    return _is_fresh(row["base_dttm"], now, max_age)
 
 
 def fetch_regions() -> list[dict[str, Any]]:
