@@ -16,7 +16,7 @@ from psycopg.rows import dict_row
 STOCK_FRESHNESS = timedelta(minutes=10)
 DEMAND_FRESHNESS = timedelta(minutes=10)
 URGENCY_FRESHNESS = timedelta(minutes=10)
-URGENCY_EXPIRY = timedelta(minutes=20)
+URGENCY_EXPIRY = timedelta(minutes=60)
 ULTRA_SHORT_FRESHNESS = timedelta(hours=2)
 SHORT_TERM_FRESHNESS = timedelta(hours=4)
 EVENT_FRESHNESS = timedelta(hours=36)
