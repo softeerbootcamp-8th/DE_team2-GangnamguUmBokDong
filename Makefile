@@ -302,12 +302,17 @@ deploy-restart:
 deploy-resync:
 	$(PROD_COMPOSE) run --rm airflow-init
 
+# nginx가 대시보드와 /api/ 프록시를 Basic Auth로 잠그므로(ops/nginx/default.conf)
+# 자격증명 없이 찍으면 전부 401이 되어 smoke가 항상 실패한다. .env의 계정을 쓴다.
+# 8080은 nginx를 거치지 않고 Airflow가 직접 받으며 자체 로그인 화면을 200으로 준다.
 deploy-smoke:
 	@set -e; \
-	echo "[smoke] web";        curl -fsS -o /dev/null localhost/ && echo "  ok"; \
-	echo "[smoke] api health"; curl -fsS localhost/api/healthz && echo; \
-	echo "[smoke] api ready";  curl -fsS localhost/api/readyz  && echo; \
-	echo "[smoke] stations";   curl -fsS localhost/api/stations | head -c 200; echo; \
+	set -a; . $(PROD_ENV); set +a; \
+	AUTH="$$NGINX_BASIC_AUTH_USER:$$NGINX_BASIC_AUTH_PASSWORD"; \
+	echo "[smoke] web";        curl -fsS -u "$$AUTH" -o /dev/null localhost/ && echo "  ok"; \
+	echo "[smoke] api health"; curl -fsS -u "$$AUTH" localhost/api/healthz && echo; \
+	echo "[smoke] api ready";  curl -fsS -u "$$AUTH" localhost/api/readyz  && echo; \
+	echo "[smoke] stations";   curl -fsS -u "$$AUTH" localhost/api/stations | head -c 200; echo; \
 	echo "[smoke] airflow";    curl -fsS -o /dev/null -w '  http %{http_code}\n' localhost:8080/
 
 # --- 로컬에서 실행 ---
