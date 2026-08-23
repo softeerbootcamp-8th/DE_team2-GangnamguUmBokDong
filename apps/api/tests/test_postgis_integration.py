@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 from datetime import UTC, datetime, timedelta
-from uuid import UUID, uuid4
+from uuid import UUID
 from zoneinfo import ZoneInfo
 
 import main
@@ -413,6 +413,13 @@ def test_serving_queries_use_real_postgis_and_fresh_projection(
     assert alerts[0]["data_status"] == "fresh"
     assert 0 <= alerts[0]["age_minutes"] <= 10
 
+    routes = queries.fetch_routes(status="proposed", limit=1)
+    assert len(routes) == 1
+    assert routes[0]["route_id"] == str(ROUTE_ID)
+    assert routes[0]["stops"][0]["visit_order"] == 1
+    assert routes[0]["stops"][0]["lat"] == pytest.approx(37.5)
+    assert queries.fetch_route(ROUTE_ID) == routes[0]
+
 
 def test_alerts_serve_one_last_known_good_snapshot_until_expiry(
     database_url: str,
@@ -461,6 +468,51 @@ def test_alerts_serve_one_last_known_good_snapshot_until_expiry(
     assert queries.fetch_alerts(base_dttm + timedelta(minutes=20, seconds=1)) == []
 
     with psycopg.connect(database_url) as connection:
+        # 공통 fixture의 proposed route를 먼저 정상 삭제한다. Gold DDL은 proposed
+        # route만 삭제할 수 있고 stop은 FK cascade로 함께 제거된다. route 무결성
+        # trigger와 독립적으로 active topology projection만 검증하기 위한 격리다.
+        connection.execute(
+            "DELETE FROM rebalance_route WHERE route_status_cd = 'proposed'"
+        )
+        connection.execute(
+            "UPDATE station SET is_active = false WHERE sta_id = 'ST-1'"
+        )
+    assert queries.fetch_alerts(base_dttm + timedelta(minutes=15)) == []
+
+    with psycopg.connect(database_url) as connection:
+        connection.execute(
+            """
+            UPDATE station
+               SET is_active = false
+             WHERE dispatch_center_id = 'test_center'
+            """
+        )
+        connection.execute(
+            """
+            UPDATE dispatch_center
+               SET is_active = false
+             WHERE dispatch_center_id = 'test_center'
+            """
+        )
+    assert queries.fetch_alerts(base_dttm + timedelta(minutes=15)) == []
+
+    with psycopg.connect(database_url) as connection:
+        connection.execute(
+            """
+            UPDATE dispatch_center
+               SET is_active = true
+             WHERE dispatch_center_id = 'test_center'
+            """
+        )
+        connection.execute(
+            """
+            UPDATE station
+               SET is_active = true
+             WHERE dispatch_center_id = 'test_center'
+            """
+        )
+
+    with psycopg.connect(database_url) as connection:
         connection.execute(
             """
             UPDATE gold_meta.publication_state
@@ -471,13 +523,6 @@ def test_alerts_serve_one_last_known_good_snapshot_until_expiry(
             {"next_anchor": next_anchor},
         )
     assert queries.fetch_alerts(next_anchor) == []
-
-    routes = queries.fetch_routes(status="proposed", limit=1)
-    assert len(routes) == 1
-    assert routes[0]["route_id"] == str(ROUTE_ID)
-    assert routes[0]["stops"][0]["visit_order"] == 1
-    assert routes[0]["stops"][0]["lat"] == pytest.approx(37.5)
-    assert queries.fetch_route(ROUTE_ID) == routes[0]
 
 
 def test_route_lifecycle_and_constraint_error_mapping(database_url: str) -> None:
