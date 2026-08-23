@@ -270,8 +270,10 @@ target이 있으면 이를 사용하고 없으면 단기를 사용한다. 필요
 한 transaction에서 교체한다. 13번째 시각은 정각 rollover 중 미래 12행을 보장한다.
 writer는 topology shared lock을 얻은 뒤 입력 manifest와 활성 격자 fingerprint가 여전히
 최신인지 다시 확인하므로 오래 계산한 job이 나중 snapshot을 덮을 수 없다.
-API는 반환할 미래 12행의 `min(updated_dttm)`을 publication freshness로 사용하고
-`now-45분..now+5분` 범위 밖이면 503을 반환한다. 오래된 행 하나가 섞여도 fail-closed다.
+API는 반환할 미래 12행의 `base_dttm`(기상청 발표 시각)을 freshness 기준으로 쓰고
+제품별 허용 age(초단기예보 2시간, 단기예보 4시간) 또는 `now+5분`을 벗어나면 503을
+반환한다. 오래된 행 하나가 섞여도 fail-closed다. `updated_dttm`은 값이 바뀐 행만
+갱신되므로 발표 주기보다 오래 멈출 수 있어 freshness 기준으로 쓰지 않는다.
 
 수치 CHECK는 `temperature -50..50°C`, `precipitation_prob 0..100%`,
 `precipitation_amount 0 이상`, `humidity 0..100%`, `wind_speed 0..50m/s`다. 대상시각은

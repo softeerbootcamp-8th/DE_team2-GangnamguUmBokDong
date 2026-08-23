@@ -13,6 +13,7 @@ from psycopg.errors import CheckViolation, RaiseException
 NOW = datetime(2026, 8, 20, 1, 5, tzinfo=UTC)
 BASE = datetime(2026, 8, 20, 1, 0, tzinfo=UTC)
 ROUTE_ID = UUID("11111111-1111-4111-8111-111111111111")
+_ULTRA_SHORT_HOUR_COUNT = 6
 
 
 def _forecast_points(base_dttm: datetime = BASE) -> list[dict[str, Any]]:
@@ -53,9 +54,13 @@ def _forecast_snapshot(
 
 def _weather_rows(
     *,
-    updated_dttm: datetime = BASE,
+    ultra_short_base_dttm: datetime = NOW - timedelta(hours=1),
+    short_term_base_dttm: datetime = NOW - timedelta(hours=3),
 ) -> list[dict[str, Any]]:
-    """정확한 미래 12개 정시 날씨 fixture를 만든다."""
+    """앞 6정시는 초단기, 뒤 6정시는 단기예보인 12행 fixture를 만든다.
+
+    각 base_dttm 기본값은 그 제품의 직전 발표(초단기 1시간 주기, 단기 3시간 주기)다.
+    """
     first_target = NOW.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
     return [
         {
@@ -67,7 +72,14 @@ def _weather_rows(
             "precipitation_amount": None,
             "humidity": 60.0,
             "wind_speed": 2.0,
-            "updated_dttm": updated_dttm,
+            "source_product_cd": (
+                "ultra_short" if offset < _ULTRA_SHORT_HOUR_COUNT else "short_term"
+            ),
+            "base_dttm": (
+                ultra_short_base_dttm
+                if offset < _ULTRA_SHORT_HOUR_COUNT
+                else short_term_base_dttm
+            ),
         }
         for offset in range(queries.FORECAST_HOUR_COUNT)
     ]
@@ -309,7 +321,10 @@ def test_fetch_weather_returns_exact_fresh_horizon(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """날씨는 미래 첫 정시부터 정확히 12행이고 모두 fresh해야 한다."""
-    rows = _weather_rows(updated_dttm=NOW - queries.WEATHER_FRESHNESS)
+    rows = _weather_rows(
+        ultra_short_base_dttm=NOW - queries.ULTRA_SHORT_FRESHNESS,
+        short_term_base_dttm=NOW - queries.SHORT_TERM_FRESHNESS,
+    )
     monkeypatch.setattr(
         queries,
         "_read_weather_snapshot",
@@ -320,7 +335,22 @@ def test_fetch_weather_returns_exact_fresh_horizon(
 
     assert result.state is queries.WeatherState.READY
     assert len(result.points) == 12
-    assert "updated_dttm" not in result.points[0]
+    assert "base_dttm" not in result.points[0]
+    assert "source_product_cd" not in result.points[0]
+
+
+def test_fetch_weather_accepts_short_term_issued_over_45_minutes_ago(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """단기예보는 3시간 주기 발표이므로 3시간 전 발표도 fresh다."""
+    rows = _weather_rows(short_term_base_dttm=NOW - timedelta(hours=3))
+    monkeypatch.setattr(
+        queries,
+        "_read_weather_snapshot",
+        lambda _sta_id, _now, _hours: (True, rows),
+    )
+
+    assert queries.fetch_weather("ST-1", NOW).state is queries.WeatherState.READY
 
 
 def test_fetch_weather_reports_missing_station(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -337,25 +367,41 @@ def test_fetch_weather_reports_missing_station(monkeypatch: pytest.MonkeyPatch) 
     )
 
 
-@pytest.mark.parametrize("defect", ["missing", "wrong_hour", "stale", "future"])
+@pytest.mark.parametrize(
+    "defect",
+    [
+        "missing",
+        "wrong_hour",
+        "stale_ultra_short",
+        "stale_short_term",
+        "future",
+        "unknown_product",
+    ],
+)
 def test_fetch_weather_fails_closed_for_partial_or_stale_rows(
     monkeypatch: pytest.MonkeyPatch,
     defect: str,
 ) -> None:
-    """행 누락·시간 틀림·양방향 freshness 위반은 weather_not_ready다."""
-    rows = _weather_rows(updated_dttm=NOW)
+    """행 누락·시간 틀림·제품별 freshness 위반·미지 제품은 weather_not_ready다."""
+    rows = _weather_rows()
     if defect == "missing":
         rows.pop()
     elif defect == "wrong_hour":
         rows[4]["forecast_dttm"] += timedelta(minutes=30)
-    elif defect == "stale":
-        rows[4]["updated_dttm"] = (
-            NOW - queries.WEATHER_FRESHNESS - timedelta(microseconds=1)
+    elif defect == "stale_ultra_short":
+        rows[4]["base_dttm"] = (
+            NOW - queries.ULTRA_SHORT_FRESHNESS - timedelta(microseconds=1)
         )
-    else:
-        rows[4]["updated_dttm"] = (
+    elif defect == "stale_short_term":
+        rows[8]["base_dttm"] = (
+            NOW - queries.SHORT_TERM_FRESHNESS - timedelta(microseconds=1)
+        )
+    elif defect == "future":
+        rows[4]["base_dttm"] = (
             NOW + queries.FUTURE_TOLERANCE + timedelta(microseconds=1)
         )
+    else:
+        rows[4]["source_product_cd"] = "nowcast"
     monkeypatch.setattr(
         queries,
         "_read_weather_snapshot",
