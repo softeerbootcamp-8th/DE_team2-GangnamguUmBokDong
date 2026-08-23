@@ -158,13 +158,13 @@ def test_weather_variant_folds_collectors_and_gate_before_prepare(
     assert prepare.upstream_task_ids == {"collect_bike_station_realtime", "weather_ready_gate"}
     assert prepare.trigger_rule == TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS
 
+    # 재시도 없이 60초 안에 실패시킨다(세 소스 다 동일값, 소스별 dict라 필요하면
+    # 하나만 바꿀 수 있다 — realtime_tick.py의 _WEATHER_COLLECTOR_TIMEOUTS 참고).
     for source in expected_weather_sources:
         task = target_dag.get_task(f"collect_{source}")
         assert f"--source {source}" in task.bash_command
-        # 재시도 없이 30초 안에 실패시킨다 — 옛 wait_for_weather_manifests 센서의
-        # 30초 상한을 재현한다. 그래야 KMA가 느려도 게이트가 오래 안 막힌다.
         assert task.retries == 0
-        assert task.execution_timeout == timedelta(seconds=30)
+        assert task.execution_timeout == timedelta(seconds=60)
 
 
 @pytest.mark.parametrize("target_dag", _ALL_DAGS)

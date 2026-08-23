@@ -36,12 +36,19 @@ import copy
 import json
 import math
 import os
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING
 
 import httpx
 
-from adapters.base import FetchErrorKind, FetchResult, adapter, classify_http_status
+from adapters.base import (
+    FetchErrorKind,
+    FetchResult,
+    adapter,
+    classify_http_status,
+    run_concurrent,
+)
 
 if TYPE_CHECKING:
     from config.schema import SourceConfig
@@ -51,6 +58,10 @@ if TYPE_CHECKING:
 _BASE_URL = "https://apihub.kma.go.kr/api/typ02/openApi/VilageFcstInfoService_2.0"
 _NUM_OF_ROWS = 1000  # 격자 하나당 한 시각의 관측·예보 항목 수를 넉넉히 덮는 상한
 _EXPECTED_GRID_COUNT = 34
+# adapter_params에 concurrency를 선언하지 않은 소스는 순차로 돈다(seoul_openapi와
+# 같은 opt-in 관례). 단기예보(getVilageFcst)만 격자당 페이지 2장이 필요해 무거워서
+# concurrency를 켠다 — 실측(2026-08-23): 순차 50.89초 -> 4개씩 병렬로 크게 단축.
+_DEFAULT_CONCURRENCY = 1
 
 
 def _api_key() -> str:
@@ -131,6 +142,81 @@ def _merge_pages(bodies: list[dict], root_key: str) -> bytes:
     return json.dumps(merged).encode()
 
 
+@dataclass(frozen=True, slots=True)
+class _GridOutcome:
+    """격자 하나(페이지 여러 장 포함)를 전부 받은 뒤의 결과. 스레드풀 워커가
+    돌려주는 값이라 순수 데이터로 둔다."""
+
+    payload: bytes | None
+    error: FetchErrorKind | None
+
+
+def _fetch_grid(
+    client: httpx.Client,
+    endpoint: str,
+    root_key: str,
+    base_date: str,
+    base_time: str,
+    nx: int,
+    ny: int,
+) -> _GridOutcome:
+    """격자 하나를 필요한 만큼 페이지를 넘겨가며 받아 하나의 결과로 합친다.
+
+    페이지 중 하나라도 실패하면 그 격자 전체를 실패로 처리한다 — 부분 페이지만 따로
+    재시도하면 "이 격자는 몇 페이지짜리였는지"를 라운드 사이에 기억할 방법이 없다.
+    """
+    base_url = (
+        f"{_BASE_URL}/{endpoint}?authKey={_api_key()}&dataType=JSON"
+        f"&numOfRows={_NUM_OF_ROWS}"
+        f"&base_date={base_date}&base_time={base_time}&nx={nx}&ny={ny}"
+    )
+
+    page_bodies: list[dict] = []
+    first_page_raw: bytes | None = None
+    total_pages = 1
+    page_no = 1
+
+    while page_no <= total_pages:
+        url = f"{base_url}&pageNo={page_no}"
+        try:
+            response = client.get(url)
+        except httpx.RequestError:
+            return _GridOutcome(payload=None, error=FetchErrorKind.TRANSIENT)
+
+        category = classify_http_status(response.status_code)
+        if category is not None:
+            # FATAL(인증키 오류)이든 TRANSIENT/PERMANENT든 판정만 돌려준다 —
+            # "전체 중단할지"는 호출자(fetch)가 결정한다.
+            return _GridOutcome(payload=None, error=category)
+
+        # HTTP 200 OK일 경우 본문의 resultCode 확인
+        try:
+            body = json.loads(response.content)
+            if not isinstance(body, dict):
+                raise TypeError("응답이 JSON 객체가 아님")
+            result_code = body.get("response", {}).get("header", {}).get("resultCode")
+        except (json.JSONDecodeError, TypeError):
+            return _GridOutcome(payload=None, error=FetchErrorKind.TRANSIENT)
+
+        api_category = _classify_result_code(result_code)
+        if api_category is not None:
+            return _GridOutcome(payload=None, error=api_category)
+
+        page_bodies.append(body)
+        if page_no == 1:
+            first_page_raw = response.content
+            total_count = body.get("response", {}).get("body", {}).get("totalCount")
+            if isinstance(total_count, int) and total_count > _NUM_OF_ROWS:
+                total_pages = math.ceil(total_count / _NUM_OF_ROWS)
+
+        page_no += 1
+
+    payload = (
+        first_page_raw if len(page_bodies) == 1 else _merge_pages(page_bodies, root_key)
+    )
+    return _GridOutcome(payload=payload, error=None)
+
+
 @adapter("kma_apihub")
 class KmaApiHubAdapter:
     """기상청 API 허브 공용 격자 반복 어댑터."""
@@ -184,106 +270,36 @@ class KmaApiHubAdapter:
         base_date = adjusted_time.strftime("%Y%m%d")
         base_time = adjusted_time.strftime("%H%M")
 
-        for nx, ny in params["grids"]:
-            key = f"grid-{nx:03d}x{ny:03d}"
-            if key in skip:
-                continue
+        grid_items = [
+            (f"grid-{nx:03d}x{ny:03d}", nx, ny)
+            for nx, ny in params["grids"]
+            if f"grid-{nx:03d}x{ny:03d}" not in skip
+        ]
 
-            base_url = (
-                f"{_BASE_URL}/{endpoint}?authKey={_api_key()}&dataType=JSON"
-                f"&numOfRows={_NUM_OF_ROWS}"
-                f"&base_date={base_date}&base_time={base_time}&nx={nx}&ny={ny}"
-            )
+        def fetch_one_grid(item: tuple[str, int, int]) -> _GridOutcome:
+            _key, nx, ny = item
+            return _fetch_grid(client, endpoint, root_key, base_date, base_time, nx, ny)
 
-            page_bodies: list[dict] = []
-            first_page_raw: bytes | None = None
-            total_pages = 1
-            page_no = 1
-            grid_failed = False
-
-            while page_no <= total_pages:
-                url = f"{base_url}&pageNo={page_no}"
-                try:
-                    response = client.get(url)
-                except httpx.RequestError:
-                    yield FetchResult(
-                        key=key,
-                        payload=None,
-                        error=FetchErrorKind.TRANSIENT,
-                        expected_total=None,
-                    )
-                    grid_failed = True
-                    break
-
-                category = classify_http_status(response.status_code)
-                if category is FetchErrorKind.FATAL:
-                    # HTTP 레벨의 인증키 오류 등 확정적 원인인 경우, 즉시 중단.
-                    yield FetchResult(
-                        key=key, payload=None, error=category, expected_total=None
-                    )
+        # concurrency 미선언 소스는 순차로 돈다(seoul_openapi와 같은 opt-in 관례).
+        concurrency = max(1, int(params.get("concurrency", _DEFAULT_CONCURRENCY)))
+        if concurrency == 1:
+            for item in grid_items:
+                key, _nx, _ny = item
+                outcome = fetch_one_grid(item)
+                yield FetchResult(
+                    key=key, payload=outcome.payload, error=outcome.error, expected_total=None
+                )
+                if outcome.error is FetchErrorKind.FATAL:
+                    # 모든 격자가 같은 인증키를 쓰므로 나머지도 같은 이유로 실패한다.
                     return
-                elif category is not None:
-                    # HTTP 상태 5xx (TRANSIENT) 또는 4xx (PERMANENT)
-                    yield FetchResult(
-                        key=key, payload=None, error=category, expected_total=None
-                    )
-                    grid_failed = True
-                    break
+            return
 
-                # HTTP 200 OK일 경우 본문의 resultCode 확인
-                try:
-                    body = json.loads(response.content)
-                    if not isinstance(body, dict):
-                        raise TypeError("응답이 JSON 객체가 아님")
-                    result_code = (
-                        body.get("response", {}).get("header", {}).get("resultCode")
-                    )
-                except (json.JSONDecodeError, TypeError):
-                    yield FetchResult(
-                        key=key,
-                        payload=None,
-                        error=FetchErrorKind.TRANSIENT,
-                        expected_total=None,
-                    )
-                    grid_failed = True
-                    break
-
-                api_category = _classify_result_code(result_code)
-                if api_category is not None:
-                    if api_category is FetchErrorKind.FATAL:
-                        yield FetchResult(
-                            key=key,
-                            payload=None,
-                            error=api_category,
-                            expected_total=None,
-                        )
-                        return
-                    yield FetchResult(
-                        key=key, payload=None, error=api_category, expected_total=None
-                    )
-                    grid_failed = True
-                    break
-
-                page_bodies.append(body)
-                if page_no == 1:
-                    first_page_raw = response.content
-                    total_count = (
-                        body.get("response", {}).get("body", {}).get("totalCount")
-                    )
-                    if isinstance(total_count, int) and total_count > _NUM_OF_ROWS:
-                        total_pages = math.ceil(total_count / _NUM_OF_ROWS)
-
-                page_no += 1
-
-            if grid_failed:
-                continue
-
-            payload = (
-                first_page_raw
-                if len(page_bodies) == 1
-                else _merge_pages(page_bodies, root_key)
+        for (key, _nx, _ny), outcome in run_concurrent(
+            grid_items, concurrency, fetch_one_grid, "kma-grid"
+        ):
+            yield FetchResult(
+                key=key, payload=outcome.payload, error=outcome.error, expected_total=None
             )
-            yield FetchResult(key=key, payload=payload, error=None, expected_total=None)
 
     @staticmethod
     def normalize(chunks: list[bytes], config: SourceConfig) -> list[dict]:

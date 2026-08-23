@@ -6,6 +6,7 @@ adapter_params:
   root_key: response.body.items.item
   pivot: {key: category, value: fcstValue}
   time_rule: half_hourly
+  concurrency: 8
   grids:
   - [57, 125]
   - [57, 126]

@@ -56,12 +56,22 @@ from airflow import DAG
 _ULTRA_WEATHER_SOURCES = (WEATHER_10MIN_SOURCE, WEATHER_ULTRA_SHORT_FORECAST_SOURCE)
 _FULL_WEATHER_SOURCES = _ULTRA_WEATHER_SOURCES + (WEATHER_3H_SOURCE,)
 
-# 구 wait_for_weather_manifests 센서가 최대 30초만 기다리고 soft_fail로 넘어가던 것과
-# 같은 상한이다. 재시도 없이(retries=0) 30초 안에 못 끝나면 바로 실패시켜서, 날씨
-# collector가 자기 재시도 정책(기본 240초 x 3회)대로 붙잡고 있느라 뒤의
+# 재시도 없이(retries=0) 이 시간 안에 못 끝나면 바로 실패시켜서, 날씨 collector가
+# 자기 재시도 정책(기본 240초 x 3회)대로 붙잡고 있느라 뒤의
 # prepare_serving_plan~publish_rebalance_route 체인 전체를 최대 13분까지 묶어두는
-# 일을 막는다. 실측 KMA 호출은 12~13초대라 30초면 넉넉하다.
-_WEATHER_COLLECTOR_TIMEOUT = timedelta(seconds=30)
+# 일을 막는다.
+#
+# 소스별 dict로 둔다 — 지금은 셋 다 60초로 같지만, 세 API의 실측 소요가 원래
+# 꽤 달라서(단기예보만 격자당 페이지 2장 필요, concurrency:8로 줄인 뒤에도
+# 14~16초대, 나머지 둘은 7~11초대 — collector/sources/weather_*.yaml 참고) 나중에
+# 하나만 튜닝해야 할 상황이 다시 생길 수 있다. 그때 이 dict만 고치면 된다
+# (2026-08-23 실측 근거로 30초에서 60초로 올림 — 3개 동시 실행 시 단기예보가
+# 16.36초까지 늘어나는 걸 봐서 여유를 더 뒀다).
+_WEATHER_COLLECTOR_TIMEOUTS = {
+    WEATHER_10MIN_SOURCE: timedelta(seconds=60),
+    WEATHER_ULTRA_SHORT_FORECAST_SOURCE: timedelta(seconds=60),
+    WEATHER_3H_SOURCE: timedelta(seconds=60),
+}
 
 
 def _build_realtime_tick_dag(dag_id: str, cron: str, weather_source_ids: tuple[str, ...]) -> DAG:
@@ -88,7 +98,7 @@ def _build_realtime_tick_dag(dag_id: str, cron: str, weather_source_ids: tuple[s
                     dag,
                     source_id,
                     retries=0,
-                    execution_timeout=_WEATHER_COLLECTOR_TIMEOUT,
+                    execution_timeout=_WEATHER_COLLECTOR_TIMEOUTS[source_id],
                 )
                 for source_id in weather_source_ids
             ]
