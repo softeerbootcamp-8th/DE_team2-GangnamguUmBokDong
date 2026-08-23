@@ -464,8 +464,11 @@ def test_alerts_serve_one_last_known_good_snapshot_until_expiry(
     assert {alert["data_status"] for alert in alerts} == {"stale"}
     assert alerts[0]["age_minutes"] == pytest.approx(15.0)
 
-    assert queries.fetch_alerts(base_dttm + timedelta(minutes=20))
-    assert queries.fetch_alerts(base_dttm + timedelta(minutes=20, seconds=1)) == []
+    assert queries.fetch_alerts(base_dttm + queries.URGENCY_EXPIRY)
+    assert (
+        queries.fetch_alerts(base_dttm + queries.URGENCY_EXPIRY + timedelta(seconds=1))
+        == []
+    )
 
     with psycopg.connect(database_url) as connection:
         # 공통 fixture의 proposed route를 먼저 정상 삭제한다. Gold DDL은 proposed

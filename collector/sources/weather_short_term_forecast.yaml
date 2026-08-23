@@ -6,6 +6,11 @@ adapter_params:
   root_key: response.body.items.item
   pivot: {key: category, value: fcstValue}
   time_rule: vilage_fcst
+  # 격자당 페이지가 2장 필요해 순차로 돌면 34개 x 2페이지 = 68회, 약 51초가 걸린다
+  # (실측 2026-08-23). 다른 두 날씨 소스보다 훨씬 무거워서 이 소스만 켠다.
+  # 실측: 순차 50.89초 -> concurrency 4는 36.54초(30초 타임아웃에 여전히 못 들어감,
+  # KMA 서버가 동시 연결을 어느 정도 제한하는 것으로 보임) -> concurrency 8은 14.45초.
+  concurrency: 8
   grids:
   - [57, 125]
   - [57, 126]

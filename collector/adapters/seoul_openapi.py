@@ -24,8 +24,6 @@ from __future__ import annotations
 
 import json
 import os
-from collections import deque
-from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import TYPE_CHECKING
@@ -33,7 +31,7 @@ from typing import TYPE_CHECKING
 import httpx
 from core.forecast import POPULATION_FORECAST_SLOT_COUNT
 
-from adapters.base import FetchErrorKind, FetchResult, adapter
+from adapters.base import FetchErrorKind, FetchResult, adapter, run_concurrent
 
 if TYPE_CHECKING:
     from config.schema import SourceConfig
@@ -370,47 +368,6 @@ def _validate_natural_key(
             f"rows={len(rows)}, unique={unique_count}"
         )
 
-
-def _run_concurrent(items, concurrency: int, fetch_one, thread_name_prefix: str):
-    """items 순서를 유지하며 fetch_one(item)을 동시 실행해 (item, outcome) 순서대로 yield한다.
-
-    완료 순서대로 내보내면(as_completed) 조각 키 순서가 흔들리므로, 앞 항목을 기다리는
-    동안에도 뒤 요청은 이미 나가 있게 해 전체 소요를 완료순과 같게 만든다. 미리 요청하는
-    개수를 concurrency의 2배로 묶는 이유는 메모리다 — 전부 던져두면 완료됐지만 아직
-    내보내지 않은 응답이 쌓인다.
-    """
-    pool = ThreadPoolExecutor(
-        max_workers=concurrency, thread_name_prefix=thread_name_prefix
-    )
-    try:
-        queued = iter(items)
-        inflight: deque[tuple[object, Future[_PageOutcome]]] = deque()
-
-        def submit_next() -> bool:
-            item = next(queued, None)
-            if item is None:
-                return False
-            inflight.append((item, pool.submit(fetch_one, item)))
-            return True
-
-        for _ in range(concurrency * 2):
-            if not submit_next():
-                break
-
-        while inflight:
-            item, future = inflight.popleft()
-            outcome = future.result()
-            submit_next()
-            yield item, outcome
-            if outcome.error is FetchErrorKind.FATAL:
-                # 모든 조각이 같은 인증키를 쓰므로 나머지도 같은 이유로 실패한다.
-                return
-    finally:
-        # `with ThreadPoolExecutor(...)`를 쓰면 __exit__이 shutdown(wait=True)라
-        # 큐에 남은 항목이 끝날 때까지 블록한다. fetch_with_rounds가 마감 시한을
-        # 넘겨 순회를 중단하고 이 제너레이터를 버릴 때 그 대기가 마감 시한 방어를
-        # 무력화한다. 실행 중인 요청은 끊을 수 없지만 대기 큐는 즉시 비운다.
-        pool.shutdown(wait=False, cancel_futures=True)
 
 
 def _probe_page_key(start: int, page_size: int) -> str:
@@ -775,7 +732,7 @@ class SeoulOpenApiAdapter:
                 _, url = item
                 return _fetch_poi(client, url, wrapper_key)
 
-            for (key, _url), outcome in _run_concurrent(
+            for (key, _url), outcome in run_concurrent(
                 pois, concurrency, fetch_one_poi, "seoul-poi"
             ):
                 yield FetchResult(
@@ -875,12 +832,12 @@ class SeoulOpenApiAdapter:
             return
 
         # living_population_grid는 254페이지라 페이지당 1.4MB면 수백 MB가 된다 —
-        # 그래서 _run_concurrent가 미리 요청하는 개수를 concurrency의 2배로 묶는다.
+        # 그래서 run_concurrent가 미리 요청하는 개수를 concurrency의 2배로 묶는다.
         def fetch_one_page(item: tuple[str, int, int]) -> _PageOutcome:
             _, start, end = item
             return _fetch_page(client, page_url(start, end), wrapper_key, row_path)
 
-        for (key, start, _end), outcome in _run_concurrent(
+        for (key, start, _end), outcome in run_concurrent(
             pages, concurrency, fetch_one_page, "seoul-page"
         ):
             yield FetchResult(
