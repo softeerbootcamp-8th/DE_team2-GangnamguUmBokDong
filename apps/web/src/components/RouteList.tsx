@@ -13,8 +13,6 @@ import {
 import { useMemo } from "react";
 import type { DispatchCenter, Route, RouteStatus } from "../api";
 import {
-  buildStationConflicts,
-  describeStationConflict,
   estimateRoute,
   formatRouteDuration,
   groupWorkRoutes,
@@ -30,6 +28,18 @@ const STATUS_META: Record<
   completed: { className: "completed", icon: CheckCheck },
   cancelled: { className: "cancelled", icon: CircleX },
 };
+
+const KST_DATE = new Intl.DateTimeFormat("ko-KR", {
+  timeZone: "Asia/Seoul",
+  month: "numeric",
+  day: "numeric",
+});
+const KST_TIME = new Intl.DateTimeFormat("ko-KR", {
+  timeZone: "Asia/Seoul",
+  hour: "2-digit",
+  minute: "2-digit",
+  hourCycle: "h23",
+});
 
 interface Props {
   routes: Route[];
@@ -55,6 +65,22 @@ function routeSummary(route: Route): string {
   return `대여소 ${route.stops.length}곳 · 회수 ${pickup}대 · 공급 ${dropoff}대`;
 }
 
+function routeStateTime(route: Route, now = new Date()): string | null {
+  const stateTime = route.status === "proposed"
+    ? { label: "기준", value: route.proposed_at }
+    : route.status === "dispatched"
+      ? { label: "승인", value: route.dispatched_at }
+      : route.status === "completed"
+        ? { label: "완료", value: route.completed_at }
+        : { label: "취소", value: route.cancelled_at };
+  if (stateTime.value === null) return null;
+  const parsed = new Date(stateTime.value);
+  if (!Number.isFinite(parsed.getTime())) return null;
+  const day = KST_DATE.format(parsed);
+  const dayPrefix = day === KST_DATE.format(now) ? "" : `${day} `;
+  return `${stateTime.label} ${dayPrefix}${KST_TIME.format(parsed)}`;
+}
+
 export function RouteList({
   routes,
   regions,
@@ -77,7 +103,6 @@ export function RouteList({
     routes.forEach((route) => byRouteId.set(route.route_id, estimateRoute(route, regions)));
     return byRouteId;
   }, [routes, regions]);
-  const stationConflicts = useMemo(() => buildStationConflicts(routes), [routes]);
 
   function confirmDismiss(route: Route) {
     // 삭제하면 화면에서 다시 꺼낼 방법이 없다. 실수 한 번을 막는 값이 크다.
@@ -92,15 +117,13 @@ export function RouteList({
     const isSelected = route.route_id === selectedRouteId;
     const isBusy = route.route_id === busyRouteId;
     const transitionsBlocked = busyRouteId !== null;
-    // 진행 중 작업이 점유한 대여소를 다시 배차하지 않도록 승인만 막는다.
-    // 카드 선택은 남겨 둔다 — 운영자가 지도에서 어느 대여소가 겹치는지 봐야 한다.
-    const conflict = stationConflicts.get(route.route_id) ?? null;
-    const conflictReason = conflict === null ? null : describeStationConflict(conflict);
+    const stateTime = routeStateTime(route);
     return (
       <li key={route.route_id}>
         <article
           className={`route-card${isSelected ? " selected" : ""} has-actions`}
           aria-current={isSelected ? "true" : undefined}
+          data-route-id={route.route_id}
         >
           <button type="button" className="route-card-main" onClick={() => onSelect(route)}>
             <span className={`route-status-icon ${status.className}`} aria-hidden="true">
@@ -112,15 +135,15 @@ export function RouteList({
                 {route.region} {routeKind(route)}
               </span>
               <span className="route-card-summary">{routeSummary(route)}</span>
-              {conflictReason && (
-                <span className="route-card-conflict">{conflictReason}</span>
-              )}
-              {estimate && (
+              {(estimate || stateTime) && (
                 <span className="route-card-meta">
-                  <span title="직선거리×1.25, 도심 18km/h, 정차 4분, 자전거 1대당 30초 기준">
-                    <Timer size={11} aria-hidden="true" />
-                    예상 {estimate.distanceKm.toFixed(1)}km · 약 {formatRouteDuration(estimate.durationMinutes)}
-                  </span>
+                  {estimate && (
+                    <span title="직선거리×1.25, 도심 18km/h, 정차 4분, 자전거 1대당 30초 기준">
+                      <Timer size={11} aria-hidden="true" />
+                      예상 {estimate.distanceKm.toFixed(1)}km · 약 {formatRouteDuration(estimate.durationMinutes)}
+                    </span>
+                  )}
+                  {stateTime && <span>{stateTime}</span>}
                 </span>
               )}
             </span>
@@ -131,10 +154,10 @@ export function RouteList({
               <button
                 type="button"
                 className={`route-action primary icon-only${isBusy ? " is-busy" : ""}`}
-                disabled={transitionsBlocked || conflictReason !== null}
+                disabled={transitionsBlocked}
                 onClick={() => onDispatch(route)}
-                aria-label={isBusy ? "처리 중" : conflictReason ? "승인 불가" : "승인"}
-                title={isBusy ? "승인 처리 중" : (conflictReason ?? "작업 승인")}
+                aria-label={isBusy ? "처리 중" : "승인"}
+                title={isBusy ? "승인 처리 중" : "작업 승인"}
               >
                 {isBusy
                   ? <Loader2 size={14} aria-hidden="true" className="route-action-spinner" />
@@ -189,7 +212,7 @@ export function RouteList({
                   disabled={transitionsBlocked}
                   onClick={() => onRestore(route)}
                   aria-label={isBusy ? "처리 중" : "되돌리기"}
-                  title={isBusy ? "처리 중" : "작업 후보로 되돌리기"}
+                  title={isBusy ? "처리 중" : "작업 중으로 되돌리기"}
                 >
                   {isBusy
                     ? <Loader2 size={14} aria-hidden="true" className="route-action-spinner" />

@@ -7,7 +7,7 @@ CI_INTEGRATION_PROJECTS := loader
 PLATFORM_COMPOSE := $(shell bash ops/compose/platform_args.sh)
 COMPOSE = docker compose $(if $(wildcard .env),--env-file .env,) -f ops/compose/docker-compose.yml $(PLATFORM_COMPOSE)
 
-.PHONY: sync-all sync-ci-unit lint test-gold-bootstrap test-gold-transition-available test test-ci test-ci-unit test-ci-integration bootstrap up down logs ps migrate-route-cancellation migrate-route-dismiss-restore seed bootstrap-gold-seeds seed-e2e e2e-preflight e2e-smoke
+.PHONY: sync-all sync-ci-unit lint test-gold-bootstrap test-gold-transition-available test test-ci test-ci-unit test-ci-integration bootstrap up down logs ps migrate-route-cancellation migrate-route-dismiss-restore migrate-route-restore-uniqueness migrate-route-restore-in-place seed bootstrap-gold-seeds seed-e2e e2e-preflight e2e-smoke
 
 E2E_LOGICAL_DTTM ?= $(shell TZ=Asia/Seoul date '+%Y-%m-%dT%H:%M:00+09:00' | awk -F: '{ printf "%s:%02d:00+09:00\n", $$1, int($$2 / 5) * 5 }')
 E2E_STATION_SOURCE_DTTM ?= $(shell python3 ops/e2e_time.py station-source '$(E2E_LOGICAL_DTTM)')
@@ -126,11 +126,17 @@ migrate-route-dismiss-restore:
 	@$(COMPOSE) exec -T postgres \
 		psql -v ON_ERROR_STOP=1 -U "$${POSTGRES_USER:-postgres}" -d "$${POSTGRES_APP_DB:-app}" \
 		< ops/postgres/migrations/131_add_route_dismiss_and_restore.sql
-
-migrate-route-restore-uniqueness:
 	@$(COMPOSE) exec -T postgres \
 		psql -v ON_ERROR_STOP=1 -U "$${POSTGRES_USER:-postgres}" -d "$${POSTGRES_APP_DB:-app}" \
 		< ops/postgres/migrations/132_add_route_restore_uniqueness.sql
+	@$(COMPOSE) exec -T postgres \
+		psql -v ON_ERROR_STOP=1 -U "$${POSTGRES_USER:-postgres}" -d "$${POSTGRES_APP_DB:-app}" \
+		< ops/postgres/migrations/133_restore_cancelled_route_in_place.sql
+
+# 기존에 안내한 타깃도 세 migration을 모두 적용하도록 호환성을 유지한다.
+migrate-route-restore-uniqueness: migrate-route-dismiss-restore
+
+migrate-route-restore-in-place: migrate-route-dismiss-restore
 
 seed:
 	@echo "[gold-postgis] make seed는 weather grid seed_version/effective_dttm SSOT 확정 전이라 비활성화되었습니다." >&2
@@ -202,7 +208,7 @@ EMR_INSTANCE_TYPE ?= m5.xlarge
 EMR_INSTANCE_COUNT?= 3
 
 .PHONY: deploy-env deploy-secrets deploy-db-bootstrap deploy-db-check \
-        deploy-migrate-route-restore-uniqueness deploy-seed-models \
+		deploy-migrate-route-dismiss-restore deploy-migrate-route-restore-uniqueness deploy-migrate-route-restore-in-place deploy-seed-models \
         deploy-up deploy-down deploy-ps deploy-logs deploy-restart deploy-resync deploy-smoke \
         train-start train-stop train-status tunnel-airflow tunnel-mlflow \
         ssh-app ssh-train allow-my-ip \
@@ -240,17 +246,23 @@ deploy-db-check:
 	  -v "$(PWD)/ops/postgres:/opt/scripts:ro" \
 	  $(PSQL_IMAGE) bash /opt/scripts/check_gold_schema.sh
 
-# 되돌리기 중복 방지 unique index를 RDS에 적용한다. 이미 있으면 아무 일도 하지 않는다.
-# **새 API 코드를 올리기 전에** 실행해야 한다. queries.restore_route의 ON CONFLICT가
-# 이 index를 arbiter로 추론하므로, index가 없으면 되돌리기 요청이 그대로 실패한다.
-deploy-migrate-route-restore-uniqueness:
+# 작업 삭제·되돌리기 스키마와 동일 작업 복원 규칙을 RDS에 순서대로 적용한다.
+# **새 API 코드를 올리기 전에** 실행해야 한다. 세 migration은 재실행해도 안전하다.
+deploy-migrate-route-dismiss-restore:
 	@set -a; . $(PROD_ENV); set +a; \
 	docker run --rm \
 	  -e PGHOST -e PGPORT -e PGPASSWORD -e PGSSLMODE \
 	  -v "$(PWD)/ops/postgres/migrations:/opt/migrations:ro" \
 	  $(PSQL_IMAGE) \
 	  psql -v ON_ERROR_STOP=1 -U "$$POSTGRES_USER" -d "$$POSTGRES_APP_DB" \
-	       -f /opt/migrations/132_add_route_restore_uniqueness.sql
+	       -f /opt/migrations/131_add_route_dismiss_and_restore.sql \
+	       -f /opt/migrations/132_add_route_restore_uniqueness.sql \
+	       -f /opt/migrations/133_restore_cancelled_route_in_place.sql
+
+# 기존 운영 타깃도 완결된 migration 경로로 연결한다.
+deploy-migrate-route-restore-uniqueness: deploy-migrate-route-dismiss-restore
+
+deploy-migrate-route-restore-in-place: deploy-migrate-route-dismiss-restore
 
 # 최초 1회. 로컬 compose의 minio-init이 하던 일을 대신한다 — 빠뜨리면 ml/inference가
 # champion 포인터를 못 찾아 조용히 실패한다.
