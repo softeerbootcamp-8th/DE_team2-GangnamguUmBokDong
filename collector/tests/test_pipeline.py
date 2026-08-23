@@ -386,6 +386,28 @@ class TestMissingRatioGate:
         assert result.counts.fetched == 101
         assert result.missing.rows == 0
 
+    def test_default_tolerance_allows_small_overfetch(
+        self,
+        scripted_adapter,
+        client,
+        monkeypatch,
+    ):
+        """소스가 따로 지정하지 않아도 기본 허용치(10%) 안의 초과는 통과한다."""
+        scripted_adapter.results = [[
+            FetchResult(key="a", payload=_chunk("a"), error=None, expected_total=100)
+        ]]
+        monkeypatch.setattr(
+            scripted_adapter,
+            "normalize",
+            staticmethod(lambda chunks, config: [{"k": str(i)} for i in range(105)]),
+        )
+
+        result = pipeline.execute_window(_config(), WINDOW_START, client=client)
+
+        assert result.failure_reason is None
+        assert result.counts.expected == 105
+        assert result.counts.fetched == 105
+
     def test_overfetch_beyond_tolerance_still_fails(
         self,
         scripted_adapter,
