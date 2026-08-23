@@ -98,6 +98,9 @@ const ALERTS: Alert[] = [
     urgency_score: 50,
     minutes_until_critical: 10,
     region: "센터",
+    base_dttm: "2026-08-20T00:00:00Z",
+    data_status: "fresh",
+    age_minutes: 5,
   },
 ];
 const FORECAST: ForecastResponse = {
