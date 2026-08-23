@@ -377,6 +377,116 @@ def _open_unlinked_memmap(file_obj, row_count: int) -> np.memmap:
     return mapped
 
 
+def _empty_unlinked_memmap(prefix: str, row_count: int) -> np.memmap:
+    """지정한 길이의 삭제 예약된 float64 scratch 배열을 만든다."""
+    file_obj = tempfile.NamedTemporaryFile(prefix=prefix, suffix=".bin", delete=False)
+    path = file_obj.name
+    try:
+        file_obj.truncate(row_count * np.dtype(np.float64).itemsize)
+        return _open_unlinked_memmap(file_obj, row_count)
+    except Exception:
+        if not file_obj.closed:
+            file_obj.close()
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+class LazySequenceDataset(lgb.Dataset):
+    """날짜 Sequence를 chunk 단위 init score로 이어 학습하는 Dataset이다.
+
+    LightGBM의 기본 continuation 경로는 ``data=[Sequence, ...]``를 하나의 NumPy
+    배열로 바꾸려 한다. 날짜마다 행 수가 다른 운영 데이터에서는 실패하고, 억지로
+    합치면 전체 feature 원본이 동시에 상주한다. 이 클래스는 이전 Booster의 raw
+    score를 날짜별로 계산해 disk-backed 1차원 배열에 이어 쓰고 native Dataset에
+    복사한다. 원래 init score(exposure offset)가 있으면 이전 tree raw score에 더해
+    중단 전 학습 의미를 그대로 복원한다.
+    """
+
+    _resume_base_init_score: np.ndarray | None = None
+    _resume_init_score_attached: bool = False
+
+    def _set_init_score_by_predictor(self, predictor, data, used_indices):
+        """lazy Sequence 목록은 전체 결합 없이 predictor init score를 설정한다."""
+        if predictor is None and used_indices is None and self._resume_init_score_attached:
+            return self._reset_resume_init_score()
+        if predictor is None or used_indices is not None or not (
+            isinstance(data, list)
+            and data
+            and all(isinstance(chunk, _DatePartitionSequence) for chunk in data)
+        ):
+            return super()._set_init_score_by_predictor(predictor, data, used_indices)
+        if predictor.num_class != 1:
+            raise NotImplementedError(
+                "lazy checkpoint 재개는 현재 단일 출력 모델만 지원합니다: "
+                f"num_class={predictor.num_class}"
+            )
+
+        num_data = self.num_data()
+        init_score = _empty_unlinked_memmap("bike-resume-init-score-", num_data)
+        base_init_score = self._resume_base_init_score
+        if base_init_score is not None and len(base_init_score) != num_data:
+            raise ValueError(
+                "재개용 base init score 행 수가 Dataset과 다릅니다: "
+                f"base={len(base_init_score):,}, dataset={num_data:,}"
+            )
+
+        offset = 0
+        try:
+            for chunk in data:
+                feature_arr = chunk[:]
+                chunk_size = len(feature_arr)
+                stop = offset + chunk_size
+                raw_score = np.asarray(
+                    predictor.predict(feature_arr, raw_score=True),
+                    dtype=np.float64,
+                ).ravel()
+                if len(raw_score) != chunk_size:
+                    raise ValueError(
+                        "재개 predictor 결과 행 수가 날짜 chunk와 다릅니다: "
+                        f"predictions={len(raw_score):,}, chunk={chunk_size:,}"
+                    )
+                init_score[offset:stop] = raw_score
+                if base_init_score is not None:
+                    init_score[offset:stop] += base_init_score[offset:stop]
+                offset = stop
+                del feature_arr, raw_score
+            if offset != num_data:
+                raise ValueError(
+                    "재개 init score 행 수가 Dataset과 다릅니다: "
+                    f"predictions={offset:,}, dataset={num_data:,}"
+                )
+            # `set_init_score()`는 native field에 쓴 뒤 `self.init_score`에 전체 길이
+            # float64 사본을 되읽는다(800M행이면 ~6.4GB). 여기는 lgb.train() 안이라
+            # train/valid native storage가 이미 둘 다 상주한 시점이므로 그 사본이
+            # 곧바로 peak를 밀어올린다. native field에만 직접 쓴다.
+            self.set_field("init_score", init_score)
+            self.init_score = None
+            self._resume_init_score_attached = True
+            return self
+        finally:
+            del init_score
+
+    def _reset_resume_init_score(self):
+        """phase가 바뀌어 predictor가 떨어질 때 재개용 init score를 걷어낸다.
+
+        LightGBM 기본 구현은 ``self.init_score``가 살아 있을 때만 native field를
+        0으로 덮는다(`Dataset._set_init_score_by_predictor`의 ``elif`` 분기). 위에서
+        메모리 때문에 Python 사본을 비워두므로 그 경로가 그대로 통과해버리고,
+        ``train_set``/``valid_set``을 phase 간 재사용하는 `train_common.train_target`
+        에서는 앞 phase의 raw score가 다음 phase의 offset으로 남는다(예: q10을
+        체크포인트에서 재개하면 q50/q90이 q10 예측 위에서 학습된다). 재사용 전에
+        직접 원상복구한다 — 원래 offset(대여 poisson의 log(exposure))이 있으면 그
+        값으로, 없으면 field 자체를 비운다.
+        """
+        self.set_field("init_score", self._resume_base_init_score)
+        self.init_score = None
+        self._resume_init_score_attached = False
+        return self
+
+
 def _stream_prepass_arrays(
     table_path: str,
     dates: list[str],
@@ -529,7 +639,7 @@ def build_lazy_dataset(
     ]
     init_score = _log_memmap(exposure) if exposure is not None else None
     cat_idx = [feature_columns.index("station_no")]
-    dataset = lgb.Dataset(
+    dataset = LazySequenceDataset(
         data=sequences,
         label=y,
         init_score=init_score,
@@ -548,7 +658,10 @@ def build_lazy_dataset(
     # `lgb.train()`은 이미 구성된 handle을 직접 사용한다.
     dataset.label = None
     dataset.init_score = None
-    del init_score
+    if keep_raw_data:
+        dataset._resume_base_init_score = init_score
+    else:
+        del init_score
     return dataset, y, exposure
 
 

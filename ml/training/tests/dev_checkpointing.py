@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import lightgbm as lgb
 import numpy as np
 import pytest
+from lightgbm.basic import EvalResult
 
 from training import checkpointing, train_common
 
@@ -45,7 +46,12 @@ def checkpoint_store(monkeypatch):
     return objects
 
 
-def _manager(contract: dict, *, interval: int = 3) -> checkpointing.TrainingCheckpointManager:
+def _manager(
+    contract: dict,
+    *,
+    interval: int = 3,
+    compatible_code_fingerprints: frozenset[str] = frozenset(),
+) -> checkpointing.TrainingCheckpointManager:
     """테스트용 checkpoint manager를 생성한다."""
     return checkpointing.TrainingCheckpointManager(
         "models/archive/dt=test/profile",
@@ -54,6 +60,7 @@ def _manager(contract: dict, *, interval: int = 3) -> checkpointing.TrainingChec
         contract,
         interval,
         True,
+        compatible_code_fingerprints,
     )
 
 
@@ -140,6 +147,41 @@ def test_contract_mismatch_rejects_resume(checkpoint_store):
         _manager({"dataset": "v2"}).load("models/final.txt")
 
 
+def test_explicit_code_compatibility_requires_all_other_contract_fields_to_match(
+    checkpoint_store,
+):
+    """명시한 이전 코드라도 데이터·파라미터 계약 변화는 재개하지 않는다."""
+    old_contract = {
+        "dataset": "fixed",
+        "params": {"num_leaves": 7},
+        "filters": [["horizon", "in", [1, 2]]],
+        "code_fingerprint": "old-code",
+    }
+    old_manager = _manager(old_contract)
+    old_manager._write_state(status="in_progress", completed_iterations=0)
+
+    compatible_contract = {
+        **old_contract,
+        "filters": [("horizon", "in", [1, 2])],
+        "code_fingerprint": "resume-fix",
+    }
+    state = _manager(
+        compatible_contract,
+        compatible_code_fingerprints=frozenset({"old-code"}),
+    ).load("models/final.txt")
+    assert state.completed_iterations == 0
+
+    changed_data_contract = {
+        **compatible_contract,
+        "params": {"num_leaves": 15},
+    }
+    with pytest.raises(checkpointing.CheckpointContractMismatchError):
+        _manager(
+            changed_data_contract,
+            compatible_code_fingerprints=frozenset({"old-code"}),
+        ).load("models/final.txt")
+
+
 def test_resume_aware_early_stopping_preserves_best_score_and_patience():
     """중단 전 최고 round와 patience가 재개 후에도 동일한 종료점을 만든다."""
     scores = [10.0, 9.0, 8.0, 8.5, 8.6]
@@ -171,6 +213,35 @@ def test_resume_aware_early_stopping_preserves_best_score_and_patience():
             resumed(env(iteration, score))
 
     assert uninterrupted_stop.value.best_iteration == resumed_stop.value.best_iteration == 2
+
+
+def test_resume_aware_early_stopping_supports_lightgbm_47_eval_result():
+    """LightGBM 4.7 EvalResult의 동적 길이와 무관하게 저장 점수를 복원한다."""
+    item = EvalResult("valid_0", "l2", 8.5, False, None)
+    callback = checkpointing.ResumeAwareEarlyStopping(
+        5,
+        {
+            "dataset_name": "valid_0",
+            "metric_name": "l2",
+            "higher_is_better": False,
+            "best_iteration": 3,
+            "best_score": 7.25,
+        },
+    )
+    env = SimpleNamespace(
+        iteration=4,
+        end_iteration=20,
+        evaluation_result_list=[item],
+    )
+
+    callback(env)
+
+    restored = callback.best_score_list[0]
+    assert restored.dataset_name == "valid_0"
+    assert restored.metric_name == "l2"
+    assert restored.metric_value == 7.25
+    assert restored.maximize is False
+    assert restored.metric_std_dev is None
 
 
 def test_state_pointer_updates_only_after_booster_upload(monkeypatch):
