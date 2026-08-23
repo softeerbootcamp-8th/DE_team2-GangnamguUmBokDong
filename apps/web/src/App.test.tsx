@@ -199,6 +199,11 @@ describe("App polling state", () => {
   });
 
   it("상태가 바뀌는 작업 카드를 view transition으로 이동한다", async () => {
+    const scrollIntoView = vi.fn();
+    Object.defineProperty(HTMLElement.prototype, "scrollIntoView", {
+      configurable: true,
+      value: scrollIntoView,
+    });
     const startViewTransition = vi.fn((update: () => void) => {
       update();
       return {
@@ -221,8 +226,13 @@ describe("App polling state", () => {
     await settleRequests();
 
     expect(startViewTransition).toHaveBeenCalledTimes(1);
+    expect(scrollIntoView).toHaveBeenCalledWith({ block: "nearest", inline: "nearest" });
     expect(screen.getByRole("button", { name: "완료" })).not.toBeNull();
     Object.defineProperty(document, "startViewTransition", {
+      configurable: true,
+      value: undefined,
+    });
+    Object.defineProperty(HTMLElement.prototype, "scrollIntoView", {
       configurable: true,
       value: undefined,
     });

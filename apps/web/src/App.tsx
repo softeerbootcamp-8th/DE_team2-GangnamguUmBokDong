@@ -23,14 +23,25 @@ const ALL_REGIONS = "all";
 type ListMode = "routes" | "stations";
 type RouteTransition = "dispatch" | "complete" | "cancel" | "dismiss" | "restore";
 
-function updateRoutesWithMotion(update: () => void) {
+function revealRouteCard(routeId: string | null) {
+  if (routeId === null) return;
+  const card = [...document.querySelectorAll<HTMLElement>("[data-route-id]")]
+    .find((element) => element.dataset.routeId === routeId);
+  card?.scrollIntoView?.({ block: "nearest", inline: "nearest" });
+}
+
+function updateRoutesWithMotion(routeId: string | null, update: () => void) {
   const reducedMotion = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false;
   const startViewTransition = document.startViewTransition?.bind(document);
+  const applyUpdate = () => {
+    flushSync(update);
+    revealRouteCard(routeId);
+  };
   if (!startViewTransition || reducedMotion) {
-    update();
+    applyUpdate();
     return;
   }
-  startViewTransition(() => flushSync(update));
+  startViewTransition(applyUpdate);
 }
 
 function preferredRoute(routes: Route[]): Route | null {
@@ -302,7 +313,7 @@ export default function App() {
       if (transition === "dismiss") {
         const dismissed = await api.dismissRoute(route.route_id);
         routeMutationGenerationRef.current += 1;
-        updateRoutesWithMotion(() => setRoutes((current) =>
+        updateRoutesWithMotion(null, () => setRoutes((current) =>
           current.filter((item) => item.route_id !== dismissed.route_id)));
         if (selectedRouteIdRef.current === dismissed.route_id) {
           selectedRouteIdRef.current = null;
@@ -316,7 +327,7 @@ export default function App() {
         routeMutationGenerationRef.current += 1;
         // 요청 중 목록 모드나 권역이 바뀌었다면 이전 화면의 응답을 적용하지 않는다.
         if (routeViewGeneration !== routeViewGenerationRef.current) return;
-        updateRoutesWithMotion(() => setRoutes((current) => current.map((item) =>
+        updateRoutesWithMotion(restored.route_id, () => setRoutes((current) => current.map((item) =>
           item.route_id === restored.route_id ? restored : item)));
         selectRoute(restored);
         return;
@@ -327,7 +338,7 @@ export default function App() {
           ? await api.completeRoute(route.route_id)
           : await api.cancelRoute(route.route_id);
       routeMutationGenerationRef.current += 1;
-      updateRoutesWithMotion(() => setRoutes((current) => current.map((item) =>
+      updateRoutesWithMotion(updated.route_id, () => setRoutes((current) => current.map((item) =>
         item.route_id === updated.route_id ? updated : item)));
     } catch (error) {
       routeMutationGenerationRef.current += 1;

@@ -1382,6 +1382,14 @@ body {
   animation: none;
 }
 
+::view-transition-old(root) {
+  opacity: 0;
+}
+
+::view-transition-new(root) {
+  opacity: 1;
+}
+
 @media (prefers-reduced-motion: reduce) {
   .route-action-spinner {
     animation: none;
