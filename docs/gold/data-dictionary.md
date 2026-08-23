@@ -408,7 +408,10 @@ UUIDv5 namespace는 `d0d59897-9e72-541f-bb05-bd3d113c2639`다. name의 정확한
 회귀 UUID는 [publication-contract-v1.md](publication-contract-v1.md)를 따른다. center ID와
 후보의 동률 정렬 규칙은 원천-목표 매핑 문서를 따른다.
 route 목록은 `proposed|dispatched|completed|cancelled`만 status filter로 받고 기본 100·최대 500의
-`limit`, 0 이상의 `offset`, `(proposed_dttm DESC, route_id ASC)` 정렬을 사용한다. 상태 변경은
+`limit`, 0 이상의 `offset`, `(proposed_dttm DESC, route_id ASC)` 정렬을 사용한다. 선택적인
+`closed_within_minutes`는 서버 현재시각을 기준으로 완료·취소 작업만 해당 분 이내로 제한하고,
+미승인·진행 중 작업은 시간과 무관하게 유지한다. 대시보드 작업 현황은 60분을 요청하며 DB 행을
+자동 삭제하거나 `dismissed_dttm`을 설정하지 않는다. 상태 변경은
 expected status guarded UPDATE이고 없는 ID는 404, 상태 충돌은 409다. path ID는 API UUID
 타입으로 먼저 검증해 malformed 값은 422, 응답 UUID는 문자열이다.
 route publication은 현재 station·demand·stock tuple과 urgency input의 동명 tuple이 같을

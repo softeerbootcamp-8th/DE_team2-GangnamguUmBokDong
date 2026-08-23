@@ -506,6 +506,29 @@ def test_fetch_routes_builds_bounded_single_statement_aggregate(
     }
 
 
+def test_fetch_routes_limits_only_closed_routes_by_terminal_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """종료 시간창은 후보·진행 작업을 보존하고 완료·취소 시각만 제한한다."""
+    captured: dict[str, Any] = {}
+    closed_since = NOW - timedelta(hours=1)
+
+    def fake_fetch_all(query: str, params: dict) -> list[dict]:
+        """실행할 route SQL과 parameter를 기록한다."""
+        captured.update(query=query, params=params)
+        return []
+
+    monkeypatch.setattr(queries, "fetch_all", fake_fetch_all)
+
+    assert queries.fetch_routes(closed_since=closed_since) == []
+
+    normalized = " ".join(captured["query"].split())
+    assert "route.route_status_cd IN ('proposed', 'dispatched')" in normalized
+    assert "route.completed_dttm >= %(closed_since)s" in normalized
+    assert "route.cancelled_dttm >= %(closed_since)s" in normalized
+    assert captured["params"]["closed_since"] == closed_since
+
+
 def test_fetch_route_casts_uuid_to_text_in_one_statement(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

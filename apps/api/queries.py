@@ -577,8 +577,9 @@ def fetch_routes(
     status: str | None = None,
     limit: int = 100,
     offset: int = 0,
+    closed_since: datetime | None = None,
 ) -> list[dict[str, Any]]:
-    """bounded filter와 결정적 순서로 route aggregate 목록을 반환한다."""
+    """상태·종료 시간창과 bounded pagination으로 route 목록을 반환한다."""
     # 삭제한 작업과 과거 복제 방식으로 이미 후속 route가 생긴 원본은 목록에서
     # 제외한다. 단건 조회(fetch_route)는 감사 이력을 읽을 수 있도록 유지한다.
     conditions: list[str] = [
@@ -598,6 +599,23 @@ def fetch_routes(
     if status is not None:
         conditions.append("route.route_status_cd = %(status)s")
         params["status"] = status
+    if closed_since is not None:
+        conditions.append(
+            """
+            (
+                route.route_status_cd IN ('proposed', 'dispatched')
+                OR (
+                    route.route_status_cd = 'completed'
+                    AND route.completed_dttm >= %(closed_since)s
+                )
+                OR (
+                    route.route_status_cd = 'cancelled'
+                    AND route.cancelled_dttm >= %(closed_since)s
+                )
+            )
+            """
+        )
+        params["closed_since"] = closed_since
     where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
     query = _route_aggregate_query(
         where_clause,

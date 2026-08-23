@@ -195,6 +195,13 @@ describe("App polling state", () => {
     await settleRequests();
     await settleRequests();
 
+    expect(apiMock.routes).toHaveBeenCalledWith({
+      region: "이수",
+      closedWithinMinutes: 60,
+      limit: 500,
+      offset: 0,
+    });
+
     fireEvent.click(screen.getByRole("button", { name: "승인" }));
     await settleRequests();
 

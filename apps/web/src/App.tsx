@@ -19,6 +19,7 @@ const POLL_INTERVAL_MS = 15_000;
 const FORECAST_POLL_INTERVAL_MS = 60_000;
 const ROUTE_POLL_INTERVAL_MS = 30_000;
 const ROUTE_PAGE_SIZE = 500;
+const CLOSED_ROUTE_HISTORY_MINUTES = 60;
 const ALL_REGIONS = "all";
 type ListMode = "routes" | "stations";
 type RouteTransition = "dispatch" | "complete" | "cancel" | "dismiss" | "restore";
@@ -38,6 +39,7 @@ async function fetchAllRoutes(region: string): Promise<Route[]> {
   while (true) {
     const page = await api.routes({
       region: region === ALL_REGIONS ? undefined : region,
+      closedWithinMinutes: CLOSED_ROUTE_HISTORY_MINUTES,
       limit: ROUTE_PAGE_SIZE,
       offset,
     });
