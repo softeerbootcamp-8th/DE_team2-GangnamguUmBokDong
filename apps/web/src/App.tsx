@@ -60,6 +60,7 @@ export default function App() {
   const [routesError, setRoutesError] = useState(false);
   const [routesInitialized, setRoutesInitialized] = useState(false);
   const routeMutationGenerationRef = useRef(0);
+  const routeViewGenerationRef = useRef(0);
   const [listMode, setListMode] = useState<ListMode>("routes");
   const [selectedRouteId, setSelectedRouteId] = useState<string | null>(null);
   const selectedRouteIdRef = useRef<string | null>(null);
@@ -172,12 +173,12 @@ export default function App() {
         setRoutes(data);
         setRoutesError(false);
         setRoutesInitialized(true);
-        if (data.some((route) => route.route_id === selectedRouteIdRef.current)) return;
         if (listMode !== "routes") {
           selectedRouteIdRef.current = null;
           setSelectedRouteId(null);
           return;
         }
+        if (data.some((route) => route.route_id === selectedRouteIdRef.current)) return;
 
         const nextRoute = preferredRoute(data);
         selectedRouteIdRef.current = nextRoute?.route_id ?? null;
@@ -260,6 +261,7 @@ export default function App() {
 
   function changeRegion(region: string) {
     if (region === selectedRegion) return;
+    routeViewGenerationRef.current += 1;
     setSelectedRegion(region);
     setRouteTransitionError(null);
     selectedRouteIdRef.current = null;
@@ -267,6 +269,7 @@ export default function App() {
   }
 
   function changeListMode(mode: ListMode) {
+    routeViewGenerationRef.current += 1;
     setListMode(mode);
     setRouteTransitionError(null);
     if (mode === "stations") {
@@ -280,6 +283,7 @@ export default function App() {
 
   async function transitionRoute(route: Route, transition: RouteTransition) {
     if (busyRouteId) return;
+    const routeViewGeneration = routeViewGenerationRef.current;
     routeMutationGenerationRef.current += 1;
     setBusyRouteId(route.route_id);
     setRouteTransitionError(null);
@@ -301,6 +305,8 @@ export default function App() {
         // 있던 항목이면 중복으로 넣지 않고 갱신한다.
         const restored = await api.restoreRoute(route.route_id);
         routeMutationGenerationRef.current += 1;
+        // 요청 중 목록 모드나 권역이 바뀌었다면 이전 화면의 응답을 적용하지 않는다.
+        if (routeViewGeneration !== routeViewGenerationRef.current) return;
         setRoutes((current) => [
           ...current.filter((item) => item.route_id !== restored.route_id),
           restored,

@@ -28,20 +28,30 @@ vi.mock("./api", async (importOriginal) => {
   return { ...actual, api: apiMock };
 });
 
-vi.mock("./components/Header", () => ({ Header: () => <div>header</div> }));
+vi.mock("./components/Header", () => ({
+  Header: ({ onRegionChange }: { onRegionChange: (region: string) => void }) => (
+    <div>
+      <span>header</span>
+      <button type="button" onClick={() => onRegionChange("다른센터")}>권역 변경</button>
+    </div>
+  ),
+}));
 vi.mock("./components/StationMap", () => ({
   StationMap: ({
     stations,
     alerts,
     onSelect,
+    selectedRoute,
   }: {
     stations: StationSummary[];
     alerts: Alert[];
     onSelect: (stationId: string) => void;
+    selectedRoute: Route | null;
   }) => (
     <div>
       <span data-testid="map-stations">{stations.map((station) => station.sta_id).join(",")}</span>
       <span data-testid="map-alerts">{alerts.map((alert) => alert.sta_id).join(",")}</span>
+      <span data-testid="map-route">{selectedRoute?.route_id ?? "none"}</span>
       <button type="button" onClick={() => onSelect("ST-2")}>
         두 번째 대여소 선택
       </button>
@@ -260,6 +270,66 @@ describe("App polling state", () => {
 
     expect(apiMock.restoreRoute).toHaveBeenCalledWith(cancelled.route_id);
     expect(screen.getByRole("button", { name: "승인" })).not.toBeNull();
+  });
+
+  it("되돌리기 요청 중 대여소 모드로 바꾸면 이전 응답을 선택하지 않는다", async () => {
+    const cancelled: Route = {
+      ...ROUTES[0],
+      status: "cancelled",
+      dispatched_at: "2026-08-20T00:01:00Z",
+      cancelled_at: "2026-08-20T00:02:00Z",
+    };
+    const restored: Route = {
+      ...ROUTES[0],
+      route_id: "99999999-9999-4999-8999-999999999999",
+      status: "proposed",
+      proposed_at: "2026-08-20T00:03:00Z",
+      restored_from_route_id: cancelled.route_id,
+    };
+    const pendingRestore = deferred<Route>();
+    apiMock.stations.mockResolvedValue(STATIONS);
+    apiMock.routes.mockResolvedValue([cancelled]);
+    apiMock.restoreRoute.mockReturnValue(pendingRestore.promise);
+    render(<App />);
+    await settleRequests();
+    await settleRequests();
+
+    fireEvent.click(screen.getByRole("button", { name: "되돌리기" }));
+    fireEvent.click(screen.getByRole("button", { name: "대여소" }));
+    pendingRestore.resolve(restored);
+    await settleRequests();
+
+    expect(screen.getByTestId("map-route").textContent).toBe("none");
+  });
+
+  it("되돌리기 요청 중 권역을 바꾸면 이전 응답을 선택하지 않는다", async () => {
+    const cancelled: Route = {
+      ...ROUTES[0],
+      status: "cancelled",
+      dispatched_at: "2026-08-20T00:01:00Z",
+      cancelled_at: "2026-08-20T00:02:00Z",
+    };
+    const restored: Route = {
+      ...ROUTES[0],
+      route_id: "99999999-9999-4999-8999-999999999999",
+      status: "proposed",
+      proposed_at: "2026-08-20T00:03:00Z",
+      restored_from_route_id: cancelled.route_id,
+    };
+    const pendingRestore = deferred<Route>();
+    apiMock.stations.mockResolvedValue(STATIONS);
+    apiMock.routes.mockResolvedValueOnce([cancelled]).mockResolvedValueOnce([]);
+    apiMock.restoreRoute.mockReturnValue(pendingRestore.promise);
+    render(<App />);
+    await settleRequests();
+    await settleRequests();
+
+    fireEvent.click(screen.getByRole("button", { name: "되돌리기" }));
+    fireEvent.click(screen.getByRole("button", { name: "권역 변경" }));
+    pendingRestore.resolve(restored);
+    await settleRequests();
+
+    expect(screen.getByTestId("map-route").textContent).toBe("none");
   });
 
   it("이미 대기 중인 후보를 다시 돌려받아도 목록에 중복으로 쌓이지 않는다", async () => {
