@@ -297,9 +297,14 @@ export default function App() {
       if (transition === "restore") {
         // 되돌리기는 원본을 그대로 두고 새 후보를 만든다. 새 후보의 proposed_at이
         // 현재 시각이라 후보 창을 통과하고, 바로 선택해 지도에 띄운다.
+        // 이미 대기 중인 후보가 있으면 서버가 그 후보를 그대로 돌려준다. 목록에
+        // 있던 항목이면 중복으로 넣지 않고 갱신한다.
         const restored = await api.restoreRoute(route.route_id);
         routeMutationGenerationRef.current += 1;
-        setRoutes((current) => [...current, restored]);
+        setRoutes((current) => [
+          ...current.filter((item) => item.route_id !== restored.route_id),
+          restored,
+        ]);
         selectRoute(restored);
         return;
       }

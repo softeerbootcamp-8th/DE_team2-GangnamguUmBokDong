@@ -262,6 +262,37 @@ describe("App polling state", () => {
     expect(screen.getByRole("button", { name: "승인" })).not.toBeNull();
   });
 
+  it("이미 대기 중인 후보를 다시 돌려받아도 목록에 중복으로 쌓이지 않는다", async () => {
+    const cancelled: Route = {
+      ...ROUTES[0],
+      status: "cancelled",
+      dispatched_at: "2026-08-20T00:01:00Z",
+      cancelled_at: "2026-08-20T00:02:00Z",
+    };
+    const reused: Route = {
+      ...ROUTES[0],
+      route_id: "99999999-9999-4999-8999-999999999999",
+      status: "proposed",
+      proposed_at: "2026-08-20T00:03:00Z",
+      restored_from_route_id: ROUTES[0].route_id,
+    };
+    apiMock.stations.mockResolvedValue(STATIONS);
+    apiMock.routes.mockResolvedValue([cancelled]);
+    // 서버는 두 번째 되돌리기에도 같은 후보를 돌려준다.
+    apiMock.restoreRoute.mockResolvedValue(reused);
+    render(<App />);
+    await settleRequests();
+    await settleRequests();
+
+    fireEvent.click(screen.getByRole("button", { name: "되돌리기" }));
+    await settleRequests();
+    fireEvent.click(screen.getByRole("button", { name: "되돌리기" }));
+    await settleRequests();
+
+    expect(apiMock.restoreRoute).toHaveBeenCalledTimes(2);
+    expect(screen.getAllByRole("button", { name: "승인" })).toHaveLength(1);
+  });
+
   it("대여소 선택을 바꾸는 즉시 이전 forecast를 지운다", async () => {
     apiMock.stations.mockResolvedValue(STATIONS);
     apiMock.forecast.mockResolvedValueOnce(FORECAST).mockReturnValueOnce(new Promise(() => {}));
