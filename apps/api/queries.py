@@ -16,8 +16,6 @@ from psycopg.rows import dict_row
 
 STOCK_FRESHNESS = timedelta(minutes=10)
 DEMAND_FRESHNESS = timedelta(minutes=10)
-URGENCY_FRESHNESS = timedelta(minutes=10)
-URGENCY_EXPIRY = timedelta(minutes=20)
 ULTRA_SHORT_FRESHNESS = timedelta(hours=2)
 SHORT_TERM_FRESHNESS = timedelta(hours=4)
 EVENT_FRESHNESS = timedelta(hours=36)
@@ -457,67 +455,35 @@ def fetch_regions() -> list[dict[str, Any]]:
 
 
 def fetch_alerts(now: datetime) -> list[dict[str, Any]]:
-    """마지막 완전 성공 urgency snapshot을 freshness 정책 안에서 반환한다.
-
-    계산용 current stock/demand와 다시 조인하지 않는다. ``publication_state``가
-    가리키는 exact anchor의 전체 urgency set만 선택하고 게시 row count가 맞을
-    때만 제공하므로, 새 tick 일부만 섞인 비정상 상태도 정상 snapshot으로 보지
-    않는다.
-    """
+    """같은 fresh anchor와 최신 correction을 만족하는 긴급도만 반환한다."""
     return fetch_all(
         """
-        WITH urgency_authority AS MATERIALIZED (
-            SELECT logical_dttm,
-                   published_row_cnt
-              FROM gold_meta.publication_state
-             WHERE publication_key = 'station_urgency'
-               AND logical_dttm BETWEEN %(now)s - %(expiry)s
-                                    AND %(now)s + %(future_tolerance)s
-        ),
-        urgency_snapshot AS MATERIALIZED (
-            SELECT urgency.*
-              FROM station_urgency AS urgency
-              JOIN urgency_authority AS authority
-                ON authority.logical_dttm = urgency.base_dttm
-        ),
-        complete_authority AS MATERIALIZED (
-            SELECT authority.logical_dttm
-              FROM urgency_authority AS authority
-             WHERE authority.published_row_cnt = (
-                       SELECT COUNT(*) FROM urgency_snapshot
-                   )
-        )
         SELECT s.sta_id,
                s.sta_nm,
                urgency.rebalance_need_type_cd AS action_type,
                urgency.urgency_score,
                urgency.critical_remaining_min AS minutes_until_critical,
-               center.dispatch_center_nm AS region,
-               urgency.base_dttm,
-               CASE
-                   WHEN urgency.base_dttm >= %(now)s - %(freshness)s
-                   THEN 'fresh'
-                   ELSE 'stale'
-               END AS data_status,
-               GREATEST(
-                   0.0,
-                   EXTRACT(EPOCH FROM (%(now)s - urgency.base_dttm)) / 60.0
-               )::double precision AS age_minutes
-          FROM complete_authority AS authority
-          JOIN urgency_snapshot AS urgency
-            ON urgency.base_dttm = authority.logical_dttm
+               center.dispatch_center_nm AS region
+          FROM station_urgency AS urgency
+          JOIN station_stock AS stock
+            ON stock.sta_id = urgency.sta_id
+           AND stock.base_dttm = urgency.base_dttm
           JOIN station AS s
             ON s.sta_id = urgency.sta_id
+           AND s.is_active
+           AND s.last_seen_dttm = stock.base_dttm
           JOIN dispatch_center AS center
             ON center.dispatch_center_id = s.dispatch_center_id
+           AND center.is_active
+         WHERE urgency.base_dttm BETWEEN %(now)s - INTERVAL '10 minutes'
+                                       AND %(now)s + INTERVAL '5 minutes'
+           AND stock.base_dttm BETWEEN %(now)s - INTERVAL '10 minutes'
+                                     AND %(now)s + INTERVAL '5 minutes'
+           AND urgency.updated_dttm >= stock.updated_dttm
+           AND urgency.updated_dttm >= s.updated_dttm
          ORDER BY urgency.urgency_score DESC, s.sta_id ASC
         """,
-        {
-            "now": now,
-            "freshness": URGENCY_FRESHNESS,
-            "expiry": URGENCY_EXPIRY,
-            "future_tolerance": FUTURE_TOLERANCE,
-        },
+        {"now": now},
     )
 
 

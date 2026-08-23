@@ -25,7 +25,6 @@ export function AlertList({
   // /alerts는 조치가 필요 없는 normal 대여소도 함께 내려준다. 두 열에는 담지
   // 않지만, 목록이 전체가 아니라는 사실은 알려야 한다.
   const normalCount = alerts.length - supplyAlerts.length - retrievalAlerts.length;
-  const staleAlert = alerts.find((alert) => alert.data_status === "stale");
 
   function renderColumn(items: Alert[], title: string, id: string) {
     return (
@@ -73,11 +72,6 @@ export function AlertList({
 
   return (
     <div className="alert-list-wrap">
-      {staleAlert && (
-        <p className="column-note" role="status">
-          긴급도 갱신이 지연되어 {Math.floor(staleAlert.age_minutes)}분 전 마지막 성공 결과를 표시합니다.
-        </p>
-      )}
       <div className="alert-workspace">
         {renderColumn(supplyAlerts, "공급 필요", "supply-stations-heading")}
         {renderColumn(retrievalAlerts, "회수 필요", "retrieval-stations-heading")}

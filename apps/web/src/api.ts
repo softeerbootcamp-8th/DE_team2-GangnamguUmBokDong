@@ -47,9 +47,6 @@ export interface Alert {
   urgency_score: number;
   minutes_until_critical: number;
   region: string;
-  base_dttm: string;
-  data_status: "fresh" | "stale";
-  age_minutes: number;
 }
 
 export interface StatusResponse {

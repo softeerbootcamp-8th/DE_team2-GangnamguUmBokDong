@@ -760,15 +760,6 @@ def publish_rebalance_route(
         )
 
     logical_dttm = urgency_snapshot.manifest.logical_dttm
-    dependency_by_key = {
-        dependency.publication_key: dependency for dependency in dependencies
-    }
-    for current_key in ("station_stock", "station_demand_forecast"):
-        if dependency_by_key[current_key].logical_dttm != logical_dttm:
-            raise ContractViolation(
-                f"route는 current {current_key}와 같은 anchor의 urgency만 사용할 수 "
-                "있습니다."
-            )
     database_snapshot = _load_route_database_snapshot(connection, logical_dttm)
     coverage_payload = database_snapshot.route_coverage.canonical_bytes
     coverage_input = InputArtifact(
