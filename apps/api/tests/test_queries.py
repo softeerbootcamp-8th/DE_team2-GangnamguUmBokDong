@@ -435,10 +435,10 @@ def test_fetch_regions_uses_active_center_points(
     assert "ST_X(dispatch_center_point) AS lon" in normalized
 
 
-def test_fetch_alerts_enforces_anchor_correction_and_order(
+def test_fetch_alerts_uses_complete_publication_state_snapshot(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """alerts SQL은 same-anchor·updated 순서·결정적 tie-break를 모두 적용한다."""
+    """alerts는 current stock이 아니라 authoritative urgency snapshot을 읽는다."""
     captured: dict[str, Any] = {}
 
     def fake_fetch_all(query: str, params: dict) -> list[dict]:
@@ -450,14 +450,23 @@ def test_fetch_alerts_enforces_anchor_correction_and_order(
 
     assert queries.fetch_alerts(NOW) == []
     normalized = " ".join(captured["query"].split())
-    assert "stock.base_dttm = urgency.base_dttm" in normalized
-    assert "s.last_seen_dttm = stock.base_dttm" in normalized
-    assert "urgency.updated_dttm >= stock.updated_dttm" in normalized
-    assert "urgency.updated_dttm >= s.updated_dttm" in normalized
-    assert "center.is_active" in normalized
+    assert "FROM gold_meta.publication_state" in normalized
+    assert "publication_key = 'station_urgency'" in normalized
+    assert "authority.logical_dttm = urgency.base_dttm" in normalized
+    assert "authority.published_row_cnt = ( SELECT COUNT(*) FROM urgency_snapshot )" in normalized
+    assert "JOIN station_stock" not in normalized
+    assert "s.last_seen_dttm" not in normalized
     assert "ORDER BY urgency.urgency_score DESC, s.sta_id ASC" in normalized
     assert "rebalance_need_type_cd AS action_type" in normalized
     assert "critical_remaining_min AS minutes_until_critical" in normalized
+    assert "END AS data_status" in normalized
+    assert "AS age_minutes" in normalized
+    assert captured["params"] == {
+        "now": NOW,
+        "freshness": queries.URGENCY_FRESHNESS,
+        "expiry": queries.URGENCY_EXPIRY,
+        "future_tolerance": queries.FUTURE_TOLERANCE,
+    }
 
 
 def test_fetch_routes_builds_bounded_single_statement_aggregate(
