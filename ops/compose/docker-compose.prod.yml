@@ -137,6 +137,11 @@ services:
     restart: unless-stopped
     ports:
       - "80:80"
+    # 이미지 안에 굽지 않고 런타임에 마운트한다 — 계정을 바꿀 때 이미지를
+    # 다시 빌드하지 않고 이 파일만 갱신 후 web 컨테이너만 재시작하면 된다.
+    # make deploy-nginx-auth (Makefile 참고)로 생성한다.
+    volumes:
+      - ${PROD_NGINX_HTPASSWD:-/opt/app/ops/nginx/.htpasswd}:/etc/nginx/.htpasswd:ro
     depends_on:
       api:
         condition: service_healthy
