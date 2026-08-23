@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -74,6 +75,7 @@ class RouteTransitionResult(StrEnum):
     NOT_FOUND = "not_found"
     WRONG_STATUS = "wrong_status"
     CONSTRAINT_CONFLICT = "constraint_conflict"
+    STATION_CONFLICT = "station_conflict"
 
 
 def now_utc() -> datetime:
@@ -574,6 +576,34 @@ def fetch_route(route_id: UUID) -> dict[str, Any] | None:
     )
 
 
+_STATION_CONFLICT_SQL = """
+SELECT count(DISTINCT candidate_stop.sta_id) AS conflict_cnt
+  FROM rebalance_route_stop AS candidate_stop
+  JOIN rebalance_route_stop AS active_stop USING (sta_id)
+  JOIN rebalance_route AS active_route
+       ON active_route.route_id = active_stop.route_id
+ WHERE candidate_stop.route_id = %(route_id)s
+   AND active_route.route_id <> %(route_id)s
+   AND active_route.route_status_cd = 'dispatched'
+"""
+
+
+def _station_conflict_guard(
+    cursor: Cursor[dict[str, Any]],
+    route_id: UUID,
+) -> RouteTransitionResult | None:
+    """진행 중 경로와 대여소가 겹치면 STATION_CONFLICT를 반환한다.
+
+    같은 대여소에 트럭 두 대가 배정되는 것을 막는다. 자기 경로는 이미 dispatched로
+    바뀐 뒤라 제외한다.
+    """
+    cursor.execute(_STATION_CONFLICT_SQL, {"route_id": route_id})
+    row = cursor.fetchone()
+    if row is not None and row["conflict_cnt"] > 0:
+        return RouteTransitionResult.STATION_CONFLICT
+    return None
+
+
 def _transition_route(
     route_id: UUID,
     now: datetime,
@@ -581,8 +611,15 @@ def _transition_route(
     expected_status: str,
     next_status: str,
     timestamp_column: str,
+    guard: Callable[[Cursor[dict[str, Any]], UUID], RouteTransitionResult | None]
+    | None = None,
 ) -> dict[str, Any] | RouteTransitionResult:
-    """guarded update와 aggregate 재조회를 같은 transaction에서 수행한다."""
+    """guarded update와 aggregate 재조회를 같은 transaction에서 수행한다.
+
+    guard는 UPDATE 뒤에 실행한다. rebalance_route 쓰기가 statement trigger로
+    route operation advisory lock을 잡으므로, UPDATE 전에 읽으면 lock 없이 읽어
+    동시 전이가 서로를 놓칠 수 있다.
+    """
     try:
         with (
             get_connection() as connection,
@@ -612,6 +649,11 @@ def _transition_route(
                 if cursor.fetchone() is None:
                     return RouteTransitionResult.NOT_FOUND
                 return RouteTransitionResult.WRONG_STATUS
+            if guard is not None:
+                blocked = guard(cursor, route_id)
+                if blocked is not None:
+                    connection.rollback()
+                    return blocked
             route = _fetch_route_with_cursor(cursor, route_id)
             if route is None:
                 raise RuntimeError("상태 전이 직후 route aggregate를 찾을 수 없습니다.")
@@ -631,6 +673,7 @@ def dispatch_route(
         expected_status="proposed",
         next_status="dispatched",
         timestamp_column="dispatched_dttm",
+        guard=_station_conflict_guard,
     )
 
 

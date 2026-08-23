@@ -517,6 +517,17 @@ def test_fetch_route_casts_uuid_to_text_in_one_statement(
     assert captured["params"] == {"route_id": ROUTE_ID}
 
 
+def test_station_conflict_sql_excludes_self_and_closed_routes() -> None:
+    """겹침 검사는 자기 경로를 빼고 dispatched 경로만 본다."""
+    normalized = " ".join(queries._STATION_CONFLICT_SQL.split())
+
+    assert "count(DISTINCT candidate_stop.sta_id) AS conflict_cnt" in normalized
+    assert "FROM rebalance_route_stop AS candidate_stop" in normalized
+    assert "JOIN rebalance_route_stop AS active_stop USING (sta_id)" in normalized
+    assert "active_route.route_id <> %(route_id)s" in normalized
+    assert "active_route.route_status_cd = 'dispatched'" in normalized
+
+
 class _TransitionCursor:
     """route 상태 전이의 동일 cursor 사용을 검증하는 최소 fake다."""
 
@@ -548,6 +559,7 @@ class _TransitionConnection:
         """공유할 cursor를 저장한다."""
         self.cursor_value = cursor
         self.cursor_calls = 0
+        self.rollback_calls = 0
 
     def __enter__(self) -> Self:
         """context manager 진입 시 자신을 반환한다."""
@@ -561,13 +573,19 @@ class _TransitionConnection:
         self.cursor_calls += 1
         return self.cursor_value
 
+    def rollback(self) -> None:
+        """rollback 호출 횟수를 센다."""
+        self.rollback_calls += 1
+
 
 def test_dispatch_updates_and_reads_aggregate_in_same_transaction(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """dispatch guarded update와 aggregate 조회는 같은 connection/cursor를 사용한다."""
     route = {"route_id": str(ROUTE_ID), "status": "dispatched", "stops": []}
-    cursor = _TransitionCursor([{"route_id": ROUTE_ID}, route])
+    cursor = _TransitionCursor(
+        [{"route_id": ROUTE_ID}, {"conflict_cnt": 0}, route]
+    )
     connection = _TransitionConnection(cursor)
     monkeypatch.setattr(queries, "get_connection", lambda: connection)
 
@@ -575,10 +593,26 @@ def test_dispatch_updates_and_reads_aggregate_in_same_transaction(
 
     assert result == route
     assert connection.cursor_calls == 1
-    assert len(cursor.statements) == 2
+    assert len(cursor.statements) == 3
     assert "UPDATE rebalance_route" in cursor.statements[0]
     assert "route_status_cd = %(expected_status)s" in cursor.statements[0]
-    assert "rebalance_route_stop AS stop" in cursor.statements[1]
+    assert "rebalance_route_stop AS candidate_stop" in cursor.statements[1]
+    assert "rebalance_route_stop AS stop" in cursor.statements[2]
+
+
+def test_dispatch_rolls_back_and_skips_aggregate_on_station_conflict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """겹침 guard가 걸리면 rollback 후 aggregate 조회 없이 STATION_CONFLICT를 반환한다."""
+    cursor = _TransitionCursor([{"route_id": ROUTE_ID}, {"conflict_cnt": 1}])
+    connection = _TransitionConnection(cursor)
+    monkeypatch.setattr(queries, "get_connection", lambda: connection)
+
+    result = queries.dispatch_route(ROUTE_ID, NOW)
+
+    assert result is queries.RouteTransitionResult.STATION_CONFLICT
+    assert connection.rollback_calls == 1
+    assert len(cursor.statements) == 2
 
 
 def test_cancel_sets_cancelled_timestamp_in_same_transaction(
