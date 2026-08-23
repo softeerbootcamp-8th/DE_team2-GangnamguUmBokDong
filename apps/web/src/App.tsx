@@ -74,7 +74,7 @@ export default function App() {
   const [forecast, setForecast] = useState<ForecastResponse | null>(null);
   const [forecastError, setForecastError] = useState<Error | null>(null);
   const forecastRequestGenerationRef = useRef(0);
-  const [selectedRegion, setSelectedRegion] = useState<string>(ALL_REGIONS);
+  const [selectedRegion, setSelectedRegion] = useState<string>("이수");
   const [regionCenters, setRegionCenters] = useState<DispatchCenter[]>([]);
   const [focusedEvent, setFocusedEvent] = useState<FocusedEvent | null>(null);
 
