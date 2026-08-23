@@ -1,5 +1,4 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { flushSync } from "react-dom";
 import { List, Route as RouteIcon } from "lucide-react";
 import { api } from "./api";
 import type { Alert, DispatchCenter, ForecastResponse, Route, StationSummary } from "./api";
@@ -13,6 +12,7 @@ import { RouteStopRail } from "./components/RouteStopRail";
 import { StationMap } from "./components/StationMap";
 import { StockPanel } from "./components/StockPanel";
 import { candidateReferenceMs, isFreshCandidate, isRebalanceRoute, routeTransitionMessage } from "./routeOperations";
+import { updateRoutesWithMotion } from "./routeCardMotion";
 import { ResizableHandle, ResizablePanel, ResizablePanelGroup } from "@/components/ui/resizable";
 
 const POLL_INTERVAL_MS = 15_000;
@@ -22,98 +22,6 @@ const ROUTE_PAGE_SIZE = 500;
 const ALL_REGIONS = "all";
 type ListMode = "routes" | "stations";
 type RouteTransition = "dispatch" | "complete" | "cancel" | "dismiss" | "restore";
-
-function routeCard(routeId: string | null): HTMLElement | null {
-  if (routeId === null) return null;
-  return [...document.querySelectorAll<HTMLElement>("[data-route-id]")]
-    .find((element) => element.dataset.routeId === routeId) ?? null;
-}
-
-interface RouteCardPosition {
-  height: number;
-  left: number;
-  top: number;
-  width: number;
-}
-
-function revealRouteCard(
-  card: HTMLElement | null,
-  behavior: ScrollBehavior,
-): RouteCardPosition | null {
-  const list = card?.closest<HTMLElement>(".route-column-list");
-  if (!card || !list) return null;
-  const cardPosition = card.getBoundingClientRect();
-  const listPosition = list.getBoundingClientRect();
-  const requestedScrollTop = list.scrollTop
-    + cardPosition.top
-    - listPosition.top
-    - ((listPosition.height - cardPosition.height) / 2);
-  const targetScrollTop = Math.min(
-    Math.max(0, list.scrollHeight - list.clientHeight),
-    Math.max(0, requestedScrollTop),
-  );
-  list.scrollTo?.({ top: targetScrollTop, behavior });
-  return {
-    height: cardPosition.height,
-    left: cardPosition.left,
-    top: cardPosition.top - (targetScrollTop - list.scrollTop),
-    width: cardPosition.width,
-  };
-}
-
-async function updateRoutesWithMotion(routeId: string | null, update: () => void) {
-  const reducedMotion = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false;
-  const previousCard = routeCard(routeId);
-  const previousPosition = previousCard?.getBoundingClientRect() ?? null;
-  const workspace = previousCard?.closest<HTMLElement>(".route-workspace") ?? null;
-  const ghost = !reducedMotion && previousCard?.animate
-    ? previousCard.cloneNode(true) as HTMLElement
-    : null;
-  flushSync(update);
-  const card = routeCard(routeId);
-  const destinationPosition = revealRouteCard(card, reducedMotion ? "auto" : "smooth");
-  if (!ghost || !workspace || !card || !previousPosition || !destinationPosition) {
-    return;
-  }
-  const workspacePosition = workspace.getBoundingClientRect();
-  ghost.classList.add("route-card-motion-ghost", "selected");
-  ghost.classList.remove("route-card-motion-target");
-  ghost.removeAttribute("data-route-id");
-  ghost.removeAttribute("aria-current");
-  ghost.setAttribute("aria-hidden", "true");
-  ghost.querySelectorAll<HTMLButtonElement>("button").forEach((button) => {
-    button.tabIndex = -1;
-  });
-  Object.assign(ghost.style, {
-    height: `${previousPosition.height}px`,
-    left: `${previousPosition.left - workspacePosition.left}px`,
-    top: `${previousPosition.top - workspacePosition.top}px`,
-    width: `${previousPosition.width}px`,
-  });
-  workspace.append(ghost);
-  card.classList.add("route-card-motion-target");
-  const animation = ghost.animate(
-    [
-      { opacity: 0.82, transform: "translate(0, 0) scale(0.985)" },
-      {
-        opacity: 1,
-        transform: `translate(${destinationPosition.left - previousPosition.left}px, ${destinationPosition.top - previousPosition.top}px) scale(1)`,
-      },
-    ],
-    {
-      duration: 650,
-      easing: "cubic-bezier(0.22, 1, 0.36, 1)",
-    },
-  );
-  try {
-    await animation.finished;
-  } catch {
-    // 연속 조작으로 애니메이션이 교체돼도 상태 변경은 이미 적용됐다.
-  } finally {
-    card.classList.remove("route-card-motion-target");
-    ghost.remove();
-  }
-}
 
 function preferredRoute(routes: Route[]): Route | null {
   const referenceMs = candidateReferenceMs(routes);

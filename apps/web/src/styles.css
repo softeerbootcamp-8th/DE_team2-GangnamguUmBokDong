@@ -496,7 +496,6 @@ body {
 
 .route-workspace,
 .alert-workspace {
-  position: relative;
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   flex: 1;
@@ -508,6 +507,7 @@ body {
 }
 
 .route-workspace {
+  position: relative;
   isolation: isolate;
 }
 
@@ -573,6 +573,10 @@ body {
   margin: 0;
   padding: 0 8px 4px 0;
   list-style: none;
+}
+
+.route-column-list {
+  overflow-anchor: none;
 }
 
 .route-card {

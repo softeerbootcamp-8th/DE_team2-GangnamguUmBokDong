@@ -224,61 +224,6 @@ describe("App polling state", () => {
       .toBeNull();
   });
 
-  it("승인한 카드를 작업 후보에서 작업 현황으로 가로 이동한다", async () => {
-    const scrollTo = vi.fn();
-    const animate = vi.fn((..._args: unknown[]) => ({ finished: Promise.resolve() }));
-    const getBoundingClientRect = vi
-      .spyOn(HTMLElement.prototype, "getBoundingClientRect")
-      .mockImplementation(function (this: HTMLElement) {
-        if (this.classList.contains("route-workspace")) return new DOMRect(0, 0, 1000, 500);
-        const isCandidate = this.closest('[aria-labelledby="candidate-routes-heading"]') !== null;
-        if (this.classList.contains("route-column-list")) {
-          return new DOMRect(isCandidate ? 10 : 510, 40, 480, 440);
-        }
-        if (this.matches("[data-route-id]")) {
-          return new DOMRect(isCandidate ? 20 : 520, 80, 450, 92);
-        }
-        return new DOMRect();
-      });
-    Object.defineProperty(HTMLElement.prototype, "scrollTo", {
-      configurable: true,
-      value: scrollTo,
-    });
-    Object.defineProperty(HTMLElement.prototype, "animate", {
-      configurable: true,
-      value: animate,
-    });
-    apiMock.stations.mockResolvedValue(STATIONS);
-    render(<App />);
-    await settleRequests();
-    await settleRequests();
-
-    fireEvent.click(screen.getByRole("button", { name: "승인" }));
-    await settleRequests();
-
-    expect(animate).toHaveBeenCalledTimes(1);
-    expect(scrollTo).toHaveBeenCalledWith({
-      behavior: "smooth",
-      top: 0,
-    });
-    const keyframes = animate.mock.calls[0][0] as Keyframe[];
-    expect(keyframes[1].transform).toContain("translate(500px");
-    expect(screen.getByRole("button", { name: "완료" })).not.toBeNull();
-    getBoundingClientRect.mockRestore();
-    Object.defineProperty(HTMLElement.prototype, "animate", {
-      configurable: true,
-      value: undefined,
-    });
-    Object.defineProperty(HTMLElement.prototype, "scrollTo", {
-      configurable: true,
-      value: undefined,
-    });
-    Object.defineProperty(HTMLElement.prototype, "scrollIntoView", {
-      configurable: true,
-      value: undefined,
-    });
-  });
-
   it("승인 전에 시작한 polling 응답이 승인 완료 상태를 덮지 못한다", async () => {
     const staleRoutes = deferred<Route[]>();
     apiMock.stations.mockResolvedValue(STATIONS);
@@ -326,27 +271,6 @@ describe("App polling state", () => {
   });
 
   it("취소된 작업을 되돌리면 같은 작업이 진행 중으로 바뀐다", async () => {
-    const scrollTo = vi.fn();
-    const animate = vi.fn((..._args: unknown[]) => ({ finished: Promise.resolve() }));
-    Object.defineProperty(HTMLElement.prototype, "scrollTo", {
-      configurable: true,
-      value: scrollTo,
-    });
-    Object.defineProperty(HTMLElement.prototype, "animate", {
-      configurable: true,
-      value: animate,
-    });
-    const getBoundingClientRect = vi
-      .spyOn(HTMLElement.prototype, "getBoundingClientRect")
-      .mockImplementation(function (this: HTMLElement) {
-        if (this.classList.contains("route-workspace")) return new DOMRect(0, 0, 1000, 500);
-        if (this.classList.contains("route-column-list")) return new DOMRect(510, 40, 480, 400);
-        if (this.matches("[data-route-id]")) {
-          const isCancelled = this.querySelector(".route-status-icon.cancelled") !== null;
-          return new DOMRect(520, isCancelled ? 330 : -300, 450, 92);
-        }
-        return new DOMRect();
-      });
     const cancelled: Route = {
       ...ROUTES[0],
       status: "cancelled",
@@ -365,12 +289,6 @@ describe("App polling state", () => {
     render(<App />);
     await settleRequests();
     await settleRequests();
-    const operationList = document.querySelector<HTMLElement>(".route-column-list");
-    Object.defineProperties(operationList, {
-      clientHeight: { configurable: true, value: 400 },
-      scrollHeight: { configurable: true, value: 800 },
-      scrollTop: { configurable: true, value: 350, writable: true },
-    });
 
     fireEvent.click(screen.getByRole("button", { name: "되돌리기" }));
     await settleRequests();
@@ -380,18 +298,6 @@ describe("App polling state", () => {
     expect(screen.getByRole("button", { name: "취소" })).not.toBeNull();
     expect(screen.queryByRole("button", { name: "승인" })).toBeNull();
     expect(screen.queryByRole("button", { name: "되돌리기" })).toBeNull();
-    expect(scrollTo).toHaveBeenCalledWith({ behavior: "smooth", top: 0 });
-    const keyframes = animate.mock.calls[0][0] as Keyframe[];
-    expect(keyframes[1].transform).toContain("translate(0px, -280px)");
-    getBoundingClientRect.mockRestore();
-    Object.defineProperty(HTMLElement.prototype, "animate", {
-      configurable: true,
-      value: undefined,
-    });
-    Object.defineProperty(HTMLElement.prototype, "scrollTo", {
-      configurable: true,
-      value: undefined,
-    });
   });
 
   it("되돌리기 요청 중 대여소 모드로 바꾸면 이전 응답을 선택하지 않는다", async () => {
