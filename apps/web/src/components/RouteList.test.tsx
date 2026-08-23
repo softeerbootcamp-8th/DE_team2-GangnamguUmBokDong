@@ -197,6 +197,11 @@ describe("RouteList", () => {
 
     expect(screen.getByRole("button", { name: "처리 중" })).not.toBeNull();
     expect(screen.queryByRole("button", { name: "승인" })).toBeNull();
+    const cards = [...document.querySelectorAll<HTMLElement>("[data-route-id]")];
+    expect(cards.find((card) => card.dataset.routeId === ROUTES[0].route_id)?.style.viewTransitionName)
+      .toBe(`route-${ROUTES[0].route_id.replace(/-/g, "")}`);
+    expect(cards.find((card) => card.dataset.routeId === ROUTES[1].route_id)?.style.viewTransitionName)
+      .toBe("");
   });
 
   it("진행 중 작업과 대여소가 겹치는 후보도 승인할 수 있다", () => {

@@ -30,7 +30,7 @@ function revealRouteCard(routeId: string | null) {
   card?.scrollIntoView?.({ block: "nearest", inline: "nearest" });
 }
 
-function updateRoutesWithMotion(routeId: string | null, update: () => void) {
+async function updateRoutesWithMotion(routeId: string | null, update: () => void) {
   const reducedMotion = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false;
   const startViewTransition = document.startViewTransition?.bind(document);
   const applyUpdate = () => {
@@ -41,7 +41,12 @@ function updateRoutesWithMotion(routeId: string | null, update: () => void) {
     applyUpdate();
     return;
   }
-  startViewTransition(applyUpdate);
+  const transition = startViewTransition(applyUpdate);
+  try {
+    await transition.finished;
+  } catch {
+    // 브라우저가 다른 전환으로 대체해도 상태 변경은 이미 적용됐으므로 그대로 끝낸다.
+  }
 }
 
 function preferredRoute(routes: Route[]): Route | null {
@@ -313,7 +318,7 @@ export default function App() {
       if (transition === "dismiss") {
         const dismissed = await api.dismissRoute(route.route_id);
         routeMutationGenerationRef.current += 1;
-        updateRoutesWithMotion(null, () => setRoutes((current) =>
+        await updateRoutesWithMotion(null, () => setRoutes((current) =>
           current.filter((item) => item.route_id !== dismissed.route_id)));
         if (selectedRouteIdRef.current === dismissed.route_id) {
           selectedRouteIdRef.current = null;
@@ -327,9 +332,12 @@ export default function App() {
         routeMutationGenerationRef.current += 1;
         // 요청 중 목록 모드나 권역이 바뀌었다면 이전 화면의 응답을 적용하지 않는다.
         if (routeViewGeneration !== routeViewGenerationRef.current) return;
-        updateRoutesWithMotion(restored.route_id, () => setRoutes((current) => current.map((item) =>
-          item.route_id === restored.route_id ? restored : item)));
-        selectRoute(restored);
+        await updateRoutesWithMotion(restored.route_id, () => {
+          setRoutes((current) => current.map((item) =>
+            item.route_id === restored.route_id ? restored : item));
+          selectedRouteIdRef.current = restored.route_id;
+          setSelectedRouteId(restored.route_id);
+        });
         return;
       }
       const updated = transition === "dispatch"
@@ -338,8 +346,12 @@ export default function App() {
           ? await api.completeRoute(route.route_id)
           : await api.cancelRoute(route.route_id);
       routeMutationGenerationRef.current += 1;
-      updateRoutesWithMotion(updated.route_id, () => setRoutes((current) => current.map((item) =>
-        item.route_id === updated.route_id ? updated : item)));
+      await updateRoutesWithMotion(updated.route_id, () => {
+        setRoutes((current) => current.map((item) =>
+          item.route_id === updated.route_id ? updated : item));
+        selectedRouteIdRef.current = updated.route_id;
+        setSelectedRouteId(updated.route_id);
+      });
     } catch (error) {
       routeMutationGenerationRef.current += 1;
       setRouteTransitionError(routeTransitionMessage(error));

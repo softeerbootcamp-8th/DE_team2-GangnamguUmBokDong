@@ -198,6 +198,32 @@ describe("App polling state", () => {
     expect(apiMock.dispatchRoute).toHaveBeenCalledWith(ROUTES[0].route_id);
   });
 
+  it("버튼으로 상태를 바꾼 결과 카드에 선택 테두리를 옮긴다", async () => {
+    const second: Route = {
+      ...ROUTES[0],
+      route_id: "22222222-2222-4222-8222-222222222222",
+      proposed_at: "2026-08-19T23:59:00Z",
+    };
+    apiMock.stations.mockResolvedValue(STATIONS);
+    apiMock.routes.mockResolvedValue([ROUTES[0], second]);
+    apiMock.dispatchRoute.mockResolvedValue({
+      ...second,
+      status: "dispatched",
+      dispatched_at: "2026-08-20T00:05:00Z",
+    });
+    render(<App />);
+    await settleRequests();
+    await settleRequests();
+
+    fireEvent.click(screen.getAllByRole("button", { name: "승인" })[1]);
+    await settleRequests();
+
+    expect(document.querySelector(`[data-route-id="${second.route_id}"]`)?.getAttribute("aria-current"))
+      .toBe("true");
+    expect(document.querySelector(`[data-route-id="${ROUTES[0].route_id}"]`)?.getAttribute("aria-current"))
+      .toBeNull();
+  });
+
   it("상태가 바뀌는 작업 카드를 view transition으로 이동한다", async () => {
     const scrollIntoView = vi.fn();
     Object.defineProperty(HTMLElement.prototype, "scrollIntoView", {

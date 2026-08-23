@@ -124,7 +124,9 @@ export function RouteList({
           className={`route-card${isSelected ? " selected" : ""} has-actions`}
           aria-current={isSelected ? "true" : undefined}
           data-route-id={route.route_id}
-          style={{ viewTransitionName: `route-${route.route_id.replace(/-/g, "")}` }}
+          style={isBusy
+            ? { viewTransitionName: `route-${route.route_id.replace(/-/g, "")}` }
+            : undefined}
         >
           <button type="button" className="route-card-main" onClick={() => onSelect(route)}>
             <span className={`route-status-icon ${status.className}`} aria-hidden="true">
