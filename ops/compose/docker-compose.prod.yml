@@ -1,13 +1,13 @@
-# 운영(AWS EC2) 전용 Compose 구성.
+# AWS 운영 runtime의 단일 Compose 원본.
 #
-# docker-compose.yml의 override가 아니라 **독립 파일**이다. Compose의 병합 규칙상
-# `depends_on`은 union으로 합쳐져 제거할 수 없어서, override 방식으로는 postgres·minio가
-# 딸려 올라온다. 독립 파일로 두면 로컬 개발 파일을 한 줄도 건드리지 않는다.
+# AWS에서는 이 파일을 단독 실행한다. 로컬에서는 이 파일을 먼저 읽고
+# docker-compose.yml adapter를 뒤에 합쳐 RDS→Postgres, S3→MinIO만 치환한다.
+# Airflow/API/MLflow/web build·command는 양쪽 모두 이 파일의 정의를 그대로 쓴다.
 #
 # 로컬과 달라지는 점:
 #   - postgres/postgres-schema-check  → RDS (외부)
 #   - minio/minio-init                → 실제 S3 (instance profile 인증)
-#   - web(Vite dev server)            → Dockerfile.web(정적 번들 + nginx)
+#   - host port와 local credential adapter를 사용하지 않음
 #
 # 실행:
 #   docker compose --env-file /opt/app/.env -f ops/compose/docker-compose.prod.yml up -d --build

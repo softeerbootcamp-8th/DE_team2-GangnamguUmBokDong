@@ -44,6 +44,7 @@ from gold.state import load_dependencies
 from gold.weather_grid import load_weather_grid_seed, publish_weather_grid
 from ml_core import common_config
 from ml_core.model_contract import RENTAL_FEATURE_COLUMNS, RETURN_FEATURE_COLUMNS
+from ml_core.paths import POPULATION_HOURLY_PROFILE_PARQUET
 from ml_core.serving_release import (
     ExplicitImmutablePayload,
     S3ServingReleasePointerStore,
@@ -269,6 +270,51 @@ def _publish_nowcasts(
         _put_object(client, bucket, key, payload)
         keys.append(key)
     return tuple(keys)
+
+
+def _population_hourly_profile_table() -> pa.Table:
+    """모든 요일·시간을 덮는 작은 생활인구 fallback 프로필을 만든다."""
+    rows = []
+    for dow in range(7):
+        for hour in range(24):
+            rows.append(
+                {
+                    "grid_id": _CELL_ID,
+                    "hour": hour,
+                    "dow": dow,
+                    "pop_resd_mean": 980.0,
+                    "pop_long_foreign_mean": 10.0,
+                    "pop_short_foreign_mean": 10.0,
+                    "pop_total_mean": 1_000.0,
+                    "n_samples": 1,
+                }
+            )
+    return pa.Table.from_pylist(
+        rows,
+        schema=pa.schema(
+            (
+                pa.field("grid_id", pa.string(), nullable=False),
+                pa.field("hour", pa.int8(), nullable=False),
+                pa.field("dow", pa.int8(), nullable=False),
+                pa.field("pop_resd_mean", pa.float32(), nullable=False),
+                pa.field("pop_long_foreign_mean", pa.float32(), nullable=False),
+                pa.field("pop_short_foreign_mean", pa.float32(), nullable=False),
+                pa.field("pop_total_mean", pa.float32(), nullable=False),
+                pa.field("n_samples", pa.int32(), nullable=False),
+            )
+        ),
+    )
+
+
+def _publish_population_hourly_profile(client: Any, bucket: str) -> str:
+    """추론 fallback용 생활인구 프로필을 로컬 MinIO에 멱등 게시한다."""
+    _put_object(
+        client,
+        bucket,
+        POPULATION_HOURLY_PROFILE_PARQUET,
+        _parquet_bytes(_population_hourly_profile_table()),
+    )
+    return POPULATION_HOURLY_PROFILE_PARQUET
 
 
 def _enriched_station_master_table(
@@ -925,6 +971,7 @@ def seed(logical: datetime, *, model_bundle: Path | None = None) -> dict[str, ob
     object_store = S3ImmutableObjectStore(client)
     stations = _load_stations(logical + timedelta(minutes=-5))
     nowcasts = _publish_nowcasts(client, bucket, logical)
+    population_profile = _publish_population_hourly_profile(client, bucket)
     enriched = _publish_enriched_station_master(client, bucket, logical, stations)
     prerequisite_sources = _publish_prerequisite_source_snapshots(
         object_store,
@@ -954,6 +1001,7 @@ def seed(logical: datetime, *, model_bundle: Path | None = None) -> dict[str, ob
         "logical_dttm": logical.isoformat(),
         "model_source": "issue-175-prototype" if model_bundle else "generated-fixture",
         "nowcasts": nowcasts,
+        "population_hourly_profile": population_profile,
         "prerequisite_source_count": len(prerequisite_sources),
         "serving_release_uri": release_uri,
         "station_count": len(stations),
@@ -976,6 +1024,7 @@ def check(logical: datetime) -> dict[str, object]:
         "silver/station_master_enriched/"
         f"dt={logical:%Y-%m-%d}/hh={logical:%H}/{logical:%H%M}.parquet"
     )
+    required_keys.append(POPULATION_HOURLY_PROFILE_PARQUET)
     for key in required_keys:
         client.head_object(Bucket=bucket, Key=key)
     for offset in _HISTORY_OFFSETS_MINUTES:
