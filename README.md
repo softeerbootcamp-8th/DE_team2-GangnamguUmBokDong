@@ -58,6 +58,10 @@
 
 ![architecture](./architecture.png)
 
+### 데이터 흐름
+
+![dataflow](./dataflow.png)
+
 ### 기술 스택
 
 | 구분 | 기술 |
