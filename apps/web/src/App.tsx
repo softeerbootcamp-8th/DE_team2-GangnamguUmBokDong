@@ -26,6 +26,30 @@ const CLOSED_ROUTE_HISTORY_MINUTES = 60;
 const ALL_REGIONS = "all";
 type ListMode = "routes" | "stations";
 type RouteTransition = "dispatch" | "complete" | "cancel" | "dismiss" | "restore";
+type RouteRefreshState = "normal" | "soon" | "delayed";
+
+function routeRefreshState(
+  health: ServingHealthResponse | null,
+  error: boolean,
+): { state: RouteRefreshState; description: string } {
+  const routeHealth = health?.components.routes;
+  if (error || routeHealth?.state === "missing" || routeHealth?.state === "expired") {
+    return { state: "delayed", description: "작업 후보 갱신이 지연되고 있습니다." };
+  }
+  const ageMinutes = routeHealth?.age_minutes;
+  if (ageMinutes !== null && ageMinutes !== undefined && ageMinutes > 5) {
+    return { state: "delayed", description: "5분 주기의 작업 후보 갱신이 지연되고 있습니다." };
+  }
+  if (ageMinutes !== null && ageMinutes !== undefined && ageMinutes >= 4) {
+    return { state: "soon", description: "새 작업 후보가 곧 게시될 수 있습니다." };
+  }
+  return {
+    state: "normal",
+    description: routeHealth
+      ? "작업 후보는 5분 주기로 갱신됩니다."
+      : "작업 후보 갱신 상태를 확인하고 있습니다.",
+  };
+}
 
 function preferredRoute(routes: Route[]): Route | null {
   const referenceMs = candidateReferenceMs(routes);
@@ -319,6 +343,7 @@ export default function App() {
   const dispatchHealthUnavailable = servingHealthError
     || (servingHealth !== null && !canDispatchNewRoutes);
   const staleAlert = filteredAlerts.find((alert) => alert.data_status === "stale");
+  const routeRefresh = routeRefreshState(servingHealth, servingHealthError);
   const listStatusMessage = listMode === "routes"
     ? routesError
       ? "작업 목록 조회에 실패해 마지막 결과를 표시합니다."
@@ -494,6 +519,7 @@ export default function App() {
                             busyRouteId={busyRouteId}
                             transitionError={routeTransitionError}
                             canDispatchNewRoutes={canDispatchNewRoutes}
+                            candidateRefresh={routeRefresh}
                             onSelect={selectRoute}
                             onDispatch={(route) => void transitionRoute(route, "dispatch")}
                             onComplete={(route) => void transitionRoute(route, "complete")}

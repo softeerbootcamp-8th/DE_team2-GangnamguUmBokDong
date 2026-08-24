@@ -322,6 +322,30 @@ describe("App polling state", () => {
     expect(apiMock.dispatchRoute).toHaveBeenCalledWith(ROUTES[0].route_id);
   });
 
+  it.each([
+    [2, "작업 후보는 5분 주기로 갱신됩니다.", "normal"],
+    [4.2, "새 작업 후보가 곧 게시될 수 있습니다.", "soon"],
+    [5.1, "5분 주기의 작업 후보 갱신이 지연되고 있습니다.", "delayed"],
+  ])("작업 후보 게시 후 %s분 상태를 큰 시계에 표시한다", async (ageMinutes, label, state) => {
+    apiMock.stations.mockResolvedValue(STATIONS);
+    apiMock.servingHealth.mockResolvedValue({
+      ...HEALTH,
+      components: {
+        ...HEALTH.components,
+        routes: {
+          ...HEALTH.components.routes,
+          age_minutes: ageMinutes,
+        },
+      },
+    });
+    render(<App />);
+    await settleRequests();
+    await settleRequests();
+
+    const indicator = screen.getByRole("img", { name: label });
+    expect(indicator.querySelector(".route-status-icon")?.classList.contains(state)).toBe(true);
+  });
+
   it("핵심 publication이 지연되면 작업은 보존하고 신규 승인만 막는다", async () => {
     apiMock.stations.mockResolvedValue(STATIONS);
     apiMock.servingHealth.mockResolvedValue({
