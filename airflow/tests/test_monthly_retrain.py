@@ -68,22 +68,25 @@ def test_orchestrate_retrain_loop_executes_emr_then_ec2(monkeypatch) -> None:
     commands_run = []
 
     monkeypatch.setattr(
-        monthly_dag, "run_emr_feature_mart_job", lambda p: emr_calls.append(p) or "job-123"
+        monthly_dag,
+        "run_emr_feature_mart_job",
+        lambda p, **kwargs: emr_calls.append(p) or "job-123",
     )
     monkeypatch.setattr(
-        monthly_dag, "start_ec2_instance", lambda: ec2_starts.append(1) or "i-123"
+        monthly_dag, "start_ec2_instance", lambda **kwargs: ec2_starts.append(1) or "i-123"
     )
     monkeypatch.setattr(
-        monthly_dag, "stop_ec2_instance", lambda: ec2_stops.append(1)
+        monthly_dag, "stop_ec2_instance", lambda **kwargs: ec2_stops.append(1)
     )
     monkeypatch.setattr(
         monthly_dag,
         "run_command_on_ec2",
-        lambda cmd, working_dir=None: commands_run.append(cmd) or {"StandardOutputContent": "success"},
+        lambda cmd, working_dir=None, **kwargs: commands_run.append(cmd)
+        or {"StandardOutputContent": "success"},
     )
 
     loop_fn = monthly_dag.make_task_orchestrate_retrain_loop("rental")
-    result = loop_fn(ti=mock_ti)
+    result = loop_fn(ti=mock_ti, params={})
 
     assert result["status"] == "completed"
     assert emr_calls == ["rental-profile-1"]
