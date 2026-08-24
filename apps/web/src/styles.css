@@ -201,12 +201,10 @@ body {
 }
 
 .header-time-tooltip {
-  position: absolute;
+  position: fixed;
   z-index: 1000;
-  top: calc(100% + 7px);
-  right: 0;
   width: max-content;
-  max-width: 250px;
+  max-width: min(250px, calc(100vw - 16px));
   padding: 7px 9px;
   border: 1px solid var(--border);
   border-radius: 7px;
@@ -225,15 +223,13 @@ body {
   white-space: normal;
 }
 
-.header-time-help:hover .header-time-tooltip,
-.header-time-help:focus-within .header-time-tooltip {
+.header-time-tooltip.is-visible {
   opacity: 1;
   transform: translateY(0);
   visibility: visible;
 }
 
-.serving-health-badge,
-.serving-health-overall {
+.serving-health-badge {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -248,37 +244,32 @@ body {
   font-size: 10px;
 }
 
-.serving-health-badge.healthy,
-.serving-health-overall.healthy {
+.serving-health-badge.healthy {
   background: color-mix(in srgb, var(--status-good) 12%, transparent);
   color: var(--status-good);
 }
 
-.serving-health-badge.degraded,
-.serving-health-overall.degraded {
+.serving-health-badge.degraded {
   background: color-mix(in srgb, var(--status-warning) 16%, transparent);
   color: color-mix(in srgb, var(--status-warning) 78%, var(--text-primary));
 }
 
-.serving-health-badge.unavailable,
-.serving-health-overall.unavailable {
+.serving-health-badge.unavailable {
   background: color-mix(in srgb, var(--status-critical) 12%, transparent);
   color: var(--status-critical);
 }
 
-.serving-health-badge.loading,
-.serving-health-overall.loading {
+.serving-health-badge.loading {
   background: color-mix(in srgb, var(--text-muted) 10%, transparent);
   color: var(--text-muted);
 }
 
 .serving-health-popover {
-  position: absolute;
+  position: fixed;
   z-index: 1200;
-  top: calc(100% + 8px);
-  right: -72px;
   display: flex;
-  width: 360px;
+  width: min(360px, calc(100vw - 16px));
+  box-sizing: border-box;
   flex-direction: column;
   gap: 8px;
   padding: 11px;
@@ -297,8 +288,7 @@ body {
   white-space: normal;
 }
 
-.serving-health-help:hover .serving-health-popover,
-.serving-health-help:focus-within .serving-health-popover {
+.serving-health-popover.is-visible {
   opacity: 1;
   pointer-events: auto;
   transform: translateY(0);
@@ -313,16 +303,9 @@ body {
 }
 
 .serving-health-popover-header {
-  grid-template-columns: 1fr auto;
   padding-bottom: 7px;
   border-bottom: 1px solid var(--border);
   color: var(--text-primary);
-}
-
-.serving-health-overall {
-  min-height: 18px;
-  padding: 1px 7px;
-  font-size: 10px;
 }
 
 .serving-health-list {
