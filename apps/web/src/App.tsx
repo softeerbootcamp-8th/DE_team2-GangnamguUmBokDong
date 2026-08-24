@@ -330,6 +330,7 @@ export default function App() {
   }, [selectedStationId]);
 
   const selectedRoute = routes.find((route) => route.route_id === selectedRouteId) ?? null;
+  const routeSelectionPending = listMode === "routes" && !routesInitialized;
   const selectedStation = stations.find((station) => station.sta_id === selectedStationId) ?? null;
   const filteredStations = selectedRegion === ALL_REGIONS
     ? stations
@@ -361,6 +362,7 @@ export default function App() {
     routeViewGenerationRef.current += 1;
     setSelectedRegion(region);
     setRouteTransitionError(null);
+    setRoutesInitialized(false);
     selectedRouteIdRef.current = null;
     setSelectedRouteId(null);
   }
@@ -454,14 +456,14 @@ export default function App() {
                   <section className="flex h-full min-h-0 min-w-0 flex-col gap-2">
                     <div className="map-panel-toolbar">
                       <span className="map-panel-title">
-                        <h2>{selectedRoute ? "작업 경로 지도" : "대여소 지도"}</h2>
+                        <h2>{selectedRoute || routeSelectionPending ? "작업 경로 지도" : "대여소 지도"}</h2>
                       </span>
                     </div>
                     <div className="relative min-h-0 flex-1 overflow-hidden rounded-md border">
                       <div className="absolute inset-0 z-0">
                         <StationMap
-                          stations={filteredStations}
-                          alerts={filteredAlerts}
+                          stations={routeSelectionPending ? [] : filteredStations}
+                          alerts={routeSelectionPending ? [] : filteredAlerts}
                           selectedStationId={selectedStationId}
                           stationFocusRequest={stationFocusRequest}
                           onSelect={selectStation}

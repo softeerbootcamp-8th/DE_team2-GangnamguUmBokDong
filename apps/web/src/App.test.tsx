@@ -554,6 +554,29 @@ describe("App polling state", () => {
     expect(screen.getByTestId("map-route").textContent).toBe("none");
   });
 
+  it("작업 경로 화면에서 권역을 바꾸는 동안 일반 대여소 마커를 표시하지 않는다", async () => {
+    const nextRegionRoutes = deferred<Route[]>();
+    apiMock.stations.mockResolvedValue([
+      ...STATIONS,
+      { ...STATIONS[0], sta_id: "ST-3", sta_nm: "다른 권역 대여소", region: "다른센터" },
+    ]);
+    apiMock.routes.mockResolvedValueOnce(ROUTES).mockReturnValueOnce(nextRegionRoutes.promise);
+    render(<App />);
+    await settleRequests();
+    await settleRequests();
+
+    expect(screen.getByTestId("map-route").textContent).toBe(ROUTES[0].route_id);
+    fireEvent.click(screen.getByRole("button", { name: "권역 변경" }));
+
+    expect(screen.getByRole("heading", { name: "작업 경로 지도" })).not.toBeNull();
+    expect(screen.getByTestId("map-route").textContent).toBe("none");
+    expect(screen.getByTestId("map-stations").textContent).toBe("");
+    expect(screen.getByTestId("map-alerts").textContent).toBe("");
+
+    nextRegionRoutes.resolve([]);
+    await settleRequests();
+  });
+
   it("되돌린 작업은 기존 카드를 갱신하고 중복 카드를 만들지 않는다", async () => {
     const cancelled: Route = {
       ...ROUTES[0],
