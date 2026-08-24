@@ -7,16 +7,20 @@
 
 from __future__ import annotations
 
+import json
+import subprocess
 from datetime import timedelta
 
+from airflow.providers.standard.operators.python import ShortCircuitOperator
 from airflow.task.trigger_rule import TriggerRule
+from callbacks.task_callbacks import on_failure_callback, on_success_callback
 from config.schedules import (
     DEFAULT_EXECUTION_TIMEOUT,
     DEFAULT_RETRIES,
     EXECUTION_TIMEOUT_OVERRIDES,
 )
 
-from orchestration.task_builder import REPO_ROOT, build_module_task
+from orchestration.task_builder import REPO_ROOT, build_module_task, module_subprocess_env
 from orchestration.templates import (
     KST_WINDOW_START,
     kst_day_hour_replay_days_ago,
@@ -24,6 +28,55 @@ from orchestration.templates import (
 )
 
 COLLECTOR_DIR = str(REPO_ROOT / "collector")
+_FRESHNESS_CHECK_TIMEOUT_SECONDS = 30
+
+
+def _check_source_due(source_id: str, min_interval_seconds: int) -> bool:
+    """collector CLI를 서브프로세스로 불러 마지막 성공 수집 이후 충분히 지났는지 묻는다.
+
+    실제 실행 시각(`datetime.now()`) 기준으로 판단한다 — DAG의 논리 시각
+    (`logical_date`)은 이전 run이 늦게 끝나면 실제 시각보다 뒤처질 수 있어서,
+    "지금 진짜로 얼마나 지났는지"를 묻는 이 판단에는 맞지 않는다.
+    """
+    env = module_subprocess_env(COLLECTOR_DIR)
+    result = subprocess.run(
+        [
+            "uv", "run", "--frozen", "python", "main.py",
+            "--source", source_id,
+            "--check-due-after-seconds", str(min_interval_seconds),
+        ],
+        cwd=COLLECTOR_DIR,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=_FRESHNESS_CHECK_TIMEOUT_SECONDS,
+        check=True,
+    )
+    payload = json.loads(result.stdout.strip().splitlines()[-1])
+    return bool(payload["due"])
+
+
+def build_weather_freshness_gate_task(dag, source_id: str, *, min_interval: timedelta):
+    """마지막 성공 수집 이후 `min_interval`이 안 지났으면 이후 태스크를 스킵하는 게이트.
+
+    `ShortCircuitOperator`가 `False`를 반환하면 직접 하위 태스크(이 소스의
+    `collect_{source_id}`)만 스킵된다 — `ignore_downstream_trigger_rules=False`를
+    명시해야 한다. 기본값(`True`)이면 이 태스크 뒤에 연결된 모든 태스크(`weather_
+    ready_gate`는 물론 `prepare_serving_plan` 이후 전체 체인)가 트리거룰과 무관하게
+    강제로 스킵되어, 날씨 하나만 아직 안 지났어도 그 tick의 서빙 전체가 멈춘다.
+    `False`로 두면 직접 하위(collect 태스크)만 스킵되고, `weather_ready_gate`
+    (`ALL_DONE`)부터는 실제 상태를 보고 정상 평가된다.
+    """
+    return ShortCircuitOperator(
+        task_id=f"freshness_gate_{source_id}",
+        python_callable=lambda: _check_source_due(source_id, int(min_interval.total_seconds())),
+        ignore_downstream_trigger_rules=False,
+        retries=0,
+        execution_timeout=timedelta(seconds=_FRESHNESS_CHECK_TIMEOUT_SECONDS),
+        on_success_callback=on_success_callback,
+        on_failure_callback=on_failure_callback,
+        dag=dag,
+    )
 
 
 def build_collector_task(

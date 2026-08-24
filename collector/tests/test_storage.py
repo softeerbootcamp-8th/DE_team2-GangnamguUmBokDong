@@ -16,6 +16,7 @@ from core.gold_publication.errors import (
 from storage import (
     clear_bronze,
     delete_retry_marker,
+    latest_source_snapshot_logical_dttm,
     list_retry_markers,
     list_source_snapshot_windows,
     read_bronze,
@@ -247,6 +248,41 @@ class TestSourceSnapshotWindowListing:
 
         with pytest.raises(ValueError, match="partition"):
             list_source_snapshot_windows("test_source", date(2026, 8, 12))
+
+
+class TestLatestSourceSnapshotLogicalDttm:
+    """Airflow freshness gate가 쓰는 '마지막 성공 수집 시각' 조회를 검증한다."""
+
+    def test_returns_latest_window_at_or_before_as_of(self) -> None:
+        older = datetime(2026, 8, 12, 10, 0, tzinfo=KST)
+        newer = datetime(2026, 8, 12, 10, 10, tzinfo=KST)
+        future = datetime(2026, 8, 12, 10, 20, tzinfo=KST)
+        write_source_snapshot_manifest("test_source", older, 0, b"{}")
+        write_source_snapshot_manifest("test_source", newer, 0, b"{}")
+        write_source_snapshot_manifest("test_source", future, 0, b"{}")
+
+        result = latest_source_snapshot_logical_dttm(
+            "test_source", as_of=datetime(2026, 8, 12, 10, 15, tzinfo=KST)
+        )
+
+        assert result == newer
+
+    def test_falls_back_to_previous_kst_day_right_after_midnight(self) -> None:
+        late_yesterday = datetime(2026, 8, 11, 23, 55, tzinfo=KST)
+        write_source_snapshot_manifest("test_source", late_yesterday, 0, b"{}")
+
+        result = latest_source_snapshot_logical_dttm(
+            "test_source", as_of=datetime(2026, 8, 12, 0, 2, tzinfo=KST)
+        )
+
+        assert result == late_yesterday
+
+    def test_returns_none_when_nothing_found(self) -> None:
+        result = latest_source_snapshot_logical_dttm(
+            "test_source", as_of=datetime(2026, 8, 12, 10, 15, tzinfo=KST)
+        )
+
+        assert result is None
 
 
 class TestRetryMarkerRawIO:
