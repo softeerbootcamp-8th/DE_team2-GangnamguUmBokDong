@@ -12,17 +12,21 @@
 
 `apps/web`은 React(Node.js) 프로젝트라 uv/Python과 무관합니다. npm/pnpm으로 별도 관리합니다.
 
-## 로컬 인프라 띄우기 (Postgres / MinIO / Airflow)
+## AWS 운영 runtime을 로컬에서 띄우기
 
-`airflow`, `apps`, `ml`, `collector`가 공통으로 의존하는 인프라(Postgres, MinIO, Airflow)는 `ops/compose`의 docker compose로 관리합니다. 최초 1회 아래 명령이면 충분합니다.
+로컬은 별도 개발 runtime이 아니라 AWS 운영 구성을 재현합니다.
+`docker-compose.prod.yml`의 Airflow/API/MLflow/nginx 정의를 그대로 사용하고,
+AWS RDS와 S3만 Postgres와 MinIO로 치환합니다. 최초 1회 아래 명령이면 충분합니다.
 
 ```bash
 make bootstrap
 ```
 
-`.env`가 없으면 `.env.example`에서 자동으로 복사하고, Postgres / MinIO / Airflow(webserver+scheduler)를 기동합니다. 완료되면 아래 주소로 접속할 수 있습니다.
+`.env`가 없으면 `.env.example`에서 자동으로 복사한 뒤 API key가 없다는 안내와 함께
+중단합니다. `SEOUL_OPENAPI_KEY`와 `KMA_APIHUB_KEY`를 채우고 다시 실행하세요. 운영 이미지
+기동 후 fixture 입력을 준비하고 `realtime_tick` 전체 DAG가 성공해야 완료됩니다.
 
-- 대시보드: `http://localhost:5173`
+- 대시보드(운영 nginx): `http://localhost:5173` (`admin / admin`, `.env`에서 변경 가능)
 - API: `http://localhost:8000`
 - Postgres: `localhost:5433` (앱 DB: `app`, Airflow·MLflow 메타데이터 DB도 같은 인스턴스 안에 분리 생성됨)
 - MinIO 콘솔: `http://localhost:9001`
@@ -50,13 +54,12 @@ make migrate-route-cancellation
 - `umbokdong-dashboard-live_postgres-data`: 앱 Gold 데이터와 Airflow·MLflow 메타데이터
 - `umbokdong-dashboard-live_minio-data`: 수집 원본·가공 데이터·학습 산출물·서빙 모델
 
-`umbokdong-dashboard-live_airflow-module-venvs`와
-`umbokdong-dashboard-live_web-node-modules`는 재설치 가능한 의존성 캐시다. PostgreSQL과
-MinIO는 저장 형식과 복구 절차가 완전히 다르므로 하나의 물리 볼륨에 섞지 않는다.
+`umbokdong-dashboard-live_airflow-module-venvs`는 재설치 가능한 의존성 캐시다.
+PostgreSQL과 MinIO는 저장 형식과 복구 절차가 완전히 다르므로 하나의 물리 볼륨에
+섞지 않는다.
 
-전체 realtime 파이프라인을 로컬 Airflow에서 시각적으로 확인하려면 스택 기동 후
-`make e2e-smoke`를 실행합니다. Fixture 범위와 UI 확인 방법은
-[로컬 Airflow E2E smoke](airflow/local-e2e.md)를 참고하세요.
+전체 realtime 파이프라인을 다시 확인하려면 스택 기동 후 `make e2e-smoke`를
+실행합니다. 이 명령도 운영 Compose 원본의 Airflow에서 같은 DAG를 실행합니다.
 
 ### Apple Silicon에서 PostGIS 실행
 
@@ -83,6 +86,9 @@ Makefile을 통하지 않고 Docker Compose를 직접 실행해야 하는 Apple 
 
 ```bash
 docker compose \
+  --env-file ops/compose/local.defaults.env \
+  --env-file .env \
+  -f ops/compose/docker-compose.prod.yml \
   -f ops/compose/docker-compose.yml \
   -f ops/compose/docker-compose.apple-silicon.yml \
   up -d --build

@@ -5,7 +5,7 @@ from pathlib import Path
 import yaml
 
 _ROOT = Path(__file__).resolve().parents[2]
-_COMPOSE_PATH = _ROOT / "ops" / "compose" / "docker-compose.yml"
+_LOCAL_ADAPTER_PATH = _ROOT / "ops" / "compose" / "docker-compose.yml"
 _PROD_COMPOSE_PATH = _ROOT / "ops" / "compose" / "docker-compose.prod.yml"
 _ENV_EXAMPLE_PATH = _ROOT / ".env.example"
 _ENTRYPOINT_PATH = _ROOT / "ops" / "compose" / "airflow-entrypoint.sh"
@@ -19,12 +19,15 @@ _MODULE_ENV_VOLUME = "airflow-module-venvs:/opt/venvs/modules"
 
 
 def test_airflow_services_share_container_only_module_environments():
-    """모든 Airflow 서비스가 host .venv 대신 같은 named volume을 사용한다."""
-    compose = yaml.safe_load(_COMPOSE_PATH.read_text(encoding="utf-8"))
+    """운영 원본의 모든 Airflow 서비스가 같은 named volume을 사용한다."""
+    production = yaml.safe_load(_PROD_COMPOSE_PATH.read_text(encoding="utf-8"))
+    local_text = _LOCAL_ADAPTER_PATH.read_text(encoding="utf-8")
 
-    assert "airflow-module-venvs" in compose["volumes"]
+    assert "airflow-module-venvs" in production["volumes"]
+    assert _MODULE_ENV_VOLUME in production["x-airflow-common"]["volumes"]
     for service_name in _AIRFLOW_SERVICES:
-        assert _MODULE_ENV_VOLUME in compose["services"][service_name]["volumes"]
+        service_section = local_text.split(f"  {service_name}:", 1)[1].split("\n  ", 1)[0]
+        assert "volumes:" not in service_section
 
 
 def test_airflow_init_prewarms_every_bash_operator_project():
@@ -39,9 +42,9 @@ def test_airflow_init_prewarms_every_bash_operator_project():
 
 
 def test_local_and_production_use_same_airflow_concurrency_contract():
-    """개발·배포 환경이 같은 환경변수와 안전 기본 동시성을 사용한다."""
-    local = yaml.safe_load(_COMPOSE_PATH.read_text(encoding="utf-8"))
+    """로컬 adapter가 운영 원본의 안전 동시성 계약을 덮어쓰지 않는다."""
     production = yaml.safe_load(_PROD_COMPOSE_PATH.read_text(encoding="utf-8"))
+    local_text = _LOCAL_ADAPTER_PATH.read_text(encoding="utf-8")
     expected = {
         "AIRFLOW__CORE__PARALLELISM": "${AIRFLOW__CORE__PARALLELISM:-3}",
         "AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG": (
@@ -49,39 +52,52 @@ def test_local_and_production_use_same_airflow_concurrency_contract():
         ),
     }
 
-    for service_name in _AIRFLOW_SERVICES:
-        environment = local["services"][service_name]["environment"]
-        assert {key: environment[key] for key in expected} == expected
-
     production_environment = production["x-airflow-common"]["environment"]
     assert {
         key: production_environment[key] for key in expected
     } == expected
+    assert "AIRFLOW__CORE__PARALLELISM" not in local_text
+    assert "AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG" not in local_text
 
     env_example = _ENV_EXAMPLE_PATH.read_text(encoding="utf-8")
     assert "AIRFLOW__CORE__PARALLELISM=3" in env_example
     assert "AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG=2" in env_example
 
 
-def test_local_and_production_enable_same_resource_probe_sampling():
-    """개발·배포의 task resource probe가 같은 관측 주기를 사용한다."""
-    local = yaml.safe_load(_COMPOSE_PATH.read_text(encoding="utf-8"))
+def test_local_airflow_starts_project_dags_paused_without_examples():
+    """운영 원본이 빈 metadata DB에서도 프로젝트 DAG를 pause 생성한다."""
     production = yaml.safe_load(_PROD_COMPOSE_PATH.read_text(encoding="utf-8"))
+    environment = production["x-airflow-common"]["environment"]
+
+    assert environment["AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION"] == "true"
+    assert environment["AIRFLOW__CORE__LOAD_EXAMPLES"] == "false"
+
+
+def test_local_and_production_enable_same_resource_probe_sampling():
+    """로컬 adapter가 운영 원본의 resource probe 주기를 덮어쓰지 않는다."""
+    production = yaml.safe_load(_PROD_COMPOSE_PATH.read_text(encoding="utf-8"))
+    local_text = _LOCAL_ADAPTER_PATH.read_text(encoding="utf-8")
     expected = "${AIRFLOW_RESOURCE_PROBE_SAMPLE_SECONDS:-1}"
 
-    for service_name in _AIRFLOW_SERVICES:
-        assert (
-            local["services"][service_name]["environment"][
-                "AIRFLOW_RESOURCE_PROBE_SAMPLE_SECONDS"
-            ]
-            == expected
-        )
     assert (
         production["x-airflow-common"]["environment"][
             "AIRFLOW_RESOURCE_PROBE_SAMPLE_SECONDS"
         ]
         == expected
     )
+    assert "AIRFLOW_RESOURCE_PROBE_SAMPLE_SECONDS" not in local_text
     assert "AIRFLOW_RESOURCE_PROBE_SAMPLE_SECONDS=1" in _ENV_EXAMPLE_PATH.read_text(
         encoding="utf-8"
     )
+
+
+def test_local_adapter_does_not_redefine_production_runtime_images_or_commands():
+    """로컬은 managed service 연결만 바꾸고 운영 runtime 정의는 재사용한다."""
+    local_text = _LOCAL_ADAPTER_PATH.read_text(encoding="utf-8")
+
+    for service_name in (*_AIRFLOW_SERVICES, "api", "mlflow", "web"):
+        service_section = local_text.split(f"  {service_name}:", 1)[1].split("\n  ", 1)[0]
+        assert "build:" not in service_section
+        assert "image:" not in service_section
+        assert "command:" not in service_section
+        assert "restart:" not in service_section

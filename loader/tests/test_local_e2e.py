@@ -116,6 +116,16 @@ def test_nowcast_fixture_has_every_hour_and_age_column() -> None:
     assert set(local_e2e._AGE_COLUMNS).issubset(table.column_names)
 
 
+def test_population_profile_fixture_covers_every_hour_and_weekday() -> None:
+    """생활인구 fallback은 fixture 격자의 24시간·7요일을 모두 포함한다."""
+    table = local_e2e._population_hourly_profile_table()
+
+    assert table.num_rows == 24 * 7
+    keys = set(zip(table["hour"].to_pylist(), table["dow"].to_pylist(), strict=True))
+    assert keys == {(hour, dow) for hour in range(24) for dow in range(7)}
+    assert set(table["grid_id"].to_pylist()) == {local_e2e._CELL_ID}
+
+
 def test_weather_forecast_fixture_covers_every_grid_and_hour() -> None:
     """단기예보 fixture는 Gold resolver의 34 grid×13시간을 완전히 덮는다."""
     logical = datetime.fromisoformat("2026-08-20T16:40:00+09:00")
