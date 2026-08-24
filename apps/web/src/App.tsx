@@ -391,7 +391,7 @@ export default function App() {
         >
           <ResizablePanel id="workspace-row" defaultSize="50%">
             <ResizablePanelGroup orientation="horizontal">
-              <ResizablePanel id="map-col" defaultSize="50%" minSize="35%">
+              <ResizablePanel id="map-col" defaultSize="50%">
                 <div className="flex h-full flex-col bg-background px-4 py-2">
                   <section className="flex h-full min-h-0 min-w-0 flex-col gap-2">
                     <div className="map-panel-toolbar">
@@ -422,7 +422,7 @@ export default function App() {
 
               <ResizableHandle withHandle />
 
-              <ResizablePanel id="list-col" defaultSize="50%" minSize="35%">
+              <ResizablePanel id="list-col" defaultSize="50%">
                 <div className="flex h-full min-h-0 min-w-0 flex-col bg-card px-4 py-2">
                   <section className="flex h-full min-h-0 min-w-0 flex-col gap-2">
                     <div className="work-list-header">

@@ -252,8 +252,12 @@ describe("App polling state", () => {
       .toBeNull();
     expect(screen.getByTestId("resizable-panel-map-col").getAttribute("data-default-size"))
       .toBe("50%");
+    expect(screen.getByTestId("resizable-panel-map-col").getAttribute("data-min-size"))
+      .toBeNull();
     expect(screen.getByTestId("resizable-panel-list-col").getAttribute("data-default-size"))
       .toBe("50%");
+    expect(screen.getByTestId("resizable-panel-list-col").getAttribute("data-min-size"))
+      .toBeNull();
   });
 
   it("상세 기본 높이만 화면 절반 이내로 계산하고 사용자 조절 뒤에는 덮어쓰지 않는다", async () => {
