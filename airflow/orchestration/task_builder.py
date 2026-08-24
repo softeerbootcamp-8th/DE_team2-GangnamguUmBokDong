@@ -9,6 +9,7 @@ bind mount된 호스트 ``.venv``를 macOS와 Linux 컨테이너가 서로 덮�
 
 from __future__ import annotations
 
+import os
 import re
 from collections.abc import Callable
 from pathlib import Path
@@ -63,6 +64,37 @@ def _profiled_bash_command(command: str) -> str:
     )
 
 
+def _module_project_environment(module_dir: str, uv_environment_name: str | None) -> str:
+    """모듈의 독립 uv venv 경로를 검증해서 반환한다(BashOperator와 subprocess 호출이 공유)."""
+    environment_name = uv_environment_name or Path(module_dir).name
+    if (
+        type(environment_name) is not str
+        or re.fullmatch(r"[a-z][a-z0-9-]*", environment_name) is None
+    ):
+        raise ValueError(
+            "uv_environment_name은 lowercase 영숫자와 하이픈만 허용합니다."
+        )
+    return f"{_MODULE_UV_ENV_ROOT}/{environment_name}"
+
+
+def module_subprocess_env(
+    module_dir: str, *, uv_environment_name: str | None = None
+) -> dict[str, str]:
+    """모듈 venv를 가리키는 환경변수를 계산한다.
+
+    `build_module_task()`(BashOperator)를 못 쓰는 자리 — 예: PythonOperator/
+    ShortCircuitOperator의 callable 안에서 `subprocess.run()`으로 모듈 CLI를 직접
+    부를 때 — 를 위한 것이다. Airflow 자체의 ``VIRTUAL_ENV``를 물려받지 않도록
+    지운다(호스트/컨테이너가 `.venv`를 서로 덮어쓰지 않게 하는 이유는 이 파일
+    docstring 참고).
+    """
+    project_environment = _module_project_environment(module_dir, uv_environment_name)
+    env = dict(os.environ)
+    env.pop("VIRTUAL_ENV", None)
+    env["UV_PROJECT_ENVIRONMENT"] = project_environment
+    return env
+
+
 def build_module_task(
     dag,
     task_id: str,
@@ -84,15 +116,7 @@ def build_module_task(
             ``--project``가 작업 디렉터리와 다른 프로젝트를 가리키는 경우에만
             명시한다.
     """
-    environment_name = uv_environment_name or Path(module_dir).name
-    if (
-        type(environment_name) is not str
-        or re.fullmatch(r"[a-z][a-z0-9-]*", environment_name) is None
-    ):
-        raise ValueError(
-            "uv_environment_name은 lowercase 영숫자와 하이픈만 허용합니다."
-        )
-    project_environment = f"{_MODULE_UV_ENV_ROOT}/{environment_name}"
+    project_environment = _module_project_environment(module_dir, uv_environment_name)
     profiled_command = _profiled_bash_command(bash_command)
     arguments: dict[str, Any] = {
         "task_id": task_id,

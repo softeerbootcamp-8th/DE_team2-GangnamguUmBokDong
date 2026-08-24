@@ -2,17 +2,21 @@
 
 import json
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import jinja2
 import pytest
 from airflow.sdk.execution_time import macros
 from airflow.task.trigger_rule import TriggerRule
 from callbacks.task_callbacks import on_failure_callback, on_success_callback
+
+import orchestration.collector_task as collector_task
 from orchestration.collector_task import (
     COLLECTOR_DIR,
     build_collector_replay_task,
     build_collector_task,
     build_daily_history_replay_task,
+    build_weather_freshness_gate_task,
 )
 from orchestration.gold_publisher_task import (
     GOLD_PUBLISHER_DIR,
@@ -72,6 +76,66 @@ def test_collector_task_uses_kst_window_and_own_project_environment(dag) -> None
     assert "astimezone" in task.bash_command
     assert "// 5" in task.bash_command
     assert task.cwd == COLLECTOR_DIR
+
+
+def test_weather_freshness_gate_only_skips_direct_downstream(dag) -> None:
+    """다운스트림 전체를 강제 스킵하면 weather_ready_gate 이후 체인이 통째로 멈춘다."""
+    from airflow.providers.standard.operators.python import ShortCircuitOperator
+
+    gate = build_weather_freshness_gate_task(
+        dag, "weather_ultra_short_live", min_interval=timedelta(minutes=10)
+    )
+
+    assert isinstance(gate, ShortCircuitOperator)
+    assert gate.ignore_downstream_trigger_rules is False
+    assert gate.retries == 0
+    assert gate.execution_timeout == timedelta(seconds=30)
+    assert gate.task_id == "freshness_gate_weather_ultra_short_live"
+
+
+def test_weather_freshness_gate_callable_delegates_with_seconds(monkeypatch, dag) -> None:
+    """min_interval을 초 단위로 바꿔 _check_source_due에 그대로 넘긴다."""
+    captured = {}
+
+    def fake_check(source_id, min_interval_seconds):
+        captured["source_id"] = source_id
+        captured["min_interval_seconds"] = min_interval_seconds
+        return True
+
+    monkeypatch.setattr(collector_task, "_check_source_due", fake_check)
+
+    gate = build_weather_freshness_gate_task(
+        dag, "weather_short_term_forecast", min_interval=timedelta(hours=3)
+    )
+
+    assert gate.python_callable() is True
+    assert captured == {
+        "source_id": "weather_short_term_forecast",
+        "min_interval_seconds": 10800,
+    }
+
+
+def test_check_source_due_parses_collector_cli_json(monkeypatch) -> None:
+    """collector CLI의 --check-due-after-seconds JSON 출력을 그대로 신뢰한다."""
+    captured_kwargs = {}
+
+    def fake_run(cmd, **kwargs):
+        captured_kwargs["cmd"] = cmd
+        captured_kwargs.update(kwargs)
+        return SimpleNamespace(stdout='{"due": false, "elapsed_seconds": 42.0}\n')
+
+    monkeypatch.setattr(collector_task.subprocess, "run", fake_run)
+
+    result = collector_task._check_source_due("weather_ultra_short_live", 600)
+
+    assert result is False
+    assert captured_kwargs["cwd"] == COLLECTOR_DIR
+    assert captured_kwargs["timeout"] == 30
+    assert captured_kwargs["env"]["UV_PROJECT_ENVIRONMENT"] == "/opt/venvs/modules/collector"
+    assert captured_kwargs["cmd"][-4:] == [
+        "--source", "weather_ultra_short_live",
+        "--check-due-after-seconds", "600",
+    ]
 
 
 def test_module_task_rejects_unsafe_environment_name(dag) -> None:

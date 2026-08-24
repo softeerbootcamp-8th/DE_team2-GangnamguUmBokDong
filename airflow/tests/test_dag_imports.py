@@ -8,17 +8,11 @@ import dags.realtime_tick as realtime_tick_dag
 import dags.station_master as station_master_dag
 from airflow.task.trigger_rule import TriggerRule
 
-_REALTIME_TICK_DAGS = (
-    realtime_tick_dag.dag,
-    realtime_tick_dag.dag_ultra_weather,
-    realtime_tick_dag.dag_ultra_weather_on_hour,
-    realtime_tick_dag.dag_full_weather,
-)
-
 
 def test_all_dag_ids_import() -> None:
     """모든 production/manual DAG module이 의존성 오류 없이 import된다."""
-    assert {dag.dag_id for dag in _REALTIME_TICK_DAGS} | {
+    assert {
+        realtime_tick_dag.dag.dag_id,
         station_master_dag.dag.dag_id,
         daily_dag.dag.dag_id,
         daily_compaction_dag.dag.dag_id,
@@ -26,9 +20,6 @@ def test_all_dag_ids_import() -> None:
         monthly_return_dag.dag.dag_id,
     } == {
         "realtime_tick",
-        "realtime_tick_ultra_weather",
-        "realtime_tick_ultra_weather_on_hour",
-        "realtime_tick_full_weather",
         "station_master",
         "daily_population_and_events",
         "daily_compaction",
@@ -38,59 +29,53 @@ def test_all_dag_ids_import() -> None:
 
 
 def test_realtime_population_is_normalized_before_inference() -> None:
-    """Realtime inference가 raw population collector를 우회하지 않는다(4개 DAG 전부)."""
-    for dag in _REALTIME_TICK_DAGS:
-        normalizer = dag.get_task("run_normalizer")
-        inference = dag.get_task("run_inference")
+    """Realtime inference가 raw population collector를 우회하지 않는다."""
+    dag = realtime_tick_dag.dag
+    normalizer = dag.get_task("run_normalizer")
+    inference = dag.get_task("run_inference")
 
-        assert normalizer.upstream_task_ids == {"collect_population_realtime"}
-        assert "run_normalizer" in inference.upstream_task_ids
-        assert "collect_population_realtime" not in inference.upstream_task_ids
-        assert inference.trigger_rule == TriggerRule.ALL_SUCCESS
-        assert "collect_weather_ultra_short_live" not in inference.upstream_task_ids
+    assert normalizer.upstream_task_ids == {"collect_population_realtime"}
+    assert "run_normalizer" in inference.upstream_task_ids
+    assert "collect_population_realtime" not in inference.upstream_task_ids
+    assert inference.trigger_rule == TriggerRule.ALL_SUCCESS
+    assert "collect_weather_ultra_short_live" not in inference.upstream_task_ids
 
 
 def test_realtime_uses_single_coordinated_publication_chain() -> None:
-    """4개 realtime DAG 모두 inference 이후 exact-ref chain을 소유한다."""
-    for dag in _REALTIME_TICK_DAGS:
-        assert dag.get_task("finalize_serving_release").upstream_task_ids == {
-            "run_inference"
-        }
-        assert dag.get_task("publish_station_urgency").upstream_task_ids == {
-            "finalize_serving_release"
-        }
-        assert dag.get_task("publish_rebalance_route").upstream_task_ids == {
-            "publish_station_urgency"
-        }
+    """realtime tick DAG가 inference 이후 exact-ref chain을 소유한다."""
+    dag = realtime_tick_dag.dag
+    assert dag.get_task("finalize_serving_release").upstream_task_ids == {
+        "run_inference"
+    }
+    assert dag.get_task("publish_station_urgency").upstream_task_ids == {
+        "finalize_serving_release"
+    }
+    assert dag.get_task("publish_rebalance_route").upstream_task_ids == {
+        "publish_station_urgency"
+    }
 
 
-def test_weather_collection_is_folded_into_matching_realtime_tick_only() -> None:
-    """날씨 collector는 필요한 realtime tick DAG에만, 필요한 만큼만 존재한다."""
-    assert not {
-        "collect_weather_ultra_short_live",
-        "collect_weather_ultra_short_forecast",
-        "collect_weather_short_term_forecast",
-        "weather_ready_gate",
-    }.intersection(realtime_tick_dag.dag.task_ids)
-
-    for dag in (
-        realtime_tick_dag.dag_ultra_weather,
-        realtime_tick_dag.dag_ultra_weather_on_hour,
+def test_weather_collection_always_present_behind_freshness_gate() -> None:
+    """날씨 collector는 매 tick 존재하되, freshness gate를 직접 상위로 둔다."""
+    dag = realtime_tick_dag.dag
+    for source_id in (
+        "weather_ultra_short_live",
+        "weather_ultra_short_forecast",
+        "weather_short_term_forecast",
     ):
-        assert {
-            "collect_weather_ultra_short_live",
-            "collect_weather_ultra_short_forecast",
-            "weather_ready_gate",
-        }.issubset(dag.task_ids)
-        assert "collect_weather_short_term_forecast" not in dag.task_ids
+        collect_task_id = f"collect_{source_id}"
+        gate_task_id = f"freshness_gate_{source_id}"
+        assert collect_task_id in dag.task_ids
+        assert gate_task_id in dag.task_ids
+        assert dag.get_task(collect_task_id).upstream_task_ids == {gate_task_id}
+        assert dag.get_task(gate_task_id).ignore_downstream_trigger_rules is False
 
-    full_weather_dag = realtime_tick_dag.dag_full_weather
-    assert {
+    assert "weather_ready_gate" in dag.task_ids
+    assert dag.get_task("weather_ready_gate").upstream_task_ids == {
         "collect_weather_ultra_short_live",
         "collect_weather_ultra_short_forecast",
         "collect_weather_short_term_forecast",
-        "weather_ready_gate",
-    }.issubset(full_weather_dag.task_ids)
+    }
 
 
 def test_station_schedule_is_collector_only() -> None:
