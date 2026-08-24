@@ -5,6 +5,7 @@ import { estimateRoute, formatRouteDuration, groupWorkRoutes, isRebalanceRoute, 
 const CENTERS: DispatchCenter[] = [{ region: "강남", lat: 37.5, lon: 127.0 }];
 const ROUTE: Route = {
   route_id: "11111111-1111-4111-8111-111111111111",
+  work_no: null,
   region: "강남",
   status: "proposed",
   proposed_at: "2026-08-21T03:00:00Z",

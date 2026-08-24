@@ -77,6 +77,7 @@ export interface RouteStop {
 
 export interface Route {
   route_id: string;
+  work_no: number | null;
   region: string;
   status: RouteStatus;
   proposed_at: string;

@@ -524,8 +524,20 @@ def fetch_alerts(now: datetime) -> list[dict[str, Any]]:
 def _route_aggregate_query(where_clause: str, page_clause: str = "") -> str:
     """route header와 stop을 한 statement에서 읽는 SQL을 만든다."""
     return f"""
-        WITH route_page AS MATERIALIZED (
+        WITH approved_route_number AS MATERIALIZED (
+            SELECT stored_route.route_id,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY
+                           stored_route.dispatch_center_id,
+                           (stored_route.dispatched_dttm AT TIME ZONE 'Asia/Seoul')::date
+                       ORDER BY stored_route.dispatched_dttm, stored_route.route_id
+                   ) AS work_no
+              FROM rebalance_route AS stored_route
+             WHERE stored_route.dispatched_dttm IS NOT NULL
+        ),
+        route_page AS MATERIALIZED (
             SELECT route.route_id,
+                   number.work_no,
                    center.dispatch_center_nm AS region,
                    route.route_status_cd AS status,
                    route.proposed_dttm AS proposed_at,
@@ -536,11 +548,13 @@ def _route_aggregate_query(where_clause: str, page_clause: str = "") -> str:
                    route.restored_from_route_id::text AS restored_from_route_id
               FROM rebalance_route AS route
               JOIN dispatch_center AS center USING (dispatch_center_id)
+              LEFT JOIN approved_route_number AS number USING (route_id)
              {where_clause}
              ORDER BY route.proposed_dttm DESC, route.route_id ASC
              {page_clause}
         )
         SELECT page.route_id::text AS route_id,
+               page.work_no,
                page.region,
                page.status,
                page.proposed_at,

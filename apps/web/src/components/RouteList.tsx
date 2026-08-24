@@ -133,6 +133,9 @@ export function RouteList({
               <span className="route-card-title">
                 <RouteIcon size={15} aria-hidden="true" />
                 {route.region} {routeKind(route)}
+                {route.work_no !== null && (
+                  <span className="route-work-number">작업 #{route.work_no}</span>
+                )}
               </span>
               <span className="route-card-summary">{routeSummary(route)}</span>
               {(estimate || stateTime) && (

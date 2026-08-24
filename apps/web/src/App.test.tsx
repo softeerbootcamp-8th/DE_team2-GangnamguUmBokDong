@@ -169,6 +169,7 @@ const FORECAST: ForecastResponse = {
 const ROUTES: Route[] = [
   {
     route_id: "11111111-1111-4111-8111-111111111111",
+    work_no: null,
     region: "이수",
     status: "proposed",
     proposed_at: "2026-08-20T00:00:00Z",

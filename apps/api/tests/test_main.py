@@ -83,6 +83,7 @@ def _route(status: str = "proposed") -> dict:
     """route API 정상 응답 fixture를 만든다."""
     return {
         "route_id": str(ROUTE_ID),
+        "work_no": 1 if status in {"dispatched", "completed", "cancelled"} else None,
         "region": "테스트 센터",
         "status": status,
         "proposed_at": BASE,
@@ -458,6 +459,7 @@ def test_route_response_exposes_dismiss_and_restore_fields(
     response = client.get(f"/routes/{ROUTE_ID}")
 
     assert response.status_code == 200
+    assert response.json()["work_no"] == 1
     assert response.json()["dismissed_at"] == "2026-08-20T01:05:00Z"
     assert response.json()["restored_from_route_id"] == "44444444-4444-4444-8444-444444444444"
 
