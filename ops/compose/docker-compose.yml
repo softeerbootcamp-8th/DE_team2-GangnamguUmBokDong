@@ -158,4 +158,5 @@ services:
 
 volumes:
   postgres-data:
+    name: ${POSTGRES_DATA_VOLUME_NAME:-umbokdong-dashboard-live_postgres-data}
   minio-data:
