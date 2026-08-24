@@ -114,6 +114,42 @@ def _check_adapter_params(config: SourceConfig) -> list[str]:
             errors.append(
                 "adapter_params.poi_start/poi_end: 1 <= poi_start <= poi_end여야 합니다."
             )
+
+        poi_exclude = params.get("poi_exclude", [])
+        if not isinstance(poi_exclude, list):
+            errors.append("adapter_params.poi_exclude: 정수 목록이어야 합니다.")
+        else:
+            valid_excludes = [
+                value
+                for value in poi_exclude
+                if isinstance(value, int) and not isinstance(value, bool)
+            ]
+            if len(valid_excludes) != len(poi_exclude):
+                errors.append(
+                    "adapter_params.poi_exclude: 모든 값이 정수여야 합니다."
+                )
+            if len(set(valid_excludes)) != len(valid_excludes):
+                errors.append(
+                    "adapter_params.poi_exclude: 중복 번호를 선언할 수 없습니다."
+                )
+            if (
+                isinstance(poi_start, int)
+                and not isinstance(poi_start, bool)
+                and isinstance(poi_end, int)
+                and not isinstance(poi_end, bool)
+                and poi_start <= poi_end
+            ):
+                if any(
+                    value < poi_start or value > poi_end
+                    for value in valid_excludes
+                ):
+                    errors.append(
+                        "adapter_params.poi_exclude: POI 범위 안의 번호만 허용됩니다."
+                    )
+                if len(set(valid_excludes)) >= poi_end - poi_start + 1:
+                    errors.append(
+                        "adapter_params.poi_exclude: 모든 POI를 제외할 수 없습니다."
+                    )
         return errors
 
     if pagination in {"probe", "probe_until_empty"}:
