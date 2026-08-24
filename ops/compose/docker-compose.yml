@@ -1,12 +1,19 @@
-# 로컬 개발 스택의 이름을 고정해 make up/down이 항상 같은 컨테이너와
-# 프로젝트 범위 볼륨을 재사용하도록 한다. 임시 검증은 `docker compose -p`로 분리한다.
+# 로컬 운영 재현용 adapter override.
+#
+# Airflow/API/MLflow/web 정의는 docker-compose.prod.yml을 단일 원본으로 사용한다.
+# 이 파일은 AWS managed service만 로컬 대체재로 바꾸며 단독 실행하지 않는다.
+#
+#   docker compose --env-file .env \
+#     -f ops/compose/docker-compose.prod.yml \
+#     -f ops/compose/docker-compose.yml up -d --build
+
 name: umbokdong-dashboard-live
 
 services:
+  # RDS PostgreSQL 16 + PostGIS 3.4를 같은 버전의 로컬 컨테이너로 치환한다.
   postgres:
     image: postgis/postgis:16-3.4
     entrypoint: ["bash", "/usr/local/bin/gold-postgis-entrypoint.sh"]
-    # Compose에서 entrypoint를 덮으면 이미지의 기본 CMD가 비워지므로 명시한다.
     command: ["postgres"]
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
@@ -23,8 +30,6 @@ services:
       - ../postgres/entrypoint.sh:/usr/local/bin/gold-postgis-entrypoint.sh:ro
       - ../../docs/gold/target-schema.sql:/opt/gold/target-schema.sql:ro
     healthcheck:
-      # 공식 entrypoint의 init용 임시 서버는 Unix socket만 열기 때문에 TCP와
-      # baseline 성공 marker를 함께 확인해야 전체 init 완료 전 green이 되지 않는다.
       test:
         - CMD-SHELL
         - >-
@@ -35,8 +40,6 @@ services:
       start_period: 60s
       retries: 10
 
-  # 기존 볼륨에는 DDL을 재적용하지 않는다. 새 볼륨의 원자적 baseline 적용 후에도
-  # SSOT의 핵심 객체가 모두 있는지 읽기 전용으로 확인한 뒤 소비자를 시작한다.
   postgres-schema-check:
     image: postgis/postgis:16-3.4
     environment:
@@ -53,6 +56,7 @@ services:
       postgres:
         condition: service_healthy
 
+  # AWS S3를 S3-compatible MinIO로 치환한다.
   minio:
     image: minio/minio
     command: server /data --console-address ":9001"
@@ -70,10 +74,6 @@ services:
     depends_on:
       - minio
     volumes:
-      # 운영환경에서는 학습 파이프라인이 S3에 직접 모델을 올린다 — 이 볼륨/미러링은
-      # 로컬 개발 전용 1회성 부트스트랩이다 (models/*.txt,*.json은 참고용으로 레포
-      # 루트에 있을 뿐, ml/inference는 S3에서만 모델을 로드하므로 로컬 MinIO에도
-      # 똑같이 올려둬야 추론이 실제로 동작한다).
       - ../../models:/seed-models:ro
     entrypoint: >
       /bin/sh -c "
@@ -85,202 +85,77 @@ services:
       exit 0;
       "
 
-  mlflow:
-    build:
-      context: ../..
-      dockerfile: ops/compose/Dockerfile.mlflow
-    environment:
-      MLFLOW_S3_ENDPOINT_URL: http://minio:9000
-      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
-      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
-    # --serve-artifacts로 이 서버가 S3 업로드/다운로드를 대신 중계한다 — 그래서
-    # feature_engine(EMR)/training(로컬)/inference(어디든) 클라이언트는 S3 자격증명
-    # 없이 MLFLOW_TRACKING_URI 하나만으로 파라미터/지표/아티팩트를 전부 기록할 수 있다.
-    command: >
-      mlflow server
-      --host 0.0.0.0
-      --port 5000
-      --backend-store-uri postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_MLFLOW_DB:-mlflow}
-      --artifacts-destination s3://${S3_BUCKET:-local-dev}/mlflow-artifacts
-      --serve-artifacts
-    ports:
-      - "${MLFLOW_PORT:-5000}:5000"
-    depends_on:
-      postgres:
-        condition: service_healthy
-      minio:
-        condition: service_started
-
   airflow-init:
-    build:
-      context: ../..
-      dockerfile: ops/compose/Dockerfile.airflow
-    command: ["init"]
-    env_file:
+    env_file: !override &local-runtime-env
       - path: ../../.env
         required: false
-    environment:
-      AIRFLOW_HOME: /workspace/airflow
-      PYTHONPATH: /workspace/airflow
-      AIRFLOW__CORE__EXECUTOR: LocalExecutor
-      AIRFLOW__CORE__PARALLELISM: ${AIRFLOW__CORE__PARALLELISM:-3}
-      AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG: ${AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG:-2}
-      AIRFLOW_RESOURCE_PROBE_SAMPLE_SECONDS: ${AIRFLOW_RESOURCE_PROBE_SAMPLE_SECONDS:-1}
-      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_AIRFLOW_DB:-airflow}
-      AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-webserver:8080/execution/
-      AIRFLOW__CORE__AUTH_MANAGER: airflow.api_fastapi.auth.managers.simple.simple_auth_manager.SimpleAuthManager
-      AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_USERS: ${AIRFLOW_ADMIN_USER:-admin}:admin
-      AIRFLOW__API_AUTH__JWT_SECRET: "c29tZV9yYW5kb21fdmVyeV9sb25nX3NlY3JldF9rZXlfdGhhdF9tdXN0X2JlX2F0X2xlYXN0XzMyX2NoYXJz"
+    environment: &local-airflow-adapter
       AIRFLOW__API__BASE_URL: http://localhost:${AIRFLOW_WEBSERVER_PORT:-8080}
-      # BashOperator subprocess(collector/normalizer/nowcasting/ml/loader)가 컨테이너
-      # 내부에서 실제로 Postgres/MinIO에 붙도록, 호스트 관점 .env 값을 컨테이너 관점으로 덮어쓴다.
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_AIRFLOW_DB:-airflow}
       DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_APP_DB:-app}
       S3_ENDPOINT_URL: http://minio:9000
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
       GOLD_STATION_MASTER_LOOKBACK_HOURS: ${GOLD_STATION_MASTER_LOOKBACK_HOURS:-168}
       GOLD_STATION_REALTIME_LOOKBACK_HOURS: ${GOLD_STATION_REALTIME_LOOKBACK_HOURS:-24}
-    volumes:
-      - ../..:/workspace
-      - airflow-module-venvs:/opt/venvs/modules
     depends_on:
       postgres-schema-check:
+        condition: service_completed_successfully
+      minio-init:
         condition: service_completed_successfully
 
   airflow-webserver:
-    build:
-      context: ../..
-      dockerfile: ops/compose/Dockerfile.airflow
-    command: ["api-server"]
-    env_file:
-      - path: ../../.env
-        required: false
-    environment:
-      AIRFLOW_HOME: /workspace/airflow
-      PYTHONPATH: /workspace/airflow
-      AIRFLOW__CORE__EXECUTOR: LocalExecutor
-      AIRFLOW__CORE__PARALLELISM: ${AIRFLOW__CORE__PARALLELISM:-3}
-      AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG: ${AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG:-2}
-      AIRFLOW_RESOURCE_PROBE_SAMPLE_SECONDS: ${AIRFLOW_RESOURCE_PROBE_SAMPLE_SECONDS:-1}
-      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_AIRFLOW_DB:-airflow}
-      AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-webserver:8080/execution/
-      AIRFLOW__CORE__AUTH_MANAGER: airflow.api_fastapi.auth.managers.simple.simple_auth_manager.SimpleAuthManager
-      AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_USERS: ${AIRFLOW_ADMIN_USER:-admin}:admin
-      AIRFLOW__API_AUTH__JWT_SECRET: "c29tZV9yYW5kb21fdmVyeV9sb25nX3NlY3JldF9rZXlfdGhhdF9tdXN0X2JlX2F0X2xlYXN0XzMyX2NoYXJz"
-      AIRFLOW__API__BASE_URL: http://localhost:${AIRFLOW_WEBSERVER_PORT:-8080}
-      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_APP_DB:-app}
-      S3_ENDPOINT_URL: http://minio:9000
-    ports:
+    env_file: *local-runtime-env
+    environment: *local-airflow-adapter
+    ports: !override
       - "${AIRFLOW_WEBSERVER_PORT:-8080}:8080"
-    volumes:
-      - ../..:/workspace
-      - airflow-module-venvs:/opt/venvs/modules
-    depends_on:
-      postgres:
-        condition: service_healthy
-      airflow-init:
-        condition: service_completed_successfully
 
   airflow-scheduler:
-    build:
-      context: ../..
-      dockerfile: ops/compose/Dockerfile.airflow
-    command: ["scheduler"]
-    env_file:
-      - path: ../../.env
-        required: false
-    environment:
-      AIRFLOW_HOME: /workspace/airflow
-      PYTHONPATH: /workspace/airflow
-      AIRFLOW__CORE__EXECUTOR: LocalExecutor
-      AIRFLOW__CORE__PARALLELISM: ${AIRFLOW__CORE__PARALLELISM:-3}
-      AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG: ${AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG:-2}
-      AIRFLOW_RESOURCE_PROBE_SAMPLE_SECONDS: ${AIRFLOW_RESOURCE_PROBE_SAMPLE_SECONDS:-1}
-      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_AIRFLOW_DB:-airflow}
-      AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-webserver:8080/execution/
-      AIRFLOW__CORE__AUTH_MANAGER: airflow.api_fastapi.auth.managers.simple.simple_auth_manager.SimpleAuthManager
-      AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_USERS: ${AIRFLOW_ADMIN_USER:-admin}:admin
-      AIRFLOW__API_AUTH__JWT_SECRET: "c29tZV9yYW5kb21fdmVyeV9sb25nX3NlY3JldF9rZXlfdGhhdF9tdXN0X2JlX2F0X2xlYXN0XzMyX2NoYXJz"
-      AIRFLOW__API__BASE_URL: http://localhost:${AIRFLOW_WEBSERVER_PORT:-8080}
-      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_APP_DB:-app}
-      S3_ENDPOINT_URL: http://minio:9000
-      GOLD_STATION_MASTER_LOOKBACK_HOURS: ${GOLD_STATION_MASTER_LOOKBACK_HOURS:-168}
-      GOLD_STATION_REALTIME_LOOKBACK_HOURS: ${GOLD_STATION_REALTIME_LOOKBACK_HOURS:-24}
-    volumes:
-      - ../..:/workspace
-      - airflow-module-venvs:/opt/venvs/modules
-    depends_on:
-      postgres:
-        condition: service_healthy
-      airflow-init:
-        condition: service_completed_successfully
+    env_file: *local-runtime-env
+    environment: *local-airflow-adapter
 
   airflow-dag-processor:
-    build:
-      context: ../..
-      dockerfile: ops/compose/Dockerfile.airflow
-    command: ["dag-processor"]
-    env_file:
-      - path: ../../.env
-        required: false
-    environment:
-      AIRFLOW_HOME: /workspace/airflow
-      PYTHONPATH: /workspace/airflow
-      AIRFLOW__CORE__EXECUTOR: LocalExecutor
-      AIRFLOW__CORE__PARALLELISM: ${AIRFLOW__CORE__PARALLELISM:-3}
-      AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG: ${AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG:-2}
-      AIRFLOW_RESOURCE_PROBE_SAMPLE_SECONDS: ${AIRFLOW_RESOURCE_PROBE_SAMPLE_SECONDS:-1}
-      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_AIRFLOW_DB:-airflow}
-      AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-webserver:8080/execution/
-      AIRFLOW__CORE__AUTH_MANAGER: airflow.api_fastapi.auth.managers.simple.simple_auth_manager.SimpleAuthManager
-      AIRFLOW__API_AUTH__JWT_SECRET: "c29tZV9yYW5kb21fdmVyeV9sb25nX3NlY3JldF9rZXlfdGhhdF9tdXN0X2JlX2F0X2xlYXN0XzMyX2NoYXJz"
-      AIRFLOW__API__BASE_URL: http://localhost:${AIRFLOW_WEBSERVER_PORT:-8080}
-    volumes:
-      - ../..:/workspace
-      - airflow-module-venvs:/opt/venvs/modules
-    depends_on:
-      postgres:
-        condition: service_healthy
-      airflow-init:
-        condition: service_completed_successfully
+    env_file: *local-runtime-env
+    environment: *local-airflow-adapter
 
   api:
-    build:
-      context: ../..
-      dockerfile: ops/compose/Dockerfile.airflow
-    command:
-      - bash
-      - -lc
-      - cd /workspace/apps/api && env -u VIRTUAL_ENV uv run --frozen uvicorn main:app --host 0.0.0.0 --port 8000
+    env_file: *local-runtime-env
     environment:
       DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_APP_DB:-app}
+      S3_ENDPOINT_URL: http://minio:9000
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
     ports:
       - "${API_PORT:-8000}:8000"
-    volumes:
-      - ../..:/workspace
     depends_on:
       postgres-schema-check:
         condition: service_completed_successfully
+      minio-init:
+        condition: service_completed_successfully
 
-  web:
-    image: node:20-alpine
-    working_dir: /workspace/apps/web
-    command: sh -c "npm ci && npm run dev -- --host 0.0.0.0"
+  mlflow:
+    env_file: *local-runtime-env
     environment:
-      # 미지정 시 브라우저가 접속한 호스트명과 API_PORT를 조합한다. 따라서
-      # localhost와 Tailscale/LAN 주소 모두 별도 override 없이 같은 스택을 쓴다.
-      VITE_API_BASE: ${VITE_API_BASE:-}
-      VITE_API_PORT: ${API_PORT:-8000}
-    ports:
-      - "${WEB_PORT:-5173}:5173"
-    volumes:
-      - ../..:/workspace
-      - web-node-modules:/workspace/apps/web/node_modules
+      MLFLOW_BACKEND_STORE_URI: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_MLFLOW_DB:-mlflow}
+      MLFLOW_S3_ENDPOINT_URL: http://minio:9000
+      S3_BUCKET: ${S3_BUCKET:-local-dev}
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    ports: !override
+      - "${MLFLOW_PORT:-5000}:5000"
     depends_on:
-      - api
+      postgres-schema-check:
+        condition: service_completed_successfully
+      minio-init:
+        condition: service_completed_successfully
+
+  # 운영과 같은 정적 build + nginx + same-origin /api proxy를 사용한다.
+  web:
+    ports: !override
+      - "${WEB_PORT:-5173}:80"
+    volumes: !override
+      - ../../ops/nginx/.htpasswd:/etc/nginx/.htpasswd:ro
 
 volumes:
-  # 삭제하면 안 되는 영속 데이터 볼륨이다.
   postgres-data:
   minio-data:
-  # 아래 둘은 의존성을 다시 설치하면 복구되는 빌드 캐시다.
-  airflow-module-venvs:
-  web-node-modules:
