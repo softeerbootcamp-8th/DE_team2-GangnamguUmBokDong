@@ -75,6 +75,7 @@ class ServingHealthComponent(BaseModel):
 
     state: ServingHealthState
     data_dttm: datetime | None
+    source_dttm: datetime | None = None
     age_minutes: float | None
     reason: str
 

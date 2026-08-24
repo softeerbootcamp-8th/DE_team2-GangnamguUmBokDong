@@ -62,6 +62,7 @@ export type ServingOverallState = "healthy" | "degraded" | "unavailable";
 export interface ServingHealthComponent {
   state: ServingHealthState;
   data_dttm: string | null;
+  source_dttm?: string | null;
   age_minutes: number | null;
   reason: string;
 }

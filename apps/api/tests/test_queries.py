@@ -106,6 +106,7 @@ def _serving_health_rows() -> list[dict[str, Any]]:
             "weather_row_cnt": 24,
             "expected_weather_row_cnt": 24,
             "weather_rows_fresh": True,
+            "oldest_weather_issue_dttm": BASE,
         }
         for key in keys
     ]
@@ -179,6 +180,7 @@ def test_serving_health_requires_fresh_aligned_operational_chain(
     assert health["operational_base_dttm"] == BASE
     assert health["can_dispatch_new_routes"] is True
     assert all(item["state"] == "ready" for item in health["components"].values())
+    assert health["components"]["weather"]["source_dttm"] == BASE
     normalized = " ".join(captured["query"].split())
     assert "gold_meta.publication_state" in normalized
     assert "weather_rows_fresh" in normalized

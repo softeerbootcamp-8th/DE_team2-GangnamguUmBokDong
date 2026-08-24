@@ -362,6 +362,7 @@ def fetch_serving_health(now: datetime) -> dict[str, Any]:
         ),
         weather_horizon AS (
             SELECT COUNT(*) AS weather_row_cnt,
+                   MIN(wf.base_dttm) AS oldest_weather_issue_dttm,
                    (
                        SELECT COUNT(DISTINCT weather_grid_id) * %(forecast_hours)s
                          FROM station
@@ -392,7 +393,8 @@ def fetch_serving_health(now: datetime) -> dict[str, Any]:
                state.published_row_cnt,
                weather.weather_row_cnt,
                weather.expected_weather_row_cnt,
-               weather.weather_rows_fresh
+               weather.weather_rows_fresh,
+               weather.oldest_weather_issue_dttm
           FROM desired
           LEFT JOIN gold_meta.publication_state AS state USING (publication_key)
          CROSS JOIN weather_horizon AS weather
@@ -443,6 +445,8 @@ def fetch_serving_health(now: datetime) -> dict[str, Any]:
         now,
         freshness=DEMAND_FRESHNESS,
     )
+    if weather_row is not None:
+        weather_component["source_dttm"] = weather_row["oldest_weather_issue_dttm"]
     if weather_row is not None and weather_component["state"] == "ready":
         complete = weather_row["weather_row_cnt"] == weather_row["expected_weather_row_cnt"]
         if not complete:

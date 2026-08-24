@@ -338,8 +338,17 @@ body {
 }
 
 .serving-health-row time {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
   color: var(--text-muted);
   text-align: right;
+}
+
+.serving-health-row time small {
+  color: color-mix(in srgb, var(--status-warning) 76%, var(--text-primary));
+  font-size: 9px;
+  line-height: 1.2;
 }
 
 .serving-health-dot {

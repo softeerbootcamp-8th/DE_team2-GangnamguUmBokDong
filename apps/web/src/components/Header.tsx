@@ -65,6 +65,15 @@ function componentTime(value: string | null): string {
   return formatIsoTime(value, { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" });
 }
 
+function componentStateLabel(
+  key: typeof HEALTH_COMPONENTS[number][0],
+  state: ServingHealthState | undefined,
+  reason: string | undefined,
+): string {
+  if (key === "weather" && reason === "weather_issue_stale") return "원본 지연";
+  return state ? HEALTH_STATE_LABEL[state] : "확인 중";
+}
+
 function ServingHealthTime({
   health,
   error,
@@ -115,9 +124,17 @@ function ServingHealthTime({
                   <span className={`serving-health-dot ${state ?? "loading"}`} aria-hidden="true" />
                   <span className="serving-health-label">{label}</span>
                   <span className={`serving-health-state ${state ?? "loading"}`}>
-                    {state ? HEALTH_STATE_LABEL[state] : "확인 중"}
+                    {componentStateLabel(key, state, component?.reason)}
                   </span>
-                  <time>{componentTime(component?.data_dttm ?? null)}</time>
+                  <time>
+                    <span>
+                      {component?.source_dttm ? "게시 " : ""}
+                      {componentTime(component?.data_dttm ?? null)}
+                    </span>
+                    {component?.source_dttm && (
+                      <small>원본 {componentTime(component.source_dttm)}</small>
+                    )}
+                  </time>
                 </span>
               );
             })}

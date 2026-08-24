@@ -15,7 +15,13 @@ const HEALTH: ServingHealthResponse = {
     demand: { state: "ready", data_dttm: "2026-08-20T00:00:00Z", age_minutes: 5, reason: "fresh" },
     urgency: { state: "stale", data_dttm: "2026-08-19T23:50:00Z", age_minutes: 15, reason: "publication_stale" },
     routes: { state: "misaligned", data_dttm: "2026-08-19T23:50:00Z", age_minutes: 15, reason: "operational_anchor_mismatch" },
-    weather: { state: "ready", data_dttm: "2026-08-20T00:00:00Z", age_minutes: 5, reason: "fresh" },
+    weather: {
+      state: "stale",
+      data_dttm: "2026-08-20T00:00:00Z",
+      source_dttm: "2026-08-19T20:00:00Z",
+      age_minutes: 5,
+      reason: "weather_issue_stale",
+    },
     events: { state: "missing", data_dttm: null, age_minutes: null, reason: "not_published" },
     regions: { state: "ready", data_dttm: "2026-08-19T00:00:00Z", age_minutes: 1445, reason: "fresh" },
   },
@@ -57,6 +63,9 @@ describe("Header serving health", () => {
       .forEach((label) => expect(screen.getByText(label)).not.toBeNull());
     expect(screen.getByText("기준 불일치")).not.toBeNull();
     expect(screen.getByText("미게시")).not.toBeNull();
+    expect(screen.getByText("원본 지연")).not.toBeNull();
+    expect(screen.getByText(/^게시 /)).not.toBeNull();
+    expect(screen.getByText(/^원본 8\./)).not.toBeNull();
   });
 
   it("상태 조회 실패 뒤 마지막 기준 시각과 상세는 유지하고 연결 끊김을 표시한다", () => {
