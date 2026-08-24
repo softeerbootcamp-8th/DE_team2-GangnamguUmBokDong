@@ -94,6 +94,7 @@ class Route(BaseModel):
     """header와 stop이 같은 snapshot인 route aggregate다."""
 
     route_id: str
+    work_no: int | None
     region: str
     status: RouteStatus
     proposed_at: datetime

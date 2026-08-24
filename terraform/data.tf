@@ -189,7 +189,9 @@ locals {
 
     # 컨테이너 안에서 mlflow 서비스는 compose 네트워크 이름으로 붙는다.
     # 학습 EC2는 이 값 대신 상시 EC2의 사설 IP를 쓴다.
-    MLFLOW_TRACKING_URI=http://mlflow:5000
+    # 끝의 /mlflow는 오타가 아니다 — 트래킹 서버를 --static-prefix /mlflow로 띄워
+    # UI를 web(nginx)의 /mlflow/ 아래에 붙였고, API 경로도 같은 접두를 갖는다.
+    MLFLOW_TRACKING_URI=http://mlflow:5000/mlflow
   EOT
 }
 
