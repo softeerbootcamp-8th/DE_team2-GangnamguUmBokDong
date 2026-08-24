@@ -52,8 +52,6 @@ export function StockChart({ station, baseDttm, points }: Props) {
   const yAt = (v: number) => MARGIN.top + (1 - v / maxY) * PLOT_HEIGHT;
   const yTicks = [0, Math.round(station.hold_cnt / 2), station.hold_cnt];
   const xTicks = tickTimes(startMs, endMs);
-  const last = series[series.length - 1];
-
   function handlePointerMove(event: React.PointerEvent<SVGRectElement>) {
     const rect = event.currentTarget.getBoundingClientRect();
     const relativeX = ((event.clientX - rect.left) / rect.width) * WIDTH;
@@ -134,7 +132,6 @@ export function StockChart({ station, baseDttm, points }: Props) {
           />
 
           <path d={path} fill="none" stroke="var(--series-stock)" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" />
-          <circle cx={xAt(series.length - 1)} cy={yAt(last.bikes)} r={4} fill="var(--series-stock)" stroke="var(--surface-1)" strokeWidth={2} />
           {hoverIndex !== null && hovered && (
             <>
               <line
