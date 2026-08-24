@@ -706,9 +706,14 @@ def test_fetch_route_casts_uuid_to_text_in_one_statement(
 class _TransitionCursor:
     """route 상태 전이의 동일 cursor 사용을 검증하는 최소 fake다."""
 
-    def __init__(self, responses: list[dict | None]) -> None:
-        """fetchone 응답 순서를 초기화한다."""
+    def __init__(
+        self,
+        responses: list[dict | None],
+        row_sets: list[list[dict[str, Any]]] | None = None,
+    ) -> None:
+        """fetchone과 fetchall 응답 순서를 초기화한다."""
         self.responses = responses
+        self.row_sets = row_sets or []
         self.statements: list[str] = []
 
     def __enter__(self) -> Self:
@@ -725,6 +730,10 @@ class _TransitionCursor:
     def fetchone(self) -> dict | None:
         """준비된 단일 행 응답을 반환한다."""
         return self.responses.pop(0)
+
+    def fetchall(self) -> list[dict[str, Any]]:
+        """준비된 다중 행 응답을 반환한다."""
+        return self.row_sets.pop(0)
 
 
 class _TransitionConnection:
@@ -758,7 +767,10 @@ def test_dispatch_updates_and_reads_aggregate_in_same_transaction(
 ) -> None:
     """dispatch guarded update와 aggregate 조회는 같은 connection/cursor를 사용한다."""
     route = {"route_id": str(ROUTE_ID), "status": "dispatched", "stops": []}
-    cursor = _TransitionCursor([{"route_id": ROUTE_ID}, route])
+    cursor = _TransitionCursor(
+        [{"route_id": ROUTE_ID}, route],
+        row_sets=[_serving_health_rows()],
+    )
     connection = _TransitionConnection(cursor)
     monkeypatch.setattr(queries, "get_connection", lambda: connection)
 
@@ -766,10 +778,32 @@ def test_dispatch_updates_and_reads_aggregate_in_same_transaction(
 
     assert result == route
     assert connection.cursor_calls == 1
-    assert len(cursor.statements) == 2
-    assert "UPDATE rebalance_route" in cursor.statements[0]
-    assert "route_status_cd = %(expected_status)s" in cursor.statements[0]
-    assert "rebalance_route_stop AS stop" in cursor.statements[1]
+    assert len(cursor.statements) == 3
+    assert "gold_meta.publication_state" in cursor.statements[0]
+    assert "FOR SHARE" in cursor.statements[0]
+    assert "UPDATE rebalance_route" in cursor.statements[1]
+    assert "route_status_cd = %(expected_status)s" in cursor.statements[1]
+    assert "rebalance_route_stop AS stop" in cursor.statements[2]
+
+
+def test_dispatch_rejects_stale_publication_before_update(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """dispatch는 transaction의 핵심 publication이 stale이면 route를 갱신하지 않는다."""
+    rows = _serving_health_rows()
+    for row in rows:
+        if row["publication_key"] == "station_urgency":
+            row["logical_dttm"] = NOW - queries.URGENCY_FRESHNESS - timedelta(seconds=1)
+    cursor = _TransitionCursor([], row_sets=[rows])
+    connection = _TransitionConnection(cursor)
+    monkeypatch.setattr(queries, "get_connection", lambda: connection)
+
+    result = queries.dispatch_route(ROUTE_ID, NOW)
+
+    assert result is queries.RouteTransitionResult.SERVING_NOT_READY
+    assert len(cursor.statements) == 1
+    assert "gold_meta.publication_state" in cursor.statements[0]
+    assert all("UPDATE rebalance_route" not in statement for statement in cursor.statements)
 
 
 def test_cancel_sets_cancelled_timestamp_in_same_transaction(

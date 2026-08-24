@@ -389,6 +389,11 @@ def test_route_query_converts_closed_window_with_server_time(
             409,
             "route_transition_conflict",
         ),
+        (
+            queries.RouteTransitionResult.SERVING_NOT_READY,
+            409,
+            "route_dispatch_not_ready",
+        ),
     ],
 )
 def test_dispatch_maps_not_found_state_and_constraints(
@@ -398,7 +403,7 @@ def test_dispatch_maps_not_found_state_and_constraints(
     status_code: int,
     detail: str,
 ) -> None:
-    """dispatch는 404·상태 409·DB constraint 409를 명시적으로 매핑한다."""
+    """dispatch는 404와 상태·DB·publication 409를 명시적으로 매핑한다."""
     monkeypatch.setattr(queries, "dispatch_route", lambda _route_id, _now: result)
 
     response = client.post(f"/routes/{ROUTE_ID}/dispatch")

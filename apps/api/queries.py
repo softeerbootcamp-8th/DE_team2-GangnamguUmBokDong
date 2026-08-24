@@ -78,6 +78,7 @@ class RouteTransitionResult(StrEnum):
     WRONG_STATUS = "wrong_status"
     CONSTRAINT_CONFLICT = "constraint_conflict"
     ALREADY_DISMISSED = "already_dismissed"
+    SERVING_NOT_READY = "serving_not_ready"
 
 
 def now_utc() -> datetime:
@@ -345,6 +346,68 @@ def _publication_state(
     }
 
 
+def _dispatch_health_components(
+    by_key: dict[str, dict[str, Any]],
+    now: datetime,
+) -> tuple[dict[str, dict[str, Any]], bool]:
+    """신규 작업 승인에 필요한 핵심 publication의 상태와 정합성을 판정한다."""
+    station = by_key.get("station")
+    stock = by_key.get("station_stock")
+    stock_component = _publication_state(
+        stock,
+        now,
+        freshness=STOCK_FRESHNESS,
+    )
+    if station is None or stock is None:
+        stock_component = _publication_state(None, now, freshness=STOCK_FRESHNESS)
+    elif (
+        station["logical_dttm"] != stock["logical_dttm"]
+        and stock_component["state"] not in {"missing", "expired"}
+    ):
+        stock_component = {
+            **stock_component,
+            "state": "misaligned",
+            "reason": "station_stock_anchor_mismatch",
+        }
+
+    components = {
+        "stock": stock_component,
+        "demand": _publication_state(
+            by_key.get("station_demand_forecast"),
+            now,
+            freshness=DEMAND_FRESHNESS,
+        ),
+        "urgency": _publication_state(
+            by_key.get("station_urgency"),
+            now,
+            freshness=URGENCY_FRESHNESS,
+            expiry=URGENCY_EXPIRY,
+        ),
+        "routes": _publication_state(
+            by_key.get("rebalance_route"),
+            now,
+            freshness=URGENCY_FRESHNESS,
+        ),
+    }
+    dispatch_times = [component["data_dttm"] for component in components.values()]
+    can_dispatch = (
+        all(component["state"] == "ready" for component in components.values())
+        and len(set(dispatch_times)) == 1
+    )
+    if not can_dispatch and all(
+        component["state"] == "ready" for component in components.values()
+    ):
+        components = {
+            key: {
+                **component,
+                "state": "misaligned",
+                "reason": "operational_anchor_mismatch",
+            }
+            for key, component in components.items()
+        }
+    return components, can_dispatch
+
+
 def fetch_serving_health(now: datetime) -> dict[str, Any]:
     """publication state와 실제 날씨 horizon으로 대시보드 서빙 상태를 판정한다."""
     rows = fetch_all(
@@ -404,41 +467,7 @@ def fetch_serving_health(now: datetime) -> dict[str, Any]:
     )
     by_key = {row["publication_key"]: row for row in rows}
 
-    station = by_key.get("station")
-    stock = by_key.get("station_stock")
-    stock_component = _publication_state(
-        stock,
-        now,
-        freshness=STOCK_FRESHNESS,
-    )
-    if station is None or stock is None:
-        stock_component = _publication_state(None, now, freshness=STOCK_FRESHNESS)
-    elif (
-        station["logical_dttm"] != stock["logical_dttm"]
-        and stock_component["state"] not in {"missing", "expired"}
-    ):
-        stock_component = {
-            **stock_component,
-            "state": "misaligned",
-            "reason": "station_stock_anchor_mismatch",
-        }
-
-    demand_component = _publication_state(
-        by_key.get("station_demand_forecast"),
-        now,
-        freshness=DEMAND_FRESHNESS,
-    )
-    urgency_component = _publication_state(
-        by_key.get("station_urgency"),
-        now,
-        freshness=URGENCY_FRESHNESS,
-        expiry=URGENCY_EXPIRY,
-    )
-    route_component = _publication_state(
-        by_key.get("rebalance_route"),
-        now,
-        freshness=URGENCY_FRESHNESS,
-    )
+    dispatch_components, can_dispatch = _dispatch_health_components(by_key, now)
     weather_row = by_key.get("weather_forecast")
     weather_component = _publication_state(
         weather_row,
@@ -501,27 +530,11 @@ def fetch_serving_health(now: datetime) -> dict[str, Any]:
         region_component["state"] = "missing"
 
     components = {
-        "stock": stock_component,
-        "demand": demand_component,
-        "urgency": urgency_component,
-        "routes": route_component,
+        **dispatch_components,
         "weather": weather_component,
         "events": event_component,
         "regions": region_component,
     }
-    dispatch_keys = ("stock", "demand", "urgency", "routes")
-    dispatch_times = [components[key]["data_dttm"] for key in dispatch_keys]
-    can_dispatch = (
-        all(components[key]["state"] == "ready" for key in dispatch_keys)
-        and len(set(dispatch_times)) == 1
-    )
-    if not can_dispatch and all(components[key]["state"] == "ready" for key in dispatch_keys):
-        for key in dispatch_keys:
-            components[key] = {
-                **components[key],
-                "state": "misaligned",
-                "reason": "operational_anchor_mismatch",
-            }
 
     stock_time = components["stock"]["data_dttm"]
     demand_time = components["demand"]["data_dttm"]
@@ -947,50 +960,105 @@ def _transition_route(
             get_connection() as connection,
             connection.cursor(row_factory=dict_row) as cursor,
         ):
-            cursor.execute(
-                f"""
-                UPDATE rebalance_route
-                   SET route_status_cd = %(next_status)s,
-                       {timestamp_column} = %(now)s
-                 WHERE route_id = %(route_id)s
-                   AND route_status_cd = %(expected_status)s
-                RETURNING route_id
-                """,
-                {
-                    "route_id": route_id,
-                    "now": now,
-                    "expected_status": expected_status,
-                    "next_status": next_status,
-                },
+            return _transition_route_with_cursor(
+                cursor,
+                route_id,
+                now,
+                expected_status=expected_status,
+                next_status=next_status,
+                timestamp_column=timestamp_column,
             )
-            if cursor.fetchone() is None:
-                cursor.execute(
-                    "SELECT route_status_cd FROM rebalance_route WHERE route_id = %(route_id)s",
-                    {"route_id": route_id},
-                )
-                if cursor.fetchone() is None:
-                    return RouteTransitionResult.NOT_FOUND
-                return RouteTransitionResult.WRONG_STATUS
-            route = _fetch_route_with_cursor(cursor, route_id)
-            if route is None:
-                raise RuntimeError("상태 전이 직후 route aggregate를 찾을 수 없습니다.")
-            return route
     except CheckViolation:
         return RouteTransitionResult.CONSTRAINT_CONFLICT
+
+
+def _transition_route_with_cursor(
+    cursor: Cursor[dict[str, Any]],
+    route_id: UUID,
+    now: datetime,
+    *,
+    expected_status: str,
+    next_status: str,
+    timestamp_column: str,
+) -> dict[str, Any] | RouteTransitionResult:
+    """주어진 transaction cursor에서 route 상태를 전이하고 aggregate를 반환한다."""
+    cursor.execute(
+        f"""
+        UPDATE rebalance_route
+           SET route_status_cd = %(next_status)s,
+               {timestamp_column} = %(now)s
+         WHERE route_id = %(route_id)s
+           AND route_status_cd = %(expected_status)s
+        RETURNING route_id
+        """,
+        {
+            "route_id": route_id,
+            "now": now,
+            "expected_status": expected_status,
+            "next_status": next_status,
+        },
+    )
+    if cursor.fetchone() is None:
+        cursor.execute(
+            "SELECT route_status_cd FROM rebalance_route WHERE route_id = %(route_id)s",
+            {"route_id": route_id},
+        )
+        if cursor.fetchone() is None:
+            return RouteTransitionResult.NOT_FOUND
+        return RouteTransitionResult.WRONG_STATUS
+    route = _fetch_route_with_cursor(cursor, route_id)
+    if route is None:
+        raise RuntimeError("상태 전이 직후 route aggregate를 찾을 수 없습니다.")
+    return route
+
+
+def _fetch_dispatch_publications(
+    cursor: Cursor[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """승인 transaction의 snapshot에서 핵심 publication 상태를 조회한다."""
+    cursor.execute(
+        """
+        SELECT publication_key,
+               logical_dttm,
+               published_row_cnt
+          FROM gold_meta.publication_state
+         WHERE publication_key IN (
+             'station',
+             'station_stock',
+             'station_demand_forecast',
+             'station_urgency',
+             'rebalance_route'
+         )
+         FOR SHARE
+        """
+    )
+    return {row["publication_key"]: row for row in cursor.fetchall()}
 
 
 def dispatch_route(
     route_id: UUID,
     now: datetime,
 ) -> dict[str, Any] | RouteTransitionResult:
-    """route를 proposed에서 dispatched로 원자 전이한다."""
-    return _transition_route(
-        route_id,
-        now,
-        expected_status="proposed",
-        next_status="dispatched",
-        timestamp_column="dispatched_dttm",
-    )
+    """핵심 publication을 잠근 동일 transaction에서 route를 원자 승인한다."""
+    try:
+        with (
+            get_connection() as connection,
+            connection.cursor(row_factory=dict_row) as cursor,
+        ):
+            by_key = _fetch_dispatch_publications(cursor)
+            _, can_dispatch = _dispatch_health_components(by_key, now)
+            if not can_dispatch:
+                return RouteTransitionResult.SERVING_NOT_READY
+            return _transition_route_with_cursor(
+                cursor,
+                route_id,
+                now,
+                expected_status="proposed",
+                next_status="dispatched",
+                timestamp_column="dispatched_dttm",
+            )
+    except CheckViolation:
+        return RouteTransitionResult.CONSTRAINT_CONFLICT
 
 
 def complete_route(
