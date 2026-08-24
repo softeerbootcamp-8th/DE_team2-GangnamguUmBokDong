@@ -28,7 +28,7 @@ fi
 echo "[bootstrap] 운영 runtime을 로컬 Postgres / MinIO adapter로 기동합니다 (최초 실행 시 이미지 빌드로 시간이 걸릴 수 있습니다)..."
 make up
 
-echo "[bootstrap] 빈 저장소용 fixture를 게시하고 realtime_tick 전체 체인을 검증합니다..."
+echo "[bootstrap] 실제 대여소 원천과 파생 fixture를 게시하고 realtime_tick 전체 체인을 검증합니다..."
 make e2e-smoke
 
 cat <<EOF

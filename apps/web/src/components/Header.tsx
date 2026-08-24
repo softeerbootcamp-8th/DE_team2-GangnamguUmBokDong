@@ -1,16 +1,15 @@
 import { useEffect, useState } from "react";
-import { api } from "../api";
-import type { DispatchCenter } from "../api";
+import type { DispatchCenter, ServingHealthResponse, ServingHealthState } from "../api";
 import { formatClock, formatIsoTime } from "../format";
 import { RegionTabs } from "./RegionTabs";
 import logo from "../../assets/ubd_logo.png";
-
-const STATUS_POLL_INTERVAL_MS = 30_000;
 
 interface Props {
   regions: DispatchCenter[];
   selectedRegion: string;
   stationsUpdatedAt: Date | null;
+  servingHealth: ServingHealthResponse | null;
+  servingHealthError: boolean;
   onRegionChange: (region: string) => void;
 }
 
@@ -43,42 +42,130 @@ function HeaderTime({ id, label, value, description, error = false }: HeaderTime
   );
 }
 
-export function Header({ regions, selectedRegion, stationsUpdatedAt, onRegionChange }: Props) {
+const HEALTH_COMPONENTS = [
+  ["stock", "대여소·재고"],
+  ["demand", "수요예측"],
+  ["urgency", "대여소 우선순위"],
+  ["routes", "작업 추천"],
+  ["weather", "날씨"],
+  ["events", "행사"],
+  ["regions", "권역 설정"],
+] as const;
+
+const HEALTH_STATE_LABEL: Record<ServingHealthState, string> = {
+  ready: "정상",
+  stale: "지연",
+  expired: "사용 불가",
+  missing: "미게시",
+  misaligned: "기준 불일치",
+};
+
+function componentTime(value: string | null): string {
+  if (!value) return "-";
+  return formatIsoTime(value, { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" });
+}
+
+function componentStateLabel(
+  key: typeof HEALTH_COMPONENTS[number][0],
+  state: ServingHealthState | undefined,
+  reason: string | undefined,
+): string {
+  if (key === "weather" && reason === "weather_issue_stale") return "원본 지연";
+  return state ? HEALTH_STATE_LABEL[state] : "확인 중";
+}
+
+function ServingHealthTime({
+  health,
+  error,
+}: {
+  health: ServingHealthResponse | null;
+  error: boolean;
+}) {
+  const overall = error ? "unavailable" : health?.overall ?? "loading";
+  const overallLabel = overall === "healthy"
+    ? "정상"
+    : overall === "degraded"
+      ? "일부 지연"
+      : overall === "unavailable"
+        ? "연결 끊김"
+        : "확인 중";
+  const baseTime = health?.operational_base_dttm
+    ? formatIsoTime(health.operational_base_dttm, { hour: "2-digit", minute: "2-digit" })
+    : "-";
+
+  return (
+    <span className="header-time serving-health-time">
+      <span>기준 시각 {baseTime}</span>
+      <span className="header-time-help serving-health-help">
+        <button
+          type="button"
+          className="header-time-info"
+          aria-label="기준 시각 및 데이터 상태 설명"
+          aria-describedby="serving-health-tooltip"
+        >
+          i
+        </button>
+        <span
+          id="serving-health-tooltip"
+          className="serving-health-popover"
+          role="tooltip"
+          aria-label="데이터 상태 상세"
+        >
+          <span className="serving-health-popover-header">
+            <strong>데이터 상태</strong>
+            <span className={`serving-health-overall ${overall}`}>{overallLabel}</span>
+          </span>
+          <span className="serving-health-list">
+            {HEALTH_COMPONENTS.map(([key, label]) => {
+              const component = health?.components[key];
+              const state = component?.state;
+              return (
+                <span key={key} className="serving-health-row">
+                  <span className={`serving-health-dot ${state ?? "loading"}`} aria-hidden="true" />
+                  <span className="serving-health-label">{label}</span>
+                  <span className={`serving-health-state ${state ?? "loading"}`}>
+                    {componentStateLabel(key, state, component?.reason)}
+                  </span>
+                  <time>
+                    <span>
+                      {component?.source_dttm ? "게시 " : ""}
+                      {componentTime(component?.data_dttm ?? null)}
+                    </span>
+                    {component?.source_dttm && (
+                      <small>원본 {componentTime(component.source_dttm)}</small>
+                    )}
+                  </time>
+                </span>
+              );
+            })}
+          </span>
+          <span className="serving-health-footer">
+            {error
+              ? "상태 조회 실패 · 마지막 정상 화면을 유지합니다."
+              : health
+                ? `마지막 확인 ${componentTime(health.checked_at)}`
+                : "데이터 상태를 확인하고 있습니다."}
+          </span>
+        </span>
+      </span>
+      <span className={`serving-health-badge ${overall}`}>{overallLabel}</span>
+    </span>
+  );
+}
+
+export function Header({
+  regions,
+  selectedRegion,
+  stationsUpdatedAt,
+  servingHealth,
+  servingHealthError,
+  onRegionChange,
+}: Props) {
   const [now, setNow] = useState(new Date());
-  const [predictedAt, setPredictedAt] = useState<string | null>(null);
-  const [statusError, setStatusError] = useState(false);
 
   useEffect(() => {
     const clock = setInterval(() => setNow(new Date()), 1000);
     return () => clearInterval(clock);
-  }, []);
-
-  useEffect(() => {
-    let cancelled = false;
-    let requestGeneration = 0;
-    function refresh() {
-      const currentGeneration = ++requestGeneration;
-      api
-        .status()
-        .then((data) => {
-          if (!cancelled && currentGeneration === requestGeneration) {
-            setPredictedAt(data.base_dttm);
-            setStatusError(false);
-          }
-        })
-        .catch(() => {
-          if (!cancelled && currentGeneration === requestGeneration) {
-            setPredictedAt(null);
-            setStatusError(true);
-          }
-        });
-    }
-    refresh();
-    const timer = setInterval(refresh, STATUS_POLL_INTERVAL_MS);
-    return () => {
-      cancelled = true;
-      clearInterval(timer);
-    };
   }, []);
 
   return (
@@ -105,13 +192,7 @@ export function Header({ regions, selectedRegion, stationsUpdatedAt, onRegionCha
           value={stationsUpdatedAt ? formatClock(stationsUpdatedAt) : "-"}
           description="현재 화면의 대여소 정보를 API에서 성공적으로 조회한 시각입니다. 조회에 실패하면 -로 표시됩니다."
         />
-        <HeaderTime
-          id="forecast-base-time"
-          label="기준 시각"
-          value={statusError ? "갱신 실패" : predictedAt ? formatIsoTime(predictedAt, { hour: "2-digit", minute: "2-digit" }) : "-"}
-          description="전체 수요예측이 공통으로 사용하는 데이터 기준 시각입니다. 최근 10분 내의 일관된 예측만 표시됩니다."
-          error={statusError}
-        />
+        <ServingHealthTime health={servingHealth} error={servingHealthError} />
       </div>
     </header>
   );
