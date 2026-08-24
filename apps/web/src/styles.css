@@ -1400,11 +1400,3 @@ body {
     animation: none;
   }
 }
-
-.station-stock-basis {
-  margin: 8px 0 0;
-  text-align: center;
-  color: var(--text-secondary);
-  font-size: 11px;
-  font-variant-numeric: tabular-nums;
-}

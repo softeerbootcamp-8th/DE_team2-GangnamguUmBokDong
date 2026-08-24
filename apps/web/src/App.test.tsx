@@ -72,7 +72,25 @@ vi.mock("./components/ForecastPanel", () => ({
 vi.mock("./components/StockPanel", () => ({ StockPanel: () => <div>stock</div> }));
 vi.mock("@/components/ui/resizable", () => ({
   ResizablePanelGroup: ({ children }: { children: ReactNode }) => <div>{children}</div>,
-  ResizablePanel: ({ children }: { children: ReactNode }) => <div>{children}</div>,
+  ResizablePanel: ({
+    children,
+    id,
+    defaultSize,
+    minSize,
+  }: {
+    children: ReactNode;
+    id?: string;
+    defaultSize?: number | string;
+    minSize?: number | string;
+  }) => (
+    <div
+      data-testid={id === undefined ? undefined : `resizable-panel-${id}`}
+      data-default-size={defaultSize}
+      data-min-size={minSize}
+    >
+      {children}
+    </div>
+  ),
   ResizableHandle: () => <div />,
 }));
 
@@ -189,6 +207,23 @@ afterEach(() => {
 });
 
 describe("App polling state", () => {
+  it("기본 패널 비율과 하단 상세 최소 높이를 고정한다", async () => {
+    apiMock.stations.mockResolvedValue(STATIONS);
+    render(<App />);
+    await settleRequests();
+
+    expect(screen.getByTestId("resizable-panel-workspace-row").getAttribute("data-default-size"))
+      .toBe("55%");
+    expect(screen.getByTestId("resizable-panel-detail-row").getAttribute("data-default-size"))
+      .toBe("45%");
+    expect(screen.getByTestId("resizable-panel-detail-row").getAttribute("data-min-size"))
+      .toBe("320px");
+    expect(screen.getByTestId("resizable-panel-map-col").getAttribute("data-default-size"))
+      .toBe("50%");
+    expect(screen.getByTestId("resizable-panel-list-col").getAttribute("data-default-size"))
+      .toBe("50%");
+  });
+
   it("작업 승인 버튼을 실제 상태 전이 API와 연결한다", async () => {
     apiMock.stations.mockResolvedValue(STATIONS);
     render(<App />);

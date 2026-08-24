@@ -346,9 +346,9 @@ export default function App() {
       />
       <div className="flex-1 overflow-hidden">
         <ResizablePanelGroup orientation="vertical" className="rounded-lg border bg-background">
-          <ResizablePanel defaultSize={64} minSize={36}>
+          <ResizablePanel id="workspace-row" defaultSize="55%" minSize="280px">
             <ResizablePanelGroup orientation="horizontal">
-              <ResizablePanel id="map-col" defaultSize={50} minSize={35}>
+              <ResizablePanel id="map-col" defaultSize="50%" minSize="35%">
                 <div className="flex h-full flex-col bg-background px-4 py-2">
                   <section className="flex h-full min-h-0 min-w-0 flex-col gap-2">
                     <div className="map-panel-toolbar">
@@ -379,7 +379,7 @@ export default function App() {
 
               <ResizableHandle withHandle />
 
-              <ResizablePanel id="list-col" defaultSize={50} minSize={35}>
+              <ResizablePanel id="list-col" defaultSize="50%" minSize="35%">
                 <div className="flex h-full min-h-0 min-w-0 flex-col bg-card px-4 py-2">
                   <section className="flex h-full min-h-0 min-w-0 flex-col gap-2">
                     <div className="work-list-header">
@@ -431,7 +431,7 @@ export default function App() {
 
           <ResizableHandle withHandle />
 
-          <ResizablePanel defaultSize={36} minSize={24}>
+          <ResizablePanel id="detail-row" defaultSize="45%" minSize="320px">
             <div className="flex h-full min-h-0 flex-col bg-card">
               <RouteStopRail
                 route={selectedRoute}
