@@ -449,6 +449,47 @@ def test_population_fetch_uses_configured_poi_range_and_does_not_stop_at_gap():
     assert any("/POI121/" in url for url in calls)
 
 
+def test_population_fetch_excludes_configured_poi_gaps():
+    """공식 POI 코드의 결번은 계획과 실제 HTTP 요청 모두에서 제외한다."""
+    config = _StubConfig(
+        {
+            "service": "citydata_ppltn",
+            "page_size": 1000,
+            "root_key": "SeoulRtd.citydata_ppltn",
+            "root_key_literal": True,
+            "poi_start": 20,
+            "poi_end": 23,
+            "poi_exclude": [22],
+        }
+    )
+    calls = []
+
+    def handler(request):
+        poi_id = request.url.path.rstrip("/").rsplit("/", 1)[-1]
+        calls.append(poi_id)
+        body = {
+            "RESULT": {"RESULT.CODE": "INFO-000"},
+            "SeoulRtd.citydata_ppltn": [{"AREA_CD": poi_id}],
+        }
+        return httpx.Response(200, content=json.dumps(body).encode())
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    planned = SeoulOpenApiAdapter.planned_parts(config, window=None)
+    results = list(SeoulOpenApiAdapter.fetch(config, window=None, client=client))
+
+    assert planned == {
+        "poi-POI020",
+        "poi-POI021",
+        "poi-POI023",
+    }
+    assert [result.key for result in results] == [
+        "poi-POI020",
+        "poi-POI021",
+        "poi-POI023",
+    ]
+    assert calls == ["POI020", "POI021", "POI023"]
+
+
 def test_population_fetch_requests_pois_concurrently_and_preserves_order():
     import threading
     import time
