@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { api } from "../api";
 import type { CulturalEvent, StationDetail, WeatherPoint } from "../api";
 import { formatIsoTime } from "../format";
+import { stationStockVisual } from "../stationStockVisual";
 
 export interface FocusedEvent {
   eventLat: number;
@@ -48,6 +49,47 @@ interface Props {
 
 function nullableMeasurement(value: number | null, suffix: string): string {
   return value === null ? "-" : `${value}${suffix}`;
+}
+
+function StockDonut({ current, capacity }: { current: number; capacity: number }) {
+  const visual = stationStockVisual(current, capacity);
+  return (
+    <div
+      className="stock-donut"
+      data-stock-band={visual.band}
+      role="img"
+      aria-label={`현재 자전거 ${current}대, 거치대 ${capacity}대, 재고율 ${visual.ratioPercent}%`}
+    >
+      <svg viewBox="0 0 48 48" aria-hidden="true">
+        <circle className={`stock-donut-track ${visual.band}`} cx="24" cy="24" r="15" />
+        <circle
+          className={`stock-donut-value ${visual.band}`}
+          cx="24"
+          cy="24"
+          r="15"
+          pathLength="100"
+          strokeDasharray={`${visual.capacityPercent} 100`}
+        />
+        {visual.overflowPercent > 0 && (
+          <>
+            <circle className="stock-donut-overflow-track" cx="24" cy="24" r="20" />
+            <circle
+              className="stock-donut-overflow-value"
+              cx="24"
+              cy="24"
+              r="20"
+              pathLength="100"
+              strokeDasharray={`${visual.overflowPercent} 100`}
+            />
+          </>
+        )}
+      </svg>
+      <span className="stock-donut-number">
+        <strong>{current}</strong>
+        <small>/ {capacity}대</small>
+      </span>
+    </div>
+  );
 }
 
 export function DetailPanel({ stationId, stationPoint, onFocusEvent }: Props) {
@@ -217,27 +259,10 @@ export function DetailPanel({ stationId, stationPoint, onFocusEvent }: Props) {
               </header>
 
               <div className="station-stock-card">
-                <div
-                  className="stock-donut"
-                  role="img"
-                  aria-label={`현재 자전거 ${detail.parking_bike_tot_cnt}대, 거치대 ${detail.hold_cnt}대`}
-                >
-                  <svg viewBox="0 0 42 42" aria-hidden="true">
-                    <circle className="stock-donut-track" cx="21" cy="21" r="16" />
-                    <circle
-                      className="stock-donut-value"
-                      cx="21"
-                      cy="21"
-                      r="16"
-                      pathLength="100"
-                      strokeDasharray={`${Math.min(100, Math.max(0, Math.round(detail.shared_rate * 100)))} 100`}
-                    />
-                  </svg>
-                  <span className="stock-donut-number">
-                    <strong>{detail.parking_bike_tot_cnt}</strong>
-                    <small>/ {detail.hold_cnt}대</small>
-                  </span>
-                </div>
+                <StockDonut
+                  current={detail.parking_bike_tot_cnt}
+                  capacity={detail.hold_cnt}
+                />
               </div>
             </div>
           )

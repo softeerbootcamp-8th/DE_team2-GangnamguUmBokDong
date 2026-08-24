@@ -101,11 +101,36 @@ describe("DetailPanel stale state", () => {
 
     expect(screen.getByRole("heading", { name: DETAIL.sta_nm })).not.toBeNull();
     expect(screen.getByText(DETAIL.sta_addr)).not.toBeNull();
-    expect(screen.getByRole("img", { name: "현재 자전거 3대, 거치대 10대" })).not.toBeNull();
+    const donut = screen.getByRole("img", {
+      name: "현재 자전거 3대, 거치대 10대, 재고율 30%",
+    });
+    expect(donut.getAttribute("data-stock-band")).toBe("warning");
+    expect(donut.querySelector(".stock-donut-value")?.getAttribute("stroke-dasharray"))
+      .toBe("30 100");
+    expect(donut.querySelector(".stock-donut-overflow-value")).toBeNull();
     expect(screen.queryByText("현재 자전거")).toBeNull();
     expect(screen.queryByText("30% 이용 가능")).toBeNull();
     expect(screen.queryByText("재고 갱신")).toBeNull();
     expect(screen.queryByText(/갱신 시각/)).toBeNull();
+  });
+
+  it("정원 초과분을 같은 크기 안의 외부 링으로 표시한다", async () => {
+    apiMock.station.mockResolvedValue({
+      ...DETAIL,
+      parking_bike_tot_cnt: 13,
+      shared_rate: 1.3,
+    });
+    renderDetail();
+    await settleRequests();
+
+    const donut = screen.getByRole("img", {
+      name: "현재 자전거 13대, 거치대 10대, 재고율 130%",
+    });
+    expect(donut.getAttribute("data-stock-band")).toBe("overflow");
+    expect(donut.querySelector(".stock-donut-value")?.getAttribute("stroke-dasharray"))
+      .toBe("100 100");
+    expect(donut.querySelector(".stock-donut-overflow-value")?.getAttribute("stroke-dasharray"))
+      .toBe("30 100");
   });
 
   it("station polling 실패 뒤 이전 상세를 경고와 함께 유지한다", async () => {

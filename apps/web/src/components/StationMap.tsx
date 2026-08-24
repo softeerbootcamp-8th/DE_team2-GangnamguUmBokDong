@@ -3,10 +3,9 @@ import { intersect } from "@turf/intersect";
 import "leaflet/dist/leaflet.css";
 import { Delaunay } from "d3-delaunay";
 import L from "leaflet";
-import { Fragment, useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Circle, CircleMarker, MapContainer, Marker, Polygon, Polyline, TileLayer, Tooltip, useMapEvents } from "react-leaflet";
 import type { ActionType, Alert, DispatchCenter, Route, StationFilter, StationSummary } from "../api";
-import { stationStockVisual, type StationStockBand } from "../stationStockVisual";
 import type { FocusedEvent } from "./DetailPanel";
 import seoulBoundary from "../seoul_boundary.json";
 
@@ -27,12 +26,6 @@ const CLICK_PADDING = 10; // 시각적 마커보다 이만큼 더 넓게 클릭�
 const SELECTED_BORDER = "#2edb8c";
 const IDLE_BORDER = "#fcfcfb";
 const MAX_VISIBLE_MARKERS = 100; // 현재 화면 범위 안에 이보다 많으면 덜 급한 것부터 숨긴다
-const STOCK_RING_GAP = 4;
-const STOCK_RING_COLORS: Record<Exclude<StationStockBand, "normal">, string> = {
-  critical: "#e34948",
-  warning: "#e3a321",
-  overflow: "#00a878",
-};
 
 // 서비스 대상이 서울 전역이라, 그 밖으로 패닝/줌아웃해서 벗어날 이유가 없다.
 // 실제 대여소 좌표 범위(위도 37.43~37.69, 경도 126.80~127.18)보다 여유를 두고
@@ -213,13 +206,6 @@ function markerRadius(alert: Alert | undefined): number {
   return MIN_RADIUS + (score / 100) * (MAX_RADIUS - MIN_RADIUS);
 }
 
-function stockRingColor(station: StationSummary): string | null {
-  /** 예측 마커와 독립적인 현재 재고 상태 링의 색을 반환한다. */
-  const visual = stationStockVisual(station.parking_bike_tot_cnt, station.hold_cnt);
-  if (visual.band === "normal") return null;
-  return STOCK_RING_COLORS[visual.band];
-}
-
 // 재고 수는 마커 밖에 별도 라벨로 띄우지 않고 마커 안에 바로 적는다. 마커가
 // 회색인데 라벨만 빨강/파랑으로 따로 떠 있으면 둘이 서로 다른 걸 가리키는
 // 것처럼 헷갈리므로, 그냥 마커 채우기색 위에 흰 숫자만 얹는다. 채우기색이
@@ -330,7 +316,6 @@ function StationMarkers({
   const scale = zoomScale(zoom);
   const showCounts = zoom >= COUNT_LABEL_MIN_ZOOM;
   const alertsByStation = useMemo(() => new Map(alerts.map((alert) => [alert.sta_id, alert])), [alerts]);
-  const stationsById = useMemo(() => new Map(stations.map((station) => [station.sta_id, station])), [stations]);
   const priorityOf = (station: StationSummary) =>
     zPriority(alertsByStation.get(station.sta_id), station.sta_id === selectedStationId);
 
@@ -539,45 +524,24 @@ function StationMarkers({
         const isSelected = station.sta_id === selectedStationId;
         const alert = alertsByStation.get(station.sta_id);
         const radius = markerRadius(alert) * scale;
-        const ringColor = stockRingColor(station);
-        const ratio = stationStockVisual(station.parking_bike_tot_cnt, station.hold_cnt).ratioPercent;
         const handleClick = () => onSelect(station.sta_id);
         return (
-          <Fragment key={station.sta_id}>
-            {ringColor && (
-              <CircleMarker
-                center={[station.lat, station.lon]}
-                radius={radius + STOCK_RING_GAP}
-                pathOptions={{
-                  color: ringColor,
-                  weight: 2.5,
-                  fill: false,
-                  opacity: 0.95,
-                  dashArray: stationStockVisual(
-                    station.parking_bike_tot_cnt,
-                    station.hold_cnt,
-                  ).band === "overflow" ? "5 3" : undefined,
-                }}
-                interactive={false}
-              />
-            )}
-            <CircleMarker
-              center={[station.lat, station.lon]}
-              radius={radius}
-              pathOptions={{
-                color: isSelected ? SELECTED_BORDER : IDLE_BORDER,
-                weight: isSelected ? 3 : 2,
-                fillColor: markerColor(alert),
-                fillOpacity: 1,
-              }}
-              eventHandlers={{ click: handleClick }}
-            >
-              <Tooltip direction="top" offset={[0, -8]}>
-                {station.sta_nm} · {station.parking_bike_tot_cnt}/{station.hold_cnt}대
-                {` · ${ratio}%`}
-              </Tooltip>
-            </CircleMarker>
-          </Fragment>
+          <CircleMarker
+            key={station.sta_id}
+            center={[station.lat, station.lon]}
+            radius={radius}
+            pathOptions={{
+              color: isSelected ? SELECTED_BORDER : IDLE_BORDER,
+              weight: isSelected ? 3 : 2,
+              fillColor: markerColor(alert),
+              fillOpacity: 1,
+            }}
+            eventHandlers={{ click: handleClick }}
+          >
+            <Tooltip direction="top" offset={[0, -8]}>
+              {station.sta_nm} · {station.parking_bike_tot_cnt}/{station.hold_cnt}대
+            </Tooltip>
+          </CircleMarker>
         );
       })}
       {!selectedRoute && showCounts &&
@@ -600,54 +564,24 @@ function StationMarkers({
               />
             );
           })}
-      {selectedRoute?.stops.map((stop) => {
-        const station = stationsById.get(stop.sta_id);
-        const ringColor = station ? stockRingColor(station) : null;
-        if (!station || !ringColor) return null;
-        return (
-          <CircleMarker
-            key={`route-stock-ring-${stop.visit_order}-${stop.sta_id}`}
-            center={[stop.lat, stop.lon]}
-            radius={18}
-            pathOptions={{
-              color: ringColor,
-              weight: 2.5,
-              fill: false,
-              opacity: 0.95,
-              dashArray: stationStockVisual(
-                station.parking_bike_tot_cnt,
-                station.hold_cnt,
-              ).band === "overflow" ? "5 3" : undefined,
-            }}
-            interactive={false}
-          />
-        );
-      })}
-      {selectedRoute?.stops.map((stop) => {
-        const station = stationsById.get(stop.sta_id);
-        const ratio = station
-          ? stationStockVisual(station.parking_bike_tot_cnt, station.hold_cnt).ratioPercent
-          : null;
-        return (
-          <Marker
-            key={`route-stop-${stop.visit_order}-${stop.sta_id}`}
-            position={[stop.lat, stop.lon]}
-            icon={L.divIcon({
-              className: `route-stop-map-marker${stop.sta_id === selectedStationId ? " selected" : ""}`,
-              html: `<span class="${stop.action}">${stop.visit_order}</span>`,
-              iconSize: [28, 28],
-              iconAnchor: [14, 14],
-            })}
-            eventHandlers={{ click: () => onSelect(stop.sta_id) }}
-            zIndexOffset={2_000_000 + stop.visit_order}
-          >
-            <Tooltip direction="top" offset={[0, -12]}>
-              {stop.visit_order}. {stop.sta_nm} · {stop.action === "pickup" ? "회수" : "공급"} {stop.bike_cnt}대
-              {ratio === null ? "" : ` · 현재 ${ratio}%`}
-            </Tooltip>
-          </Marker>
-        );
-      })}
+      {selectedRoute?.stops.map((stop) => (
+        <Marker
+          key={`route-stop-${stop.visit_order}-${stop.sta_id}`}
+          position={[stop.lat, stop.lon]}
+          icon={L.divIcon({
+            className: `route-stop-map-marker${stop.sta_id === selectedStationId ? " selected" : ""}`,
+            html: `<span class="${stop.action}">${stop.visit_order}</span>`,
+            iconSize: [28, 28],
+            iconAnchor: [14, 14],
+          })}
+          eventHandlers={{ click: () => onSelect(stop.sta_id) }}
+          zIndexOffset={2_000_000 + stop.visit_order}
+        >
+          <Tooltip direction="top" offset={[0, -12]}>
+            {stop.visit_order}. {stop.sta_nm} · {stop.action === "pickup" ? "회수" : "공급"} {stop.bike_cnt}대
+          </Tooltip>
+        </Marker>
+      ))}
     </>
   );
 }
@@ -690,39 +624,32 @@ export function StationMap({
   }, []);
 
   return (
-    <div className="station-map-shell">
-      <MapContainer
-        center={GANGNAM_CENTER}
-        zoom={DEFAULT_ZOOM}
-        minZoom={SEOUL_MIN_ZOOM}
-        maxBounds={SEOUL_BOUNDS}
-        maxBoundsViscosity={1.0}
-        style={{ height: "100%", width: "100%" }}
-        wheelDebounceTime={100}
-      >
-        <MapResizer />
-        <TileLayer
-          attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions">CARTO</a>'
-          url={`https://{s}.basemaps.cartocdn.com/${prefersDark ? "dark_all" : "light_all"}/{z}/{x}/{y}{r}.png`}
-        />
-        <StationMarkers
-          stations={stations}
-          alerts={alerts}
-          selectedStationId={selectedStationId}
-          stationFocusRequest={stationFocusRequest}
-          onSelect={onSelect}
-          mapFilterMode={mapFilterMode}
-          regionCenters={regionCenters}
-          selectedRegion={selectedRegion}
-          focusedEvent={focusedEvent}
-          selectedRoute={selectedRoute}
-        />
-      </MapContainer>
-      <div className="station-stock-legend" aria-label="현재 재고율 링 범례">
-        <span><i className="critical" aria-hidden="true" />20% 이하</span>
-        <span><i className="warning" aria-hidden="true" />40% 이하</span>
-        <span><i className="overflow" aria-hidden="true" />100% 초과</span>
-      </div>
-    </div>
+    <MapContainer
+      center={GANGNAM_CENTER}
+      zoom={DEFAULT_ZOOM}
+      minZoom={SEOUL_MIN_ZOOM}
+      maxBounds={SEOUL_BOUNDS}
+      maxBoundsViscosity={1.0}
+      style={{ height: "100%", width: "100%" }}
+      wheelDebounceTime={100}
+    >
+      <MapResizer />
+      <TileLayer
+        attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions">CARTO</a>'
+        url={`https://{s}.basemaps.cartocdn.com/${prefersDark ? "dark_all" : "light_all"}/{z}/{x}/{y}{r}.png`}
+      />
+      <StationMarkers
+        stations={stations}
+        alerts={alerts}
+        selectedStationId={selectedStationId}
+        stationFocusRequest={stationFocusRequest}
+        onSelect={onSelect}
+        mapFilterMode={mapFilterMode}
+        regionCenters={regionCenters}
+        selectedRegion={selectedRegion}
+        focusedEvent={focusedEvent}
+        selectedRoute={selectedRoute}
+      />
+    </MapContainer>
   );
 }

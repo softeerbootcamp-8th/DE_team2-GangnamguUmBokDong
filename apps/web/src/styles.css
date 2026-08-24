@@ -500,56 +500,6 @@ body {
   border-radius: 4px;
 }
 
-.station-map-shell {
-  position: relative;
-  width: 100%;
-  height: 100%;
-}
-
-.station-stock-legend {
-  position: absolute;
-  z-index: 800;
-  bottom: 14px;
-  left: 12px;
-  display: flex;
-  gap: 9px;
-  padding: 5px 8px;
-  border: 1px solid var(--border);
-  border-radius: 999px;
-  background: color-mix(in srgb, var(--surface-1) 92%, transparent);
-  box-shadow: 0 2px 8px rgb(0 0 0 / 10%);
-  color: var(--text-secondary);
-  font-size: 10px;
-  pointer-events: none;
-}
-
-.station-stock-legend span {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  white-space: nowrap;
-}
-
-.station-stock-legend i {
-  width: 9px;
-  height: 9px;
-  border: 2px solid;
-  border-radius: 50%;
-}
-
-.station-stock-legend i.critical {
-  border-color: #e34948;
-}
-
-.station-stock-legend i.warning {
-  border-color: #e3a321;
-}
-
-.station-stock-legend i.overflow {
-  border-color: #00a878;
-  border-style: dashed;
-}
-
 /* 지도 마커 재고 수 라벨(일정 줌 이상에서만 렌더링됨, StationMap.tsx 참고) */
 .marker-count-label {
   background: transparent;
@@ -1423,8 +1373,38 @@ body {
   stroke: var(--gridline);
 }
 
+.stock-donut-track.critical {
+  stroke: color-mix(in srgb, var(--status-critical) 24%, var(--gridline));
+}
+
+.stock-donut-track.warning {
+  stroke: color-mix(in srgb, var(--status-warning) 28%, var(--gridline));
+}
+
 .stock-donut-value {
   stroke: var(--brand-green);
+  stroke-linecap: round;
+}
+
+.stock-donut-value.critical {
+  stroke: var(--status-critical);
+}
+
+.stock-donut-value.warning {
+  stroke: var(--status-warning);
+}
+
+.stock-donut-overflow-track,
+.stock-donut-overflow-value {
+  stroke-width: 3;
+}
+
+.stock-donut-overflow-track {
+  stroke: color-mix(in srgb, #00a878 18%, var(--gridline));
+}
+
+.stock-donut-overflow-value {
+  stroke: #00a878;
   stroke-linecap: round;
 }
 
