@@ -159,14 +159,14 @@ Airflow가 수집, 정규화, 생활인구 보정, 추론, Gold 게시와 재배
 
 | DAG | 스케줄 | 역할 |
 | --- | --- | --- |
-| `realtime_tick*` | 매 5분 | 실시간 데이터 수집 → 정규화 → 추론 → Gold 게시 → 긴급도·경로 생성 |
+| `realtime_tick` | 매 5분 | 실시간 데이터 수집 → 정규화 → 추론 → Gold 게시 → 긴급도·경로 생성 |
 | `daily_population_and_events` | 매일 03:00 | 생활인구 수집·보정 및 문화·공연 행사 게시 |
 | `station_master` | 매일 03:04 | 대여소 기준정보 수집 및 서빙용 마스터 생성 |
 | `daily_compaction` | 매일 04:30 | D-6 대여이력 재수집 및 Silver 일 단위 Archive 압축 |
 | `monthly_retrain_rental` | 매월 1일 03:00 | 대여 모델 평가 및 조건부 재학습 |
 | `monthly_retrain_return` | 매월 1일 06:00 | 반납 모델 평가 및 조건부 재학습 |
 
-`realtime_tick`은 날씨 발표 주기에 맞춰 네 DAG로 분리되어 있지만, 합쳐서 빠짐없이 매 5분 실행됩니다. 날씨가 필요하지 않은 tick은 불필요한 외부 API 호출을 생략합니다.
+`realtime_tick`은 단일 DAG로 5분마다 실행됩니다. 날씨 collector별 freshness gate가 마지막 성공 수집 시각을 확인해, 날씨가 필요하지 않은 tick에는 불필요한 외부 API 호출을 생략합니다.
 
 ## 9. 로컬 실행
 
@@ -185,7 +185,7 @@ cd DE_team2-GangnamguUmBokDong
 make bootstrap
 ```
 
-`make bootstrap`은 최초 실행 시 `.env.example`을 `.env`로 복사하고 로컬 서비스를 구성합니다. 실제 외부 데이터를 수집하려면 생성된 `.env`에 API 키를 입력하세요.
+최초 실행 시 `make bootstrap`은 `.env.example`을 `.env`로 복사합니다. 필수 API 키가 비어 있으면 서비스를 기동하지 않고 중단하므로, 생성된 `.env`에 `SEOUL_OPENAPI_KEY`와 `KMA_APIHUB_KEY`를 입력한 뒤 `make bootstrap`을 다시 실행하세요.
 
 | 서비스 | 기본 주소 |
 | --- | --- |
