@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { LayoutChangedMeta, PanelImperativeHandle } from "react-resizable-panels";
-import { List, Route as RouteIcon } from "lucide-react";
+import { List, Route as RouteIcon, TriangleAlert } from "lucide-react";
 import { api } from "./api";
 import type { Alert, DispatchCenter, ForecastResponse, Route, ServingHealthResponse, StationSummary } from "./api";
 import { AlertList } from "./components/AlertList";
@@ -318,6 +318,18 @@ export default function App() {
   const stockHealth = servingHealth?.components.stock;
   const dispatchHealthUnavailable = servingHealthError
     || (servingHealth !== null && !canDispatchNewRoutes);
+  const staleAlert = filteredAlerts.find((alert) => alert.data_status === "stale");
+  const listStatusMessage = listMode === "routes"
+    ? routesError
+      ? "작업 목록 조회에 실패해 마지막 결과를 표시합니다."
+      : dispatchHealthUnavailable
+        ? "핵심 데이터가 지연되거나 기준 시각이 달라 신규 승인을 잠시 중단합니다."
+        : null
+    : alertsError
+      ? "우선순위 조회에 실패해 마지막 결과를 표시합니다."
+      : staleAlert
+        ? `긴급도 갱신이 지연되어 ${Math.floor(staleAlert.age_minutes)}분 전 마지막 성공 결과를 표시합니다.`
+        : null;
 
   function changeRegion(region: string) {
     if (region === selectedRegion) return;
@@ -455,6 +467,12 @@ export default function App() {
                     <div className="work-list-header">
                       <div className="work-list-title-group">
                         <h2>{listMode === "routes" ? "재배치 작업" : "대여소 우선순위"}</h2>
+                        {listStatusMessage && (
+                          <p className="work-list-status" role="status" title={listStatusMessage}>
+                            <TriangleAlert size={12} aria-hidden="true" />
+                            <span>{listStatusMessage}</span>
+                          </p>
+                        )}
                       </div>
                       <button
                         type="button"
@@ -469,13 +487,6 @@ export default function App() {
                     <div className="min-h-0 flex-1 overflow-hidden">
                       {listMode === "routes" ? (
                         <div className="data-preserving-panel">
-                          {(routesError || dispatchHealthUnavailable) && (
-                            <p className="data-refresh-warning" role="status">
-                              {routesError
-                                ? "작업 목록 조회에 실패해 마지막 결과를 표시합니다."
-                                : "핵심 데이터가 지연되거나 기준 시각이 달라 신규 승인을 잠시 중단합니다."}
-                            </p>
-                          )}
                           <RouteList
                             routes={routes}
                             regions={regionCenters}
@@ -493,11 +504,6 @@ export default function App() {
                         </div>
                       ) : (
                         <div className="data-preserving-panel">
-                          {alertsError && (
-                            <p className="data-refresh-warning" role="status">
-                              우선순위 조회에 실패해 마지막 결과를 표시합니다.
-                            </p>
-                          )}
                           <AlertList
                             alerts={filteredAlerts}
                             selectedStationId={selectedStationId}

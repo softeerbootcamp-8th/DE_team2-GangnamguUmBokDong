@@ -546,7 +546,8 @@ body {
 }
 
 .station-stock-legend i.overflow {
-  border-color: #2a78d6;
+  border-color: #00a878;
+  border-style: dashed;
 }
 
 /* 지도 마커 재고 수 라벨(일정 줌 이상에서만 렌더링됨, StationMap.tsx 참고) */
@@ -633,7 +634,38 @@ body {
   display: flex;
   align-items: center;
   gap: 8px;
+  flex: 1;
   min-width: 0;
+}
+
+.work-list-title-group > h2 {
+  flex: none;
+}
+
+.work-list-status {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  height: 22px;
+  margin: 0;
+  padding: 0 7px;
+  border: 1px solid color-mix(in srgb, var(--status-warning) 30%, var(--border));
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--status-warning) 9%, var(--surface-1));
+  color: color-mix(in srgb, var(--status-warning) 72%, var(--text-primary));
+  font-size: 10px;
+  line-height: 1;
+}
+
+.work-list-status > svg {
+  flex: none;
+  margin-right: 4px;
+}
+
+.work-list-status > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 

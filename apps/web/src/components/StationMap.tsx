@@ -31,7 +31,7 @@ const STOCK_RING_GAP = 4;
 const STOCK_RING_COLORS: Record<Exclude<StationStockBand, "normal">, string> = {
   critical: "#e34948",
   warning: "#e3a321",
-  overflow: "#2a78d6",
+  overflow: "#00a878",
 };
 
 // 서비스 대상이 서울 전역이라, 그 밖으로 패닝/줌아웃해서 벗어날 이유가 없다.
@@ -548,7 +548,16 @@ function StationMarkers({
               <CircleMarker
                 center={[station.lat, station.lon]}
                 radius={radius + STOCK_RING_GAP}
-                pathOptions={{ color: ringColor, weight: 2.5, fill: false, opacity: 0.95 }}
+                pathOptions={{
+                  color: ringColor,
+                  weight: 2.5,
+                  fill: false,
+                  opacity: 0.95,
+                  dashArray: stationStockVisual(
+                    station.parking_bike_tot_cnt,
+                    station.hold_cnt,
+                  ).band === "overflow" ? "5 3" : undefined,
+                }}
                 interactive={false}
               />
             )}
@@ -594,15 +603,25 @@ function StationMarkers({
       {selectedRoute?.stops.map((stop) => {
         const station = stationsById.get(stop.sta_id);
         const ringColor = station ? stockRingColor(station) : null;
-        return ringColor ? (
+        if (!station || !ringColor) return null;
+        return (
           <CircleMarker
             key={`route-stock-ring-${stop.visit_order}-${stop.sta_id}`}
             center={[stop.lat, stop.lon]}
             radius={18}
-            pathOptions={{ color: ringColor, weight: 2.5, fill: false, opacity: 0.95 }}
+            pathOptions={{
+              color: ringColor,
+              weight: 2.5,
+              fill: false,
+              opacity: 0.95,
+              dashArray: stationStockVisual(
+                station.parking_bike_tot_cnt,
+                station.hold_cnt,
+              ).band === "overflow" ? "5 3" : undefined,
+            }}
             interactive={false}
           />
-        ) : null;
+        );
       })}
       {selectedRoute?.stops.map((stop) => {
         const station = stationsById.get(stop.sta_id);

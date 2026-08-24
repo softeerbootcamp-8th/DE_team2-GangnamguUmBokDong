@@ -345,9 +345,29 @@ describe("App polling state", () => {
     expect(approval.hasAttribute("disabled")).toBe(true);
     fireEvent.click(approval);
     expect(apiMock.dispatchRoute).not.toHaveBeenCalled();
-    expect(screen.getByText(
+    const notice = screen.getByText(
       "핵심 데이터가 지연되거나 기준 시각이 달라 신규 승인을 잠시 중단합니다.",
-    )).not.toBeNull();
+    );
+    expect(notice.closest(".work-list-title-group")).not.toBeNull();
+    expect(notice.closest(".data-preserving-panel")).toBeNull();
+  });
+
+  it("대여소 우선순위 지연도 작업 목록과 같은 제목 행 안내로 표시한다", async () => {
+    apiMock.stations.mockResolvedValue(STATIONS);
+    apiMock.alerts.mockResolvedValue([
+      { ...ALERTS[0], data_status: "stale", age_minutes: 12 },
+    ]);
+    render(<App />);
+    await settleRequests();
+    await settleRequests();
+
+    fireEvent.click(screen.getByRole("button", { name: "대여소" }));
+
+    const notice = screen.getByText(
+      "긴급도 갱신이 지연되어 12분 전 마지막 성공 결과를 표시합니다.",
+    );
+    expect(notice.closest(".work-list-title-group")).not.toBeNull();
+    expect(notice.closest(".alert-list-wrap")).toBeNull();
   });
 
   it("버튼으로 상태를 바꾼 결과 카드에 선택 테두리를 옮긴다", async () => {
