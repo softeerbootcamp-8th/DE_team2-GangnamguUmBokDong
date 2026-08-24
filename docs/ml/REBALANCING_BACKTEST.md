@@ -1,5 +1,9 @@
 # 재배치 시스템 point-in-time 백테스트
 
+> **문서 상태:** 백테스트 구현은 `loader/evaluation/`에 있으며 계약·시뮬레이터
+> 테스트로 검증한다. 아래 결과의 원천 CSV, 모델 bundle, MinIO station master와
+> 생성 결과는 Git에 포함하지 않으므로, 동일한 고정 입력을 준비해야 수치를 재현할 수 있다.
+
 이 평가는 과거 실측 재고에서 출발해 당시까지 관측 가능한 입력으로 실제 대여·반납
 모델을 5분마다 다시 실행하고, 시민 대여 요청과 트럭 작업을 사건 순서대로 재생한다.
 미래 실제 수요로 작업량을 만드는 이전 oracle 실험은 경로 디버깅 용도로만 남기며
@@ -74,13 +78,15 @@ master 내용 SHA-256, 생활인구 제외 표면, 모델 bundle SHA-256, 모든
 
 ## 실행
 
-대시보드 Docker를 내리거나 다시 만들 필요가 없다. 현재 scheduler 컨테이너의 loader
-환경을 사용하면 고정 MinIO volume의 학습 station master를 그대로 읽는다.
+로컬 Compose가 실행 중이고 필요한 원천·모델·MinIO station master가 준비돼 있다면
+`airflow-scheduler` 서비스의 loader 환경에서 실행한다. Compose 프로젝트명이 붙은
+실제 컨테이너 이름을 직접 사용하지 않는다.
 
 ```bash
-docker exec -w /workspace/loader \
-  umbokdong-dashboard-live-airflow-scheduler-1 \
-  /workspace/loader/.venv/bin/python -m evaluation.run_policy_backtest \
+docker compose -f ops/compose/docker-compose.yml exec -T \
+  -w /workspace/loader airflow-scheduler \
+  env -u VIRTUAL_ENV UV_PROJECT_ENVIRONMENT=/opt/venvs/modules/loader \
+  uv run --frozen python -m evaluation.run_policy_backtest \
   --date 2025-06-17 \
   --center hangnyeoul \
   --start-hour 6 \
@@ -94,7 +100,8 @@ docker exec -w /workspace/loader \
 ```
 
 기본 결과 경로는 `data/backtest-results/`이며 JSON은 전체 감사용, Markdown은 빠른
-검토용이다. 원천과 결과는 Git에 포함하지 않는다.
+검토용이다. 이 경로는 컨테이너의 `/workspace/data/backtest-results/`와 같다. 원천과
+결과는 Git에 포함하지 않는다.
 
 초기 실험은 재고 CSV의 공공 번호와 station master의 내부 suffix를 같은 값으로
 간주해 서로 다른 대여소의 재고·좌표·정원·모델 범주를 결합했다. 예를 들어 공공
@@ -160,9 +167,10 @@ crosswalk로 이 오류를 교정한 뒤 전부 다시 계산한 값이며, 교�
 동일 suite는 다음 명령으로 재현한다.
 
 ```bash
-docker exec -w /workspace/loader \
-  umbokdong-dashboard-live-airflow-scheduler-1 \
-  /workspace/loader/.venv/bin/python -m evaluation.run_policy_suite \
+docker compose -f ops/compose/docker-compose.yml exec -T \
+  -w /workspace/loader airflow-scheduler \
+  env -u VIRTUAL_ENV UV_PROJECT_ENVIRONMENT=/opt/venvs/modules/loader \
+  uv run --frozen python -m evaluation.run_policy_suite \
   --dates 2025-03-17 2025-04-17 2025-05-17 2025-06-17 2025-07-17 \
           2025-08-17 2025-09-17 2025-10-17 2025-11-17 2025-12-17 \
   --center hangnyeoul \

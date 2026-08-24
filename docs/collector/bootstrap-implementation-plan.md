@@ -1,5 +1,7 @@
 # collector 초기 로드(bootstrap) 구현 계획
 
+> **보관 문서:** bootstrap을 task 단위로 구현하던 당시 계획이다. 현재 사용법과 동작은 `collector/bootstrap/__main__.py`, 현재 설정은 `collector/bootstrap/mappings/*.yaml`을 기준으로 한다.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** collector 배포 이전 기간의 `archive/`를 과거 CSV와 과거 조회 API로 한 번 채우는 1회성 부트스트랩을 만든다.
