@@ -14,6 +14,35 @@ interface Props {
   onRegionChange: (region: string) => void;
 }
 
+interface HeaderTimeProps {
+  id: string;
+  label: string;
+  value: string;
+  description: string;
+  error?: boolean;
+}
+
+function HeaderTime({ id, label, value, description, error = false }: HeaderTimeProps) {
+  return (
+    <span className={`header-time${error ? " status-error" : ""}`}>
+      <span>{label} {value}</span>
+      <span className="header-time-help">
+        <button
+          type="button"
+          className="header-time-info"
+          aria-label={`${label} 설명`}
+          aria-describedby={`${id}-tooltip`}
+        >
+          i
+        </button>
+        <span id={`${id}-tooltip`} className="header-time-tooltip" role="tooltip">
+          {description}
+        </span>
+      </span>
+    </span>
+  );
+}
+
 export function Header({ regions, selectedRegion, stationsUpdatedAt, onRegionChange }: Props) {
   const [now, setNow] = useState(new Date());
   const [predictedAt, setPredictedAt] = useState<string | null>(null);
@@ -64,11 +93,25 @@ export function Header({ regions, selectedRegion, stationsUpdatedAt, onRegionCha
         />
       </span>
       <div className="app-header-times">
-        <span>현재 시각 {formatClock(now)}</span>
-        <span>조회 시각 {stationsUpdatedAt ? formatClock(stationsUpdatedAt) : "-"}</span>
-        <span className={statusError ? "status-error" : undefined}>
-          기준 시각 {statusError ? "갱신 실패" : predictedAt ? formatIsoTime(predictedAt, { hour: "2-digit", minute: "2-digit" }) : "-"}
-        </span>
+        <HeaderTime
+          id="current-time"
+          label="현재 시각"
+          value={formatClock(now)}
+          description="이 브라우저 기기의 현재 시각입니다."
+        />
+        <HeaderTime
+          id="station-query-time"
+          label="조회 시각"
+          value={stationsUpdatedAt ? formatClock(stationsUpdatedAt) : "-"}
+          description="현재 화면의 대여소 정보를 API에서 성공적으로 조회한 시각입니다. 조회에 실패하면 -로 표시됩니다."
+        />
+        <HeaderTime
+          id="forecast-base-time"
+          label="기준 시각"
+          value={statusError ? "갱신 실패" : predictedAt ? formatIsoTime(predictedAt, { hour: "2-digit", minute: "2-digit" }) : "-"}
+          description="전체 수요예측이 공통으로 사용하는 데이터 기준 시각입니다. 최근 10분 내의 일관된 예측만 표시됩니다."
+          error={statusError}
+        />
       </div>
     </header>
   );

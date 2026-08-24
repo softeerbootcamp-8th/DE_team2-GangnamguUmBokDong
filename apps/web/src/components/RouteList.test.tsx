@@ -95,8 +95,8 @@ describe("RouteList", () => {
     expect(screen.getByRole("heading", { name: /작업 현황/ })).not.toBeNull();
     expect(screen.getByText("대여소 2곳 · 회수 2대 · 공급 2대")).not.toBeNull();
     expect(screen.getByText("대여소 0곳 · 회수 0대 · 공급 0대")).not.toBeNull();
-    expect(screen.getByText("작업 #1")).not.toBeNull();
-    expect(screen.getAllByText(/작업 #/)).toHaveLength(1);
+    expect(screen.getByText("#1")).not.toBeNull();
+    expect(screen.queryByText(/작업 #/)).toBeNull();
   });
 
   it("작업 상태에 맞는 승인·완료·취소 동작을 호출한다", () => {
