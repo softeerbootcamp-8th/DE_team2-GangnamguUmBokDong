@@ -18,15 +18,31 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 _ROOT = Path(__file__).resolve().parent.parent
-_DAG_ID = "realtime_5min"
+_DAG_ID = "realtime_tick"
+_AIRFLOW_UV_ENV = "UV_PROJECT_ENVIRONMENT=/opt/venvs/airflow"
+_LOADER_UV_ENV = "UV_PROJECT_ENVIRONMENT=/opt/venvs/modules/loader"
 
 
 def _compose_command() -> list[str]:
     """현재 host platform과 .env를 반영한 Compose 명령 prefix를 만든다."""
-    command = ["docker", "compose"]
+    command = [
+        "docker",
+        "compose",
+        "--env-file",
+        "ops/compose/local.defaults.env",
+    ]
     if (_ROOT / ".env").is_file():
         command.extend(("--env-file", ".env"))
-    command.extend(("-f", "ops/compose/docker-compose.yml"))
+    else:
+        command.extend(("--env-file", ".env.example"))
+    command.extend(
+        (
+            "-f",
+            "ops/compose/docker-compose.prod.yml",
+            "-f",
+            "ops/compose/docker-compose.yml",
+        )
+    )
     platform = subprocess.run(
         ["bash", "ops/compose/platform_args.sh"],
         cwd=_ROOT,
@@ -67,7 +83,7 @@ def _dag_is_paused(compose: list[str]) -> bool:
     """Airflow JSON 목록에서 운영 DAG의 현재 pause 상태를 읽는다."""
     output = _compose_exec(
         compose,
-        "cd /workspace/airflow && uv run airflow dags list --output json",
+        f"cd /workspace/airflow && {_AIRFLOW_UV_ENV} uv run airflow dags list --output json",
         capture=True,
     )
     json_lines = [
@@ -96,7 +112,7 @@ def _wait_for_paused_dag(compose: list[str], timeout_seconds: int) -> None:
             continue
         if not is_paused:
             raise RuntimeError(
-                "realtime_5min이 unpaused 상태입니다. 자동 스케줄과 writer 충돌을 "
+                "realtime_tick이 unpaused 상태입니다. 자동 스케줄과 writer 충돌을 "
                 "피하려면 먼저 DAG를 pause하세요."
             )
         return
@@ -199,7 +215,8 @@ def run(timeout_seconds: int, *, model_bundle: Path | None = None) -> int:
         compose,
         (
             "cd /workspace/loader && env -u VIRTUAL_ENV "
-            "LOCAL_E2E_ALLOW_FIXTURE=1 uv run --frozen python local_e2e.py seed "
+            f"{_LOADER_UV_ENV} LOCAL_E2E_ALLOW_FIXTURE=1 "
+            "uv run --frozen python local_e2e.py seed "
             f"--logical-dttm {shlex.quote(window_text)}{bundle_argument}"
         ),
     )
@@ -208,7 +225,8 @@ def run(timeout_seconds: int, *, model_bundle: Path | None = None) -> int:
     _compose_exec(
         compose,
         (
-            "cd /workspace/airflow && uv run python /workspace/ops/airflow_dag_test.py "
+            f"cd /workspace/airflow && {_AIRFLOW_UV_ENV} "
+            "uv run python /workspace/ops/airflow_dag_test.py "
             f"--logical-dttm {shlex.quote(run_logical.isoformat())}"
         ),
         timeout_seconds=timeout_seconds,
@@ -217,15 +235,15 @@ def run(timeout_seconds: int, *, model_bundle: Path | None = None) -> int:
     print(f"[e2e] Airflow UI: {ui_url}", flush=True)
 
     if not _dag_is_paused(compose):
-        raise RuntimeError("smoke 실행 중 realtime_5min pause 상태가 바뀌었습니다.")
+        raise RuntimeError("smoke 실행 중 realtime_tick pause 상태가 바뀌었습니다.")
     _compose_exec(
         compose,
         (
-            "cd /workspace/airflow && uv run airflow tasks "
+            f"cd /workspace/airflow && {_AIRFLOW_UV_ENV} uv run airflow tasks "
             f"states-for-dag-run {_DAG_ID} {shlex.quote(run_id)}"
         ),
     )
-    print("[e2e] SUCCESS: realtime_5min 전체 태스크가 성공했습니다.", flush=True)
+    print("[e2e] SUCCESS: realtime_tick 전체 태스크가 성공했습니다.", flush=True)
     return 0
 
 

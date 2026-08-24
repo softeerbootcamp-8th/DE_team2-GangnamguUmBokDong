@@ -13,7 +13,7 @@ from airflow.sdk import DagRunState
 _ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_ROOT / "airflow"))
 
-from dags.realtime_5min import dag
+from dags.realtime_tick import dag
 
 
 def _logical_dttm(raw: str) -> datetime:
@@ -25,8 +25,8 @@ def _logical_dttm(raw: str) -> datetime:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Airflow metadata에 보존되는 단일 realtime_5min test run을 실행한다."""
-    parser = argparse.ArgumentParser(description="realtime_5min local smoke를 실행한다.")
+    """Airflow metadata에 보존되는 단일 realtime_tick test run을 실행한다."""
+    parser = argparse.ArgumentParser(description="realtime_tick local smoke를 실행한다.")
     parser.add_argument("--logical-dttm", required=True)
     args = parser.parse_args(argv)
     try:
