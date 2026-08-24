@@ -89,29 +89,7 @@
 
 ## 4. 데이터 파이프라인
 
-```text
-서울 열린데이터광장 / 기상청 API 허브
-                  │
-                  ▼
-        Collector · 품질 검증
-                  │
-                  ▼
-       S3 Bronze → Silver → Archive
-                  │
-        ┌─────────┴─────────┐
-        ▼                   ▼
-생활인구 보정·특징 생성   대여·반납 모델 학습
-        │                   │
-        └─────────┬─────────┘
-                  ▼
-          실시간 수요 추론
-                  │
-                  ▼
-  Gold PostGIS → 긴급도·경로 → FastAPI
-                                  │
-                                  ▼
-                         React 운영 대시보드
-```
+![dataflow](./dataflow.png)
 
 | 계층 | 역할 |
 | --- | --- |
@@ -139,10 +117,6 @@
 ![따릉이 재배치 우선순위 시스템 아키텍처](./architecture.png)
 
 Airflow가 수집, 정규화, 생활인구 보정, 추론, Gold 게시와 재배치 경로 생성을 오케스트레이션합니다. 운영 환경에서는 S3와 RDS for PostgreSQL/PostGIS를 데이터 계층으로 사용하며, 특징 생성은 일회성 EMR Classic 클러스터에서, 모델 학습은 학습용 EC2에서 수행합니다. 상시 애플리케이션 EC2는 Airflow, MLflow, FastAPI와 웹 서비스를 실행합니다.
-
-### 데이터 흐름
-
-![dataflow](./dataflow.png)
 
 ### 기술 스택
 
