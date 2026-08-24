@@ -19,26 +19,31 @@ docker compose version
 uv --version
 ```
 
-## 2. 전체 로컬 스택 시작
+## 2. AWS 운영 runtime을 로컬에서 실행
 
-저장소 루트에서 실행한다.
+로컬은 별도 개발 runtime이 아니라 AWS 운영 구성을 재현한다.
+`docker-compose.prod.yml`의 Airflow/API/MLflow/nginx 정의를 그대로 사용하고,
+AWS RDS와 S3만 Postgres와 MinIO로 치환한다. 저장소 루트에서 실행한다.
 
 ```bash
 make bootstrap
 ```
 
-`.env`가 없으면 `.env.example`을 복사한 뒤 Postgres, MinIO, MLflow, Airflow,
-FastAPI와 Web을 빌드·실행한다. 실제 외부 수집에는 생성된 `.env`의
-`SEOUL_OPENAPI_KEY`, `KMA_APIHUB_KEY`가 필요하다.
+`.env`가 없으면 `.env.example`을 복사한 뒤 API key가 없다는 안내와 함께 중단한다.
+`SEOUL_OPENAPI_KEY`와 `KMA_APIHUB_KEY`를 채우고 다시 실행한다. 운영 이미지를 기동한
+뒤 fixture 입력을 준비하고 `realtime_tick` 전체 DAG가 성공해야 bootstrap이 완료된다.
 
 | 서비스 | 기본 주소 |
 |---|---|
-| Web | http://localhost:5173 |
+| Web(운영 nginx) | http://localhost:5173 |
 | FastAPI | http://localhost:8000 |
 | Airflow | http://localhost:8081 |
 | MLflow | http://localhost:5000 |
 | MinIO Console | http://localhost:9001 |
 | PostgreSQL | `localhost:5433` |
+
+Web의 기본 Basic Auth는 `admin / admin`이며 `.env`에서 변경할 수 있다. PostgreSQL
+인스턴스 안에는 앱, Airflow, MLflow database가 분리돼 있다.
 
 포트는 `.env`에서 바꿀 수 있다. Airflow 사용자명은 `AIRFLOW_ADMIN_USER`이며,
 Airflow 3 Simple Auth Manager가 최초 생성한 비밀번호는 웹서버 로그에서 확인한다.
@@ -50,7 +55,8 @@ make down
 make up
 ```
 
-`make bootstrap`은 Gold 기준 seed나 과거 DB migration을 자동 실행하지 않는다.
+`make bootstrap`은 로컬 E2E fixture를 게시하지만 승인된 운영 Gold 기준 seed나 과거
+DB migration을 자동 실행하지 않는다.
 
 ## 3. Gold 초기 데이터와 기존 볼륨
 
@@ -83,6 +89,10 @@ Compose는 기존 볼륨을 자동 변환하거나 삭제하지 않는다. schem
 | Bronze/Silver·모델 | `umbokdong-dashboard-live_minio-data` | 영속 데이터 |
 | Airflow 모듈 환경 | `umbokdong-dashboard-live_airflow-module-venvs` | 재생성 가능 |
 | Web 의존성 | `umbokdong-dashboard-live_web-node-modules` | 재생성 가능 |
+
+PostgreSQL과 MinIO는 저장 형식과 복구 절차가 다르므로 하나의 물리 볼륨에 섞지
+않는다. 전체 파이프라인을 다시 확인하려면 `make e2e-smoke`를 실행한다. 이 명령도
+운영 Compose 원본의 Airflow에서 같은 DAG를 실행한다.
 
 ## 4. Python 프로젝트 설치
 
@@ -150,6 +160,9 @@ Makefile 없이 직접 실행할 때만 두 Compose 파일을 함께 지정한�
 
 ```bash
 docker compose \
+  --env-file ops/compose/local.defaults.env \
+  --env-file .env \
+  -f ops/compose/docker-compose.prod.yml \
   -f ops/compose/docker-compose.yml \
   -f ops/compose/docker-compose.apple-silicon.yml \
   up -d --build

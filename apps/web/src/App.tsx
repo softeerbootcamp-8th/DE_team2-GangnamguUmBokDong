@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import type { LayoutChangedMeta, PanelImperativeHandle } from "react-resizable-panels";
 import { List, Route as RouteIcon } from "lucide-react";
 import { api } from "./api";
 import type { Alert, DispatchCenter, ForecastResponse, Route, StationSummary } from "./api";
@@ -13,12 +14,14 @@ import { StationMap } from "./components/StationMap";
 import { StockPanel } from "./components/StockPanel";
 import { candidateReferenceMs, isFreshCandidate, isRebalanceRoute, routeTransitionMessage } from "./routeOperations";
 import { updateRoutesWithMotion } from "./routeCardMotion";
+import { detailPanelDefaultHeight } from "./panelLayout";
 import { ResizableHandle, ResizablePanel, ResizablePanelGroup } from "@/components/ui/resizable";
 
 const POLL_INTERVAL_MS = 15_000;
 const FORECAST_POLL_INTERVAL_MS = 60_000;
 const ROUTE_POLL_INTERVAL_MS = 30_000;
 const ROUTE_PAGE_SIZE = 500;
+const CLOSED_ROUTE_HISTORY_MINUTES = 60;
 const ALL_REGIONS = "all";
 type ListMode = "routes" | "stations";
 type RouteTransition = "dispatch" | "complete" | "cancel" | "dismiss" | "restore";
@@ -38,6 +41,7 @@ async function fetchAllRoutes(region: string): Promise<Route[]> {
   while (true) {
     const page = await api.routes({
       region: region === ALL_REGIONS ? undefined : region,
+      closedWithinMinutes: CLOSED_ROUTE_HISTORY_MINUTES,
       limit: ROUTE_PAGE_SIZE,
       offset,
     });
@@ -77,6 +81,42 @@ export default function App() {
   const [selectedRegion, setSelectedRegion] = useState<string>("이수");
   const [regionCenters, setRegionCenters] = useState<DispatchCenter[]>([]);
   const [focusedEvent, setFocusedEvent] = useState<FocusedEvent | null>(null);
+  const workspaceGroupElementRef = useRef<HTMLDivElement | null>(null);
+  const detailPanelRef = useRef<PanelImperativeHandle | null>(null);
+  const didAdjustDetailPanelRef = useRef(false);
+
+  const applyDetailPanelDefault = useCallback(() => {
+    if (didAdjustDetailPanelRef.current) return;
+    const group = workspaceGroupElementRef.current;
+    const panel = detailPanelRef.current;
+    if (!group || !panel) return;
+
+    const height = detailPanelDefaultHeight(group.getBoundingClientRect().height);
+    if (height > 0) panel.resize(`${height}px`);
+  }, []);
+
+  useLayoutEffect(() => {
+    applyDetailPanelDefault();
+    const group = workspaceGroupElementRef.current;
+    if (!group) return;
+
+    const observer = typeof ResizeObserver === "undefined"
+      ? null
+      : new ResizeObserver(applyDetailPanelDefault);
+    observer?.observe(group);
+    window.addEventListener("resize", applyDetailPanelDefault);
+    return () => {
+      observer?.disconnect();
+      window.removeEventListener("resize", applyDetailPanelDefault);
+    };
+  }, [applyDetailPanelDefault]);
+
+  const preserveUserDetailLayout = useCallback(
+    (_layout: Record<string, number>, meta: LayoutChangedMeta) => {
+      if (meta.isUserInteraction) didAdjustDetailPanelRef.current = true;
+    },
+    [],
+  );
 
   const selectStation = useCallback((stationId: string) => {
     setStationFocusRequest((current) => current + 1);
@@ -343,10 +383,15 @@ export default function App() {
         onRegionChange={changeRegion}
       />
       <div className="flex-1 overflow-hidden">
-        <ResizablePanelGroup orientation="vertical" className="rounded-lg border bg-background">
-          <ResizablePanel defaultSize={64} minSize={36}>
+        <ResizablePanelGroup
+          orientation="vertical"
+          className="rounded-lg border bg-background"
+          elementRef={workspaceGroupElementRef}
+          onLayoutChanged={preserveUserDetailLayout}
+        >
+          <ResizablePanel id="workspace-row" defaultSize="50%">
             <ResizablePanelGroup orientation="horizontal">
-              <ResizablePanel id="map-col" defaultSize={50} minSize={35}>
+              <ResizablePanel id="map-col" defaultSize="50%">
                 <div className="flex h-full flex-col bg-background px-4 py-2">
                   <section className="flex h-full min-h-0 min-w-0 flex-col gap-2">
                     <div className="map-panel-toolbar">
@@ -377,7 +422,7 @@ export default function App() {
 
               <ResizableHandle withHandle />
 
-              <ResizablePanel id="list-col" defaultSize={50} minSize={35}>
+              <ResizablePanel id="list-col" defaultSize="50%">
                 <div className="flex h-full min-h-0 min-w-0 flex-col bg-card px-4 py-2">
                   <section className="flex h-full min-h-0 min-w-0 flex-col gap-2">
                     <div className="work-list-header">
@@ -429,7 +474,7 @@ export default function App() {
 
           <ResizableHandle withHandle />
 
-          <ResizablePanel defaultSize={36} minSize={24}>
+          <ResizablePanel id="detail-row" defaultSize="50%" panelRef={detailPanelRef}>
             <div className="flex h-full min-h-0 flex-col bg-card">
               <RouteStopRail
                 route={selectedRoute}

@@ -35,6 +35,10 @@ describe("Header status polling", () => {
     );
 
     expect(screen.getByText(/^조회 시각 /)).not.toBeNull();
+    expect(screen.getByRole("button", { name: "현재 시각 설명" })).not.toBeNull();
+    expect(screen.getByRole("button", { name: "조회 시각 설명" })).not.toBeNull();
+    expect(screen.getByRole("button", { name: "기준 시각 설명" })).not.toBeNull();
+    expect(screen.getByRole("tooltip", { name: /대여소 정보를 API에서 성공적으로 조회/ })).not.toBeNull();
   });
 
   it("status 실패 뒤 이전 성공 시각을 지운다", async () => {

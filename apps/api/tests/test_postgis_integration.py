@@ -416,6 +416,7 @@ def test_serving_queries_use_real_postgis_and_fresh_projection(
     routes = queries.fetch_routes(status="proposed", limit=1)
     assert len(routes) == 1
     assert routes[0]["route_id"] == str(ROUTE_ID)
+    assert routes[0]["work_no"] is None
     assert routes[0]["stops"][0]["visit_order"] == 1
     assert routes[0]["stops"][0]["lat"] == pytest.approx(37.5)
     assert queries.fetch_route(ROUTE_ID) == routes[0]
@@ -554,6 +555,7 @@ def test_route_lifecycle_and_constraint_error_mapping(database_url: str) -> None
     dispatched = queries.dispatch_route(ROUTE_ID, now)
     assert isinstance(dispatched, dict)
     assert dispatched["status"] == "dispatched"
+    assert dispatched["work_no"] == 1
     assert dispatched["stops"][0]["visit_order"] == 1
 
     completed = queries.complete_route(ROUTE_ID, now + timedelta(seconds=1))
@@ -650,7 +652,7 @@ def test_dismiss_columns_reject_active_routes_and_transition_writes(database_url
 
 
 def test_dismissed_routes_leave_the_list_but_stay_fetchable(database_url: str) -> None:
-    """삭제한 route는 목록에서 빠지지만 단건 조회로는 계속 읽힌다."""
+    """삭제한 route도 이후 작업 번호에는 남고 단건 조회가 가능하다."""
     now = datetime.now(UTC)
     _seed_serving_fixture(database_url, now)
 
@@ -662,10 +664,17 @@ def test_dismissed_routes_leave_the_list_but_stay_fetchable(database_url: str) -
             {"now": now + timedelta(seconds=2), "route_id": ROUTE_ID},
         )
 
-    # fixture는 ROUTE_ID와 CONFLICT_ROUTE_ID 둘을 시드한다. 삭제한 쪽만 빠져야 한다.
-    assert {route["route_id"] for route in queries.fetch_routes()} == {str(CONFLICT_ROUTE_ID)}
+    second = queries.dispatch_route(CONFLICT_ROUTE_ID, now + timedelta(seconds=3))
+    assert isinstance(second, dict)
+    assert second["work_no"] == 2
+
+    # 목록에서 삭제된 첫 작업도 같은 날·센터의 다음 작업 순번에는 포함한다.
+    visible_routes = queries.fetch_routes()
+    assert {route["route_id"] for route in visible_routes} == {str(CONFLICT_ROUTE_ID)}
+    assert visible_routes[0]["work_no"] == 2
     fetched = queries.fetch_route(ROUTE_ID)
     assert fetched is not None
+    assert fetched["work_no"] == 1
     assert fetched["dismissed_at"] == now + timedelta(seconds=2)
     assert fetched["restored_from_route_id"] is None
 

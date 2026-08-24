@@ -5,9 +5,10 @@ CI_UNIT_PROJECTS := collector apps/api ml/inference libs/core libs/ml_core norma
 CI_INTEGRATION_PROJECTS := loader
 
 PLATFORM_COMPOSE := $(shell bash ops/compose/platform_args.sh)
-COMPOSE = docker compose $(if $(wildcard .env),--env-file .env,) -f ops/compose/docker-compose.yml $(PLATFORM_COMPOSE)
+LOCAL_ENV_FILE := $(if $(wildcard .env),.env,.env.example)
+COMPOSE = docker compose --env-file ops/compose/local.defaults.env --env-file $(LOCAL_ENV_FILE) -f ops/compose/docker-compose.prod.yml -f ops/compose/docker-compose.yml $(PLATFORM_COMPOSE)
 
-.PHONY: sync-all sync-ci-unit lint test-gold-bootstrap test-gold-transition-available test test-ci test-ci-unit test-ci-integration bootstrap up down logs ps migrate-route-cancellation migrate-route-dismiss-restore migrate-route-restore-uniqueness migrate-route-restore-in-place seed bootstrap-gold-seeds seed-e2e e2e-preflight e2e-smoke
+.PHONY: sync-all sync-ci-unit lint test-gold-bootstrap test-gold-transition-available test test-ci test-ci-unit test-ci-integration bootstrap local-nginx-auth up down logs ps migrate-route-cancellation migrate-route-dismiss-restore migrate-route-restore-uniqueness migrate-route-restore-in-place seed bootstrap-gold-seeds seed-e2e e2e-preflight e2e-smoke
 
 E2E_LOGICAL_DTTM ?= $(shell TZ=Asia/Seoul date '+%Y-%m-%dT%H:%M:00+09:00' | awk -F: '{ printf "%s:%02d:00+09:00\n", $$1, int($$2 / 5) * 5 }')
 E2E_STATION_SOURCE_DTTM ?= $(shell python3 ops/e2e_time.py station-source '$(E2E_LOGICAL_DTTM)')
@@ -83,7 +84,18 @@ test-ci-integration:
 bootstrap:
 	./ops/bootstrap/bootstrap.sh
 
-up:
+local-nginx-auth:
+	@set -a; . ./$(LOCAL_ENV_FILE); set +a; \
+	user="$${NGINX_BASIC_AUTH_USER:-admin}"; \
+	password="$${NGINX_BASIC_AUTH_PASSWORD:-admin}"; \
+	if command -v htpasswd >/dev/null 2>&1; then \
+		htpasswd -Bbn "$$user" "$$password" > ops/nginx/.htpasswd; \
+	else \
+		printf '%s:%s\n' "$$user" "$$(openssl passwd -apr1 "$$password")" > ops/nginx/.htpasswd; \
+	fi; \
+	chmod 0644 ops/nginx/.htpasswd
+
+up: local-nginx-auth
 	@$(COMPOSE) up -d --build postgres postgres-schema-check || { \
 		$(COMPOSE) logs --no-color postgres postgres-schema-check; \
 		exit 1; \
@@ -334,7 +346,7 @@ tunnel-airflow:
 	ssh -i $(SSH_KEY) -N -L 8080:localhost:8080 ec2-user@$$($(TF) output -raw app_public_ip)
 
 tunnel-mlflow:
-	@echo "http://localhost:5000 에서 MLflow UI (종료: Ctrl+C)"; \
+	@echo "http://localhost:5000/mlflow 에서 MLflow UI (종료: Ctrl+C)"; \
 	ssh -i $(SSH_KEY) -N -L 5000:localhost:5000 ec2-user@$$($(TF) output -raw app_public_ip)
 
 # config/prod.env(terraform 산출물)에는 API 키를 안 넣는다 — 이 타겟이 그 나머지를

@@ -1,13 +1,13 @@
-# 운영(AWS EC2) 전용 Compose 구성.
+# AWS 운영 runtime의 단일 Compose 원본.
 #
-# docker-compose.yml의 override가 아니라 **독립 파일**이다. Compose의 병합 규칙상
-# `depends_on`은 union으로 합쳐져 제거할 수 없어서, override 방식으로는 postgres·minio가
-# 딸려 올라온다. 독립 파일로 두면 로컬 개발 파일을 한 줄도 건드리지 않는다.
+# AWS에서는 이 파일을 단독 실행한다. 로컬에서는 이 파일을 먼저 읽고
+# docker-compose.yml adapter를 뒤에 합쳐 RDS→Postgres, S3→MinIO만 치환한다.
+# Airflow/API/MLflow/web build·command는 양쪽 모두 이 파일의 정의를 그대로 쓴다.
 #
 # 로컬과 달라지는 점:
 #   - postgres/postgres-schema-check  → RDS (외부)
 #   - minio/minio-init                → 실제 S3 (instance profile 인증)
-#   - web(Vite dev server)            → Dockerfile.web(정적 번들 + nginx)
+#   - host port와 local credential adapter를 사용하지 않음
 #
 # 실행:
 #   docker compose --env-file /opt/app/.env -f ops/compose/docker-compose.prod.yml up -d --build
@@ -153,6 +153,16 @@ services:
       dockerfile: ops/compose/Dockerfile.mlflow
     # MLFLOW_S3_ENDPOINT_URL과 AWS 자격증명을 주지 않는다 — instance profile을 쓴다.
     # 학습 EC2가 사설 IP로 이 서버에 붙으므로 0.0.0.0에 바인드하고 SG로 통제한다.
+    #
+    # --static-prefix: UI를 web(nginx)의 /mlflow/ 아래에 붙이기 위해 필요하다. 이게
+    #   없으면 MLflow가 /static-files/... 같은 절대 경로를 뱉고, 그 요청은 nginx에서
+    #   대시보드 SPA로 흘러가 흰 화면이 된다. 학습 EC2가 쓰는 API 경로도 같은 접두를
+    #   갖게 되므로 MLFLOW_TRACKING_URI는 컨테이너 이름 그대로 http://mlflow:5000/mlflow 다.
+    # --cors-allowed-origins: MLflow 3.15는 Host와 별개로 CORS Origin도 검사하며
+    #   기본값이 localhost 계열뿐이다. nginx가 Host는 바꿔 보내지만 Origin은 브라우저가
+    #   실제 주소로 붙이므로, 공개 주소로 UI를 쓸 때 ajax 호출이 막히면 .env에
+    #   MLFLOW_CORS_ALLOWED_ORIGINS=http://<주소> 를 넣어 연다. 값이 없으면 옵션 자체를
+    #   붙이지 않아 기본 동작(로컬만 허용)을 유지한다.
     command:
       - sh
       - -lc
@@ -161,6 +171,8 @@ services:
         --backend-store-uri "$${MLFLOW_BACKEND_STORE_URI}"
         --artifacts-destination "s3://$${S3_BUCKET}/mlflow-artifacts"
         --serve-artifacts
+        --static-prefix /mlflow
+        $${MLFLOW_CORS_ALLOWED_ORIGINS:+--cors-allowed-origins "$${MLFLOW_CORS_ALLOWED_ORIGINS}"}
     env_file:
       - ${PROD_ENV_FILE:-/opt/app/.env}
     environment:
