@@ -94,7 +94,7 @@ export function RouteList({
   onDismiss,
   onRestore,
 }: Props) {
-  const { candidates, operations, hiddenCandidateCount, hiddenOperationCount } = useMemo(
+  const { candidates, operations, hiddenCandidateCount } = useMemo(
     () => groupWorkRoutes(routes, { keepRouteId: selectedRouteId }),
     [routes, selectedRouteId],
   );
@@ -133,6 +133,9 @@ export function RouteList({
               <span className="route-card-title">
                 <RouteIcon size={15} aria-hidden="true" />
                 {route.region} {routeKind(route)}
+                {route.work_no !== null && (
+                  <span className="route-work-number">#{route.work_no}</span>
+                )}
               </span>
               <span className="route-card-summary">{routeSummary(route)}</span>
               {(estimate || stateTime) && (
@@ -268,12 +271,7 @@ export function RouteList({
           {operations.length === 0 ? (
             <p className="empty-state">진행되었거나 종료된 작업이 없습니다.</p>
           ) : (
-            <>
-              <ul className="route-column-list">{operations.map(renderRouteCard)}</ul>
-              {hiddenOperationCount > 0 && (
-                <p className="column-note">이전 종료 작업 {hiddenOperationCount}건은 표시하지 않습니다.</p>
-              )}
-            </>
+            <ul className="route-column-list">{operations.map(renderRouteCard)}</ul>
           )}
         </section>
       </div>

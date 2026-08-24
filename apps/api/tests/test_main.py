@@ -83,6 +83,7 @@ def _route(status: str = "proposed") -> dict:
     """route API 정상 응답 fixture를 만든다."""
     return {
         "route_id": str(ROUTE_ID),
+        "work_no": 1 if status in {"dispatched", "completed", "cancelled"} else None,
         "region": "테스트 센터",
         "status": status,
         "proposed_at": BASE,
@@ -289,7 +290,7 @@ def test_route_query_parameters_and_uuid_are_validated_before_db(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """route status·pagination·UUID 오류는 DB cast 전에 422로 거부한다."""
-    monkeypatch.setattr(queries, "fetch_routes", lambda *_args: [])
+    monkeypatch.setattr(queries, "fetch_routes", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(queries, "fetch_route", lambda _route_id: None)
 
     assert client.get("/routes?status=invalid").status_code == 422
@@ -297,7 +298,41 @@ def test_route_query_parameters_and_uuid_are_validated_before_db(
     assert client.get("/routes?limit=0").status_code == 422
     assert client.get("/routes?limit=501").status_code == 422
     assert client.get("/routes?offset=-1").status_code == 422
+    assert client.get("/routes?closed_within_minutes=0").status_code == 422
+    assert client.get("/routes?closed_within_minutes=10081").status_code == 422
     assert client.get("/routes/not-a-uuid").status_code == 422
+
+
+def test_route_query_converts_closed_window_with_server_time(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """종료 작업 시간창은 서버 현재시각 기준의 절대 cutoff로 query에 전달한다."""
+    captured: dict[str, object] = {}
+
+    def fake_fetch_routes(
+        region: str | None,
+        status: str | None,
+        limit: int,
+        offset: int,
+        closed_since: datetime | None,
+    ) -> list[dict]:
+        """API가 query 계층에 넘기는 값을 기록한다."""
+        captured.update(
+            region=region,
+            status=status,
+            limit=limit,
+            offset=offset,
+            closed_since=closed_since,
+        )
+        return []
+
+    monkeypatch.setattr(queries, "fetch_routes", fake_fetch_routes)
+
+    response = client.get("/routes?closed_within_minutes=60")
+
+    assert response.status_code == 200
+    assert captured["closed_since"] == NOW - timedelta(minutes=60)
 
 
 @pytest.mark.parametrize(
@@ -424,6 +459,7 @@ def test_route_response_exposes_dismiss_and_restore_fields(
     response = client.get(f"/routes/{ROUTE_ID}")
 
     assert response.status_code == 200
+    assert response.json()["work_no"] == 1
     assert response.json()["dismissed_at"] == "2026-08-20T01:05:00Z"
     assert response.json()["restored_from_route_id"] == "44444444-4444-4444-8444-444444444444"
 

@@ -6,7 +6,6 @@ const URBAN_TRUCK_SPEED_KMH = 18;
 const STOP_SERVICE_MINUTES = 4;
 const BIKE_HANDLING_MINUTES = 0.5;
 const CANDIDATE_WINDOW_MS = 10 * 60 * 1000;
-const OPERATION_HISTORY_LIMIT = 30;
 
 // dispatched(진행 중) → proposed → completed → cancelled 순.
 // 운영자가 지금 처리해야 하는 작업이 항상 목록 위에 있어야 한다.
@@ -124,8 +123,6 @@ export interface WorkRouteGroups {
   operations: Route[];
   /** 후보 창을 벗어나 "작업 후보"에서 제외한 미승인 제안 수. */
   hiddenCandidateCount: number;
-  /** 상한을 넘겨 "작업 현황"에서 잘라낸 종료 작업 수. */
-  hiddenOperationCount: number;
 }
 
 /**
@@ -133,8 +130,8 @@ export interface WorkRouteGroups {
  *
  * - 후보는 최신 제안 기준 10분 이내의 미승인 제안. keepRouteId로 지정한 경로는
  *   운영자가 지금 보고 있는 항목이므로 창을 벗어나도 유지한다.
- * - 현황은 상태 우선순위로 정렬하고, 종료 작업은 최근 것부터 상한까지만 남긴다.
- *   /routes가 전체 이력을 내려주므로 상한이 없으면 목록이 하루 종일 길어진다.
+ * - 현황은 상태 우선순위로 정렬한다. 종료 이력 시간창은 서버 조회가 담당하므로
+ *   프론트가 임의 개수로 다시 잘라내지 않는다.
  */
 export function groupWorkRoutes(
   routes: Route[],
@@ -149,21 +146,11 @@ export function groupWorkRoutes(
   const candidates = routes.filter(isCandidate).sort(byProposedAtDesc);
   const proposedCount = routes.filter((route) => route.status === "proposed").length;
   const hiddenCandidateCount = proposedCount - candidates.length;
-  const active = routes
+  const operations = routes
     .filter((route) => route.status !== "proposed")
     .sort((left, right) =>
       STATUS_ORDER[left.status] - STATUS_ORDER[right.status] || byProposedAtDesc(left, right));
-
-  const closedFrom = active.findIndex((route) => STATUS_ORDER[route.status] > STATUS_ORDER.proposed);
-  if (closedFrom === -1 || active.length - closedFrom <= OPERATION_HISTORY_LIMIT) {
-    return { candidates, operations: active, hiddenCandidateCount, hiddenOperationCount: 0 };
-  }
-  return {
-    candidates,
-    operations: active.slice(0, closedFrom + OPERATION_HISTORY_LIMIT),
-    hiddenCandidateCount,
-    hiddenOperationCount: active.length - closedFrom - OPERATION_HISTORY_LIMIT,
-  };
+  return { candidates, operations, hiddenCandidateCount };
 }
 
 export function routeKind(route: Route): "재배치" | "센터 회수" | "센터 공급" {

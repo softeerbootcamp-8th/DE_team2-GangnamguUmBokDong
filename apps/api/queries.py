@@ -524,8 +524,20 @@ def fetch_alerts(now: datetime) -> list[dict[str, Any]]:
 def _route_aggregate_query(where_clause: str, page_clause: str = "") -> str:
     """route header와 stop을 한 statement에서 읽는 SQL을 만든다."""
     return f"""
-        WITH route_page AS MATERIALIZED (
+        WITH approved_route_number AS MATERIALIZED (
+            SELECT stored_route.route_id,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY
+                           stored_route.dispatch_center_id,
+                           (stored_route.dispatched_dttm AT TIME ZONE 'Asia/Seoul')::date
+                       ORDER BY stored_route.dispatched_dttm, stored_route.route_id
+                   ) AS work_no
+              FROM rebalance_route AS stored_route
+             WHERE stored_route.dispatched_dttm IS NOT NULL
+        ),
+        route_page AS MATERIALIZED (
             SELECT route.route_id,
+                   number.work_no,
                    center.dispatch_center_nm AS region,
                    route.route_status_cd AS status,
                    route.proposed_dttm AS proposed_at,
@@ -536,11 +548,13 @@ def _route_aggregate_query(where_clause: str, page_clause: str = "") -> str:
                    route.restored_from_route_id::text AS restored_from_route_id
               FROM rebalance_route AS route
               JOIN dispatch_center AS center USING (dispatch_center_id)
+              LEFT JOIN approved_route_number AS number USING (route_id)
              {where_clause}
              ORDER BY route.proposed_dttm DESC, route.route_id ASC
              {page_clause}
         )
         SELECT page.route_id::text AS route_id,
+               page.work_no,
                page.region,
                page.status,
                page.proposed_at,
@@ -577,8 +591,9 @@ def fetch_routes(
     status: str | None = None,
     limit: int = 100,
     offset: int = 0,
+    closed_since: datetime | None = None,
 ) -> list[dict[str, Any]]:
-    """bounded filter와 결정적 순서로 route aggregate 목록을 반환한다."""
+    """상태·종료 시간창과 bounded pagination으로 route 목록을 반환한다."""
     # 삭제한 작업과 과거 복제 방식으로 이미 후속 route가 생긴 원본은 목록에서
     # 제외한다. 단건 조회(fetch_route)는 감사 이력을 읽을 수 있도록 유지한다.
     conditions: list[str] = [
@@ -598,6 +613,23 @@ def fetch_routes(
     if status is not None:
         conditions.append("route.route_status_cd = %(status)s")
         params["status"] = status
+    if closed_since is not None:
+        conditions.append(
+            """
+            (
+                route.route_status_cd IN ('proposed', 'dispatched')
+                OR (
+                    route.route_status_cd = 'completed'
+                    AND route.completed_dttm >= %(closed_since)s
+                )
+                OR (
+                    route.route_status_cd = 'cancelled'
+                    AND route.cancelled_dttm >= %(closed_since)s
+                )
+            )
+            """
+        )
+        params["closed_since"] = closed_since
     where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
     query = _route_aggregate_query(
         where_clause,

@@ -488,12 +488,20 @@ def test_fetch_routes_builds_bounded_single_statement_aggregate(
 
     assert result == []
     normalized = " ".join(captured["query"].split())
+    assert "WITH approved_route_number AS MATERIALIZED" in normalized
+    assert "FROM rebalance_route AS stored_route" in normalized
+    assert "stored_route.dispatched_dttm IS NOT NULL" in normalized
+    assert "stored_route.dispatch_center_id" in normalized
+    assert "AT TIME ZONE 'Asia/Seoul'" in normalized
+    assert "ROW_NUMBER() OVER" in normalized
     assert "FROM rebalance_route AS route" in normalized
     assert "FROM rebalance_route_stop AS stop" in normalized
     assert "LEFT JOIN LATERAL" in normalized
     assert "jsonb_agg" in normalized
     assert "route.route_id::text AS route_id" not in normalized
     assert "page.route_id::text AS route_id" in normalized
+    assert "page.work_no" in normalized
+    assert "LEFT JOIN approved_route_number AS number USING (route_id)" in normalized
     assert "ORDER BY route.proposed_dttm DESC, route.route_id ASC" in normalized
     assert "ORDER BY stop.visit_no" in normalized
     assert "restored_route.restored_from_route_id = route.route_id" in normalized
@@ -504,6 +512,32 @@ def test_fetch_routes_builds_bounded_single_statement_aggregate(
         "region": "강남",
         "status": "proposed",
     }
+
+
+def test_fetch_routes_limits_only_closed_routes_by_terminal_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """종료 시간창은 후보·진행 작업을 보존하고 완료·취소 시각만 제한한다."""
+    captured: dict[str, Any] = {}
+    closed_since = NOW - timedelta(hours=1)
+
+    def fake_fetch_all(query: str, params: dict) -> list[dict]:
+        """실행할 route SQL과 parameter를 기록한다."""
+        captured.update(query=query, params=params)
+        return []
+
+    monkeypatch.setattr(queries, "fetch_all", fake_fetch_all)
+
+    assert queries.fetch_routes(closed_since=closed_since) == []
+
+    normalized = " ".join(captured["query"].split())
+    assert normalized.index("approved_route_number AS MATERIALIZED") < normalized.index(
+        "route.dismissed_dttm IS NULL"
+    )
+    assert "route.route_status_cd IN ('proposed', 'dispatched')" in normalized
+    assert "route.completed_dttm >= %(closed_since)s" in normalized
+    assert "route.cancelled_dttm >= %(closed_since)s" in normalized
+    assert captured["params"]["closed_since"] == closed_since
 
 
 def test_fetch_route_casts_uuid_to_text_in_one_statement(

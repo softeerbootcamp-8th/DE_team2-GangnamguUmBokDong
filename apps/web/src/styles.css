@@ -133,7 +133,7 @@ body {
 
 .app-header {
   display: flex;
-  align-items: flex-end;
+  align-items: center;
   justify-content: space-between;
   flex: none;
 }
@@ -158,11 +158,78 @@ body {
 
 .app-header-times {
   display: flex;
+  align-items: center;
   gap: 16px;
   font-size: 12px;
   color: var(--text-secondary);
   font-variant-numeric: tabular-nums;
   margin-right: 8px;
+}
+
+.header-time {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  line-height: 16px;
+  white-space: nowrap;
+}
+
+.header-time-help {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+}
+
+.header-time-info {
+  display: inline-flex;
+  width: 14px;
+  height: 14px;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 1px solid color-mix(in srgb, var(--text-muted) 45%, transparent);
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--text-muted) 8%, transparent);
+  color: var(--text-muted);
+  cursor: help;
+  font: 700 10px/1 var(--dashboard-font);
+}
+
+.header-time-info:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--text-muted) 45%, transparent);
+  outline-offset: 2px;
+}
+
+.header-time-tooltip {
+  position: absolute;
+  z-index: 1000;
+  top: calc(100% + 7px);
+  right: 0;
+  width: max-content;
+  max-width: 250px;
+  padding: 7px 9px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--surface-1) 94%, var(--text-muted));
+  box-shadow: 0 4px 14px rgb(0 0 0 / 12%);
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-variant-numeric: normal;
+  font-weight: 500;
+  line-height: 1.4;
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(-2px);
+  transition: opacity 120ms ease, transform 120ms ease, visibility 120ms ease;
+  visibility: hidden;
+  white-space: normal;
+}
+
+.header-time-help:hover .header-time-tooltip,
+.header-time-help:focus-within .header-time-tooltip {
+  opacity: 1;
+  transform: translateY(0);
+  visibility: visible;
 }
 
 .status-error {
@@ -678,6 +745,18 @@ body {
   font-size: 13px;
   font-weight: 650;
   line-height: 18px;
+}
+
+.route-work-number {
+  padding: 0 6px;
+  border: 1px solid color-mix(in srgb, var(--text-muted) 18%, transparent);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--text-muted) 9%, transparent);
+  color: var(--text-muted);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 650;
+  white-space: nowrap;
 }
 
 .route-card-summary,
@@ -1399,12 +1478,4 @@ body {
   .route-action-spinner {
     animation: none;
   }
-}
-
-.station-stock-basis {
-  margin: 8px 0 0;
-  text-align: center;
-  color: var(--text-secondary);
-  font-size: 11px;
-  font-variant-numeric: tabular-nums;
 }
