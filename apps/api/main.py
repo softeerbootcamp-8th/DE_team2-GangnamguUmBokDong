@@ -15,6 +15,7 @@ from schemas import (
     EventsResponse,
     ForecastResponse,
     Route,
+    ServingHealthResponse,
     StationDetail,
     StationSummary,
     StatusResponse,
@@ -70,27 +71,40 @@ def _shared_rate(row: dict) -> float:
 
 
 @app.get("/stations", response_model=list[StationSummary])
-def list_stations() -> list[dict]:
-    """active station과 같은 anchor의 신선한 현재 재고를 반환한다."""
+def list_stations(
+    allow_stale: bool = Query(default=False),
+) -> list[dict]:
+    """active station과 같은 anchor의 최신 재고를 freshness 옵션에 맞춰 반환한다."""
     now = queries.now_utc()
     return [
-        {**row, "shared_rate": _shared_rate(row)} for row in queries.fetch_stations(now)
+        {**row, "shared_rate": _shared_rate(row)}
+        for row in queries.fetch_stations(now, allow_stale=allow_stale)
     ]
 
 
 @app.get("/stations/{sta_id}", response_model=StationDetail)
-def get_station(sta_id: str) -> dict:
-    """신선한 현재 재고가 있는 active station 상세를 반환한다."""
-    row = queries.fetch_station(sta_id, queries.now_utc())
+def get_station(
+    sta_id: str,
+    allow_stale: bool = Query(default=False),
+) -> dict:
+    """현재 재고가 있는 active station 상세를 freshness 옵션에 맞춰 반환한다."""
+    row = queries.fetch_station(sta_id, queries.now_utc(), allow_stale=allow_stale)
     if row is None:
         raise HTTPException(status_code=404, detail=f"station {sta_id} not found")
     return {**row, "shared_rate": _shared_rate(row)}
 
 
 @app.get("/stations/{sta_id}/forecast", response_model=ForecastResponse)
-def get_forecast(sta_id: str) -> dict:
-    """같은 anchor의 재고로 미래 12시간 수요와 예측 재고를 반환한다."""
-    result = queries.fetch_forecast(sta_id, queries.now_utc())
+def get_forecast(
+    sta_id: str,
+    allow_stale: bool = Query(default=False),
+) -> dict:
+    """같은 anchor의 재고로 수요와 예측 재고를 freshness 옵션에 맞춰 반환한다."""
+    result = queries.fetch_forecast(
+        sta_id,
+        queries.now_utc(),
+        allow_stale=allow_stale,
+    )
     if result.state is queries.ForecastState.STATION_NOT_FOUND:
         raise HTTPException(status_code=404, detail=f"station {sta_id} not found")
     if result.state is queries.ForecastState.FORECAST_NOT_AVAILABLE:
@@ -115,9 +129,16 @@ def get_forecast(sta_id: str) -> dict:
 
 
 @app.get("/stations/{sta_id}/events", response_model=EventsResponse)
-def get_station_events(sta_id: str) -> dict:
-    """active station Point 주변의 신선한 현재·예정 행사를 반환한다."""
-    events = queries.fetch_nearby_events(sta_id, queries.now_utc())
+def get_station_events(
+    sta_id: str,
+    allow_stale: bool = Query(default=False),
+) -> dict:
+    """active station Point 주변 행사를 freshness 옵션에 맞춰 반환한다."""
+    events = queries.fetch_nearby_events(
+        sta_id,
+        queries.now_utc(),
+        allow_stale=allow_stale,
+    )
     if events is None:
         raise HTTPException(status_code=404, detail=f"station {sta_id} not found")
     return {"radius_km": queries.NEARBY_EVENT_RADIUS_KM, "events": events}
@@ -127,9 +148,15 @@ def get_station_events(sta_id: str) -> dict:
 def get_station_weather(
     sta_id: str,
     hours: int = Query(default=12, ge=12, le=12),
+    allow_stale: bool = Query(default=False),
 ) -> dict:
-    """active station 격자의 fresh한 미래 12개 정시 날씨를 반환한다."""
-    result = queries.fetch_weather(sta_id, queries.now_utc(), hours)
+    """active station 격자의 날씨를 freshness 옵션에 맞춰 반환한다."""
+    result = queries.fetch_weather(
+        sta_id,
+        queries.now_utc(),
+        hours,
+        allow_stale=allow_stale,
+    )
     if result.state is queries.WeatherState.STATION_NOT_FOUND:
         raise HTTPException(status_code=404, detail=f"station {sta_id} not found")
     if result.state is queries.WeatherState.WEATHER_NOT_READY:
@@ -152,10 +179,18 @@ def get_status() -> dict:
     return {"base_dttm": base_dttm}
 
 
+@app.get("/serving-health", response_model=ServingHealthResponse)
+def get_serving_health() -> dict:
+    """대시보드 전체 데이터의 게시·신선도·정합 상태를 반환한다."""
+    return queries.fetch_serving_health(queries.now_utc())
+
+
 @app.get("/alerts", response_model=list[Alert])
-def list_alerts() -> list[dict]:
+def list_alerts(
+    include_expired: bool = Query(default=False),
+) -> list[dict]:
     """같은 anchor와 correction 순서를 만족하는 긴급도 목록을 반환한다."""
-    return queries.fetch_alerts(queries.now_utc())
+    return queries.fetch_alerts(queries.now_utc(), include_expired=include_expired)
 
 
 @app.get("/routes", response_model=list[Route])

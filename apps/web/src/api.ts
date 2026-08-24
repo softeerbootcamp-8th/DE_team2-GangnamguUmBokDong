@@ -56,6 +56,24 @@ export interface StatusResponse {
   base_dttm: string;
 }
 
+export type ServingHealthState = "ready" | "stale" | "expired" | "missing" | "misaligned";
+export type ServingOverallState = "healthy" | "degraded" | "unavailable";
+
+export interface ServingHealthComponent {
+  state: ServingHealthState;
+  data_dttm: string | null;
+  age_minutes: number | null;
+  reason: string;
+}
+
+export interface ServingHealthResponse {
+  overall: ServingOverallState;
+  operational_base_dttm: string | null;
+  checked_at: string;
+  can_dispatch_new_routes: boolean;
+  components: Record<string, ServingHealthComponent>;
+}
+
 export interface DispatchCenter {
   region: string;
   lat: number;
@@ -191,13 +209,14 @@ function routeQueryString(query: RouteQuery): string {
 }
 
 export const api = {
-  stations: () => getJson<StationSummary[]>("/stations"),
-  station: (id: string) => getJson<StationDetail>(`/stations/${id}`),
-  forecast: (id: string) => getJson<ForecastResponse>(`/stations/${id}/forecast`),
-  events: (id: string) => getJson<EventsResponse>(`/stations/${id}/events`),
-  weather: (id: string) => getJson<WeatherResponse>(`/stations/${id}/weather?hours=12`),
-  alerts: () => getJson<Alert[]>("/alerts"),
+  stations: () => getJson<StationSummary[]>("/stations?allow_stale=true"),
+  station: (id: string) => getJson<StationDetail>(`/stations/${id}?allow_stale=true`),
+  forecast: (id: string) => getJson<ForecastResponse>(`/stations/${id}/forecast?allow_stale=true`),
+  events: (id: string) => getJson<EventsResponse>(`/stations/${id}/events?allow_stale=true`),
+  weather: (id: string) => getJson<WeatherResponse>(`/stations/${id}/weather?hours=12&allow_stale=true`),
+  alerts: () => getJson<Alert[]>("/alerts?include_expired=true"),
   status: () => getJson<StatusResponse>("/status"),
+  servingHealth: () => getJson<ServingHealthResponse>("/serving-health"),
   regions: () => getJson<DispatchCenter[]>("/regions"),
   routes: (query: RouteQuery = {}) => getJson<Route[]>(`/routes?${routeQueryString(query)}`),
   dispatchRoute: (routeId: string) => postJson<Route>(`/routes/${routeId}/dispatch`),

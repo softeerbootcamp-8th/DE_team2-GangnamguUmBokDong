@@ -47,6 +47,7 @@ interface Props {
   selectedRouteId: string | null;
   busyRouteId: string | null;
   transitionError: string | null;
+  canDispatchNewRoutes: boolean;
   onSelect: (route: Route) => void;
   onDispatch: (route: Route) => void;
   onComplete: (route: Route) => void;
@@ -87,6 +88,7 @@ export function RouteList({
   selectedRouteId,
   busyRouteId,
   transitionError,
+  canDispatchNewRoutes,
   onSelect,
   onDispatch,
   onComplete,
@@ -157,10 +159,14 @@ export function RouteList({
               <button
                 type="button"
                 className={`route-action primary icon-only${isBusy ? " is-busy" : ""}`}
-                disabled={transitionsBlocked}
+                disabled={transitionsBlocked || !canDispatchNewRoutes}
                 onClick={() => onDispatch(route)}
                 aria-label={isBusy ? "처리 중" : "승인"}
-                title={isBusy ? "승인 처리 중" : "작업 승인"}
+                title={isBusy
+                  ? "승인 처리 중"
+                  : canDispatchNewRoutes
+                    ? "작업 승인"
+                    : "데이터 갱신 또는 기준 시각 정합을 기다리는 중"}
               >
                 {isBusy
                   ? <Loader2 size={14} aria-hidden="true" className="route-action-spinner" />

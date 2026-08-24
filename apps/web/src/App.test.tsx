@@ -4,7 +4,7 @@ import { act, cleanup, fireEvent, render, screen } from "@testing-library/react"
 import type { ReactNode, Ref } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
-import type { Alert, ForecastResponse, Route, StationSummary } from "./api";
+import type { Alert, ForecastResponse, Route, ServingHealthResponse, StationSummary } from "./api";
 
 const resizableMock = vi.hoisted(() => ({
   layoutChanged: undefined as ((layout: Record<string, number>, meta: { isUserInteraction: boolean }) => void) | undefined,
@@ -19,6 +19,7 @@ const apiMock = vi.hoisted(() => ({
   weather: vi.fn(),
   alerts: vi.fn(),
   status: vi.fn(),
+  servingHealth: vi.fn(),
   regions: vi.fn(),
   routes: vi.fn(),
   dispatchRoute: vi.fn(),
@@ -166,6 +167,23 @@ const FORECAST: ForecastResponse = {
   base_dttm: "2026-08-20T00:00:00Z",
   points: [],
 };
+const HEALTH: ServingHealthResponse = {
+  overall: "healthy",
+  operational_base_dttm: "2026-08-20T00:00:00Z",
+  checked_at: "2026-08-20T00:05:00Z",
+  can_dispatch_new_routes: true,
+  components: Object.fromEntries(
+    ["stock", "demand", "urgency", "routes", "weather", "events", "regions"].map((key) => [
+      key,
+      {
+        state: "ready",
+        data_dttm: "2026-08-20T00:00:00Z",
+        age_minutes: 5,
+        reason: "fresh",
+      },
+    ]),
+  ),
+};
 const ROUTES: Route[] = [
   {
     route_id: "11111111-1111-4111-8111-111111111111",
@@ -227,6 +245,7 @@ beforeEach(() => {
   apiMock.forecast.mockResolvedValue(FORECAST);
   apiMock.regions.mockResolvedValue([]);
   apiMock.routes.mockResolvedValue(ROUTES);
+  apiMock.servingHealth.mockResolvedValue(HEALTH);
   apiMock.dispatchRoute.mockResolvedValue({ ...ROUTES[0], status: "dispatched" });
   apiMock.completeRoute.mockResolvedValue({ ...ROUTES[0], status: "completed" });
   apiMock.cancelRoute.mockResolvedValue({ ...ROUTES[0], status: "cancelled" });
@@ -301,6 +320,34 @@ describe("App polling state", () => {
     await settleRequests();
 
     expect(apiMock.dispatchRoute).toHaveBeenCalledWith(ROUTES[0].route_id);
+  });
+
+  it("핵심 publication이 지연되면 작업은 보존하고 신규 승인만 막는다", async () => {
+    apiMock.stations.mockResolvedValue(STATIONS);
+    apiMock.servingHealth.mockResolvedValue({
+      ...HEALTH,
+      overall: "degraded",
+      can_dispatch_new_routes: false,
+      components: {
+        ...HEALTH.components,
+        urgency: {
+          ...HEALTH.components.urgency,
+          state: "stale",
+          reason: "publication_stale",
+        },
+      },
+    });
+    render(<App />);
+    await settleRequests();
+    await settleRequests();
+
+    const approval = screen.getByRole("button", { name: "승인" });
+    expect(approval.hasAttribute("disabled")).toBe(true);
+    fireEvent.click(approval);
+    expect(apiMock.dispatchRoute).not.toHaveBeenCalled();
+    expect(screen.getByText(
+      "핵심 데이터가 지연되거나 기준 시각이 달라 신규 승인을 잠시 중단합니다.",
+    )).not.toBeNull();
   });
 
   it("버튼으로 상태를 바꾼 결과 카드에 선택 테두리를 옮긴다", async () => {
@@ -505,7 +552,7 @@ describe("App polling state", () => {
     expect(screen.getByTestId("detail-station").textContent).toContain("ST-2");
   });
 
-  it("stations polling 실패 뒤 선택과 하위 성공 데이터를 남기지 않는다", async () => {
+  it("stations polling 실패 뒤 마지막 선택과 하위 성공 데이터를 유지한다", async () => {
     apiMock.stations.mockResolvedValueOnce(STATIONS).mockRejectedValueOnce(new Error("network unavailable"));
     render(<App />);
     await settleRequests();
@@ -519,9 +566,9 @@ describe("App polling state", () => {
       await Promise.resolve();
     });
 
-    expect(screen.getByTestId("detail-station").textContent).toContain("none");
-    expect(screen.getByTestId("forecast-state").textContent).toContain("empty");
-    expect(screen.getByText("대여소 정보를 갱신하지 못했습니다.")).not.toBeNull();
+    expect(screen.getByTestId("detail-station").textContent).toContain("ST-1");
+    expect(screen.getByTestId("forecast-state").textContent).toContain(FORECAST.base_dttm);
+    expect(screen.getByText("재고 조회에 실패해 마지막 정상 화면을 표시합니다.")).not.toBeNull();
   });
 
   it("새 stations 목록에서 선택 ID가 사라지면 선택과 forecast를 해제한다", async () => {
@@ -549,7 +596,7 @@ describe("App polling state", () => {
     expect(screen.getByTestId("forecast-state").textContent).toContain("empty");
   });
 
-  it("alerts polling 실패 뒤 이전 우선순위를 현재값처럼 남기지 않는다", async () => {
+  it("alerts polling 실패 뒤 이전 우선순위를 경고와 함께 유지한다", async () => {
     apiMock.stations.mockResolvedValue(STATIONS);
     apiMock.alerts.mockResolvedValueOnce(ALERTS).mockRejectedValueOnce(new Error("network unavailable"));
     render(<App />);
@@ -562,9 +609,9 @@ describe("App polling state", () => {
       await Promise.resolve();
     });
 
-    expect(screen.getByTestId("map-alerts").textContent).toBe("");
+    expect(screen.getByTestId("map-alerts").textContent).toBe("ST-1");
     fireEvent.click(screen.getByRole("button", { name: "대여소" }));
-    expect(screen.getByText("대여소 우선순위를 갱신하지 못했습니다.")).not.toBeNull();
+    expect(screen.getByText("우선순위 조회에 실패해 마지막 결과를 표시합니다.")).not.toBeNull();
   });
 
   it("stations와 alerts의 느린 이전 요청이 최신 polling 결과를 복원하지 못한다", async () => {
@@ -630,7 +677,7 @@ describe("App polling state", () => {
     expect(screen.getByTestId("forecast-state").textContent).not.toContain(FORECAST.base_dttm);
   });
 
-  it("stations 실패 clear가 진행 중 forecast 요청을 즉시 무효화한다", async () => {
+  it("stations 실패 중에도 선택과 진행 중 forecast 요청을 유지한다", async () => {
     const oldForecast = deferred<ForecastResponse>();
     apiMock.stations.mockResolvedValueOnce(STATIONS).mockRejectedValueOnce(new Error("network unavailable"));
     apiMock.forecast.mockReturnValueOnce(oldForecast.promise);
@@ -645,8 +692,8 @@ describe("App polling state", () => {
       await Promise.resolve();
     });
 
-    expect(screen.getByTestId("detail-station").textContent).toContain("none");
-    expect(screen.getByTestId("forecast-state").textContent).toContain("empty");
+    expect(screen.getByTestId("detail-station").textContent).toContain("ST-1");
+    expect(screen.getByTestId("forecast-state").textContent).toContain(FORECAST.base_dttm);
   });
 
   it("stations 선택 ID 소실 clear가 진행 중 forecast 요청을 즉시 무효화한다", async () => {

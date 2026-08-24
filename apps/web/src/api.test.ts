@@ -24,7 +24,9 @@ describe("api", () => {
         detail: "forecast_not_available",
       }),
     );
-    expect(fetchMock).toHaveBeenCalledWith("http://localhost:8000/stations/ST-1/forecast");
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://localhost:8000/stations/ST-1/forecast?allow_stale=true",
+    );
   });
 
   it("날씨를 고정된 12시간 계약으로 요청한다", async () => {
@@ -38,7 +40,9 @@ describe("api", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     await expect(api.weather("ST-1")).resolves.toEqual(response);
-    expect(fetchMock).toHaveBeenCalledWith("http://localhost:8000/stations/ST-1/weather?hours=12");
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://localhost:8000/stations/ST-1/weather?hours=12&allow_stale=true",
+    );
   });
 
   it("작업 목록 필터를 query string으로 직렬화한다", async () => {

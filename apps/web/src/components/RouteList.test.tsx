@@ -66,6 +66,7 @@ function renderRouteList(overrides: Partial<React.ComponentProps<typeof RouteLis
     selectedRouteId: null,
     busyRouteId: null,
     transitionError: null,
+    canDispatchNewRoutes: true,
     onSelect: vi.fn(),
     onDispatch: vi.fn(),
     onComplete: vi.fn(),
@@ -215,6 +216,22 @@ describe("RouteList", () => {
     expect(approval.hasAttribute("disabled")).toBe(false);
     fireEvent.click(approval);
     expect(props.onDispatch).toHaveBeenCalledWith(ROUTES[0]);
+  });
+
+  it("핵심 데이터가 지연되면 신규 승인만 막는다", () => {
+    const running = { ...ROUTES[1], region: "강남" };
+    const props = renderRouteList({
+      routes: [ROUTES[0], running],
+      canDispatchNewRoutes: false,
+    });
+
+    const approval = screen.getByRole("button", { name: "승인" });
+    expect(approval.hasAttribute("disabled")).toBe(true);
+    fireEvent.click(approval);
+    expect(props.onDispatch).not.toHaveBeenCalled();
+
+    expect(screen.getByRole("button", { name: "완료" }).hasAttribute("disabled")).toBe(false);
+    expect(screen.getByRole("button", { name: "취소" }).hasAttribute("disabled")).toBe(false);
   });
 
   it("겹치는 후보의 카드 선택과 진행 중 작업의 완료·취소는 그대로 동작한다", () => {

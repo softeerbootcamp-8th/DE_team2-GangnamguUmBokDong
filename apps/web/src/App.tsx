@@ -2,7 +2,7 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react
 import type { LayoutChangedMeta, PanelImperativeHandle } from "react-resizable-panels";
 import { List, Route as RouteIcon } from "lucide-react";
 import { api } from "./api";
-import type { Alert, DispatchCenter, ForecastResponse, Route, StationSummary } from "./api";
+import type { Alert, DispatchCenter, ForecastResponse, Route, ServingHealthResponse, StationSummary } from "./api";
 import { AlertList } from "./components/AlertList";
 import { DetailPanel } from "./components/DetailPanel";
 import type { FocusedEvent } from "./components/DetailPanel";
@@ -20,6 +20,7 @@ import { ResizableHandle, ResizablePanel, ResizablePanelGroup } from "@/componen
 const POLL_INTERVAL_MS = 15_000;
 const FORECAST_POLL_INTERVAL_MS = 60_000;
 const ROUTE_POLL_INTERVAL_MS = 30_000;
+const STATUS_POLL_INTERVAL_MS = 30_000;
 const ROUTE_PAGE_SIZE = 500;
 const CLOSED_ROUTE_HISTORY_MINUTES = 60;
 const ALL_REGIONS = "all";
@@ -64,6 +65,8 @@ export default function App() {
   const [routes, setRoutes] = useState<Route[]>([]);
   const [routesError, setRoutesError] = useState(false);
   const [routesInitialized, setRoutesInitialized] = useState(false);
+  const [servingHealth, setServingHealth] = useState<ServingHealthResponse | null>(null);
+  const [servingHealthError, setServingHealthError] = useState(false);
   const routeMutationGenerationRef = useRef(0);
   const routeViewGenerationRef = useRef(0);
   const [listMode, setListMode] = useState<ListMode>("routes");
@@ -166,15 +169,7 @@ export default function App() {
         }
       }).catch(() => {
         if (!cancelled && currentStationsGeneration === stationsGeneration) {
-          setStations([]);
-          setStationsUpdatedAt(null);
           setStationsError(true);
-          selectedStationIdRef.current = null;
-          forecastRequestGenerationRef.current += 1;
-          setSelectedStationId(null);
-          setForecast(null);
-          setForecastError(null);
-          setFocusedEvent(null);
         }
       });
 
@@ -186,7 +181,6 @@ export default function App() {
         }
       }).catch(() => {
         if (!cancelled && currentAlertsGeneration === alertsGeneration) {
-          setAlerts([]);
           setAlertsError(true);
         }
       });
@@ -231,11 +225,8 @@ export default function App() {
           && currentGeneration === requestGeneration
           && currentMutationGeneration === routeMutationGenerationRef.current
         ) {
-          setRoutes([]);
           setRoutesError(true);
           setRoutesInitialized(true);
-          selectedRouteIdRef.current = null;
-          setSelectedRouteId(null);
         }
       });
     }
@@ -249,6 +240,30 @@ export default function App() {
 
   useEffect(() => {
     api.regions().then(setRegionCenters).catch(() => setRegionCenters([]));
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    let requestGeneration = 0;
+    function refresh() {
+      const currentGeneration = ++requestGeneration;
+      api.servingHealth().then((data) => {
+        if (!cancelled && currentGeneration === requestGeneration) {
+          setServingHealth(data);
+          setServingHealthError(false);
+        }
+      }).catch(() => {
+        if (!cancelled && currentGeneration === requestGeneration) {
+          setServingHealthError(true);
+        }
+      });
+    }
+    refresh();
+    const timer = setInterval(refresh, STATUS_POLL_INTERVAL_MS);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
   }, []);
 
   useEffect(() => {
@@ -277,7 +292,6 @@ export default function App() {
         }
       }).catch((error: Error) => {
         if (!cancelled && currentGeneration === forecastRequestGenerationRef.current) {
-          setForecast(null);
           setForecastError(error);
         }
       });
@@ -299,6 +313,11 @@ export default function App() {
   const filteredAlerts = selectedRegion === ALL_REGIONS
     ? alerts
     : alerts.filter((alert) => alert.region === selectedRegion);
+  const canDispatchNewRoutes = !servingHealthError
+    && servingHealth?.can_dispatch_new_routes === true;
+  const stockHealth = servingHealth?.components.stock;
+  const dispatchHealthUnavailable = servingHealthError
+    || (servingHealth !== null && !canDispatchNewRoutes);
 
   function changeRegion(region: string) {
     if (region === selectedRegion) return;
@@ -380,6 +399,8 @@ export default function App() {
         regions={regionCenters}
         selectedRegion={selectedRegion}
         stationsUpdatedAt={stationsUpdatedAt}
+        servingHealth={servingHealth}
+        servingHealthError={servingHealthError}
         onRegionChange={changeRegion}
       />
       <div className="flex-1 overflow-hidden">
@@ -413,7 +434,13 @@ export default function App() {
                           focusedEvent={focusedEvent}
                           selectedRoute={selectedRoute}
                         />
-                        {stationsError && <p className="poll-error" role="status">대여소 정보를 갱신하지 못했습니다.</p>}
+                        {(stationsError || (stockHealth && stockHealth.state !== "ready")) && (
+                          <p className="poll-error" role="status">
+                            {stationsError
+                              ? "재고 조회에 실패해 마지막 정상 화면을 표시합니다."
+                              : `재고 갱신 지연 · ${Math.floor(stockHealth?.age_minutes ?? 0)}분 전`}
+                          </p>
+                        )}
                       </div>
                     </div>
                   </section>
@@ -440,30 +467,43 @@ export default function App() {
                     </div>
 
                     <div className="min-h-0 flex-1 overflow-hidden">
-                      {listMode === "routes" ? routesError ? (
-                        <p className="empty-state" role="status">작업 목록을 갱신하지 못했습니다.</p>
+                      {listMode === "routes" ? (
+                        <div className="data-preserving-panel">
+                          {(routesError || dispatchHealthUnavailable) && (
+                            <p className="data-refresh-warning" role="status">
+                              {routesError
+                                ? "작업 목록 조회에 실패해 마지막 결과를 표시합니다."
+                                : "핵심 데이터가 지연되거나 기준 시각이 달라 신규 승인을 잠시 중단합니다."}
+                            </p>
+                          )}
+                          <RouteList
+                            routes={routes}
+                            regions={regionCenters}
+                            selectedRouteId={selectedRouteId}
+                            busyRouteId={busyRouteId}
+                            transitionError={routeTransitionError}
+                            canDispatchNewRoutes={canDispatchNewRoutes}
+                            onSelect={selectRoute}
+                            onDispatch={(route) => void transitionRoute(route, "dispatch")}
+                            onComplete={(route) => void transitionRoute(route, "complete")}
+                            onCancel={(route) => void transitionRoute(route, "cancel")}
+                            onDismiss={(route) => void transitionRoute(route, "dismiss")}
+                            onRestore={(route) => void transitionRoute(route, "restore")}
+                          />
+                        </div>
                       ) : (
-                        <RouteList
-                          routes={routes}
-                          regions={regionCenters}
-                          selectedRouteId={selectedRouteId}
-                          busyRouteId={busyRouteId}
-                          transitionError={routeTransitionError}
-                          onSelect={selectRoute}
-                          onDispatch={(route) => void transitionRoute(route, "dispatch")}
-                          onComplete={(route) => void transitionRoute(route, "complete")}
-                          onCancel={(route) => void transitionRoute(route, "cancel")}
-                          onDismiss={(route) => void transitionRoute(route, "dismiss")}
-                          onRestore={(route) => void transitionRoute(route, "restore")}
-                        />
-                      ) : alertsError ? (
-                        <p className="empty-state" role="status">대여소 우선순위를 갱신하지 못했습니다.</p>
-                      ) : (
-                        <AlertList
-                          alerts={filteredAlerts}
-                          selectedStationId={selectedStationId}
-                          onSelect={selectStation}
-                        />
+                        <div className="data-preserving-panel">
+                          {alertsError && (
+                            <p className="data-refresh-warning" role="status">
+                              우선순위 조회에 실패해 마지막 결과를 표시합니다.
+                            </p>
+                          )}
+                          <AlertList
+                            alerts={filteredAlerts}
+                            selectedStationId={selectedStationId}
+                            onSelect={selectStation}
+                          />
+                        </div>
                       )}
                     </div>
                   </section>

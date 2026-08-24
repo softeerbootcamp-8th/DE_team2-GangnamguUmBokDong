@@ -112,7 +112,7 @@ def test_stations_preserve_aliases_without_gu(
 ) -> None:
     """station 응답은 Point alias와 region을 유지하고 gu를 노출하지 않는다."""
     row = {**_station_row(), "gu": "남겨서는 안 됨"}
-    monkeypatch.setattr(queries, "fetch_stations", lambda _now: [row])
+    monkeypatch.setattr(queries, "fetch_stations", lambda _now, **_kwargs: [row])
 
     response = client.get("/stations")
 
@@ -138,7 +138,7 @@ def test_station_detail_returns_404_when_not_servable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """missing·inactive·stale stock은 query에서 모두 제외되어 상세 404가 된다."""
-    monkeypatch.setattr(queries, "fetch_station", lambda _sta_id, _now: None)
+    monkeypatch.setattr(queries, "fetch_station", lambda _sta_id, _now, **_kwargs: None)
 
     response = client.get("/stations/ST-1")
 
@@ -163,7 +163,9 @@ def test_forecast_maps_contract_states(
 ) -> None:
     """forecast의 station/model/freshness 상태를 404와 503으로 구분한다."""
     monkeypatch.setattr(
-        queries, "fetch_forecast", lambda _sta_id, _now: _forecast_result(state)
+        queries,
+        "fetch_forecast",
+        lambda _sta_id, _now, **_kwargs: _forecast_result(state),
     )
 
     response = client.get("/stations/ST-1/forecast")
@@ -180,7 +182,7 @@ def test_forecast_returns_twelve_points_without_reasons(
     monkeypatch.setattr(
         queries,
         "fetch_forecast",
-        lambda _sta_id, _now: _forecast_result(queries.ForecastState.READY),
+        lambda _sta_id, _now, **_kwargs: _forecast_result(queries.ForecastState.READY),
     )
 
     response = client.get("/stations/ST-1/forecast")
@@ -207,6 +209,40 @@ def test_status_returns_503_without_real_fresh_projection(
     assert response.json()["detail"] == "forecast_not_ready"
 
 
+def test_serving_health_returns_component_statuses(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """serving health는 전체 상태와 데이터별 상태를 한 응답으로 제공한다."""
+    health = {
+        "overall": "degraded",
+        "operational_base_dttm": BASE,
+        "checked_at": NOW,
+        "can_dispatch_new_routes": False,
+        "components": {
+            "stock": {
+                "state": "ready",
+                "data_dttm": BASE,
+                "age_minutes": 5.0,
+                "reason": "fresh",
+            },
+            "events": {
+                "state": "missing",
+                "data_dttm": None,
+                "age_minutes": None,
+                "reason": "not_published",
+            },
+        },
+    }
+    monkeypatch.setattr(queries, "fetch_serving_health", lambda _now: health)
+
+    response = client.get("/serving-health")
+
+    assert response.status_code == 200
+    assert response.json()["overall"] == "degraded"
+    assert response.json()["components"]["events"]["state"] == "missing"
+
+
 def test_events_remove_unused_fields_and_keep_radius(
     client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
@@ -224,7 +260,11 @@ def test_events_remove_unused_fields_and_keep_radius(
         "category": "제거 대상",
         "is_free": "제거 대상",
     }
-    monkeypatch.setattr(queries, "fetch_nearby_events", lambda _sta_id, _now: [event])
+    monkeypatch.setattr(
+        queries,
+        "fetch_nearby_events",
+        lambda _sta_id, _now, **_kwargs: [event],
+    )
 
     response = client.get("/stations/ST-1/events")
 
@@ -254,7 +294,7 @@ def test_weather_maps_missing_and_not_ready_states(
     monkeypatch.setattr(
         queries,
         "fetch_weather",
-        lambda _sta_id, _now, _hours: queries.WeatherResult(state),
+        lambda _sta_id, _now, _hours, **_kwargs: queries.WeatherResult(state),
     )
 
     response = client.get("/stations/ST-1/weather?hours=12")
@@ -271,7 +311,7 @@ def test_weather_returns_exact_points_and_rejects_other_hours(
     monkeypatch.setattr(
         queries,
         "fetch_weather",
-        lambda _sta_id, _now, _hours: queries.WeatherResult(
+        lambda _sta_id, _now, _hours, **_kwargs: queries.WeatherResult(
             queries.WeatherState.READY,
             _weather_points(),
         ),

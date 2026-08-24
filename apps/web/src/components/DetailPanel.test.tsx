@@ -108,7 +108,7 @@ describe("DetailPanel stale state", () => {
     expect(screen.queryByText(/갱신 시각/)).toBeNull();
   });
 
-  it("station polling 실패 뒤 이전 상세를 지운다", async () => {
+  it("station polling 실패 뒤 이전 상세를 경고와 함께 유지한다", async () => {
     apiMock.station.mockResolvedValueOnce(DETAIL).mockRejectedValueOnce(new Error("network unavailable"));
     renderDetail();
     await settleRequests();
@@ -120,11 +120,11 @@ describe("DetailPanel stale state", () => {
       await Promise.resolve();
     });
 
-    expect(screen.queryByText(DETAIL.sta_nm)).toBeNull();
-    expect(screen.getByText("대여소 정보를 불러오지 못했습니다.")).not.toBeNull();
+    expect(screen.getByText(DETAIL.sta_nm)).not.toBeNull();
+    expect(screen.getByText("상세 조회에 실패해 마지막 결과를 표시합니다.")).not.toBeNull();
   });
 
-  it("events polling 실패 뒤 이전 행사와 검색 반경 상태를 지운다", async () => {
+  it("events polling 실패 뒤 이전 행사와 검색 반경 상태를 유지한다", async () => {
     apiMock.events
       .mockResolvedValueOnce({ radius_km: 1, events: [EVENT] })
       .mockRejectedValueOnce(new Error("network unavailable"));
@@ -139,11 +139,11 @@ describe("DetailPanel stale state", () => {
       await Promise.resolve();
     });
 
-    expect(screen.queryByText(EVENT.title)).toBeNull();
-    expect(screen.getByText("주변 행사 정보를 불러오지 못했습니다.")).not.toBeNull();
+    expect(screen.getByText(EVENT.title)).not.toBeNull();
+    expect(screen.getByText("행사 조회에 실패해 마지막 결과를 표시합니다.")).not.toBeNull();
   });
 
-  it("weather polling 실패 뒤 이전 예보를 지운다", async () => {
+  it("weather polling 실패 뒤 이전 예보를 유지한다", async () => {
     apiMock.weather.mockResolvedValueOnce(WEATHER).mockRejectedValueOnce(new Error("network unavailable"));
     renderDetail();
     fireEvent.click(screen.getByRole("tab", { name: "주변 날씨" }));
@@ -156,8 +156,8 @@ describe("DetailPanel stale state", () => {
       await Promise.resolve();
     });
 
-    expect(screen.queryByText("28℃")).toBeNull();
-    expect(screen.getByText("주변 날씨 정보를 불러오지 못했습니다.")).not.toBeNull();
+    expect(screen.getByText("28℃")).not.toBeNull();
+    expect(screen.getByText("날씨 조회에 실패해 마지막 결과를 표시합니다.")).not.toBeNull();
   });
 
   it("station 변경 직후 이전 상세를 지운다", async () => {
