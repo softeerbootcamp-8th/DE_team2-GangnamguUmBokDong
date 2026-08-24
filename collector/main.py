@@ -41,6 +41,7 @@ import httpx
 import adapters  # noqa: F401 (어댑터 레지스트리 로드용)
 import config.loader as config_loader
 import pipeline
+import storage
 from logging_setup import configure_logging
 from manifest import RunStatus
 
@@ -73,11 +74,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--force", action="store_true", help="재개 분기를 무시하고 clear_bronze 후 전체 재수집")
     parser.add_argument("--backfill", action="store_true", help="완결된 window의 누락 조각만 채운다")
     parser.add_argument("--list-backfill-targets", action="store_true", help="백필 대상을 JSON으로 출력하고 종료")
+    parser.add_argument(
+        "--check-due-after-seconds",
+        type=int,
+        default=None,
+        help="마지막 성공 수집 이후 이 초만큼 안 지났으면 수집을 건너뛰어도 되는지 JSON으로 출력하고 종료",
+    )
     args = parser.parse_args(argv)
 
-    if not args.list_backfill_targets and not args.window_start:
-        parser.error("the following arguments are required: --window-start (unless --list-backfill-targets is used)")
-
+    if (
+        not args.list_backfill_targets
+        and args.check_due_after_seconds is None
+        and not args.window_start
+    ):
+        parser.error(
+            "the following arguments are required: --window-start "
+            "(unless --list-backfill-targets/--check-due-after-seconds is used)"
+        )
 
     if args.force and args.backfill:
         parser.error("--force와 --backfill은 함께 줄 수 없다")
@@ -113,7 +126,7 @@ def main(argv: list[str] | None = None) -> int:
         Airflow가 태스크 성공/실패를 판단할 프로세스 종료 코드.
     """
     args = parse_args(argv)
-    
+
     if args.list_backfill_targets:
         import json
         config = config_loader.load(args.source)
@@ -121,6 +134,22 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(targets))
         return 0
 
+    if args.check_due_after_seconds is not None:
+        import json
+
+        from zoneinfo import ZoneInfo
+
+        now = datetime.now(ZoneInfo("Asia/Seoul"))
+        last = storage.latest_source_snapshot_logical_dttm(args.source, as_of=now)
+        elapsed_seconds = None if last is None else (now - last).total_seconds()
+        due = elapsed_seconds is None or elapsed_seconds >= args.check_due_after_seconds
+        print(json.dumps({
+            "source_id": args.source,
+            "due": due,
+            "last_logical_dttm": None if last is None else last.isoformat(),
+            "elapsed_seconds": elapsed_seconds,
+        }))
+        return 0
 
     window_start = datetime.fromisoformat(args.window_start)
 
