@@ -105,6 +105,8 @@ describe("DetailPanel stale state", () => {
       name: "현재 자전거 3대, 거치대 10대, 재고율 30%",
     });
     expect(donut.getAttribute("data-stock-band")).toBe("warning");
+    expect(donut.querySelector("svg")?.getAttribute("viewBox")).toBe("0 0 42 42");
+    expect(donut.querySelector(".stock-donut-track")?.getAttribute("r")).toBe("16");
     expect(donut.querySelector(".stock-donut-value")?.getAttribute("stroke-dasharray"))
       .toBe("30 100");
     expect(donut.querySelector(".stock-donut-overflow-value")).toBeNull();
@@ -129,6 +131,7 @@ describe("DetailPanel stale state", () => {
     expect(donut.getAttribute("data-stock-band")).toBe("overflow");
     expect(donut.querySelector(".stock-donut-value")?.getAttribute("stroke-dasharray"))
       .toBe("100 100");
+    expect(donut.querySelector(".stock-donut-overflow-track")?.getAttribute("r")).toBe("20");
     expect(donut.querySelector(".stock-donut-overflow-value")?.getAttribute("stroke-dasharray"))
       .toBe("30 100");
   });

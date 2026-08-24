@@ -1373,14 +1373,6 @@ body {
   stroke: var(--gridline);
 }
 
-.stock-donut-track.critical {
-  stroke: color-mix(in srgb, var(--status-critical) 24%, var(--gridline));
-}
-
-.stock-donut-track.warning {
-  stroke: color-mix(in srgb, var(--status-warning) 28%, var(--gridline));
-}
-
 .stock-donut-value {
   stroke: var(--brand-green);
   stroke-linecap: round;
@@ -1396,11 +1388,11 @@ body {
 
 .stock-donut-overflow-track,
 .stock-donut-overflow-value {
-  stroke-width: 3;
+  stroke-width: 2;
 }
 
 .stock-donut-overflow-track {
-  stroke: color-mix(in srgb, #00a878 18%, var(--gridline));
+  stroke: var(--gridline);
 }
 
 .stock-donut-overflow-value {

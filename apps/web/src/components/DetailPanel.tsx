@@ -60,23 +60,23 @@ function StockDonut({ current, capacity }: { current: number; capacity: number }
       role="img"
       aria-label={`현재 자전거 ${current}대, 거치대 ${capacity}대, 재고율 ${visual.ratioPercent}%`}
     >
-      <svg viewBox="0 0 48 48" aria-hidden="true">
-        <circle className={`stock-donut-track ${visual.band}`} cx="24" cy="24" r="15" />
+      <svg viewBox="0 0 42 42" aria-hidden="true">
+        <circle className="stock-donut-track" cx="21" cy="21" r="16" />
         <circle
           className={`stock-donut-value ${visual.band}`}
-          cx="24"
-          cy="24"
-          r="15"
+          cx="21"
+          cy="21"
+          r="16"
           pathLength="100"
           strokeDasharray={`${visual.capacityPercent} 100`}
         />
         {visual.overflowPercent > 0 && (
           <>
-            <circle className="stock-donut-overflow-track" cx="24" cy="24" r="20" />
+            <circle className="stock-donut-overflow-track" cx="21" cy="21" r="20" />
             <circle
               className="stock-donut-overflow-value"
-              cx="24"
-              cy="24"
+              cx="21"
+              cy="21"
               r="20"
               pathLength="100"
               strokeDasharray={`${visual.overflowPercent} 100`}
