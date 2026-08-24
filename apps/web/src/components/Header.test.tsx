@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ServingHealthResponse } from "../api";
 import { Header } from "./Header";
@@ -56,7 +56,7 @@ describe("Header serving health", () => {
     renderHeader();
 
     expect(screen.getByText(/^조회 시각 /)).not.toBeNull();
-    expect(screen.getAllByText("일부 지연")).toHaveLength(2);
+    expect(screen.getByText("일부 지연")).not.toBeNull();
     expect(screen.getByRole("button", { name: "기준 시각 및 데이터 상태 설명" })).not.toBeNull();
     expect(screen.getByRole("tooltip", { name: "데이터 상태 상세" })).not.toBeNull();
     ["대여소·재고", "수요예측", "대여소 우선순위", "작업 추천", "날씨", "행사", "권역 설정"]
@@ -68,11 +68,35 @@ describe("Header serving health", () => {
     expect(screen.getByText(/^원본 8\./)).not.toBeNull();
   });
 
+  it("작은 화면에서도 기준 시각 정보창을 viewport 안에 배치한다", () => {
+    Object.defineProperty(window, "innerWidth", { configurable: true, value: 240 });
+    Object.defineProperty(window, "innerHeight", { configurable: true, value: 500 });
+    renderHeader();
+    const trigger = screen.getByRole("button", { name: "기준 시각 및 데이터 상태 설명" });
+    vi.spyOn(trigger, "getBoundingClientRect").mockReturnValue({
+      bottom: 24,
+      height: 14,
+      left: 4,
+      right: 18,
+      top: 10,
+      width: 14,
+      x: 4,
+      y: 10,
+      toJSON: () => ({}),
+    });
+
+    fireEvent.mouseEnter(trigger);
+
+    const tooltip = screen.getByRole("tooltip", { name: "데이터 상태 상세" });
+    expect(tooltip.style.left).toBe("8px");
+    expect(tooltip.classList.contains("is-visible")).toBe(true);
+  });
+
   it("상태 조회 실패 뒤 마지막 기준 시각과 상세는 유지하고 연결 끊김을 표시한다", () => {
     renderHeader({ servingHealthError: true });
 
     expect(screen.getByText(/^기준 시각 /).textContent).not.toBe("기준 시각 -");
-    expect(screen.getAllByText("연결 끊김")).toHaveLength(2);
+    expect(screen.getByText("연결 끊김")).not.toBeNull();
     expect(screen.getByText("상태 조회 실패 · 마지막 정상 화면을 유지합니다.")).not.toBeNull();
     expect(screen.getByText("대여소·재고")).not.toBeNull();
   });
