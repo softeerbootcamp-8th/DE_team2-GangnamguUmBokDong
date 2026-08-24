@@ -4,6 +4,12 @@
 `server {}` 레벨에 `auth_basic`을 걸어 정적 자산과 `/api/` 프록시를 전부 잠근다 —
 API를 직접 두드려도 로그인 없이는 401이다.
 
+이 정책은 운영 compose에만 적용한다. 로컬 compose는
+`dashboard-auth.local.conf`를 같은 nginx snippet 경로에 mount해 Basic Auth를
+끄므로 `5173`에서 브라우저 기본 로그인창 없이 개발 화면을 확인한다. 로컬 포트가
+`0.0.0.0`에 열리므로 같은 LAN/Tailscale 사용자의 접근 가능성은 개발 환경의
+네트워크 ACL로 통제한다.
+
 ## 동작 방식
 
 - 브라우저가 `Authorization: Basic base64(id:pw)` 헤더를 보내고, nginx가

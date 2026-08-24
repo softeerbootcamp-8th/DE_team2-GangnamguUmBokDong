@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import local_e2e
 import pyarrow as pa
@@ -105,6 +106,64 @@ def test_realtime_station_snapshot_builds_serving_rows() -> None:
     assert tuple(station["station_no"] for station in stations) == (4, 9)
     assert stations[0]["lat"] == 37.50
     assert stations[0]["capacity"] == 15
+    assert "station_address" not in stations[0]
+
+
+def test_local_e2e_uses_actual_station_master_snapshot(monkeypatch) -> None:
+    """로컬 E2E는 운영 collector의 실제 주소 authority를 그대로 사용한다."""
+    logical = datetime.fromisoformat("2026-08-20T16:40:00+09:00")
+    table = pa.Table.from_pylist(
+        [
+            {
+                "RNTLS_ID": "ST-4",
+                "ADDR1": "서울특별시 강남구 실제 주소",
+                "LAT": 37.50,
+                "LOT": 127.00,
+            }
+        ]
+    )
+    observed: list[tuple[str, datetime]] = []
+
+    def read_snapshot(source_id: str, source_logical: datetime):
+        observed.append((source_id, source_logical))
+        return SimpleNamespace(
+            table=table,
+            manifest=SimpleNamespace(silver_uri="s3://local-dev/master.parquet"),
+        )
+
+    monkeypatch.setattr(local_e2e, "read_exact_source_snapshot", read_snapshot)
+
+    assert (
+        local_e2e._require_actual_station_master_snapshot(logical)
+        == "s3://local-dev/master.parquet"
+    )
+    assert observed == [("bike_station_master", logical)]
+
+
+def test_local_e2e_rejects_synthetic_station_master_address(monkeypatch) -> None:
+    """가짜 E2E 주소가 station Gold authority로 다시 유입되는 것을 거부한다."""
+    logical = datetime.fromisoformat("2026-08-20T16:40:00+09:00")
+    table = pa.Table.from_pylist(
+        [
+            {
+                "RNTLS_ID": "ST-4",
+                "ADDR1": "로컬 E2E fixture 첫 번째 대여소",
+                "LAT": 37.50,
+                "LOT": 127.00,
+            }
+        ]
+    )
+    monkeypatch.setattr(
+        local_e2e,
+        "read_exact_source_snapshot",
+        lambda *_args: SimpleNamespace(
+            table=table,
+            manifest=SimpleNamespace(silver_uri="s3://local-dev/master.parquet"),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="fixture 주소"):
+        local_e2e._require_actual_station_master_snapshot(logical)
 
 
 def test_nowcast_fixture_has_every_hour_and_age_column() -> None:

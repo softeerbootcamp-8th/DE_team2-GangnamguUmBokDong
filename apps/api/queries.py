@@ -20,6 +20,7 @@ URGENCY_EXPIRY = timedelta(minutes=60)
 ULTRA_SHORT_FRESHNESS = timedelta(hours=2)
 SHORT_TERM_FRESHNESS = timedelta(hours=4)
 EVENT_FRESHNESS = timedelta(hours=36)
+SERVING_EXPIRY = timedelta(minutes=60)
 FUTURE_TOLERANCE = timedelta(minutes=5)
 FORECAST_HOUR_COUNT = 12
 NEARBY_EVENT_RADIUS_KM = 1.5
@@ -77,6 +78,7 @@ class RouteTransitionResult(StrEnum):
     WRONG_STATUS = "wrong_status"
     CONSTRAINT_CONFLICT = "constraint_conflict"
     ALREADY_DISMISSED = "already_dismissed"
+    SERVING_NOT_READY = "serving_not_ready"
 
 
 def now_utc() -> datetime:
@@ -94,8 +96,8 @@ def _start_read_snapshot(cursor: Cursor[dict[str, Any]]) -> None:
     cursor.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
 
 
-def fetch_stations(now: datetime) -> list[dict[str, Any]]:
-    """활성 대여소와 같은 anchor의 신선한 최신 재고를 반환한다."""
+def fetch_stations(now: datetime, *, allow_stale: bool = False) -> list[dict[str, Any]]:
+    """활성 대여소와 같은 anchor의 최신 재고를 freshness 정책에 맞춰 반환한다."""
     return fetch_all(
         """
         SELECT s.sta_id,
@@ -114,16 +116,24 @@ def fetch_stations(now: datetime) -> list[dict[str, Any]]:
             ON center.dispatch_center_id = s.dispatch_center_id
            AND center.is_active
          WHERE s.is_active
-           AND stock.base_dttm BETWEEN %(now)s - INTERVAL '10 minutes'
-                                   AND %(now)s + INTERVAL '5 minutes'
+           AND stock.base_dttm <= %(now)s + INTERVAL '5 minutes'
+           AND (
+               %(allow_stale)s
+               OR stock.base_dttm >= %(now)s - INTERVAL '10 minutes'
+           )
          ORDER BY s.sta_id
         """,
-        {"now": now},
+        {"now": now, "allow_stale": allow_stale},
     )
 
 
-def fetch_station(sta_id: str, now: datetime) -> dict[str, Any] | None:
-    """활성 대여소 하나와 같은 anchor의 신선한 최신 재고를 반환한다."""
+def fetch_station(
+    sta_id: str,
+    now: datetime,
+    *,
+    allow_stale: bool = False,
+) -> dict[str, Any] | None:
+    """활성 대여소 하나와 같은 anchor의 최신 재고를 freshness 정책에 맞춰 반환한다."""
     return fetch_one(
         """
         SELECT s.sta_id,
@@ -144,10 +154,13 @@ def fetch_station(sta_id: str, now: datetime) -> dict[str, Any] | None:
            AND center.is_active
          WHERE s.sta_id = %(sta_id)s
            AND s.is_active
-           AND stock.base_dttm BETWEEN %(now)s - INTERVAL '10 minutes'
-                                   AND %(now)s + INTERVAL '5 minutes'
+           AND stock.base_dttm <= %(now)s + INTERVAL '5 minutes'
+           AND (
+               %(allow_stale)s
+               OR stock.base_dttm >= %(now)s - INTERVAL '10 minutes'
+           )
         """,
-        {"sta_id": sta_id, "now": now},
+        {"sta_id": sta_id, "now": now, "allow_stale": allow_stale},
     )
 
 
@@ -210,8 +223,13 @@ def _read_forecast_snapshot(
     return station, demand_summary, points, stock
 
 
-def fetch_forecast(sta_id: str, now: datetime) -> ForecastResult:
-    """대여소의 정렬된 미래 12시간 수요예측과 같은 anchor 재고를 판정한다."""
+def fetch_forecast(
+    sta_id: str,
+    now: datetime,
+    *,
+    allow_stale: bool = False,
+) -> ForecastResult:
+    """대여소의 완전한 12시간 수요예측과 같은 anchor 재고를 판정한다."""
     station, summary, points, stock = _read_forecast_snapshot(sta_id)
     if station is None:
         return ForecastResult(ForecastState.STATION_NOT_FOUND)
@@ -220,7 +238,8 @@ def fetch_forecast(sta_id: str, now: datetime) -> ForecastResult:
     if (
         summary["row_cnt"] == 0
         or common_base != summary["max_base_dttm"]
-        or not _is_fresh(common_base, now, DEMAND_FRESHNESS)
+        or common_base > now + FUTURE_TOLERANCE
+        or (not allow_stale and not _is_fresh(common_base, now, DEMAND_FRESHNESS))
     ):
         return ForecastResult(ForecastState.FORECAST_NOT_READY)
 
@@ -236,7 +255,7 @@ def fetch_forecast(sta_id: str, now: datetime) -> ForecastResult:
         len(points) != FORECAST_HOUR_COUNT
         or any(point["base_dttm"] != common_base for point in points)
         or actual_targets != expected_targets
-        or any(target <= now for target in actual_targets)
+        or (not allow_stale and any(target <= now for target in actual_targets))
     ):
         return ForecastResult(ForecastState.FORECAST_NOT_READY)
 
@@ -244,7 +263,10 @@ def fetch_forecast(sta_id: str, now: datetime) -> ForecastResult:
         stock is None
         or stock["base_dttm"] != common_base
         or station["last_seen_dttm"] != stock["base_dttm"]
-        or not _is_fresh(stock["base_dttm"], now, STOCK_FRESHNESS)
+        or (
+            not allow_stale
+            and not _is_fresh(stock["base_dttm"], now, STOCK_FRESHNESS)
+        )
     ):
         return ForecastResult(ForecastState.STOCK_NOT_ALIGNED)
 
@@ -290,12 +312,261 @@ def fetch_status_base_dttm(now: datetime) -> datetime | None:
     return base_dttm
 
 
+def _publication_state(
+    row: dict[str, Any] | None,
+    now: datetime,
+    *,
+    freshness: timedelta,
+    expiry: timedelta | None = SERVING_EXPIRY,
+) -> dict[str, Any]:
+    """publication row를 프런트 공통 상태로 변환한다."""
+    if row is None or row.get("logical_dttm") is None:
+        return {
+            "state": "missing",
+            "data_dttm": None,
+            "age_minutes": None,
+            "reason": "not_published",
+        }
+    logical_dttm = row["logical_dttm"]
+    age_minutes = max(0.0, (now - logical_dttm).total_seconds() / 60.0)
+    if _is_fresh(logical_dttm, now, freshness):
+        state = "ready"
+        reason = "fresh"
+    elif expiry is not None and now - logical_dttm > expiry:
+        state = "expired"
+        reason = "publication_expired"
+    else:
+        state = "stale"
+        reason = "publication_stale"
+    return {
+        "state": state,
+        "data_dttm": logical_dttm,
+        "age_minutes": round(age_minutes, 1),
+        "reason": reason,
+    }
+
+
+def _dispatch_health_components(
+    by_key: dict[str, dict[str, Any]],
+    now: datetime,
+) -> tuple[dict[str, dict[str, Any]], bool]:
+    """신규 작업 승인에 필요한 핵심 publication의 상태와 정합성을 판정한다."""
+    station = by_key.get("station")
+    stock = by_key.get("station_stock")
+    stock_component = _publication_state(
+        stock,
+        now,
+        freshness=STOCK_FRESHNESS,
+    )
+    if station is None or stock is None:
+        stock_component = _publication_state(None, now, freshness=STOCK_FRESHNESS)
+    elif (
+        station["logical_dttm"] != stock["logical_dttm"]
+        and stock_component["state"] not in {"missing", "expired"}
+    ):
+        stock_component = {
+            **stock_component,
+            "state": "misaligned",
+            "reason": "station_stock_anchor_mismatch",
+        }
+
+    components = {
+        "stock": stock_component,
+        "demand": _publication_state(
+            by_key.get("station_demand_forecast"),
+            now,
+            freshness=DEMAND_FRESHNESS,
+        ),
+        "urgency": _publication_state(
+            by_key.get("station_urgency"),
+            now,
+            freshness=URGENCY_FRESHNESS,
+            expiry=URGENCY_EXPIRY,
+        ),
+        "routes": _publication_state(
+            by_key.get("rebalance_route"),
+            now,
+            freshness=URGENCY_FRESHNESS,
+        ),
+    }
+    dispatch_times = [component["data_dttm"] for component in components.values()]
+    can_dispatch = (
+        all(component["state"] == "ready" for component in components.values())
+        and len(set(dispatch_times)) == 1
+    )
+    if not can_dispatch and all(
+        component["state"] == "ready" for component in components.values()
+    ):
+        components = {
+            key: {
+                **component,
+                "state": "misaligned",
+                "reason": "operational_anchor_mismatch",
+            }
+            for key, component in components.items()
+        }
+    return components, can_dispatch
+
+
+def fetch_serving_health(now: datetime) -> dict[str, Any]:
+    """publication state와 실제 날씨 horizon으로 대시보드 서빙 상태를 판정한다."""
+    rows = fetch_all(
+        """
+        WITH desired(publication_key) AS (
+            VALUES ('dispatch_center'),
+                   ('station'),
+                   ('station_stock'),
+                   ('station_demand_forecast'),
+                   ('station_urgency'),
+                   ('rebalance_route'),
+                   ('weather_forecast'),
+                   ('event:cultural_event'),
+                   ('event:performance_event')
+        ),
+        weather_horizon AS (
+            SELECT COUNT(*) AS weather_row_cnt,
+                   MIN(wf.base_dttm) AS oldest_weather_issue_dttm,
+                   (
+                       SELECT COUNT(DISTINCT weather_grid_id) * %(forecast_hours)s
+                         FROM station
+                        WHERE is_active
+                   ) AS expected_weather_row_cnt,
+                   COALESCE(
+                       BOOL_AND(
+                           CASE wf.source_product_cd
+                               WHEN 'ultra_short' THEN
+                                   wf.base_dttm BETWEEN %(now)s - INTERVAL '2 hours'
+                                                       AND %(now)s + INTERVAL '5 minutes'
+                               WHEN 'short_term' THEN
+                                   wf.base_dttm BETWEEN %(now)s - INTERVAL '4 hours'
+                                                       AND %(now)s + INTERVAL '5 minutes'
+                               ELSE FALSE
+                           END
+                       ),
+                       FALSE
+                   ) AS weather_rows_fresh
+              FROM weather_forecast AS wf
+             WHERE wf.forecast_dttm >= date_trunc('hour', %(now)s::TIMESTAMPTZ)
+                                           + INTERVAL '1 hour'
+               AND wf.forecast_dttm < date_trunc('hour', %(now)s::TIMESTAMPTZ)
+                                           + (%(forecast_hours)s + 1) * INTERVAL '1 hour'
+        )
+        SELECT desired.publication_key,
+               state.logical_dttm,
+               state.published_row_cnt,
+               weather.weather_row_cnt,
+               weather.expected_weather_row_cnt,
+               weather.weather_rows_fresh,
+               weather.oldest_weather_issue_dttm
+          FROM desired
+          LEFT JOIN gold_meta.publication_state AS state USING (publication_key)
+         CROSS JOIN weather_horizon AS weather
+         ORDER BY desired.publication_key
+        """,
+        {"now": now, "forecast_hours": FORECAST_HOUR_COUNT},
+    )
+    by_key = {row["publication_key"]: row for row in rows}
+
+    dispatch_components, can_dispatch = _dispatch_health_components(by_key, now)
+    weather_row = by_key.get("weather_forecast")
+    weather_component = _publication_state(
+        weather_row,
+        now,
+        freshness=DEMAND_FRESHNESS,
+    )
+    if weather_row is not None:
+        weather_component["source_dttm"] = weather_row["oldest_weather_issue_dttm"]
+    if weather_row is not None and weather_component["state"] == "ready":
+        complete = weather_row["weather_row_cnt"] == weather_row["expected_weather_row_cnt"]
+        if not complete:
+            weather_component = {
+                **weather_component,
+                "state": "misaligned",
+                "reason": "weather_horizon_incomplete",
+            }
+        elif not weather_row["weather_rows_fresh"]:
+            weather_component = {
+                **weather_component,
+                "state": "stale",
+                "reason": "weather_issue_stale",
+            }
+
+    event_rows = [
+        by_key.get("event:cultural_event"),
+        by_key.get("event:performance_event"),
+    ]
+    event_parts = [
+        _publication_state(row, now, freshness=EVENT_FRESHNESS, expiry=None)
+        for row in event_rows
+    ]
+    event_component = min(
+        event_parts,
+        key=lambda item: {
+            "missing": 0,
+            "expired": 1,
+            "misaligned": 2,
+            "stale": 3,
+            "ready": 4,
+        }[item["state"]],
+    )
+    event_times = [item["data_dttm"] for item in event_parts if item["data_dttm"]]
+    if event_times:
+        event_component = {
+            **event_component,
+            "data_dttm": min(event_times),
+            "age_minutes": round((now - min(event_times)).total_seconds() / 60.0, 1),
+            "reason": (
+                "fresh" if all(item["state"] == "ready" for item in event_parts)
+                else "event_source_incomplete"
+            ),
+        }
+
+    region_row = by_key.get("dispatch_center")
+    region_component = {
+        **_publication_state(region_row, now, freshness=timedelta(days=36500), expiry=None),
+        "reason": "fresh" if region_row and region_row["published_row_cnt"] > 0 else "not_published",
+    }
+    if region_row is None or region_row["published_row_cnt"] <= 0:
+        region_component["state"] = "missing"
+
+    components = {
+        **dispatch_components,
+        "weather": weather_component,
+        "events": event_component,
+        "regions": region_component,
+    }
+
+    stock_time = components["stock"]["data_dttm"]
+    demand_time = components["demand"]["data_dttm"]
+    operational_base = stock_time if stock_time is not None and stock_time == demand_time else None
+    core_unavailable = any(
+        components[key]["state"] in {"missing", "expired"}
+        for key in ("stock", "demand")
+    )
+    overall = (
+        "unavailable"
+        if core_unavailable
+        else "healthy"
+        if all(component["state"] == "ready" for component in components.values())
+        else "degraded"
+    )
+    return {
+        "overall": overall,
+        "operational_base_dttm": operational_base,
+        "checked_at": now,
+        "can_dispatch_new_routes": can_dispatch,
+        "components": components,
+    }
+
+
 def fetch_nearby_events(
     sta_id: str,
     now: datetime,
     radius_km: float = NEARBY_EVENT_RADIUS_KM,
+    *,
+    allow_stale: bool = False,
 ) -> list[dict[str, Any]] | None:
-    """활성 station 주변의 신선한 현재·예정 행사를 PostGIS 거리순으로 반환한다.
+    """활성 station 주변의 현재·예정 행사를 freshness 옵션에 맞춰 반환한다.
 
     활성 station이 없으면 None을 반환하고, station은 있지만 행사가 없으면 빈 목록을
     반환해 API가 404와 정상 EMPTY를 구분할 수 있게 한다.
@@ -339,11 +610,19 @@ def fetch_nearby_events(
              WHERE s.sta_id = %(sta_id)s
                AND s.is_active
                AND e.event_end_dt >= (%(now)s AT TIME ZONE 'Asia/Seoul')::date
-               AND e.last_seen_dttm BETWEEN %(now)s - INTERVAL '36 hours'
-                                            AND %(now)s + INTERVAL '5 minutes'
+               AND e.last_seen_dttm <= %(now)s + INTERVAL '5 minutes'
+               AND (
+                   %(allow_stale)s
+                   OR e.last_seen_dttm >= %(now)s - INTERVAL '36 hours'
+               )
              ORDER BY distance_km, e.event_id
             """,
-            {"sta_id": sta_id, "now": now, "radius_m": radius_km * 1000.0},
+            {
+                "sta_id": sta_id,
+                "now": now,
+                "radius_m": radius_km * 1000.0,
+                "allow_stale": allow_stale,
+            },
         )
         events = cursor.fetchall()
     return [
@@ -408,8 +687,10 @@ def fetch_weather(
     sta_id: str,
     now: datetime,
     hours: int = FORECAST_HOUR_COUNT,
+    *,
+    allow_stale: bool = False,
 ) -> WeatherResult:
-    """활성 대여소의 fresh하고 완전한 미래 정시 날씨를 반환한다."""
+    """활성 대여소의 미래 정시 날씨를 freshness 옵션에 맞춰 반환한다."""
     station_exists, rows = _read_weather_snapshot(sta_id, now, hours)
     if not station_exists:
         return WeatherResult(WeatherState.STATION_NOT_FOUND)
@@ -418,10 +699,17 @@ def fetch_weather(
     expected_targets = [
         first_target + timedelta(hours=offset) for offset in range(hours)
     ]
-    if (
-        len(rows) != hours
-        or [row["forecast_dttm"] for row in rows] != expected_targets
-        or any(not _is_forecast_issue_fresh(row, now) for row in rows)
+    actual_targets = [row["forecast_dttm"] for row in rows]
+    expected_available_targets = expected_targets[: len(rows)]
+    invalid_shape = (
+        not rows
+        or actual_targets != expected_available_targets
+        or any(row["base_dttm"] > now + FUTURE_TOLERANCE for row in rows)
+        or (not allow_stale and len(rows) != hours)
+    )
+    if invalid_shape or (
+        not allow_stale
+        and any(not _is_forecast_issue_fresh(row, now) for row in rows)
     ):
         return WeatherResult(WeatherState.WEATHER_NOT_READY)
 
@@ -454,7 +742,7 @@ def fetch_regions() -> list[dict[str, Any]]:
     )
 
 
-def fetch_alerts(now: datetime) -> list[dict[str, Any]]:
+def fetch_alerts(now: datetime, *, include_expired: bool = False) -> list[dict[str, Any]]:
     """마지막 완전 성공 urgency snapshot을 freshness 정책 안에서 반환한다.
 
     계산용 current stock/demand와 다시 조인하지 않는다. ``publication_state``가
@@ -515,7 +803,7 @@ def fetch_alerts(now: datetime) -> list[dict[str, Any]]:
         {
             "now": now,
             "freshness": URGENCY_FRESHNESS,
-            "expiry": URGENCY_EXPIRY,
+            "expiry": timedelta(days=36500) if include_expired else URGENCY_EXPIRY,
             "future_tolerance": FUTURE_TOLERANCE,
         },
     )
@@ -672,50 +960,105 @@ def _transition_route(
             get_connection() as connection,
             connection.cursor(row_factory=dict_row) as cursor,
         ):
-            cursor.execute(
-                f"""
-                UPDATE rebalance_route
-                   SET route_status_cd = %(next_status)s,
-                       {timestamp_column} = %(now)s
-                 WHERE route_id = %(route_id)s
-                   AND route_status_cd = %(expected_status)s
-                RETURNING route_id
-                """,
-                {
-                    "route_id": route_id,
-                    "now": now,
-                    "expected_status": expected_status,
-                    "next_status": next_status,
-                },
+            return _transition_route_with_cursor(
+                cursor,
+                route_id,
+                now,
+                expected_status=expected_status,
+                next_status=next_status,
+                timestamp_column=timestamp_column,
             )
-            if cursor.fetchone() is None:
-                cursor.execute(
-                    "SELECT route_status_cd FROM rebalance_route WHERE route_id = %(route_id)s",
-                    {"route_id": route_id},
-                )
-                if cursor.fetchone() is None:
-                    return RouteTransitionResult.NOT_FOUND
-                return RouteTransitionResult.WRONG_STATUS
-            route = _fetch_route_with_cursor(cursor, route_id)
-            if route is None:
-                raise RuntimeError("상태 전이 직후 route aggregate를 찾을 수 없습니다.")
-            return route
     except CheckViolation:
         return RouteTransitionResult.CONSTRAINT_CONFLICT
+
+
+def _transition_route_with_cursor(
+    cursor: Cursor[dict[str, Any]],
+    route_id: UUID,
+    now: datetime,
+    *,
+    expected_status: str,
+    next_status: str,
+    timestamp_column: str,
+) -> dict[str, Any] | RouteTransitionResult:
+    """주어진 transaction cursor에서 route 상태를 전이하고 aggregate를 반환한다."""
+    cursor.execute(
+        f"""
+        UPDATE rebalance_route
+           SET route_status_cd = %(next_status)s,
+               {timestamp_column} = %(now)s
+         WHERE route_id = %(route_id)s
+           AND route_status_cd = %(expected_status)s
+        RETURNING route_id
+        """,
+        {
+            "route_id": route_id,
+            "now": now,
+            "expected_status": expected_status,
+            "next_status": next_status,
+        },
+    )
+    if cursor.fetchone() is None:
+        cursor.execute(
+            "SELECT route_status_cd FROM rebalance_route WHERE route_id = %(route_id)s",
+            {"route_id": route_id},
+        )
+        if cursor.fetchone() is None:
+            return RouteTransitionResult.NOT_FOUND
+        return RouteTransitionResult.WRONG_STATUS
+    route = _fetch_route_with_cursor(cursor, route_id)
+    if route is None:
+        raise RuntimeError("상태 전이 직후 route aggregate를 찾을 수 없습니다.")
+    return route
+
+
+def _fetch_dispatch_publications(
+    cursor: Cursor[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """승인 transaction의 snapshot에서 핵심 publication 상태를 조회한다."""
+    cursor.execute(
+        """
+        SELECT publication_key,
+               logical_dttm,
+               published_row_cnt
+          FROM gold_meta.publication_state
+         WHERE publication_key IN (
+             'station',
+             'station_stock',
+             'station_demand_forecast',
+             'station_urgency',
+             'rebalance_route'
+         )
+         FOR SHARE
+        """
+    )
+    return {row["publication_key"]: row for row in cursor.fetchall()}
 
 
 def dispatch_route(
     route_id: UUID,
     now: datetime,
 ) -> dict[str, Any] | RouteTransitionResult:
-    """route를 proposed에서 dispatched로 원자 전이한다."""
-    return _transition_route(
-        route_id,
-        now,
-        expected_status="proposed",
-        next_status="dispatched",
-        timestamp_column="dispatched_dttm",
-    )
+    """핵심 publication을 잠근 동일 transaction에서 route를 원자 승인한다."""
+    try:
+        with (
+            get_connection() as connection,
+            connection.cursor(row_factory=dict_row) as cursor,
+        ):
+            by_key = _fetch_dispatch_publications(cursor)
+            _, can_dispatch = _dispatch_health_components(by_key, now)
+            if not can_dispatch:
+                return RouteTransitionResult.SERVING_NOT_READY
+            return _transition_route_with_cursor(
+                cursor,
+                route_id,
+                now,
+                expected_status="proposed",
+                next_status="dispatched",
+                timestamp_column="dispatched_dttm",
+            )
+    except CheckViolation:
+        return RouteTransitionResult.CONSTRAINT_CONFLICT
 
 
 def complete_route(
