@@ -1386,17 +1386,9 @@ body {
   stroke: var(--status-warning);
 }
 
-.stock-donut-overflow-track,
-.stock-donut-overflow-value {
-  stroke-width: 2;
-}
-
-.stock-donut-overflow-track {
-  stroke: var(--gridline);
-}
-
 .stock-donut-overflow-value {
   stroke: #00a878;
+  stroke-width: 5;
   stroke-linecap: round;
 }
 

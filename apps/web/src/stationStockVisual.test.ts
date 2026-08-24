@@ -7,25 +7,29 @@ describe("stationStockVisual", () => {
     [4, 10, "warning", 40, 0, 40],
     [5, 10, "normal", 50, 0, 50],
     [10, 10, "normal", 100, 0, 100],
-    [13, 10, "overflow", 100, 30, 130],
+    [13, 10, "overflow", 100, 11, 130],
+    [20, 10, "overflow", 100, 30, 200],
+    [30, 10, "overflow", 100, 48, 300],
+    [50, 10, "overflow", 100, 70, 500],
+    [100, 10, "overflow", 100, 100, 1000],
   ] as const)(
-    "현재 %d대/정원 %d대를 %s 내부·초과 링으로 표시한다",
-    (current, capacity, band, capacityPercent, overflowPercent, ratioPercent) => {
+    "현재 %d대/정원 %d대를 %s 기본·초과 호로 표시한다",
+    (current, capacity, band, capacityPercent, overflowArcPercent, ratioPercent) => {
       expect(stationStockVisual(current, capacity)).toEqual({
         band,
         capacityPercent,
-        overflowPercent,
+        overflowArcPercent,
         ratioPercent,
       });
     },
   );
 
-  it("200%가 넘는 초과량은 외부 링을 가득 채우고 숫자는 실제 비율을 유지한다", () => {
-    expect(stationStockVisual(33, 10)).toEqual({
+  it("1000%가 넘으면 진초록 호만 상한에 고정하고 숫자는 실제 비율을 유지한다", () => {
+    expect(stationStockVisual(120, 10)).toEqual({
       band: "overflow",
       capacityPercent: 100,
-      overflowPercent: 100,
-      ratioPercent: 330,
+      overflowArcPercent: 100,
+      ratioPercent: 1200,
     });
   });
 
@@ -33,7 +37,7 @@ describe("stationStockVisual", () => {
     expect(stationStockVisual(3, 0)).toEqual({
       band: "normal",
       capacityPercent: 0,
-      overflowPercent: 0,
+      overflowArcPercent: 0,
       ratioPercent: 0,
     });
   });

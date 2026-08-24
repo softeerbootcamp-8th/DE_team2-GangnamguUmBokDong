@@ -70,23 +70,22 @@ function StockDonut({ current, capacity }: { current: number; capacity: number }
           pathLength="100"
           strokeDasharray={`${visual.capacityPercent} 100`}
         />
-        {visual.overflowPercent > 0 && (
-          <>
-            <circle className="stock-donut-overflow-track" cx="21" cy="21" r="20" />
-            <circle
-              className="stock-donut-overflow-value"
-              cx="21"
-              cy="21"
-              r="20"
-              pathLength="100"
-              strokeDasharray={`${visual.overflowPercent} 100`}
-            />
-          </>
+        {visual.overflowArcPercent > 0 && (
+          <circle
+            className="stock-donut-overflow-value"
+            cx="21"
+            cy="21"
+            r="16"
+            pathLength="100"
+            strokeDasharray={`${visual.overflowArcPercent} 100`}
+          />
         )}
       </svg>
       <span className="stock-donut-number">
         <strong>{current}</strong>
-        <small>/ {capacity}대</small>
+        <small>
+          / {capacity}대{visual.band === "overflow" ? ` · ${visual.ratioPercent}%` : ""}
+        </small>
       </span>
     </div>
   );

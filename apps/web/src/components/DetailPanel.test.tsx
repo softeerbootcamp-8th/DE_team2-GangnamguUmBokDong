@@ -129,11 +129,14 @@ describe("DetailPanel stale state", () => {
       name: "현재 자전거 13대, 거치대 10대, 재고율 130%",
     });
     expect(donut.getAttribute("data-stock-band")).toBe("overflow");
+    expect(donut.querySelector(".stock-donut-track")?.getAttribute("r")).toBe("16");
     expect(donut.querySelector(".stock-donut-value")?.getAttribute("stroke-dasharray"))
       .toBe("100 100");
-    expect(donut.querySelector(".stock-donut-overflow-track")?.getAttribute("r")).toBe("20");
+    expect(donut.querySelector(".stock-donut-overflow-track")).toBeNull();
+    expect(donut.querySelector(".stock-donut-overflow-value")?.getAttribute("r")).toBe("16");
     expect(donut.querySelector(".stock-donut-overflow-value")?.getAttribute("stroke-dasharray"))
-      .toBe("30 100");
+      .toBe("11 100");
+    expect(screen.getByText("/ 10대 · 130%")).not.toBeNull();
   });
 
   it("station polling 실패 뒤 이전 상세를 경고와 함께 유지한다", async () => {
