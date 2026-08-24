@@ -10,8 +10,11 @@ from __future__ import annotations
 
 import io
 import json
+import re
+import zipfile
 from datetime import datetime
 from pathlib import Path
+from xml.etree import ElementTree
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -34,6 +37,42 @@ from manifest import RunStatus
 KST = ZoneInfo("Asia/Seoul")
 SOURCES_DIR = Path(__file__).resolve().parent.parent / "sources"
 SOURCE_IDS = sorted(p.stem for p in SOURCES_DIR.glob("*.yaml"))
+OFFICIAL_POI_LIST = (
+    Path(__file__).resolve().parents[2]
+    / "normalizer"
+    / "data"
+    / "서울시 주요 121장소 목록.xlsx"
+)
+
+
+def _official_poi_codes() -> frozenset[str]:
+    """저장소에 고정한 서울시 공식 XLSX에서 AREA_CD 집합을 읽는다."""
+    namespace = {"main": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+    with zipfile.ZipFile(OFFICIAL_POI_LIST) as workbook:
+        shared_strings: list[str] = []
+        if "xl/sharedStrings.xml" in workbook.namelist():
+            shared_root = ElementTree.fromstring(
+                workbook.read("xl/sharedStrings.xml")
+            )
+            shared_strings = [
+                "".join(node.text or "" for node in item.findall(".//main:t", namespace))
+                for item in shared_root.findall("main:si", namespace)
+            ]
+
+        sheet = ElementTree.fromstring(
+            workbook.read("xl/worksheets/sheet1.xml")
+        )
+        values: list[str] = []
+        for cell in sheet.findall(".//main:c", namespace):
+            value_node = cell.find("main:v", namespace)
+            if value_node is None or value_node.text is None:
+                continue
+            value = value_node.text
+            if cell.get("t") == "s":
+                value = shared_strings[int(value)]
+            values.append(value)
+
+    return frozenset(value for value in values if re.fullmatch(r"POI\d{3}", value))
 
 
 @pytest.fixture(autouse=True)
@@ -185,14 +224,33 @@ class TestAllSourcesLoad:
             "max": 127.5,
         }
 
-    def test_population_realtime_covers_current_121_pois(self):
+    def test_population_realtime_matches_official_poi_list(self):
+        """실시간 인구 요청 대상을 저장소의 서울시 공식 목록과 동일하게 유지한다."""
         config = config_loader.load("population_realtime", base_dir=SOURCES_DIR)
 
         assert config.adapter_params["poi_start"] == 1
-        assert config.adapter_params["poi_end"] == 121
+        assert config.adapter_params["poi_end"] == 131
+        assert config.adapter_params["poi_exclude"] == [
+            22,
+            28,
+            57,
+            62,
+            65,
+            69,
+            75,
+            97,
+            99,
+            113,
+        ]
         assert config.adapter_params["concurrency"] == 8
         assert config.adapter_params["root_key_literal"] is True
         assert config.adapter_params["flatten_forecast"] is True
+        planned = seoul_openapi.SeoulOpenApiAdapter.planned_parts(
+            config, window=None
+        )
+        assert planned is not None
+        planned_codes = {part.removeprefix("poi-") for part in planned}
+        assert planned_codes == _official_poi_codes()
 
     def test_population_realtime_declares_all_twelve_forecast_slots(self):
         """어댑터가 평탄화한 `FCST_n_*` 컬럼이 전부 선언돼 있어야 silver까지 살아 남는다."""
@@ -242,6 +300,26 @@ class TestAllSourcesLoad:
                 "root_key": "SeoulRtd.citydata_ppltn",
                 "poi_start": 10,
                 "poi_end": 9,
+            },
+            {
+                "service": "citydata_ppltn",
+                "page_size": 1000,
+                "root_key": "SeoulRtd.citydata_ppltn",
+                "root_key_literal": True,
+                "flatten_forecast": True,
+                "poi_start": 1,
+                "poi_end": 131,
+                "poi_exclude": [22, 22],
+            },
+            {
+                "service": "citydata_ppltn",
+                "page_size": 1000,
+                "root_key": "SeoulRtd.citydata_ppltn",
+                "root_key_literal": True,
+                "flatten_forecast": True,
+                "poi_start": 1,
+                "poi_end": 131,
+                "poi_exclude": [132],
             },
         ],
     )

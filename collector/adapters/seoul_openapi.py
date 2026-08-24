@@ -642,6 +642,31 @@ def _fetch_probe_pages(
         page_start += page_size
 
 
+def _population_poi_numbers(params: dict) -> tuple[int, ...]:
+    """설정 범위에서 명시된 결번을 제외한 POI 번호를 반환한다."""
+    poi_start = int(params.get("poi_start", 1))
+    poi_end = int(params["poi_end"])
+    raw_exclude = params.get("poi_exclude", [])
+    if poi_start < 1 or poi_end < poi_start:
+        raise ValueError("citydata_ppltn의 poi_start/poi_end 범위가 올바르지 않습니다")
+    if not isinstance(raw_exclude, list) or any(
+        not isinstance(value, int) or isinstance(value, bool)
+        for value in raw_exclude
+    ):
+        raise ValueError("citydata_ppltn의 poi_exclude는 정수 목록이어야 합니다")
+    excluded = frozenset(raw_exclude)
+    if len(excluded) != len(raw_exclude) or any(
+        value < poi_start or value > poi_end for value in excluded
+    ):
+        raise ValueError("citydata_ppltn의 poi_exclude가 올바르지 않습니다")
+    numbers = tuple(
+        value for value in range(poi_start, poi_end + 1) if value not in excluded
+    )
+    if not numbers:
+        raise ValueError("citydata_ppltn의 POI 요청 대상이 비어 있습니다")
+    return numbers
+
+
 @adapter("seoul_openapi")
 class SeoulOpenApiAdapter:
     """서울 열린데이터광장 공용 페이지네이션 규약 어댑터."""
@@ -661,9 +686,9 @@ class SeoulOpenApiAdapter:
         params = config.adapter_params
         if params["service"] != "citydata_ppltn":
             return None
-        poi_start = int(params.get("poi_start", 1))
-        poi_end = int(params["poi_end"])
-        return frozenset(f"poi-POI{i:03d}" for i in range(poi_start, poi_end + 1))
+        return frozenset(
+            f"poi-POI{i:03d}" for i in _population_poi_numbers(params)
+        )
 
     @staticmethod
     def fetch(
@@ -693,17 +718,10 @@ class SeoulOpenApiAdapter:
                 window_last=window.window_start - timedelta(seconds=1),
             )
         # citydata_ppltn은 페이지네이션 대신 YAML에 선언된 POI 범위를 순회한다.
-        # 장소가 늘어날 때 공통 코드를 고치지 않고 poi_end만 갱신할 수 있게 한다.
+        # 장소가 늘거나 결번이 바뀔 때 공통 코드를 고치지 않고 설정만 갱신한다.
         if service == "citydata_ppltn":
-            poi_start = int(params.get("poi_start", 1))
-            poi_end = int(params["poi_end"])
-            if poi_start < 1 or poi_end < poi_start:
-                raise ValueError(
-                    "citydata_ppltn의 poi_start/poi_end 범위가 올바르지 않습니다"
-                )
-
             pois = []
-            for i in range(poi_start, poi_end + 1):
+            for i in _population_poi_numbers(params):
                 poi_id = f"POI{i:03d}"
                 key = f"poi-{poi_id}"
                 if key not in skip:

@@ -10,7 +10,9 @@ adapter_params:
   # FCST_PPLTN 중첩 배열을 Silver 검증용 FCST_n_* 스칼라 컬럼으로 펼친다.
   flatten_forecast: true
   poi_start: 1
-  poi_end: 121
+  poi_end: 131
+  # 공식 121개 장소 AREA_CD는 POI001~POI131 사이에 아래 10개 결번이 있다.
+  poi_exclude: [22, 28, 57, 62, 65, 69, 75, 97, 99, 113]
   # 5분마다 POI 121개를 각각 호출하므로 병렬 조회한다.
   concurrency: 8
 schedule: {interval: 5m}
