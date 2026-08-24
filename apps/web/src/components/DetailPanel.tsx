@@ -83,9 +83,7 @@ function StockDonut({ current, capacity }: { current: number; capacity: number }
       </svg>
       <span className="stock-donut-number">
         <strong>{current}</strong>
-        <small>
-          / {capacity}대{visual.band === "overflow" ? ` · ${visual.ratioPercent}%` : ""}
-        </small>
+        <small>/ {capacity}대</small>
       </span>
     </div>
   );

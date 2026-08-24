@@ -136,7 +136,8 @@ describe("DetailPanel stale state", () => {
     expect(donut.querySelector(".stock-donut-overflow-value")?.getAttribute("r")).toBe("16");
     expect(donut.querySelector(".stock-donut-overflow-value")?.getAttribute("stroke-dasharray"))
       .toBe("11 100");
-    expect(screen.getByText("/ 10대 · 130%")).not.toBeNull();
+    expect(screen.getByText("/ 10대")).not.toBeNull();
+    expect(screen.queryByText("130%")).toBeNull();
   });
 
   it("station polling 실패 뒤 이전 상세를 경고와 함께 유지한다", async () => {
