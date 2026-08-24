@@ -1,5 +1,7 @@
 # Gold 데이터 사전
 
+> **현재 계약:** Gold column의 의미와 단위 기준이다. 물리 type·key·constraint가 다르게 보이면 `target-schema.sql`을 우선한다. 코드 확인일: 2026-08-24.
+
 ## 적용 원칙
 
 이 문서는 대시보드 API와 재배치 운영이 직접 읽고 쓰는 `public` Gold RDS 10개
@@ -51,6 +53,8 @@
 | `proposed_dttm` | 재배치 경로가 제안된 일시 |
 | `dispatched_dttm` | 운영자가 경로 실행을 확정한 일시 |
 | `completed_dttm` | 경로 실행이 완료된 일시 |
+| `cancelled_dttm` | 실행 확정 후 경로가 취소된 일시 |
+| `dismissed_dttm` | 완료·취소 경로를 기본 목록에서 숨긴 일시 |
 | `logical_dttm` | publication의 최신성 비교 기준이 되는 논리 시각 |
 | `created_dttm` | DB 행이 처음 생성된 일시 |
 | `updated_dttm` | DB 행이 마지막으로 변경된 일시 |
@@ -394,23 +398,33 @@ batch가 소유하므로 Gold에 중복 저장하지 않는다. route producer�
 | `dispatched_dttm` | `TIMESTAMPTZ` | NULL | 운영 API | 실행 확정 일시 |
 | `completed_dttm` | `TIMESTAMPTZ` | NULL | 운영 API | 완료 일시 |
 | `cancelled_dttm` | `TIMESTAMPTZ` | NULL | 운영 API | 승인 후 취소 일시 |
+| `dismissed_dttm` | `TIMESTAMPTZ` | NULL | 운영 API | 완료·취소 경로의 목록 숨김 일시 |
+| `restored_from_route_id` | `UUID` | FK, NULL | 과거 복제형 복원 lineage | 원본 취소 경로 ID |
 | `created_dttm` | `TIMESTAMPTZ` | NOT NULL | DB default | 행 생성 일시 |
 | `updated_dttm` | `TIMESTAMPTZ` | NOT NULL | DB trigger | 상태 변경 일시 |
 
 상태는 `proposed`, `dispatched`, `completed`, `cancelled`다. INSERT는 활성 센터의
 `proposed`만 허용한다. 전이는 `proposed→dispatched→completed` 또는
-`proposed→dispatched↔cancelled`만 허용한다. 취소를 되돌릴 때는 동일 route의
-`cancelled_dttm`만 비우고 최초 `dispatched_dttm`을 보존한다. ID, 센터, 제안일시는
-불변이다. 삭제는 `proposed`만 가능하다.
+`proposed→dispatched↔cancelled`만 허용한다. `/restore`는 새 route를 복제하지 않고 동일
+route를 `cancelled→dispatched`로 되돌리며 `cancelled_dttm`만 비우고 최초
+`dispatched_dttm`과 stop을 보존한다. 따라서 현재 API 복원 경로의
+`restored_from_route_id`는 null이다. 이 컬럼과 self FK·open-child unique index는 과거
+복제형 복원 데이터의 lineage와 무결성을 보존하기 위한 호환 계약이다.
+
+`dismissed_dttm`은 `completed` 또는 `cancelled` 상태에서만 설정할 수 있고 종료 시각보다
+빠를 수 없다. 상태 전이와 같은 UPDATE에서 바꿀 수 없으며, dismiss된 route는 목록에서는
+제외되지만 ID 단건 조회에는 남는다. Route ID, 센터, 제안일시와 복원 원본은 INSERT 뒤
+불변이고 물리 삭제는 `proposed`만 가능하다.
 모든 일시는 유한하고 완료 시 `proposed_dttm <= dispatched_dttm <= completed_dttm`,
 취소 시 `proposed_dttm <= dispatched_dttm <= cancelled_dttm` 순서다.
 UUIDv5 namespace는 `d0d59897-9e72-541f-bb05-bd3d113c2639`다. name의 정확한 canonical JSON과
 회귀 UUID는 [publication-contract-v1.md](publication-contract-v1.md)를 따른다. center ID와
 후보의 동률 정렬 규칙은 원천-목표 매핑 문서를 따른다.
-route 목록은 `proposed|dispatched|completed|cancelled`만 status filter로 받고 기본 100·최대 500의
-`limit`, 0 이상의 `offset`, `(proposed_dttm DESC, route_id ASC)` 정렬을 사용한다. 상태 변경은
-expected status guarded UPDATE이고 없는 ID는 404, 상태 충돌은 409다. path ID는 API UUID
-타입으로 먼저 검증해 malformed 값은 422, 응답 UUID는 문자열이다.
+route 목록은 `proposed|dispatched|completed|cancelled`만 status filter로 받고 기본 100·최대
+500의 `limit`, 0 이상의 `offset`, `(proposed_dttm DESC, route_id ASC)` 정렬을 사용한다.
+Dismiss된 종료 route와 활성 복제형 복원 자식이 있는 원본은 기본 목록에서 제외한다. 상태
+변경은 expected status guarded UPDATE이고 없는 ID는 404, 상태·dismiss·constraint 충돌은
+409다. path ID는 API UUID 타입으로 먼저 검증해 malformed 값은 422, 응답 UUID는 문자열이다.
 route publication은 현재 station·demand·stock tuple과 urgency input의 동명 tuple이 같을
 때만 허용해 correction 뒤 오래된 urgency로 새 route를 만들지 않는다.
 
@@ -457,7 +471,7 @@ shared→route lock을 잡고, dispatch 전이는 활성 센터와 active/same-c
 | `event` | 원천별 현재·예정, 완전 snapshot reconcile |
 | `station_urgency` | 계산 가능 station 전체의 최신 완전 projection 원자 교체 |
 | `proposed` route·stop | 다음 성공 batch에서 aggregate 단위 원자 교체 |
-| terminal route·stop | archive 정책 구현 전까지 불변 보존 |
+| terminal route·stop | stop과 경로 identity는 보존하며, 종료 route는 dismiss할 수 있고 cancelled route는 동일 ID로 restore 가능 |
 | `gold_meta.publication_state` | key별 마지막 version/tombstone, 전진만 허용하고 삭제 금지 |
 
 ## 현행 이름·계약 교체
