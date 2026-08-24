@@ -233,6 +233,76 @@ def test_main_check_only_model_filtering(monkeypatch, capsys):
     assert data["results"][0]["model_name"] == "rental"
 
 
+def test_main_check_only_writes_result_to_s3_key(monkeypatch, capsys):
+    """--result-s3-key를 주면 EMR 스텝처럼 stdout을 못 읽는 호출부를 위해 같은
+    요약을 S3에도 써준다(월간 재학습 DAG가 스텝 완료 후 이 키를 읽는다)."""
+    mock_results = [
+        {
+            "model_name": "rental",
+            "needs_retrain": True,
+            "period": {"start": "2026-07-01", "end": "2026-07-31"},
+            "n_rows": 1000,
+            "baseline_deviance": 0.90,
+            "current_deviance": 1.05,
+            "deviance_relative_change": 0.16,
+            "baseline_coverage": 0.80,
+            "current_coverage": 0.79,
+            "coverage_drift": -0.01,
+            "reasons": ["deviance 16.7% 악화"],
+        },
+    ]
+    monkeypatch.setattr(mrc, "check_all_models", lambda as_of=None: mock_results)
+    monkeypatch.setattr(
+        "sys.argv",
+        ["monthly_retrain_check", "--check-only", "--result-s3-key", "models/training-runs/test/check.json"],
+    )
+
+    mrc.main()
+
+    written = s3_io.read_json("models/training-runs/test/check.json")
+    assert written["needs_retrain"] is True
+    assert written["retrain_models"] == ["rental"]
+
+
+def test_main_execute_writes_promotion_result_to_s3_key(monkeypatch):
+    """--execute --result-s3-key 실행 시 모델별 승격 여부를 S3에 기록한다."""
+    mock_results = [
+        {
+            "model_name": "rental",
+            "needs_retrain": True,
+            "period": {"start": "2026-07-01", "end": "2026-07-31"},
+            "n_rows": 1000,
+            "baseline_deviance": 0.90,
+            "current_deviance": 1.05,
+            "deviance_relative_change": 0.16,
+            "baseline_coverage": 0.80,
+            "current_coverage": 0.79,
+            "coverage_drift": -0.01,
+            "reasons": ["deviance 16.7% 악화"],
+        },
+    ]
+    monkeypatch.setattr(mrc, "check_all_models", lambda as_of=None: mock_results)
+    monkeypatch.setattr(mrc, "_load_baseline_metrics", lambda model_name: None)
+    monkeypatch.setattr(mrc, "_attempt_promotion", lambda *args, **kwargs: True)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "monthly_retrain_check",
+            "--execute",
+            "--skip-feature-pipeline",
+            "--profile-name",
+            "builtin-default",
+            "--result-s3-key",
+            "models/training-runs/test/execute.json",
+        ],
+    )
+
+    mrc.main()
+
+    written = s3_io.read_json("models/training-runs/test/execute.json")
+    assert written["promoted"] == {"rental": True}
+    assert written["target_models"] == ["rental"]
+
 
 def test_candidate_profiles_model_specific_filtering(monkeypatch):
     """대여 모델은 rental_* 프로필을 우선하고 return_*을 제외하며, 반납 모델은 반대로 동작한다."""

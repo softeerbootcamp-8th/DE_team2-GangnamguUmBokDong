@@ -31,25 +31,40 @@ SynapseML(LightGBM-on-Spark)도 검토했지만 채택하지 않았었다(histor
 최근 N개월만 자른다"는 원칙은 유지하고, 그 잘린 데이터를 여러 머신에 나눠
 학습 속도/메모리를 더 아끼는 용도로 쓴다.
 
-## 1-1. LightGBM 분산 학습(Socket) — 코드는 준비, 인프라는 아직
+## 1-1. LightGBM 분산 학습(Socket) — YARN Distributed Shell로 워커 기동
 
 `train_common.py`는 `training/config.py`의 환경변수(`LGB_TREE_LEARNER`,
 `LGB_NUM_MACHINES`, `LGB_MACHINE_RANK`, `LGB_MACHINES`, `LGB_LOCAL_LISTEN_PORT`,
 `LGB_TIME_OUT`)로 LightGBM 자체 분산 학습(`tree_learner="data"`/`"voting"`)을
-켤 수 있다. 기본값은 `LGB_TREE_LEARNER="serial"`(단일 머신) — 워커 인프라가
-아직 없어서(2026-08 기준) 코드만 먼저 준비해둔 상태다.
+켠다. 기본값(`LGB_TREE_LEARNER="serial"`)은 여전히 기존과 동일한 단일 머신
+학습이고, 분산은 명시적으로 켜야 한다.
 
 - **왜 SynapseML이 아니라 LightGBM 자체 분산인가**: SynapseML은 `VectorAssembler`로
   피처를 재조립해야 하고, 이 프로젝트 핵심인 exposure offset(`init_score`,
   §2 참고) 우회 구현이 필요해 리스크가 컸다. LightGBM 자체 분산은 지금
   `train_common.py`의 `lgb.Dataset`/`lgb.train` 호출에 파라미터만 얹으면 되고
   offset 로직을 그대로 재사용할 수 있다.
+- **워커를 어떻게 띄우는가(YARN Distributed Shell)**: 학습용 EC2가 없어지고
+  EMR도 m4.large만 허용되는 제약에서, SSM은 이 계정 SCP가 전면 차단하고
+  SSH도 자동화하려면 SSM만큼의 신규 인프라가 필요해서 둘 다 안 쓴다. 대신
+  피처마트 Spark 잡과 똑같은 경로(EMR Step)로 YARN Distributed Shell을
+  제출해 `LGB_NUM_MACHINES`개 컨테이너를 core 노드에 뿌린다 — 각 컨테이너의
+  진입점은 `training/scripts/yarn_worker_bootstrap.py`로, 자기 host:port를
+  S3의 정해진 위치에 등록하고 전체가 다 모일 때까지 기다린(barrier) 뒤 자기
+  `LGB_MACHINE_RANK`와 전체 `LGB_MACHINES` 문자열을 계산해 실제 학습 스크립트를
+  실행한다(YARN은 컨테이너 배치만 해줄 뿐 서로의 주소를 알려주는 기능은 없어
+  이 등록/barrier는 직접 구현했다). 배경과 대안 비교는
+  [ADR-0007](../../adr/0007-yarn-distributed-shell-workers.md) 참고.
 - **데이터 분배(data-parallel)**: LightGBM 소켓 분산은 전체 데이터를 자동으로
   나눠주지 않는다 — 각 머신이 미리 자기 몫만 들고 `lgb.train()`을 호출해야
-  한다. `train_common._shard_for_this_machine()`이 `station_id`를 `zlib.crc32`
-  해시로 머신 수만큼 나눠 배정한다(날짜 범위는 모든 머신에 동일 — station
-  집합만 갈림). `hash()` 내장 함수는 안 씀 — `PYTHONHASHSEED`가 프로세스마다
-  달라 머신 간 배정이 어긋날 수 있음.
+  한다. `lazy_train_dataset._shard_for_this_machine()`이 `station_no`를
+  `zlib.crc32` 해시로 머신 수만큼 나눠 배정한다(날짜 범위는 모든 머신에 동일 —
+  station 집합만 갈림). `hash()` 내장 함수는 안 씀 — `PYTHONHASHSEED`가
+  프로세스마다 달라 머신 간 배정이 어긋날 수 있음. **단, station_no
+  `CategoricalDtype`을 고정하는 `station_categories_for_dates()` 호출은 이
+  샤딩과 무관하게 항상 전체 station 목록을 스캔한다** — 머신마다 다른
+  station 부분집합만 보고 카테고리를 고정하면 머신 간 카테고리 코드가
+  어긋나서 `inference`가 조용히 잘못된 station을 읽게 된다.
 - **모든 머신이 `lgb.train()`을 같은 횟수만큼 호출해야 함**: 소켓 핸드셰이크가
   전 머신 동기 호출을 전제로 하므로, Poisson + quantile 3개 총 4번의
   `lgb.train()` 호출을 어느 머신도 건너뛰면 안 된다(중간에 `return`하면 다른
@@ -61,10 +76,11 @@ SynapseML(LightGBM-on-Spark)도 검토했지만 채택하지 않았었다(histor
   전체가 아니라 대표 머신(rank 0)의 station 샤드만으로 계산된다 — 여러 머신의
   conformity score를 모아 합치려면 LightGBM 소켓 프로토콜 밖의 별도 집계 단계가
   필요해 지금은 범위 밖으로 남겨뒀다.
-- **아직 안 한 것**: 실제 워커 인프라(머신 IP/포트, 방화벽/보안그룹, 동시 기동
-  스크립트)는 준비되지 않았다 — 지금은 `LGB_NUM_MACHINES=1`(기본값)로 기존과
-  동일하게 동작하는 것만 검증됨. 인프라가 서면 `LGB_MACHINES`에 실제
-  `host:port` 목록을 넣고 각 머신에서 같은 스크립트를 동시에 띄워 검증해야 한다.
+- **EMR 노드 수**: 피처마트(Spark)는 core 3대로 충분하고 분산 학습만 8대가
+  필요해서, 클러스터를 껐다 켜지 않고 `ModifyInstanceGroups`로 그 자리에서
+  늘린다. 줄이는 건 실행 중인 작업을 죽일 위험이 있어 하지 않는다 — 한 사이클
+  안에서 한 번 8로 늘리면 그 사이클이 끝날 때까지 유지한다(피처마트 단계에서
+  유휴 노드 비용은 감수).
 
 ## 2. Poisson + exposure offset
 
@@ -268,7 +284,8 @@ validation을 사용하는 경로는 최고 점수, 최고 iteration, patience �
 현재 프로세스에서 다시 계산한다. 부분 checkpoint는 serving release가 참조하지
 않으므로 중단된 실행이 현재 서빙 모델을 바꾸지 않는다.
 
-**범위 밖(2026-08 기준)**: 분산 학습(`LGB_TREE_LEARNER`≠"serial")은 아직 이
-지연 로딩과 연동되지 않았다 — `train_target()`이 `LGB_NUM_MACHINES>1`이면
-바로 `NotImplementedError`를 낸다(station_no 샤딩을 날짜별 로더 안에서 다시
-구현해야 함, 구조상 막혀있지 않으나 아직 안 만듦).
+**분산 학습과의 연동**: `LGB_NUM_MACHINES>1`이면 `_DatePartitionSequence`가 날짜
+파티션을 읽은 직후 `_shard_for_this_machine()`으로 이 머신 몫만 남기고 반환한다
+(라벨/exposure memmap도 같은 필터를 통과한 행 기준). station_no
+`CategoricalDtype`을 고정하는 `station_categories_for_dates()`는 이 필터와
+무관하게 항상 전체 station 목록을 스캔한다 — 1-1번 항목 참고.

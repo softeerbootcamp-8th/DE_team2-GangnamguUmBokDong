@@ -76,6 +76,35 @@ SPARK_PYTHON = ML_ROOT / "feature_engine" / ".venv" / "bin" / "python"
 _TRAIN_SCRIPTS = {"rental": "training.train_rental_model", "return": "training.train_return_model"}
 _EXPLICIT_TRAIN_WINDOW_ENV = ("TRAIN_WINDOW_START", "TRAIN_WINDOW_END")
 
+# --- LGB_NUM_MACHINES>1일 때 로컬 subprocess 대신 YARN distributed-shell로 학습을
+# 띄우는 데 쓰는 값들(ADR-0007). `training.config`의 LGB_* 환경변수와 짝을 이룬다 —
+# 여기서는 "몇 대"(LGB_NUM_MACHINES)가 이미 결정된 뒤 "그 대수만큼 컨테이너를 어떻게
+# 띄울지"만 다룬다. `/opt/gng`는 `ops/emr/bootstrap.sh`가 레포 패키지를 푸는
+# 고정 경로다 — 이 분기는 실제로 EMR 노드에서만 실행되므로(월간 재학습 DAG가
+# LGB_NUM_MACHINES>1을 EMR 스텝에만 준다) 하드코딩해도 된다.
+_EMR_PYTHONPATH = "/opt/gng"
+_EMR_PYTHON = "python3.11"
+YARN_DISTRIBUTED_SHELL_JAR = os.environ.get(
+    "YARN_DISTRIBUTED_SHELL_JAR", "/usr/lib/hadoop-yarn/hadoop-yarn-applications-distributedshell.jar"
+)
+# m4.large(8GB) 노드 1대에 컨테이너 1개만 배치되게 노드 용량에 가깝게 잡는다 —
+# 여러 개가 배치되면 같은 LGB_LOCAL_LISTEN_PORT를 두고 충돌한다
+# (`yarn_worker_bootstrap._resolve_rank_and_machines()` 중복 host 가드 참고).
+YARN_CONTAINER_MEMORY_MB = int(os.environ.get("YARN_CONTAINER_MEMORY_MB", "6144"))
+YARN_CONTAINER_VCORES = int(os.environ.get("YARN_CONTAINER_VCORES", "2"))
+# 컨테이너로 반드시 넘겨야 하는 환경변수 — distributed-shell 컨테이너는 이 프로세스의
+# 환경을 상속하지 않고 `-shell_env`로 명시한 것만 받는다.
+_YARN_SHELL_ENV_KEYS = (
+    "ML_PROFILE",
+    "MODEL_ARCHIVE_DATE",
+    "LGB_NUM_MACHINES",
+    "LGB_TREE_LEARNER",
+    "LGB_LOCAL_LISTEN_PORT",
+    "LGB_TIME_OUT",
+    "TRAINING_RUN_ID",
+    "S3_BUCKET",
+)
+
 
 def _notify(message: str) -> None:
     """학습/승격 진행 상황을 알린다 — 지금은 표준 출력뿐이지만, 나중에 실제
@@ -264,6 +293,57 @@ def _validate_candidate_serving_contract(profile_name: str, env_overrides: dict[
     )
 
 
+def _run_distributed_training_via_yarn(model_name: str, env: dict[str, str]) -> None:
+    """LGB_NUM_MACHINES(>1)개 컨테이너로 YARN distributed-shell 학습 앱을 제출하고
+    끝날 때까지 대기한다(ADR-0007).
+
+    이 함수는 EMR 노드(주로 master, YARN 클라이언트가 설치된 곳)에서만 의미가
+    있다 — `_run_training_subprocess()`가 `LGB_NUM_MACHINES>1`일 때만 이 경로를
+    타므로, 로컬/EC2에서 이 코드가 실행될 일은 없다(월간 재학습 DAG가 EMR
+    스텝에만 `LGB_NUM_MACHINES>1`을 준다). 각 컨테이너는
+    `training.scripts.yarn_worker_bootstrap`으로 시작해 barrier를 거친 뒤 이
+    함수와 무관하게 독립적으로 `train_rental_model`/`train_return_model`을
+    실행한다 — 이 함수는 그 컨테이너들을 다 띄우고 YARN 앱이 끝날 때까지
+    블로킹하는 역할만 한다(그래야 호출부가 바로 이어서 archive의 metrics.json을
+    읽어도 이미 다 쓰인 뒤라 안전하다).
+
+    args:
+        model_name: "rental" 또는 "return"
+        env: 컨테이너에 전달할 환경변수 원본(`_YARN_SHELL_ENV_KEYS`에 있는 키만
+            실제로 `-shell_env`로 넘어간다) — 특히 `TRAINING_RUN_ID`가 이미
+            채워져 있어야 한다(barrier 네임스페이스, 호출부가 시도마다 새로 만듦).
+    raises:
+        RuntimeError: YARN 애플리케이션이 실패로 끝남
+    """
+    shell_command = (
+        f"cd {_EMR_PYTHONPATH} && PYTHONPATH={_EMR_PYTHONPATH} {_EMR_PYTHON} "
+        f"-m training.scripts.yarn_worker_bootstrap --model {model_name}"
+    )
+    shell_env_args = []
+    for key in _YARN_SHELL_ENV_KEYS:
+        if env.get(key):
+            shell_env_args += ["-shell_env", f"{key}={env[key]}"]
+
+    num_machines = env["LGB_NUM_MACHINES"]
+    cmd = [
+        "yarn",
+        "org.apache.hadoop.yarn.applications.distributedshell.Client",
+        "-jar",
+        YARN_DISTRIBUTED_SHELL_JAR,
+        "-shell_command",
+        shell_command,
+        "-num_containers",
+        num_machines,
+        "-container_memory",
+        str(YARN_CONTAINER_MEMORY_MB),
+        "-container_vcores",
+        str(YARN_CONTAINER_VCORES),
+        *shell_env_args,
+    ]
+    _notify(f"[{model_name}] YARN distributed-shell 제출 (컨테이너 {num_machines}개)...")
+    subprocess.run(cmd, check=True)
+
+
 def _run_training_subprocess(
     model_name: str, profile_name: str, archive_date: str, env_overrides: dict[str, str]
 ) -> dict:
@@ -290,13 +370,19 @@ def _run_training_subprocess(
     returns:
         dict: train_target()이 저장한 metrics.json
     raises:
-        subprocess.CalledProcessError: 학습 자체가 실패했을 때
-        RuntimeError: 학습은 성공했다고 나왔는데 metrics.json을 못 찾았을 때(버그 신호)
+        subprocess.CalledProcessError: 학습 자체가 실패했을 때(로컬 subprocess 경로)
+        RuntimeError: YARN distributed-shell 제출이 실패했거나, 학습은 성공했다고
+            나왔는데 metrics.json을 못 찾았을 때(버그 신호)
     """
     env = _monthly_subprocess_env(profile_name, env_overrides)
     env["MODEL_ARCHIVE_DATE"] = archive_date
     _notify(f"[{model_name}] '{profile_name}' 프로필로 학습 중...")
-    subprocess.run([sys.executable, "-m", _TRAIN_SCRIPTS[model_name]], cwd=ML_ROOT, check=True, env=env)
+
+    if int(env.get("LGB_NUM_MACHINES", "1")) > 1:
+        env["TRAINING_RUN_ID"] = f"{archive_date}-{profile_name}-{model_name}"
+        _run_distributed_training_via_yarn(model_name, env)
+    else:
+        subprocess.run([sys.executable, "-m", _TRAIN_SCRIPTS[model_name]], cwd=ML_ROOT, check=True, env=env)
 
     archive_prefix = archive_models_prefix(archive_date, profile_name)
     metrics = s3_io.read_json(model_json_key(model_name, "metrics", archive_prefix))
@@ -475,6 +561,15 @@ def main() -> list[dict]:
         default=None,
         help="기준 날짜(YYYY-MM-DD) override — 기본은 오늘",
     )
+    parser.add_argument(
+        "--result-s3-key",
+        default=None,
+        help=(
+            "결과 요약을 이 S3 키에 JSON으로 써준다. EMR 스텝(command-runner.jar)으로 이 "
+            "스크립트를 실행하면 SSM처럼 stdout을 바로 못 돌려받으므로, Airflow가 스텝 완료 "
+            "후 이 키를 읽어 재학습 필요 여부/승격 결과를 판단한다(월간 재학습 DAG 참고)."
+        ),
+    )
     args = parser.parse_args()
 
     results = check_all_models(as_of=args.as_of)
@@ -514,25 +609,34 @@ def main() -> list[dict]:
                     f"기준 미달 모델 {len(retrain_needed)}개 — 실제 재학습은 --execute로 다시 실행하세요 "
                     "(지금은 dry-run/check-only라 아무것도 바꾸지 않았습니다)"
                 )
+        if args.result_s3_key:
+            s3_io.write_json(args.result_s3_key, summary)
         return relevant_results
 
     if not target_models:
         _notify("재학습 대상 모델이 없음 — 종료")
+        if args.result_s3_key:
+            s3_io.write_json(args.result_s3_key, {"promoted": {}, "target_models": []})
         return results
 
     _notify(f"=== 챌린저 재학습 시도 시작 ({len(target_models)}개 모델: {target_models}) ===")
+    promoted_by_model: dict[str, bool] = {}
     for model_name in target_models:
         try:
             champion_metrics = _load_baseline_metrics(model_name)
         except FileNotFoundError:
             champion_metrics = None
-        _attempt_promotion(
+        promoted_by_model[model_name] = _attempt_promotion(
             model_name,
             champion_metrics,
             skip_feature_pipeline=args.skip_feature_pipeline,
             target_profile=args.profile_name,
         )
 
+    if args.result_s3_key:
+        s3_io.write_json(
+            args.result_s3_key, {"promoted": promoted_by_model, "target_models": target_models}
+        )
     return results
 
 

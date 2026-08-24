@@ -17,14 +17,20 @@ g 이상인 배수이면서 1시간과 1일을 나눠야 한다. 아래 기본 �
 override 없이 g20/r20/a20을 사용한다.
 
 `feature_engine.spark.silver_source`는 historical fact(트립/재고/날씨/인구)를
-날짜별 Archive에서 읽고 누락 날짜를 fail-closed한다. 최신
-`station_master_enriched`만 historical snapshot이 없는 current dimension으로
-Silver에서 읽는 계약을 유지한다. 따라서 아래 실행 전 남은 데이터 전제는 2025와
-앞뒤 context Archive partition을 실제로 모두 적재하는 것이다.
+날짜별 Archive에서 읽는다. 요청 구간 중 일부 날짜만 없으면(2026-08부터) 그
+날짜만 건너뛰고 경고를 남긴 채 계속하고, 요청 구간 **전체**가 다 없을 때만
+fail-closed한다(대여/반납처럼 타겟에 가까운 소스도 포함 — 결측 날짜가 조용히
+"수요 0"으로 들어갈 수 있다는 트레이드오프를 감수하고 학습이 절대 실패하지
+않는 쪽을 택한 결정). 최신 `station_master_enriched`만 historical snapshot이
+없는 current dimension으로 Silver에서 읽는 계약을 유지한다. 정확도를 최대화하려면
+아래 실행 전 2025와 앞뒤 context Archive partition을 실제로 모두 적재해두는
+편이 여전히 좋다.
 
 ## 전제 조건
 
-- 2025 CSV/API 원천이 source별 `archive/` partition에 모두 적재돼 있어야 한다.
+- 2025 CSV/API 원천이 source별 `archive/` partition에 최대한 적재돼 있어야
+  한다(일부 날짜가 비어 있어도 실행 자체는 막히지 않지만, 결측 날짜만큼
+  타겟/피처 정확도가 떨어진다).
 - feature engine historical reader는 archive schema를 현재 feature schema로 변환하며,
   트립/재고/날씨/인구 fact에 `silver/` fallback을 두지 않는다.
 - 최신 `silver/station_master_enriched`는 current station dimension 입력으로 사용할

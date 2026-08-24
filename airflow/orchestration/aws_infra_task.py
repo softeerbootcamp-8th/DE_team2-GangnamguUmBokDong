@@ -27,6 +27,23 @@ EMR_CORE_INSTANCE_COUNT = int(os.environ.get("AWS_EMR_CORE_INSTANCE_COUNT", "2")
 EMR_SERVICE_ROLE = os.environ.get("AWS_EMR_SERVICE_ROLE", "EMR_DefaultRole")
 EMR_JOB_FLOW_ROLE = os.environ.get("AWS_EMR_JOB_FLOW_ROLE", "EMR_EC2_DefaultRole")
 EMR_S3_SCRIPTS_PREFIX = os.environ.get("AWS_EMR_S3_SCRIPTS_PREFIX", "s3://local-dev/scripts")
+# `make emr-package`가 올리는 위치(core/ml_core/feature_engine/training 번들 +
+# bootstrap.sh)와 반드시 같은 값이어야 한다 — `create_emr_cluster()`의
+# BootstrapActions가 이 스크립트를 실행해 상시 클러스터 노드에 `training` 패키지를
+# 깐다(월간 재학습 evaluation·YARN distributed-shell 학습이 이 노드에서 직접
+# 돌아야 하므로). 비워두면(기본값) BootstrapActions 없이 뜬다 — 로컬/모의 환경 등
+# 코드가 굳이 EMR에 안 깔려도 되는 경우를 위함.
+EMR_BOOTSTRAP_SCRIPT_S3_URI = os.environ.get("AWS_EMR_BOOTSTRAP_SCRIPT_S3_URI", "")
+EMR_PYFILES_S3_BUCKET = os.environ.get("AWS_EMR_PYFILES_S3_BUCKET", "")
+
+# `libs/ml_core/paths.py`의 MODELS_PREFIX/TRAINING_RUNS_PREFIX를 그대로 미러링한다.
+# airflow venv는 lightgbm 등 무거운 의존성을 끌고 오는 ml_core/core를 설치하지
+# 않으므로(`ml/feature_engine/spark/config.py`가 이미 같은 이유로 같은 상수를
+# 독립적으로 다시 정의하는 것과 동일한 패턴), boto3만으로 직접 읽는다. 값이 서로
+# 어긋나면 안 되므로 한쪽을 고치면 반드시 다른 쪽도 같이 고칠 것.
+S3_BUCKET = os.environ.get("S3_BUCKET", "gangnamgu")
+_MODELS_PREFIX = os.environ.get("MODELS_PREFIX", "models")
+TRAINING_RUNS_PREFIX = os.environ.get("TRAINING_RUNS_PREFIX", f"{_MODELS_PREFIX}/training-runs")
 
 # is_mock_mode()/is_emr_mock_mode()의 override 인자에 허용되는 값.
 MOCK_OVERRIDE_FORCE_MOCK = "force_mock"
@@ -34,21 +51,27 @@ MOCK_OVERRIDE_FORCE_REAL = "force_real"
 
 
 def is_mock_mode(override: str | None = None) -> bool:
-    """EC2 학습을 실제로 호출할지 확인한다 — 운영에서도 기본값은 항상 mock이다.
+    """EC2 관련 호출을 실제로 할지 확인한다 — 기본값은 실제 호출이다(2026-08 반전).
+
+    **이전에는 기본값이 mock이었다**: override 없으면 무조건 mock이라 배포된
+    `monthly_retrain` DAG가 한 번도 실제로 학습/평가를 돈 적이 없었을 가능성이
+    있었다(`docs/adr/0007-yarn-distributed-shell-workers.md` Context 참고). 이제는
+    반대로 override 없으면 실제 AWS 호출이 나가고, `MOCK_OVERRIDE_FORCE_MOCK`을
+    명시해야만(테스트/로컬 dry-run) 시뮬레이션으로 빠진다 — `is_emr_mock_mode()`와
+    같은 판별 순서로 맞췄다.
 
     AWS 키가 진짜인지(instance profile/실제 access key)로는 판단하지 않는다 —
     운영 환경도 access key를 그냥 가지고 있을 수 있어서, 키의 진위로 판단하면
-    아무도 명시적으로 요청하지 않았는데 실제 EC2 학습이 조용히 시작될 수 있다.
-    실제 호출은 오직 `MOCK_OVERRIDE_FORCE_REAL`을 명시했을 때만 일어난다.
+    실제 상황을 놓칠 수 있다.
 
     args:
         override: DAG trigger 시점 파라미터 등으로 넘긴다.
-            `MOCK_OVERRIDE_FORCE_REAL`이면 실제 호출, 그 외(`MOCK_OVERRIDE_FORCE_MOCK`
-            포함, `None`도 포함)에는 전부 mock.
+            `MOCK_OVERRIDE_FORCE_MOCK`이면 mock, 그 외(`MOCK_OVERRIDE_FORCE_REAL`
+            포함, `None`도 포함)에는 전부 실제 호출.
     """
     if os.environ.get("MOCK_AWS_INFRA", "").lower() in ("1", "true", "yes"):
         return True
-    return override != MOCK_OVERRIDE_FORCE_REAL
+    return override == MOCK_OVERRIDE_FORCE_MOCK
 
 
 def is_emr_mock_mode(override: str | None = None) -> bool:
@@ -78,6 +101,43 @@ def _get_boto3_client(service_name: str, region_name: str | None = None) -> Any:
 
     region = region_name or DEFAULT_REGION
     return boto3.client(service_name, region_name=region)
+
+
+def read_s3_json(key: str, *, region_name: str | None = None) -> dict | None:
+    """`core.s3.read_json()`과 같은 버킷/엔드포인트 판별 규칙으로 JSON 객체를 읽는다.
+
+    EMR 스텝(`command-runner.jar`)은 SSM과 달리 stdout을 호출부에 바로 돌려주지
+    않으므로, `monthly_retrain_check.py --result-s3-key`가 이 함수가 읽는 위치에
+    결과 요약을 남긴다(월간 재학습 DAG 참고). `core.s3._client()`/`get_object_bytes()`를
+    그대로 재사용하지 않는 이유는 `TRAINING_RUNS_PREFIX` 주석 참고.
+
+    args:
+        key: 읽을 S3 객체의 전체 키
+        region_name: AWS 리전명(엔드포인트 override가 없을 때만 의미 있음)
+    returns:
+        파싱된 JSON dict, 키가 없으면 None
+    """
+    import boto3
+    from botocore.exceptions import ClientError
+
+    endpoint_url = os.environ.get("S3_ENDPOINT_URL") or None
+    if endpoint_url:
+        client = boto3.client(
+            "s3",
+            endpoint_url=endpoint_url,
+            aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID", "minioadmin"),
+            aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY", "minioadmin"),
+        )
+    else:
+        client = boto3.client("s3", region_name=region_name or DEFAULT_REGION)
+
+    try:
+        body = client.get_object(Bucket=S3_BUCKET, Key=key)["Body"].read()
+    except ClientError as exc:
+        if exc.response["Error"]["Code"] == "NoSuchKey":
+            return None
+        raise
+    return json.loads(body)
 
 
 # ==========================================
@@ -384,7 +444,7 @@ def run_emr_feature_mart_job(
         "Steps": steps,
         "JobFlowRole": EMR_JOB_FLOW_ROLE,
         "ServiceRole": EMR_SERVICE_ROLE,
-        "AutoTerminate": True,
+        "Tags": [{"Key": "for-use-with-amazon-emr-managed-policies", "Value": "true"}],
     }
 
     logger.info("[EMR] Transient 클러스터 '%s' 생성 요청...", flow_name)
@@ -440,3 +500,257 @@ def terminate_emr_cluster(
         emr.terminate_job_flows(JobFlowIds=[cluster_id])
     except Exception as exc:  # noqa: BLE001 - 자원 정리 실패가 상위 태스크를 깨뜨리지 않도록 로깅만 수행
         logger.error("[EMR] 클러스터 '%s' 종료 중 오류 발생: %s", cluster_id, exc)
+
+
+def create_emr_cluster(
+    *,
+    cluster_name: str | None = None,
+    core_instance_count: int | None = None,
+    timeout_seconds: int = 1200,
+    region_name: str | None = None,
+    mock_override: str | None = None,
+    master_instance_type: str | None = None,
+    core_instance_type: str | None = None,
+) -> str:
+    """월간 재학습 사이클 전체가 공유하는 상시(long-lived) EMR 클러스터를 생성한다.
+
+    `run_emr_feature_mart_job()`(스텝을 미리 심고 완료되면 자동 종료되는 transient
+    클러스터)과 달리, 이 함수는 스텝 없이 `KeepJobFlowAliveWhenNoSteps=True`로만
+    띄운다 — 평가 → (필요시) 재학습 루프 동안 `submit_emr_step()`으로 스텝을 하나씩
+    얹고, 끝나면 호출부가 반드시 `terminate_emr_cluster()`를 불러야 한다(자동 종료
+    없음, `docs/adr/0007-yarn-distributed-shell-workers.md` 참고).
+
+    args:
+        cluster_name: 클러스터 명칭(미지정 시 타임스탬프로 생성)
+        core_instance_count: 미지정 시 `AWS_EMR_CORE_INSTANCE_COUNT` 사용 — 월간
+            사이클은 피처마트 단계용으로 3개에서 시작해, 학습이 필요해지면
+            `resize_emr_cluster()`로 늘리는 흐름을 가정한다.
+        timeout_seconds: WAITING 상태 진입 최대 대기 시간(초)
+        region_name: AWS 리전명
+        mock_override: `is_emr_mock_mode()` 참고(EC2용 `is_mock_mode()`가 아니라
+            EMR 전용 판별을 쓴다 — `run_emr_feature_mart_job()`과 동일한 이유)
+        master_instance_type: 미지정 시 `AWS_EMR_MASTER_INSTANCE_TYPE` 사용(이 계정은
+            m4.large 외 타입을 허용하지 않음)
+        core_instance_type: 미지정 시 `AWS_EMR_CORE_INSTANCE_TYPE` 사용
+    returns:
+        생성된 EMR 클러스터(JobFlow) ID
+    raises:
+        RuntimeError: 클러스터가 WAITING에 도달하기 전에 종료됨
+        TimeoutError: 최대 대기 시간 초과
+    """
+    if is_emr_mock_mode(mock_override):
+        mock_cluster_id = f"mock-j-{int(time.time())}"
+        logger.info("[Mock EMR] 상시 클러스터 '%s' 생성 (Mock: %s)", cluster_name or "monthly-retrain", mock_cluster_id)
+        return mock_cluster_id
+
+    master_type = master_instance_type or EMR_MASTER_INSTANCE_TYPE
+    core_type = core_instance_type or EMR_CORE_INSTANCE_TYPE
+    core_count = core_instance_count or EMR_CORE_INSTANCE_COUNT
+
+    emr = _get_boto3_client("emr", region_name)
+    now_str = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    flow_name = cluster_name or f"ml-monthly-retrain-{now_str}"
+
+    job_flow_overrides = {
+        "Name": flow_name,
+        "ReleaseLabel": EMR_RELEASE_LABEL,
+        "Applications": [{"Name": "Spark"}, {"Name": "Hadoop"}],
+        "Instances": {
+            "InstanceGroups": [
+                {
+                    "Name": "Master",
+                    "Market": "ON_DEMAND",
+                    "InstanceRole": "MASTER",
+                    "InstanceType": master_type,
+                    "InstanceCount": 1,
+                },
+                {
+                    "Name": "Core",
+                    "Market": "ON_DEMAND",
+                    "InstanceRole": "CORE",
+                    "InstanceType": core_type,
+                    "InstanceCount": core_count,
+                },
+            ],
+            "KeepJobFlowAliveWhenNoSteps": True,
+            "TerminationProtected": False,
+        },
+        "JobFlowRole": EMR_JOB_FLOW_ROLE,
+        "ServiceRole": EMR_SERVICE_ROLE,
+        "Tags": [{"Key": "for-use-with-amazon-emr-managed-policies", "Value": "true"}],
+    }
+    if EMR_BOOTSTRAP_SCRIPT_S3_URI:
+        job_flow_overrides["BootstrapActions"] = [
+            {
+                "Name": "install-training-env",
+                "ScriptBootstrapAction": {
+                    "Path": EMR_BOOTSTRAP_SCRIPT_S3_URI,
+                    "Args": [EMR_PYFILES_S3_BUCKET] if EMR_PYFILES_S3_BUCKET else [],
+                },
+            }
+        ]
+
+    logger.info("[EMR] 상시 클러스터 '%s' 생성 요청(core=%d)...", flow_name, core_count)
+    run_resp = emr.run_job_flow(**job_flow_overrides)
+    cluster_id = run_resp["JobFlowId"]
+    logger.info("[EMR] 상시 클러스터 생성됨: %s", cluster_id)
+
+    start_time = time.time()
+    while time.time() - start_time < timeout_seconds:
+        state = emr.describe_cluster(ClusterId=cluster_id)["Cluster"]["Status"]["State"]
+        logger.info("[EMR] 클러스터 '%s' 상태: %s", cluster_id, state)
+        if state == "WAITING":
+            return cluster_id
+        if state in ("TERMINATED", "TERMINATED_WITH_ERRORS"):
+            raise RuntimeError(f"EMR 클러스터 '{cluster_id}' 생성 중 비정상 종료: {state}")
+        time.sleep(30)
+
+    raise TimeoutError(f"EMR 클러스터 '{cluster_id}'가 {timeout_seconds}초 내에 WAITING 상태가 되지 못했습니다.")
+
+
+def get_core_instance_group_id(
+    cluster_id: str, *, region_name: str | None = None, mock_override: str | None = None
+) -> str:
+    """클러스터의 core InstanceGroup ID를 조회한다(`resize_emr_cluster()` 호출에 필요).
+
+    args:
+        cluster_id: 대상 EMR 클러스터 ID
+        region_name: AWS 리전명
+        mock_override: `is_emr_mock_mode()` 참고
+    returns:
+        core InstanceGroup ID
+    """
+    if is_emr_mock_mode(mock_override):
+        return "mock-ig-core"
+
+    emr = _get_boto3_client("emr", region_name)
+    groups = emr.list_instance_groups(ClusterId=cluster_id)["InstanceGroups"]
+    core_group = next(g for g in groups if g["InstanceGroupType"] == "CORE")
+    return core_group["Id"]
+
+
+def resize_emr_cluster(
+    cluster_id: str,
+    instance_group_id: str,
+    *,
+    target_core_count: int,
+    timeout_seconds: int = 1200,
+    region_name: str | None = None,
+    mock_override: str | None = None,
+) -> None:
+    """실행 중인 EMR 클러스터의 core 인스턴스 그룹 크기를 죽이지 않고 조정한다.
+
+    **스케일 업 전용으로 쓸 것**: 이 함수 자체는 target_core_count가 현재보다
+    작아도 막지 않지만, 스케일 다운은 진행 중인 YARN 컨테이너를 강제로 죽일 수
+    있어 위험하다 — 월간 재학습 DAG는 한 사이클 안에서 3→8로 한 번만 늘리고 그
+    사이클이 끝날 때까지(클러스터 종료 시까지) 다시 줄이지 않는다(계획 6번 항목).
+
+    args:
+        cluster_id: 대상 EMR 클러스터(JobFlow) ID
+        instance_group_id: 리사이즈할 core InstanceGroup ID(`get_core_instance_group_id()`로 조회)
+        target_core_count: 목표 core 인스턴스 개수
+        timeout_seconds: 목표 개수만큼 RUNNING 상태 도달 대기 최대 시간(초)
+        region_name: AWS 리전명
+        mock_override: `is_emr_mock_mode()` 참고
+    raises:
+        TimeoutError: 대기 시간 내에 목표 개수만큼 RUNNING 상태가 되지 않음
+    """
+    if is_emr_mock_mode(mock_override):
+        logger.info(
+            "[Mock EMR] 클러스터 '%s' core 그룹 '%s'를 %d개로 리사이즈 (Mock)",
+            cluster_id,
+            instance_group_id,
+            target_core_count,
+        )
+        return
+
+    emr = _get_boto3_client("emr", region_name)
+    logger.info(
+        "[EMR] 클러스터 '%s' core 그룹 '%s'를 %d개로 리사이즈 요청...", cluster_id, instance_group_id, target_core_count
+    )
+    emr.modify_instance_groups(
+        InstanceGroups=[{"InstanceGroupId": instance_group_id, "InstanceCount": target_core_count}]
+    )
+
+    start_time = time.time()
+    while time.time() - start_time < timeout_seconds:
+        groups = emr.list_instance_groups(ClusterId=cluster_id)["InstanceGroups"]
+        group = next(g for g in groups if g["Id"] == instance_group_id)
+        running_count = group["RunningInstanceCount"]
+        logger.info("[EMR] 클러스터 '%s' core 그룹 RUNNING 인스턴스: %d/%d", cluster_id, running_count, target_core_count)
+        if running_count >= target_core_count:
+            logger.info("[EMR] 클러스터 '%s' 리사이즈 완료(%d개 RUNNING)", cluster_id, target_core_count)
+            return
+        time.sleep(30)
+
+    raise TimeoutError(
+        f"EMR 클러스터 '{cluster_id}' core 그룹이 {timeout_seconds}초 내에 "
+        f"{target_core_count}개로 리사이즈되지 못했습니다."
+    )
+
+
+def submit_emr_step(
+    cluster_id: str,
+    name: str,
+    command: list[str],
+    *,
+    action_on_failure: str = "CONTINUE",
+    timeout_seconds: int = 5400,
+    region_name: str | None = None,
+    mock_override: str | None = None,
+) -> dict[str, Any]:
+    """이미 떠 있는(KeepJobFlowAliveWhenNoSteps=True) EMR 클러스터에 범용 스텝
+    하나를 제출하고 완료까지 대기한다.
+
+    `run_emr_feature_mart_job()`은 클러스터 생성+스텝+자동종료를 한 번에 묶지만,
+    이 함수는 `create_emr_cluster()`로 띄워둔 상시 클러스터에 평가/피처마트/YARN
+    distributed-shell 학습 스텝을 하나씩 얹는 범용 진입점이다(계획 4번 항목).
+
+    args:
+        cluster_id: 대상 EMR 클러스터 ID
+        name: 스텝 이름(EMR 콘솔/로그 표시용)
+        command: command-runner.jar에 넘길 인자 목록(예: `["bash", "-c", "..."]`)
+        action_on_failure: 기본값 "CONTINUE" — 평가/재학습 루프 중 스텝 하나가
+            실패해도 클러스터는 살려두고 다음 후보 프로필을 계속 시도해야 하므로
+            `run_emr_feature_mart_job()`의 "TERMINATE_CLUSTER"와 다르게 잡았다.
+        timeout_seconds: 스텝 완료 대기 최대 시간(초)
+        region_name: AWS 리전명
+        mock_override: `is_emr_mock_mode()` 참고
+    returns:
+        dict: {"StepId": ..., "State": "COMPLETED"}
+    raises:
+        RuntimeError: 스텝이 실패/취소됨
+        TimeoutError: 대기 시간 초과
+    """
+    if is_emr_mock_mode(mock_override):
+        mock_step_id = f"mock-s-{int(time.time())}"
+        logger.info("[Mock EMR] 클러스터 '%s'에 스텝 '%s' 제출 및 완료 (Mock: %s)", cluster_id, name, mock_step_id)
+        return {"StepId": mock_step_id, "State": "COMPLETED"}
+
+    emr = _get_boto3_client("emr", region_name)
+    logger.info("[EMR] 클러스터 '%s'에 스텝 '%s' 제출...", cluster_id, name)
+    resp = emr.add_job_flow_steps(
+        JobFlowId=cluster_id,
+        Steps=[
+            {
+                "Name": name,
+                "ActionOnFailure": action_on_failure,
+                "HadoopJarStep": {"Jar": "command-runner.jar", "Args": command},
+            }
+        ],
+    )
+    step_id = resp["StepIds"][0]
+
+    start_time = time.time()
+    while time.time() - start_time < timeout_seconds:
+        desc = emr.describe_step(ClusterId=cluster_id, StepId=step_id)
+        state = desc["Step"]["Status"]["State"]
+        logger.info("[EMR] 스텝 '%s'(%s) 상태: %s", name, step_id, state)
+        if state == "COMPLETED":
+            return {"StepId": step_id, "State": state}
+        if state in ("FAILED", "CANCELLED", "INTERRUPTED"):
+            failure = desc["Step"]["Status"].get("FailureDetails", {})
+            raise RuntimeError(f"EMR 스텝 '{name}'({step_id}) 실패({state}): {failure}")
+        time.sleep(15)
+
+    raise TimeoutError(f"EMR 스텝 '{name}'({step_id})이 {timeout_seconds}초 내에 완료되지 못했습니다.")

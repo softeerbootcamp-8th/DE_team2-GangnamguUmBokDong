@@ -75,9 +75,11 @@ LightGBM 자체 분산 학습(Socket, `tree_learner="data"`/`"voting"`)을
   모아 전체 검증셋 기준으로 정확히 맞추려면 LightGBM 소켓 프로토콜 밖의 별도
   집계 단계가 필요한데, 지금은 범위 밖으로 남겨뒀다. 설정 표면(환경변수 6개)이
   늘어나 배포 문서화 부담이 생긴다.
-- 중립적/후속 고려사항: 분산 코드 경로 자체는 실제 다중 머신 환경 없이는
-  End-to-End 검증이 불가능하다(2026-08-13 기준 인프라 미비) — 인프라가 서면
-  실제 여러 머신에서 동시에 스크립트를 띄워 검증해야 한다. conformal
-  correction 근사 문제를 언제·어떻게 해소할지(전체 검증셋 집계 단계 추가 등)는
-  아직 미결정이다. 상세 구현은 [training/DESIGN.md](../training/DESIGN.md)
+- 중립적/후속 고려사항: 워커 인프라(EMR + YARN Distributed Shell)와
+  `_shard_for_this_machine()`의 실제 구현 위치(`lazy_train_dataset.py`)는
+  [ADR-0007](0007-yarn-distributed-shell-workers.md)에서 확정했다 — 이 문서
+  작성 시점에는 `_shard_for_this_machine()`을 `train_common.py` 소유로
+  적었지만 실제 구현은 날짜별 지연 로더 쪽에 있다. conformal correction
+  근사 문제를 언제·어떻게 해소할지(전체 검증셋 집계 단계 추가 등)는 여전히
+  미결정이다. 상세 구현은 [training/DESIGN.md](../ml/training/DESIGN.md)
   1-1번 항목, 결정 경위는 [history.md](../history.md) 17번 항목 참고.
