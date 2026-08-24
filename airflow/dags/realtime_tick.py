@@ -1,16 +1,20 @@
-"""5분 realtime 체인을 날씨 필요 여부에 따라 4개 cron으로 나눠 실행한다.
+"""5분마다 도는 단일 realtime 체인. 날씨는 freshness gate로 필요 시에만 수집한다.
 
-이전에는 DAG 하나(`realtime_5min`)가 매 5분 돌면서, `prepare_serving_plan` 앞에
-`wait_for_weather_manifests` 센서를 둬서 날씨 authority가 준비됐는지 폴링했다.
-그런데 어떤 시각에 어떤 날씨가 필요한지는 애초에 분·시 나머지 연산으로 고정돼
-있어서(`config.schedules`의 `REALTIME_TICK_*_CRON` 주석 참고) 런타임에 물어볼 필요가
-없다 — cron 자체를 그 경계로 나누고, 필요한 시각에만 날씨 collector를 같은 DAG 안
-직접 의존성으로 묶으면 센서도, 폴링도, 워커 슬롯 점유도 전부 사라진다.
+한때는 이 체인을 날씨 필요 여부에 따라 4개 cron으로 나눠 실행했다(분·시 나머지
+연산으로 "언제 초단기/단기 날씨가 필요한지"가 고정돼 있다는 점을 이용해, 필요한
+시각에만 날씨 collector를 그 cron의 DAG에 직접 의존성으로 묶는 방식). 그런데
+서로 다른 DAG는 `max_active_runs`를 각자 따로 관리해서, 한 DAG의 tick이 늦어지면
+다른 DAG의 tick과 실행 시각이 겹칠 수 있었다 — 약한 인스턴스에서 CPU 경합이 나면
+60초 타임아웃(retries=0)인 날씨 collector가 죽을 위험이 있다(`config.schedules.
+REALTIME_TICK_CRON` 주석의 2026-08-22 실측 참고). 게다가 3시간짜리(단기예보)
+수집이 한 번 실패하면 다음 cron 경계까지 최대 3시간을 기다려야 했다.
 
-그래서 하나였던 `weather_10min`/`weather_3h` DAG의 날씨 수집도 여기로 흡수했다 —
-같은 소스를 두 DAG이 같은 시각에 중복 수집하면 안 되기 때문이다. 4개 DAG 모두
-`_build_realtime_tick_dag`라는 같은 빌더를 호출해서 만들어지므로 core 로직(수집·
-정규화·serving 체인)은 한 곳에만 있다.
+지금은 DAG 하나로 합치고, 대신 날씨 collector마다
+`orchestration.collector_task.build_weather_freshness_gate_task()`로 "마지막
+성공 수집 이후 충분히 지났는지"를 실제 시각(`datetime.now()`, DAG의 논리 시각이
+아니라) 기준으로 매 tick마다 직접 물어서 스킵 여부를 정한다. 이러면 동시 실행
+경합이 구조적으로 사라지고(같은 DAG 안에서는 태스크 의존성이 순서를 강제한다),
+실패한 수집은 다음 5분 tick에서 곧바로 재시도된다.
 """
 
 from __future__ import annotations
@@ -26,9 +30,6 @@ from config.schedules import (
     CATCHUP,
     MAX_ACTIVE_RUNS,
     REALTIME_TICK_CRON,
-    REALTIME_TICK_FULL_WEATHER_CRON,
-    REALTIME_TICK_ULTRA_WEATHER_CRON,
-    REALTIME_TICK_ULTRA_WEATHER_ON_HOUR_CRON,
     TIMEZONE,
 )
 from config.sources import (
@@ -41,6 +42,7 @@ from config.sources import (
 from orchestration.collector_task import (
     build_collector_replay_task,
     build_collector_task,
+    build_weather_freshness_gate_task,
 )
 from orchestration.inference_task import build_inference_task
 from orchestration.normalizer_task import build_normalizer_task
@@ -53,8 +55,16 @@ from orchestration.urgency_task import build_urgency_task
 
 from airflow import DAG
 
-_ULTRA_WEATHER_SOURCES = (WEATHER_10MIN_SOURCE, WEATHER_ULTRA_SHORT_FORECAST_SOURCE)
-_FULL_WEATHER_SOURCES = _ULTRA_WEATHER_SOURCES + (WEATHER_3H_SOURCE,)
+# 초단기(실황+예보)는 10분, 단기예보는 3시간 — 기상청이 그보다 자주 새 값을 내지
+# 않으므로, 마지막 성공 수집이 이보다 최근이면 이번 tick은 건너뛴다.
+_ULTRA_WEATHER_MIN_INTERVAL = timedelta(minutes=10)
+_SHORT_TERM_WEATHER_MIN_INTERVAL = timedelta(hours=3)
+_WEATHER_MIN_INTERVAL_BY_SOURCE = {
+    WEATHER_10MIN_SOURCE: _ULTRA_WEATHER_MIN_INTERVAL,
+    WEATHER_ULTRA_SHORT_FORECAST_SOURCE: _ULTRA_WEATHER_MIN_INTERVAL,
+    WEATHER_3H_SOURCE: _SHORT_TERM_WEATHER_MIN_INTERVAL,
+}
+_WEATHER_SOURCES = tuple(_WEATHER_MIN_INTERVAL_BY_SOURCE)
 
 # 재시도 없이(retries=0) 이 시간 안에 못 끝나면 바로 실패시켜서, 날씨 collector가
 # 자기 재시도 정책(기본 240초 x 3회)대로 붙잡고 있느라 뒤의
@@ -74,11 +84,11 @@ _WEATHER_COLLECTOR_TIMEOUTS = {
 }
 
 
-def _build_realtime_tick_dag(dag_id: str, cron: str, weather_source_ids: tuple[str, ...]) -> DAG:
-    """공통 realtime 체인을 만들고, 주어지면 날씨 collector를 prepare 앞에 직접 묶는다."""
+def _build_realtime_tick_dag() -> DAG:
+    """realtime 체인 하나를 만든다. 날씨는 freshness gate로 매 tick 필요 여부를 정한다."""
     with DAG(
-        dag_id=dag_id,
-        schedule=CronTriggerTimetable(cron, timezone=TIMEZONE),
+        dag_id="realtime_tick",
+        schedule=CronTriggerTimetable(REALTIME_TICK_CRON, timezone=TIMEZONE),
         start_date=pendulum.datetime(2026, 8, 16, tz=TIMEZONE),
         catchup=CATCHUP,
         max_active_runs=MAX_ACTIVE_RUNS,
@@ -91,36 +101,38 @@ def _build_realtime_tick_dag(dag_id: str, cron: str, weather_source_ids: tuple[s
         run_normalizer = build_normalizer_task(dag)
         collector_tasks["population_realtime"] >> run_normalizer
 
-        prepare_upstream = [collector_tasks["bike_station_realtime"]]
-        if weather_source_ids:
-            weather_tasks = [
-                build_collector_task(
-                    dag,
-                    source_id,
-                    retries=0,
-                    execution_timeout=_WEATHER_COLLECTOR_TIMEOUTS[source_id],
-                )
-                for source_id in weather_source_ids
-            ]
-            # ALL_DONE 게이트: 날씨 수집이 실패해도(FAILED) 이 게이트는 항상 성공으로
-            # 끝나므로, prepare의 NONE_FAILED_MIN_ONE_SUCCESS를 위반하지 않는다 — 이전
-            # 센서의 soft_fail이 하던 "날씨가 없으면 이전 스냅샷으로 계속 진행" 역할을
-            # 폴링 없이 그대로 재현한다.
-            weather_gate = EmptyOperator(
-                task_id="weather_ready_gate",
-                trigger_rule=TriggerRule.ALL_DONE,
-                on_success_callback=on_success_callback,
-                on_failure_callback=on_failure_callback,
-                dag=dag,
+        weather_collect_tasks = []
+        for source_id in _WEATHER_SOURCES:
+            freshness_gate = build_weather_freshness_gate_task(
+                dag, source_id, min_interval=_WEATHER_MIN_INTERVAL_BY_SOURCE[source_id]
             )
-            weather_tasks >> weather_gate
-            prepare_upstream.append(weather_gate)
+            collect = build_collector_task(
+                dag,
+                source_id,
+                retries=0,
+                execution_timeout=_WEATHER_COLLECTOR_TIMEOUTS[source_id],
+            )
+            freshness_gate >> collect
+            weather_collect_tasks.append(collect)
+
+        # ALL_DONE 게이트: 날씨 수집이 실패하거나(FAILED) freshness gate로
+        # 건너뛰어졌어도(SKIPPED) 이 게이트는 항상 성공으로 끝나므로, prepare의
+        # NONE_FAILED_MIN_ONE_SUCCESS를 위반하지 않는다 — "날씨가 없으면 이전
+        # 스냅샷으로 계속 진행"을 폴링 없이 재현한다.
+        weather_gate = EmptyOperator(
+            task_id="weather_ready_gate",
+            trigger_rule=TriggerRule.ALL_DONE,
+            on_success_callback=on_success_callback,
+            on_failure_callback=on_failure_callback,
+            dag=dag,
+        )
+        weather_collect_tasks >> weather_gate
 
         prepare_plan = build_prepare_serving_task(
             dag,
             trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS,
         )
-        prepare_upstream >> prepare_plan
+        [collector_tasks["bike_station_realtime"], weather_gate] >> prepare_plan
 
         run_inference = build_inference_task(dag, plan_task_id=prepare_plan.task_id)
         [
@@ -152,15 +164,4 @@ def _build_realtime_tick_dag(dag_id: str, cron: str, weather_source_ids: tuple[s
     return dag
 
 
-dag = _build_realtime_tick_dag("realtime_tick", REALTIME_TICK_CRON, ())
-dag_ultra_weather = _build_realtime_tick_dag(
-    "realtime_tick_ultra_weather", REALTIME_TICK_ULTRA_WEATHER_CRON, _ULTRA_WEATHER_SOURCES
-)
-dag_ultra_weather_on_hour = _build_realtime_tick_dag(
-    "realtime_tick_ultra_weather_on_hour",
-    REALTIME_TICK_ULTRA_WEATHER_ON_HOUR_CRON,
-    _ULTRA_WEATHER_SOURCES,
-)
-dag_full_weather = _build_realtime_tick_dag(
-    "realtime_tick_full_weather", REALTIME_TICK_FULL_WEATHER_CRON, _FULL_WEATHER_SOURCES
-)
+dag = _build_realtime_tick_dag()

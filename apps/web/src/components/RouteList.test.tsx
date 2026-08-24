@@ -66,6 +66,11 @@ function renderRouteList(overrides: Partial<React.ComponentProps<typeof RouteLis
     selectedRouteId: null,
     busyRouteId: null,
     transitionError: null,
+    canDispatchNewRoutes: true,
+    candidateRefresh: {
+      state: "normal",
+      description: "작업 후보는 5분 주기로 갱신됩니다.",
+    },
     onSelect: vi.fn(),
     onDispatch: vi.fn(),
     onComplete: vi.fn(),
@@ -97,6 +102,20 @@ describe("RouteList", () => {
     expect(screen.getByText("대여소 0곳 · 회수 0대 · 공급 0대")).not.toBeNull();
     expect(screen.getByText("#1")).not.toBeNull();
     expect(screen.queryByText(/작업 #/)).toBeNull();
+  });
+
+  it("후보 갱신 상태를 카드 왼쪽의 큰 시계 색으로 표시한다", () => {
+    renderRouteList({
+      candidateRefresh: {
+        state: "soon",
+        description: "새 작업 후보가 곧 게시될 수 있습니다.",
+      },
+    });
+
+    const soon = screen.getByRole("img", { name: "새 작업 후보가 곧 게시될 수 있습니다." });
+    expect(soon.querySelector(".route-status-icon")?.classList.contains("soon")).toBe(true);
+    expect(soon.closest(".route-card-main")).not.toBeNull();
+    expect(soon.closest(".route-card-title")).toBeNull();
   });
 
   it("작업 상태에 맞는 승인·완료·취소 동작을 호출한다", () => {
@@ -215,6 +234,22 @@ describe("RouteList", () => {
     expect(approval.hasAttribute("disabled")).toBe(false);
     fireEvent.click(approval);
     expect(props.onDispatch).toHaveBeenCalledWith(ROUTES[0]);
+  });
+
+  it("핵심 데이터가 지연되면 신규 승인만 막는다", () => {
+    const running = { ...ROUTES[1], region: "강남" };
+    const props = renderRouteList({
+      routes: [ROUTES[0], running],
+      canDispatchNewRoutes: false,
+    });
+
+    const approval = screen.getByRole("button", { name: "승인" });
+    expect(approval.hasAttribute("disabled")).toBe(true);
+    fireEvent.click(approval);
+    expect(props.onDispatch).not.toHaveBeenCalled();
+
+    expect(screen.getByRole("button", { name: "완료" }).hasAttribute("disabled")).toBe(false);
+    expect(screen.getByRole("button", { name: "취소" }).hasAttribute("disabled")).toBe(false);
   });
 
   it("겹치는 후보의 카드 선택과 진행 중 작업의 완료·취소는 그대로 동작한다", () => {

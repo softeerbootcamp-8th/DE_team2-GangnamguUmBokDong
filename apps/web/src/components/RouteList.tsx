@@ -47,6 +47,11 @@ interface Props {
   selectedRouteId: string | null;
   busyRouteId: string | null;
   transitionError: string | null;
+  canDispatchNewRoutes: boolean;
+  candidateRefresh: {
+    state: "normal" | "soon" | "delayed";
+    description: string;
+  };
   onSelect: (route: Route) => void;
   onDispatch: (route: Route) => void;
   onComplete: (route: Route) => void;
@@ -87,6 +92,8 @@ export function RouteList({
   selectedRouteId,
   busyRouteId,
   transitionError,
+  canDispatchNewRoutes,
+  candidateRefresh,
   onSelect,
   onDispatch,
   onComplete,
@@ -126,9 +133,27 @@ export function RouteList({
           data-route-id={route.route_id}
         >
           <button type="button" className="route-card-main" onClick={() => onSelect(route)}>
-            <span className={`route-status-icon ${status.className}`} aria-hidden="true">
-              <StatusIcon size={16} />
-            </span>
+            {route.status === "proposed" ? (
+              <span
+                className="route-candidate-indicator"
+                role="img"
+                aria-label={candidateRefresh.description}
+              >
+                <span
+                  className={`route-status-icon proposed ${candidateRefresh.state}`}
+                  aria-hidden="true"
+                >
+                  <Clock3 size={16} />
+                </span>
+                <span className="route-candidate-tooltip" aria-hidden="true">
+                  {candidateRefresh.description}
+                </span>
+              </span>
+            ) : (
+              <span className={`route-status-icon ${status.className}`} aria-hidden="true">
+                <StatusIcon size={16} />
+              </span>
+            )}
             <span className="route-card-copy">
               <span className="route-card-title">
                 <RouteIcon size={15} aria-hidden="true" />
@@ -157,10 +182,14 @@ export function RouteList({
               <button
                 type="button"
                 className={`route-action primary icon-only${isBusy ? " is-busy" : ""}`}
-                disabled={transitionsBlocked}
+                disabled={transitionsBlocked || !canDispatchNewRoutes}
                 onClick={() => onDispatch(route)}
                 aria-label={isBusy ? "처리 중" : "승인"}
-                title={isBusy ? "승인 처리 중" : "작업 승인"}
+                title={isBusy
+                  ? "승인 처리 중"
+                  : canDispatchNewRoutes
+                    ? "작업 승인"
+                    : "데이터 갱신 또는 기준 시각 정합을 기다리는 중"}
               >
                 {isBusy
                   ? <Loader2 size={14} aria-hidden="true" className="route-action-spinner" />

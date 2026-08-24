@@ -329,6 +329,30 @@ def list_source_snapshot_windows(source_id: str, day: date) -> list[datetime]:
     return sorted(logical_windows)
 
 
+def latest_source_snapshot_logical_dttm(
+    source_id: str, *, as_of: datetime
+) -> datetime | None:
+    """`as_of` 이전 가장 최근 source snapshot의 logical 시각을 반환한다(없으면 None).
+
+    Airflow의 freshness gate가 "마지막 성공 수집 이후 얼마나 지났는지"를 판단하는
+    용도다 — `as_of`가 속한 KST 날짜에서 못 찾으면 자정을 막 넘긴 경우를 위해
+    전날도 한 번 더 본다(그 이상 과거는 보지 않는다: 그만큼 오래 비어있다면 이미
+    다른 방식으로 감지되어야 할 장애다).
+
+    args:
+        source_id: 대상 Collector source ID
+        as_of: 기준 시각(aware) — 이 시각 이후의 window는 무시한다
+    returns:
+        가장 최근 logical 시각(KST aware) 또는 None
+    """
+    as_of_kst = as_of.astimezone(_KST)
+    candidates = [w for w in list_source_snapshot_windows(source_id, as_of_kst.date()) if w <= as_of_kst]
+    if not candidates:
+        yesterday = (as_of_kst - timedelta(days=1)).date()
+        candidates = [w for w in list_source_snapshot_windows(source_id, yesterday) if w <= as_of_kst]
+    return max(candidates) if candidates else None
+
+
 def object_uri(key: str) -> str:
     """현재 collector bucket의 exact S3 object URI를 만든다."""
     return f"s3://{os.environ.get('S3_BUCKET', 'gangnamgu')}/{key}"

@@ -202,7 +202,6 @@ def _stations_from_realtime(table: pa.Table) -> tuple[dict[str, object], ...]:
             "capacity": capacity,
             "lat": latitude,
             "lon": longitude,
-            "station_address": f"로컬 E2E fixture {station_name}",
             "station_id": station_id,
             "station_name": station_name,
             "station_no": station_no,
@@ -389,22 +388,6 @@ def _realtime_table(stations: tuple[dict[str, object], ...]) -> pa.Table:
     )
 
 
-def _master_table(stations: tuple[dict[str, object], ...]) -> pa.Table:
-    """Station Gold publisher가 소비하는 master source fixture를 만든다."""
-    return pa.Table.from_pylist(
-        [
-            {
-                "RNTLS_ID": station["station_id"],
-                "ADDR1": station["station_address"],
-                "ADDR2": "",
-                "LAT": station["lat"],
-                "LOT": station["lon"],
-            }
-            for station in stations
-        ]
-    )
-
-
 def _floor_logical(logical: datetime, tick_minutes: int) -> datetime:
     """Timezone을 보존하며 logical time을 지정 분 경계로 내린다."""
     midnight = logical.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -575,29 +558,45 @@ def _publish_source_snapshot(
     return key
 
 
+def _require_actual_station_master_snapshot(logical: datetime) -> str:
+    """운영 collector가 게시한 실제 station master authority URI를 반환한다."""
+    try:
+        snapshot = read_exact_source_snapshot("bike_station_master", logical)
+    except SourceSnapshotNotFoundError as exc:
+        raise ValueError(
+            "local E2E 전에 운영과 같은 bike_station_master collector를 실행해야 합니다."
+        ) from exc
+    if snapshot.table is None:
+        raise ValueError("bike_station_master source snapshot이 EMPTY입니다.")
+    required = {"RNTLS_ID", "ADDR1", "LAT", "LOT"}
+    if missing := required - set(snapshot.table.column_names):
+        raise ValueError(
+            f"bike_station_master 필수 컬럼이 없습니다: {sorted(missing)}"
+        )
+    addresses = snapshot.table.column("ADDR1").to_pylist()
+    if not any(isinstance(value, str) and value.strip() for value in addresses):
+        raise ValueError("bike_station_master에 실제 주소가 하나도 없습니다.")
+    if any(
+        isinstance(value, str) and value.startswith("로컬 E2E fixture")
+        for value in addresses
+    ):
+        raise ValueError("bike_station_master에 로컬 fixture 주소가 섞여 있습니다.")
+    if snapshot.manifest.silver_uri is None:
+        raise ValueError("bike_station_master SUCCEEDED manifest에 Silver URI가 없습니다.")
+    return snapshot.manifest.silver_uri
+
+
 def _publish_prerequisite_source_snapshots(
     object_store: S3ImmutableObjectStore,
     bucket: str,
     logical: datetime,
-    stations: tuple[dict[str, object], ...],
 ) -> dict[str, str]:
-    """운영 DAG가 수집하지 않는 station·weather authority를 준비한다."""
+    """실제 station master를 고정하고 운영 DAG가 수집하지 않는 날씨를 준비한다."""
     kma_parts = _kma_parts(logical)
     short_logical = _floor_logical(logical, 180)
     ultra_logical = _floor_logical(logical, 30)
     return {
-        "bike_station_master": _publish_source_snapshot(
-            object_store,
-            bucket,
-            source_id="bike_station_master",
-            logical=logical,
-            table=_master_table(stations),
-            planned_parts=(
-                "page-00001-01000",
-                "page-01001-02000",
-                "page-02001-03000",
-            ),
-        ),
+        "bike_station_master": _require_actual_station_master_snapshot(logical),
         "weather_short_term_forecast": _publish_source_snapshot(
             object_store,
             bucket,
@@ -977,7 +976,6 @@ def seed(logical: datetime, *, model_bundle: Path | None = None) -> dict[str, ob
         object_store,
         bucket,
         logical,
-        stations,
     )
     history = _publish_history_snapshots(
         object_store,

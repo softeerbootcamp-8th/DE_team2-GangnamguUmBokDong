@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import datetime
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
@@ -43,6 +44,14 @@ class TestParseArgs:
                 ]
             )
 
+    def test_check_due_after_seconds_does_not_require_window_start(self):
+        args = main.parse_args(
+            ["--source", "weather_ultra_short_live", "--check-due-after-seconds", "600"]
+        )
+
+        assert args.check_due_after_seconds == 600
+        assert args.window_start is None
+
 
 class TestExitCodeFor:
     @pytest.mark.parametrize(
@@ -53,6 +62,74 @@ class TestExitCodeFor:
 
     def test_failed_maps_to_nonzero(self):
         assert main.exit_code_for(RunStatus.FAILED) != 0
+
+
+class TestCheckDueAfterSeconds:
+    """Airflow freshness gate가 파싱하는 --check-due-after-seconds JSON 출력을 검증한다."""
+
+    def test_due_true_when_never_collected(self, monkeypatch, capsys):
+        monkeypatch.setattr(
+            main.storage, "latest_source_snapshot_logical_dttm", lambda *a, **k: None
+        )
+
+        code = main.main(
+            ["--source", "weather_ultra_short_live", "--check-due-after-seconds", "600"]
+        )
+
+        assert code == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload == {
+            "source_id": "weather_ultra_short_live",
+            "due": True,
+            "last_logical_dttm": None,
+            "elapsed_seconds": None,
+        }
+
+    def test_due_false_when_within_threshold(self, monkeypatch, capsys):
+        now = datetime(2026, 8, 24, 10, 15, tzinfo=KST)
+        last = datetime(2026, 8, 24, 10, 12, tzinfo=KST)
+
+        class _FixedDatetime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return now
+
+        monkeypatch.setattr(main, "datetime", _FixedDatetime)
+        monkeypatch.setattr(
+            main.storage, "latest_source_snapshot_logical_dttm", lambda *a, **k: last
+        )
+
+        code = main.main(
+            ["--source", "weather_ultra_short_live", "--check-due-after-seconds", "600"]
+        )
+
+        assert code == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["due"] is False
+        assert payload["elapsed_seconds"] == 180.0
+        assert payload["last_logical_dttm"] == last.isoformat()
+
+    def test_due_true_once_threshold_elapsed(self, monkeypatch, capsys):
+        now = datetime(2026, 8, 24, 10, 25, tzinfo=KST)
+        last = datetime(2026, 8, 24, 10, 12, tzinfo=KST)
+
+        class _FixedDatetime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return now
+
+        monkeypatch.setattr(main, "datetime", _FixedDatetime)
+        monkeypatch.setattr(
+            main.storage, "latest_source_snapshot_logical_dttm", lambda *a, **k: last
+        )
+
+        code = main.main(
+            ["--source", "weather_ultra_short_live", "--check-due-after-seconds", "600"]
+        )
+
+        assert code == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["due"] is True
 
 
 class TestMain:
