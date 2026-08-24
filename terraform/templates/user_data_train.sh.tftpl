@@ -35,7 +35,7 @@ export S3_BUCKET=${s3_bucket}
 export MODELS_PREFIX=models
 # 상시 EC2의 사설 IP. 같은 VPC 안이라 인터넷을 타지 않고, sg-app의
 # "5000 ← sg-train" 규칙으로 통제된다.
-export MLFLOW_TRACKING_URI=http://${mlflow_host}:5000
+export MLFLOW_TRACKING_URI=http://${mlflow_host}:5000/mlflow
 PROFILE
 
 cat > /etc/motd <<'MOTD'
