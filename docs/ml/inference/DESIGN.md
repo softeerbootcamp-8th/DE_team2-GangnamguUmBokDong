@@ -1,149 +1,176 @@
-# inference — 설계 문서
+# Inference 설계
 
-실행 방법은 [README.md](../../../ml/inference/README.md), 결정의 배경은 [history.md](../history.md)/
-[REALTIME_FEATURES.md](../REALTIME_FEATURES.md)를 참고. 이 문서는 "지금 코드가
-왜 이렇게 짜여 있는지"에 집중한다.
+> 현재 상태: **운영 코드와 일치**
+>
+> 운영 진입점: `inference.publication_cli`
+>
+> 실행 방법: [inference README](../../../ml/inference/README.md)
 
-## 1. 왜 두 가지 예측 경로인가
+Inference는 pinned serving release의 대여·반납 모델로 전체 서빙 대상 정류소의
+12개 horizon을 계산하고, 검증된 결과를 immutable snapshot으로 게시한다. 예측값을
+계산하는 것뿐 아니라 입력·모델·결과의 정확한 identity와 완전성을 보장하는 것이
+운영 경로의 책임이다.
 
-배치 조회(`predict_common.py`)는 이미 계산된 feature 테이블(`feature_engine`의
-산출물)에서 골라 조회하는 것이라 2025년 범위 밖은 다룰 수 없다. 실서비스 연동
-대상은 **단일 시점 예측**(`predict_single.py`)이다 — 정류소ID + 날짜/시각 + 날씨만
-받으면 lag/rolling을 내부에서 자동으로 채워 임의 시점을 예측한다.
+## 1. 실행 경로
 
-## 2. `predict_single.py`가 lag를 자동 계산하는 이유
+두 예측 경로의 목적은 다르다.
 
-**(2026-08 갱신) lag/rolling 피처가 대폭 축소됐다** — 지금 모델 feature는
-대여/반납 각각 `rental_lag_1h`/`return_lag_1h` 딱 1개씩뿐이다(예전엔
-`lag_24h/168h`, `roll_mean/std_3h·24h` 등 14개짜리 스키마였다 — 아래 내용이
-그 시절 기준이면 지금은 안 맞음). 그래도 원리는 그대로다: 모델이 가장
-중요하게 쓰는 정보는 그 정류소의 직전 실적("이미 일어난 일"이라 사용자가
-시나리오처럼 지정할 값이 아니라 조회해야 하는 값)이므로, 모듈 내부에서
-히스토리를 보고 자동으로 채운다. 히스토리 소스는 두 개로 나뉜다:
+| 경로 | 용도 | Authority 여부 |
+|---|---|---|
+| `predict_common.py`, `predict_{rental,return}_demand.py` | 기존 feature mart 조회·백테스트 | 아님 |
+| `predict_single.py` | 단일 정류소 또는 전체 정류소의 실시간 feature 조립·채점 | 계산 엔진 |
+| `publication_cli.py` → `publication.py` | serving plan 기반 운영 추론·검증·게시 | **정식 authority** |
 
-- **`_get_history_by_station()`** — 병합 테이블(시간 단위 집계). 반납은 반납
-  이벤트 자체가 로그 시점이라 지연 관측 문제가 없어서 `return_lag_1h`
-  전체가 이 경로만 쓴다.
-- **`_get_rental_events_by_station()`**(`ml_core.trip_events.load_rental_trip_events()`) —
-  트립 단위(start_dt/end_dt) 원본. `rental_lag_1h` 계산에 쓴다 — 대여는
-  반납이 완료돼야 로그에 잡히는 지연 관측 문제가 있어서, 시간 단위 집계만
-  으로는 그 시점에 실제로 관측 가능했던 값을 재현할 수 없기 때문이다
-  (`ml_core.rolling_window_features.count_visible_in_window()`로 계산).
-  실제 서비스로 갈 때는 이 두 함수만 각각 실시간 소스(집계 스토어 / 트립
-  이벤트 버퍼)로 교체하면 나머지 로직은 그대로 재사용된다.
+Airflow의 네 `realtime_tick*` DAG는 공통 체인을 사용한다.
 
-## 3. 2단계 fallback — 실시간 데이터 결측/지연 대응
+```text
+collector / normalizer
+        │
+        ▼
+prepare_serving_plan
+        │ exact plan URI + SHA-256
+        ▼
+run_inference
+        │ immutable inference manifest
+        ▼
+finalize_serving → urgency → routes
+```
 
-요구사항은 "근접 미래를 실시간 실적으로 계속 예측하되, 피드가 끊기거나
-지연돼도 어느 정도 정확도를 유지해야 한다"는 것이었다. `_lag_rolling_features()`가
-`rental_lag_1h`/`return_lag_1h`를 다음 순서로 채운다:
+날씨가 필요한 tick에서는 초단기실황·초단기예보·단기예보 collector가 같은 DAG의
+선행 task로 실행된다. 수집 실패 시에는 `ALL_DONE` gate를 지나 이전에 게시된 날씨로
+계속할 수 있지만, serving plan·정류소·대여이력·normalizer 의존성은 우회하지 않는다.
 
-1. **실시간 히스토리에서 조회** — 있으면 그대로 사용
-2. **없으면 `station_hourly_profile.parquet`(`inference.build_station_profile`)로 대체** —
-   그 정류소가 이 달·이 요일·이 tick(minute)에 보통 어느 정도였는지(월을
-   그룹 키에 반드시 포함 — 계절에 따라 대여량이 최대 2.44배 차이나서, 월
-   없이 묶으면 겨울 결측을 여름 수준으로 채우는 오류가 생김). **키가
-   `hour`가 아니라 `minute`인 이유(2026-08)**: `rental_count`/`return_count`가
-   60분짜리 forward-rolling 합계를 5분마다 다시 계산한 값이라, 같은 시간
-   (hour) 안의 인접 tick끼리 창이 최대 11/12 겹친다 — hour로 묶어 표본을 늘려도
-   그 "추가" 표본이 사실상 중복이라 minute 단위로 묶는 것과 실질적으로
-   차이가 없다(오히려 세분화 손해가 없다는 뜻).
+## 2. Pinned serving release
 
-"없으면"의 판정 기준: **`rental_lag_1h`**는 "그 anchor의 윈도우에 트립이
-0건"(정상 관측값 0)과 "그 윈도우 자체가 로드된 트립 데이터 커버리지
-밖"(진짜 결측)을 구분한다 — 전자는 fallback이 아니다. **`return_lag_1h`**는
-해당 시각이 히스토리 그리드에 없으면 결측 → fallback.
+운영 실행은 mutable champion key를 채점 도중 다시 읽지 않는다.
 
-두 lag 각각을 독립적으로 대체하는 방식이라(재귀적으로 예측값을 다음 입력에
-다시 먹이지 않음), 여러 horizon 앞을 예측해도 오차가 쌓이지 않는다 — §7 참고.
-반환값의 `lag_fallback_used`/`lag_data_freshness`로 이번 예측이 실시간
-데이터를 얼마나 썼는지 확인할 수 있다.
+1. serving plan이 지정한 logical time과 expected station set을 읽는다.
+2. serving release pointer를 실행 시작에 한 번 읽는다.
+3. release에 결합된 rental/return model snapshot, station categories, effective
+   profile, station fallback profile을 실제 bytes와 checksum으로 검증한다.
+4. 두 모델과 fallback profile을 한 실행 동안 고정한다.
+5. 현재 `common_config`와 artifact의 serving feature 계약이 다르면 실패한다.
 
-**날씨는 lag와 다르게 다룬다(2026-08 신규)**: `_resolve_live_weather()`가
-target_ts(horizon에 따라 미래일 수 있음)와 anchor_ts(T0, "지금")를 비교해서
-미래면 예보(`weather_short_term_forecast`)를 먼저 시도하고, 그렇지 않거나
-예보를 못 찾으면 관측(`weather_ultra_short_live`)으로 fallback한다 — 학습은
-항상 target_ts의 실제 관측 날씨(ground truth, 이미 지난 과거라 실측이
-있음)로 배우지만, 추론은 target_ts가 미래일 수 있어 이 분기가 필요하다.
-collector의 예보 자동 수집 스케줄이 아직 없어(수동 트리거만 가능) 실제로는
-관측 fallback을 타는 경우가 아직 많다.
+이 구조는 실행 중 champion이 교체돼 대여·반납 모델 또는 category 순서가 서로 다른
+버전으로 섞이는 것을 막는다. 모델 feature 순서와 dtype의 단일 기준은
+`libs/ml_core/model_contract.py`다.
 
-인구(`population`)도 같은 원리로 `population_hourly_profile.parquet`
-(`inference.build_population_profile`)로 대체되지만, 그룹 키에 **월을 넣지
-않는다** — 생활인구는 월별로는 거의 안 변하고(1.05배) 시간대별로만 크게
-변해서(1.42배, 출퇴근 패턴) station 프로필과 계절 반응이 다르기 때문.
+## 3. 시간과 multi-horizon 계약
 
-**날씨로도 조건화하지 않는 이유(검토 후 보류)**: station 프로필은 이미
-`station × hour × dow × month`로 쪼개져 있어 그룹당 표본이 4~5개뿐이다.
-여기에 `rain_flag`(강수 여부)까지 추가해봤더니 표본 1개 이하인 그룹이
-17.6%로 뛰었다(반대로 month를 빼고 rain_flag만 넣으면 표본은 넉넉해지지만
-계절성을 다시 잃음) — station 단위로 세분화한 상태에서 축을 하나 더 늘리면
-1년치 데이터로는 표본이 순식간에 바닥난다. "station 기준값 × 도시 전체
-날씨 보정 배수"처럼 계층적으로 접근하는 대안은 있지만, fallback 하나를 위해
-별도 보정 로직을 얹는 복잡도 대비 이득이 낮다고 판단해 지금은 month까지만
-유지한다.
+운영 logical time은 정확한 분 경계이며 KST 기준 `SERVING_TICK_MINUTES=5`의 배수여야
+한다. 모델 학습 grid가 기본 20분이어도 서빙은 매 5분 실행할 수 있다.
 
-## 4. `ml_core/`에서 가져오는 것과 이 폴더에 남은 것
+각 정류소의 anchor 시각 `T0`에서 horizon `h`의 target 시각은
+`T0 + (h-1)시간`이다.
 
-- `ml_core.model_contract.RENTAL_FEATURE_COLUMNS`/`RETURN_FEATURE_COLUMNS`/
-  `load_station_dtype()` — training이 저장한 station_no(station_id 아님 —
-  모델 feature는 정수 station_no, station_id는 식별용) 카테고리를 그대로
-  로드해야 모델이 정류소를 올바르게 해석한다(모델 계약,
-  [training/DESIGN.md](../training/DESIGN.md) 4절 참고).
-- `ml_core.scoring.predict()` — 저장된 booster 채점 로직(exposure 복원,
-  conformal 보정 적용) — `monitor_performance.py`와 동일한 로직을 씀.
-- `ml_core.rolling_window_features.count_visible_in_window()`,
-  `ml_core.trip_events.load_rental_trip_events()` — point-in-time censoring을
-  배치(`feature_engine`)와 서빙(이 폴더)이 같은 규칙으로 계산해야 한다.
+- `rental_lag_1h`와 `return_lag_1h`는 anchor에서 한 번 계산해 모든 horizon에 고정한다.
+- 날씨·인구·캘린더·`horizon`은 target 시각 기준으로 만든다.
+- 이전 horizon의 예측값을 다음 입력에 넣지 않는다.
+- 운영 authority는 모든 expected station에 horizon 1..12가 정확히 있어야 한다.
 
-이 폴더에 남은 건 "서빙 시나리오 조립"(fallback 판정, 프로필 조회, CLI/함수
-인터페이스)뿐이다.
+따라서 재귀 예측의 오차 누적은 없으며, 학습용 multi-horizon mart와 같은 feature
+의미를 유지한다.
 
-## 5. 검증 — 배치와 서빙의 일치
+## 4. 실시간 feature와 fallback
 
-히스토리에 있는 시점을 넣으면 실제 과거 lag 값을 그대로 써서 예측하고, 배치
-CLI의 같은 시점 결과와 소수점까지 정확히 일치한다(`population`을 제공한
-경우 기준). `return_lag_1h`는 배치·서빙 둘 다 같은 시간 단위 집계를
-조회하므로 일치가 자명하다. `rental_lag_1h`는 배치(`feature_engine/spark/build_features.py`의
-`censored_rolling_counts`)와 서빙 시뮬레이션(이 모듈, `count_visible_in_window`
-반복 호출)이 서로 다른 코드 경로지만 같은 point-in-time censoring 규칙을
-쓰므로 일치해야 한다 — `tests/dev_rental_censoring_cross_parity.py`가 합성
-데이터로 이를 확인한다.
+### Lag
 
-## 6. 실시간 트립 카운트 스토어 — Kafka+Spark Streaming은 과설계
+- 대여 lag는 트립별 `start_dt`와 `end_dt`를 사용해
+  `[T-embargo-window, T-embargo)` 중 `end_dt <= T`인 이벤트만 센다.
+- 반납 lag는 반납 이벤트를 시간 단위로 집계한다.
+- 정상 관측값 0과 데이터 커버리지 밖 결측을 구분한다.
+- 실제 데이터가 없을 때만 `station_hourly_profile.parquet`의
+  `station_no × minute × dow × month` 평균으로 대체한다.
+- 서빙 시각이 학습 anchor 사이에 있으면 profile 조회에 한해 같은 날의 직전 학습
+  anchor로 내린다. 미래 anchor를 사용하지 않는다.
 
-§2의 `_get_rental_events_by_station()`을 실제 서비스에서 실시간 소스로
-교체할 때를 대비해 검토한 내용. 초안에서는 Kafka + Spark Structured
-Streaming을 제안했었지만, 실제 처리량을 계산해보니 명백한 과설계였다 —
-2025년 실측 기준 서울 전체(정류소 2,582개 합산) 트립 이벤트는 평균 초당
-1.2건, 가장 붐비는 시간대(평일 18시)도 초당 3.3건에 불과하다. Kafka는 초당
-수만~수백만 건, 여러 독립 프로듀서/컨슈머 분리나 이벤트 재생(replay)이 하드
-요구사항인 상황을 위한 도구라, 초당 한두 건짜리 이벤트에 브로커 클러스터+
-상시 구동 Spark 클러스터를 얹으면 운영 부담(장애 지점·모니터링 대상 증가)이
-얻는 이득보다 훨씬 크다.
+### 날씨
 
-**더 적합한 대안**: 트립 이벤트를 수집하는 쪽이 Redis에 직접 쓰면 끝난다 —
-`station_id`별로 `INCR bike:{station_id}:{tick_bucket}` 하나면 tick당
-카운트가 되고 `EXPIRE`로 오래된 키를 정리하면 `rental_lag_1h`/`return_lag_1h`
-조회용 rolling window가 그대로 구현된다. 폴링 주기가 분 단위(예: 5분마다 API 조회)라면 cron/스케줄러가
-주기적으로 Redis나 Postgres 테이블을 갱신하는 배치 스크립트로 충분하다 —
-"근접 미래, 지연에도 견고해야 함"이라는 §3의 fallback 설계 전제와도 자연스럽게
-맞는다. 이벤트 소스가 여러 개라 디커플링이 실제로 필요해지면 그때 메시지
-큐를 고려할 수 있는데, 이 처리량대에서는 Kafka보다 Redis Streams나
-RabbitMQ로 충분하다 — Kafka는 초당 수천 건 이상·여러 소비자 그룹·장기
-보관/재처리가 필요해지는 다음 단계에서나 정당화된다.
+target 시각이 미래면 `weather_short_term_forecast`를 먼저 조회하고, 유효한 예보가
+없거나 target이 현재·과거이면 `weather_ultra_short_live` 관측을 사용한다. 날씨
+collector는 현재 `realtime_tick*` DAG에 통합돼 있으며, 실패 시 이전 snapshot을
+사용할 수 있다.
 
-## 7. N시간 뒤까지 예측 — horizon-as-feature (2026-08 갱신, 예전엔 재귀 방식)
+### 생활인구와 재고
 
-**이 절은 원래 "재귀 방식을 알고도 임시로 채택했다"고 적혀 있었다 — 그 임시
-방식은 이후 실제로 horizon-as-feature로 교체됐다(history.md 18/20번 항목의
-후속).** `predict_demand_multi_hour()`는 이제 직전 스텝의 예측값을 다음 스텝
-입력으로 재사용하지 않는다 — lag(`rental_lag_1h`/`return_lag_1h`)는
-anchor_ts(T0, "지금") 기준으로 딱 한 번만 계산하고, "몇 시간 뒤인지"(horizon,
-1~`HORIZON_COUNT`)를 평범한 입력 feature로 모델에 직접 알려준다. 학습
-테이블 자체가 이 구조로 만들어져 있다(`feature_engine/spark/build_multi_horizon_features.py`,
-같은 anchor에 horizon만 다른 행을 union) — 그래서 서빙도 재귀 없이 그
-학습 구조를 그대로 재현하기만 하면 된다. 모든 horizon(h=1이든 h=12든)이
-같은 경로(lag는 T0 고정, 날씨/캘린더/타겟만 target_ts 기준 재계산)를 타므로
-정확도가 horizon 전체에 걸쳐 균일하게 보존되고, 오차가 누적될 여지 자체가
-없다 — 재귀 로직(`_recursive_lag_rolling_features()` 등)은 삭제됐다.
+- 인구는 `living_population_normalized`의 최근 값을 먼저 사용하고, 없으면
+  `population_hourly_profile.parquet`의 `grid_id × hour × dow` 평균을 쓴다.
+- 재고가 없으면 `stockout=False`로 대체한다. 이는 `rental_exposure=1.0`이 되어 실제
+  품절 수요를 과대평가할 수 있으므로 결과 metadata에서 fallback 여부를 추적한다.
+
+직접 호출 API는 `lag_fallback_used`, `lag_data_freshness`, `population_source`,
+`stockout_source`를 반환한다. 다만 이 진단 필드는 정식 Gold inference authority의
+7개 컬럼에는 포함하지 않는다.
+
+## 5. 전체 정류소 계산과 완전성
+
+전체 정류소 경로는 active station과 두 모델 support의 교집합을 serving plan에서
+expected set으로 고정한다. horizon별로 정류소를 묶어 LightGBM을 배치 호출하고,
+대여의 최근 실적 계산도 정류소별 반복 대신 벡터화한다.
+
+`predict_single.py` 자체는 진단을 위해 station별 실패를 `failed` 목록에 격리할 수
+있다. 그러나 `publication.py`는 다음 중 하나라도 만족하지 않으면 authority를 쓰지
+않는다.
+
+- `failed`가 비어 있지 않음
+- `actual_count != expected_count`
+- expected station 집합과 결과 station 집합이 다름
+- 정류소별 horizon 1..12가 중복·누락됨
+- target date/hour/minute가 logical time과 horizon 관계에 맞지 않음
+- 예측값이 유한한 non-negative 값이 아님
+
+정식 결과는 다음 exact 7-column schema로 canonicalize한다.
+
+| 컬럼 | 의미 |
+|---|---|
+| `station_id` | 서빙 정류소 ID |
+| `date`, `hour`, `minute` | KST target 시각 |
+| `horizon` | 1..12 |
+| `rental_pred_mean` | 대여 평균 예측 |
+| `return_pred_mean` | 반납 평균 예측 |
+
+P10/P50/P90과 fallback 진단값은 직접 호출 결과에는 존재하지만 Gold 전달 authority에는
+포함하지 않는다.
+
+## 6. Immutable publication
+
+`run_and_publish_inference()`는 결과를 다음 순서로 공개한다.
+
+1. 계산 중 실제로 읽은 non-model S3 bytes를 캡처한다.
+2. 입력과 7-column Parquet을 content-addressed object로 고정한다.
+3. logical time별 immutable revision catalog를 claim한다.
+4. 성공 또는 `EMPTY` manifest를 마지막에 기록한다.
+5. 기록한 manifest bytes를 다시 읽어 SHA-256과 구조를 검증한다.
+
+같은 logical time과 같은 bytes의 재실행은 새 revision을 만들지 않는 exact replay다.
+계산 결과가 달라지면 기존 latest manifest가 완전한지 검증한 뒤 다음 revision을 만든다.
+manifest가 공개되기 전의 object는 authority가 아니므로 소비자는 catalog와 manifest만
+따라가야 한다.
+
+## 7. 알려진 한계
+
+- 정류소 master는 current dimension이므로 과거 좌표·capacity를 시점별로 복원하지
+  못한다.
+- fallback profile은 평소 패턴이라 돌발 수요를 반영하지 못한다.
+- 실시간 재고 결측 시 `stockout=False`는 대여 수요를 높게 만들 수 있다.
+- 학습 support에 없거나 current active set에 없는 정류소는 serving surface에서
+  제외된다. 신규 정류소는 재학습·승격 전까지 예측 대상이 아니다.
+- 학습은 target 시각의 실제 관측 날씨를 사용하지만 미래 추론은 예보를 사용하므로
+  근본적인 weather train-serving 차이는 남는다.
+
+## 8. 검증 기준
+
+```bash
+cd ml
+./inference/.venv/bin/python -m pytest inference/tests/ -q
+```
+
+변경 시 최소한 다음을 검증한다.
+
+1. feature 순서·dtype·station category가 모델 snapshot과 같다.
+2. 대여 censoring 결과가 feature engine의 Spark 결과와 같다.
+3. lag fallback은 관측값 0을 결측으로 오인하지 않는다.
+4. horizon 변화는 anchor lag를 바꾸지 않는다.
+5. 예보·관측·인구·재고 fallback의 source 판정이 노출된다.
+6. partial 결과는 immutable authority로 게시되지 않는다.
+7. replay·revision·manifest-last 계약이 유지된다.

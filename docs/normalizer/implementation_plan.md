@@ -1,90 +1,138 @@
-# 생활인구 250m 격자 × 실시간 인구 POI 병합/정규화 (seoul-pop-normalizer)
+# 생활인구 Normalizer 구현
 
-## Context
+> **현재 구현:** `normalizer/`와 Airflow `realtime_tick`, `station_master` DAG가 사용하는
+> 공간 정규화 경로다. 코드 확인일: 2026-08-24.
 
-서울 생활인구(250m 격자, 일 1회, `collector`가 `living_population_grid`로 수집)와 서울시 실시간 인구(121개 주요장소 폴리곤, 5분 주기, `collector`가 `population_realtime`으로 수집)는 형태·단위가 달라 그대로는 비교/결합할 수 없다. 목표는 250m 격자를 공간 기준으로 삼아, 실시간 POI가 격자에 겹치는 비율만큼 격자의 "면적당 인구(밀도)"를 실시간 값으로 가중 갱신하고, 여러 POI가 겹치면 면적이 큰 것부터 순차 적용해 좁고 밀집도 높은 핫스팟의 영향이 희석되지 않게 하는 것이다. 이 결과는 s3의 silver에 파케이 형식으로 저장한다.
+## 해결하는 문제
 
-**이 작업은 `collector`와 완전히 분리된 독립 모듈 `seoul-pop-normalizer/`(브랜치명과 동일, 저장소 루트에 이미 빈 디렉터리로 존재)에 구현한다.** `collector`, `apps/api`, `ml/feature_engine` 등과 동일하게 `Makefile`의 `PROJECTS`에 등록된 독자적인 uv 프로젝트로 취급하고, `collector`의 내부 코드(스토리지·검증·파이프라인)를 직접 import하지 않는다. **`ml/` 모듈은 이번 설계에서 전례·참고 대상으로 삼지 않는다** — 완전히 독립된 별개 모듈이다.
+**전역을 덮는 생활인구는 늦고, 실시간 인구는 121개 주요 장소만 제공된다.**
 
-이전 시도에서 실제 데이터로 전체 파이프라인을 끝까지 실행해 검증했고, 그 과정에서 확인한 사실과 발견한 버그를 아래에 반영한다.
+Normalizer는 nowcaster의 250m 격자 baseline과 5분 단위 POI 실시간 인구를 EPSG:5179
+공간 교차로 결합한다. 겹치지 않는 격자는 baseline을 유지하고, 겹치는 영역만 POI의
+인구 밀도로 보정해 `living_population_normalized` Silver를 만든다.
 
-## 실측으로 검증된 사실
+## 두 실행 경로
 
-**격자 ID → 좌표 변환**: `CELL_ID`(예: `다사52255325`)는 "한글 2자 + 숫자 8자리"(동서글자·남북글자·동서4자리·남북4자리) 형식이며, 행정안전부 국가지점번호 체계와 동일하다. 한글은 가나다순 인덱스(가=0, 나=1, ...)를 쓴다.
-
-```
-X(EPSG:5179) = 700,000 + 동서글자_인덱스 × 100,000 + 앞4자리_숫자 × 10
-Y(EPSG:5179) = 1,300,000 + 남북글자_인덱스 × 100,000 + 뒤4자리_숫자 × 10
-```
-
-이 좌표가 250m 정사각 격자의 남서쪽 꼭짓점이며 `box(x, y, x+250, y+250)`이 격자 폴리곤(EPSG:5179 축 정렬, 회전 없음)이다. 검증: `cell_id_to_epsg5179_sw_corner("다사53815262")` == `(953810.0, 1952620.0)`, 서울시청 인근 좌표와 일치(위키백과 예시 "동쪽 253.81km·북쪽 652.62km"로 교차 검증됨). `living_population_grid` 실제 silver 스키마: `YMD, TT(00~23 시간대), H_DNG_CD, CELL_ID, SPOP, M00~M70, F00~F70`. **한 CELL_ID당 하루 24개 행(TT별)이 있다** — 병합 시 `window_start`의 시(hour)와 같은 TT 행만 써야 한다(아래 버그 참고).
-
-**POI(121장소) 폴리곤**: 서울시가 OA-21778 페이지에서 공식 제공하는 "서울시 주요 121장소 영역.zip"(shapefile, 이미 EPSG:4326)에 실제로 **`AREA_CD`, `AREA_NM`, `geometry` 컬럼이 직접 포함**돼 있어, 별도 "목록.xlsx"와의 이름 조인이 필요 없다. 전부 `Polygon`(MultiPolygon 없음), 121개 row. 단, **`AREA_CD` 값은 `POI001`~`POI131` 사이에 10개의 결번이 있는 121개**이며 연속된 1~121이 아니다(구체적으로 `POI022,028,057,062,065,069,075,097,099,113`이 결번). `population_realtime`의 `AREA_CD`와 동일한 코드 체계.
-
-**실측으로 발견한 버그 2건** (이번 재구현에서 처음부터 올바르게 반영):
-1. **자기교차(위상 오류) 폴리곤**: 실제 shapefile 중 `POI070`("쌍문역")이 `shapely`가 `TopologyException`을 던질 정도로 자기교차한다. 로딩 시 `is_valid` 체크 후 `shapely.validation.make_valid`로 복구하고, 복구 결과가 단일 `Polygon`이 아니면(예: `MultiPolygon`으로 쪼개짐) 면적이 가장 큰 조각을 취한다. Polygon 조각이 하나도 없으면 명확히 실패시킨다.
-2. **TT(시간대) 미필터링**: `living_population_grid`가 격자당 하루 24행(TT별)을 가진다는 걸 놓치면, 병합 시 24개 행을 전부 밀도 계산에 섞어 넣어 결과가 24배 가까이 부풀려진다. `window_start`의 시(hour)와 일치하는 TT 행만 골라 써야 하고, 수집 쪽 재시도로 실제 관측된 동일 `(CELL_ID, TT)` 중복 행도 정리해야 한다(dict 컴프리헨션으로 자연 정리 가능).
-
-**서비스 안내 페이지 확인**: 생활인구는 "기준일로부터 4일 전까지만 제공"(OA-22784 페이지 명시, 실측 데이터에서도 `dt=2026-08-15`로 수집한 파일의 내용이 `YMD=20260811`이었음 — 4일 지연과 일치). **이 결측 보정 로직은 이번 스코프에서 명시적으로 제외**하고, 가장 최근 완결된 날짜의 silver를 그대로 쓴다고 가정한다.
-
-**규모**: 서울 전체 250m 격자는 약 1만 개(`living_population_grid` 1회 수집분에서 8,570개 CELL_ID 확인), POI는 121개 고정. STRtree로 후보를 좁히면 실제 겹치는 (격자, POI) 쌍은 수천 건 수준 
-
-
-
-
-작성해주신 내용을 바탕으로 핵심 로직이 한눈에 들어오도록 **마크다운(Markdown) 문서로 구조화하여 정리**했습니다. *(참고: 마지막의 'Mdfh'는 한영 변환 오타인 '으로'로 이해하여, 해당 내용을 체계적인 기획/정의서 형태로 다듬었습니다.)*
-
----
-
-# 📊 250m 격자 기반 인구 데이터 병합 및 정규화 로직 정의서
-
-## 1. 목표 및 기본 방향
-
-* **목표:** 형태와 단위가 다른 두 이종(Heterogeneous) 인구 데이터를 '250m 격자' 기준으로 병합하여 정규화
-* **공간 기준:** 250m × 250m 정사각 격자 (생활인구 기준)
-* **연산 기준:** 단순 인구수가 아닌 '단위 면적당 인구(인구 밀도)'를 기준으로 계산
-
----
-
-## 2. 데이터 특징 요약
-
-| 구분 | 서울 생활인구 (250m) | 서울시 실시간 인구 (POI) |
+| CLI | Airflow | 출력 |
 | --- | --- | --- |
-| **형태** | 고정된 250m 정사각 격자 (Grid) | 면적과 모양이 불규칙한 121개 주요 핫스팟 (Polygon) |
-| **성격** | 과거 이력 기준의 절대 추정 인구수 | 실시간 기준의 인구 범위 (예: 1,000~1,200명) |
+| `main.py --window-start` | `realtime_tick`의 `run_normalizer` | 현재와 향후 최대 12시간의 정규화 격자 |
+| `station_master.py --window-start` | 일일 `station_master`의 `enrich_station_master` | 인구·기상 격자가 붙은 대여소 master |
 
----
+Normalizer는 독립 uv project이며 Collector 내부 구현을 import하지 않는다. S3와 source
+snapshot 공통 계약은 `libs/core`를 사용한다.
 
-## 3. 단일 POI 겹침 시 인구 업데이트 로직
+## 입력과 출력
 
-하나의 격자(A) 영역 중 일부 면적에 단일 POI(B)가 겹치는 경우, 교차하는 면적 비율을 가중치로 사용하여 격자의 인구 밀도를 갱신합니다. (예: 격자 A의 30% 영역에 POI B가 교차)
+```text
+nowcaster nowcast.parquet ─┐
+                           ├─ main.py ─→ living_population_normalized
+population_realtime ───────┘
 
-1. **밀도 산출:** 격자 A의 기존 면적당 인구($D_A$)와 POI B의 실시간 면적당 인구($D_B$)를 각각 산출합니다.
-2. **밀도 갱신:** 교차 및 미교차 면적 비율을 가중치로 적용하여 새로운 밀도($D_{new}$)를 계산합니다.
+bike_station_master ──────┐
+bike_station_realtime ────┼─ station_master.py ─→ station_master_enriched
+latest successful nowcast ┘
+```
 
-$$D_{new} = (W_{미교차} \times D_A) + (W_{교차} \times D_B)$$
+- 현재·미래 정규화는 대상 날짜의 exact nowcast가 없으면 실패한다.
+- Station master 보강은 정적인 CELL geometry만 필요하므로 미래 파일을 제외한 최신 성공
+  nowcast를 사용할 수 있다.
+- Collector 입력은 source snapshot authority가 가리키는 Parquet을 읽는다. EMPTY는
+  실패하며, 허용된 source만 PARTIAL fallback을 사용할 수 있다.
 
+## 공간 계약
 
-* *A의 미교차 영역 (70%): 기존 A의 면적당 인구 유지*
-* *A의 교차 영역 (30%): POI B의 실시간 면적당 인구 적용*
+### 250m CELL
 
+`CELL_ID`는 국가지점번호 형식이며 `grid.py`가 남서쪽 꼭짓점을 EPSG:5179로 변환해
+`250m × 250m` Polygon을 만든다.
 
-3. **최종 인구 산출:** 업데이트된 전체 밀도에 격자 A의 전체 면적을 곱하여 최종 인구($P_{final}$)를 산출합니다.
+```text
+X = 700,000 + 동서 문자 index × 100,000 + 동서 숫자 × 10
+Y = 1,300,000 + 남북 문자 index × 100,000 + 남북 숫자 × 10
+```
 
-$$P_{final} = D_{new} \times Area_A$$
+예시 회귀값은 `다사53815262 → (953810.0, 1952620.0)`이다.
 
+### POI
 
+`poi.py`는 repository의 121개 장소 Shapefile을 읽고 WGS84에서 EPSG:5179로 변환한다.
+유효하지 않은 geometry는 `make_valid`로 복구하고, 결과가 여러 Polygon이면 가장 큰
+조각을 사용한다. Polygon을 얻지 못하면 실패한다.
 
----
+## 밀도 합성
 
-## 4. 다중 POI 겹침 시 처리 로직 (핵심)
+`merge.py`는 STRtree로 후보를 좁힌 뒤 실제 intersection 면적을 계산한다.
 
-하나의 격자(A) 위에 여러 개의 POI(C, D)가 동시에 겹치는 경우, **면적이 큰 POI부터 작은 POI 순으로 순차적 업데이트**를 진행합니다. *(조건 예시: POI 면적 기준 C < D)*
+```text
+w = intersection_area / cell_area
+new_density = (1 - w) × current_density + w × poi_density
+new_population = new_density × cell_area
+```
 
-### 순차 업데이트 과정
+한 CELL에 여러 POI가 겹치면 POI 전체 면적 내림차순으로 적용한다. 넓은 권역을 먼저
+반영하고 좁은 hotspot을 나중에 적용해 국소 밀도가 희석되는 것을 줄인다.
 
-1. **1차 갱신:** 격자 A와 **면적이 더 큰 POI D**를 먼저 교차 연산하여 A의 밀도를 1차 업데이트합니다.
-2. **2차 갱신:** 1차 갱신된 격자 A와 **면적이 더 작은 POI C**를 교차 연산하여 A의 밀도를 최종 업데이트(덮어쓰기)합니다.
+- 현재 시각: 마지막으로 적용된 POI의 성비를 사용하고, 성별 내부 연령 비율은 기존
+  CELL 분포를 유지한다.
+- 미래 시각: `FCST_n_*`에는 성비가 없으므로 총량만 보정하고 baseline의 28개 성·연령
+  비율을 유지한다.
+- 출력 수량은 deterministic rounding을 거친다.
 
+## 시간 처리
 
-> * **데이터 현실성 반영:** 일반적으로 면적이 좁은 POI일수록 인구 밀집도가 높은 **'핵심 핫스팟'**일 확률이 높습니다. 이 로직을 통해 작은 POI가 나중에 덮어씌워지므로, 핵심 핫스팟의 높은 인구 밀도가 희석되지 않고 결과값에 효과적으로 반영됩니다.
+- Living population의 `TT`는 공백 포함 문자열, 1·2자리 문자열 또는 정수를 0~23으로
+  엄격히 정규화한다.
+- 같은 `CELL_ID`, `TT`의 여러 `H_DNG_CD` component는 SPOP과 28개 연령 컬럼을 합산한다.
+- 미래 target은 slot 번호가 아니라 `FCST_n_TIME` 실제 값을 사용한다.
+- `FCST_YN != "Y"`, 필수 예측값 누락, 현재 이전 또는 12시간 초과 target은 제외한다.
+- 여러 POI의 target 합집합을 정렬해 최대 현재+12시간 범위를 생성한다.
+- 과거 실행이 더 최신 source window가 만든 미래 파일을 덮지 않도록 S3 generation
+  metadata를 비교한다.
+
+## Station master 보강
+
+`station_master.py`는 다음 컬럼을 생성한다.
+
+| 컬럼 | 계산 |
+| --- | --- |
+| `station_id` | Master `RNTLS_ID` |
+| `station_no` | 정확한 `ST-<숫자>` suffix, 양의 int16 |
+| `station_name` | Realtime 명칭 → master 주소 fallback |
+| `capacity` | Realtime `rackTotCnt` |
+| `lat`, `lon` | 유효한 master 좌표 → realtime fallback |
+| `grid_id` | Station Point와 250m CELL Polygon 공간 조인 |
+| `weather_nx`, `weather_ny` | `core.weather_grid.latlon_to_grid` |
+
+WGS84 유효 범위는 위도 `36.5..38.5`, 경도 `125.5..128.5`다. `grid_id` coverage가
+`MIN_GRID_COVERAGE=0.95`보다 낮으면 snapshot 전체를 실패시킨다. Weather grid는 산술
+변환이므로 생활인구 coverage 밖에서도 값이 나올 수 있다.
+
+## S3 경로
+
+```text
+silver/living_population_grid/dt=YYYY-MM-DD/hh=00/nowcast.parquet
+silver/population_realtime/dt=YYYY-MM-DD/hh=HH/HHMM.parquet
+silver/living_population_normalized/dt=YYYY-MM-DD/hh=HH/HHMM.parquet
+silver/station_master_enriched/dt=YYYY-MM-DD/hh=HH/HHMM.parquet
+_manifest/<output_source_id>/dt=YYYY-MM-DD/hh=HH/HHMM.json
+```
+
+Manifest에는 입력·출력과 매칭 수, 미래 target, 최신 generation 때문에 건너뛴 target 등
+실행 근거를 기록한다.
+
+## 실행과 검증
+
+```bash
+cd normalizer
+
+uv run --frozen python main.py \
+  --window-start 2026-08-24T09:05:00+09:00
+
+uv run --frozen python station_master.py \
+  --window-start 2026-08-24T03:00:00+09:00
+
+uv run --frozen pytest -q
+```
+
+두 CLI는 timezone offset을 포함한 ISO 8601 시각을 요구한다. 실제 S3 쓰기까지 검증하려면
+운영 bucket이 아닌 격리된 test object store를 사용한다.
