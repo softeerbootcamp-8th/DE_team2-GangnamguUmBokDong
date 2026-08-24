@@ -85,6 +85,33 @@ def _weather_rows(
     ]
 
 
+def _serving_health_rows() -> list[dict[str, Any]]:
+    """정상 서빙 상태 판정에 필요한 publication row fixture를 만든다."""
+    keys = (
+        "dispatch_center",
+        "station",
+        "station_stock",
+        "station_demand_forecast",
+        "station_urgency",
+        "rebalance_route",
+        "weather_forecast",
+        "event:cultural_event",
+        "event:performance_event",
+    )
+    return [
+        {
+            "publication_key": key,
+            "logical_dttm": BASE,
+            "published_row_cnt": 0 if key == "rebalance_route" else 1,
+            "weather_row_cnt": 24,
+            "expected_weather_row_cnt": 24,
+            "weather_rows_fresh": True,
+            "oldest_weather_issue_dttm": BASE,
+        }
+        for key in keys
+    ]
+
+
 @pytest.mark.parametrize(
     "value,max_age,expected",
     [
@@ -127,10 +154,75 @@ def test_fetch_stations_uses_active_postgis_contract(
     assert "ST_X(s.sta_point) AS lon" in normalized
     assert "s.is_active" in normalized
     assert "center.is_active" in normalized
-    assert "BETWEEN %(now)s - INTERVAL '10 minutes'" in normalized
+    assert "stock.base_dttm >= %(now)s - INTERVAL '10 minutes'" in normalized
+    assert "stock.base_dttm <= %(now)s + INTERVAL '5 minutes'" in normalized
     assert "stations" not in normalized
     assert ".gu" not in normalized
-    assert captured["params"] == {"now": NOW}
+    assert captured["params"] == {"now": NOW, "allow_stale": False}
+
+
+def test_serving_health_requires_fresh_aligned_operational_chain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """동일 anchor의 fresh 핵심 체인만 신규 route 승인을 허용한다."""
+    captured: dict[str, Any] = {}
+
+    def fake_fetch_all(query: str, params: dict) -> list[dict[str, Any]]:
+        """health SQL과 parameter를 기록하고 정상 publication을 반환한다."""
+        captured.update(query=query, params=params)
+        return _serving_health_rows()
+
+    monkeypatch.setattr(queries, "fetch_all", fake_fetch_all)
+
+    health = queries.fetch_serving_health(NOW)
+
+    assert health["overall"] == "healthy"
+    assert health["operational_base_dttm"] == BASE
+    assert health["can_dispatch_new_routes"] is True
+    assert all(item["state"] == "ready" for item in health["components"].values())
+    assert health["components"]["weather"]["source_dttm"] == BASE
+    normalized = " ".join(captured["query"].split())
+    assert "gold_meta.publication_state" in normalized
+    assert "weather_rows_fresh" in normalized
+
+
+def test_serving_health_marks_anchor_mismatch_and_missing_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """route anchor 불일치와 행사 source 누락을 부분 지연으로 노출한다."""
+    rows = _serving_health_rows()
+    for row in rows:
+        if row["publication_key"] == "rebalance_route":
+            row["logical_dttm"] = BASE - timedelta(minutes=5)
+        if row["publication_key"] == "event:performance_event":
+            row["logical_dttm"] = None
+            row["published_row_cnt"] = None
+    monkeypatch.setattr(queries, "fetch_all", lambda _query, _params: rows)
+
+    health = queries.fetch_serving_health(NOW)
+
+    assert health["overall"] == "degraded"
+    assert health["can_dispatch_new_routes"] is False
+    assert health["components"]["routes"]["state"] == "misaligned"
+    assert health["components"]["events"]["state"] == "missing"
+
+
+def test_serving_health_marks_expired_stock_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """한 시간 넘은 재고는 행이 남아 있어도 운영 사용 불가로 판정한다."""
+    rows = _serving_health_rows()
+    expired = NOW - queries.SERVING_EXPIRY - timedelta(minutes=1)
+    for row in rows:
+        if row["publication_key"] in {"station", "station_stock"}:
+            row["logical_dttm"] = expired
+    monkeypatch.setattr(queries, "fetch_all", lambda _query, _params: rows)
+
+    health = queries.fetch_serving_health(NOW)
+
+    assert health["overall"] == "unavailable"
+    assert health["components"]["stock"]["state"] == "expired"
+    assert health["can_dispatch_new_routes"] is False
 
 
 def test_fetch_station_adds_address_without_legacy_columns(
@@ -152,7 +244,11 @@ def test_fetch_station_adds_address_without_legacy_columns(
     assert "ST_Y(s.sta_point) AS lat" in normalized
     assert "FROM station AS s" in normalized
     assert "FROM stations" not in normalized
-    assert captured["params"] == {"sta_id": "ST-1", "now": NOW}
+    assert captured["params"] == {
+        "sta_id": "ST-1",
+        "now": NOW,
+        "allow_stale": False,
+    }
 
 
 def test_fetch_forecast_returns_exact_ready_projection(
@@ -176,6 +272,27 @@ def test_fetch_forecast_returns_exact_ready_projection(
     assert len(result.points) == 12
     assert result.points[0]["predicted_return_cnt"] == 2
     assert "base_dttm" not in result.points[0]
+
+
+def test_fetch_forecast_can_serve_last_complete_stale_projection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """대시보드 fallback은 anchor 정합성을 유지한 마지막 완전 projection을 읽는다."""
+    stale_base = NOW - timedelta(hours=2)
+    snapshot = _forecast_snapshot(base_dttm=stale_base)
+    monkeypatch.setattr(
+        queries,
+        "_read_forecast_snapshot",
+        lambda _sta_id: snapshot,
+    )
+
+    assert (
+        queries.fetch_forecast("ST-1", NOW).state
+        is queries.ForecastState.FORECAST_NOT_READY
+    )
+    fallback = queries.fetch_forecast("ST-1", NOW, allow_stale=True)
+    assert fallback.state is queries.ForecastState.READY
+    assert fallback.base_dttm == stale_base
 
 
 def test_fetch_forecast_reports_missing_station(
@@ -414,6 +531,29 @@ def test_fetch_weather_fails_closed_for_partial_or_stale_rows(
     )
 
 
+def test_fetch_weather_can_serve_remaining_stale_horizon(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """대시보드 fallback은 시간 순서가 온전한 남은 예보를 부분 제공한다."""
+    rows = _weather_rows(
+        ultra_short_base_dttm=NOW - timedelta(hours=3),
+        short_term_base_dttm=NOW - timedelta(hours=5),
+    )[:5]
+    monkeypatch.setattr(
+        queries,
+        "_read_weather_snapshot",
+        lambda _sta_id, _now, _hours: (True, rows),
+    )
+
+    assert (
+        queries.fetch_weather("ST-1", NOW).state
+        is queries.WeatherState.WEATHER_NOT_READY
+    )
+    fallback = queries.fetch_weather("ST-1", NOW, allow_stale=True)
+    assert fallback.state is queries.WeatherState.READY
+    assert len(fallback.points) == 5
+
+
 def test_fetch_regions_uses_active_center_points(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -566,9 +706,14 @@ def test_fetch_route_casts_uuid_to_text_in_one_statement(
 class _TransitionCursor:
     """route 상태 전이의 동일 cursor 사용을 검증하는 최소 fake다."""
 
-    def __init__(self, responses: list[dict | None]) -> None:
-        """fetchone 응답 순서를 초기화한다."""
+    def __init__(
+        self,
+        responses: list[dict | None],
+        row_sets: list[list[dict[str, Any]]] | None = None,
+    ) -> None:
+        """fetchone과 fetchall 응답 순서를 초기화한다."""
         self.responses = responses
+        self.row_sets = row_sets or []
         self.statements: list[str] = []
 
     def __enter__(self) -> Self:
@@ -585,6 +730,10 @@ class _TransitionCursor:
     def fetchone(self) -> dict | None:
         """준비된 단일 행 응답을 반환한다."""
         return self.responses.pop(0)
+
+    def fetchall(self) -> list[dict[str, Any]]:
+        """준비된 다중 행 응답을 반환한다."""
+        return self.row_sets.pop(0)
 
 
 class _TransitionConnection:
@@ -618,7 +767,10 @@ def test_dispatch_updates_and_reads_aggregate_in_same_transaction(
 ) -> None:
     """dispatch guarded update와 aggregate 조회는 같은 connection/cursor를 사용한다."""
     route = {"route_id": str(ROUTE_ID), "status": "dispatched", "stops": []}
-    cursor = _TransitionCursor([{"route_id": ROUTE_ID}, route])
+    cursor = _TransitionCursor(
+        [{"route_id": ROUTE_ID}, route],
+        row_sets=[_serving_health_rows()],
+    )
     connection = _TransitionConnection(cursor)
     monkeypatch.setattr(queries, "get_connection", lambda: connection)
 
@@ -626,10 +778,32 @@ def test_dispatch_updates_and_reads_aggregate_in_same_transaction(
 
     assert result == route
     assert connection.cursor_calls == 1
-    assert len(cursor.statements) == 2
-    assert "UPDATE rebalance_route" in cursor.statements[0]
-    assert "route_status_cd = %(expected_status)s" in cursor.statements[0]
-    assert "rebalance_route_stop AS stop" in cursor.statements[1]
+    assert len(cursor.statements) == 3
+    assert "gold_meta.publication_state" in cursor.statements[0]
+    assert "FOR SHARE" in cursor.statements[0]
+    assert "UPDATE rebalance_route" in cursor.statements[1]
+    assert "route_status_cd = %(expected_status)s" in cursor.statements[1]
+    assert "rebalance_route_stop AS stop" in cursor.statements[2]
+
+
+def test_dispatch_rejects_stale_publication_before_update(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """dispatch는 transaction의 핵심 publication이 stale이면 route를 갱신하지 않는다."""
+    rows = _serving_health_rows()
+    for row in rows:
+        if row["publication_key"] == "station_urgency":
+            row["logical_dttm"] = NOW - queries.URGENCY_FRESHNESS - timedelta(seconds=1)
+    cursor = _TransitionCursor([], row_sets=[rows])
+    connection = _TransitionConnection(cursor)
+    monkeypatch.setattr(queries, "get_connection", lambda: connection)
+
+    result = queries.dispatch_route(ROUTE_ID, NOW)
+
+    assert result is queries.RouteTransitionResult.SERVING_NOT_READY
+    assert len(cursor.statements) == 1
+    assert "gold_meta.publication_state" in cursor.statements[0]
+    assert all("UPDATE rebalance_route" not in statement for statement in cursor.statements)
 
 
 def test_cancel_sets_cancelled_timestamp_in_same_transaction(

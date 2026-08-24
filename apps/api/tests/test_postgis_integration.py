@@ -316,7 +316,8 @@ def _seed_serving_fixture(database_url: str, now: datetime) -> datetime:
             """,
             {"base_dttm": base_dttm},
         )
-        connection.execute(
+        _executemany(
+            connection,
             """
             INSERT INTO gold_meta.publication_state (
                 publication_key,
@@ -327,16 +328,30 @@ def _seed_serving_fixture(database_url: str, now: datetime) -> datetime:
                 input_fingerprint_sha256,
                 published_row_cnt
             ) VALUES (
-                'station_urgency',
+                %(publication_key)s,
                 %(base_dttm)s,
                 0,
-                's3://test/station_urgency/manifest.json',
+                %(manifest_uri)s,
                 repeat('a', 64),
                 repeat('b', 64),
-                1
+                %(published_row_cnt)s
             )
             """,
-            {"base_dttm": base_dttm},
+            [
+                {
+                    "publication_key": publication_key,
+                    "base_dttm": base_dttm,
+                    "manifest_uri": f"s3://test/{publication_key}/manifest.json",
+                    "published_row_cnt": 0 if publication_key == "rebalance_route" else 1,
+                }
+                for publication_key in (
+                    "station",
+                    "station_stock",
+                    "station_demand_forecast",
+                    "station_urgency",
+                    "rebalance_route",
+                )
+            ],
         )
         _executemany(
             connection,
@@ -590,6 +605,25 @@ def test_route_lifecycle_and_constraint_error_mapping(database_url: str) -> None
     response = TestClient(main.app).post(f"/routes/{CONFLICT_ROUTE_ID}/dispatch")
     assert response.status_code == 409
     assert response.json()["detail"] == "route_transition_conflict"
+
+
+def test_dispatch_rejects_stale_publication_without_mutating_route(
+    database_url: str,
+) -> None:
+    """실제 DB 승인 transaction은 stale 핵심 publication에서 route를 보존한다."""
+    now = datetime.now(UTC).replace(second=0, microsecond=0)
+    _seed_serving_fixture(database_url, now)
+    stale_now = now + queries.URGENCY_FRESHNESS + timedelta(seconds=1)
+
+    result = queries.dispatch_route(ROUTE_ID, stale_now)
+
+    assert result is queries.RouteTransitionResult.SERVING_NOT_READY
+    with psycopg.connect(database_url) as connection:
+        status = connection.execute(
+            "SELECT route_status_cd FROM rebalance_route WHERE route_id = %(route_id)s",
+            {"route_id": ROUTE_ID},
+        ).fetchone()
+    assert status == ("proposed",)
 
 
 def test_dismiss_columns_reject_active_routes_and_transition_writes(database_url: str) -> None:

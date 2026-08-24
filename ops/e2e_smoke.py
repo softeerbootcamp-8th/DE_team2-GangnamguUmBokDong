@@ -205,6 +205,16 @@ def run(timeout_seconds: int, *, model_bundle: Path | None = None) -> int:
             f"--window-start {shlex.quote(station_source_text)}"
         ),
     )
+    print(f"[e2e] 실제 station master 준비: window={window_text}", flush=True)
+    _compose_exec(
+        compose,
+        (
+            "cd /workspace/collector && env -u VIRTUAL_ENV "
+            "UV_PROJECT_ENVIRONMENT=/opt/venvs/modules/collector "
+            "uv run --frozen python main.py --source bike_station_master "
+            f"--window-start {shlex.quote(window_text)}"
+        ),
+    )
     container_bundle = _stage_model_bundle(model_bundle) if model_bundle else None
     model_label = "issue-175-prototype" if container_bundle else "generated-fixture"
     print(f"[e2e] fixture 준비: window={window_text} model={model_label}", flush=True)

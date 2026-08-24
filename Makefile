@@ -182,6 +182,8 @@ seed-e2e:
 	@$(COMPOSE) exec -T airflow-scheduler sh -lc \
 		'cd /workspace/collector && env -u VIRTUAL_ENV UV_PROJECT_ENVIRONMENT=/opt/venvs/modules/collector uv run --frozen python main.py --source bike_station_realtime --window-start "$(E2E_STATION_SOURCE_DTTM)"'
 	@$(COMPOSE) exec -T airflow-scheduler sh -lc \
+		'cd /workspace/collector && env -u VIRTUAL_ENV UV_PROJECT_ENVIRONMENT=/opt/venvs/modules/collector uv run --frozen python main.py --source bike_station_master --window-start "$(E2E_LOGICAL_DTTM)"'
+	@$(COMPOSE) exec -T airflow-scheduler sh -lc \
 		'cd /workspace/loader && env -u VIRTUAL_ENV LOCAL_E2E_ALLOW_FIXTURE=1 uv run --frozen python local_e2e.py seed --logical-dttm "$(E2E_LOGICAL_DTTM)"'
 
 e2e-preflight:

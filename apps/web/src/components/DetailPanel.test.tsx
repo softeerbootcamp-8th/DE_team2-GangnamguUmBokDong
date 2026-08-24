@@ -101,14 +101,46 @@ describe("DetailPanel stale state", () => {
 
     expect(screen.getByRole("heading", { name: DETAIL.sta_nm })).not.toBeNull();
     expect(screen.getByText(DETAIL.sta_addr)).not.toBeNull();
-    expect(screen.getByRole("img", { name: "현재 자전거 3대, 거치대 10대" })).not.toBeNull();
+    const donut = screen.getByRole("img", {
+      name: "현재 자전거 3대, 거치대 10대, 재고율 30%",
+    });
+    expect(donut.getAttribute("data-stock-band")).toBe("warning");
+    expect(donut.querySelector("svg")?.getAttribute("viewBox")).toBe("0 0 42 42");
+    expect(donut.querySelector(".stock-donut-track")?.getAttribute("r")).toBe("16");
+    expect(donut.querySelector(".stock-donut-value")?.getAttribute("stroke-dasharray"))
+      .toBe("30 100");
+    expect(donut.querySelector(".stock-donut-overflow-value")).toBeNull();
     expect(screen.queryByText("현재 자전거")).toBeNull();
     expect(screen.queryByText("30% 이용 가능")).toBeNull();
     expect(screen.queryByText("재고 갱신")).toBeNull();
     expect(screen.queryByText(/갱신 시각/)).toBeNull();
   });
 
-  it("station polling 실패 뒤 이전 상세를 지운다", async () => {
+  it("정원 초과분을 같은 크기 안의 외부 링으로 표시한다", async () => {
+    apiMock.station.mockResolvedValue({
+      ...DETAIL,
+      parking_bike_tot_cnt: 13,
+      shared_rate: 1.3,
+    });
+    renderDetail();
+    await settleRequests();
+
+    const donut = screen.getByRole("img", {
+      name: "현재 자전거 13대, 거치대 10대, 재고율 130%",
+    });
+    expect(donut.getAttribute("data-stock-band")).toBe("overflow");
+    expect(donut.querySelector(".stock-donut-track")?.getAttribute("r")).toBe("16");
+    expect(donut.querySelector(".stock-donut-value")?.getAttribute("stroke-dasharray"))
+      .toBe("100 100");
+    expect(donut.querySelector(".stock-donut-overflow-track")).toBeNull();
+    expect(donut.querySelector(".stock-donut-overflow-value")?.getAttribute("r")).toBe("16");
+    expect(donut.querySelector(".stock-donut-overflow-value")?.getAttribute("stroke-dasharray"))
+      .toBe("11 100");
+    expect(screen.getByText("/ 10대")).not.toBeNull();
+    expect(screen.queryByText("130%")).toBeNull();
+  });
+
+  it("station polling 실패 뒤 이전 상세를 경고와 함께 유지한다", async () => {
     apiMock.station.mockResolvedValueOnce(DETAIL).mockRejectedValueOnce(new Error("network unavailable"));
     renderDetail();
     await settleRequests();
@@ -120,11 +152,11 @@ describe("DetailPanel stale state", () => {
       await Promise.resolve();
     });
 
-    expect(screen.queryByText(DETAIL.sta_nm)).toBeNull();
-    expect(screen.getByText("대여소 정보를 불러오지 못했습니다.")).not.toBeNull();
+    expect(screen.getByText(DETAIL.sta_nm)).not.toBeNull();
+    expect(screen.getByText("상세 조회에 실패해 마지막 결과를 표시합니다.")).not.toBeNull();
   });
 
-  it("events polling 실패 뒤 이전 행사와 검색 반경 상태를 지운다", async () => {
+  it("events polling 실패 뒤 이전 행사와 검색 반경 상태를 유지한다", async () => {
     apiMock.events
       .mockResolvedValueOnce({ radius_km: 1, events: [EVENT] })
       .mockRejectedValueOnce(new Error("network unavailable"));
@@ -139,11 +171,11 @@ describe("DetailPanel stale state", () => {
       await Promise.resolve();
     });
 
-    expect(screen.queryByText(EVENT.title)).toBeNull();
-    expect(screen.getByText("주변 행사 정보를 불러오지 못했습니다.")).not.toBeNull();
+    expect(screen.getByText(EVENT.title)).not.toBeNull();
+    expect(screen.getByText("행사 조회에 실패해 마지막 결과를 표시합니다.")).not.toBeNull();
   });
 
-  it("weather polling 실패 뒤 이전 예보를 지운다", async () => {
+  it("weather polling 실패 뒤 이전 예보를 유지한다", async () => {
     apiMock.weather.mockResolvedValueOnce(WEATHER).mockRejectedValueOnce(new Error("network unavailable"));
     renderDetail();
     fireEvent.click(screen.getByRole("tab", { name: "주변 날씨" }));
@@ -156,8 +188,8 @@ describe("DetailPanel stale state", () => {
       await Promise.resolve();
     });
 
-    expect(screen.queryByText("28℃")).toBeNull();
-    expect(screen.getByText("주변 날씨 정보를 불러오지 못했습니다.")).not.toBeNull();
+    expect(screen.getByText("28℃")).not.toBeNull();
+    expect(screen.getByText("날씨 조회에 실패해 마지막 결과를 표시합니다.")).not.toBeNull();
   });
 
   it("station 변경 직후 이전 상세를 지운다", async () => {

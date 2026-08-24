@@ -66,6 +66,30 @@ class StatusResponse(BaseModel):
     base_dttm: datetime
 
 
+ServingHealthState = Literal["ready", "stale", "expired", "missing", "misaligned"]
+ServingOverallState = Literal["healthy", "degraded", "unavailable"]
+
+
+class ServingHealthComponent(BaseModel):
+    """서빙 데이터 한 종류의 게시·신선도 상태다."""
+
+    state: ServingHealthState
+    data_dttm: datetime | None
+    source_dttm: datetime | None = None
+    age_minutes: float | None
+    reason: str
+
+
+class ServingHealthResponse(BaseModel):
+    """대시보드가 한 번에 표시할 전체 서빙 상태다."""
+
+    overall: ServingOverallState
+    operational_base_dttm: datetime | None
+    checked_at: datetime
+    can_dispatch_new_routes: bool
+    components: dict[str, ServingHealthComponent]
+
+
 class DispatchCenter(BaseModel):
     """active dispatch center의 화면 표시값이다."""
 
