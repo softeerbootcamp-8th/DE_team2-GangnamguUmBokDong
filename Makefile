@@ -334,7 +334,7 @@ tunnel-airflow:
 	ssh -i $(SSH_KEY) -N -L 8080:localhost:8080 ec2-user@$$($(TF) output -raw app_public_ip)
 
 tunnel-mlflow:
-	@echo "http://localhost:5000 에서 MLflow UI (종료: Ctrl+C)"; \
+	@echo "http://localhost:5000/mlflow 에서 MLflow UI (종료: Ctrl+C)"; \
 	ssh -i $(SSH_KEY) -N -L 5000:localhost:5000 ec2-user@$$($(TF) output -raw app_public_ip)
 
 # config/prod.env(terraform 산출물)에는 API 키를 안 넣는다 — 이 타겟이 그 나머지를
