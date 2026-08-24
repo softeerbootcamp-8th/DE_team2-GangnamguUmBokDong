@@ -656,6 +656,11 @@ MONITOR_LOOKBACK_MONTHS = _int_env("MONITOR_LOOKBACK_MONTHS", _PROFILE["MONITOR_
 TRAIN_LOOKBACK_MONTHS = _int_env("TRAIN_LOOKBACK_MONTHS", _PROFILE["TRAIN_LOOKBACK_MONTHS"])
 TRAINING_SAFETY_MARGIN_DAYS = _int_env("TRAINING_SAFETY_MARGIN_DAYS", _PROFILE["TRAINING_SAFETY_MARGIN_DAYS"])
 
+# 학습에 쓸 날짜를 day-of-month 배수로 솎아내는 정도(1=전체 날짜). train/valid/test
+# 자체를 나누는 값은 아니라 VALID_DAYS_OF_MONTH/TEST_DAYS_OF_MONTH와는 별개 축이다
+# (ml/training/config.py의 `_dates_for_split()` 참고).
+TRAIN_DAY_DIVISOR = _int_env("TRAIN_DAY_DIVISOR", _PROFILE["TRAIN_DAY_DIVISOR"])
+
 
 def effective_profile() -> dict:
     """환경변수 override까지 반영된 이번 프로세스의 프로필 snapshot을 반환한다.
@@ -688,6 +693,7 @@ def effective_profile() -> dict:
         "MONITOR_LOOKBACK_MONTHS": MONITOR_LOOKBACK_MONTHS,
         "TRAIN_LOOKBACK_MONTHS": TRAIN_LOOKBACK_MONTHS,
         "TRAINING_SAFETY_MARGIN_DAYS": TRAINING_SAFETY_MARGIN_DAYS,
+        "TRAIN_DAY_DIVISOR": TRAIN_DAY_DIVISOR,
         "TRAIN_HORIZONS": list(TRAIN_HORIZONS),
         "ADAPTIVE_TRAIN_ANCHORS": ADAPTIVE_TRAIN_ANCHORS,
         "WEEKDAY_PEAK_HOURS": [list(p) for p in WEEKDAY_PEAK_HOURS],

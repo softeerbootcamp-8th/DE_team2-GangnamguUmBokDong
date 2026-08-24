@@ -79,7 +79,14 @@ def unique_archive_date(as_of: date | None = None) -> str:
 # valid/test 여부를 먼저 확정하고 그 앞뒤 `SPLIT_EMBARGO_DAYS`까지 purge한 뒤
 # train 배수 조건을 보므로, TRAIN_DAY_DIVISOR가 1이라 "모든 날짜가 배수"인
 # 경우에도 평가 anchor가 train으로 새지 않는다.
-TRAIN_DAY_DIVISOR = int(os.environ.get("TRAIN_DAY_DIVISOR", "1"))
+#
+# **2026-08**: 프로필 필드로 승격했다 — 피처마트/추론은 이 값을 참조하지 않고
+# (학습 스크립트가 완성된 날짜 파티션 중 일부만 고르는 후처리 필터일 뿐) 순수
+# 실험 하이퍼파라미터라 프로필과 성격이 맞는데도 처음엔 임시 dial로만 존재했다.
+# 이제 프로필에 없으면 기본 1(전체 날짜)을 쓰고, 환경변수가 있으면 그게 우선한다.
+TRAIN_DAY_DIVISOR = int(os.environ.get("TRAIN_DAY_DIVISOR", str(common_config.TRAIN_DAY_DIVISOR)))
+if TRAIN_DAY_DIVISOR < 1:
+    raise ValueError(f"TRAIN_DAY_DIVISOR는 1 이상이어야 합니다: {TRAIN_DAY_DIVISOR}")
 
 
 def _day_set_env(name: str, default: str) -> frozenset[int]:
