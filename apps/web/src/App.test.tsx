@@ -1,10 +1,15 @@
 // @vitest-environment jsdom
 
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
-import type { ReactNode } from "react";
+import type { ReactNode, Ref } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
 import type { Alert, ForecastResponse, Route, StationSummary } from "./api";
+
+const resizableMock = vi.hoisted(() => ({
+  layoutChanged: undefined as ((layout: Record<string, number>, meta: { isUserInteraction: boolean }) => void) | undefined,
+  resize: vi.fn(),
+}));
 
 const apiMock = vi.hoisted(() => ({
   stations: vi.fn(),
@@ -70,29 +75,54 @@ vi.mock("./components/ForecastPanel", () => ({
   ),
 }));
 vi.mock("./components/StockPanel", () => ({ StockPanel: () => <div>stock</div> }));
-vi.mock("@/components/ui/resizable", () => ({
-  ResizablePanelGroup: ({ children }: { children: ReactNode }) => <div>{children}</div>,
-  ResizablePanel: ({
-    children,
-    id,
-    defaultSize,
-    minSize,
-  }: {
-    children: ReactNode;
-    id?: string;
-    defaultSize?: number | string;
-    minSize?: number | string;
-  }) => (
-    <div
-      data-testid={id === undefined ? undefined : `resizable-panel-${id}`}
-      data-default-size={defaultSize}
-      data-min-size={minSize}
-    >
-      {children}
-    </div>
-  ),
-  ResizableHandle: () => <div />,
-}));
+vi.mock("@/components/ui/resizable", () => {
+  function setRef<T>(ref: Ref<T> | undefined, value: T | null) {
+    if (typeof ref === "function") ref(value);
+    else if (ref) (ref as { current: T | null }).current = value;
+  }
+
+  return {
+    ResizablePanelGroup: ({
+      children,
+      elementRef,
+      onLayoutChanged,
+    }: {
+      children: ReactNode;
+      elementRef?: Ref<HTMLDivElement>;
+      onLayoutChanged?: (layout: Record<string, number>, meta: { isUserInteraction: boolean }) => void;
+    }) => {
+      if (onLayoutChanged) resizableMock.layoutChanged = onLayoutChanged;
+      return <div ref={(node) => setRef(elementRef, node)}>{children}</div>;
+    },
+    ResizablePanel: ({
+      children,
+      id,
+      defaultSize,
+      minSize,
+      panelRef,
+    }: {
+      children: ReactNode;
+      id?: string;
+      defaultSize?: number | string;
+      minSize?: number | string;
+      panelRef?: Ref<{ resize: (size: number | string) => void }>;
+    }) => {
+      if (id === "detail-row") {
+        setRef(panelRef, { resize: resizableMock.resize });
+      }
+      return (
+        <div
+          data-testid={id === undefined ? undefined : `resizable-panel-${id}`}
+          data-default-size={defaultSize}
+          data-min-size={minSize}
+        >
+          {children}
+        </div>
+      );
+    },
+    ResizableHandle: () => <div />,
+  };
+});
 
 const STATIONS: StationSummary[] = [
   {
@@ -103,7 +133,7 @@ const STATIONS: StationSummary[] = [
     hold_cnt: 10,
     parking_bike_tot_cnt: 3,
     shared_rate: 0.3,
-    region: "센터",
+    region: "이수",
     base_dttm: "2026-08-20T00:00:00Z",
   },
   {
@@ -114,7 +144,7 @@ const STATIONS: StationSummary[] = [
     hold_cnt: 10,
     parking_bike_tot_cnt: 4,
     shared_rate: 0.4,
-    region: "센터",
+    region: "이수",
     base_dttm: "2026-08-20T00:00:00Z",
   },
 ];
@@ -125,7 +155,7 @@ const ALERTS: Alert[] = [
     action_type: "supply_needed",
     urgency_score: 50,
     minutes_until_critical: 10,
-    region: "센터",
+    region: "이수",
     base_dttm: "2026-08-20T00:00:00Z",
     data_status: "fresh",
     age_minutes: 5,
@@ -139,7 +169,7 @@ const FORECAST: ForecastResponse = {
 const ROUTES: Route[] = [
   {
     route_id: "11111111-1111-4111-8111-111111111111",
-    region: "센터",
+    region: "이수",
     status: "proposed",
     proposed_at: "2026-08-20T00:00:00Z",
     dispatched_at: null,
@@ -191,6 +221,7 @@ beforeEach(() => {
   vi.useFakeTimers();
   vi.setSystemTime(new Date("2026-08-20T00:05:00Z"));
   vi.clearAllMocks();
+  resizableMock.layoutChanged = undefined;
   apiMock.alerts.mockResolvedValue(ALERTS);
   apiMock.forecast.mockResolvedValue(FORECAST);
   apiMock.regions.mockResolvedValue([]);
@@ -204,24 +235,48 @@ afterEach(() => {
   cleanup();
   vi.clearAllTimers();
   vi.useRealTimers();
+  vi.restoreAllMocks();
 });
 
 describe("App polling state", () => {
-  it("기본 패널 비율과 하단 상세 최소 높이를 고정한다", async () => {
+  it("측정 전 패널을 절반으로 배치하고 사용자 조절 제한을 두지 않는다", async () => {
     apiMock.stations.mockResolvedValue(STATIONS);
     render(<App />);
     await settleRequests();
 
     expect(screen.getByTestId("resizable-panel-workspace-row").getAttribute("data-default-size"))
-      .toBe("55%");
+      .toBe("50%");
     expect(screen.getByTestId("resizable-panel-detail-row").getAttribute("data-default-size"))
-      .toBe("45%");
+      .toBe("50%");
     expect(screen.getByTestId("resizable-panel-detail-row").getAttribute("data-min-size"))
-      .toBe("320px");
+      .toBeNull();
     expect(screen.getByTestId("resizable-panel-map-col").getAttribute("data-default-size"))
       .toBe("50%");
     expect(screen.getByTestId("resizable-panel-list-col").getAttribute("data-default-size"))
       .toBe("50%");
+  });
+
+  it("상세 기본 높이만 화면 절반 이내로 계산하고 사용자 조절 뒤에는 덮어쓰지 않는다", async () => {
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockReturnValue({
+      bottom: 1_000,
+      height: 1_000,
+      left: 0,
+      right: 1_000,
+      toJSON: () => ({}),
+      top: 0,
+      width: 1_000,
+      x: 0,
+      y: 0,
+    });
+    apiMock.stations.mockResolvedValue(STATIONS);
+    render(<App />);
+    await settleRequests();
+
+    expect(resizableMock.resize).toHaveBeenCalledWith("380px");
+    resizableMock.layoutChanged?.({}, { isUserInteraction: true });
+    resizableMock.resize.mockClear();
+    window.dispatchEvent(new Event("resize"));
+    expect(resizableMock.resize).not.toHaveBeenCalled();
   });
 
   it("작업 승인 버튼을 실제 상태 전이 API와 연결한다", async () => {
