@@ -1,12 +1,13 @@
 """Gold PostGIS 대시보드 API endpoint를 제공한다."""
 
+from datetime import timedelta
 from typing import Literal
 from uuid import UUID
 
 import queries
 from core.db import fetch_one
 from core.forecast import enrich_forecast_points
-from fastapi import FastAPI, HTTPException, Query, Response
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from schemas import (
     Alert,
@@ -161,11 +162,23 @@ def list_alerts() -> list[dict]:
 def list_routes(
     region: str | None = None,
     status: RouteStatusFilter | None = None,
+    closed_within_minutes: int | None = Query(default=None, ge=1, le=10_080),
     limit: int = Query(default=100, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
 ) -> list[dict]:
-    """필터와 bounded pagination을 적용한 route aggregate 목록을 반환한다."""
-    return queries.fetch_routes(region, status, limit, offset)
+    """상태·종료 시간창과 bounded pagination을 적용한 route 목록을 반환한다."""
+    closed_since = (
+        None
+        if closed_within_minutes is None
+        else queries.now_utc() - timedelta(minutes=closed_within_minutes)
+    )
+    return queries.fetch_routes(
+        region=region,
+        status=status,
+        limit=limit,
+        offset=offset,
+        closed_since=closed_since,
+    )
 
 
 @app.get("/routes/{route_id}", response_model=Route)

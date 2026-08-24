@@ -5,6 +5,7 @@ import { estimateRoute, formatRouteDuration, groupWorkRoutes, isRebalanceRoute, 
 const CENTERS: DispatchCenter[] = [{ region: "강남", lat: 37.5, lon: 127.0 }];
 const ROUTE: Route = {
   route_id: "11111111-1111-4111-8111-111111111111",
+  work_no: null,
   region: "강남",
   status: "proposed",
   proposed_at: "2026-08-21T03:00:00Z",
@@ -122,7 +123,7 @@ describe("routeOperations", () => {
       .toEqual(["dispatched", "completed", "cancelled"]);
   });
 
-  it("종료 작업은 상한까지만 남기고 나머지 개수를 알린다", () => {
+  it("서버가 시간창으로 조회한 종료 작업을 개수 제한 없이 유지한다", () => {
     const closed = Array.from({ length: 35 }, (_, index) => ({
       ...ROUTE,
       route_id: `closed-${index}`,
@@ -132,9 +133,7 @@ describe("routeOperations", () => {
 
     const groups = groupWorkRoutes(closed);
 
-    expect(groups.operations).toHaveLength(30);
-    expect(groups.hiddenOperationCount).toBe(5);
-    // 최근 것부터 남는다.
+    expect(groups.operations).toHaveLength(35);
     expect(groups.operations[0].route_id).toBe("closed-34");
   });
 

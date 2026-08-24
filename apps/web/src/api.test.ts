@@ -46,10 +46,14 @@ describe("api", () => {
       new Response("[]", { status: 200, headers: { "Content-Type": "application/json" } }),
     );
 
-    await expect(api.routes({ region: "영남", status: "dispatched" })).resolves.toEqual([]);
+    await expect(api.routes({
+      region: "영남",
+      status: "dispatched",
+      closedWithinMinutes: 60,
+    })).resolves.toEqual([]);
 
     expect(fetchMock).toHaveBeenCalledWith(
-      "http://localhost:8000/routes?region=%EC%98%81%EB%82%A8&status=dispatched&limit=500&offset=0",
+      "http://localhost:8000/routes?region=%EC%98%81%EB%82%A8&status=dispatched&closed_within_minutes=60&limit=500&offset=0",
     );
   });
 

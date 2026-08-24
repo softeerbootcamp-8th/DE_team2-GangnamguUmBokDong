@@ -105,6 +105,7 @@ describe("DetailPanel stale state", () => {
     expect(screen.queryByText("현재 자전거")).toBeNull();
     expect(screen.queryByText("30% 이용 가능")).toBeNull();
     expect(screen.queryByText("재고 갱신")).toBeNull();
+    expect(screen.queryByText(/갱신 시각/)).toBeNull();
   });
 
   it("station polling 실패 뒤 이전 상세를 지운다", async () => {

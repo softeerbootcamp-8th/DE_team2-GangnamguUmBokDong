@@ -77,6 +77,7 @@ export interface RouteStop {
 
 export interface Route {
   route_id: string;
+  work_no: number | null;
   region: string;
   status: RouteStatus;
   proposed_at: string;
@@ -91,6 +92,7 @@ export interface Route {
 export interface RouteQuery {
   region?: string;
   status?: RouteStatus;
+  closedWithinMinutes?: number;
   limit?: number;
   offset?: number;
 }
@@ -180,6 +182,9 @@ function routeQueryString(query: RouteQuery): string {
   const params = new URLSearchParams();
   if (query.region) params.set("region", query.region);
   if (query.status) params.set("status", query.status);
+  if (query.closedWithinMinutes !== undefined) {
+    params.set("closed_within_minutes", String(query.closedWithinMinutes));
+  }
   params.set("limit", String(query.limit ?? 500));
   params.set("offset", String(query.offset ?? 0));
   return params.toString();
