@@ -41,6 +41,7 @@ airflow/airflow.cfg
 airflow/airflow-webserver.pid
 airflow/webserver_config.py
 airflow/standalone_admin_password.txt
+airflow/simple_auth_manager_passwords.json.generated
 
 
 # EMR 패키징 임시 디렉터리 (make emr-package)
