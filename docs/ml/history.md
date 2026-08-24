@@ -1,7 +1,41 @@
-# 의사결정 히스토리
+# ML 의사결정 히스토리
 
-이 문서는 "무엇을 왜 그렇게 결정했는지"를 시간 순으로 남긴다. 각 항목의 상세 구현은
-해당 코드/문서를 링크로 참조하고, 여기서는 **결정과 근거**만 정리한다.
+> **문서 상태: 역사 기록·비권위 문서**
+>
+> 이 파일은 초기 pandas 파이프라인부터 uv 프로젝트와 `libs/ml_core` 분리까지의
+> 결정 당시 상태를 보존한다. 과거 경로, 환경, 테스트 개수, 성능 수치와 “현재”,
+> “미구현”, “다음 단계” 표현은 오늘의 저장소 상태를 뜻하지 않는다.
+
+이 문서는 “당시에 무엇을 왜 결정했는지”를 시간순으로 남긴다. 기록을 현재 구조에
+맞춰 소급 수정하면 결정 맥락이 사라지므로 본문은 원문을 유지한다. 특히 `src/`,
+`ml/common/`, `.venv-spark`, 삭제된 문서와 실험 폴더 링크는 역사적 문자열이며,
+실행 경로나 현행 사양으로 사용하면 안 된다.
+
+## 현재 상태를 확인하는 곳
+
+| 확인 대상 | 현행 기준 |
+|---|---|
+| 전체 ML 구성과 검증 시작점 | [ML 작업 인계 가이드](SESSION_HANDOFF.md) |
+| 학습 데이터와 schema | [데이터 카탈로그](DATA_CATALOG.md) |
+| Spark feature mart | [Feature Engine 설계](feature_engine/DESIGN.md) |
+| 학습·checkpoint·archive·재학습 | [Training 설계](training/DESIGN.md) |
+| 실시간 채점과 publication | [Inference 설계](inference/DESIGN.md), [실시간 Feature](REALTIME_FEATURES.md) |
+| MLflow 운영 | [MLflow 설정](MLFLOW_SETUP.md) |
+| 재배치 정책 평가 | [재배치 백테스트](REBALANCING_BACKTEST.md) |
+
+현행 동작의 최종 근거는 링크된 문서만으로 끝나지 않는다. 실제 코드와 테스트,
+고정 입력이 기록된 실행 산출물을 함께 대조해야 한다. 이 파일의 과거 성능 수치는
+현재 모델 품질이나 운영 성능의 근거로 재사용하지 않는다.
+
+## 기록 범위
+
+- 1~13: point-in-time feature, 초기 Spark 이전, 증분 처리와 로컬 자원 실험
+- 14~18: profile, 5분 grid, 분산 학습 준비와 multi-horizon 실험
+- 19~24: 레거시 문서 정리와 초기 실시간 추론 최적화
+- 25~30: 배포 코드 정리, 경로 통합, uv 전환과 `libs/ml_core` 분리
+
+번호 13 뒤에 16이 먼저 기록되고 이후 14~15가 나오는 순서는 원문의 작성 순서를
+보존한 것이다. 번호를 현재 작업 우선순위나 구현 완성도로 해석하지 않는다.
 
 ---
 
@@ -18,10 +52,10 @@
 (`predict_single.py`)에는 연결이 안 돼 있었다.
 
 **결정**: 대여에만 적용(반납은 반납 이벤트 자체가 로그 시점이라 이 문제 자체가 없음).
-- **학습**: [src/features.py](src/features.py) `_add_rental_lag_rolling()` — `rental_lag_1h`와
+- **학습**: `src/features.py` `_add_rental_lag_rolling()` — `rental_lag_1h`와
   `roll_mean/std_3h·24h`만 point-in-time censored 값으로 대체, `lag_24h/168h`는
   예측 시점엔 이미 완전히 해소된 값이라 raw 유지.
-- **추론**: [src/predict_single.py](src/predict_single.py) — 히스토리 소스를 시간 단위
+- **추론**: `src/predict_single.py` — 히스토리 소스를 시간 단위
   집계 대신 트립 단위(start_dt/end_dt) 원본으로 교체, `count_visible_in_window()`로
   실제 censoring 규칙 적용. "윈도우 내 0건"과 "데이터 커버리지 밖"을 구분해서
   후자만 fallback(정류소 평소 패턴)으로 처리.
@@ -133,7 +167,7 @@ End-to-End 실행 성공(로컬 5분 53초 — **EMR 노드 0개, 순수 로컬 
 워터마크보다 최신인 행만 골라 append. rolling_rental_features 자체는 영구
 저장 안 하고 lookback 구간만 매번 재계산(가볍고 단순).
 
-**구현**: [feature_engine/watermark.py](feature_engine/watermark.py)
+**구현**: `feature_engine/watermark.py`
 (JSON 파일, read/write), `config.py`의 `PARAM_COMBO_ID`로 파라미터 조합별 출력
 경로 분리(`w60_e30_t5` 등), `run_pipeline.py`가 워터마크 유무로 전체/증분 분기.
 
@@ -146,7 +180,7 @@ End-to-End 실행 성공(로컬 5분 53초 — **EMR 노드 0개, 순수 로컬 
 파라미터(censoring 윈도우, LAG_HOURS, LightGBM 하이퍼파라미터 등)를 따로
 하드코딩하고 있어서, 한쪽만 고치고 잊으면 조용히 갈라지는 위험이 있었음.
 
-**해법**: [common_config.py](common_config.py)(ml/ 루트, pandas/pyspark 등 무거운
+**해법**: `common_config.py`(ml/ 루트, pandas/pyspark 등 무거운
 의존성 없는 순수 상수 모듈)를 만들어 두 config.py가 여기서 값을 가져오도록
 리팩터링. 경로처럼 원래 다를 수밖에 없는 값은 각자 파일에 그대로 둠. 두 패키지가
 서로 import하지 않는 원칙(EMR엔 `feature_engine/`만 올라가면 됨)은 유지 —
@@ -154,9 +188,9 @@ End-to-End 실행 성공(로컬 5분 53초 — **EMR 노드 0개, 순수 로컬 
 
 ## 9. 월별 성능 모니터링 / 재학습 트리거
 
-**구현**: [src/monitor_performance.py](src/monitor_performance.py) —
+**구현**: `src/monitor_performance.py` —
 `evaluate_recent_performance()`(최근 N개월 실측 vs baseline), `decide_retrain()`
-(임계값 적용). [scripts/monthly_retrain_check.py](scripts/monthly_retrain_check.py) —
+(임계값 적용). `scripts/monthly_retrain_check.py` —
 CLI, 기본 dry-run(리포트만), `--execute`로 실제 feature_engine(Spark, 별도
 venv로 subprocess) → 재학습까지 트리거. `train_common.train_target()`이 이제
 학습 끝날 때마다 `models/{model_name}_metrics.json`을 저장해서 다음 모니터링의
@@ -265,7 +299,7 @@ part 파일로 나눠 쓴다(`ParquetWriter` 하나를 계속 붙들지 않음 +
 학습해야 해서, 쪼개면 서로 다른 여러 모델이 돼버려 챔피언과 비교 불가).
 사용자 판단: 프로덕션 코드(`src/train_common.py`)는 절대 안 건드리고, 별도
 실험 경로에 **청크 이어학습**(`lgb.train(..., init_model=이전_booster)`)을
-구현. [experiments/tick_model_ooc/chunked_training.py](experiments/tick_model_ooc/chunked_training.py) —
+구현. `experiments/tick_model_ooc/chunked_training.py` —
 시간순으로 청크(기본 30일)를 하나씩 읽어 이어 학습하고, valid셋 재평가로
 청크를 넘나드는 수동 조기종료를 구현. **이건 근사다** — 전체 데이터를 한 번에
 보는 "진짜" gradient boosting과 수학적으로 동일하지 않다(각 라운드가 그
@@ -279,7 +313,7 @@ part 파일로 나눠 쓴다(`ParquetWriter` 하나를 계속 붙들지 않음 +
 0건**임을 발견(수집 장애로 추정) — 버그가 아니라 실제 소스 데이터의 결측이라,
 `iter_chunks()`가 빈 청크를 에러 없이 건너뛰도록 처리.
 
-**실습용 노트북**: [experiments/tick_model_ooc/tick_model_walkthrough.ipynb](experiments/tick_model_ooc/tick_model_walkthrough.ipynb) —
+**실습용 노트북**: `experiments/tick_model_ooc/tick_model_walkthrough.ipynb` —
 피처마트 생성 확인 → 청크 학습 스모크 테스트 → 본 학습(대여/반납) → 챔피언과
 지표 비교 → 추론 스모크 테스트까지 단계별로 직접 실행해볼 수 있게 자세한
 주석과 함께 구성.
@@ -511,7 +545,7 @@ train/valid를 샤딩하고(`_shard_for_this_machine()`), Poisson/quantile 4개
 End-to-End 검증 불가(2026-08-13 기준 인프라 미비). 다음 세션에서 인프라(워커
 IP/포트)가 서면 `LGB_MACHINES`에 실제 값을 넣고 여러 머신에서 같은 스크립트를
 동시에 띄워 검증해야 함 — training/DESIGN.md 1-1번 항목,
-[ADR-0001](adr/0001-lightgbm-distributed-training.md) 참고.
+당시 `adr/0001-lightgbm-distributed-training.md` 참고.
 
 ## 18. multi-horizon 실험 — "horizon을 feature로" 방식으로 12시간 앞 배치 예측 구현·검증
 
@@ -626,7 +660,7 @@ history.md 11번 항목의 "8% 표본 학습" 실험도 비슷한 성격의 표�
   **`feature_engine/DESIGN.md` 0번 항목으로 이관**하고 원본은 삭제.
 - `SPARK_SCALING.md`: §1~3(feature engineering/학습을 Spark로 옮길지 판단)은
   이미 실행 완료된 질문(`feature_engine/spark/` 존재, 학습 쪽은 17번 항목+
-  [ADR-0001](adr/0001-lightgbm-distributed-training.md)로 결론) — 버려도 됨.
+  당시 `adr/0001-lightgbm-distributed-training.md`로 결론) — 버려도 됨.
   **§4.3(Kafka+Spark Streaming 대신 Redis로 충분하다는 재검토)만 유일하게
   다른 곳에 없는 미래 아키텍처 결정**이라 `inference/DESIGN.md` 6번 항목으로
   이관하고 원본은 삭제.
@@ -943,7 +977,7 @@ pandas 2차정제 호출 제거, 1~5단계만)와 `run_full_pipeline.py`(dataset
 `dev_spark_incremental`, 12개)로 Spark 로직이 pandas 기준 구현과 여전히 정확히
 일치함을 재확인, 나머지 회귀 테스트(`common`/`training`/`inference` 34개 +
 legacy 11개) 전부 통과 — 파일 이동/임포트 수정이 기존 동작을 깨지 않았음을 확인.
-자세한 파일별 분류·근거는 [LEGACY_AUDIT.md](LEGACY_AUDIT.md)에 남김(경로 불일치는
+자세한 파일별 분류·근거는 당시 `LEGACY_AUDIT.md`에 남김(경로 불일치는
 26번 항목에서 마저 해결).
 
 ## 26. Spark 피처마트 산출물 경로를 `training`/`inference`가 읽는 경로와 통일 + `DATA_ROOT` 회귀 버그 발견·수정
@@ -986,7 +1020,7 @@ dirname 두 번으로 정확히 `ml/`에 닿았지만, 재편으로 `ml/feature_
 `FEATURE_PARAM_COMBO_ID`(또는 그게 파생되는 `ROLLING_WINDOW_MINUTES`/
 `ROLLING_EMBARGO_MINUTES`/`ROLLING_TICK_MINUTES`/`ML_PROFILE`) 환경변수를 Spark
 실행과 training/inference 실행 양쪽에 **반드시 같은 값으로** 설정해야 한다 —
-한쪽만 바꾸면 다시 어긋난다. 상세는 [LEGACY_AUDIT.md](LEGACY_AUDIT.md) 참고.
+한쪽만 바꾸면 다시 어긋난다. 상세는 당시 `LEGACY_AUDIT.md` 참고.
 
 ## 27. 실험 폴더는 git에 안 올리기로 확정 — `tick_model_ooc`/`tick_model_sampled` 추적 해제
 
@@ -1006,7 +1040,7 @@ dirname 두 번으로 정확히 `ml/`에 닿았지만, 재편으로 `ml/feature_
 `experiment_log.py`/`scripts/{build_embargo_candidate,compare_baselines,run_embargo_sweep}.py`만
 남는다.
 
-상세는 [LEGACY_AUDIT.md](LEGACY_AUDIT.md) 참고.
+상세는 당시 `LEGACY_AUDIT.md` 참고.
 
 ## 28. `feature_engine`의 pandas는 1차정제까지 전부 legacy — 25번 항목 분류 정정
 
@@ -1046,7 +1080,7 @@ pandas==Spark parity가 이미 검증돼 있다는 사실에 기대는 간접 �
 
 **검증**: 기존 회귀 테스트 45개(pandas) + 12개(Spark parity) 재실행 전부 통과.
 
-상세는 [LEGACY_AUDIT.md](LEGACY_AUDIT.md) 참고.
+상세는 당시 `LEGACY_AUDIT.md` 참고.
 
 ## 29. common/training/inference도 실제 참조 관계로 재검증 — `profiles/embargo45.json` legacy로 추가 이동
 
@@ -1076,7 +1110,7 @@ README/`run_full_pipeline.py`의 엔트리포인트로 쓰이고 있음을 재�
 
 **검증**: 회귀 테스트 45개(pandas) + 12개(Spark parity) 재실행 전부 통과.
 
-상세는 [LEGACY_AUDIT.md](LEGACY_AUDIT.md) 참고.
+상세는 당시 `LEGACY_AUDIT.md` 참고.
 
 ## 30. 환경 관리를 uv로 전환 + `common`을 `libs/ml_core/`으로 분리(독립 라이브러리화)
 
@@ -1125,5 +1159,5 @@ editable 의존성이 새 경로(`../../libs/ml_core`)로 정확히 잡히는지
 전부 갱신했지만, `history.md`의 과거 항목(1~29번)은 당시 실제 코드가
 `common`으로 불렸던 시점의 기록이라 그대로 둔다(이 저장소의 결정 로그
 컨벤션 — 과거 기록은 그때 사실을 남기고, 최신 상태는 README/LEGACY_AUDIT.md가
-반영). 자세한 파일별 변경 목록은 [LEGACY_AUDIT.md](LEGACY_AUDIT.md)의
+반영). 자세한 파일별 변경 목록은 당시 `LEGACY_AUDIT.md`의
 "환경 관리 — uv + `libs/ml_core/`" 절 참고.

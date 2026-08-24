@@ -1,330 +1,217 @@
-# 검증 상태 분류 기준
+# Collector 데이터 계약
 
-> 이 문서는 원천·Silver 컬럼의 데이터 품질 검증 기준이다. 운영 Gold의 목표 물리
-> 모델과 이름은 #129에서 확정하는 `docs/gold/target-erd.md`와
-> `docs/gold/data-dictionary.md`를 따른다. 따라서 이 문서에 등장하는 논리 컬럼이
-> 모두 Gold에 영속되는 것은 아니다.
+> 상태: 현재 코드 기준<br>
+> 코드 확인일: 2026-08-24
 
-## 1. 분류 원칙
+이 문서는 Collector가 외부 API 응답을 어떤 schema와 저장 계층으로 생산하는지 설명한다. Column별 type, required, range, enum과 정책의 최종 기준은 `collector/sources/*.yaml`이다. Gold/PostGIS schema는 `docs/gold/`에서 별도로 관리한다.
 
-컬럼은 현재 Gold 생성 또는 모델 추론에 직접 필요한지에 따라 `필수`와 `일반`으로 구분한다.
+## 계약의 구성
 
-- **필수**: 값이 없거나 사용할 수 없으면 현재 Gold 생성 또는 모델 추론 결과에 직접 영향을 주는 컬럼
-- **일반**: 현재 Gold/추론에는 반드시 필요하지 않지만 향후 분석·Feature Mart·모델 개선에 활용할 수 있는 컬럼
+Source 하나의 계약은 다음 항목으로 구성된다.
 
-수집 자체가 성공한 뒤 검증 과정에서 결측·이상치가 발견되어도 API 재시도는 수행하지 않는다. API 호출 실패, 타임아웃, HTTP/원천 RESULT 오류 등 수집 자체가 진행되지 못한 경우에만 수집 단계에서 재시도한다.
+| 항목 | 정의 위치 | 역할 |
+| --- | --- | --- |
+| Source ID·adapter | source YAML | 외부 API와 응답 해석 방식 선택 |
+| `columns` | source YAML | Silver에 허용할 column, type, required, range, enum |
+| `policies` | source YAML | missing·type error·outlier 처리 |
+| `quality` | source YAML | 수집 누락과 폐기 행 허용 비율 |
+| Pydantic schema | `collector/config/schema.py` | 알 수 없는 설정과 잘못된 조합을 로딩 단계에서 거부 |
+| Validation engine | `collector/validation/` | raw 값을 실제 Silver 값과 quarantine 판정으로 변환 |
+| Storage layout | `collector/storage.py` | Bronze, Silver, manifest, Archive key 생성 |
 
-타입 변환에 실패한 값은 별도의 타입오류 상태로 분리하지 않고 **이상치**로 분류한다. 예를 들어 integer 컬럼에 `"abc"`가 들어온 경우 해당 값은 이상치로 판정한다.
+Source YAML에 선언되지 않은 raw field는 Silver에서 제거된다. 새 field가 필요하면 YAML과 downstream 소비 계약을 함께 변경해야 한다.
 
-검증 결과는 다음 5개 상태로 구분한다.
+## 저장 계층
+
+### Bronze
+
+```text
+bronze/<source_id>/dt=YYYY-MM-DD/hh=HH/HHMM/part=<part_key>.json.gz
+```
+
+- API page, 기상 격자 또는 POI 같은 fetch part별 gzip JSON이다.
+- 응답 원문에 가깝게 보존하며 validation 이전의 재개 지점이다.
+- part가 도착할 때마다 즉시 쓴다.
+- 일반 재시도는 기존 Bronze를 재사용한다. `--force`만 window의 Bronze를 비우고 다시 받는다.
+
+### Silver
+
+```text
+silver/<source_id>/dt=YYYY-MM-DD/hh=HH/HHMM/sha256=<digest>.parquet
+```
+
+- source YAML에 선언된 column만 가진다.
+- 선언 type으로 casting되고 policy 적용을 마친 row다.
+- content-addressed immutable object이며 같은 bytes는 같은 key를 사용한다.
+- `_row_status`가 `ok` 또는 `repaired`로 각 row의 검증 결과를 나타낸다.
+
+Downstream은 Silver prefix에서 최신 파일처럼 보이는 객체를 직접 고르지 않는다. Source snapshot manifest의 exact URI와 SHA를 사용한다.
+
+### Quarantine
+
+```text
+quarantine/<source_id>/dt=YYYY-MM-DD/hh=HH/HHMM.jsonl
+```
+
+폐기된 row가 있을 때만 생성된다. 원래 raw field에 다음 진단 field를 붙인다.
+
+| Field | 의미 |
+| --- | --- |
+| `_row_index` | window batch 안에서의 원래 row 위치 |
+| `_issues` | 문제가 발생한 column, 종류, raw value와 적용 action |
+
+Quality gate가 실패해 Silver를 게시하지 않더라도 폐기 원인을 분석할 수 있도록 quarantine은 남길 수 있다.
+
+### 실행 Manifest
+
+```text
+_manifest/<source_id>/dt=YYYY-MM-DD/hh=HH/HHMM.json
+```
+
+한 번의 실행이 어디까지 진행됐는지 나타내는 mutable 진단 기록이다.
+
+| Field | 의미 |
+| --- | --- |
+| `status` | `running`, `succeeded`, `partial`, `failed`, `empty`, `skipped` |
+| `stage` | `bronze_written`, `validated`, `completed` |
+| `failure_reason` | `fetch_error`, `storage_error`, `quality_gate`, `config_error` |
+| `attempt` | 해당 window의 진단 실행 횟수 |
+| `revision` | authoritative content correction 번호 |
+| `counts` | expected, fetched, kept, repaired, dropped row 수 |
+| `missing` | 누락 part 또는 row와 계산 기준 |
+| `column_issues` | column별 missing, type error, outlier 집계 |
+| `policy_actions` | 적용된 policy action 집계 |
+| `artifacts` | Bronze prefix·parts, Silver, quarantine 위치 |
+
+### Source Authority Manifest
+
+```text
+source_snapshot_manifest/<source_id>/dt=<UTC-date>/hh=<UTC-hour>/
+logical=<UTC-timestamp>/revision=<10-digit>.json
+```
+
+검증된 source snapshot의 immutable authority다. 논리 시각, config version, exact Silver URI·SHA, row count와 완료 part를 고정한다.
+
+- 최초 authoritative 결과는 revision 0이다.
+- 같은 content의 재실행은 같은 revision을 재사용한다.
+- content 또는 상태가 달라진 correction만 revision이 증가한다.
+- revision은 0부터 빈틈없이 이어져야 한다.
+
+진단 manifest는 “실행이 어떻게 됐는가”, authority manifest는 “downstream이 어떤 content를 읽어야 하는가”에 답한다.
+
+### Archive
+
+```text
+archive/<source_id>/dt=YYYY-MM-DD.parquet
+_archive_manifest/<source_id>/dt=YYYY-MM-DD.json
+```
+
+날짜별 Silver를 고정 schema로 묶은 학습·재현 계층이다. Source column 뒤에 다음 meta column이 추가된다.
+
+| Column | 의미 |
+| --- | --- |
+| `_row_status` | Silver validation 결과 |
+| `_window_start` | row가 관측된 KST window |
+| `_source_kind` | 운영 compaction은 `collector`, 초기 적재는 `bootstrap` |
+
+## 검증 상태
+
+### Column issue
+
+| Issue | 조건 |
+| --- | --- |
+| `MISSING` | 값이 `None`, 빈 문자열 또는 마스킹된 값 |
+| `TYPE_ERROR` | 선언된 type을 순서대로 시도했지만 모두 실패 |
+| `OUTLIER` | casting 성공 후 range 또는 enum 위반 |
+
+현재 지원 caster는 `str`, `int`, `float`, `bool`, `precip`, `snow`, `masked_float`다.
+
+### Row status
 
 | 상태 | 의미 |
 | --- | --- |
-| 정상 | 값이 존재하고 정의된 타입으로 해석 가능하며 정상 범위/규칙을 만족 |
-| 필/결 | 필수 컬럼의 값이 수집되지 않음 |
-| 필/이 | 필수 컬럼의 값이 존재하지만 타입 변환에 실패하거나 정상 범위 또는 정합성 규칙을 위반 |
-| 일/결 | 일반 컬럼의 값이 수집되지 않음 |
-| 일/이 | 일반 컬럼의 값이 존재하지만 타입 변환에 실패하거나 정상 범위 또는 정합성 규칙을 위반 |
+| `ok` | issue나 값 교정 없이 유지 |
+| `repaired` | null 교체, 기본값, 범위 clipping 같은 policy가 값을 변경 |
+| dropped | Silver에 넣지 않고 quarantine으로 이동 |
 
-판정 순서는 `결측 → 이상치 → 정상` 순서로 한다. 타입 변환 실패는 이상치 판정에 포함한다. 같은 상태라도 특정 컬럼의 비즈니스 의미에 따라 별도 처리 정책을 둘 수 있으며, 컬럼별 정책이 공통 상태 정책보다 우선한다.
+`drop_row` 또는 row policy로 폐기된 row는 Silver에 row status로 남지 않는다.
 
-### 결측 판정 공통 규칙
-- `NULL`, Python `None`, 빈 문자열 `""`은 기본적으로 결측으로 본다.
-- 공백만 있는 문자열은 trim 후 빈 문자열이면 결측으로 본다.
-- 원천 API가 별도 결측 sentinel 값을 사용하는 경우 해당 소스 config에 명시하여 결측으로 변환한다.
-- 숫자 `0`, 문자열 `"0"`, boolean `false`는 해당 컬럼에서 정상값이 될 수 있으므로 결측으로 간주하지 않는다.
+### 기본 Policy
 
-### 이상치 판정 공통 규칙
-- 원천이 문자열로 숫자를 제공하는 경우(`"15"`, `"31.6"`) 정의된 숫자 타입으로 안전하게 캐스팅되면 정상값으로 본다.
-- 캐스팅할 수 없는 문자열(`"abc"` 등), 잘못된 날짜/시간 문자열, 잘못된 geometry는 이상치로 본다.
-- 타입 변환에 성공하더라도 정상 범위, enum, FK/PK, 컬럼 간 정합성 규칙을 위반하면 이상치로 본다.
+모든 현재 source는 같은 네 가지 기본값을 사용한다.
 
----
-
-# 컬럼별 검증 기준
-
-> `created_dttm`, `updated_dttm` 등 Silver 생성 과정에서 ETL이 만드는 시스템 컬럼은 Bronze 원천값이 아니므로 이 검증 대상에서 제외한다. 해당 값의 생성 실패는 데이터 품질 상태가 아니라 ETL 구현 오류로 처리한다.
-
-## weather_grid
-
-| 컬럼 | 중요도 | 결측 | 이상치 기준 | 근거 |
-| --- | --- | --- | --- | --- |
-| weather_grid_id | 필수 | 값 없음 | `<= 0`, PK 중복 | 날씨 데이터와 대여소를 격자에 연결하는 식별자 |
-| weather_grid_x_no | 필수 | 값 없음 | 57~63 밖이거나 `(x,y)` 조합이 서울 격자 목록에 없음 | 서울권 기상 격자 매핑에 필요 |
-| weather_grid_y_no | 필수 | 값 없음 | 124~129 밖이거나 `(x,y)` 조합이 서울 격자 목록에 없음 | 서울권 기상 격자 매핑에 필요 |
-
-추가 행 규칙: `(weather_grid_x_no, weather_grid_y_no)` 조합 중복은 이상치로 분류한다.
-
-## weather_forecast
-
-| 컬럼 | 중요도 | 결측 | 이상치 기준 | 근거 |
-| --- | --- | --- | --- | --- |
-| forecast_dttm | 필수 | 값 없음 | `forecast_dttm < base_dttm` | 어떤 시점의 날씨 Feature인지 결정 |
-| weather_grid_id | 필수 | 값 없음 | weather_grid Master에 없는 ID | 대여소와 날씨를 공간적으로 연결 |
-| temperature | 일반 | 값 없음 | 현재 Hard range 없음. 별도 Soft Warning 범위 사용 가능 | 현재 필수 식별정보가 아니며 향후/모델 Feature로 활용 가능 |
-| precipitation_prob | 일반 | 값 없음 | `< 0` 또는 `> 100` | 강수확률의 이론적 백분율 범위 |
-| precipitation_amount | 일반 | 값 없음 또는 원천 결측 표현 | `< 0` | 강수량은 음수가 될 수 없음. 원천 특수 표현은 normalize 정책 필요 |
-| humidity | 일반 | 값 없음 | `< 0` 또는 `> 100` | 상대습도의 이론적 범위 |
-| wind_speed | 일반 | 값 없음 | `< 0` | 풍속의 크기는 음수가 될 수 없음 |
-| base_dttm | 필수 | 값 없음 | `base_dttm > forecast_dttm` | 어떤 기준시각에 생성된 예보인지 식별 |
-
-## main_spot
-
-| 컬럼 | 중요도 | 결측 | 이상치 기준 | 근거 |
-| --- | --- | --- | --- | --- |
-| main_spot_id | 필수 | 값 없음/빈 문자열 | 중복 ID | 주요장소 인구 및 공간 Mapping의 PK |
-| main_spot_nm | 일반 | 값 없음/빈 문자열 | 별도 범위 없음 | 현재 계산에는 ID와 공간정보가 핵심이며 이름은 표시·분석용 |
-| main_spot_point | 필수 | 값 없음 | 유효하지 않은 EPSG:4326 Point 또는 polygon과 불일치 | 공간 매핑 기준 위치 |
-| main_spot_area | 필수 | 값 없음 | `<= 0` | 인구 밀도와 중첩 계산에 사용 |
-| main_spot_polygon | 필수 | 값 없음 | invalid polygon | 인구 격자 중첩 계산에 직접 필요 |
-
-## main_spot_living_population
-
-| 컬럼 | 중요도 | 결측 | 이상치 기준 | 근거 |
-| --- | --- | --- | --- | --- |
-| predicted_dttm | 필수 | 값 없음 | `< base_dttm` | 추론에 사용할 인구의 대상 시각 |
-| main_spot_id | 필수 | 값 없음 | main_spot Master에 없는 ID | 주요장소와 인구 연결 |
-| congestion_lv | 일반 | 값 없음 | 서울시가 정의한 허용값 집합을 적용하기로 한 경우 집합 밖의 값 | 현재 핵심 수치 Feature가 아니며 원천 분류값 보존 목적 |
-| pop_min | 필수 | 값 없음 | `< 0` 또는 `pop_min > pop_avg` | 주요장소 인구 수준 산정에 직접 사용 |
-| pop_max | 필수 | 값 없음 | `< 0` 또는 `pop_max < pop_avg` | 주요장소 인구 수준 산정에 직접 사용 |
-| pop_avg | 필수 | 값 없음 | `< 0` 또는 `pop_avg < pop_min` 또는 `pop_avg > pop_max` | 주요장소 인구의 대표 Feature |
-| male_rate | 일반 | 값 없음 | `< 0` 또는 `> 100` | 미래 예측 행에는 미제공될 수 있고 향후 Feature 후보 |
-| female_rate | 일반 | 값 없음 | `< 0` 또는 `> 100` | 미래 예측 행에는 미제공될 수 있고 향후 Feature 후보 |
-| age_0_rate | 일반 | 값 없음 | `< 0` 또는 `> 100` | 연령 Feature 후보 |
-| age_10_rate | 일반 | 값 없음 | `< 0` 또는 `> 100` | 연령 Feature 후보 |
-| age_20_rate | 일반 | 값 없음 | `< 0` 또는 `> 100` | 연령 Feature 후보 |
-| age_30_rate | 일반 | 값 없음 | `< 0` 또는 `> 100` | 연령 Feature 후보 |
-| age_40_rate | 일반 | 값 없음 | `< 0` 또는 `> 100` | 연령 Feature 후보 |
-| age_50_rate | 일반 | 값 없음 | `< 0` 또는 `> 100` | 연령 Feature 후보 |
-| age_60_rate | 일반 | 값 없음 | `< 0` 또는 `> 100` | 연령 Feature 후보 |
-| age_70_over_rate | 일반 | 값 없음 | `< 0` 또는 `> 100` | 연령 Feature 후보 |
-| resident_rate | 일반 | 값 없음 | `< 0` 또는 `> 100` | 거주 특성 Feature 후보 |
-| non_resident_rate | 일반 | 값 없음 | `< 0` 또는 `> 100` | 거주 특성 Feature 후보 |
-| base_dttm | 필수 | 값 없음 | `> predicted_dttm` | 인구 관측/예측의 기준 시각 |
-
-추가 행 규칙: `pop_min <= pop_avg <= pop_max`. 성별·연령·거주 비율 합계 검증은 해당 구성 컬럼들이 모두 제공된 행에 한해 허용 오차를 둔 Soft Validation으로 수행한다.
-
-## station
-
-| 컬럼 | 중요도 | 결측 | 이상치 기준 | 근거 |
-| --- | --- | --- | --- | --- |
-| sta_id | 필수 | 값 없음 | `<= 0`, PK 중복 | 모든 대여소 재고·대여이력·Gold의 연결 키 |
-| sta_nm | 일반 | 값 없음/빈 문자열 | 별도 범위 없음 | 서비스 표시에는 유용하지만 계산 자체는 ID로 가능 |
-| hold_cnt | 일반 | 값 없음 | `< 0` | 거치 규모 Feature/분석용이며 현재 재고값 자체는 별도 존재 |
-| sta_point | 필수 | 값 없음 | invalid Point, 서울 대상 영역 밖, 공간 Mapping 불일치 | 날씨·인구·행정구역 Mapping에 필수 |
-| sta_addr | 일반 | 값 없음 | 별도 Hard range 없음 | 좌표/ID로 핵심 처리 가능 |
-| is_active | 필수 | 값 없음 | true/false 이외의 값 | 비운영 대여소를 추론/서빙 대상에서 제외하는 기준 |
-| weather_grid_id | 필수 | 값 없음 | weather_grid에 없는 ID 또는 공간상 불일치 | 날씨 Feature 연결에 필요 |
-| pop_grid_id | 필수 | 값 없음 | population_grid에 없는 ID 또는 공간상 불일치 | 생활인구 Feature 연결에 필요 |
-| dong_id | 일반 | 값 없음 | dong_master에 없는 ID 또는 공간상 불일치 | 행정구역 표시·분석에 활용. 현재 핵심 추론 Feature 여부가 변경되면 필수로 승격 |
-
-## station_stock
-
-| 컬럼 | 중요도 | 결측 | 이상치 기준 | 근거 |
-| --- | --- | --- | --- | --- |
-| base_dttm | 필수 | 값 없음 | 유효하지 않은 관측 시각 | 현재 재고의 시점 식별 |
-| sta_id | 필수 | 값 없음 | station에 없는 ID | 어느 대여소의 재고인지 식별 |
-| parking_bike_tot_cnt | 필수 | 값 없음 | `< 0` | 현재 자전거 재고는 추론 및 Gold 핵심값 |
-| shared_rate | 일반 | 값 없음 | `< 0` | 보조 정보이며 100 초과가 실제로 가능하므로 상한을 Hard rule로 두지 않음 |
-
-`parking_bike_tot_cnt > hold_cnt`는 실제 운영상 발생할 수 있으므로 Hard 이상치로 처리하지 않고 필요하면 Soft Warning으로 기록한다.
-
-## event_spot
-
-| 컬럼 | 중요도 | 결측 | 이상치 기준 | 근거 |
-| --- | --- | --- | --- | --- |
-| event_spot_id | 필수 | 값 없음/빈 문자열 | 중복 ID | event와 장소를 연결하는 PK |
-| event_spot_nm | 일반 | 값 없음/빈 문자열 | 별도 범위 없음 | 표시·분석용 |
-| event_spot_point | 필수 | 값 없음 | invalid EPSG:4326 Point 또는 서비스 대상 지역 밖 | 가까운 대여소와 행사를 연결해 Gold/대시보드에 제공하기 위해 필요 |
-
-## event
-
-| 컬럼 | 중요도 | 결측 | 이상치 기준 | 근거 |
-| --- | --- | --- | --- | --- |
-| event_id | 필수 | 값 없음 | `<= 0`, 중복 | 행사 식별 PK |
-| event_spot_id | 필수 | 값 없음 | event_spot에 없는 ID | 행사와 공간을 연결 |
-| event_name | 일반 | 값 없음/빈 문자열 | 별도 범위 없음 | 표시·분석용이며 공간·일정 Feature 계산 자체에는 다른 키 사용 가능 |
-| event_start_dt | 필수 | 값 없음 | `> event_end_dt` | 특정 시점에 행사 영향이 있는지 판단하는 핵심값 |
-| event_end_dt | 필수 | 값 없음 | `< event_start_dt` | 행사 유효기간 판단의 핵심값 |
-| event_schedule | 일반 | 값 없음 | 별도 Hard range 없음 | 상세 일정은 비정형이며 향후 정교한 Feature에 사용 가능 |
-| event_type | 일반 | 값 없음 | 허용 코드집합을 명시한 경우 집합 밖의 값 | 행사 유형 Feature/분석 후보 |
-| event_url | 일반 | 값 없음 | URL 검증을 적용하는 경우 유효하지 않은 URL | 부가 서비스 정보 |
-| event_image_url | 일반 | 값 없음 | URL 검증을 적용하는 경우 유효하지 않은 URL | 부가 서비스 정보 |
-
-## gu_master
-
-| 컬럼 | 중요도 | 결측 | 이상치 기준 | 근거 |
-| --- | --- | --- | --- | --- |
-| gu_id | 필수 | 값 없음/빈 문자열 | 중복, 서울 자치구 Master와 불일치 | 행정구역 Mapping 식별자 |
-| gu_nm | 일반 | 값 없음/빈 문자열 | 서울 자치구명 목록과 불일치 | 표시·검증용 이름 |
-| gu_polygon | 필수 | 값 없음 | invalid Polygon | 행정구역 공간 연산에 필요 |
-
-## dong_master
-
-| 컬럼 | 중요도 | 결측 | 이상치 기준 | 근거 |
-| --- | --- | --- | --- | --- |
-| dong_id | 필수 | 값 없음/빈 문자열 | 중복 | 행정동 Mapping 식별자 |
-| dong_nm | 일반 | 값 없음/빈 문자열 | 별도 Hard range 없음 | 표시·검증용 이름 |
-| dong_polygon | 필수 | 값 없음 | invalid Polygon 또는 gu_polygon과 심각한 공간 불일치 | 대여소 행정구역 Mapping에 사용 |
-| gu_id | 필수 | 값 없음 | gu_master에 없는 ID | 동-구 관계 유지 |
-
-## population_grid
-
-| 컬럼 | 중요도 | 결측 | 이상치 기준 | 근거 |
-| --- | --- | --- | --- | --- |
-| pop_grid_id | 필수 | 값 없음/빈 문자열 | 중복 | 격자 생활인구와 대여소를 연결하는 PK |
-| pop_grid_point | 일반 | 값 없음 | invalid Point 또는 polygon 바깥 | 대표 위치·시각화용. 중첩 계산은 polygon 사용 |
-| pop_grid_polygon | 필수 | 값 없음 | invalid Polygon | 주요장소 중첩 보정과 대여소 Mapping에 직접 사용 |
-
-## population_grid_main_spot
-
-| 컬럼 | 중요도 | 결측 | 이상치 기준 | 근거 |
-| --- | --- | --- | --- | --- |
-| pop_grid_id | 필수 | 값 없음 | population_grid에 없는 ID | 중첩 보정 대상 격자 식별 |
-| main_spot_id | 필수 | 값 없음 | main_spot에 없는 ID | 중첩 보정 대상 주요장소 식별 |
-| overlap_rate | 필수 | 값 없음 | `<= 0` 또는 `> 1` | 주요장소/격자 중첩 보정 계산에 직접 사용 |
-
-## living_population_per_population_grid (collector source: `living_population_grid`)
-
-`collector/sources/living_population_grid.yaml` + `seoul_openapi` 어댑터의 `normalize()`가
-API 원본 필드를 그대로 통과시키므로, 이 표의 논리 컬럼명(`base_dttm`, `pop_grid_id`,
-`living_pop_tot`, `male_00_09` 등)이 아니라 아래 **물리 컬럼명 그대로 저장된다.**
-`base_dttm`은 `YMD`(날짜) + `TT`(0~23 시간대) 조합에 대응하고, `pop_grid_id`는
-`CELL_ID`(250m 격자 ID)에 대응한다.
-
-`SPOP`과 `M00`~`F70`은 `types: [masked_float]`로 선언돼 있다. 이 캐스터가 마스킹 표기 `*`을
-**타입 오류가 아니라 결측(MISSING)으로** 판정시키므로, 아래 표의 "결측" 기준이 그대로
-manifest의 `column_issues.missing`과 `optional_missing` 정책에 걸린다(`core.masked` 참고). `living_pop_tot`은 `SPOP`에 대응하되, yaml에
-`required: true`가 없어 **실측 데이터에 null이 실제로 존재한다**(계획서와 달리 필수
-컬럼이 아님 — downstream에서 반드시 null 처리 필요).
-
-| 컬럼 | 중요도 | 결측 | 이상치 기준 | 근거 |
-| --- | --- | --- | --- | --- |
-| YMD | 필수 | 값 없음/빈 문자열 | 유효하지 않은 날짜 형식(YYYYMMDD) | 4주 평균 및 아카이브 파티션 키 |
-| TT | 필수 | 값 없음/빈 문자열 | `00~23` 범위 밖 | 시간대별 인구 계산 기준 |
-| H_DNG_CD | 필수 | 값 없음/빈 문자열 | 값 형식 불일치 | 행정동 단위 집계·조인에 사용 |
-| CELL_ID | 필수 | 값 없음/빈 문자열 | 중복 | 격자별 인구 식별(PK 역할) |
-| SPOP | 일반 | 값 없음(null 실제 발생) | `< 0` 또는 `> 10,000,000` | 현재 격자 인구 추정/예측의 핵심값이지만 collector 정책상 필수 아님 |
-| M00 | 일반 | 값 없음(마스킹 `*` → null) | `< 0` | 남성 0~9세, 성·연령 Feature 후보 |
-| M10 | 일반 | 값 없음(마스킹 `*` → null) | `< 0` | 남성 10~14세 |
-| M15 | 일반 | 값 없음(마스킹 `*` → null) | `< 0` | 남성 15~19세 |
-| M20 | 일반 | 값 없음(마스킹 `*` → null) | `< 0` | 남성 20~24세 |
-| M25 | 일반 | 값 없음(마스킹 `*` → null) | `< 0` | 남성 25~29세 |
-| M30 | 일반 | 값 없음(마스킹 `*` → null) | `< 0` | 남성 30~34세 |
-| M35 | 일반 | 값 없음(마스킹 `*` → null) | `< 0` | 남성 35~39세 |
-| M40 | 일반 | 값 없음(마스킹 `*` → null) | `< 0` | 남성 40~44세 |
-| M45 | 일반 | 값 없음(마스킹 `*` → null) | `< 0` | 남성 45~49세 |
-| M50 | 일반 | 값 없음(마스킹 `*` → null) | `< 0` | 남성 50~54세 |
-| M55 | 일반 | 값 없음(마스킹 `*` → null) | `< 0` | 남성 55~59세 |
-| M60 | 일반 | 값 없음(마스킹 `*` → null) | `< 0` | 남성 60~64세 |
-| M65 | 일반 | 값 없음(마스킹 `*` → null) | `< 0` | 남성 65~69세 |
-| M70 | 일반 | 값 없음(마스킹 `*` → null) | `< 0` | 남성 70세 이상 |
-| F00 | 일반 | 값 없음(마스킹 `*` → null) | `< 0` | 여성 0~9세 |
-| F10 | 일반 | 값 없음(마스킹 `*` → null) | `< 0` | 여성 10~14세 |
-| F15 | 일반 | 값 없음(마스킹 `*` → null) | `< 0` | 여성 15~19세 |
-| F20 | 일반 | 값 없음(마스킹 `*` → null) | `< 0` | 여성 20~24세 |
-| F25 | 일반 | 값 없음(마스킹 `*` → null) | `< 0` | 여성 25~29세 |
-| F30 | 일반 | 값 없음(마스킹 `*` → null) | `< 0` | 여성 30~34세 |
-| F35 | 일반 | 값 없음(마스킹 `*` → null) | `< 0` | 여성 35~39세 |
-| F40 | 일반 | 값 없음(마스킹 `*` → null) | `< 0` | 여성 40~44세 |
-| F45 | 일반 | 값 없음(마스킹 `*` → null) | `< 0` | 여성 45~49세 |
-| F50 | 일반 | 값 없음(마스킹 `*` → null) | `< 0` | 여성 50~54세 |
-| F55 | 일반 | 값 없음(마스킹 `*` → null) | `< 0` | 여성 55~59세 |
-| F60 | 일반 | 값 없음(마스킹 `*` → null) | `< 0` | 여성 60~64세 |
-| F65 | 일반 | 값 없음(마스킹 `*` → null) | `< 0` | 여성 65~69세 |
-| F70 | 일반 | 값 없음(마스킹 `*` → null) | `< 0` | 여성 70세 이상 |
-
-추가 행 규칙: 모든 연령·성별 세부값이 존재하는 경우 세부합과 `SPOP`의 차이를 허용 오차 기반 Soft Validation으로 검사한다.
-
-### 서울 열린데이터광장 CSV 원본과의 매핑 (`250_LOCAL_RESD_YYYYMMDD.csv`)
-
-과거 이력을 CSV로 직접 받을 때는 EUC-KR 인코딩 + 한글 헤더를 쓰고, 결측/마스킹 값은
-문자열 `*`로 표기된다(2026-04-01~2026-08-11 CSV 133개를 전수 비교해 헤더/컬럼 수가
-전부 동일함을 확인 — 이 기간 스키마 변경 없음). `seoul-pop-nowcasting/backfill.py`의
-`read_source_csv`가 아래 매핑으로 물리 컬럼명으로 정규화한다.
-
-| CSV 한글 헤더 | 물리 컬럼명 |
+| 조건 | Policy |
 | --- | --- |
-| 일자 | YMD |
-| 시간 | TT |
-| 행정동코드 | H_DNG_CD |
-| 250M격자 | CELL_ID |
-| 생활인구합계 | SPOP |
-| 남자 0~9세 ~ 남자 70세 이상 | M00, M10, M15, M20, M25, M30, M35, M40, M45, M50, M55, M60, M65, M70 |
-| 여자 0~9세 ~ 여자 70세 이상 | F00, F10, F15, F20, F25, F30, F35, F40, F45, F50, F55, F60, F65, F70 |
+| required missing | `drop_row` |
+| required outlier/type error | `drop_row` |
+| optional missing | `keep_null` |
+| optional outlier/type error | `set_null` |
 
-## predicted_living_population_per_population_grid
+Column별 override나 row policy가 선언된 경우 YAML 설정이 우선한다.
 
-| 컬럼 | 중요도 | 결측 | 이상치 기준 | 근거 |
-| --- | --- | --- | --- | --- |
-| predicted_dttm | 필수 | 값 없음 | `< base_dttm` | 추론에서 사용할 인구의 대상 시각 |
-| pop_grid_id | 필수 | 값 없음 | population_grid에 없는 ID | 격자별 예측 인구 식별 |
-| base_dttm | 필수 | 값 없음 | `> predicted_dttm` | 예측 생성 기준 시각 |
-| living_pop_tot | 필수 | 값 없음 | `< 0` | 현재 추론에 사용하는 격자 예측 인구 핵심값 |
-| male_00_09 | 일반 | 값 없음 | `< 0` | 성·연령 Feature 후보 |
-| male_10_14 | 일반 | 값 없음 | `< 0` | 성·연령 Feature 후보 |
-| male_15_19 | 일반 | 값 없음 | `< 0` | 성·연령 Feature 후보 |
-| male_20_24 | 일반 | 값 없음 | `< 0` | 성·연령 Feature 후보 |
-| male_25_29 | 일반 | 값 없음 | `< 0` | 성·연령 Feature 후보 |
-| male_30_34 | 일반 | 값 없음 | `< 0` | 성·연령 Feature 후보 |
-| male_35_39 | 일반 | 값 없음 | `< 0` | 성·연령 Feature 후보 |
-| male_40_44 | 일반 | 값 없음 | `< 0` | 성·연령 Feature 후보 |
-| male_45_49 | 일반 | 값 없음 | `< 0` | 성·연령 Feature 후보 |
-| male_50_54 | 일반 | 값 없음 | `< 0` | 성·연령 Feature 후보 |
-| male_55_59 | 일반 | 값 없음 | `< 0` | 성·연령 Feature 후보 |
-| male_60_64 | 일반 | 값 없음 | `< 0` | 성·연령 Feature 후보 |
-| male_65_69 | 일반 | 값 없음 | `< 0` | 성·연령 Feature 후보 |
-| male_70_over | 일반 | 값 없음 | `< 0` | 성·연령 Feature 후보 |
-| female_00_09 | 일반 | 값 없음 | `< 0` | 성·연령 Feature 후보 |
-| female_10_14 | 일반 | 값 없음 | `< 0` | 성·연령 Feature 후보 |
-| female_15_19 | 일반 | 값 없음 | `< 0` | 성·연령 Feature 후보 |
-| female_20_24 | 일반 | 값 없음 | `< 0` | 성·연령 Feature 후보 |
-| female_25_29 | 일반 | 값 없음 | `< 0` | 성·연령 Feature 후보 |
-| female_30_34 | 일반 | 값 없음 | `< 0` | 성·연령 Feature 후보 |
-| female_35_39 | 일반 | 값 없음 | `< 0` | 성·연령 Feature 후보 |
-| female_40_44 | 일반 | 값 없음 | `< 0` | 성·연령 Feature 후보 |
-| female_45_49 | 일반 | 값 없음 | `< 0` | 성·연령 Feature 후보 |
-| female_50_54 | 일반 | 값 없음 | `< 0` | 성·연령 Feature 후보 |
-| female_55_59 | 일반 | 값 없음 | `< 0` | 성·연령 Feature 후보 |
-| female_60_64 | 일반 | 값 없음 | `< 0` | 성·연령 Feature 후보 |
-| female_65_69 | 일반 | 값 없음 | `< 0` | 성·연령 Feature 후보 |
-| female_70_over | 일반 | 값 없음 | `< 0` | 성·연령 Feature 후보 |
+## Source별 Silver column
 
-추가 행 규칙: 모든 성·연령 세부값이 존재하는 경우 세부합과 `living_pop_tot`의 차이를 허용 오차 기반 Soft Validation으로 검사한다.
+아래는 column 집합을 빠르게 찾기 위한 요약이다. 정확한 type과 constraint는 각 YAML을 확인한다.
 
-## rental
+### Bike
 
-| 컬럼 | 중요도 | 결측 | 이상치 기준 | 근거 |
-| --- | --- | --- | --- | --- |
-| rent_id | 필수 | 값 없음 | `<= 0`, 중복 | 대여 이력 식별 및 중복 제거에 필요 |
-| bike_id | 일반 | 값 없음/빈 문자열 | 별도 Hard range 없음 | 개별 자전거 분석에는 필요하지만 현재 대여소 수요 Feature는 시간·대여소 중심으로 생성 가능 |
-| rent_dttm | 필수 | 값 없음 | `rent_dttm > rtn_dttm` | 대여 수요의 발생 시각 핵심값 |
-| rtn_dttm | 필수 | 값 없음 | `< rent_dttm` | 현재 사용하는 원천은 반납 완료 후 확정되는 대여이력이며 반납 기반 집계/검증에 필요 |
-| use_min | 일반 | 값 없음 | `< 0` | 향후 이용행태 Feature/분석용 |
-| use_dst | 일반 | 값 없음 | `< 0` | 향후 이용행태 Feature/분석용 |
-| usr_cls_cd | 일반 | 값 없음 | 정의된 사용자분류 코드셋 밖의 값 | 사용자 특성 Feature 후보 |
-| sex_cd | 일반 | 값 없음 | 정의된 성별 코드셋 밖의 값 | 인구통계 Feature 후보 |
-| birth_year | 일반 | 값 없음 | 대여연도보다 미래이거나 실제 데이터 분석 후 정한 비현실적 출생연도 범위 밖 | 인구통계 Feature 후보이며 원천 특수값 가능 |
-| bike_type_cd | 일반 | 값 없음 | 정의된 자전거유형 코드셋 밖의 값 | 자전거 유형 Feature 후보 |
-| rent_sta_id | 필수 | 값 없음 | 유효한 station 식별 규칙을 만족하지 않음. 물리 FK 적용 여부는 과거 폐쇄 대여소 확인 후 결정 | 수요가 발생한 대여소를 집계하는 핵심값 |
-| rtn_sta_id | 필수 | 값 없음 | 유효한 station 식별 규칙을 만족하지 않음. 물리 FK 적용 여부는 과거 폐쇄 대여소 확인 후 결정 | 공급/반납 흐름 분석의 핵심값 |
+| Source | Column |
+| --- | --- |
+| `bike_station_master` | `RNTLS_ID`, `ADDR1`, `ADDR2`, `LAT`, `LOT` |
+| `bike_station_realtime` | `stationId`, `stationName`, `rackTotCnt`, `parkingBikeTotCnt`, `shared`, `stationLatitude`, `stationLongitude` |
+| `bike_rental_history` | `BIKE_ID`, `RENT_DT`, `RENT_ID`, `RENT_NM`, `RENT_HOLD`, `RTN_DT`, `RTN_ID`, `RTN_NM`, `RTN_HOLD`, `USE_MIN`, `USE_DST`, `USR_CLS_CD`, `SEX_CD`, `BIRTH_YEAR`, `RENT_STATION_ID`, `RETURN_STATION_ID`, `BIKE_SE_CD` |
 
-`use_min`과 `rtn_dttm - rent_dttm`의 차이는 원천 계산·반올림 차이가 있을 수 있으므로 Hard 이상치가 아니라 Soft Validation 후보로 둔다. `rent_sta_id == rtn_sta_id`는 정상적으로 가능한 값이다.
+### Population
 
-## code_group
+| Source | Column |
+| --- | --- |
+| `living_population_grid` | `YMD`, `TT`, `H_DNG_CD`, `CELL_ID`, `SPOP`, 성별·연령별 `M00..M70`, `F00..F70` |
+| `population_realtime` | `AREA_*`, 성별 인구 비율, `FCST_YN`, 1~12번 `FCST_n_TIME`, `CONGEST_LVL`, `PPLTN_MIN`, `PPLTN_MAX` |
 
-| 컬럼 | 중요도 | 결측 | 이상치 기준 | 근거 |
-| --- | --- | --- | --- | --- |
-| code_group_id | 필수 | 값 없음 | `<= 0`, 중복 | 공통 코드 그룹 식별 PK |
-| code_group_nm | 일반 | 값 없음/빈 문자열 | 별도 Hard range 없음 | 사람이 코드를 관리·해석하기 위한 설명값 |
+`living_population_grid`의 `*`는 개인정보 보호 마스킹이며 `masked_float` caster가 `MISSING`으로 처리한다. `population_realtime`의 forecast 번호는 target 시간 순서일 뿐 “n시간 후”를 뜻하지 않으므로 `FCST_n_TIME`을 사용한다.
 
-## code
+### Weather
 
-| 컬럼 | 중요도 | 결측 | 이상치 기준 | 근거 |
-| --- | --- | --- | --- | --- |
-| code_id | 필수 | 값 없음 | `<= 0`, 중복 | 내부에서 코드 Row를 식별하는 인공키 |
-| code_group_id | 필수 | 값 없음 | code_group에 없는 ID | 코드가 속한 그룹 연결 |
-| code_value | 필수 | 값 없음/빈 문자열 | 같은 `(code_group_id, code_value)` 중복 | 원천 코드와 Silver 값을 매핑하는 실제 코드값 |
-| code_nm | 일반 | 값 없음/빈 문자열 | 별도 Hard range 없음 | 사람이 원천 코드를 해석하기 위한 표시명 |
+| Source | Identity·time | 주요 값 |
+| --- | --- | --- |
+| `weather_ultra_short_live` | `nx`, `ny`, `baseDate`, `baseTime` | `T1H`, `REH`, `WSD`, `RN1`, `PTY`, `UUU`, `VVV`, `VEC` |
+| `weather_ultra_short_forecast` | 위 + `fcstDate`, `fcstTime` | `T1H`, `RN1`, `SKY`, `PTY`, `REH`, `WSD`, `LGT`, `POP`, `UUU`, `VVV`, `VEC` |
+| `weather_short_term_forecast` | 위 + `fcstDate`, `fcstTime` | `TMP`, `REH`, `WSD`, `POP`, `PCP`, `SKY`, `PTY`, `UUU`, `VVV`, `VEC`, `WAV`, `SNO` |
 
-`code_id`는 원천 코드값이 아니라 내부 인공키로 사용한다. 원천 코드값은 `code_value`에 저장하며 `(code_group_id, code_value)`는 UNIQUE를 권장한다.
+초단기실황 `RN1`은 숫자 mm이고, 예보의 `RN1`·`PCP`는 “강수없음”, “1mm 미만”, 범위 표현 등이 섞여 있어 `precip` caster로 mm 값으로 정규화한다.
+
+### Event
+
+| Source | Column |
+| --- | --- |
+| `cultural_event` | `TITLE`, `CODENAME`, `GUNAME`, `PLACE`, `STRTDATE`, `END_DATE`, `IS_FREE`, `LOT`, `LAT` |
+| `performance_event` | `SCH_SEQ`, `TITLE`, `SDATE`, `EDATE`, 이용 조건·요금·URL, 등록·수정일, 분류 code와 title |
+
+두 행사 source만 `allow_empty=true`다. 행사가 없는 window는 실패가 아니라 정상 `EMPTY`가 될 수 있다.
+
+## Schema 변경 절차
+
+1. 외부 API raw 응답에서 field와 값 범위를 확인한다.
+2. 해당 source YAML의 `columns`, 정책과 quality 값을 수정한다.
+3. adapter가 구조 변환을 해야 하는 field인지 판단한다.
+4. downstream의 `libs/ml_core/silver_schema.py`, normalizer, loader 사용 여부를 검색한다.
+5. source config·adapter·pipeline 테스트를 실행한다.
+6. 기존 Archive와 schema가 달라지는 경우 재생성 또는 호환 전략을 정한다.
+
+```bash
+uv run --project collector --frozen pytest \
+  collector/tests/test_source_configs.py \
+  collector/tests/test_api_contracts.py \
+  collector/tests/test_pipeline.py \
+  collector/tests/test_source_snapshot_manifest.py \
+  collector/tests/test_compaction.py -q
+```
+
+## 코드 기준 위치
+
+- Source schema: `collector/sources/*.yaml`
+- Config model: `collector/config/schema.py`
+- Validation: `collector/validation/engine.py`, `collector/validation/policies.py`
+- 저장 key와 I/O: `collector/storage.py`
+- 실행 manifest와 source authority: `collector/manifest.py`
+- Archive schema: `collector/compaction.py`

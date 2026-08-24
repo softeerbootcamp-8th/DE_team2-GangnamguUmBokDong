@@ -1,102 +1,207 @@
-# Airflow 데이터 흐름: 외부 API에서 대시보드까지
+# Airflow 운영 구조와 데이터 흐름
 
-`loader/local_e2e.py`가 만드는 로컬 fixture 경로와 운영 DAG 경로는 다르다. 
-운영 경로의 외부 관측값은 Collector가 API에서 받고, 모델 예측·긴급도·재배치 경로만 내부에서 계산한다.
+이 문서는 현재 코드에 구현된 Airflow DAG를 설명한다. 기준 코드는 `airflow/dags/`, `airflow/config/schedules.py`, `airflow/config/sources.py`와 `airflow/orchestration/`이다.
 
-## 1. 전체 흐름
+## 한눈에 보기
 
-| 단계 | 저장 위치 | 데이터가 받는 변화 | 다음 소비자 |
+```text
+외부 API
+  → Collector: Bronze JSON + Silver Parquet + source manifest
+  → Normalizer/Nowcaster: 추론용 파생 Silver
+  → Serving plan: 입력·모델의 URI와 SHA 고정
+  → LightGBM inference: 대여·반납 12시간 예측
+  → Gold PostgreSQL/PostGIS: 동일 기준시각의 projection 원자 게시
+  → 긴급도·재배치 경로
+  → FastAPI → React 대시보드
+```
+
+Airflow는 계산을 직접 구현하지 않는다. `BashOperator`로 각 애플리케이션의 CLI를 실행하고 순서, 재시도, timeout과 성공·실패 상태를 관리한다. 월별 재학습 DAG만 `PythonOperator`로 AWS EC2 제어와 원격 명령 실행을 오케스트레이션한다.
+
+## DAG와 실제 주기
+
+모든 시간은 KST(`Asia/Seoul`) 기준이며 `catchup=False`, `max_active_runs=1`이다.
+
+| DAG | cron | 역할 |
+| --- | --- | --- |
+| `realtime_tick` | 매시 5·15·25·35·45·55분 | 실시간 수집과 serving 체인 실행 |
+| `realtime_tick_ultra_weather` | 매시 10·20·30·40·50분 | 위 체인 + 초단기실황·초단기예보 수집 |
+| `realtime_tick_ultra_weather_on_hour` | 3의 배수가 아닌 시의 정각 | 위 체인 + 초단기실황·초단기예보 수집 |
+| `realtime_tick_full_weather` | 0·3·6·9·12·15·18·21시 정각 | 위 체인 + 초단기실황·초단기예보·단기예보 수집 |
+| `daily_population_and_events` | 매일 03:00 | 생활인구 수집·nowcast와 두 행사 source 게시 |
+| `station_master` | 매일 03:04 | 대여소 마스터 수집 후 공간·격자 정보 보강 |
+| `daily_compaction` | 매일 04:30 | D-6 대여이력 재수집 후 일별 Archive 생성 |
+| `monthly_retrain_rental` | 매월 1일 03:00 | 대여 모델 평가 및 조건부 재학습 |
+| `monthly_retrain_return` | 매월 1일 06:00 | 반납 모델 평가 및 조건부 재학습 |
+
+네 realtime DAG의 실행 시각은 겹치지 않으며 합치면 정확히 5분 간격이다. 별도의 `realtime_5min`, `weather_10min`, `weather_3h` DAG나 날씨 대기 sensor는 현재 없다.
+
+`station_master`의 03:04는 03:00 realtime 실행 중 source authority가 바뀌어 Gold finalize가 중단되는 것을 피하기 위한 운영값이다. realtime 처리시간이 5분에 가까워지면 이 간격을 다시 검토해야 한다.
+
+## 왜 `realtime_5min`과 날씨 DAG를 통합했는가
+
+### 변경 전 구조
+
+```text
+weather_10min ─┐
+weather_3h ────┴→ S3 weather manifest
+                         ↑ 2초 간격, 최대 30초 폴링
+realtime_5min → wait_for_weather_manifests → prepare → inference → Gold
+```
+
+기존에는 `realtime_5min`과 날씨 수집 DAG가 서로 독립적으로 스케줄되었다. 따라서
+realtime DAG는 같은 시각의 날씨 수집이 끝났는지 Airflow 의존성으로 알 수 없었고,
+`wait_for_weather_manifests` sensor가 S3 manifest를 반복 조회해야 했다.
+
+이 구조에는 다음 문제가 있었다.
+
+- 날씨 완료 관계가 DAG 그래프에 나타나지 않고 S3 상태와 polling에 의존했다.
+- LocalExecutor 병렬 슬롯이 3개인 환경에서 sensor가 대기하는 동안 슬롯 하나를
+  점유했다.
+- 날씨가 필요한 시각은 고정돼 있는데도 모든 5분 tick에서 런타임 확인이 필요했다.
+- 분리 DAG를 유지하면서 realtime DAG에도 날씨 수집을 추가하면 같은 source를 같은
+  시각에 중복 수집할 수 있었다.
+
+### 현재 구조
+
+날씨가 필요한 시각에만 weather collector를 realtime 실행 안에 넣고,
+`weather_ready_gate → prepare_serving_plan`을 명시적인 task dependency로 연결했다.
+
+```text
+필요한 weather collectors ─→ weather_ready_gate ─┐
+bike_station_realtime ────────────────────────────┴→ prepare → inference → Gold
+```
+
+이제 prepare는 별도 DAG의 완료를 추측하거나 manifest를 polling하지 않는다. 같은 DAG
+run의 날씨 태스크가 끝난 직후 실행되므로 의존성과 실행 상태를 Airflow graph에서 바로
+확인할 수 있다. 기존 `weather_10min`과 `weather_3h` DAG는 제거하여 중복 수집도 막았다.
+
+단, 날씨 장애가 전체 serving을 막지는 않는다. `weather_ready_gate`는
+`TriggerRule.ALL_DONE`이므로 새 날씨 수집이 실패해도 성공하고, prepare는 이전의
+유효한 weather snapshot으로 계속 진행할 수 있다. 이는 기존 sensor의 soft-fail
+정책을 유지한 것이다. 각 날씨 collector는 `retries=0`, timeout 60초로 제한하여
+날씨 장애가 realtime 체인을 장시간 붙잡지 않게 했다.
+
+### 왜 하나가 아니라 4개 realtime DAG인가
+
+운영 관점에서는 하나의 공통 realtime 파이프라인이지만, Airflow에는 다음 4개 DAG로
+등록된다. `_build_realtime_tick_dag()`가 동일한 core task를 만들고 cron과 포함할
+날씨 source만 다르게 받는다.
+
+| tick 구간 | 포함할 날씨 | DAG |
+| --- | --- | --- |
+| 10분 경계가 아닌 시각 | 없음 | `realtime_tick` |
+| 매시 10·20·30·40·50분 | 초단기실황·초단기예보 | `realtime_tick_ultra_weather` |
+| 3시간 경계가 아닌 정각 | 초단기실황·초단기예보 | `realtime_tick_ultra_weather_on_hour` |
+| 3시간 경계 정각 | 위 두 source + 단기예보 | `realtime_tick_full_weather` |
+
+분할 기준은 데이터 상태가 아니라 `minute % 10`, `hour % 3`으로 미리 결정되는 발행
+주기다. 이를 cron으로 표현하면 sensor 없이 필요한 task만 생성할 수 있다. 정각의
+“3시간 경계 여부”를 하나의 cron으로 함께 표현하기 어려워 초단기 weather DAG가 두
+종류로 나뉘었다.
+
+### 코드와 검증 근거
+
+- `airflow/dags/realtime_tick.py`: 공통 DAG builder, weather task와 `ALL_DONE` gate의
+  직접 의존성
+- `airflow/config/schedules.py`: 4개 cron과 분할 사유
+- `airflow/tests/test_realtime_tick.py`: 4개 cron이 서로 겹치지 않고, 합집합이 기존
+  `*/5 * * * *`의 모든 tick과 정확히 같은지 검증
+- `airflow/tests/test_dag_imports.py`: 날씨 source가 해당 realtime DAG에만 포함되고
+  prepare의 upstream으로 연결되는지 검증
+
+변경 당시 로컬 Airflow에서도 DAG import 오류가 없고, 초단기 날씨 실행에서 collector
+종료 후 gate가 약 0.04초 만에 통과하는 것을 확인했다. 따라서 이 변경의 핵심은 DAG
+수를 단순히 줄이는 것이 아니라, **외부 상태 polling을 같은 DAG 내부의 명시적
+의존성으로 바꾸고 제한된 worker slot을 돌려주는 것**이다.
+
+## Realtime serving 체인
+
+```text
+bike_station_realtime ────────────────────────┐
+필요 시 weather collectors → ALL_DONE gate ──┤
+                                              ├→ prepare_serving_plan
+bike_rental_history ──────────────────────────┼→ run_inference
+population_realtime → run_normalizer ─────────┘       ↓
+                                          finalize_serving_release
+                                                      ↓
+                                          publish_station_urgency
+                                                      ↓
+                                          publish_rebalance_route
+
+bike_rental_history → 1시간 전 replay  (serving과 독립된 side chain)
+```
+
+| 단계 | 실제 책임 | 실패 시 경계 |
+| --- | --- | --- |
+| Collector | API 응답을 Bronze/Silver로 저장하고 검증된 source manifest 게시 | 필수 실시간 source가 실패하면 downstream 중단 |
+| 날씨 gate | 날씨 태스크의 성공 여부와 무관하게 종료 | 새 날씨가 없으면 prepare가 이전의 유효한 snapshot 사용 가능 |
+| Normalizer | 일별 격자 인구를 실시간 POI 인구로 보정 | 추론 중단 |
+| Serving plan | station, stock, weather, model 입력을 immutable URI+SHA로 고정 | Gold는 변경되지 않음 |
+| Inference | 공통 지원 대여소별 1~12시간 대여·반납량 생성 | 이전 정상 Gold release 유지 |
+| Finalize | station, stock, demand, weather projection을 한 트랜잭션으로 게시 | 입력 drift 또는 불완전 결과면 전체 게시 중단 |
+| Urgency·route | 새 release로 긴급도와 센터별 제안 경로 계산 | serving release는 유지되고 파생 정보만 갱신되지 않음 |
+
+날씨 collector는 재시도 없이 60초 안에 끝내도록 제한한다. 실패해도 `ALL_DONE` gate를 통과시켜 이전의 유효한 날씨로 serving을 계속할 수 있게 한다. 반면 재고, 대여이력과 정규화 인구는 inference의 필수 upstream이다.
+
+## 일·월 단위 체인
+
+### 일별 생활인구와 행사
+
+세 branch는 서로 독립이다.
+
+- `living_population_grid → run_nowcasting`
+- `cultural_event → event:cultural_event Gold 게시`
+- `performance_event → event:performance_event Gold 게시`
+
+### 대여소 마스터
+
+`bike_station_master`를 수집한 뒤 `station_master_enriched`를 만든다. realtime plan과 inference가 이 보강 결과를 필수 입력으로 사용한다.
+
+### 일별 compaction
+
+D-6의 대여이력 24개 시간대를 순차적으로 강제 재조회한다. 각 시간대는 `ALL_DONE`으로 다음 시간대를 계속 시도하며, 마지막에는 성공 여부와 무관하게 대여이력 compaction을 실행한다. 다른 compaction source는 이 replay chain과 독립적으로 실행된다.
+
+### 월별 모델 점검
+
+대여와 반납은 같은 DAG builder를 쓰되 실행 시간을 분리한다.
+
+```text
+EC2 시작 → champion 평가 → 평가 EC2 중지 → 재학습 여부 분기
+                                      ├→ 조건부 재학습 loop
+                                      └→ skip
+                                             ↓
+                                  모든 관련 EC2 중지 보장
+```
+
+재학습은 단일 학습 EC2에서 수행한다. Airflow scheduler 프로세스에서 모델을 직접 학습하지 않는다.
+
+## 데이터 계층과 소비자
+
+| 계층 | 저장소 | 내용 | 주요 소비자 |
 | --- | --- | --- | --- |
-| 외부 원천 | 서울 열린데이터광장, 서울 실시간 도시데이터, 기상청 API Hub | 원천 JSON/XML 응답 | Collector |
-| Bronze | S3/MinIO source-window별 JSON 조각 | 응답을 가능한 한 원형대로 보존한다. 페이지·격자별 조각과 실행 manifest를 함께 기록한다. | Collector 내부 재개·검증 |
-| Silver | S3/MinIO `dt`/`hh` 파티션 Parquet | 타입 변환, 기상 category pivot, 인구 forecast flatten, 결측·범위 검증, 정책에 따른 drop/null 처리 | Normalizer, Nowcaster, 추론, Gold publisher, compaction |
-| Derived Silver/Archive | S3/MinIO Parquet | 생활인구 추정·공간 보정, 일별 중복 제거·압축 | 추론과 향후 모델 학습 |
-| Serving plan·inference authority | S3/MinIO content-addressed manifest/Parquet | 사용할 source snapshot과 모델을 URI+SHA로 고정하고 station별 12개 horizon 대여·반납량을 예측 | Gold finalize |
-| Gold serving | RDS/PostgreSQL(PostGIS) | 검증된 projection을 현재 운영 테이블에 원자적으로 게시 | FastAPI |
-| API | `/status`, `/stations`, `/forecast`, `/weather`, `/alerts`, `/routes` 등 | freshness와 anchor 정합성을 확인한 뒤 화면용 JSON으로 변환 | React 대시보드 |
-| 화면 | 브라우저 메모리 | 지도, 예측 그래프, 긴급도 목록, 경로, 주변 행사로 표시 | 운영자 |
+| Bronze | S3/MinIO JSON | 외부 API 원문에 가까운 page/chunk | 재처리·감사 |
+| Silver | S3/MinIO Parquet | 타입·결측·범위 검증을 통과한 source window | normalizer, inference, loader |
+| Source manifest | S3/MinIO JSON | 선택된 Silver의 URI, SHA, logical time, revision | 모든 downstream |
+| Derived/Archive | S3/MinIO Parquet | 보정 인구, nowcast, 일별 중복 제거 결과 | inference·학습 |
+| Serving plan/output | S3/MinIO JSON·Parquet | 고정 입력 계약과 12시간 예측 | Gold finalize |
+| Gold | PostgreSQL/PostGIS | 현재 station, stock, forecast, weather, event, urgency, route | FastAPI |
 
-`Bronze → Silver`는 모든 Collector source가 공유하는 공통 과정이다. Collector는 fetch가 일부 실패하면 허용 누락률을 검사하고, 검증 실패 행은 제외하거나 quarantine에 남긴다. 품질 게이트를 넘지 못한 window에는 Silver를 쓰지 않는다.
+API와 화면은 S3를 직접 읽지 않는다. Gold의 freshness와 공통 기준시각 검사를 통과한 데이터만 제공하며, stale하거나 서로 다른 release의 projection을 섞지 않는다.
 
-## 2. DAG별 역할과 실행 결과
+## 새 환경의 선행 조건
 
-아래 주기는 `collector/sources/*.yaml`의 설명값이 아니라 **실제로 Airflow가 호출하는 주기**다.
+1. PostgreSQL/PostGIS schema 적용
+2. `dispatch_center`, `weather_grid` 기준정보 bootstrap
+3. 검증된 rental/return model serving release 등록
+4. station master와 생활인구 등 선행 source 생성
+5. realtime DAG 활성화
 
-| DAG | 실제 주기(KST) | 주요 태스크 | 만들어지는 결과 | RDS 직접 변경 |
-| --- | --- | --- | --- | --- |
-| `station_master` | 매일 03:00 | `collect_bike_station_master` | 대여소 ID, 주소, 위경도 Silver/source authority | 아니오. 이후 `realtime_5min` finalize가 `station`에 게시 |
-| `weather_10min` | 10분마다 | 초단기 실황, 초단기예보 수집 | 격자별 실황·예보 Silver/source authority | 아니오. 이후 `realtime_5min` finalize가 예보를 선택·병합해 게시 |
-| `weather_3h` | 3시간마다 정시 | 단기예보 수집 | 격자별 장기 범위 예보 Silver/source authority | 아니오 |
-| `daily_population_and_events` | 매일 03:00 | 생활인구 수집→nowcast, 문화행사 수집→Gold, 체육시설 공연 수집→Gold | 생활인구 archive/nowcast와 `event` | 행사는 예, 생활인구는 아니오 |
-| `realtime_5min` | 5분마다 | 대여이력·실시간 재고·실시간 인구 수집, 인구 보정, plan, 추론, Gold finalize, 긴급도, 경로 | 현재 serving projection 전체 | 예 |
-| `daily_compaction` | 매일 04:30 | D-6 대여이력 24시간 재수집, recovery compaction | 학습·재현용 일별 Archive | 아니오 |
+기준정보와 model release가 없으면 DAG 자체는 로드되더라도 serving plan 또는 downstream publication이 성공할 수 없다.
 
-`daily_compaction`은 실시간 대시보드를 갱신하지 않는다. 대여이력의 장기대여 누락을 보강하고 작은 Silver 파일을 일별 Archive로 만드는 학습·재현 경로다.
+## 운영 확인 위치
 
-## 3. 원천별 데이터 변화
-
-| source ID | 외부 API와 실제 데이터 | Silver에서의 주요 변화 | 운영에서 사용되는 곳 | 최종 화면 |
-| --- | --- | --- | --- | --- |
-| `bike_station_master` | 서울 `bikeStationMaster`; 대여소 원천 ID, 주소, 좌표 | 타입·좌표 검증. 실시간 대여소 정보와 결합해 활성 대여소 projection의 기준이 됨 | Gold `station`; weather grid·dispatch center 연결 | 지도 위치, 대여소명·주소·거치대 수, 지역센터 |
-| `bike_station_realtime` | 서울 `bikeList`; 현재 자전거 수, 거치대 수, 대여소명·좌표 | `stationId` 기준 중복·범위 검증. logical window를 재고 기준 시각으로 사용 | Gold `station_stock`; 최근 5개 source window는 긴급도 변화량 계산에 사용 | 지도 자전거 수, 현재 재고, 예측 재고 시작값, 우선순위 |
-| `bike_rental_history` | 서울 `tbCycleRentData`; 대여·반납 완료 이력 | 한 시간 누적 응답을 Parquet으로 저장. 1시간 후 replay와 D-6 전체 replay로 늦은 반납을 보강하고 compaction 시 중복 제거 | 모델의 rolling 대여·반납 feature | 직접 표시되지 않고 대여·반납 예측값에 반영 |
-| `population_realtime` | 서울 실시간 도시데이터 `citydata_ppltn`; 121개 POI 현재 인구와 향후 예측 범위 | 중첩 forecast를 `FCST_n_*`으로 펼침. Normalizer가 POI 인구를 250m 격자에 공간 배분 | 추론의 현재·미래 생활인구 feature | 직접 표시되지 않고 수요 예측에 반영 |
-| `living_population_grid` | 서울 `Se250MSpopLocalResd`; 250m 격자·시간·연령별 생활인구 | `*` 마스킹을 결측으로 처리. Nowcaster가 실측을 실제 `YMD` 날짜 archive로 옮기고 과거 동일 요일/휴일로 D-3~D+3을 추정 | Normalizer의 격자 baseline | 직접 표시되지 않고 수요 예측에 반영 |
-| `weather_ultra_short_live` | 기상청 `getUltraSrtNcst`; 격자별 온도·습도·강수·바람 실황 | category를 한 행으로 pivot하고 숫자·코드 검증 | 추론의 현재 날씨 feature, 일별 Archive | 현재 상태 자체는 직접 노출하지 않으며 예측에 반영 |
-| `weather_ultra_short_forecast` | 기상청 `getUltraSrtFcst`; 가까운 미래 예보 | category pivot, 강수 범주를 mm 값으로 변환, 예보시각 정규화 | 가까운 시간대 Gold 날씨와 추론 feature | 대여소 상세의 향후 날씨 |
-| `weather_short_term_forecast` | 기상청 `getVilageFcst`; 단기예보 | category pivot, 강수·하늘 코드를 공통 의미로 변환 | 초단기예보가 덮지 못하는 시간대의 Gold 날씨와 추론 feature | 대여소 상세의 향후 날씨 |
-| `cultural_event` | 서울 `culturalEventInfo`; 문화행사 장소·기간·좌표 | 날짜·좌표 검증 후 source-scoped Gold publication | Gold `event` | 선택 대여소 반경 1.5km 주변 행사 |
-| `performance_event` | 서울 `stadiumScheduleInfo`; 체육시설 행사 일정 | 저장소의 경기장 좌표와 결합해 공간 정보 생성 후 게시 | Gold `event` | 선택 대여소 주변 행사 |
-
-## 4. `realtime_5min` 내부 변환 순서
-
-| 순서 | 태스크 | 읽는 데이터 | 만드는 데이터·변환 | 실패 시 영향 |
-| --- | --- | --- | --- | --- |
-| 1 | `collect_bike_rental_history` | 해당 시각이 속한 시간대의 대여 완료 이력 API | Bronze/Silver와 source manifest | 추론이 실행되지 않음. 과거 replay side chain은 별도 시도 가능 |
-| 1 | `collect_bike_station_realtime` | 현재 대여소 재고 API | 현재 tick의 authoritative 재고 snapshot | serving plan이 만들어지지 않음 |
-| 1 | `collect_population_realtime` | 121개 POI 실시간 인구 API | 현재·향후 POI 인구 Silver | Normalizer와 추론이 실행되지 않음 |
-| 2 | `run_normalizer` | 생활인구 nowcast baseline + 실시간 POI 인구 | 현재와 향후 최대 12시간의 보정된 격자 인구 Parquet | 추론이 실행되지 않음 |
-| 2 | `prepare_serving_plan` | 현재 model release, station master, 현재 재고, 단기·초단기 날씨, 기존 Gold state | 사용할 source/model/대상 station을 immutable URI+SHA로 고정. `station`, `station_stock`, `weather_forecast` 후보도 준비 | 이후 태스크가 실행되지 않음. 준비 후 날씨 correction이 바뀌면 현재 구현의 finalize가 stale로 실패할 수 있음 |
-| 3 | `run_inference` | plan에 고정된 모델, station profile, 대여이력, 보정 인구, 날씨 | 공통 지원 station마다 12 horizon의 `rental_pred_mean`, `return_pred_mean` 생성 | Gold는 이전 정상 projection을 유지 |
-| 4 | `finalize_serving_release` | plan과 inference manifest의 exact URI+SHA | `station`, `station_stock`, `station_demand_forecast`, `weather_forecast`를 같은 release로 검증·원자 게시 | 네 projection 모두 새 tick으로 전환되지 않음 |
-| 5 | `publish_station_urgency` | 새 station/stock/demand exact ref + 과거 재고 source window 5개 | 예측 재고, 부족·과잉 여부, 임계까지 남은 시간, 0~100 긴급도 계산 후 `station_urgency` 게시 | 우선순위와 새 route가 갱신되지 않음. 정확한 과거 window가 없으면 실패 |
-| 6 | `publish_rebalance_route` | urgency exact ref + 배차센터·대여소 위치 + 진행 중 배차 상태 | 센터별 공급·회수 station을 묶고 방문 순서와 이동 수량을 계산해 proposed route 게시 | 이전 route 상태는 남고 새 proposed route가 생기지 않음 |
-| side | `collect_bike_rental_history_replay_1h` | 한 시간 전 API를 `--force` 재조회 | 늦게 반납된 대여 기록으로 과거 Silver 보강 | 현재 tick serving chain을 막지 않음 |
-
-여기서 **실제 관측값**은 API에서 온 대여소·재고·이력·인구·날씨·행사다. **내부 생성값**은 nowcast 생활인구, 공간 보정 인구, 대여·반납 예측, 예측 재고, 긴급도와 재배치 경로다. 운영 DAG는 `local_e2e.py`의 `capacity // 2`, 20°C, 인구 1000 같은 fixture를 만들지 않는다.
-
-## 5. Gold/RDS에서 API와 화면으로
-
-| Gold/RDS 테이블 | API endpoint | API가 추가로 확인·계산하는 것 | 대시보드 사용처 |
-| --- | --- | --- | --- |
-| `station` + `station_stock` + `dispatch_center` | `GET /stations` | 활성 station, station의 `last_seen_dttm`과 같은 재고, 10분 freshness, `현재 자전거/거치대` 비율 | 지도 마커·지역 필터·대여소 선택 |
-| 위와 동일 | `GET /stations/{sta_id}` | station 존재·활성·fresh stock | 대여소명, 주소, 현재 자전거 수, 갱신 시각 |
-| `station_demand_forecast` | `GET /status` | 전체 행이 하나의 공통 base인지, base가 10분 이내인지 | 헤더의 `예측 시각` |
-| `station_demand_forecast` + `station_stock` | `GET /stations/{sta_id}/forecast` | station별 정확히 12시간, 공통 base, 미래 target, 같은 base의 fresh stock을 확인하고 누적 대여·반납으로 예측 재고 계산 | 대여·반납 예측 그래프, 재고 예측 그래프 |
-| `weather_forecast` + `station.weather_grid_id` | `GET /stations/{sta_id}/weather` | 다음 정시부터 정확히 12행인지, 각 행의 발표 시각(`base_dttm`)이 제품별 freshness(초단기 2시간, 단기 4시간) 안인지 확인 | 대여소 상세의 주변 날씨 |
-| `event` + `station` PostGIS geometry | `GET /stations/{sta_id}/events` | 반경 1.5km, 종료되지 않은 행사, 36시간 freshness, 거리 계산 | 주변 행사 탭과 지도 포커스 |
-| `station_urgency` + station/stock/center | `GET /alerts` | urgency와 stock anchor 일치, 10분 freshness, 최신 correction 순서 확인 | 작업 우선순위 목록과 부족/회수 지도 필터 |
-| `rebalance_route` + `rebalance_route_stop` | `GET /routes` | 센터·상태별 필터와 stop 집계 | 재배치 작업 경로 |
-| `dispatch_center` | `GET /regions` | 활성 센터 좌표 | 지역센터 필터와 지도 기준점 |
-
-## 6. 실패·freshness와 대시보드 동작
-
-| 상황 | 저장소/RDS 상태 | API 응답 | 현재 화면 동작 |
-| --- | --- | --- | --- |
-| Collector가 실패 | 해당 source의 새 Silver authority 없음 | 이전 Gold가 freshness 안이면 계속 조회 가능 | 잠시 이전 값이 보일 수 있음 |
-| inference 또는 finalize 실패 | 새 Gold release는 게시되지 않고 이전 정상 release가 남음 | 이전 demand/stock base가 10분을 넘으면 `/status`·`/forecast`는 503 또는 조회 불가 | `예측 시각 갱신 실패`; 프론트는 이전 예측을 지움 |
-| urgency 실패 | 이전 urgency가 남음 | anchor/freshness 조건을 만족하지 않으면 `/alerts`가 빈 목록 | 작업 우선순위가 비거나 갱신 실패 표시 |
-| station polling/API 자체 실패 | 브라우저에는 이전 station 상태가 있었음 | 네트워크/서버 오류 | 현재 프론트는 station·선택·예측·상세를 모두 지움 |
-| 날씨 발표가 제품별 허용 age(초단기 2시간, 단기 4시간)보다 오래됨 | 이전 weather projection은 RDS에 남음 | `/weather`가 503 `weather_not_ready` | 날씨 패널이 갱신 중 상태로 바뀜 |
-
-현재 화면은 오래된 운영 판단을 막기 위해 fail-closed로 동작한다. 즉 RDS의 마지막 정상 데이터가 물리적으로 삭제된 것은 아니어도, freshness를 넘으면 API가 제공하지 않고 프론트도 이전 성공값을 유지하지 않는다.
-
-## 7. DAG 밖에서 먼저 필요한 기준정보
-
-| 기준정보 | 생성 방법 | 사용처 | 주의점 |
-| --- | --- | --- | --- |
-| `dispatch_center` | 승인된 `docs/gold/dispatch-center-seed.yaml`을 `gold_cli.py`로 일회성 bootstrap | station의 담당 지역, alerts·route 지역 구분 | `make up`만으로 외부 RDS에 자동 게시되지 않음 |
-| `weather_grid` | 승인된 `docs/gold/weather-grid-seed.yaml`을 `gold_cli.py`로 일회성 bootstrap | station 좌표와 기상청 `(nx, ny)` 연결 | AWS에서는 seed version/effective time을 명시적으로 고정해야 함 |
-| model serving release | 학습·승격 파이프라인 또는 검증된 기존 bundle 등록 | `prepare_serving_plan`, inference | rental/return 모델, station support, feature contract가 함께 고정되어야 함 |
-
-따라서 새 환경의 최소 순서는 `DB schema → dispatch center/weather grid bootstrap → model serving release 등록 → station/weather/population 선행 수집 → realtime_5min`이다. 선행 DAG가 source authority를 만들고, `realtime_5min`이 그것을 Gold serving projection으로 전환한다.
+- 스케줄·timeout: `airflow/config/schedules.py`
+- source 그룹: `airflow/config/sources.py`
+- 태스크 명령: `airflow/orchestration/`
+- 자원 manifest: `airflow/resource-profiles/<dag_id>/<run_id>/<task_id>/...json`
+- DAG 구조 회귀 테스트: `airflow/tests/`

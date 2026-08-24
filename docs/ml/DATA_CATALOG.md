@@ -1,18 +1,75 @@
-# 데이터 카탈로그
+# ML 데이터 카탈로그
 
-`ml/data/`에 있는 모든 원본·중간·참고 데이터를 소스별로 상세히 정리한 문서.
-"이 데이터가 뭐고, 얼마나 있고, 어떤 주기·속성을 가지는지"에 집중한다. 이
-데이터들을 어떻게 가공해서 모델에 넣었는지는 [feature_engine/DESIGN.md](feature_engine/DESIGN.md)/
-[training/DESIGN.md](training/DESIGN.md), 왜 그렇게 했는지는
-[history.md](history.md)를 참고.
+> **현재 runtime + 보관 inventory:** 먼저 현재 학습·추론이 읽는 S3 계약을 설명하고,
+> 이후 절에는 초기 모델 개발 때 조사한 `ml/data/` 로컬 자산의 규모와 품질 기록을
+> 보존한다. 코드 확인일: 2026-08-24.
 
-> 아래 `data/...` 경로와 용량은 과거 로컬 원본/분석 자산의 inventory다. 현재
-> feature_engine은 이 파일을 직접 읽지 않고, bootstrap/collector가 일별 S3
-> Archive에 적재한 historical fact를 읽는다(최신 station dimension만 Silver).
-> 표의 “사용”은 해당 원천의 정보가 현행 학습에 들어간다는 뜻이지 로컬 경로를
-> runtime에서 읽는다는 뜻이 아니다.
+## 현재 runtime 데이터 지도
 
-## 0. 전체 데이터 지도
+**학습은 확정된 일별 Archive fact를 읽고, 추론은 최신 Silver snapshot을 읽는다.**
+
+로컬 `ml/data/` 파일은 현행 feature pipeline의 입력이 아니다. Collector bootstrap과
+compaction, Nowcaster, Normalizer가 만든 S3 객체가 authority이며 schema·key 규칙은
+`libs/ml_core/silver_schema.py`, 경로 공식은 `libs/ml_core/paths.py`가 공유한다.
+
+### 학습 입력
+
+| 데이터 | 현재 S3 입력 | 역할 |
+| --- | --- | --- |
+| Station dimension | `silver/station_master_enriched/dt=.../hh=.../HHMM.parquet` 중 최신 snapshot | `station_id↔station_no`, 좌표, capacity, 인구·기상 grid |
+| 대여·반납 이력 | `archive/bike_rental_history/dt=YYYY-MM-DD.parquet` | Station×시간 target과 lag |
+| Station 재고 | `archive/bike_station_realtime/dt=YYYY-MM-DD.parquet` | Stock·품절 feature |
+| 날씨 관측 | `archive/weather_ultra_short_live/dt=YYYY-MM-DD.parquet` | 기온·강수·습도·풍속 |
+| 생활인구 | `archive/living_population_grid/dt=YYYY-MM-DD.parquet` | `CELL_ID`별 실측 생활인구 |
+
+Historical fact는 요청 범위에 필요한 일별 partition 하나라도 없으면 Silver로 fallback하지
+않고 실패한다. Station master만 current dimension이므로 최신 enriched Silver를 사용한다.
+
+### 실시간 추론 입력
+
+| 데이터 | Silver source | 기본 탐색 |
+| --- | --- | --- |
+| Station dimension | `station_master_enriched` | 최신 snapshot |
+| 대여·반납 이벤트 | `bike_rental_history` | 5분 tick lookback |
+| Station 재고 | `bike_station_realtime` | 5분 tick lookback |
+| 날씨 관측 | `weather_ultra_short_live` | 최대 3시간, 5분 key 탐색 |
+| 날씨 예보 | `weather_short_term_forecast` | 발표시각 lookback 후 target 선택 |
+| 생활인구 | `living_population_normalized` | 현재·미래 target의 5분 key |
+
+`living_population_normalized`는 Normalizer가 nowcast baseline을 POI 실시간·예측 인구로
+보정한 서빙 전용 데이터다. 학습은 사후 보정된 값을 정답 시점에 소급 사용하지 않고
+`archive/living_population_grid` 실측을 사용한다.
+
+### Feature mart와 모델 artifact
+
+Feature Engine은 source를 `processed_v2/` 중간 table로 재구성한 뒤 parameter combination별
+`processed/features/<feature-param-combo>/` 아래에 multi-horizon rental·return table을
+작성한다. 정확한 prefix는 `libs/ml_core/paths.py`가 계산하며 training과 inference도 같은
+공식을 사용한다.
+
+모델이 읽는 feature 목록의 SSOT는 다음 두 곳이다.
+
+- 공통 feature: `libs/ml_core/common_config.py::BASE_FEATURE_COLUMNS`
+- 모델별 feature: `libs/ml_core/model_contract.py::RENTAL_FEATURE_COLUMNS`,
+  `RETURN_FEATURE_COLUMNS`
+
+학습된 모델·profile은 immutable `models/archive/...` 아래에 보관되고, rental·return pair와
+station profile/crosswalk를 묶은 serving release manifest를 pointer-last 방식으로 승격한다.
+
+현재 처리 방식은 [Feature Engine README](../../ml/feature_engine/README.md)와
+[Training README](../../ml/training/README.md), 결정 배경은 [history.md](history.md)를
+참고한다.
+
+---
+
+## 과거 로컬 데이터 inventory
+
+아래 `data/...` 경로, 기간, 용량과 통계는 초기 모델 개발 당시 로컬 자산 조사 기록이다.
+표의 “사용”은 해당 원천 정보가 모델 설계에 채택됐다는 뜻이며, 현재 runtime이 이 로컬
+경로를 직접 읽는다는 뜻이 아니다. 최신 S3 객체의 현재 행 수를 주장하는 자료로도
+사용하지 않는다.
+
+### 전체 데이터 지도
 
 | 소스 | 위치 | 기간 | 파이프라인 사용 여부 |
 |---|---|---|---|
@@ -33,7 +90,7 @@
 
 ---
 
-## 1. 파이프라인에서 실제 사용한 데이터
+## 1. 당시 모델 개발에 사용한 로컬 데이터
 
 ### 1.1 대여이력 (트립 단위 이벤트 데이터)
 
@@ -48,7 +105,7 @@
 | **Parquet (파이프라인이 실제로 쓰는 버전)** | `data/parquet/*.parquet` | — | 9컬럼, **`대여소ID` 없이 `start_st`/`end_st`(5자리 대여소번호)만** — utf8_trips와 컬럼 구성이 다름 |
 
 **기간**: 2024-01-01 ~ 2026-06-30 (30개월). **학습에는 이 중 2025년 12개월만
-사용**했다 (다른 소스가 2025년만 커버하기 때문, [feature_engine/DESIGN.md](feature_engine/DESIGN.md) 0.2절).
+사용**했다 (다른 소스가 2025년만 커버했기 때문).
 
 **규모**: 전체 30개월 **99,736,535건**. 2025년 한 해만 37,372,654건
 (기존 EDA `analysis_summary.json`의 `trips_2025`와 정확히 일치, 교차 검증됨).
@@ -143,7 +200,7 @@ end_st, end_st_nm, duration_min, distance_m` (9컬럼)
 **`거치대수량` 통계** (2025-06 샘플, n=2,000,111): 평균 11.76, 중앙값 8,
 최댓값 **212**(!) — `station_master.capacity`의 중앙값(10)을 훨씬 초과하는
 overflow가 실제로 관측됨. 반납이 거치대 상태와 무관하게 항상 성공하기 때문
-(버그 아님, [feature_engine/DESIGN.md](feature_engine/DESIGN.md) 0.4절).
+(버그가 아닌 실제 재고 특성이다).
 
 **품질 이슈**: 컬럼명이 `거치대수량`이라 capacity처럼 보이지만, 실제로는
 **그 시각 실제 주차된 자전거 수**(시간별 변동값)다.
@@ -175,7 +232,7 @@ overflow가 실제로 관측됨. 반납이 거치대 상태와 무관하게 항�
 **같이 있지만 미사용**: `data/raw_forecast/OBS_ASOS_TIM_*.csv` — 폴더명은
 "forecast"지만 내용은 위 관측 파일과 **행 수(8,762)·값이 완전히 동일한
 중복본**이다. 실제 예보 데이터가 아니므로 사용하지 않음
-([feature_engine/DESIGN.md](feature_engine/DESIGN.md) 0.1절).
+([Feature Engine README](../../ml/feature_engine/README.md) 참고).
 
 ### 1.5 생활인구 250m 격자 (KT + 서울시)
 
@@ -212,7 +269,7 @@ overflow가 실제로 관측됨. 반납이 거치대 상태와 무관하게 항�
   몽골 등 18개국 + 기타) 컬럼
 
 **격자 ID 규칙**: `다사52255325` 형태, 행정안전부 국가지점번호 체계와 동일 —
-좌표 역산 공식은 [feature_engine/DESIGN.md](feature_engine/DESIGN.md) 0.3절,
+좌표 역산 공식은 Normalizer의 `grid.py`,
 `grid.py`(옛 pandas 1차정제 코드 — 지금은 삭제됨) 참고.
 
 **마스킹 규칙**: 집계값이 **3 이하면 K-익명성 처리로 `"*"`** — KT 자체 EDA
@@ -247,7 +304,7 @@ EDA**의 요약 결과. 파이프라인은 이 중 **`holidays_2025`(공휴일 1
 (`stratified_resid`), 강수 dose-response, 온도 구간별 반응, 자치구 단위 상관
 등 훨씬 많은 분석 결과가 담겨 있으며 (`trips_2025: 37,372,654`가 우리 파이프라인
 집계와 정확히 일치해 같은 원본 데이터임을 교차 검증하는 데도 썼다,
-[feature_engine/DESIGN.md](feature_engine/DESIGN.md) 0.5절) 이번 모델링에는 공휴일 목록 외엔 직접
+[Feature Engine README](../../ml/feature_engine/README.md)) 이번 모델링에는 공휴일 목록 외엔 직접
 활용하지 않았다.
 
 ---
@@ -258,7 +315,7 @@ EDA**의 요약 결과. 파이프라인은 이 중 **`holidays_2025`(공휴일 1
 
 원래 이 값을 쓰려고 했으나(정류소↔행정동 매핑 테이블이 없어서 어려움을 겪음),
 사용자가 250m 격자 원본을 제공하면서 대체됨
-([feature_engine/DESIGN.md](feature_engine/DESIGN.md) 0.2절).
+([Feature Engine README](../../ml/feature_engine/README.md) 참고).
 
 - **기간**: 2025-01~2026-06 (18개월, 250m보다 범위가 넓음 — 나중에 학습 기간을
   확장하게 되면 이 데이터가 다시 후보가 될 수 있음)
@@ -351,7 +408,7 @@ center_lat` 5컬럼, 34행뿐 — **격자가 자치구(區) 단위로만 뭉쳐
 1개가 아니라 **대여/반납 각각의 multi-horizon 테이블 2개**다
 (`feature_engine/README.md`의 "산출물" 절 참고) — horizon 1~12를 self-join으로
 펼치므로 기본 20분 anchor에서도 2025년 전체 기준 각각 약 8억 행까지
-커진다(실측, `training/DESIGN.md` §9). g5/r5/a5는 이보다 더 크고,
+커진다(당시 실측). g5/r5/a5는 이보다 더 크고,
 g5/r5/a20은 5분 base 산출물을 만들되 multi-horizon 학습 행은 20분으로
 제한한다. 정확한 현재 규모는 이 표를 갱신하는 대신 실제 파이프라인을 돌려
 `.count()`로 확인하거나, 학습 시 MLflow에 로깅되는 `train_rows`/`valid_rows`/

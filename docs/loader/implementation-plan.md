@@ -1,161 +1,205 @@
-# Gold DB 데이터 적재 파이프라인 설계 및 DDL 스펙
+# Loader와 Gold publication 구조
 
-이 문서는 S3(또는 Collector)에서 수집되는 날씨와 행사 데이터를 Gold DB에 어떻게 정제하여 적재할 것인지에 대한 설계안입니다.
-기존 스키마(`stations`, `station_stock`)와 새롭게 추가될 스키마의 전체 DDL 및 **Silver Parquet 컬럼 매핑 규칙**을 명세합니다.
+> **현재 구현:** `loader/gold/`, `gold_cli.py`, `serving_cli.py`와 Airflow
+> `realtime_tick`이 사용하는 적재 경로를 설명한다. 코드 확인일: 2026-08-24.
 
----
+## 역할
 
-## 1. 기존 데이터 적재 스펙 및 DDL
+**Loader는 행별 upsert 도구가 아니라, 검증된 immutable 입력을 Gold serving projection으로
+원자 게시하는 publisher다.**
 
-### 1-1. `stations` (대여소 마스터 정보)
-- **S3 Silver Parquet 추출 출처**: `bike_station_realtime`
-- **컬럼 매핑 (Silver -> Gold)**:
-  - `stationId` (string) -> `sta_id` (대여소 ID, integer 변환)
-  - `stationName` (string) -> `sta_nm` (대여소명)
-  - `stationName` 파싱 등 -> `gu` (자치구명, 파싱 혹은 별도 매핑)
-  - `stationName` 파싱 등 -> `sta_addr` (상세주소, 파싱 혹은 별도 매핑)
-  - `stationLatitude` (double), `stationLongitude` (double) -> `lat`, `lon` (위경도)
-  - `rackTotCnt` (int64) -> `hold_cnt` (총 거치대 수)
+원천 snapshot, serving plan, inference 결과와 선행 publication manifest를 URI·SHA-256으로
+고정하고 다음을 한 transaction에서 처리한다.
 
-### 1-2. `station_stock` (실시간 재고 이력)
-- **S3 Silver Parquet 추출 출처**: `bike_station_realtime`
-- **컬럼 매핑 (Silver -> Gold)**:
-  - `stationId` (string) -> `sta_id` (대여소 ID, integer 변환)
-  - 파티션 시간(`dt`, `hh`) 또는 수집 시간 -> `observed_at` (관측 시간)
-  - `parkingBikeTotCnt` (int64) -> `parking_bike_tot_cnt` (거치 대수)
+1. 입력 artifact와 dependency 재검증
+2. Publication key별 advisory lock 획득
+3. Staging 결과 검증
+4. Gold target projection 변경
+5. `gold_meta.publication_state` 전진
+6. Commit 뒤 immutable publication manifest 공개
 
-#### 기존 DDL
-```sql
-CREATE TABLE IF NOT EXISTS stations (
-    sta_id      INTEGER PRIMARY KEY,
-    sta_nm      TEXT NOT NULL,
-    gu          TEXT NOT NULL,
-    sta_addr    TEXT NOT NULL,
-    lat         DOUBLE PRECISION NOT NULL,
-    lon         DOUBLE PRECISION NOT NULL,
-    hold_cnt    INTEGER NOT NULL
-);
+Canonical byte와 manifest 규칙은
+[Gold publication contract](../gold/publication-contract-v1.md), 물리 테이블은
+[target-schema.sql](../gold/target-schema.sql)을 기준으로 한다.
 
--- 대여소별 재고 관측 이력. 수집 파이프라인이 매 주기마다 새 행을 추가한다.
-CREATE TABLE IF NOT EXISTS station_stock (
-    sta_id                  INTEGER NOT NULL REFERENCES stations (sta_id),
-    observed_at             TIMESTAMPTZ NOT NULL,
-    parking_bike_tot_cnt    INTEGER NOT NULL,
-    PRIMARY KEY (sta_id, observed_at)
-);
+## 현재 진입점
+
+| 진입점 | 용도 | 현재 상태 |
+| --- | --- | --- |
+| `gold_cli.py` | Seed와 독립 event source publication | 운영 경로 |
+| `serving_cli.py` | Realtime serving chain의 prepare/finalize/urgency/route | 운영 경로 |
+| `local_e2e.py` | Local fixture 기반 smoke·검증 | 개발 전용 |
+| `main.py`, `tables.yaml`, `transform.py` | 과거 table별 Silver→DB upsert | Legacy 호환 경로, 현재 Airflow Gold publication에서 미사용 |
+
+과거 문서의 `stations`, `weather_current`, `cultural_events`, `forecast_points` DDL은 현행
+Gold schema가 아니다. 현재 target은 단수형 `station`, 통합 `event`, resolver 결과인
+`weather_forecast`, `station_demand_forecast`를 사용하며 `weather_current`는 Gold에 두지
+않는다.
+
+## Publication 흐름
+
+### Seed와 event
+
+`gold_cli.py`가 지원하는 publication은 다음 네 개다.
+
+| CLI 값 | publication key | 입력 |
+| --- | --- | --- |
+| `seed:dispatch_center` | `dispatch_center` | `docs/gold/dispatch-center-seed.yaml` |
+| `seed:weather_grid` | `weather_grid` | 단기·초단기 forecast source YAML의 동일한 34개 grid |
+| `event:cultural_event` | `event:cultural_event` | Exact cultural source snapshot |
+| `event:performance_event` | `event:performance_event` | Exact performance snapshot와 stadium coordinate asset |
+
+`station-master-correction`, `station-release`, `weather-forecast` 값은 parser 호환을 위해
+남아 있지만 실행 시 실패한다. 이 standalone authority는 retired됐으며 coordinated serving
+chain을 사용해야 한다.
+
+### Realtime serving chain
+
+```text
+bike/weather source publication
+        │
+        ▼
+serving_cli.py prepare ──→ immutable serving plan
+        │
+        ▼
+ML inference ────────────→ immutable inference manifest
+        │
+        ▼
+serving_cli.py finalize
+        ├── station
+        ├── station_stock
+        ├── station_demand_forecast
+        └── weather_forecast
+                │
+                ▼
+serving_cli.py urgency ──→ station_urgency
+                │
+                ▼
+serving_cli.py route ────→ rebalance_route + stop
 ```
 
----
+Airflow `realtime_tick`은 이 순서를 task dependency로 강제한다. 각 task는 이전 task의
+XCom에서 전체 payload가 아닌 manifest `uri`와 `byte_sha256`만 전달받는다.
 
-## 2. 신규 데이터 적재 스펙 (UI 상세정보용)
+## 단계별 책임
 
-### 2-1. `weather_current` (초단기 실황 날씨)
-- **S3 Silver Parquet 추출 출처**: `weather_ultra_short_live`
-- **컬럼 매핑 (Silver -> Gold)**:
-  - `nx`, `ny` (int) -> `nx`, `ny` (조인 키, 그대로 유지)
-  - 격자 좌표 -> `gu` (표시용 파생 컬럼, `grid_to_gu`로 계산. PK 아님)
-  - 파티션 시간(`dt`, `hh`) 또는 데이터 내부 시간 -> `observed_at` (TIMESTAMPTZ)
-  - `T1H` (double) -> `temperature`
-  - `REH` (double) -> `humidity`
-  - `WSD` (double) -> `wind_speed`
-  - `RN1` (double) -> `rainfall`
-  - `PTY` (int64) -> `pty_type`
-- **처리 로직**: 이상치 정제 후 `(nx, ny)`를 기준으로 최신 실황만 Upsert. `gu`는 구 경계 왜곡을 피하기 위해 조인 키로 쓰지 않는다(자세한 배경은 `docs/superpowers/specs/2026-08-19-weather-grid-matching-design.md` 참고).
+### 1. Prepare
 
-### 2-2. `weather_forecast` (단기 예보 날씨)
-- **S3 Silver Parquet 추출 출처**: `weather_short_term_forecast`(3시간)와 `weather_ultra_short_forecast`(30분)가 같은 물리 테이블을 공유한다.
-- **컬럼 매핑 (Silver -> Gold)**:
-  - `nx`, `ny` (int) -> `nx`, `ny` (조인 키)
-  - 격자 좌표 -> `gu` (표시용 파생 컬럼, PK 아님)
-  - 예보 대상 시간 데이터 -> `forecast_dttm` (TIMESTAMPTZ)
-  - `TMP`/`T1H` (double) -> `temperature`
-  - `POP` (double) -> `precip_prob`
-  - `PCP`/`RN1` -> `precip_amount`
-  - `SKY` (int64) -> `sky_cond`
-  - `PTY` (int64) -> `pty_type`
-  - `REH` (double) -> `humidity`
-  - `WSD` (double) -> `wind_speed`
-  - 발표 시각 -> `base_dttm` (TIMESTAMPTZ)
-- **처리 로직**: 동일한 `(nx, ny, forecast_dttm)`에 대해 가장 최근에 발표된(`base_dttm`이 가장 큰) 예보로 Upsert.
+`serving_cli.py prepare --logical-dttm ...`는 다음 입력을 고정한 immutable serving plan을
+만든다.
 
-### 2-3. `cultural_events` (문화/공연 행사)
-- **S3 Silver Parquet 추출 출처**: `cultural_event`
-- **컬럼 매핑 (Silver -> Gold)**:
-  - 해시값 생성(`TITLE`+`PLACE`) -> `event_id` (PK)
-  - `TITLE` (string) -> `title`
-  - `CODENAME` (string) -> `category`
-  - `GUNAME` (string) -> `gu`
-  - `PLACE` (string) -> `place`
-  - `STRTDATE` (string) -> `start_date` (DATE로 캐스팅)
-  - `END_DATE` (string) -> `end_date` (DATE로 캐스팅)
-  - `IS_FREE` (string) -> `is_free`
-  - `LAT` (double) -> `lat`
-  - `LOT` (double) -> `lon`
-- **처리 로직**: 날짜 포맷 파싱 및 변환 후, 종료일(`END_DATE`)이 지나지 않은 현재/예정 행사만 Upsert.
+- Exact realtime station snapshot
+- Lookback 안의 최신 station master
+- 최신 단기·초단기 forecast snapshot
+- 현재 rental/return model pair와 support ID set
+- 최신 enriched station master에서 계산한 inference 가능 station ID
+- 선택적 relocation approval URI·SHA 쌍
+- 기존 Gold station state와 realtime window set
 
-#### 신규 추가 DDL
-```sql
--- 대여소의 실제 최근접 기상 격자. weather_current/weather_forecast와 (nx, ny)로
--- 직접 조인하기 위한 컬럼이다(gu 기준 조인은 구 경계 왜곡이 커서 쓰지 않는다).
-ALTER TABLE stations ADD COLUMN IF NOT EXISTS grid_nx INTEGER;
-ALTER TABLE stations ADD COLUMN IF NOT EXISTS grid_ny INTEGER;
+Master/realtime lookback은 각각 `GOLD_STATION_MASTER_LOOKBACK_HOURS`,
+`GOLD_STATION_REALTIME_LOOKBACK_HOURS`의 양의 정수 시간으로 받는다.
 
--- 기상청 초단기 실황 (현재 날씨). 격자별 최신 데이터 1건 유지(upsert).
--- gu는 표시용 파생 컬럼이며 PK가 아니다(같은 gu에 여러 격자가 걸칠 수 있다).
-CREATE TABLE IF NOT EXISTS weather_current (
-    nx              INTEGER NOT NULL,
-    ny              INTEGER NOT NULL,
-    gu              TEXT NOT NULL,
-    observed_at     TIMESTAMPTZ NOT NULL,
-    temperature     DOUBLE PRECISION,
-    humidity        DOUBLE PRECISION,
-    wind_speed      DOUBLE PRECISION,
-    rainfall        DOUBLE PRECISION,
-    pty_type        INTEGER,
-    PRIMARY KEY (nx, ny)
-);
+### 2. Finalize
 
--- 기상청 단기 예보 (미래 날씨). 동일 (nx, ny, forecast_dttm)에 대해 가장 최근
--- 발표된 예보 하나만 남는다(upsert, guard_col: base_dttm).
-CREATE TABLE IF NOT EXISTS weather_forecast (
-    nx                   INTEGER NOT NULL,
-    ny                   INTEGER NOT NULL,
-    gu                   TEXT NOT NULL,
-    forecast_dttm        TIMESTAMPTZ NOT NULL,
-    sky_cond             INTEGER,
-    pty_type             INTEGER,
-    temperature          DOUBLE PRECISION,
-    precip_prob          DOUBLE PRECISION,
-    precip_amount        DOUBLE PRECISION,
-    humidity             DOUBLE PRECISION,
-    wind_speed           DOUBLE PRECISION,
-    base_dttm            TIMESTAMPTZ NOT NULL,
-    updated_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
-    PRIMARY KEY (nx, ny, forecast_dttm)
-);
+`serving_cli.py finalize`는 plan과 같은 logical time의 inference manifest를 exact-read하고
+다음 네 publication을 coordinated transaction으로 게시한다.
 
--- 서울시 문화/공연 행사 정보.
-CREATE TABLE IF NOT EXISTS cultural_events (
-    event_id        TEXT PRIMARY KEY,
-    title           TEXT NOT NULL,
-    category        TEXT,
-    gu              TEXT,
-    place           TEXT,
-    start_date      DATE,
-    end_date        DATE,
-    is_free         TEXT,
-    lat             DOUBLE PRECISION,
-    lon             DOUBLE PRECISION
-);
+- `station`
+- `station_stock`
+- `station_demand_forecast`
+- `weather_forecast`
+
+결과 evidence key가 이 네 개와 정확히 같지 않으면 실패한다. STALE 결과도 성공으로
+취급하지 않고 후속 urgency chain을 중단한다.
+
+### 3. Urgency
+
+`serving_cli.py urgency`는 finalize가 반환한 station·demand·stock manifest의 logical time이
+모두 같은지 검증한다. 현재 stock과 `t-25`, `t-20`, `t-15`, `t-10`, `t-5분`의 사용 가능한
+realtime source window로 긴급도를 게시한다.
+
+지나간 window가 실제로 없으면 CLI가 누락 offset을 기록할 수 있지만, Publisher가 catalog를
+다시 확인하고 최소 window 계약을 검증한다. 누락을 임의로 숨겨서는 통과하지 않는다.
+
+### 4. Route
+
+`serving_cli.py route`는 exact urgency manifest를 입력으로 proposed route header와 stop을
+한 transaction에서 교체한다. Route publisher는 urgency 내부 station·demand·stock
+dependency가 현재 route 입력과 같은지 다시 확인하며, STALE이면 실패한다.
+
+## 주요 구현 모듈
+
+| 모듈 | 책임 |
+| --- | --- |
+| `gold/source_catalog.py` | S3 source manifest 탐색과 exact authority 선택 |
+| `gold/source_policy.py` | Snapshot completeness와 source 정책 |
+| `gold/serving_plan.py` | Prepare artifact와 coordinated 4-key finalize |
+| `gold/station_release.py` | Station·stock lifecycle와 원자 게시 |
+| `gold/demand.py` | Inference 결과를 demand projection으로 게시 |
+| `gold/weather_forecast.py` | 단기·초단기 resolver와 13시간 buffer 게시 |
+| `gold/event.py` | Source별 event identity·reconcile |
+| `gold/urgency.py` | Stock history와 demand 기반 urgency 게시 |
+| `gold/rebalance_route.py` | Route/stop 산출과 coverage 검증 |
+| `gold/dispatch_center.py`, `gold/weather_grid.py` | Versioned seed publication |
+| `gold/state.py`, `gold/versioning.py` | Dependency state와 publication version 처리 |
+
+공통 canonicalization, immutable storage, evidence와 DB transaction은 Loader 내부에서
+재구현하지 않고 `libs/core/src/core/gold_publication/`을 사용한다.
+
+## 실행 계약
+
+### Source publication 예시
+
+```bash
+cd loader
+uv run --frozen python gold_cli.py \
+  --publication event:cultural_event \
+  --window-start 2026-08-24T09:00:00+09:00
 ```
 
----
+### Serving prepare 예시
 
-## 3. 요약 (데이터 흐름)
+```bash
+cd loader
+uv run --frozen python serving_cli.py prepare \
+  --logical-dttm 2026-08-24T09:00:00+09:00
+```
 
-1. **Collector 파이프라인 (Airflow)** -> S3 (Bronze -> Silver Parquet)
-2. **Transform & Load 파이프라인 (ETL Batch)** -> 위 명세서에 정의된 **Silver -> Gold 컬럼 매핑** 및 정제 로직을 거쳐 적재
-3. **API 서버 (apps/api)** -> 상세정보(Detail) 요청 시 `sta_id`에 해당하는 대여소의 `gu`나 `lat/lon`을 기준으로 날씨와 행사 정보를 JOIN/필터링하여 UI로 서빙.
+두 CLI 모두 timezone offset이 있는 ISO 8601 시각을 요구한다. `S3_BUCKET`은 필수이며
+공백·slash가 없는 bucket name이어야 한다. 선택적 `S3_ENDPOINT_URL`은 local object store에
+사용한다. DB 연결은 `core.db.get_connection()`의 환경 계약을 따른다.
 
----
+`serving_cli.py`의 stdout 마지막 한 줄은 Airflow XCom이 읽는 compact JSON ref다. 일반 로그와
+결측 경고는 stderr로 보내므로 stdout 형식을 바꾸면 orchestration 계약도 함께 깨진다.
 
+## 실패와 재실행
+
+- Exact same version·fingerprint는 no-op이다.
+- 더 오래된 logical time 또는 revision은 STALE이다.
+- 같은 version인데 fingerprint가 다르면 계약 위반이다.
+- 같은 logical time의 correction은 더 큰 `revision_no`가 필요하다.
+- Input URI와 SHA가 다르거나 다른 bucket을 가리키면 fail-closed한다.
+- Finalize와 urgency가 STALE이면 후속 task를 실행하지 않는다.
+- Target mutation 중 실패하면 `publication_state`도 함께 rollback돼야 한다.
+
+따라서 실패 후 target에 직접 upsert하거나 state를 수동 전진시키지 않는다. 입력 authority와
+version을 바로잡은 뒤 동일 CLI 경계에서 재실행한다.
+
+## 검증
+
+```bash
+# Loader 전체
+UV_CACHE_DIR=/private/tmp/codex-uv-cache \
+uv run --project loader --frozen pytest loader/tests -q
+
+# CLI와 순수 Gold 로직
+UV_CACHE_DIR=/private/tmp/codex-uv-cache \
+uv run --project loader --frozen pytest \
+  loader/tests/test_gold_cli.py \
+  loader/tests/test_serving_cli.py \
+  loader/tests/gold -q
+```
+
+`GOLD_PUBLICATION_TEST_DATABASE_URL`이 없어서 PostGIS integration test가 skip되면 DB
+publication PASS로 기록하지 않는다. 전체 격리 검증 방법은
+[Gold 통합 검증 가이드](../gold/integration-validation.md)를 따른다.
