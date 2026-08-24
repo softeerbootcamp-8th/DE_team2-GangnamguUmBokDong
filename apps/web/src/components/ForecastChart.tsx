@@ -1,6 +1,6 @@
 import { useState } from "react";
 import type { ForecastPoint } from "../api";
-import { monotonePath } from "../curve";
+import { pairedMonotonePaths } from "../curve";
 import { ACTION_LABEL, formatIsoTime } from "../format";
 
 interface Props {
@@ -16,7 +16,7 @@ const PLOT_HEIGHT = HEIGHT - MARGIN.top - MARGIN.bottom;
 const X_TICK_INTERVAL_MS = 3 * 60 * 60 * 1000;
 const FORECAST_INTERVAL_MS = 60 * 60 * 1000;
 const SERIES_STROKE_WIDTH = 2;
-const OVERLAP_CENTER_DISTANCE = SERIES_STROKE_WIDTH;
+const OVERLAP_CENTER_DISTANCE = SERIES_STROKE_WIDTH + 2;
 
 // 대여가 늘면 재고가 부족해지고(공급필요, 빨강), 반납이 늘면 재고가 넘친다
 // (회수필요, 파랑) — 지도 마커의 방향별 색과 같은 의미로 맞춘다.
@@ -60,25 +60,25 @@ export function ForecastChart({ baseDttm, points }: Props) {
   );
   const xAt = (i: number) => xAtTime(intervalMidpointMs(i));
   const yAt = (v: number) => MARGIN.top + (1 - v / maxY) * PLOT_HEIGHT;
-  const rentWasAboveBeforeOverlap = (index: number) => {
-    for (let previous = index - 1; previous >= 0; previous -= 1) {
-      const rentY = yAt(points[previous].predicted_rent_cnt);
-      const returnY = yAt(points[previous].predicted_return_cnt);
-      if (Math.abs(rentY - returnY) >= OVERLAP_CENTER_DISTANCE) {
-        return rentY < returnY;
-      }
-    }
-
+  const rentIsAboveForOverlap = (index: number) => {
     const currentRentY = yAt(points[index].predicted_rent_cnt);
     const currentReturnY = yAt(points[index].predicted_return_cnt);
     if (currentRentY !== currentReturnY) {
       return currentRentY < currentReturnY;
     }
 
+    for (let previous = index - 1; previous >= 0; previous -= 1) {
+      const rentY = yAt(points[previous].predicted_rent_cnt);
+      const returnY = yAt(points[previous].predicted_return_cnt);
+      if (rentY !== returnY) {
+        return rentY < returnY;
+      }
+    }
+
     for (let next = index + 1; next < points.length; next += 1) {
       const rentY = yAt(points[next].predicted_rent_cnt);
       const returnY = yAt(points[next].predicted_return_cnt);
-      if (Math.abs(rentY - returnY) >= OVERLAP_CENTER_DISTANCE) {
+      if (rentY !== returnY) {
         return rentY < returnY;
       }
     }
@@ -95,12 +95,13 @@ export function ForecastChart({ baseDttm, points }: Props) {
       return key === "predicted_rent_cnt" ? rentY : returnY;
     }
 
-    // 실제 값과 툴팁은 그대로 두고 화면 좌표만 선 두께만큼 벌린다. 두 중심의
-    // 간격을 stroke 너비와 같게 두면 두 선의 가장자리가 빈틈 없이 맞닿으면서도
-    // 빨강과 파랑이 각각 한 줄씩 보인다. 값의 대소 방향은 뒤집지 않는다.
+    // 실제 값과 툴팁은 그대로 두고, 두 선의 중심이 4px보다 가까운 구간은 화면
+    // 중심을 4px 벌려 2px 여백을 만든다. 점에서 이미 겹친 뒤에만 보정하면 같은
+    // 기울기의 대각선 구간이 다시 붙어 보이므로 근접한 시점부터 함께 보정한다.
+    // 현재 값의 상하관계를 우선하고 값이 완전히 같을 때만 직전 관계를 이어받는다.
     const midpoint = (rentY + returnY) / 2;
     const halfDistance = OVERLAP_CENTER_DISTANCE / 2;
-    const rentAboveReturn = rentWasAboveBeforeOverlap(index);
+    const rentAboveReturn = rentIsAboveForOverlap(index);
     if (key === "predicted_rent_cnt") {
       return midpoint + (rentAboveReturn ? -halfDistance : halfDistance);
     }
@@ -115,6 +116,20 @@ export function ForecastChart({ baseDttm, points }: Props) {
   // 색 계열을 쓰면 구분이 안 된다는 의견이 있어서, 경고를 뜻하는 색으로 뺐다.
   const criticalColor = "var(--status-warning)";
   const criticalAnchor = criticalIndex <= 1 ? "start" : criticalIndex >= points.length - 2 ? "end" : "middle";
+  const pointXs = points.map((_, i) => xAt(i));
+  const chartXs = [MARGIN.left, ...pointXs, WIDTH - MARGIN.right];
+  const seriesPointYs = SERIES.map((series) => (
+    points.map((_, index) => visualYAt(series.key, index))
+  ));
+  const chartYs = seriesPointYs.map((pointYs) => (
+    [pointYs[0], ...pointYs, pointYs[pointYs.length - 1]]
+  ));
+  const seriesPaths = pairedMonotonePaths(
+    chartXs,
+    chartYs[0],
+    chartYs[1],
+    OVERLAP_CENTER_DISTANCE,
+  );
 
   function handlePointerMove(event: React.PointerEvent<SVGRectElement>) {
     const rect = event.currentTarget.getBoundingClientRect();
@@ -197,34 +212,21 @@ export function ForecastChart({ baseDttm, points }: Props) {
           </text>
         ))}
 
-        {SERIES.map((series) => {
-          const pointXs = points.map((_, i) => xAt(i));
-          const pointYs = points.map((_, index) => visualYAt(series.key, index));
+        {SERIES.map((series, seriesIndex) => {
           // 중앙점 사이의 추세선은 유지하되 첫·마지막 시간 구간도 비어 보이지
           // 않도록 같은 구간값으로 기준 시각과 +12시간 경계까지 수평 연장한다.
-          const xs = [MARGIN.left, ...pointXs, WIDTH - MARGIN.right];
-          const ys = [pointYs[0], ...pointYs, pointYs[pointYs.length - 1]];
-          const path = monotonePath(xs, ys);
+          const path = seriesPaths[seriesIndex];
           return (
-            <g key={series.key}>
-              <path
-                data-series={series.key}
-                d={path}
-                fill="none"
-                stroke={series.color}
-                strokeWidth={SERIES_STROKE_WIDTH}
-                strokeLinecap="round"
-                strokeLinejoin="round"
-              />
-              <circle
-                cx={xAt(points.length - 1)}
-                cy={visualYAt(series.key, points.length - 1)}
-                r={4}
-                fill={series.color}
-                stroke="var(--surface-1)"
-                strokeWidth={2}
-              />
-            </g>
+            <path
+              key={series.key}
+              data-series={series.key}
+              d={path}
+              fill="none"
+              stroke={series.color}
+              strokeWidth={SERIES_STROKE_WIDTH}
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            />
           );
         })}
 
