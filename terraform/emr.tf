@@ -35,6 +35,41 @@ resource "aws_iam_role_policy_attachment" "emr_service" {
   policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonEMRServicePolicy_v2"
 }
 
+# 세 번째 실제 실행에서 "Service role gng-ubd-emr-service has insufficient EC2
+# permissions"로 실패했다 — 이번엔 EC2 쪽 상세 메시지 없이 뭉뚱그려져서 어느
+# 액션이 빠졌는지 특정할 수 없었다(2026-08-25). AmazonEMRServicePolicy_v2의
+# 실제 원문(AWS 공식 문서로 재확인)을 서브넷/보안그룹 태그 조건까지 전부 대조해
+# 봤지만 이미 다 맞춰져 있었다 — 즉 v2 정책 자체에 없는 좀 더 최신/세부적인
+# 읍기 전용 액션이 빠졌을 가능성이 높다. 전부 Describe*(읍기 전용, 위험 없음)라
+# 한 번에 넉넉히 추가해 재추측 왕복을 줄인다.
+resource "aws_iam_role_policy" "emr_service_extra_describe" {
+  name = "${var.project}-emr-service-extra-describe"
+  role = aws_iam_role.emr_service.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "ExtraDescribeActionsNotInV2ManagedPolicy"
+        Effect = "Allow"
+        Action = [
+          # AmazonEMRServicePolicy_v2에 없는, 커스텀(미리 만든) 보안그룹을 EMR이
+          # 검사할 때 필요할 수 있는 최신 액션.
+          "ec2:DescribeSecurityGroupRules",
+          # v2 정책이 명시적으로 빠뜨린(구버전 v1/일반 EC2 체크리스트에는 있던) 항목들.
+          "ec2:DescribeAvailabilityZones",
+          "ec2:DescribeKeyPairs",
+          "ec2:DescribePrefixLists",
+          "ec2:DescribeInstanceStatus",
+          "ec2:DescribeTags",
+          "ec2:DescribeInstanceCreditSpecifications",
+        ]
+        Resource = "*"
+      }
+    ]
+  })
+}
+
 # --- EMR 노드(EC2)가 쓰는 역할 ---
 
 resource "aws_iam_role" "emr_ec2" {
@@ -199,6 +234,9 @@ data "aws_iam_policy_document" "airflow_infra_control" {
       # 안 남, RunJobFlow 실패가 먼저 나서 reaper 호출까지 못 가봤을 뿐).
       "elasticmapreduce:ListClusters",
       "elasticmapreduce:ListSteps",
+      # 진단용 — 클러스터 상태가 뭉뚱그려진 일반 에러일 때 인스턴스 단위 상세
+      # 사유를 보려고 추가(2026-08-25, 세 번째 실제 실행에서 필요해짐).
+      "elasticmapreduce:ListInstances",
       "elasticmapreduce:TerminateJobFlows",
       "elasticmapreduce:AddJobFlowSteps",
       "elasticmapreduce:DescribeStep",
@@ -245,7 +283,7 @@ resource "aws_iam_policy" "airflow_infra_control" {
   # 확인됨(AccessDeniedException). IAM은 정책 rename API가 아예 없어서
   # name이 바뀌면 terraform이 자동으로 삭제+재생성하므로, 내용을 고칠 때마다
   # 이 접미사 숫자를 올리면 CreatePolicyVersion을 아예 안 거치게 된다.
-  name        = "${var.project}-airflow-infra-control-v3"
+  name        = "${var.project}-airflow-infra-control-v4"
   description = "Airflow 상시 EC2가 학습 EC2/EMR 클러스터를 직접 제어하는 데 필요한 권한"
   policy      = data.aws_iam_policy_document.airflow_infra_control.json
 }
