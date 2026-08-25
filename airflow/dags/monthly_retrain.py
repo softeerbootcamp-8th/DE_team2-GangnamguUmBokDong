@@ -56,9 +56,7 @@ from orchestration.aws_infra_task import (
     S3_BUCKET,
     TRAINING_RUNS_PREFIX,
     create_emr_cluster,
-    get_core_instance_group_id,
     read_s3_json,
-    resize_emr_cluster,
     submit_emr_step,
     terminate_emr_cluster,
 )
@@ -70,10 +68,16 @@ logger = logging.getLogger(__name__)
 # 대여 → 반납 순서로 고정 실행한다(동시에 두 EMR 클러스터가 뜨는 걸 막기 위함).
 MODEL_EXECUTION_ORDER = ("rental", "return")
 
-# 피처마트 단계는 3노드로 충분하고(기존 EMR_CORE_INSTANCE_COUNT 기본값과 무관하게
-# 이 DAG 전용 기본값을 둔다), 재학습이 실제로 필요해질 때만 학습용 8노드로 키운다
-# (m4.large만 허용되는 계정 제약 — docs/adr/0007-yarn-distributed-shell-workers.md).
-FEATURE_MART_CORE_INSTANCE_COUNT = 3
+# 원래는 피처마트 단계(3노드) → 재학습 필요 시 학습용(8노드)으로 resize_emr_cluster()를
+# 태우는 2단계 구성이었다. resize 중 진행 중이던 스텝이 죽거나(노드가 빠지는 동안
+# 실행 중이던 executor/컨테이너가 유실) 리사이즈 자체가 목표 개수까지 안 올라가는
+# 사례가 의심돼(사용자 지적, 2026-08-26), 지금은 처음부터 학습 단계 노드 수로
+# 고정 생성해서 이 사이클 안에서는 resize를 아예 안 태운다 — m4.large 8대 기준
+# (같은 학습 조건이 RAM 40GB 단일 서버에서는 이미 성공했으므로, 분산이 제대로
+# 되면 8대로 충분해야 한다). 여전히 부족하면 최대 10대(이 AWS 계정 EMR 콘솔
+# 제약)까지만 늘리고, 그래도 안 되면 노드 수 문제가 아니라 데이터 로딩/분배
+# 로직(또는 메모리 미해제) 쪽을 봐야 한다.
+FEATURE_MART_CORE_INSTANCE_COUNT = 8
 TRAINING_CORE_INSTANCE_COUNT = 8
 _EMR_PYTHONPATH = "/opt/gng"
 _EMR_PYTHON = "python3.11"
@@ -127,6 +131,16 @@ def _feature_mart_spark_steps(profile: str) -> tuple[tuple[str, list[str]], tupl
     반환한다 — run_pipeline.py는 watermark 기반 증분이라 매번 불러도 안전하다
     (평가 전 최신화용 `refresh_feature_mart`와 재학습 루프 양쪽에서 재사용)."""
     common_confs = [
+        # feature_engine/spark/spark_session.py의 get_spark()가 "지금 진짜 yarn
+        # 클러스터 실행인지"를 판단할 유일한 신호 — pyspark SparkConf()로 spark-submit
+        # 인자를 되짚어 보는 시도는 SparkContext._jvm이 아직 없는 시점엔 항상 빈
+        # 값을 봐서 실패했다(실제 EMR 실행으로 확인, 2026-08-26). 이 값이 있어야
+        # get_spark()가 .master()를 안 건드리고 --master yarn을 그대로 살려 executor가
+        # 실제로 뜬다.
+        "--conf",
+        "spark.yarn.appMasterEnv.SPARK_ON_YARN=1",
+        "--conf",
+        "spark.executorEnv.SPARK_ON_YARN=1",
         "--conf",
         f"spark.yarn.appMasterEnv.ML_PROFILE={profile}",
         "--conf",
@@ -370,8 +384,10 @@ def make_task_check_retrain_branch(model_name: str) -> Any:
 
 
 def make_task_orchestrate_retrain_loop(model_name: str) -> Any:
-    """상시 EMR 클러스터 위에서 후보 프로필을 순환하며 피처마트 → (최초 1회) 8노드
-    리사이즈 → YARN distributed-shell 학습을 반복하는 callable을 반환한다."""
+    """상시 EMR 클러스터 위에서 후보 프로필을 순환하며 피처마트 → YARN
+    distributed-shell 학습을 반복하는 callable을 반환한다 — 클러스터가 이미
+    `create_cluster` 단계에서 학습용 노드 수(`TRAINING_CORE_INSTANCE_COUNT`)로
+    생성돼 있으므로 여기서 별도 resize는 하지 않는다."""
 
     def task_orchestrate_retrain_loop(**context: Any) -> dict[str, Any]:
         ti = context["ti"]
@@ -392,7 +408,6 @@ def make_task_orchestrate_retrain_loop(model_name: str) -> Any:
         )
 
         results_by_profile: dict[str, Any] = {}
-        resized_to_training = False
 
         for profile in candidate_profiles:
             logger.info("=== [%s 프로필: %s] EMR 피처마트 스텝 제출 ===", model_name, profile)
@@ -400,23 +415,6 @@ def make_task_orchestrate_retrain_loop(model_name: str) -> Any:
                 for step_name, spark_args in _feature_mart_spark_steps(profile):
                     submit_emr_step(cluster_id, step_name, spark_args, mock_override=mock_override)
                 logger.info("=== [%s 프로필: %s] EMR 피처마트 완료 ===", model_name, profile)
-
-                if not resized_to_training:
-                    logger.info(
-                        "=== [%s 프로필: %s] 학습용 %d노드로 리사이즈(사이클 중 최초 1회만) ===",
-                        model_name,
-                        profile,
-                        TRAINING_CORE_INSTANCE_COUNT,
-                    )
-                    core_group_id = get_core_instance_group_id(cluster_id, mock_override=mock_override)
-                    resize_emr_cluster(
-                        cluster_id,
-                        core_group_id,
-                        target_core_count=TRAINING_CORE_INSTANCE_COUNT,
-                        mock_override=mock_override,
-                    )
-                    submit_emr_step(cluster_id, *_wait_for_yarn_nodes_step(TRAINING_CORE_INSTANCE_COUNT), mock_override=mock_override)
-                    resized_to_training = True
 
                 logger.info("=== [%s 프로필: %s] YARN distributed-shell 학습 스텝 제출 ===", model_name, profile)
                 train_result_key = _result_s3_key(run_id, f"train-{model_name}-{profile}")
@@ -590,9 +588,9 @@ def build_monthly_retrain_dag(cron_schedule: str) -> DAG:
                 minimum=1,
                 maximum=10,
                 description=(
-                    "클러스터 생성 시점(피처마트 단계) core 노드 개수 — master 1대는 별도. "
-                    f"재학습이 실제로 필요해지면 학습 단계에서 {TRAINING_CORE_INSTANCE_COUNT}로 자동 리사이즈된다. "
-                    "대여/반납 두 사이클 모두 동일하게 적용된다."
+                    "클러스터 생성 시점 core 노드 개수 — master 1대는 별도. 피처마트/학습 "
+                    "단계 모두 이 개수를 그대로 쓴다(resize 없음). 대여/반납 두 사이클 모두 "
+                    "동일하게 적용된다."
                 ),
             ),
         },

@@ -251,9 +251,11 @@ def test_evaluate_defaults_to_needs_retrain_when_no_result(monkeypatch) -> None:
     assert result["candidate_profiles"] == ["builtin-default"]
 
 
-def test_orchestrate_retrain_loop_submits_feature_mart_then_resizes_then_trains(monkeypatch) -> None:
-    """재학습 루프가 프로필마다 피처마트 스텝을 제출하고, 최초 1회만 8노드로
-    리사이즈한 뒤 YARN distributed-shell 학습 스텝을 제출한다."""
+def test_orchestrate_retrain_loop_submits_feature_mart_then_trains_without_resize(monkeypatch) -> None:
+    """재학습 루프가 프로필마다 피처마트 스텝을 제출하고 YARN distributed-shell 학습
+    스텝을 제출한다 — 클러스터가 이미 학습 단계 노드 수로 생성돼 있으므로(resize
+    로직이 진행 중이던 작업을 죽이거나 목표치까지 못 올라가는 사례가 의심돼
+    2026-08-26에 제거) 이 루프는 더 이상 resize를 태우지 않는다."""
     mock_ti = MagicMock()
     mock_ti.xcom_pull.side_effect = lambda task_ids, key: {
         "cluster_id": "j-1",
@@ -261,19 +263,12 @@ def test_orchestrate_retrain_loop_submits_feature_mart_then_resizes_then_trains(
     }.get(key)
 
     submitted_steps = []
-    resize_calls = []
 
     monkeypatch.setattr(
         monthly_dag,
         "submit_emr_step",
         lambda cluster_id, name, command, **kwargs: submitted_steps.append(name)
         or {"StepId": "s", "State": "COMPLETED"},
-    )
-    monkeypatch.setattr(monthly_dag, "get_core_instance_group_id", lambda cluster_id, **kwargs: "ig-core")
-    monkeypatch.setattr(
-        monthly_dag,
-        "resize_emr_cluster",
-        lambda cluster_id, group_id, **kwargs: resize_calls.append(kwargs["target_core_count"]),
     )
     # 첫 프로필은 승격 실패, 두 번째 프로필은 승격 성공 -> 루프가 거기서 멈춰야 한다.
     monkeypatch.setattr(
@@ -288,12 +283,8 @@ def test_orchestrate_retrain_loop_submits_feature_mart_then_resizes_then_trains(
     assert result["status"] == "completed"
     assert result["profiles"]["profile-a"]["promoted"] is False
     assert result["profiles"]["profile-b"]["promoted"] is True
-    # 리사이즈는 최초 1회만 (8노드로)
-    assert resize_calls == [monthly_dag.TRAINING_CORE_INSTANCE_COUNT]
     assert any("Spark-RunPipeline-profile-a" in s for s in submitted_steps)
     assert any("Spark-RunPipeline-profile-b" in s for s in submitted_steps)
-    assert any(s == "Wait-YARN-Nodes" for s in submitted_steps)
-    assert submitted_steps.count("Wait-YARN-Nodes") == 1
     assert any("Train-rental-profile-a" in s for s in submitted_steps)
     assert any("Train-rental-profile-b" in s for s in submitted_steps)
 
