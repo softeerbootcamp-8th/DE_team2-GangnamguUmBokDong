@@ -140,7 +140,18 @@ dispatch_center + station topology + 진행 중 route
 
 ### `rebalance_route`
 
-Route publisher는 `station_urgency` publication manifest와 현재 Gold topology를 입력으로 사용한다. 센터별 최고 supply urgency가 경로 순서를 소유하고 `center→pickup→supply` 총거리로 안전한 pickup을 고른다. 모든 pickup 뒤 최고 supply를 첫 dropoff로 두어 결정적 UUID와 stop 순서를 만들고 proposed route와 stop을 원자 게시한다.
+`route-v4-supply-led-pickup-sla` publisher는 `station_urgency` publication manifest와 현재
+Gold topology를 입력으로 사용한다. 센터별 최고 supply urgency가 경로 순서를 소유하고
+`center→pickup→supply` 총거리로 안전한 pickup을 고른다. 실제 pickup 방문은 센터부터
+최근접 순서이며 이동속도 20km/h와 stop당 3분을 적용한 마지막 pickup 실행시각이 dispatch
+뒤 30분 이하여야 한다. 큰 split이 이 SLA를 넘으면 더 작은 pickup·dropoff 완결 route로
+분리하고, 단일 pickup도 30분 밖인 donor는 제외한다. 모든 pickup 뒤 최고 supply를 첫
+dropoff로 두어 결정적 UUID와 stop 순서를 만들고 proposed route와 stop을 원자 게시한다.
+
+정책의 exclusive 설정은 같은 pickup station을 한 plan의 여러 route로 나누지 않는다.
+진행 중 route가 예약한 pickup과 완료 뒤 cooldown 안의 pickup은
+`pickup_cooldown_station_ids` artifact로 고정해 새 후보에서 제외하며, 해당 정책 config와
+SLA 속도·작업시간·상한·버전은 route input fingerprint에 남긴다.
 
 이미 dispatched·completed·cancelled인 route와 해당 stop은 새 제안 publication이 삭제하지 않는다.
 
