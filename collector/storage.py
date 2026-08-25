@@ -117,6 +117,9 @@ def write_bronze_part(
     if revision is None:
         put_object_bytes(key, payload)
         return
+    import cold_bronze
+
+    cold_bronze.write_pending_marker(source_id, window_start.date(), key)
     existing = get_object_bytes(key)
     if existing is not None and existing != payload:
         raise RuntimeError(f"immutable Hot Bronze key 충돌: {key}")

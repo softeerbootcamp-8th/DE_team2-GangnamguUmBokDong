@@ -61,14 +61,20 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "data" {
 resource "aws_s3_bucket_lifecycle_configuration" "data" {
   bucket = aws_s3_bucket.data.id
 
-  # collector가 응답 도착 즉시 조각으로 쓰는 원본. 날짜 단위 Cold Bronze 생성과
-  # 검증에 충분한 유예를 둔 뒤 Hot 객체만 지운다.
+  # Collector가 응답 도착 즉시 조각으로 쓰는 원본. Cold readback 검증이 끝나
+  # cold_compacted=true가 붙은 Hot 객체만 생성 30일 뒤 지운다. 실패·미처리 원본은
+  # 태그가 없으므로 보존된다.
   rule {
     id     = "expire-bronze"
     status = "Enabled"
 
     filter {
-      prefix = "bronze/hot/"
+      and {
+        prefix = "bronze/hot/"
+        tags = {
+          cold_compacted = "true"
+        }
+      }
     }
 
     expiration {
