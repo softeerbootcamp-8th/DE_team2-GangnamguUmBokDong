@@ -49,9 +49,10 @@ bootstrap/compaction과 nowcaster로 요청 구간의 flat daily Archive를 먼�
 ## 실행
 
 > historical fact는 확정된 `archive/{source}/dt=YYYY-MM-DD.parquet`만 읽고 Silver로
-> fallback하지 않는다. 요청 범위의 일별 파일 하나라도 없거나 물리 스키마가 맞지
-> 않으면 fail-closed한다. `station_master_enriched`만 최신 Silver current dimension을
-> 계속 사용하며 온라인 inference 경로는 그대로 최신 Silver를 읽는다.
+> fallback하지 않는다. 요청 범위 중 일부 날짜만 없으면(2026-08부터) 그 날짜는
+> 건너뛰고 경고를 남긴 채 계속하며, 요청 범위 전체가 다 없거나 물리 스키마가
+> 맞지 않으면 fail-closed한다. `station_master_enriched`만 최신 Silver current
+> dimension을 계속 사용하며 온라인 inference 경로는 그대로 최신 Silver를 읽는다.
 
 ```bash
 cd ml

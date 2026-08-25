@@ -2,8 +2,8 @@
 
 import dags.daily_compaction as daily_compaction_dag
 import dags.daily_population_and_events as daily_dag
-import dags.monthly_retrain_rental as monthly_rental_dag
-import dags.monthly_retrain_return as monthly_return_dag
+import dags.emr_orphan_reaper as emr_orphan_reaper_dag
+import dags.monthly_retrain as monthly_retrain_dag
 import dags.realtime_tick as realtime_tick_dag
 import dags.station_master as station_master_dag
 from airflow.task.trigger_rule import TriggerRule
@@ -16,15 +16,15 @@ def test_all_dag_ids_import() -> None:
         station_master_dag.dag.dag_id,
         daily_dag.dag.dag_id,
         daily_compaction_dag.dag.dag_id,
-        monthly_rental_dag.dag.dag_id,
-        monthly_return_dag.dag.dag_id,
+        monthly_retrain_dag.dag.dag_id,
+        emr_orphan_reaper_dag.dag.dag_id,
     } == {
         "realtime_tick",
         "station_master",
         "daily_population_and_events",
         "daily_compaction",
-        "monthly_retrain_rental",
-        "monthly_retrain_return",
+        "monthly_retrain",
+        "emr_orphan_reaper",
     }
 
 
