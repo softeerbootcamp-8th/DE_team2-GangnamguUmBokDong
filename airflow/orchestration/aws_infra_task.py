@@ -45,6 +45,16 @@ S3_BUCKET = os.environ.get("S3_BUCKET", "gangnamgu")
 _MODELS_PREFIX = os.environ.get("MODELS_PREFIX", "models")
 TRAINING_RUNS_PREFIX = os.environ.get("TRAINING_RUNS_PREFIX", f"{_MODELS_PREFIX}/training-runs")
 
+# `create_emr_cluster()`가 짓는 이름(`ml-monthly-retrain-{model_name}`)의 공통
+# prefix — `list_active_emr_clusters()`가 이 값으로 "월간 재학습용" 클러스터만
+# 걸러서 본다(다른 용도로 뜬 EMR까지 실수로 건드리지 않기 위함).
+MONTHLY_RETRAIN_CLUSTER_NAME_PREFIX = os.environ.get(
+    "AWS_MONTHLY_RETRAIN_CLUSTER_NAME_PREFIX", "ml-monthly-retrain-"
+)
+# `emr_orphan_reaper.py`가 이 나이(시간)를 넘긴 클러스터를 강제 종료한다 — 정상
+# 사이클(평가 30분 + 재학습 루프 최대 6시간)보다 충분히 여유를 둔 값.
+EMR_ORPHAN_MAX_AGE_HOURS = float(os.environ.get("AWS_EMR_ORPHAN_MAX_AGE_HOURS", "8"))
+
 # is_mock_mode()/is_emr_mock_mode()의 override 인자에 허용되는 값.
 MOCK_OVERRIDE_FORCE_MOCK = "force_mock"
 MOCK_OVERRIDE_FORCE_REAL = "force_real"
@@ -502,6 +512,52 @@ def terminate_emr_cluster(
         logger.error("[EMR] 클러스터 '%s' 종료 중 오류 발생: %s", cluster_id, exc)
 
 
+def list_active_emr_clusters(
+    name_prefix: str = MONTHLY_RETRAIN_CLUSTER_NAME_PREFIX,
+    *,
+    region_name: str | None = None,
+    mock_override: str | None = None,
+) -> list[dict[str, Any]]:
+    """`name_prefix`로 시작하는, 아직 살아있는(TERMINATED가 아닌) EMR 클러스터를 나열한다.
+
+    `monthly_retrain` DAG 자신의 `terminate_cluster`(trigger_rule=ALL_DONE)는 그
+    DAG 실행 자체가 계속 진행될 때만 보장된다 — 운영자가 DAG Run 전체를 수동으로
+    "Mark Failed" 처리하면 Airflow가 이후 태스크를 더 스케줄링하지 않을 수 있어
+    (버전에 따라 동작이 다르고 확실히 보장되지 않는다), 그 경우 이 안전망이 없으면
+    EMR 클러스터가 아무도 모르게 계속 과금될 수 있다. 이 함수는 그 DAG 실행
+    그래프와 완전히 독립적으로 실제 AWS 상태를 직접 조회하는 reaper용
+    (`emr_orphan_reaper.py`)이다.
+
+    args:
+        name_prefix: 이 prefix로 시작하는 이름의 클러스터만 반환한다(다른 용도
+            EMR까지 실수로 건드리지 않기 위함) — 기본값은 `create_emr_cluster()`가
+            짓는 이름 규칙과 일치한다.
+        region_name: AWS 리전명
+        mock_override: `is_emr_mock_mode()` 참고 — mock이면 항상 빈 목록을 반환한다.
+    returns:
+        list[dict]: 각 원소는 {"id", "name", "state", "created_at"(tz-aware datetime)}
+    """
+    if is_emr_mock_mode(mock_override):
+        return []
+
+    emr = _get_boto3_client("emr", region_name)
+    paginator = emr.get_paginator("list_clusters")
+    clusters: list[dict[str, Any]] = []
+    for page in paginator.paginate(
+        ClusterStates=["STARTING", "BOOTSTRAPPING", "RUNNING", "WAITING", "TERMINATING"]
+    ):
+        for cluster in page["Clusters"]:
+            if not cluster["Name"].startswith(name_prefix):
+                continue
+            clusters.append({
+                "id": cluster["Id"],
+                "name": cluster["Name"],
+                "state": cluster["Status"]["State"],
+                "created_at": cluster["Status"]["Timeline"]["CreationDateTime"],
+            })
+    return clusters
+
+
 def create_emr_cluster(
     *,
     cluster_name: str | None = None,
@@ -605,6 +661,10 @@ def create_emr_cluster(
             raise RuntimeError(f"EMR 클러스터 '{cluster_id}' 생성 중 비정상 종료: {state}")
         time.sleep(30)
 
+    # 타임아웃 시 강제 종료 — 안 그러면 cluster_id가 호출부(DAG)의 XCom에 한 번도
+    # 안 실리고 예외만 던져지므로, 이후 어떤 정리 태스크도 이 클러스터를 찾을 수
+    # 없어 계속 과금되는 채로 방치된다(run_emr_feature_mart_job()의 동일 패턴 참고).
+    terminate_emr_cluster(cluster_id, region_name=region_name, mock_override=mock_override)
     raise TimeoutError(f"EMR 클러스터 '{cluster_id}'가 {timeout_seconds}초 내에 WAITING 상태가 되지 못했습니다.")
 
 
@@ -625,7 +685,9 @@ def get_core_instance_group_id(
 
     emr = _get_boto3_client("emr", region_name)
     groups = emr.list_instance_groups(ClusterId=cluster_id)["InstanceGroups"]
-    core_group = next(g for g in groups if g["InstanceGroupType"] == "CORE")
+    core_group = next((g for g in groups if g["InstanceGroupType"] == "CORE"), None)
+    if core_group is None:
+        raise RuntimeError(f"EMR 클러스터 '{cluster_id}'에 CORE 인스턴스 그룹이 없습니다: {groups}")
     return core_group["Id"]
 
 

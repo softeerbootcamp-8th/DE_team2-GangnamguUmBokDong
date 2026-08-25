@@ -6,6 +6,8 @@
 monkeypatch해서 Stubber로 감싼 클라이언트를 대신 반환하게 한다.
 """
 
+from datetime import UTC, datetime
+
 import boto3
 import orchestration.aws_infra_task as infra
 import pytest
@@ -130,6 +132,23 @@ def test_create_emr_cluster_raises_on_early_termination(monkeypatch):
 
     with pytest.raises(RuntimeError, match="비정상 종료"):
         infra.create_emr_cluster(core_instance_count=3, mock_override=infra.MOCK_OVERRIDE_FORCE_REAL)
+
+
+def test_create_emr_cluster_terminates_itself_on_waiting_timeout(monkeypatch):
+    """WAITING 상태 도달 전에 타임아웃되면 cluster_id가 어디에도(XCom 등) 안 실린 채
+    예외만 던져지므로, 이 함수가 직접 종료 요청까지 해야 한다 — 안 그러면 아무도
+    이 클러스터를 못 찾아 계속 과금된다(run_emr_feature_mart_job()의 동일 패턴)."""
+    stubber = _stub_emr_client(monkeypatch)
+    stubber.add_response("run_job_flow", {"JobFlowId": "j-created"})
+    stubber.add_response("terminate_job_flows", {})
+    stubber.activate()
+
+    with pytest.raises(TimeoutError, match="WAITING 상태가 되지 못했습니다"):
+        infra.create_emr_cluster(
+            core_instance_count=3, timeout_seconds=0, mock_override=infra.MOCK_OVERRIDE_FORCE_REAL
+        )
+
+    stubber.assert_no_pending_responses()
 
 
 def test_create_emr_cluster_mock_mode_returns_without_calling_aws(monkeypatch):
@@ -266,3 +285,44 @@ def test_submit_emr_step_mock_mode_returns_without_calling_aws(monkeypatch):
 
     assert result["State"] == "COMPLETED"
     assert result["StepId"].startswith("mock-s-")
+
+
+# --- list_active_emr_clusters() ---
+
+
+def test_list_active_emr_clusters_filters_by_name_prefix(monkeypatch):
+    stubber = _stub_emr_client(monkeypatch)
+    created_at = datetime(2026, 8, 1, tzinfo=UTC)
+    stubber.add_response(
+        "list_clusters",
+        {
+            "Clusters": [
+                {
+                    "Id": "j-1",
+                    "Name": "ml-monthly-retrain-rental",
+                    "Status": {"State": "WAITING", "Timeline": {"CreationDateTime": created_at}},
+                },
+                {
+                    "Id": "j-2",
+                    "Name": "some-other-cluster",
+                    "Status": {"State": "RUNNING", "Timeline": {"CreationDateTime": created_at}},
+                },
+            ]
+        },
+    )
+    stubber.activate()
+
+    clusters = infra.list_active_emr_clusters(mock_override=infra.MOCK_OVERRIDE_FORCE_REAL)
+
+    assert [c["id"] for c in clusters] == ["j-1"]
+    assert clusters[0]["name"] == "ml-monthly-retrain-rental"
+    assert clusters[0]["created_at"] == created_at
+
+
+def test_list_active_emr_clusters_mock_mode_returns_empty_without_calling_aws(monkeypatch):
+    def _fail(*args, **kwargs):
+        raise AssertionError("mock 모드에서는 boto3 클라이언트를 만들면 안 됨")
+
+    monkeypatch.setattr(infra, "_get_boto3_client", _fail)
+
+    assert infra.list_active_emr_clusters(mock_override=infra.MOCK_OVERRIDE_FORCE_MOCK) == []

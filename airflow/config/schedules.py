@@ -51,6 +51,14 @@ MONTHLY_RETRAIN_RETURN_CRON = "0 6 1 * *"
 # 하위 호환용 기본 스케줄
 MONTHLY_RETRAIN_CRON = "0 4 1 * *"
 
+# monthly_retrain_* DAG의 자체 정리 태스크(terminate_cluster, trigger_rule=ALL_DONE)는
+# 그 DAG 실행이 계속 진행될 때만 보장된다 — 운영자가 DAG Run을 수동으로 통째로
+# "Mark Failed" 처리하는 경우까지 커버하려면 그 실행 그래프와 무관하게 실제 AWS
+# 상태를 직접 확인하는 별도 안전망이 필요하다(`emr_orphan_reaper.py`). 15분마다
+# 돌아 재학습 사이클의 정상 소요 시간(평가 30분 + 재학습 루프 6시간)보다 훨씬
+# 짧은 주기로 방치 시간을 제한한다.
+EMR_ORPHAN_REAPER_CRON = "*/15 * * * *"
+
 DEFAULT_RETRIES = 2
 DEFAULT_RETRY_DELAY = timedelta(seconds=30)
 DEFAULT_EXECUTION_TIMEOUT = timedelta(seconds=240)

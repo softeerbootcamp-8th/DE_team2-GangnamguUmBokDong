@@ -24,7 +24,6 @@ from airflow.providers.standard.operators.python import (
     PythonOperator,
 )
 from airflow.sdk import Param
-from airflow.task.trigger_rule import TriggerRule
 from airflow.timetables.trigger import CronTriggerTimetable
 from config.schedules import (
     CATCHUP,
@@ -349,7 +348,6 @@ def build_monthly_retrain_dag(model_name: str, cron_schedule: str) -> DAG:
         terminate_cluster = PythonOperator(
             task_id="terminate_cluster",
             python_callable=make_task_terminate_emr_cluster(model_name),
-            trigger_rule=TriggerRule.ALL_DONE,
         )
 
         # 태스크 흐름 정의 (비순환 단방향 그래프)
@@ -357,5 +355,15 @@ def build_monthly_retrain_dag(model_name: str, cron_schedule: str) -> DAG:
         check_retrain_branch >> [orchestrate_retrain_loop, skip_monthly_retrain]
         orchestrate_retrain_loop >> terminate_cluster
         skip_monthly_retrain >> terminate_cluster
+        # trigger_rule=ALL_DONE만으로는 안전하지 않다 — 운영자가 DAG Run 전체를
+        # 수동으로 "Mark Failed" 처리하면 Airflow는 아직 실행 안 된 일반 태스크를
+        # 스케줄러의 trigger_rule 평가 없이 그냥 SKIPPED로 강제 전환하고 끝내버린다
+        # (Airflow 3.3.1 `_set_dag_run_terminal_state()` 실측 확인, 2026-08).
+        # `is_teardown=True`인 태스크만 이 강제 skip에서 예외로 남아 실제로 실행될
+        # 기회를 얻는다 — 그래서 trigger_rule 대신 setup/teardown API로 이 태스크를
+        # 표시한다. `create_cluster_and_evaluate`를 setup으로 지정하면 "그 setup이
+        # 성공했을 때만(=클러스터가 실제로 떴을 때만) teardown이 실행된다"는 semantics
+        # (TriggerRule.ALL_DONE_SETUP_SUCCESS)가 자동으로 적용된다.
+        terminate_cluster.as_teardown(setups=create_cluster_and_evaluate)
 
     return dag

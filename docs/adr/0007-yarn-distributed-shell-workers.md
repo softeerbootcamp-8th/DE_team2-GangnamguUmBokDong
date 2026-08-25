@@ -133,3 +133,16 @@ LightGBM 분산 학습 워커를 **YARN Distributed Shell**로 기동한다. 구
   정책이 요구하는 태그(`for-use-with-amazon-emr-managed-policies=true`)가
   누락돼 있던 것도 이번에 같이 고친다. 상세 구현은
   [training/DESIGN.md](../ml/training/DESIGN.md) 1-1번 항목 참고.
+- **EMR 정리 보장(2026-08 추가 검증)**: 상시 클러스터를 쓰므로(자동 종료 없음,
+  `KeepJobFlowAliveWhenNoSteps=True`) "어떤 경우에도 EMR이 삭제돼야 한다"는
+  요구사항을 만족하려면 두 겹의 방어가 필요했다. (1) `monthly_retrain.py`의
+  `terminate_cluster`는 처음엔 `trigger_rule=ALL_DONE`만 썼는데, Airflow
+  3.3.1을 직접 확인해보니 운영자가 DAG Run 전체를 수동으로 "Mark Failed"
+  처리하면 `_set_dag_run_terminal_state()`가 아직 실행 안 된 일반 태스크를
+  trigger_rule 평가 없이 그냥 SKIPPED로 강제 전환해버려 이 안전망이 무력화됐다
+  — `is_teardown=True`인 태스크만 이 강제 skip에서 예외라, setup/teardown
+  API(`terminate_cluster.as_teardown(setups=create_cluster_and_evaluate)`)로
+  바꿔야 했다. (2) 그래도 Airflow 스케줄러 자체가 죽는 등 더 근본적인 장애는
+  어떤 DAG 태스크도 못 구하므로, 그 실행 그래프와 완전히 독립적으로 실제 AWS
+  상태를 직접 확인해 정리하는 `emr_orphan_reaper.py`(15분마다, 8시간 초과
+  클러스터 강제 종료)를 별도 안전망으로 추가했다.

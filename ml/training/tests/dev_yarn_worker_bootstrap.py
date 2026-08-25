@@ -41,6 +41,19 @@ def test_poll_until_all_registered_times_out_when_not_enough_workers():
         _poll_until_all_registered("run-3", num_machines=2, timeout_seconds=0.01)
 
 
+def test_poll_until_all_registered_raises_when_more_than_expected():
+    """YARN 컨테이너 재시도로 옛 CONTAINER_ID의 등록 파일이 orphan으로 남으면
+    등록 개수가 num_machines를 넘을 수 있다 — 이때 "일부 등록만 보고 진행"하면
+    워커마다 폴링 시각에 따라 서로 다른 machines 목록을 계산해 분산 학습이
+    조용히 깨질 수 있으므로, 초과 등록은 즉시 명확한 에러로 실패해야 한다."""
+    _register_self("run-9", "worker-a", "10.0.0.1", 12400)
+    _register_self("run-9", "worker-b", "10.0.0.2", 12400)
+    _register_self("run-9", "worker-a-retry", "10.0.0.3", 12400)
+
+    with pytest.raises(RuntimeError, match="예상보다 많은 등록"):
+        _poll_until_all_registered("run-9", num_machines=2, timeout_seconds=5)
+
+
 def test_resolve_rank_and_machines_is_consistent_and_sorted_by_host():
     _register_self("run-4", "worker-a", "10.0.0.2", 12400)
     _register_self("run-4", "worker-b", "10.0.0.1", 12400)

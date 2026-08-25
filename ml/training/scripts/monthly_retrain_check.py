@@ -382,7 +382,19 @@ def _run_training_subprocess(
         env["TRAINING_RUN_ID"] = f"{archive_date}-{profile_name}-{model_name}"
         _run_distributed_training_via_yarn(model_name, env)
     else:
-        subprocess.run([sys.executable, "-m", _TRAIN_SCRIPTS[model_name]], cwd=ML_ROOT, check=True, env=env)
+        # ML_ROOT는 로컬/EC2 repo clone 레이아웃 기준으로 계산된다 — EMR
+        # bootstrap.sh는 core/ml_core/training을 /opt/gng 바로 아래 평평하게
+        # 풀어서 ML_ROOT가 존재하지 않는 경로가 된다(yarn_worker_bootstrap.
+        # _launch_training() docstring 참고). 이 분기는 지금 DAG가 항상
+        # LGB_NUM_MACHINES>1로 학습 스텝을 제출해 EMR에서 실제로 타지 않지만,
+        # 나중에 그 값이 바뀌어도 cwd 때문에 FileNotFoundError로 죽지 않도록
+        # ML_ROOT가 없는 환경에서는 상속받은 cwd를 그대로 쓴다.
+        subprocess.run(
+            [sys.executable, "-m", _TRAIN_SCRIPTS[model_name]],
+            cwd=ML_ROOT if ML_ROOT.exists() else None,
+            check=True,
+            env=env,
+        )
 
     archive_prefix = archive_models_prefix(archive_date, profile_name)
     metrics = s3_io.read_json(model_json_key(model_name, "metrics", archive_prefix))

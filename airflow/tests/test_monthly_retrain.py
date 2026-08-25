@@ -28,12 +28,20 @@ def test_monthly_retrain_dags_structure() -> None:
     assert set(return_dag.task_ids) == expected_tasks
 
 
-def test_monthly_retrain_fail_safe_trigger_rule() -> None:
-    """EMR 클러스터 종료 태스크는 상위 태스크 실패 시에도 ALL_DONE으로 반드시 실행된다
-    — 이 안전망이 없으면 태스크가 kill돼도 클러스터가 계속 과금된다."""
+def test_monthly_retrain_terminate_cluster_is_a_real_teardown() -> None:
+    """EMR 클러스터 종료 태스크는 trigger_rule=ALL_DONE만으로는 부족하다 —
+    운영자가 DAG Run 전체를 수동으로 "Mark Failed" 처리하면 Airflow는 아직 실행
+    안 된 일반 태스크를 trigger_rule 평가 없이 그냥 SKIPPED로 강제 전환하고
+    끝내버린다(Airflow 3.3.1 `_set_dag_run_terminal_state()` 실측 확인). 오직
+    `is_teardown=True`인 태스크만 이 강제 skip에서 예외로 남아 실제로 실행될
+    기회를 얻으므로, setup/teardown API로 표시돼 있는지까지 확인해야 한다."""
     for dag in (monthly_rental_dag.dag, monthly_return_dag.dag):
         terminate_cluster = dag.get_task("terminate_cluster")
-        assert terminate_cluster.trigger_rule == TriggerRule.ALL_DONE
+        create_cluster_and_evaluate = dag.get_task("create_cluster_and_evaluate")
+        assert terminate_cluster.is_teardown is True
+        assert terminate_cluster.trigger_rule == TriggerRule.ALL_DONE_SETUP_SUCCESS
+        assert create_cluster_and_evaluate.is_setup is True
+        assert "create_cluster_and_evaluate" in terminate_cluster.upstream_task_ids
 
 
 def test_check_retrain_branch_decisions() -> None:

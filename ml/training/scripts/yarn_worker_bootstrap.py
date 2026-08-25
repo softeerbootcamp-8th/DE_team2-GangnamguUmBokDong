@@ -32,7 +32,7 @@ import time
 import urllib.request
 
 from core import s3 as s3_io
-from ml_core.paths import ML_ROOT, TRAINING_RUNS_PREFIX, training_run_worker_key
+from ml_core.paths import TRAINING_RUNS_PREFIX, training_run_worker_key
 
 from .. import config
 
@@ -75,17 +75,35 @@ def _register_self(run_id: str, worker_id: str, host: str, port: int) -> None:
 
 
 def _poll_until_all_registered(run_id: str, num_machines: int, timeout_seconds: float) -> list[str]:
-    """`run_id` 아래 워커 등록 파일이 `num_machines`개 모일 때까지 폴링한다.
+    """`run_id` 아래 워커 등록 파일이 정확히 `num_machines`개 모일 때까지 폴링한다.
+
+    **정확히 일치해야 하는 이유**: 예전에는 "num_machines개 이상"이면 그 시점에
+    보이는 목록을 그대로 반환했다 — 그런데 YARN이 실패한 컨테이너를 새
+    `CONTAINER_ID`로 재시도하면 옛 컨테이너의 등록 파일이 S3에 orphan으로
+    남을 수 있어, 워커마다 폴링 시각이 조금만 달라도(예: A는 8개를 보고 즉시
+    반환, B는 0.1초 뒤 9개를 봄) 서로 다른 `machines` 문자열을 계산하게 된다 —
+    LightGBM 소켓 프로토콜은 전 머신이 정확히 같은 `machines` 목록을 봐야
+    하므로 이런 불일치는 조용한 분산 학습 corruption으로 이어진다. 정확히
+    일치를 요구하면 초과 등록은 모든 워커가 일관되게(각자 에러로) 실패해,
+    "일부는 성공한 줄 알고 진행, 일부만 무한 대기"하는 최악의 상황을 피한다.
 
     raises:
-        TimeoutError: `timeout_seconds` 안에 다 모이지 않음
+        TimeoutError: `timeout_seconds` 안에 정확히 다 모이지 않음
+        RuntimeError: 등록이 `num_machines`보다 많음(컨테이너 재시도로 인한
+            중복 등록 등 예상치 못한 상황 — 이 학습 시도를 신뢰할 수 없으므로
+            계속 진행하지 않고 즉시 실패한다)
     """
     prefix = f"{TRAINING_RUNS_PREFIX}/{run_id}/workers/"
     deadline = time.monotonic() + timeout_seconds
     while True:
         keys = s3_io.list_keys(prefix)
-        if len(keys) >= num_machines:
+        if len(keys) == num_machines:
             return keys
+        if len(keys) > num_machines:
+            raise RuntimeError(
+                f"워커 barrier에 예상보다 많은 등록이 나타남: {len(keys)} > {num_machines}개 "
+                f"(run_id={run_id}) — YARN 컨테이너 재시도 등으로 중복 등록됐을 가능성"
+            )
         if time.monotonic() >= deadline:
             raise TimeoutError(
                 f"워커 barrier 타임아웃: {len(keys)}/{num_machines}개만 등록됨 (run_id={run_id}, "
@@ -120,9 +138,17 @@ def _resolve_rank_and_machines(keys: list[str], host: str, port: int) -> tuple[i
 
 
 def _launch_training(model: str, env: dict[str, str]) -> int:
-    result = subprocess.run(
-        [sys.executable, "-m", _TRAIN_MODULES[model]], cwd=ML_ROOT, env=env, check=False
-    )
+    """학습 subprocess를 현재 작업 디렉터리를 그대로 물려받아 띄운다.
+
+    `ml_core.paths.ML_ROOT`(로컬/EC2 repo clone 레이아웃 기준으로 계산됨)를
+    `cwd`로 쓰지 않는다 — EMR bootstrap.sh는 `core`/`ml_core`/`training`을
+    `/opt/gng` 바로 아래 평평하게 풀기 때문에(레포의 `ml/` 래퍼 디렉터리가
+    없음) `ML_ROOT` 계산이 존재하지 않는 경로(`/opt/ml`)가 되어 `subprocess.run()`이
+    `FileNotFoundError`로 즉시 죽는다. 이 스크립트를 감싸는 셸 명령(`monthly_retrain_check.
+    _run_distributed_training_via_yarn()`)이 이미 `cd /opt/gng &&`로 진입한 뒤 이
+    프로세스를 띄우므로, cwd를 지정하지 않고 그대로 상속받으면 항상 올바른 위치가 된다.
+    """
+    result = subprocess.run([sys.executable, "-m", _TRAIN_MODULES[model]], env=env, check=False)
     return result.returncode
 
 
