@@ -27,7 +27,8 @@
    - 수집된 원본 CSV 파일들을 읽어 표준 물리 스키마(SPOP, 연령대별 M00~M70, F00~F70)의 Parquet으로 정규화하고 `archive/`에 일자별로 적재합니다.
    - 초기 운영에는 `bootstrap-lookback`으로 현재 추정 구간이 참조하는 1~4주 전 날짜만 선별 적재하고, 필요한 날짜가 하나라도 없으면 실패시킵니다.
 2. **일일 추정 및 실측 승격 (`estimate`)**:
-   - **실측 승격**: 수집기(Collector)가 당일 가져온 최신 실측 데이터를 실제 발생일자(`biz_date`) 아카이브로 영구 보관하고, 기존에 생성해 두었던 해당 일자의 임시 추정치를 자동 삭제합니다.
+   - **실측 승격**: Collector와 같은 exact logical window의 source authority가 확인된 실측만 실제 발생일자(`biz_date`) 아카이브로 영구 보관하고, 기존에 생성해 두었던 해당 일자의 임시 추정치를 자동 삭제합니다. PARTIAL과 authority 게시 전 Silver는 actual로 승격하지 않습니다.
+   - **손상 방어**: Exact authority가 단순히 없으면 승격만 생략하지만, revision·manifest·Silver checksum 또는 row count가 손상됐으면 task를 실패시킵니다.
    - **나우캐스팅 추정**: 기준일(D-0) 전후 일주일(D-3 ~ D+3) 중 실측이 없는 날짜들에 대해 250m 격자·시간대(00~23)별 인구를 추정하여 `silver/` 경로에 저장합니다.
 
 ---
@@ -70,11 +71,12 @@ s3://<bucket>/
 │   └── dt=YYYY-MM-DD.parquet                  # [영구] 실제 발생일 기준 실측 데이터 (is_estimated=False)
 │
 └── silver/living_population_grid/
-    ├── dt={수집실행일}/hh=00/{원본파일명}.parquet   # 수집기(Collector) 원본 파일
+    ├── dt={수집실행일}/hh=HH/HHMM/sha256=....parquet # Collector immutable Silver
     └── dt={추정대상일}/hh=00/nowcast.parquet     # [임시] 모델 추론용 인구 추정치 (is_estimated=True)
 ```
 
-> **Note**: `nowcast.parquet`은 추후 해당 날짜의 실제 공공데이터가 수집되면 실측값으로 대체되면서 자동 삭제됩니다.
+> **Note**: `nowcast.parquet`은 추후 해당 날짜의 authoritative 실측이 확인되면
+> 실측값으로 대체되면서 자동 삭제됩니다. PARTIAL만 있으면 삭제하지 않습니다.
 
 ---
 
@@ -106,12 +108,17 @@ uv run python main.py bootstrap-lookback \
   --target-date 2026-08-21 \
   --horizon-days 0
 
-# 4. 당일 실측 승격 및 D-3 ~ D+3 나우캐스팅 실행 (기본 KST 오늘 기준)
+# 4. D-3 ~ D+3 나우캐스팅만 실행 (source window가 없으므로 실측 승격 안 함)
 uv run python main.py estimate
 
-# 특정 기준일 지정 실행
+# 특정 기준일의 나우캐스팅만 실행
 uv run python main.py estimate --target-date 2026-08-17
 
-# 4. 단위 테스트 실행
+# Collector와 같은 exact window의 authoritative 실측도 함께 승격
+uv run python main.py estimate \
+  --target-date 2026-08-17 \
+  --source-window-start 2026-08-17T03:00:00+09:00
+
+# 5. 단위 테스트 실행
 uv run pytest
 ```

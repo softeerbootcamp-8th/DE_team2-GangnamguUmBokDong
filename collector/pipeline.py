@@ -92,8 +92,10 @@ legacy 백필 호환: 예전 설정처럼 `backfill.enabled`이면 `_retry_queue
 - `attempt`는 mutable 진단 실행 횟수다. `revision`은 authoritative source content의
   correction ordinal이며 최초 성공은 0, exact replay는 유지, changed content만 증가한다.
 - 각 단계 경계에서 로그 한 줄씩만 남긴다. 조각마다, 라운드마다 남기지 않는다.
-- 부분 성공의 종료 코드는 0이다. source별 누락 허용치 이내면 기존 합의대로
-  `PARTIAL`로 downstream을 계속 실행하고, 초과한 `FAILED/fetch_error`만 재시도한다.
+- 부분 성공의 종료 코드는 0이다. source별 누락 허용치 이내면 `PARTIAL`로 downstream
+  task를 스케줄하고, PARTIAL Silver를 실제 입력으로 사용할지는 각 소비자가 명시적으로
+  결정한다. 누락 허용치 초과를 포함한 모든 `FAILED`와 처리되지 않은 예외는 non-zero로
+  Airflow retry 대상이다.
 """
 
 from __future__ import annotations

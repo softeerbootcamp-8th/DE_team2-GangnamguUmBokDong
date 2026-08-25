@@ -1,7 +1,7 @@
 # 생활인구 Nowcaster 구현
 
 > **현재 구현:** `nowcaster/`와 Airflow `daily_population_and_events` DAG가 사용하는
-> 생활인구 추정·아카이브 경로다. 코드 확인일: 2026-08-24.
+> 생활인구 추정·아카이브 경로다. 코드 확인일: 2026-08-25.
 
 ## 해결하는 문제
 
@@ -14,20 +14,25 @@ Nowcaster는 실측 archive의 동일 요일·휴일 패턴으로 KST 기준 `D-
 ## 실행 흐름
 
 ```text
-Collector의 당일 living_population_grid
-                    │
-                    ▼
-실제 YMD별 archive 승격 ──→ 같은 날짜 nowcast 삭제
-                    │
-                    ▼
+Collector의 exact living_population_grid authority
+                         │
+                         ▼
+실제 YMD별 archive 승격 ─────→ 같은 날짜 nowcast 삭제
+                         │
+                         ▼
 D-3..D+3 중 archive 없는 날짜 추정
-                    │
-                    ▼
+                         │
+                         ▼
 silver/.../nowcast.parquet
 ```
 
 Collector의 `dt=`는 수집일이고 데이터 내부 `YMD`가 실제 발생일이다. Archive key는 반드시
-`YMD`에서 얻은 business date를 사용한다.
+`YMD`에서 얻은 business date를 사용한다. Nowcaster는 Collector와 같은 exact logical
+window의 source authority가 가리키는 immutable Silver만 actual로 승격한다. PARTIAL이나
+authority 게시 전 Silver는 승격하지 않지만 기존 Archive를 사용한 추정은 계속한다.
+Exact authority가 단순히 없으면 실측 승격만 생략한다. 반면 authority revision chain,
+manifest 또는 연결된 Silver checksum·row count가 손상됐으면 fail-closed하며 추정 task도
+실패한다.
 
 ## CLI
 
@@ -40,8 +45,13 @@ Collector의 `dt=`는 수집일이고 데이터 내부 `YMD`가 실제 발생일
 Airflow는 Collector의 일일 `living_population_grid` 성공 뒤 다음 명령을 실행한다.
 
 ```bash
-uv run --frozen python main.py estimate --target-date <KST YYYY-MM-DD>
+uv run --frozen python main.py estimate \
+  --target-date <KST YYYY-MM-DD> \
+  --source-window-start <Collector와 동일한 timezone-aware logical time>
 ```
+
+`--source-window-start`를 생략한 수동 실행은 actual 승격 없이 추정만 수행한다. 날짜
+prefix만으로는 어떤 Collector window가 authoritative한지 증명할 수 없기 때문이다.
 
 ## 추정 grain과 값
 
@@ -110,7 +120,8 @@ silver/living_population_grid/dt=YYYY-MM-DD/hh=00/nowcast.parquet
 - Nowcast: 추정 대상일 기준 임시 파일, `is_estimated=true`
 - 같은 날짜 archive가 존재하면 estimate를 건너뛴다.
 - 새 실측을 archive에 쓴 뒤 같은 날짜 nowcast 삭제는 idempotent하다.
-- Collector Silver를 읽을 때 `nowcast.parquet`은 실측 후보에서 제외한다.
+- Collector Silver는 exact source authority의 URI·checksum·row count를 검증해 읽는다.
+- PARTIAL, unpublished immutable Silver와 `nowcast.parquet`은 actual 후보가 아니다.
 
 ## 초기 적재
 

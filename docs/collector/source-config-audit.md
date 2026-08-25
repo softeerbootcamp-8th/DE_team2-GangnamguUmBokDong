@@ -74,8 +74,23 @@ Column은 다음 순서로 판정한다.
 
 품질 gate를 통과했지만 일부 part나 row가 빠지면 진단 Silver와 `PARTIAL` manifest를
 남길 수 있지만 authoritative source snapshot으로 게시하지 않는다. 기존 운영 합의에
-따라 생활인구·문화행사·공연행사는 모두 10% 이내 누락을 `PARTIAL`로 처리해 downstream
-실행을 계속한다. 허용치를 초과한 경우에만 `FAILED/fetch_error`가 된다.
+따라 생활인구·문화행사·공연행사는 모두 10% 이내 누락을 `PARTIAL`로 처리해 Collector
+task를 성공 종료한다. 이 때문에 Airflow는 downstream task를 스케줄하지만 PARTIAL
+Silver의 사용 여부는 소비자별로 다르다. 생활인구는 actual Archive 승격을 건너뛰고
+추정만 계속하며, 행사는 기존 `publication_state`와 content-addressed publication
+manifest가 일치할 때 Gold 행과 state를 변경하지 않는다. 유지할 state가 없는 행사는
+fail-closed한다. 허용치를 초과한 경우에만 Collector 자체가 `FAILED/fetch_error`가 된다.
+
+| Source/소비자 | Completed `PARTIAL` 처리 |
+| --- | --- |
+| `population_realtime` → Normalizer | Exact diagnostic과 checksum을 검증해 보정 입력으로 사용 |
+| `living_population_grid` → Nowcaster | Actual Archive 승격은 생략, 기존 Archive 기반 추정은 계속 |
+| `cultural_event`·`performance_event` → Gold | 기존 state·manifest가 일치하면 행/state 무변경, 기존 state가 없으면 실패 |
+| 그 밖의 authority 기반 소비자 | 명시적 허용 정책이 없으면 입력으로 사용하지 않음 |
+
+이 표는 Collector status를 API의 `ready`·`stale` 또는 전체 `degraded` 상태로 직접
+매핑하지 않는다. 최종 serving 상태는 기존 publication 시각과 endpoint freshness 계약이
+별도로 판정한다.
 
 ## 서울 열린데이터광장 Adapter
 

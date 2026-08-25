@@ -9,8 +9,11 @@
 >
 > - 범용 Backfill DAG는 없다. 일일 source의 누락이 합의된 허용치를 넘어서
 >   `fetch_error`가 되면 당일 task retry에서 Collector가 기존 부분 Bronze를 비우고
->   전체를 다시 수집한다. 허용치 이내 누락은 기존처럼 `PARTIAL`로 진행하고,
->   저장·품질 실패는 기존 Bronze를 재사용한다.
+>   전체를 다시 수집한다. 허용치 이내 누락은 `PARTIAL`(exit 0)이어서 downstream
+>   task가 스케줄되지만 데이터 사용 여부는 소비자별 정책이 결정한다. 생활인구는
+>   actual 승격을 건너뛰고 추정을 계속하며, 행사는 기존 state·manifest가 일치할 때만
+>   Gold 행과 state를 변경하지 않는다. Bronze 확보 후 실패 manifest가 남은 품질·후속
+>   저장 실패는 기존 Bronze를 재사용한다.
 > - 대여이력은 일반 백필이 아니라 `+1시간`과 `D-6`의 `--force` correction으로
 >   늦은 반납 기록을 보강한다.
 > - `daily_compaction`은 대여이력 D-6 correction 뒤 Silver를 날짜별 Archive로 묶는다.
@@ -180,7 +183,11 @@ Airflow는 Collector 내부 품질 게이트를 다시 판정하지 않고 **프
 | `SKIPPED` | `0` | `SUCCESS` |
 | `FAILED` | non-zero | Task 실패 → Airflow retry |
 
-`PARTIAL`은 일부 quarantine 또는 일부 조각 누락이 존재하더라도 Collector의 `max_missing_ratio`·`max_drop_ratio` 게이트를 통과하고 `stage=completed`까지 간 상태다. Airflow는 이를 다시 실패로 재판정하지 않는다.
+`PARTIAL`은 일부 quarantine 또는 일부 조각 누락이 존재하더라도 Collector의
+`max_missing_ratio`·`max_drop_ratio` 게이트를 통과하고 `stage=completed`까지 간
+상태다. Airflow는 Collector task를 다시 실패로 재판정하지 않지만, 이는 PARTIAL
+Silver가 모든 downstream 입력으로 허용된다는 뜻이 아니다. 각 소비자가 authority,
+명시적 PARTIAL 보정 또는 기존 publication 유지 중 자기 source 정책을 적용한다.
 
 Collector 세부 결과의 최종 근거는 S3 `_manifest/{source_id}/.../{HHMM}.json`이다. manifest에는 `status`, `stage`, `failure_reason`, `attempt`, `revision`, `counts`, `missing`, `drop_ratio`, `completeness`, `artifacts`, `backfill_status` 등이 기록될 수 있다.
 
