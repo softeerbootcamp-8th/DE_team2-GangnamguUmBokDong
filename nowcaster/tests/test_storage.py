@@ -7,6 +7,7 @@ import boto3
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+import storage
 from core.gold_publication.canonical import sha256_hex
 from core.source_snapshot import (
     SourceSnapshotCounts,
@@ -14,8 +15,6 @@ from core.source_snapshot import (
     build_source_snapshot_manifest,
 )
 from core.source_snapshot_io import SourceSnapshotReadError
-
-import storage
 from tests.conftest import KST, TEST_BUCKET
 
 
@@ -138,6 +137,18 @@ class TestReadRealGridSilver:
         _s3().put_object(Bucket=TEST_BUCKET, Key=key, Body=b"corrupted")
 
         with pytest.raises(SourceSnapshotReadError, match="checksum"):
+            storage.read_real_grid_silver(logical)
+
+    def test_raises_when_authority_revision_chain_starts_at_one(self):
+        """손상된 authority chain을 단순 snapshot 부재로 축소하지 않는다."""
+        logical = datetime(2026, 8, 11, 3, tzinfo=KST)
+        _put_authoritative_snapshot(
+            logical,
+            pa.table({"CELL_ID": ["가가00000000"], "SPOP": [10.0]}),
+            revision=1,
+        )
+
+        with pytest.raises(SourceSnapshotReadError, match="0부터 연속"):
             storage.read_real_grid_silver(logical)
 
 

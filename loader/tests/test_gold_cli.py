@@ -6,12 +6,10 @@ from contextlib import nullcontext
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
+import gold_cli
 import pytest
 from core.gold_publication import ContractViolation
 from core.source_snapshot_io import SourceSnapshotNotFoundError
-
-import gold_cli
-
 
 _EVENT_CASES = (
     ("event:cultural_event", "cultural_event"),
@@ -292,3 +290,46 @@ def test_dispatch_seed_rejects_non_ssot_effective_time(monkeypatch) -> None:
             "seed:dispatch_center",
             datetime(2026, 8, 19, 3, 15, 39, tzinfo=UTC),
         )
+
+
+def test_main_returns_zero_for_stale_event_noop(monkeypatch, capsys) -> None:
+    """검증된 행사 PARTIAL의 stale no-op을 Airflow 성공 종료코드로 변환한다."""
+    monkeypatch.setattr(
+        gold_cli.sys,
+        "argv",
+        [
+            "gold_cli.py",
+            "--publication",
+            "event:cultural_event",
+            "--window-start",
+            "2026-08-20T09:05:00+09:00",
+        ],
+    )
+    monkeypatch.setattr(gold_cli, "run", lambda *_args: "stale")
+
+    assert gold_cli.main() == 0
+    assert "outcome: stale" in capsys.readouterr().out
+
+
+def test_main_returns_one_for_event_fail_closed(monkeypatch, capsys) -> None:
+    """유지할 Gold가 없는 행사 PARTIAL을 Airflow 실패 종료코드로 변환한다."""
+    monkeypatch.setattr(
+        gold_cli.sys,
+        "argv",
+        [
+            "gold_cli.py",
+            "--publication",
+            "event:cultural_event",
+            "--window-start",
+            "2026-08-20T09:05:00+09:00",
+        ],
+    )
+
+    def fail_closed(*_args):
+        """행사 이전 publication 부재를 재현한다."""
+        raise ContractViolation("유지할 Gold publication이 없습니다")
+
+    monkeypatch.setattr(gold_cli, "run", fail_closed)
+
+    assert gold_cli.main() == 1
+    assert "유지할 Gold" in capsys.readouterr().err
