@@ -22,7 +22,6 @@ from core.source_snapshot import (
     SourceSnapshotStatus,
     build_source_snapshot_manifest,
 )
-
 from gold.common import parquet_bytes
 from gold.demand import DemandForecastRecord
 from gold.rebalance_policy import risk_band_policy

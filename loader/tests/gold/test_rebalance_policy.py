@@ -5,8 +5,8 @@ from core.gold_publication import ContractViolation
 from gold.rebalance_policy import (
     DEFAULT_REBALANCE_POLICY,
     LEGACY_REBALANCE_POLICY,
-    PICKUP_DONOR_GUARD_NONE,
     PICKUP_DONOR_GUARD_CAPACITY_RESERVE_V1,
+    PICKUP_DONOR_GUARD_NONE,
     REBALANCE_POLICY_CONFIG_SCHEMA_VERSION,
     RISK_BAND_REBALANCE_POLICY_V5,
     risk_band_policy,

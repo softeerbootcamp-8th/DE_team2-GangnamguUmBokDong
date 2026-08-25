@@ -7,7 +7,6 @@ from copy import deepcopy
 from datetime import date
 
 import pytest
-
 from evaluation.backtest_contract import EvaluationContract
 from evaluation.evaluation_profiles import (
     CALIBRATION_PROFILE,

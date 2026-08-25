@@ -21,7 +21,6 @@ from core.gold_publication import (
     parse_route_coverage,
     route_uuid_v5,
 )
-
 from gold import rebalance_route as route_module
 from gold.common import parquet_bytes, read_parquet_bytes
 from gold.rebalance_policy import (

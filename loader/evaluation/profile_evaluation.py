@@ -9,7 +9,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from .backtest_contract import EvaluationContract, PRIMARY_METRIC
+from .backtest_contract import PRIMARY_METRIC, EvaluationContract
 from .evaluation_profiles import EvaluationCell, EvaluationProfile
 
 EVALUATION_RESULT_SCHEMA_VERSION = "point-in-time-policy-evaluation-v1"

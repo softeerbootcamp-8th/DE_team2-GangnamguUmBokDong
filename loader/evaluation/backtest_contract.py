@@ -11,7 +11,6 @@ from gold.rebalance_route import (
     PICKUP_DISPATCH_SERVICE_MINUTES_PER_STOP,
 )
 
-
 EVIDENCE_GRADE = "retrospective_heldout_replay"
 BACKTEST_CONTRACT_VERSION = "point-in-time-policy-backtest-v3"
 PRIMARY_METRIC = "observed_demand_fulfillment_rate"

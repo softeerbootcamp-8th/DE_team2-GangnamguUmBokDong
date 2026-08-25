@@ -11,7 +11,6 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from core.scoring_config import URGENCY_STOCK_HISTORY_OFFSETS_MINUTES
-
 from gold.demand import DemandForecastRecord
 from gold.rebalance_policy import (
     LEGACY_REBALANCE_POLICY,

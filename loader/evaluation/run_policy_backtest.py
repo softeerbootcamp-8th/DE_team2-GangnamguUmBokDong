@@ -28,6 +28,7 @@ from .backtest_contract import (
     EvaluationContract,
     validate_sensitivity_contracts,
 )
+from .evaluation_profiles import PRODUCTION_POLICY_NAME
 from .historical_inputs import (
     HORIZON_COUNT,
     HistoricalStation,
@@ -47,7 +48,6 @@ from .legacy_baseline import (
     replay_legacy_timing,
 )
 from .policy_simulator import SimulationMetrics, simulate_no_rebalance, simulate_policy
-from .evaluation_profiles import PRODUCTION_POLICY_NAME
 from .rebalance_backtest import (
     RentalTrip,
     StockObservation,
