@@ -120,6 +120,17 @@ def _feature_mart_spark_steps(profile: str) -> tuple[tuple[str, list[str]], tupl
         f"spark.yarn.appMasterEnv.S3_BUCKET={S3_BUCKET}",
         "--conf",
         f"spark.executorEnv.S3_BUCKET={S3_BUCKET}",
+        # PYTHONPATH가 없으면 드라이버/executor가 core/ml_core/feature_engine을
+        # 못 찾아 "No module named 'core'"로 즉시 죽는다(실제 EMR 실행에서 확인,
+        # 2026-08-25) — `Makefile`의 `emr-features` 타겟이 이미 쓰던 값과 맞춘다.
+        "--conf",
+        f"spark.yarn.appMasterEnv.PYTHONPATH={_EMR_PYTHONPATH}",
+        "--conf",
+        f"spark.executorEnv.PYTHONPATH={_EMR_PYTHONPATH}",
+        "--conf",
+        "spark.pyspark.python=/usr/bin/python3.11",
+        "--conf",
+        "spark.pyspark.driver.python=/usr/bin/python3.11",
     ]
     scripts_dir = f"{_EMR_PYTHONPATH}/feature_engine/spark"
     return (
