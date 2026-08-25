@@ -132,16 +132,9 @@ Bronze가 저장된 뒤 Silver 쓰기나 품질 검증이 실패하면 다음 �
 호출하지 않고 같은 Bronze를 재사용한다. 저장 실패 때문에 이미 확보한 원본을 잃지
 않기 위한 계약이다.
 
-`fetch_error`는 source별 `fetch.retry_mode`로 복구한다.
-
-- 서울 current/mutable source의 기본값 `refetch_all`: transient round와 같은-window
-  Airflow retry 모두 기존 부분본을 버리고 전체를 다시 받는다.
-- 기상청 3종의 `retry_missing`: logical window가 발표 시각과 34개 grid key를 고정하므로
-  성공 grid를 유지하고 누락 grid만 다시 받는다.
-
-생활인구·행사·대여소 마스터 같은 일일 current-only source의 자동 fetch retry는 같은
-KST 날짜에만 허용한다. 다음 날 과거 task를 clear해도 현재 응답을 옛 logical window에
-쓰지 않는다. Airflow는 retry 횟수·간격을, Collector는 전체/누락 재수집을 담당한다.
+같은 실행의 transient 다음 round는 source 종류와 관계없이 성공 조각을 유지하고 누락
+조각만 재시도한다. Airflow가 같은 window를 다시 실행하면 외부 API를 호출하지 않고
+manifest가 가리키는 기존 Bronze를 재사용한다.
 
 현재 운영 source에는 delayed `backfill` 설정이 없고 범용 Backfill DAG도 없다.
 `--backfill`, `_retry_queue`와 manifest 필드는 기존 코드·저장 포맷 파싱 호환을 위해

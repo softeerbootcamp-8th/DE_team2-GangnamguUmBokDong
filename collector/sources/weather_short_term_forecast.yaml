@@ -47,7 +47,6 @@ adapter_params:
   - [63, 126]
   - [63, 127]
 schedule: {interval: 3h}
-fetch: {retry_mode: retry_missing}
 storage:
   bronze_format: json
   silver_format: parquet

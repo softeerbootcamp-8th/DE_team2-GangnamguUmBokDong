@@ -13,7 +13,7 @@ import manifest as manifest_module
 import pipeline
 import storage
 from adapters.base import FetchErrorKind, FetchResult, adapter
-from config.schema import Backfill, Fetch, Policies, Quality, Schedule, SourceConfig
+from config.schema import Backfill, Policies, Quality, Schedule, SourceConfig
 from config.schema import Storage as StorageConfig
 from manifest import FailureReason, RunStatus, Stage
 
@@ -184,10 +184,10 @@ class TestFreshFetchSuccess:
         assert result.missing.basis == "parts"
         assert result.completeness == 1.0
 
-    def test_refetch_all_replaces_successes_from_prior_transient_round(
+    def test_round_retry_preserves_successes_from_prior_round(
         self, scripted_adapter, client
     ):
-        """mutable source의 round retry는 서로 다른 snapshot page를 섞지 않는다."""
+        """round retry는 기존 성공 조각을 유지하고 누락 조각만 다시 받는다."""
         scripted_adapter.results = [
             [
                 FetchResult(
@@ -215,18 +215,15 @@ class TestFreshFetchSuccess:
         )
 
         assert result.status is RunStatus.SUCCEEDED
-        assert result.artifacts.bronze.revision == 1
+        assert result.artifacts.bronze.revision == 0
         assert storage.read_bronze(
-            "t_source", WINDOW_START, ["a"], revision=0
-        ) == [_chunk("old-a")]
-        assert storage.read_bronze(
-            "t_source", WINDOW_START, ["a", "b"], revision=1
+            "t_source", WINDOW_START, ["a", "b"], revision=0
         ) == [
-            _chunk("new-a"),
+            _chunk("old-a"),
             _chunk("new-b"),
         ]
 
-    def test_retry_missing_preserves_successes_from_prior_transient_round(
+    def test_all_sources_preserve_successes_from_prior_transient_round(
         self, scripted_adapter, client
     ):
         """고정 격자 source의 round retry는 이미 성공한 조각을 유지한다."""
@@ -251,7 +248,7 @@ class TestFreshFetchSuccess:
                 ),
             ],
         ]
-        config = _config(fetch=Fetch(retry_mode="retry_missing"))
+        config = _config()
 
         result = pipeline.execute_window(
             config, WINDOW_START, client=client, sleep_fn=lambda seconds: None
@@ -626,12 +623,12 @@ class TestBronzeReuseBranch:
 
 
 class TestFetchErrorRecovery:
-    """fetch_error 재실행은 소스 정책에 맞게 Bronze를 다시 확보한다."""
+    """fetch_error 재실행은 기존 Bronze를 재사용한다."""
 
-    def test_refetch_all_creates_new_revision_and_preserves_prior(
+    def test_retry_reuses_prior_revision_without_refetch(
         self, scripted_adapter, client
     ):
-        """전체 재수집은 새 revision을 발표하고 이전 원본도 보존한다."""
+        """Airflow 재실행은 외부 API를 다시 호출하지 않고 부분 Bronze를 유지한다."""
         scripted_adapter.results = [
             [
                 FetchResult(
@@ -663,21 +660,16 @@ class TestFetchErrorRecovery:
         ]
         recovered = pipeline.execute_window(config, WINDOW_START, client=client)
 
-        assert recovered.status is RunStatus.SUCCEEDED
-        assert scripted_adapter.fetch_calls == 2
+        assert recovered.status is RunStatus.FAILED
+        assert recovered.failure_reason is FailureReason.FETCH_ERROR
+        assert scripted_adapter.fetch_calls == 1
         assert failed.artifacts.bronze.revision == 0
-        assert recovered.artifacts.bronze.revision == 1
+        assert recovered.artifacts.bronze.revision == 0
         assert storage.read_bronze(
             config.source_id, WINDOW_START, ["a"], revision=0
         ) == [_chunk("old-a")]
-        assert storage.read_bronze(
-            config.source_id, WINDOW_START, ["a", "b"], revision=1
-        ) == [
-            _chunk("new-a"),
-            _chunk("new-b"),
-        ]
 
-    def test_retry_missing_preserves_successful_parts(
+    def test_retry_reuses_successful_parts(
         self, scripted_adapter, client
     ):
         """안정적인 조각 소스는 기존 성공분을 유지하고 누락분만 다시 받는다."""
@@ -694,7 +686,7 @@ class TestFetchErrorRecovery:
                 ),
             ]
         ]
-        config = _config(fetch=Fetch(retry_mode="retry_missing"))
+        config = _config()
         failed = pipeline.execute_window(
             config, WINDOW_START, client=client, sleep_fn=lambda seconds: None
         )
@@ -712,24 +704,18 @@ class TestFetchErrorRecovery:
         ]
         recovered = pipeline.execute_window(config, WINDOW_START, client=client)
 
-        assert recovered.status is RunStatus.SUCCEEDED
-        assert scripted_adapter.fetch_calls == 2
+        assert recovered.status is RunStatus.FAILED
+        assert scripted_adapter.fetch_calls == 1
         assert failed.artifacts.bronze.revision == 0
-        assert recovered.artifacts.bronze.revision == 1
+        assert recovered.artifacts.bronze.revision == 0
         assert storage.read_bronze(
             config.source_id, WINDOW_START, ["a"], revision=0
         ) == [_chunk("old-a")]
-        assert storage.read_bronze(
-            config.source_id, WINDOW_START, ["a", "b"], revision=1
-        ) == [
-            _chunk("old-a"),
-            _chunk("new-b"),
-        ]
 
-    def test_retry_missing_without_known_missing_falls_back_to_full_refetch(
+    def test_retry_without_known_missing_still_reuses_bronze(
         self, scripted_adapter, client
     ):
-        """누락 key가 없는 fetch_error는 타겟 재시도가 불가능해 전체 재조회한다."""
+        """누락 key가 없어도 Airflow 재실행은 기존 Bronze를 재사용한다."""
         scripted_adapter.results = [
             [
                 FetchResult(
@@ -737,7 +723,7 @@ class TestFetchErrorRecovery:
                 )
             ]
         ]
-        config = _config(fetch=Fetch(retry_mode="retry_missing"))
+        config = _config()
         failed = pipeline.execute_window(config, WINDOW_START, client=client)
         assert failed.failure_reason is FailureReason.FETCH_ERROR
         assert failed.missing.parts == ()
@@ -751,21 +737,18 @@ class TestFetchErrorRecovery:
         ]
         recovered = pipeline.execute_window(config, WINDOW_START, client=client)
 
-        assert recovered.status is RunStatus.SUCCEEDED
-        assert recovered.artifacts.bronze.parts == ("new",)
+        assert recovered.status is RunStatus.FAILED
+        assert recovered.artifacts.bronze.parts == ("old",)
         assert failed.artifacts.bronze.revision == 0
-        assert recovered.artifacts.bronze.revision == 1
+        assert recovered.artifacts.bronze.revision == 0
         assert storage.read_bronze(
             config.source_id, WINDOW_START, ["old"], revision=0
         ) == [_chunk("old")]
-        assert storage.read_bronze(
-            config.source_id, WINDOW_START, ["new"], revision=1
-        ) == [_chunk("new")]
 
-    def test_stale_daily_window_does_not_refetch_current_snapshot(
+    def test_daily_window_retry_does_not_refetch_current_snapshot(
         self, scripted_adapter, client, monkeypatch
     ):
-        """다음 날 과거 일일 task를 재실행해도 현재 응답을 옛 날짜에 쓰지 않는다."""
+        """일일 task 재실행은 실행 날짜와 무관하게 기존 Bronze를 재사용한다."""
         monkeypatch.setattr(pipeline, "_now", lambda: WINDOW_START.replace(hour=15))
         scripted_adapter.results = [
             [
@@ -804,10 +787,10 @@ class TestFetchErrorRecovery:
         assert scripted_adapter.fetch_calls == 1
         assert blocked.artifacts.bronze.revision == failed.artifacts.bronze.revision
 
-    def test_daily_window_refetches_within_same_kst_day(
+    def test_daily_window_does_not_refetch_within_same_kst_day(
         self, scripted_adapter, client, monkeypatch
     ):
-        """정상적인 당일 Airflow retry는 일일 전체본을 다시 수집한다."""
+        """같은 날 Airflow 재실행도 일일 전체본을 다시 수집하지 않는다."""
         now = WINDOW_START.replace(hour=15)
         monkeypatch.setattr(pipeline, "_now", lambda: now)
         scripted_adapter.results = [
@@ -838,8 +821,9 @@ class TestFetchErrorRecovery:
         ]
         recovered = pipeline.execute_window(config, WINDOW_START, client=client)
 
-        assert recovered.status is RunStatus.SUCCEEDED
-        assert scripted_adapter.fetch_calls == 2
+        assert recovered.status is RunStatus.FAILED
+        assert recovered.failure_reason is FailureReason.FETCH_ERROR
+        assert scripted_adapter.fetch_calls == 1
 
 
 class TestBackfillBranch:

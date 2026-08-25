@@ -11,10 +11,7 @@
 | 조건 | 동작 |
 | --- | --- |
 | `stage=completed` (일반 실행) | authority 검증 후 `SKIPPED` 반환 |
-| 이전 `FAILED/fetch_error` & `retry_mode=refetch_all` | 새 Hot revision에 전체 fetch(이전 revision 보존) |
-| 이전 `FAILED/fetch_error` & `retry_mode=retry_missing` & 누락 존재 | 기존 성공 조각 + 새 누락 조각을 새 Hot revision에 저장 |
-| 이전 `FAILED/fetch_error` & 지난 일일 window | 외부 API 재호출 없이 기존 revision을 재사용해 실패 유지 |
-| 이전 `storage_error`·`quality_gate` | 기존 revision의 bronze 로드(fetch 건너뜀) |
+| `stage>=bronze_written` (일반 재실행) | 기존 revision의 bronze 로드(fetch 건너뜀) |
 | 누락 존재 & legacy `--backfill` | 기존 성공 조각 + 새 누락 조각을 새 Hot revision에 저장 |
 | 그 외 (또는 `--force`) | 새 immutable Hot revision에 전체 fetch |
 
@@ -64,18 +61,16 @@ status 결정 규칙:
 silver가 있으면 하류가 manifest 확인 없이 읽을 위험이 있다. quarantine은 실패
 원인 분석에 필요해 이 경우에도 쓰지만, 폐기 행이 0건이면 만들지 않는다. 두
 게이트는 독립이고 `drop_ratio`의 분모는 `fetched`다. `quality_gate` 실패는 같은
-bronze·config로 재시도해도 결과가 같아 config를 고쳐야 하고, `fetch_error`는
-소스의 `fetch.retry_mode`에 맞춰 다시 가져와 회복할 수 있다 — 그래서
-`failure_reason`으로 둘을 구분해 남긴다.
+bronze·config로 재시도해도 결과가 같아 config를 고쳐야 하고, `fetch_error`는 수집
+누락을 뜻한다 — 그래서 `failure_reason`으로 둘을 구분해 남긴다.
 
 legacy 백필 호환: 예전 설정처럼 `backfill.enabled`이면 `_retry_queue` 마커와
 `--backfill` 동작을 유지한다. 현재 운영 source 설정은 이 지연 백필을 켜지 않으므로
-기존 marker도 발견하지 않는다. 일반 복구는 같은 Airflow task의 retry와
-`fetch.retry_mode`가 담당한다.
+기존 marker도 발견하지 않는다.
 
 `stage`의 최종 정지점은 실패 종류별로 다르다.
 - `fetch_error`·`FATAL` — fetch 단계에서 끝났으므로 `BRONZE_WRITTEN`. 다음
-  실행은 `fetch.retry_mode`에 따라 전체 또는 누락 조각을 다시 가져온다.
+  실행은 manifest가 가리키는 기존 Bronze를 재사용한다.
 - `storage_error`·`quality_gate` — normalize·검증까지는 끝났으므로 `VALIDATED`.
   `quality_gate`는 재시도해도 결과가 같지만 `COMPLETED`로 올리지 않는다.
   그러면 다음 실행이 `missing.parts`가 빈 채로 곧장 `SKIPPED`(종료 코드 0)로
@@ -101,7 +96,7 @@ from __future__ import annotations
 
 import logging
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import pyarrow as pa
@@ -237,22 +232,6 @@ def _now() -> datetime:
     return datetime.now(_KST)
 
 
-def _is_stale_daily_retry(
-    config: SourceConfig, window_start: datetime, now: datetime
-) -> bool:
-    """과거 snapshot을 현재 응답으로 덮을 수 있는 일일 window 재시도인지 판정한다.
-
-    현재 운영 중인 일일 source는 날짜 parameter 없이 최신 전체본만 반환한다. 자동
-    fetch recovery는 같은 KST 날짜 안에서만 허용하고, 과거 보정이 정말 필요하면
-    source 의미를 아는 명시적 `--force` 작업으로 분리한다.
-    """
-
-    return (
-        config.schedule.interval >= timedelta(days=1)
-        and window_start.astimezone(_KST).date() != now.astimezone(_KST).date()
-    )
-
-
 def get_backfill_targets(config: SourceConfig) -> list[dict[str, str]]:
     """legacy 백필 실행 도구에 반환할 백필 대상 목록을 조회한다.
 
@@ -324,31 +303,6 @@ def execute_window(
         if hasattr(adapter_cls, "planned_parts")
         else None
     )
-    fetch_error_candidate = bool(
-        existing
-        and existing.status == RunStatus.FAILED
-        and existing.failure_reason == FailureReason.FETCH_ERROR
-        and not force
-        and not backfill
-    )
-    stale_daily_retry = bool(
-        fetch_error_candidate
-        and _is_stale_daily_retry(config, window_start, started_at)
-    )
-    fetch_error_retry = fetch_error_candidate and not stale_daily_retry
-    retry_mode = config.effective_fetch_retry_mode()
-    retry_known_missing = bool(
-        fetch_error_retry
-        and retry_mode == "retry_missing"
-        and existing
-        and existing.missing.parts
-    )
-    if stale_daily_retry:
-        logger.warning(
-            "stage=fetch_recovery status=blocked reason=stale_daily_window "
-            f"window_date={window_start.astimezone(_KST).date()}"
-        )
-
     def _effective_plan(
         completed: tuple[str, ...],
         missing: tuple[str, ...] = (),
@@ -414,7 +368,6 @@ def execute_window(
         existing
         and existing.stage == Stage.COMPLETED
         and not force
-        and not fetch_error_retry
         and not (backfill and existing.missing.parts)
     ):
         # 분기 1: 이미 완결됐고 채울 누락도 없으면(또는 backfill이 아니면) 아무것도
@@ -426,17 +379,13 @@ def execute_window(
 
     if (
         existing
-        and (backfill or retry_known_missing)
+        and backfill
         and existing.missing.parts
         and existing.stage.value >= Stage.BRONZE_WRITTEN.value
         and not force
     ):
-        # 분기 4: 안정적인 조각 소스의 fetch retry 또는 legacy 백필. 기존 snapshot은
-        # 보존하고, 기존 성공 조각과 새 누락 조각을 합친 새 Hot revision을 만든다.
-        logger.info(
-            "stage=fetch_recovery mode=retry_missing "
-            f"missing_parts={len(existing.missing.parts)}"
-        )
+        # 분기 4: legacy 백필. 기존 snapshot은 보존하고, 기존 성공 조각과 새 누락
+        # 조각을 합친 새 Hot revision을 만든다.
         have_parts = existing.artifacts.bronze.parts
         prior_revision = existing.artifacts.bronze.revision
         prior_chunks = dict(
@@ -466,7 +415,6 @@ def execute_window(
                 config.source_id, window_start, key, payload, bronze_revision
             ),
             planned_parts=planned_parts,
-            round_retry_mode="retry_missing",
         )
         chunks = {**prior_chunks, **round_result.chunks}
         missing_keys = round_result.missing
@@ -482,7 +430,6 @@ def execute_window(
         existing
         and existing.stage.value >= Stage.BRONZE_WRITTEN.value
         and not force
-        and not fetch_error_retry
     ):
         # 분기 2: bronze 재사용 — 이전 실행이 fetch까지는 끝냈지만(예: silver 쓰기
         # 실패로 VALIDATED에서 멈췄음) 그 뒤에서 죽은 경우다. 지금 다시 fetch하면
@@ -508,25 +455,9 @@ def execute_window(
         # 분기 3(또는 --force): 처음부터 전체 fetch하되 이전 원본은 지우지 않는다.
         # 새 immutable revision 경로라 조각 수가 줄어도 이전 실행의 유령 조각이
         # 현재 snapshot에 섞이지 않는다.
-        if fetch_error_retry:
-            # retry_missing도 manifest에 누락 key가 없으면 타겟을 정할 수 없으므로
-            # 안전하게 전체 재조회한다.
-            logger.info(
-                f"stage=fetch_recovery mode=refetch_all configured={retry_mode}"
-            )
         bronze_revision = storage.next_bronze_revision(
             config.source_id, window_start
         )
-
-        def _start_fetch_round(round_index: int) -> None:
-            """전체 재수집 라운드마다 별도 immutable Bronze revision을 연다."""
-
-            nonlocal bronze_revision
-            if round_index > 0 and retry_mode == "refetch_all":
-                bronze_revision = storage.next_bronze_revision(
-                    config.source_id, window_start
-                )
-
         round_result = fetch_with_rounds(
             adapter_cls.fetch,
             config,
@@ -536,9 +467,7 @@ def execute_window(
             on_chunk=lambda key, payload: storage.write_bronze_part(
                 config.source_id, window_start, key, payload, bronze_revision
             ),
-            on_round_start=_start_fetch_round,
             planned_parts=planned_parts,
-            round_retry_mode=retry_mode,
         )
         chunks = round_result.chunks
         missing_keys = round_result.missing
@@ -738,7 +667,7 @@ def execute_window(
 
     if ratio > config.quality.max_missing_ratio:
         # 완결도 게이트 초과 — silver를 쓰지 않고 fetch_error로 끝낸다. stage는
-        # BRONZE_WRITTEN 그대로라 재실행하면 소스의 retry_mode 분기로 들어간다.
+        # BRONZE_WRITTEN 그대로라 재실행하면 기존 Bronze 재사용 분기로 들어간다.
         logger.error(
             "stage=bronze_written status=failed failure_reason=fetch_error "
             f"parts={parts_summary} missing_ratio={ratio:.3f}"

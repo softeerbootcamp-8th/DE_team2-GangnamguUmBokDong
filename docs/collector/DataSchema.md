@@ -32,11 +32,11 @@ bronze/hot/<source_id>/dt=YYYY-MM-DD/hh=HH/HHMM/revision=NNNNNNNNNN/part=<part_k
 - API page, 기상 격자 또는 POI 같은 fetch part별 gzip JSON이다.
 - 응답 원문에 가깝게 보존하며 validation 이전의 재개 지점이다.
 - part가 도착할 때마다 즉시 쓴다.
-- 저장·품질 실패와 과거 일일 window 재시도는 manifest가 가리키는 Hot Bronze
-  revision을 재사용한다.
-- 최초 수집·`refetch_all`·`--force`·backfill correction은 기존 원본을 지우지 않고
-  새 immutable revision을 만든다. `retry_missing` correction은 기존 성공 조각과
-  새 누락 조각을 새 revision에 합친다.
+- 일반 Airflow 재실행은 실패 종류와 실행 날짜에 관계없이 manifest가 가리키는 Hot
+  Bronze revision을 재사용한다.
+- 최초 수집·`--force`·backfill correction은 기존 원본을 지우지 않고 새 immutable
+  revision을 만든다. backfill correction은 기존 성공 조각과 새 누락 조각을 새
+  revision에 합친다.
 - Silver Archive 대상 여부와 관계없이 모든 Collector source의 검증된 날짜 revision은
   `bronze/cold/<source_id>/dt=YYYY-MM-DD/sha256=...parquet`에 원본 gzip bytes 그대로
   장기 보관한다.
