@@ -1,10 +1,16 @@
 # ADR-0004: 누락 조각은 분류해 재시도하고 허용 범위 안에서 부분 처리한다
 
-- 상태: 채택
+- 상태: 수정됨 (2026-08-25)
 - 결정일: 2026-08-13
 - 작성자: Data Engineering 2팀
 - 대체 대상: ADR-0003의 순번 key와 첫 실패 즉시 중단 결정
 - 대체한 ADR: 없음
+
+> **2026-08-25 수정:** 아래 1·2절의 오류 분류와 품질 gate는 유지한다. 3절의 범용
+> delayed backfill 결정은 현재 운영에서 대체되었다. 운영 source는 retry marker를
+> 만들지 않고, 같은 실행의 transient round 및 같은-window Airflow retry에서
+> `fetch.retry_mode`(`refetch_all` 또는 `retry_missing`)로 즉시 복구한다. 관련 CLI와
+> manifest 필드는 파싱 호환용 legacy이며 기존 marker는 별도 정리 대상이다.
 
 ## 배경
 
@@ -20,6 +26,10 @@
 - `PERMANENT`: HTTP 400과 404는 해당 조각만 누락으로 확정한다.
 - `FATAL`: HTTP 401과 403 같은 인증 오류는 남은 호출과 라운드를 즉시 중단한다.
 
+`TRANSIENT` 다음 round는 source의 `fetch.retry_mode`를 따른다. 페이지 경계가 바뀌는
+current/mutable API는 `refetch_all`로 전체를 다시 받고, 발표 시각과 grid key가 고정된
+기상청 source만 `retry_missing`으로 성공 조각을 유지한다.
+
 각 window의 전체 fetch에는 명시한 `fetch.budget`을 적용하고, 없으면 수집 주기의 절반과 30분 중 작은 값을 사용한다. Adapter가 전체 요청 목록을 아는 경우 `planned_parts`를 제공해 budget 전에 시작하지 못한 요청도 누락으로 기록한다.
 
 ### 2. 수집 누락과 검증 폐기를 독립적으로 판정한다
@@ -28,7 +38,7 @@
 
 검증 폐기 비율의 분모는 실제 수집 행 수다. 폐기 비율이 임계치를 넘으면 Quarantine은 남기되 Silver는 쓰지 않고 `FAILED/quality_gate`로 끝낸다. 최종 `completeness`와 누락 key는 진단 manifest에 기록한다.
 
-### 3. backfill은 시간 일관성을 지킬 수 있는 source에서만 수행한다
+### 3. backfill은 시간 일관성을 지킬 수 있는 source에서만 수행한다 (대체됨)
 
 source config의 `backfill.enabled`와 `max_age`로 허용 여부와 기간을 제한한다. 불완전한 실행은 `_retry_queue/{source_id}/{window_start}.json` marker로 찾되, 실제 대상 여부는 manifest를 다시 확인한다.
 

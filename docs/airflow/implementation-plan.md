@@ -1,6 +1,24 @@
 # Airflow 구현 계획
 
-> **보관 문서:** 구현 당시의 상세 계획을 보존한 자료다. 현재 DAG 이름, 주기와 인프라 구성은 이 문서가 아니라 [Airflow 운영 구조와 데이터 흐름](./explain.md) 및 실제 코드를 기준으로 판단한다.
+> **보관 문서:** 구현 당시의 상세 계획을 보존한 자료다. 아래 본문에 남은
+> Backfill·Bronze Compaction 설계는 현재 운영 계약이 아니다. 현행 DAG 이름, 주기와
+> 인프라 구성은 실제 `airflow/dags/`, `airflow/orchestration/` 및 Collector 코드를
+> 기준으로 판단한다.
+>
+> 현행 책임과 구현 상태는 다음과 같다.
+>
+> - 범용 Backfill DAG는 없다. 일일 전체 snapshot의 `fetch_error`는 당일 task retry에서
+>   Collector가 기존 부분 Bronze를 비우고 전체를 다시 수집한다. 저장·품질 실패는
+>   기존 Bronze를 재사용한다.
+> - 대여이력은 일반 백필이 아니라 `+1시간`과 `D-6`의 `--force` correction으로
+>   늦은 반납 기록을 보강한다.
+> - `daily_compaction`은 대여이력 D-6 correction 뒤 Silver를 날짜별 Archive로 묶는다.
+>   대여소 실시간·기상 실황 Archive는 이 replay와 독립적으로 처리한다. Bronze를
+>   압축하는 작업이 아니다.
+> - 영구 원본용 Cold Bronze archive/compaction은 아직 구현하지 않았다.
+> - `--backfill`, retry marker와 manifest의 backfill 필드는 기존 코드·manifest 파싱
+>   호환을 위해 유지한다. 운영 설정은 marker를 만들거나 발견하지 않으며, 기존
+>   `_retry_queue` 객체는 비활성 상태로 별도 정리할 대상이다.
 
 ## 1. 목적
 
