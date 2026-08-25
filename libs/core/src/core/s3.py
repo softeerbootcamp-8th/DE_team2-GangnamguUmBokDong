@@ -15,6 +15,7 @@ from contextlib import contextmanager
 from contextvars import Context, ContextVar, copy_context
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Any
 
 import boto3
 import pandas as pd
@@ -77,6 +78,8 @@ _ACTIVE_READ_CAPTURE: ContextVar[S3ReadCapture | None] = ContextVar(
     "core_s3_active_read_capture",
     default=None,
 )
+_CLIENT_CACHE_LOCK = threading.Lock()
+_CLIENT_CACHE: dict[tuple[object, ...], Any] = {}
 
 
 @contextmanager
@@ -199,7 +202,7 @@ def _select_required_columns(table: pa.Table, columns: list[str]) -> pa.Table:
 
 
 def _client(timeout_seconds: float | None = None):
-    """S3 호환 클라이언트를 생성한다.
+    """S3 호환 클라이언트를 process-local로 생성해 재사용한다.
 
     `S3_ENDPOINT_URL`이 있으면 MinIO 등 S3 호환 스토리지로 보고 환경변수의 자격증명을
     명시적으로 넘긴다(로컬 개발 경로 — 기존 동작 그대로). 없으면 실제 AWS S3로 보고
@@ -214,21 +217,51 @@ def _client(timeout_seconds: float | None = None):
             — 대부분의 호출(학습 데이터 로드 등)은 느리더라도 끝까지 재시도하는 게
             맞아 기본값을 안 바꾼다.
     """
-    config = None
-    if timeout_seconds is not None:
-        config = BotoConfig(
-            connect_timeout=timeout_seconds, read_timeout=timeout_seconds, retries={"max_attempts": 1}
-        )
     endpoint_url = os.environ.get("S3_ENDPOINT_URL") or None
-    if endpoint_url:
-        return boto3.client(
-            "s3",
-            endpoint_url=endpoint_url,
-            aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID", "minioadmin"),
-            aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY", "minioadmin"),
-            config=config,
-        )
-    return boto3.client("s3", config=config)
+    access_key = (
+        os.environ.get("AWS_ACCESS_KEY_ID", "minioadmin") if endpoint_url else None
+    )
+    secret_key = (
+        os.environ.get("AWS_SECRET_ACCESS_KEY", "minioadmin") if endpoint_url else None
+    )
+    cache_key = (
+        os.getpid(),
+        id(boto3),
+        endpoint_url,
+        access_key,
+        secret_key,
+        timeout_seconds,
+    )
+    with _CLIENT_CACHE_LOCK:
+        cached = _CLIENT_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+
+        config = None
+        if timeout_seconds is not None:
+            config = BotoConfig(
+                connect_timeout=timeout_seconds,
+                read_timeout=timeout_seconds,
+                retries={"max_attempts": 1},
+            )
+        if endpoint_url:
+            client = boto3.client(
+                "s3",
+                endpoint_url=endpoint_url,
+                aws_access_key_id=access_key,
+                aws_secret_access_key=secret_key,
+                config=config,
+            )
+        else:
+            client = boto3.client("s3", config=config)
+        _CLIENT_CACHE[cache_key] = client
+        return client
+
+
+def _clear_client_cache() -> None:
+    """테스트가 격리된 mock/backend마다 새 client를 만들도록 cache를 비운다."""
+    with _CLIENT_CACHE_LOCK:
+        _CLIENT_CACHE.clear()
 
 
 def _bucket() -> str:

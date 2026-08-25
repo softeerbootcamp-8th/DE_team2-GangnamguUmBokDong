@@ -393,10 +393,38 @@ class _CapturingBoto3:
 
     def __init__(self):
         self.kwargs: dict | None = None
+        self.calls = 0
 
     def client(self, service_name, **kwargs):
+        self.calls += 1
         self.kwargs = kwargs
         return object()
+
+
+def test_client_is_reused_inside_process(monkeypatch):
+    """같은 endpoint와 timeout의 S3 client는 process 안에서 한 번만 생성한다."""
+    fake = _CapturingBoto3()
+    monkeypatch.setattr(s3, "boto3", fake)
+    monkeypatch.delenv("S3_ENDPOINT_URL", raising=False)
+
+    first = s3._client()
+    second = s3._client()
+
+    assert first is second
+    assert fake.calls == 1
+
+
+def test_client_cache_separates_timeout_policy(monkeypatch):
+    """기본 재시도와 짧은 fallback timeout은 서로 다른 client를 쓴다."""
+    fake = _CapturingBoto3()
+    monkeypatch.setattr(s3, "boto3", fake)
+    monkeypatch.delenv("S3_ENDPOINT_URL", raising=False)
+
+    default = s3._client()
+    short = s3._client(0.5)
+
+    assert default is not short
+    assert fake.calls == 2
 
 
 @pytest.mark.parametrize("endpoint", [None, ""])

@@ -14,8 +14,17 @@ lookback_hours) 넘게 미래면 그 구간에 관측 데이터가 원천적으�
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from inference import predict_single as ps
+
+
+@pytest.fixture(autouse=True)
+def _clear_weather_caches():
+    """각 테스트가 독립된 inference run의 날씨 cache에서 시작하게 한다."""
+    ps._clear_runtime_caches()
+    yield
+    ps._clear_runtime_caches()
 
 
 def test_uses_observation_when_target_equals_anchor(monkeypatch):
@@ -231,11 +240,13 @@ def test_get_recent_weather_skips_invalid_latest_tick(monkeypatch):
     """최신 tick이 NaN이면 그대로 반환하지 않고 이전의 유효한 관측으로 돌아간다."""
     target_ts = pd.Timestamp("2026-08-17 15:00:00")
 
+    snapshots = [
+        _observed_row(np.nan, "broken"),
+        _observed_row(23.0, 0.5),
+    ]
+
     def _fake_read_many(keys, columns=None):
-        values = [None] * len(keys)
-        values[-2] = _observed_row(23.0, 0.5)
-        values[-1] = _observed_row(np.nan, "broken")
-        return values
+        return [snapshots.pop(0)]
 
     monkeypatch.setattr(ps, "_read_authoritative_collector_many", _fake_read_many)
 
@@ -246,12 +257,56 @@ def test_get_recent_weather_skips_out_of_range_latest_tick(monkeypatch):
     """Collector 계약 범위를 벗어난 최신 관측도 이전 정상 tick으로 대체한다."""
     target_ts = pd.Timestamp("2026-08-17 15:00:00")
 
+    snapshots = [
+        _observed_row(999.0, -1.0),
+        _observed_row(23.0, 0.5),
+    ]
+
     def _fake_read_many(keys, columns=None):
-        values = [None] * len(keys)
-        values[-2] = _observed_row(23.0, 0.5)
-        values[-1] = _observed_row(999.0, -1.0)
-        return values
+        return [snapshots.pop(0)]
 
     monkeypatch.setattr(ps, "_read_authoritative_collector_many", _fake_read_many)
 
     assert ps._get_recent_weather(target_ts) == {"temp": 23.0, "precip": 0.5}
+
+
+def test_recent_weather_reuses_same_anchor_result(monkeypatch):
+    """예보 실패가 horizon마다 반복돼도 같은 관측 fallback은 한 번만 읽는다."""
+    target_ts = pd.Timestamp("2026-08-17 15:00:00")
+    calls = []
+
+    def _fake_read_many(keys, columns=None):
+        calls.append(keys[0])
+        return [_observed_row(23.0, 0.5)]
+
+    monkeypatch.setattr(ps, "_read_authoritative_collector_many", _fake_read_many)
+
+    first = ps._get_recent_weather(target_ts)
+    second = ps._get_recent_weather(target_ts)
+
+    assert first == second == {"temp": 23.0, "precip": 0.5}
+    assert len(calls) == 1
+
+
+def test_forecast_reuses_same_issue_snapshot_across_targets(monkeypatch):
+    """같은 발표본에 든 서로 다른 horizon은 source snapshot을 다시 읽지 않는다."""
+    snapshots = pd.concat(
+        [
+            _forecast_row("20260817", "1500", 24.0, "1.5mm"),
+            _forecast_row("20260817", "1600", 25.0, "강수없음"),
+        ]
+    )
+    calls = []
+
+    def _fake_read_many(keys, columns=None):
+        calls.append(keys[0])
+        return [snapshots]
+
+    monkeypatch.setattr(ps, "_read_authoritative_collector_many", _fake_read_many)
+
+    at_15 = ps._get_forecast_weather(pd.Timestamp("2026-08-17 15:00:00"))
+    at_16 = ps._get_forecast_weather(pd.Timestamp("2026-08-17 16:00:00"))
+
+    assert at_15 == {"temp": 24.0, "precip": 1.5}
+    assert at_16 == {"temp": 25.0, "precip": 0.0}
+    assert len(calls) == 1

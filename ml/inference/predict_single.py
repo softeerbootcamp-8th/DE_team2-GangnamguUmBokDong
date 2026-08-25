@@ -178,6 +178,11 @@ _raw_rental_trips: pd.DataFrame | None = (
 _recent_population_by_ts: dict[
     pd.Timestamp, pd.DataFrame
 ] = {}  # _get_recent_population() 캐시 — target_ts별로 한 번만 S3에서 읽는다
+_weather_snapshot_by_key: dict[str, pd.DataFrame | None] = {}
+_recent_weather_by_query: dict[tuple[pd.Timestamp, float], dict[str, float]] = {}
+_forecast_weather_by_query: dict[
+    tuple[pd.Timestamp, float], dict[str, float] | None
+] = {}
 _PINNED_STATION_PROFILE: ContextVar[
     tuple[dict[int, int], dict[tuple[int, int], np.ndarray]] | None
 ] = (
@@ -233,6 +238,9 @@ def _clear_runtime_caches() -> None:
     _holidays_by_year.clear()
     _raw_rental_trips = None
     _recent_population_by_ts.clear()
+    _weather_snapshot_by_key.clear()
+    _recent_weather_by_query.clear()
+    _forecast_weather_by_query.clear()
 
 
 @contextmanager
@@ -1100,6 +1108,15 @@ def _weather_values(df: pd.DataFrame | None) -> dict[str, float] | None:
     return {"temp": float(means["temp"]), "precip": float(means["precip"])}
 
 
+def _read_weather_snapshot(logical_key: str) -> pd.DataFrame | None:
+    """한 authority run에서 같은 날씨 logical snapshot을 한 번만 읽는다."""
+    if logical_key not in _weather_snapshot_by_key:
+        _weather_snapshot_by_key[logical_key] = _read_authoritative_collector_many(
+            [logical_key]
+        )[0]
+    return _weather_snapshot_by_key[logical_key]
+
+
 def _get_recent_weather(
     target_ts: pd.Timestamp,
     lookback_hours: float = silver_schema.WEATHER_MAX_STALENESS_HOURS,
@@ -1122,12 +1139,16 @@ def _get_recent_weather(
     raises:
         ValueError: target_ts부터 lookback_hours시간 전까지 전부 데이터가 없을 때
     """
+    query = (target_ts, lookback_hours)
+    if query in _recent_weather_by_query:
+        return _recent_weather_by_query[query]
+
     keys = silver_schema.weather_tick_keys(target_ts, lookback_hours)
-    for df in reversed(
-        _read_authoritative_collector_many(keys)
-    ):  # target_ts에 가장 가까운 것부터
+    for logical_key in reversed(keys):  # target_ts에 가장 가까운 것부터
+        df = _read_weather_snapshot(logical_key)
         weather = _weather_values(df)
         if weather is not None:
+            _recent_weather_by_query[query] = weather
             return weather
     raise ValueError(
         f"최근 {lookback_hours}시간 안에 날씨 데이터가 없습니다(target_ts={target_ts})"
@@ -1161,14 +1182,17 @@ def _get_forecast_weather(
             타겟 시각 컬럼이 없거나 강수량 파싱에 전부 실패하면 None(호출부가
             관측치 fallback으로 넘어감)
     """
+    query = (target_ts, issue_lookback_hours)
+    if query in _forecast_weather_by_query:
+        return _forecast_weather_by_query[query]
+
     keys = silver_schema.weather_forecast_issue_keys(target_ts, issue_lookback_hours)
     date_col, time_col = (
         silver_schema.WEATHER_FORECAST_DATE_COLUMN,
         silver_schema.WEATHER_FORECAST_TIME_COLUMN,
     )
-    for df in reversed(
-        _read_authoritative_collector_many(keys)
-    ):  # 가장 최근 발표 파일부터
+    for logical_key in reversed(keys):  # 가장 최근 발표 파일부터
+        df = _read_weather_snapshot(logical_key)
         if (
             df is None
             or df.empty
@@ -1218,7 +1242,10 @@ def _get_forecast_weather(
         if not valid.any():
             continue
         means = numeric.loc[valid, ["temp", "precip"]].mean()
-        return {"temp": float(means["temp"]), "precip": float(means["precip"])}
+        weather = {"temp": float(means["temp"]), "precip": float(means["precip"])}
+        _forecast_weather_by_query[query] = weather
+        return weather
+    _forecast_weather_by_query[query] = None
     return None
 
 
