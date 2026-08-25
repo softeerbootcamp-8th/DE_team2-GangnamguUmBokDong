@@ -5,7 +5,14 @@
 
 import pendulum
 from airflow.timetables.trigger import CronTriggerTimetable
-from config.schedules import CATCHUP, DAILY_CRON, MAX_ACTIVE_RUNS, TIMEZONE
+from config.schedules import (
+    CATCHUP,
+    DAILY_CRON,
+    DAILY_POPULATION_RETRIES,
+    DAILY_POPULATION_RETRY_DELAY,
+    MAX_ACTIVE_RUNS,
+    TIMEZONE,
+)
 from config.sources import (
     DAILY_EVENT_SOURCE,
     DAILY_POPULATION_SOURCE,
@@ -25,7 +32,12 @@ with DAG(
     max_active_runs=MAX_ACTIVE_RUNS,
     tags=["daily"],
 ) as dag:
-    collect_population = build_collector_task(dag, DAILY_POPULATION_SOURCE)
+    collect_population = build_collector_task(
+        dag,
+        DAILY_POPULATION_SOURCE,
+        retries=DAILY_POPULATION_RETRIES,
+        retry_delay=DAILY_POPULATION_RETRY_DELAY,
+    )
     run_nowcasting = build_nowcasting_task(dag)
     collect_population >> run_nowcasting
 

@@ -1,10 +1,16 @@
 # ADR-0004: 누락 조각은 분류해 재시도하고 허용 범위 안에서 부분 처리한다
 
-- 상태: 채택
+- 상태: 수정됨 (2026-08-25)
 - 결정일: 2026-08-13
 - 작성자: Data Engineering 2팀
 - 대체 대상: ADR-0003의 순번 key와 첫 실패 즉시 중단 결정
 - 대체한 ADR: 없음
+
+> **2026-08-25 수정:** 아래 1·2절의 오류 분류와 품질 gate는 유지한다. 3절의 범용
+> delayed backfill 결정은 현재 운영에서 대체되었다. 운영 source는 retry marker를
+> 만들지 않고, 같은 실행의 transient round 및 같은-window Airflow retry에서
+> `fetch.retry_mode`(`refetch_all` 또는 `retry_missing`)로 즉시 복구한다. 관련 CLI와
+> manifest 필드는 파싱 호환용 legacy이며 기존 marker는 별도 정리 대상이다.
 
 ## 배경
 
@@ -20,6 +26,10 @@
 - `PERMANENT`: HTTP 400과 404는 해당 조각만 누락으로 확정한다.
 - `FATAL`: HTTP 401과 403 같은 인증 오류는 남은 호출과 라운드를 즉시 중단한다.
 
+`TRANSIENT` 다음 round는 source의 `fetch.retry_mode`를 따른다. 페이지 경계가 바뀌는
+current/mutable API는 `refetch_all`로 전체를 다시 받고, 발표 시각과 grid key가 고정된
+기상청 source만 `retry_missing`으로 성공 조각을 유지한다.
+
 각 window의 전체 fetch에는 명시한 `fetch.budget`을 적용하고, 없으면 수집 주기의 절반과 30분 중 작은 값을 사용한다. Adapter가 전체 요청 목록을 아는 경우 `planned_parts`를 제공해 budget 전에 시작하지 못한 요청도 누락으로 기록한다.
 
 ### 2. 수집 누락과 검증 폐기를 독립적으로 판정한다
@@ -28,7 +38,19 @@
 
 검증 폐기 비율의 분모는 실제 수집 행 수다. 폐기 비율이 임계치를 넘으면 Quarantine은 남기되 Silver는 쓰지 않고 `FAILED/quality_gate`로 끝낸다. 최종 `completeness`와 누락 key는 진단 manifest에 기록한다.
 
-### 3. backfill은 시간 일관성을 지킬 수 있는 source에서만 수행한다
+`PARTIAL`의 프로세스 종료 코드는 0이므로 Airflow는 downstream task를 스케줄한다.
+그러나 PARTIAL Silver는 source authority가 아니며, 실제 데이터 사용은 소비자가
+명시적으로 허용한 경우에만 가능하다. 현재 source별 처리는 다음과 같다.
+
+- `population_realtime`: Normalizer가 검증된 exact PARTIAL을 보정 입력으로 허용한다.
+- `living_population_grid`: Nowcaster는 PARTIAL을 actual Archive로 승격하지 않지만 기존
+  Archive를 이용한 `D-3..D+3` 추정은 계속한다.
+- 문화·공연행사: 기존 `publication_state`와 그 content-addressed publication manifest가
+  일치하면 Gold 행과 state를 변경하지 않는다. 유지할 state가 없거나 manifest가
+  일치하지 않으면 실패한다.
+- 그 밖의 authority 기반 소비자는 별도 허용 정책이 없으면 PARTIAL을 입력으로 쓰지 않는다.
+
+### 3. backfill은 시간 일관성을 지킬 수 있는 source에서만 수행한다 (대체됨)
 
 source config의 `backfill.enabled`와 `max_age`로 허용 여부와 기간을 제한한다. 불완전한 실행은 `_retry_queue/{source_id}/{window_start}.json` marker로 찾되, 실제 대상 여부는 manifest를 다시 확인한다.
 
@@ -46,7 +68,11 @@ Backfill은 기존 Bronze를 유지하고 누락 key만 요청한 뒤 window 전
 
 ## 결과
 
-허용된 일부 누락은 명시적인 `PARTIAL` 결과로 보존되지만 authority로 게시되지 않으며, 완전한 correction이 만들어질 때만 하류의 기준이 바뀐다. API 장애 시 실행 시간이 늘 수 있으므로 fetch budget과 Airflow execution timeout을 함께 관리해야 한다.
+허용된 일부 누락은 명시적인 `PARTIAL` 결과로 보존되지만 authority로 게시되지 않는다.
+따라서 완전한 correction이 만들어질 때만 source authority가 바뀐다. 소비자는 명시적
+PARTIAL 보정, 이전 publication 유지 또는 입력 부재 실패 중 source에 맞는 정책을
+선택한다. API 장애 시 실행 시간이 늘 수 있으므로 fetch budget과 Airflow execution
+timeout을 함께 관리해야 한다.
 
 Snapshot source처럼 과거 시각을 재조회할 수 없는 데이터는 불완전 상태가 최종값으로 남을 수 있다. 이는 다른 시점의 데이터를 섞는 것보다 안전한 선택이다.
 

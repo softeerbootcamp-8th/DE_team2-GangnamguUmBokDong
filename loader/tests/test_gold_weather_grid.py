@@ -47,8 +47,8 @@ def test_repository_weather_sources_build_exact_34_grid_seed() -> None:
     document = parse_canonical_json(seed.canonical_bytes)
     assert type(document) is dict
     assert [source["byte_sha256"] for source in document["sources"]] == [
-        "97fed1fcc636a4cbda5dddf95c2d992e30aff27bb51e8b512ed555978fcaee07",
-        "225a2af9dd78ce49e0cf310cc20f36fe3149761e4fb1c8fa273d1d295bbeafb3",
+        "a8af453399789ea243b147068114e71c5c94d446f8bd5db4e1d95ed39cb17eb5",
+        "9ebd05e8a9505d334eceebafd70c347db7c1ac4a20d44918c503831ca126c9d6",
     ]
 
 
