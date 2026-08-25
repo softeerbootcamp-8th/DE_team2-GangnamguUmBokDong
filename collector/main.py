@@ -5,7 +5,7 @@
         --window-start 2026-08-12T23:10:00+09:00 [--force] [--backfill]
 
 Airflow는 소스별 태스크에서 논리 시각을 KST로 변환해 `--window-start`로 넘긴다.
-일반 fetch 실패는 같은 태스크의 retry에서 소스별 `fetch.retry_mode`로 복구한다.
+일반 재실행은 manifest가 가리키는 기존 Bronze를 재사용한다.
 현재 범용 Backfill DAG는 없으며, `--backfill`과 대상 조회 옵션은 legacy 코드
 호환용으로만 유지한다. 운영 설정은 예전 retry marker를 발견하지 않는다.
 `window_end`는 config의 `schedule.interval`로 계산하며, collector 자체는 스케줄을

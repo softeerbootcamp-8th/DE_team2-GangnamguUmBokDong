@@ -251,10 +251,9 @@ def test_fetch_with_rounds_retries_transient_failure_in_next_round(window):
     sleep_fn.assert_called_once_with(15)
 
 
-def test_fetch_with_rounds_refetches_whole_mutable_snapshot(window):
-    """refetch_all round는 앞 round 성공분까지 새 snapshot payload로 교체한다."""
+def test_fetch_with_rounds_keeps_successes_from_prior_round(window):
+    """다음 round는 앞 round 성공분을 유지하고 누락 조각만 다시 받는다."""
     calls = []
-    started_rounds = []
 
     def fetch_fn(config, win, *, client, skip, expected_total):
         """첫 round만 실패하고 두 번째 round에서 바뀐 전체본을 반환한다."""
@@ -271,9 +270,6 @@ def test_fetch_with_rounds_refetches_whole_mutable_snapshot(window):
             )
         else:
             yield FetchResult(
-                key="a", payload=b"new-a", error=None, expected_total=2
-            )
-            yield FetchResult(
                 key="b", payload=b"new-b", error=None, expected_total=None
             )
 
@@ -283,13 +279,10 @@ def test_fetch_with_rounds_refetches_whole_mutable_snapshot(window):
         window,
         client=object(),
         sleep_fn=lambda seconds: None,
-        on_round_start=started_rounds.append,
-        round_retry_mode="refetch_all",
     )
 
-    assert calls == [frozenset(), frozenset()]
-    assert started_rounds == [0, 1]
-    assert result.chunks == {"a": b"new-a", "b": b"new-b"}
+    assert calls == [frozenset(), frozenset({"a"})]
+    assert result.chunks == {"a": b"old-a", "b": b"new-b"}
 
 
 def test_fetch_with_rounds_fatal_aborts_immediately_without_further_calls(window):

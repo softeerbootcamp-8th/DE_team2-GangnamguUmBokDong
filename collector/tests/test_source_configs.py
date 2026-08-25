@@ -24,6 +24,8 @@ from core.forecast import POPULATION_FORECAST_SLOT_COUNT
 
 pytestmark = pytest.mark.usefixtures("_bucket")
 
+from core.s3 import get_object_bytes
+
 import config.loader as config_loader
 import pipeline
 import storage
@@ -31,7 +33,6 @@ from adapters import (  # noqa: F401 — @adapter 등록을 위한 import
     kma_apihub,
     seoul_openapi,
 )
-from core.s3 import get_object_bytes
 from manifest import RunStatus
 
 KST = ZoneInfo("Asia/Seoul")
@@ -115,40 +116,6 @@ class TestAllSourcesLoad:
         config = config_loader.load(source_id, base_dir=SOURCES_DIR)
 
         assert config.quality.max_missing_ratio == expected_ratio
-
-    @pytest.mark.parametrize(
-        "source_id",
-        (
-            "weather_ultra_short_live",
-            "weather_ultra_short_forecast",
-            "weather_short_term_forecast",
-        ),
-    )
-    def test_weather_retries_only_missing_grids(self, source_id):
-        """기상 격자는 같은 발표 시각을 재조회해 성공한 Bronze를 재사용한다."""
-        config = config_loader.load(source_id, base_dir=SOURCES_DIR)
-
-        assert config.fetch is not None
-        assert config.fetch.retry_mode == "retry_missing"
-        assert config.effective_fetch_retry_mode() == "retry_missing"
-
-    @pytest.mark.parametrize(
-        "source_id",
-        (
-            "bike_rental_history",
-            "bike_station_master",
-            "bike_station_realtime",
-            "cultural_event",
-            "living_population_grid",
-            "performance_event",
-            "population_realtime",
-        ),
-    )
-    def test_non_weather_sources_default_to_full_refetch(self, source_id):
-        """기상 외 소스는 fetch 실패 후 서로 다른 snapshot 조각을 섞지 않는다."""
-        config = config_loader.load(source_id, base_dir=SOURCES_DIR)
-
-        assert config.effective_fetch_retry_mode() == "refetch_all"
 
     def test_no_source_declares_response_pagination_meta(self):
         """`RNUM`·`START_INDEX`·`END_INDEX`는 데이터가 아니라 요청/응답 메타다.

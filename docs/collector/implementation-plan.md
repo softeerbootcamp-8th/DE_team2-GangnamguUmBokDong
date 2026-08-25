@@ -565,21 +565,20 @@ if completed_authority and not force and not requested_correction:
     verify_authority()
     return SKIPPED
 
-if retry_missing or requested_backfill:
+if requested_backfill:
     prior = read_manifest_revision()
     bronze_revision = next_bronze_revision()
     copy_successful_parts(prior, bronze_revision)
-    new, missing = fetch_with_rounds(skip=prior.parts, retry_mode="retry_missing")
+    new, missing = fetch_with_rounds(skip=prior.parts)
     chunks = prior.chunks | new
 
-elif reusable_bronze or stale_daily_fetch_error:
+elif manifest and manifest.stage >= BRONZE_WRITTEN and not force:
     bronze_revision = manifest.artifacts.bronze.revision
     chunks = read_manifest_revision()                         # 외부 API 호출 없음
 
-else:                                                         # 최초·force·refetch_all
+else:                                                         # 최초·force
     bronze_revision = next_bronze_revision()
-    chunks, missing = fetch_with_rounds(retry_mode=source.retry_mode)
-    # refetch_all의 transient 새 round도 새 immutable revision을 사용한다.
+    chunks, missing = fetch_with_rounds()                     # 성공분 유지, 누락만 재시도
 
 rows = adapter.normalize(chunks)                              # 항상 다시 수행
 # 이후 게이트 → 검증 → immutable silver → authority manifest 갱신
@@ -590,14 +589,14 @@ rows = adapter.normalize(chunks)                              # 항상 다시 �
 | # | 조건 | 동작 |
 | --- | --- | --- |
 | 1 | 완료 authority & 일반 재실행 | authority 검증 후 SKIPPED |
-| 2 | `storage_error`·`quality_gate` 또는 지난 일일 `fetch_error` | manifest가 가리키는 Bronze revision 재사용 |
-| 3 | 최초 실행·`--force`·`refetch_all` | 새 Hot revision에 전체 fetch, 이전 revision 보존 |
-| 4 | `retry_missing` 또는 누락 존재 & `--backfill` | 기존 성공 조각과 새 누락 조각을 새 Hot revision에 합쳐 전체 재처리 |
+| 2 | `stage>=bronze_written`인 일반 재실행 | manifest가 가리키는 Bronze revision 재사용 |
+| 3 | 최초 실행·`--force` | 새 Hot revision에 전체 fetch, 이전 revision 보존 |
+| 4 | 누락 존재 & `--backfill` | 기존 성공 조각과 새 누락 조각을 새 Hot revision에 합쳐 전체 재처리 |
 
 `stage`를 `bronze_written`으로 올리는 것은 **fetch 단계를 마친 뒤**다. 라운드를 소진했든
 예산이 끝났든, 더 이상 호출하지 않기로 결정한 시점이다. 그 전에 죽으면
-조각이 S3에 남아 있어도 authority로 공개되지 않는다. `refetch_all`은 새 전체 snapshot을,
-`retry_missing`은 manifest가 식별한 누락 조각만 다시 받는다.
+조각이 S3에 남아 있어도 authority로 공개되지 않는다. 같은 실행의 다음 round는 이미
+성공한 조각을 유지하고 manifest가 식별한 누락 조각만 다시 받는다.
 
 재수집 전에 기존 Bronze를 지우지 않는다. 매번 새 revision을 만들고 manifest가 선택한
 revision과 part만 읽으므로 1회차 5조각, 2회차 3조각이어도 이전 두 조각은 유령 데이터로
