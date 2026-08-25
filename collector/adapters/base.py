@@ -52,6 +52,7 @@ from typing import TYPE_CHECKING, Literal, Protocol, TypeVar
 
 if TYPE_CHECKING:
     import httpx
+
     from config.schema import SourceConfig
 
 
@@ -261,6 +262,7 @@ def fetch_with_rounds(
     sleep_fn=time.sleep,
     now_fn=time.monotonic,
     on_chunk=None,
+    on_round_start=None,
     planned_parts: frozenset[str] | None = None,
     round_retry_mode: Literal["refetch_all", "retry_missing"] = "retry_missing",
 ):
@@ -280,6 +282,8 @@ def fetch_with_rounds(
         sleep_fn: 대기 함수 (테스트 시 모킹용)
         now_fn: 현재 시간 측정 함수 (테스트 시 모킹용)
         on_chunk: 조각 수집 성공 시 즉시 실행할 콜백 함수 (보통 S3 스트리밍 저장용)
+        on_round_start: 각 fetch 라운드 시작 직전에 실행할 콜백 함수. 라운드 번호를
+            받으며 저장소가 새 immutable revision을 준비할 때 사용한다.
         planned_parts: 어댑터가 요청 전에 알 수 있는 전체 조각 키. 조기 budget
             종료로 iterator가 도달하지 못한 키도 누락으로 기록하는 데 사용한다.
         round_retry_mode: transient 다음 round에서 전체 snapshot을 다시 받을지,
@@ -310,6 +314,9 @@ def fetch_with_rounds(
             collected.clear()
             permanent.clear()
             expected_total = initial_expected_total
+
+        if on_round_start is not None:
+            on_round_start(round_index)
 
         # (2) 재시도 타겟팅
         # skip: 저번 배치에서 이미 성공했던 것들

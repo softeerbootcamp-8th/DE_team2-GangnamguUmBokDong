@@ -7,9 +7,10 @@ from typing import ClassVar
 from zoneinfo import ZoneInfo
 
 import httpx
+import pytest
+
 import manifest as manifest_module
 import pipeline
-import pytest
 import storage
 from adapters.base import FetchErrorKind, FetchResult, adapter
 from config.schema import Backfill, Fetch, Policies, Quality, Schedule, SourceConfig
@@ -126,7 +127,12 @@ class TestFreshFetchSuccess:
 
         saved = manifest_module.load(config.source_id, WINDOW_START)
         assert saved.status == RunStatus.SUCCEEDED
-        assert storage.read_bronze(config.source_id, WINDOW_START, ["a", "b"]) == [
+        assert storage.read_bronze(
+            config.source_id,
+            WINDOW_START,
+            ["a", "b"],
+            result.artifacts.bronze.revision,
+        ) == [
             _chunk("a"),
             _chunk("b"),
         ]
@@ -209,7 +215,13 @@ class TestFreshFetchSuccess:
         )
 
         assert result.status is RunStatus.SUCCEEDED
-        assert storage.read_bronze("t_source", WINDOW_START, ["a", "b"]) == [
+        assert result.artifacts.bronze.revision == 1
+        assert storage.read_bronze(
+            "t_source", WINDOW_START, ["a"], revision=0
+        ) == [_chunk("old-a")]
+        assert storage.read_bronze(
+            "t_source", WINDOW_START, ["a", "b"], revision=1
+        ) == [
             _chunk("new-a"),
             _chunk("new-b"),
         ]
@@ -246,7 +258,10 @@ class TestFreshFetchSuccess:
         )
 
         assert result.status is RunStatus.SUCCEEDED
-        assert storage.read_bronze("t_source", WINDOW_START, ["a", "b"]) == [
+        assert result.artifacts.bronze.revision == 0
+        assert storage.read_bronze(
+            "t_source", WINDOW_START, ["a", "b"], revision=0
+        ) == [
             _chunk("old-a"),
             _chunk("new-b"),
         ]
@@ -330,7 +345,7 @@ class TestSkipBranch:
 
 
 class TestForceBranch:
-    """분기 3 강제: --force는 완결 여부와 무관하게 clear_bronze 후 재수집한다."""
+    """분기 3 강제: --force는 완결 여부와 무관하게 새 revision을 수집한다."""
 
     def test_force_refetches_even_when_completed(self, scripted_adapter, client):
         scripted_adapter.results = [
@@ -346,14 +361,22 @@ class TestForceBranch:
             ],
         ]
         config = _config()
-        pipeline.execute_window(config, WINDOW_START, client=client)
+        first = pipeline.execute_window(config, WINDOW_START, client=client)
 
         result = pipeline.execute_window(
             config, WINDOW_START, client=client, force=True
         )
 
         assert scripted_adapter.fetch_calls == 2
-        assert set(result.artifacts.bronze.parts) == {"z"}  # 이전 조각(a)은 지워졌다
+        assert set(result.artifacts.bronze.parts) == {"z"}
+        assert first.artifacts.bronze.revision == 0
+        assert result.artifacts.bronze.revision == 1
+        assert storage.read_bronze(
+            config.source_id, WINDOW_START, ["a"], revision=0
+        ) == [_chunk("a")]
+        assert storage.read_bronze(
+            config.source_id, WINDOW_START, ["z"], revision=1
+        ) == [_chunk("z")]
 
 
 class TestForceAndBackfillRejected:
@@ -599,13 +622,16 @@ class TestBronzeReuseBranch:
         )  # 두 번째 실행에서 다시 fetch하지 않았다
         assert result.status == RunStatus.SUCCEEDED
         assert result.stage == Stage.COMPLETED
+        assert result.artifacts.bronze.revision == first.artifacts.bronze.revision
 
 
 class TestFetchErrorRecovery:
     """fetch_error 재실행은 소스 정책에 맞게 Bronze를 다시 확보한다."""
 
-    def test_refetch_all_replaces_prior_bronze(self, scripted_adapter, client):
-        """기본 정책은 이전 성공 part까지 버리고 일관된 전체본을 다시 받는다."""
+    def test_refetch_all_creates_new_revision_and_preserves_prior(
+        self, scripted_adapter, client
+    ):
+        """전체 재수집은 새 revision을 발표하고 이전 원본도 보존한다."""
         scripted_adapter.results = [
             [
                 FetchResult(
@@ -639,7 +665,14 @@ class TestFetchErrorRecovery:
 
         assert recovered.status is RunStatus.SUCCEEDED
         assert scripted_adapter.fetch_calls == 2
-        assert storage.read_bronze(config.source_id, WINDOW_START, ["a", "b"]) == [
+        assert failed.artifacts.bronze.revision == 0
+        assert recovered.artifacts.bronze.revision == 1
+        assert storage.read_bronze(
+            config.source_id, WINDOW_START, ["a"], revision=0
+        ) == [_chunk("old-a")]
+        assert storage.read_bronze(
+            config.source_id, WINDOW_START, ["a", "b"], revision=1
+        ) == [
             _chunk("new-a"),
             _chunk("new-b"),
         ]
@@ -681,7 +714,14 @@ class TestFetchErrorRecovery:
 
         assert recovered.status is RunStatus.SUCCEEDED
         assert scripted_adapter.fetch_calls == 2
-        assert storage.read_bronze(config.source_id, WINDOW_START, ["a", "b"]) == [
+        assert failed.artifacts.bronze.revision == 0
+        assert recovered.artifacts.bronze.revision == 1
+        assert storage.read_bronze(
+            config.source_id, WINDOW_START, ["a"], revision=0
+        ) == [_chunk("old-a")]
+        assert storage.read_bronze(
+            config.source_id, WINDOW_START, ["a", "b"], revision=1
+        ) == [
             _chunk("old-a"),
             _chunk("new-b"),
         ]
@@ -713,6 +753,14 @@ class TestFetchErrorRecovery:
 
         assert recovered.status is RunStatus.SUCCEEDED
         assert recovered.artifacts.bronze.parts == ("new",)
+        assert failed.artifacts.bronze.revision == 0
+        assert recovered.artifacts.bronze.revision == 1
+        assert storage.read_bronze(
+            config.source_id, WINDOW_START, ["old"], revision=0
+        ) == [_chunk("old")]
+        assert storage.read_bronze(
+            config.source_id, WINDOW_START, ["new"], revision=1
+        ) == [_chunk("new")]
 
     def test_stale_daily_window_does_not_refetch_current_snapshot(
         self, scripted_adapter, client, monkeypatch
@@ -754,6 +802,7 @@ class TestFetchErrorRecovery:
         assert blocked.status is RunStatus.FAILED
         assert blocked.failure_reason is FailureReason.FETCH_ERROR
         assert scripted_adapter.fetch_calls == 1
+        assert blocked.artifacts.bronze.revision == failed.artifacts.bronze.revision
 
     def test_daily_window_refetches_within_same_kst_day(
         self, scripted_adapter, client, monkeypatch
@@ -829,6 +878,14 @@ class TestBackfillBranch:
         assert result.missing.parts == ()
         assert result.revision == 0
         assert set(result.artifacts.bronze.parts) == {"a", "b"}
+        assert first.artifacts.bronze.revision == 0
+        assert result.artifacts.bronze.revision == 1
+        assert storage.read_bronze(
+            config.source_id, WINDOW_START, ["a"], revision=0
+        ) == [_chunk("a")]
+        assert storage.read_bronze(
+            config.source_id, WINDOW_START, ["a", "b"], revision=1
+        ) == [_chunk("a"), _chunk("b")]
 
     def test_backfill_fetches_missing_even_if_stage_is_bronze_written(
         self, scripted_adapter, client
@@ -921,6 +978,7 @@ class TestDropRatioGate:
 
         assert second.failure_reason is FailureReason.QUALITY_GATE
         assert scripted_adapter.fetch_calls == 1
+        assert second.artifacts.bronze.revision == first.artifacts.bronze.revision
 
 
 def pipeline_make_required_str_spec():

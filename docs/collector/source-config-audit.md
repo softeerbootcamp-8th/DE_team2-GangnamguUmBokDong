@@ -147,19 +147,21 @@ KST 날짜에만 허용한다. 다음 날 과거 task를 clear해도 현재 응�
 `--backfill`, `_retry_queue`와 manifest 필드는 기존 코드·저장 포맷 파싱 호환을 위해
 남아 있지만 기존 marker는 발견·소비되지 않는 정리 대상이다.
 
-`--force`는 기존 Bronze부터 지우고 전체를 다시 받는 명령이며 `--backfill`과 동시에 사용할 수 없다.
+`--force`는 기존 Bronze를 보존한 채 새 Hot revision에 전체를 다시 받는 명령이며
+`--backfill`과 동시에 사용할 수 없다.
 
 ## Archive 대상
 
-현재 daily compaction 대상은 다음 세 source다.
+현재 daily compaction 대상은 다음 네 source다.
 
 - `bike_rental_history`
 - `bike_station_realtime`
+- `population_realtime`
 - `weather_ultra_short_live`
 
-예보 source는 사후 재현 가치가 낮아 compaction하지 않는다. 행사와 일별 생활인구는 하루 1개 window라 작은 파일을 다시 묶을 필요가 없다.
+예보 source는 사후 재현 가치가 낮아 compaction하지 않는다. 행사와 일별 생활인구는 하루 1개 window라 작은 파일을 다시 묶을 필요가 없다. `population_realtime`은 5분 Silver가 하루 최대 288개 생기므로 일별 Archive로 묶는다.
 
-Archive는 source YAML에서 만든 고정 schema와 `_row_status`, `_window_start`, `_source_kind`를 가진다. 원본 Silver는 삭제하지 않는다.
+Archive는 source YAML에서 만든 고정 schema와 `_row_status`, `_window_start`, `_source_kind`를 가진다. 최신 authority Silver는 계속 유지하고, non-authority Silver는 생성 후 30일 동안 보존한 뒤 검증된 Cold Bronze를 복구 근거로 삭제한다.
 
 ## 현재 알려진 데이터 해석 경계
 

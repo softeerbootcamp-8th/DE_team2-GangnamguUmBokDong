@@ -3,7 +3,7 @@
 from airflow.task.trigger_rule import TriggerRule
 from airflow.timetables.trigger import CronTriggerTimetable
 from config.schedules import COMPACTION_CRON
-from config.sources import COMPACTION_SOURCES
+from config.sources import COLD_BRONZE_SOURCES, COMPACTION_SOURCES
 from dags.daily_compaction import dag
 from orchestration.compaction_task import COLLECTOR_DIR, build_compaction_task
 
@@ -34,11 +34,27 @@ class TestCompactionSources:
         assert "weather_ultra_short_forecast" not in COMPACTION_SOURCES
         assert "weather_short_term_forecast" not in COMPACTION_SOURCES
 
-    def test_covers_the_three_target_sources(self):
+    def test_covers_the_four_target_sources(self):
         assert set(COMPACTION_SOURCES) == {
             "bike_rental_history",
             "bike_station_realtime",
+            "population_realtime",
             "weather_ultra_short_live",
+        }
+
+    def test_cold_bronze_covers_every_collector_source(self):
+        """공통 Hot Lifecycle 전에 모든 Collector source를 Cold로 보존한다."""
+        assert set(COLD_BRONZE_SOURCES) == {
+            "bike_rental_history",
+            "bike_station_realtime",
+            "population_realtime",
+            "weather_ultra_short_live",
+            "weather_ultra_short_forecast",
+            "weather_short_term_forecast",
+            "living_population_grid",
+            "cultural_event",
+            "performance_event",
+            "bike_station_master",
         }
 
 
@@ -86,10 +102,36 @@ class TestDag:
         assert task.trigger_rule == TriggerRule.ALL_DONE
 
     def test_other_compactions_are_independent_from_replay(self):
-        for source in ("bike_station_realtime", "weather_ultra_short_live"):
+        for source in (
+            "bike_station_realtime",
+            "population_realtime",
+            "weather_ultra_short_live",
+        ):
             task = dag.get_task(f"compact_{source}")
             assert task.upstream_task_ids == set()
             assert task.trigger_rule == TriggerRule.ALL_SUCCESS
 
+    def test_cold_bronze_runs_for_every_collector_source(self):
+        for source in COLD_BRONZE_SOURCES:
+            task = dag.get_task(f"cold_compact_{source}")
+            assert "cold_compact.py" in task.bash_command
+            assert "macros.timedelta(days=6)" in task.bash_command
+            expected_upstream = (
+                {f"compact_{source}"} if source in COMPACTION_SOURCES else set()
+            )
+            assert task.upstream_task_ids == expected_upstream
+
+    def test_non_authority_silver_gc_runs_after_thirty_day_retention(self):
+        for source in COLD_BRONZE_SOURCES:
+            task = dag.get_task(f"gc_silver_{source}")
+            assert task.upstream_task_ids == {f"cold_compact_{source}"}
+            assert "silver_gc_cli.py" in task.bash_command
+            assert "macros.timedelta(days=36)" in task.bash_command
+            assert ("--require-archive" in task.bash_command) is (
+                source in COMPACTION_SOURCES
+            )
+
     def test_expected_task_count(self):
-        assert len(dag.task_ids) == 24 + len(COMPACTION_SOURCES)
+        assert len(dag.task_ids) == (
+            24 + len(COMPACTION_SOURCES) + 2 * len(COLD_BRONZE_SOURCES)
+        )
