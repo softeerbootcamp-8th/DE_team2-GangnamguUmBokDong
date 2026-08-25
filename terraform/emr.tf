@@ -143,8 +143,14 @@ data "aws_iam_policy_document" "airflow_infra_control" {
 }
 
 resource "aws_iam_policy" "airflow_infra_control" {
-  provider    = aws.untagged
-  name        = "${var.project}-airflow-infra-control"
+  provider = aws.untagged
+  # 이름에 버전을 넣어 내용이 바뀔 때마다 IAM이 "새 정책 생성"으로 처리하게
+  # 한다(2026-08-25) — 이 계정의 edu 사용자는 iam:CreatePolicy는 되지만
+  # iam:CreatePolicyVersion(기존 정책 내용 수정)은 막혀있는 것으로 실측
+  # 확인됨(AccessDeniedException). IAM은 정책 rename API가 아예 없어서
+  # name이 바뀌면 terraform이 자동으로 삭제+재생성하므로, 내용을 고칠 때마다
+  # 이 접미사 숫자를 올리면 CreatePolicyVersion을 아예 안 거치게 된다.
+  name        = "${var.project}-airflow-infra-control-v2"
   description = "Airflow 상시 EC2가 학습 EC2/EMR 클러스터를 직접 제어하는 데 필요한 권한"
   policy      = data.aws_iam_policy_document.airflow_infra_control.json
 }
