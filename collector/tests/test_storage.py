@@ -19,6 +19,7 @@ from storage import (
     latest_source_snapshot_logical_dttm,
     list_retry_markers,
     list_source_snapshot_windows,
+    next_bronze_revision,
     read_bronze,
     read_immutable_silver_artifact,
     read_manifest,
@@ -73,6 +74,41 @@ class TestBronzeRoundTrip:
         result = read_bronze("test_source", WINDOW_START, ["page-001"])
 
         assert result == [b"keep"]
+
+    def test_immutable_hot_revisions_preserve_changed_payloads(self):
+        """강제 재수집은 기존 Hot Bronze를 덮어쓰지 않고 새 revision에 쓴다."""
+        write_bronze_part(
+            "test_source", WINDOW_START, "page-001", b"first", revision=0
+        )
+        write_bronze_part(
+            "test_source", WINDOW_START, "page-001", b"corrected", revision=1
+        )
+
+        assert read_bronze(
+            "test_source", WINDOW_START, ["page-001"], revision=0
+        ) == [b"first"]
+        assert read_bronze(
+            "test_source", WINDOW_START, ["page-001"], revision=1
+        ) == [b"corrected"]
+
+    def test_immutable_hot_revision_rejects_key_collision(self):
+        """같은 revision과 part key에 다른 원본을 덮어쓸 수 없다."""
+        write_bronze_part(
+            "test_source", WINDOW_START, "page-001", b"first", revision=0
+        )
+
+        with pytest.raises(RuntimeError, match="immutable Hot Bronze key 충돌"):
+            write_bronze_part(
+                "test_source", WINDOW_START, "page-001", b"changed", revision=0
+            )
+
+    def test_next_revision_skips_orphan_written_before_manifest(self):
+        """중간 장애로 manifest 없는 object가 남아도 그 revision을 재사용하지 않는다."""
+        write_bronze_part(
+            "test_source", WINDOW_START, "page-001", b"orphan", revision=3
+        )
+
+        assert next_bronze_revision("test_source", WINDOW_START) == 4
 
 
 class TestClearBronze:

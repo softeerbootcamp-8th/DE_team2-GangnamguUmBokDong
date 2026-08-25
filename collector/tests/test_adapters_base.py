@@ -7,6 +7,7 @@ from unittest.mock import MagicMock
 from zoneinfo import ZoneInfo
 
 import pytest
+
 from adapters.base import (
     DuplicateAdapterError,
     FetchErrorKind,
@@ -253,6 +254,7 @@ def test_fetch_with_rounds_retries_transient_failure_in_next_round(window):
 def test_fetch_with_rounds_refetches_whole_mutable_snapshot(window):
     """refetch_all round는 앞 round 성공분까지 새 snapshot payload로 교체한다."""
     calls = []
+    started_rounds = []
 
     def fetch_fn(config, win, *, client, skip, expected_total):
         """첫 round만 실패하고 두 번째 round에서 바뀐 전체본을 반환한다."""
@@ -281,10 +283,12 @@ def test_fetch_with_rounds_refetches_whole_mutable_snapshot(window):
         window,
         client=object(),
         sleep_fn=lambda seconds: None,
+        on_round_start=started_rounds.append,
         round_retry_mode="refetch_all",
     )
 
     assert calls == [frozenset(), frozenset()]
+    assert started_rounds == [0, 1]
     assert result.chunks == {"a": b"new-a", "b": b"new-b"}
 
 

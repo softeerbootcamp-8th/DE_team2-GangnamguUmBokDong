@@ -6,6 +6,21 @@
 
 # --- S3 ---
 
+locals {
+  legacy_bronze_sources = toset([
+    "bike_rental_history",
+    "bike_station_master",
+    "bike_station_realtime",
+    "cultural_event",
+    "living_population_grid",
+    "performance_event",
+    "population_realtime",
+    "weather_short_term_forecast",
+    "weather_ultra_short_forecast",
+    "weather_ultra_short_live",
+  ])
+}
+
 resource "aws_s3_bucket" "data" {
   bucket = var.s3_bucket_name
 
@@ -46,18 +61,36 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "data" {
 resource "aws_s3_bucket_lifecycle_configuration" "data" {
   bucket = aws_s3_bucket.data.id
 
-  # collector가 응답 도착 즉시 조각으로 쓰는 원본(ADR 0003). silver/archive가 정본이라
-  # 실패 원인 추적 기간만 지나면 지운다.
+  # collector가 응답 도착 즉시 조각으로 쓰는 원본. 날짜 단위 Cold Bronze 생성과
+  # 검증에 충분한 유예를 둔 뒤 Hot 객체만 지운다.
   rule {
     id     = "expire-bronze"
     status = "Enabled"
 
     filter {
-      prefix = "bronze/"
+      prefix = "bronze/hot/"
     }
 
     expiration {
       days = 30
+    }
+  }
+
+  # 이관 전 legacy Bronze는 기존과 같은 30일 보존 정책을 유지한다. cold/와
+  # cold_manifest/는 이 prefix에 들어오지 않아 장기 보관된다.
+  dynamic "rule" {
+    for_each = local.legacy_bronze_sources
+    content {
+      id     = "expire-legacy-bronze-${rule.value}"
+      status = "Enabled"
+
+      filter {
+        prefix = "bronze/${rule.value}/"
+      }
+
+      expiration {
+        days = 30
+      }
     }
   }
 

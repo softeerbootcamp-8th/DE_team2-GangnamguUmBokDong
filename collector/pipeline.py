@@ -10,13 +10,13 @@
 
 | 조건 | 동작 |
 | --- | --- |
-| `stage=completed` (일반 실행) | `SKIPPED` 반환 |
-| 이전 `FAILED/fetch_error` & `retry_mode=refetch_all` | 기존 bronze를 지우고 전체 fetch |
-| 이전 `FAILED/fetch_error` & `retry_mode=retry_missing` & 누락 존재 | 기존 성공 조각을 유지하고 누락만 fetch |
-| 이전 `FAILED/fetch_error` & 지난 일일 window | 외부 API 재호출 없이 실패 유지 |
-| 이전 `storage_error`·`quality_gate` | 기존 bronze 로드(fetch 건너뜀) |
-| 누락 존재 & legacy `--backfill` | 기존 bronze 유지, 누락 조각만 fetch하고 전체 재처리 |
-| 그 외 (또는 `--force`) | `clear_bronze` 후 전체 fetch |
+| `stage=completed` (일반 실행) | authority 검증 후 `SKIPPED` 반환 |
+| 이전 `FAILED/fetch_error` & `retry_mode=refetch_all` | 새 Hot revision에 전체 fetch(이전 revision 보존) |
+| 이전 `FAILED/fetch_error` & `retry_mode=retry_missing` & 누락 존재 | 기존 성공 조각 + 새 누락 조각을 새 Hot revision에 저장 |
+| 이전 `FAILED/fetch_error` & 지난 일일 window | 외부 API 재호출 없이 기존 revision을 재사용해 실패 유지 |
+| 이전 `storage_error`·`quality_gate` | 기존 revision의 bronze 로드(fetch 건너뜀) |
+| 누락 존재 & legacy `--backfill` | 기존 성공 조각 + 새 누락 조각을 새 Hot revision에 저장 |
+| 그 외 (또는 `--force`) | 새 immutable Hot revision에 전체 fetch |
 
 bronze 재사용이 재개의 핵심인 이유: 실시간 API(5분 주기)는 몇 분만 지나도 그 시점
 데이터를 영영 받을 수 없다. 저장 실패 후 fetch부터 다시 하면 지금 시점의 다른
@@ -30,9 +30,8 @@ bronze 재사용이 재개의 핵심인 이유: 실시간 API(5분 주기)는 �
 - `stage`는 fetch를 마친 뒤(라운드 소진 또는 예산 종료 시점)에만 올린다. 조각이
   다 모였는지는 `stage`가 아니라 `completeness`·`missing`이 따로 표현하므로,
   `stage=completed`이면서 불완전한 window도 있을 수 있다.
-- `clear_bronze`는 조각 수가 실행마다 달라질 수 있어서 필요하다(5조각→3조각).
-  백필 모드는 예외로 기존 조각을 살리며, manifest `parts`에 없는 조각은 읽지
-  않는 규칙이 유령 조각을 막는다.
+- 수집 실행마다 별도 Hot revision을 쓰므로 조각 수가 달라져도 이전 revision의
+  유령 조각이 섞이지 않는다. manifest가 가리키는 revision과 `parts`만 읽는다.
 - `normalize`는 bronze 재사용 여부와 무관하게 항상 수행한다. 네트워크를 타지
   않는 순수 변환이라 비용이 없다.
 - 검증은 window 전체가 모인 뒤 배치로 하므로 조각을 메모리에서 놓지 않는다(ADR 0003).
@@ -105,12 +104,13 @@ import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-import manifest as manifest_module
 import pyarrow as pa
+from core.source_snapshot import SourceSnapshotStatus
+
+import manifest as manifest_module
 import storage
 from adapters.base import FetchErrorKind, Window, fetch_with_rounds, get_adapter
 from config.schema import SourceConfig
-from core.source_snapshot import SourceSnapshotStatus
 from manifest import (
     Artifacts,
     BronzeArtifacts,
@@ -431,19 +431,29 @@ def execute_window(
         and existing.stage.value >= Stage.BRONZE_WRITTEN.value
         and not force
     ):
-        # 분기 4: 안정적인 조각 소스의 fetch retry 또는 legacy 백필 — 기존 성공 조각은
-        # 그대로 두고(clear_bronze 없이) 누락분만 받는다.
+        # 분기 4: 안정적인 조각 소스의 fetch retry 또는 legacy 백필. 기존 snapshot은
+        # 보존하고, 기존 성공 조각과 새 누락 조각을 합친 새 Hot revision을 만든다.
         logger.info(
             "stage=fetch_recovery mode=retry_missing "
             f"missing_parts={len(existing.missing.parts)}"
         )
         have_parts = existing.artifacts.bronze.parts
+        prior_revision = existing.artifacts.bronze.revision
         prior_chunks = dict(
             zip(
                 have_parts,
-                storage.read_bronze(config.source_id, window_start, have_parts),
+                storage.read_bronze(
+                    config.source_id, window_start, have_parts, prior_revision
+                ),
             )
         )
+        bronze_revision = storage.next_bronze_revision(
+            config.source_id, window_start
+        )
+        for key, payload in prior_chunks.items():
+            storage.write_bronze_part(
+                config.source_id, window_start, key, payload, bronze_revision
+            )
         round_result = fetch_with_rounds(
             adapter_cls.fetch,
             config,
@@ -453,7 +463,7 @@ def execute_window(
             expected_total=existing.counts.expected,
             sleep_fn=sleep_fn,
             on_chunk=lambda key, payload: storage.write_bronze_part(
-                config.source_id, window_start, key, payload
+                config.source_id, window_start, key, payload, bronze_revision
             ),
             planned_parts=planned_parts,
             round_retry_mode="retry_missing",
@@ -479,8 +489,14 @@ def execute_window(
         # 실시간 API에서는 그 시점의 다른 데이터를 받게 되므로, 반드시 이전에 저장된
         # bronze 조각을 그대로 재사용한다.
         parts = existing.artifacts.bronze.parts
+        bronze_revision = existing.artifacts.bronze.revision
         chunks = dict(
-            zip(parts, storage.read_bronze(config.source_id, window_start, parts))
+            zip(
+                parts,
+                storage.read_bronze(
+                    config.source_id, window_start, parts, bronze_revision
+                ),
+            )
         )
         # 조각 자체는 재시도하지 않으므로 실제 실패 종류는 중요하지 않다 — 아래
         # 게이트 계산이 "재시도 불가능한 누락"으로만 취급하면 되므로 PERMANENT로 채운다.
@@ -489,15 +505,28 @@ def execute_window(
         attempt = existing.attempt + 1
         revision_base = existing.revision
     else:
-        # 분기 3(또는 --force): 처음부터 전체 fetch. 조각 수가 실행마다 달라질 수
-        # 있으므로(예: 5조각 → 3조각) 이전 실행의 유령 조각이 남지 않도록 먼저 지운다.
+        # 분기 3(또는 --force): 처음부터 전체 fetch하되 이전 원본은 지우지 않는다.
+        # 새 immutable revision 경로라 조각 수가 줄어도 이전 실행의 유령 조각이
+        # 현재 snapshot에 섞이지 않는다.
         if fetch_error_retry:
             # retry_missing도 manifest에 누락 key가 없으면 타겟을 정할 수 없으므로
             # 안전하게 전체 재조회한다.
             logger.info(
                 f"stage=fetch_recovery mode=refetch_all configured={retry_mode}"
             )
-        storage.clear_bronze(config.source_id, window_start)
+        bronze_revision = storage.next_bronze_revision(
+            config.source_id, window_start
+        )
+
+        def _start_fetch_round(round_index: int) -> None:
+            """전체 재수집 라운드마다 별도 immutable Bronze revision을 연다."""
+
+            nonlocal bronze_revision
+            if round_index > 0 and retry_mode == "refetch_all":
+                bronze_revision = storage.next_bronze_revision(
+                    config.source_id, window_start
+                )
+
         round_result = fetch_with_rounds(
             adapter_cls.fetch,
             config,
@@ -505,8 +534,9 @@ def execute_window(
             client=client,
             sleep_fn=sleep_fn,
             on_chunk=lambda key, payload: storage.write_bronze_part(
-                config.source_id, window_start, key, payload
+                config.source_id, window_start, key, payload, bronze_revision
             ),
+            on_round_start=_start_fetch_round,
             planned_parts=planned_parts,
             round_retry_mode=retry_mode,
         )
@@ -519,7 +549,13 @@ def execute_window(
     bronze_parts = tuple(sorted(chunks))
     authority_planned_parts = _effective_plan(bronze_parts, tuple(sorted(missing_keys)))
     artifacts = Artifacts(
-        bronze=BronzeArtifacts(prefix=config.source_id, parts=bronze_parts)
+        bronze=BronzeArtifacts(
+            prefix=storage.bronze_prefix(
+                config.source_id, window_start, bronze_revision
+            ),
+            parts=bronze_parts,
+            revision=bronze_revision,
+        )
     )
 
     def _base_manifest(**over) -> Manifest:

@@ -527,17 +527,17 @@ def drop_if_issue_count_exceeds(
 
 | 키 | 형태 | null이 되는 경우 |
 | --- | --- | --- |
-| `bronze` | `{prefix, parts}` | `bronze_written` 미도달 |
+| `bronze` | `{prefix, parts, revision}` | `bronze_written` 미도달 |
 | `silver` | 단일 키 | 게이트(`max_missing_ratio` · `max_drop_ratio`) 초과로 silver를 쓰지 않았을 때 |
 | `quarantine` | 단일 키 | 폐기 행이 0건이라 객체를 만들지 않았을 때 |
 
-`bronze`가 조각 목록을 갖는 이유는 `read_bronze`가 무엇을 어떤 순서로 읽어야 하는지 알아야 하고, S3 LIST에 의존하지 않도록 명시적으로 기록하기 때문이다. **`parts`에 없는 조각은 읽지 않는다** — 이 규칙이 백필 모드에서 `clear_bronze`를 생략해도 유령 조각이 섞이지 않게 막는다. `quarantine`은 폐기 0건인 실행이 대부분이므로 빈 객체를 만들지 않는다 — 5분 주기 소스 3종이면 하루 864개가 쌓인다. 이 파일을 읽는 쪽은 부재를 정상으로 처리한다.
+`bronze`가 revision과 조각 목록을 갖는 이유는 `read_bronze`가 어느 원본 묶음을 어떤 순서로 읽어야 하는지 알아야 하고, S3 LIST에 의존하지 않도록 명시적으로 기록하기 때문이다. **manifest가 가리키는 revision의 `parts`에 없는 조각은 읽지 않는다.** 따라서 재수집 때 기존 원본을 삭제하지 않아도 이전 조각이 현재 snapshot에 섞이지 않는다. `quarantine`은 폐기 0건인 실행이 대부분이므로 빈 객체를 만들지 않는다 — 5분 주기 소스 3종이면 하루 864개가 쌓인다. 이 파일을 읽는 쪽은 부재를 정상으로 처리한다.
 
 경로 규칙은 `storage.py` 한 곳에서만 만든다. bronze는 조각으로 저장되므로 window마다
 디렉토리를 하나 더 갖는다.
 
 ```
-bronze              bronze/{source_id}/dt={date}/hh={hour}/{HHMM}/part={chunk_key}.json.gz
+bronze              bronze/hot/{source_id}/dt={date}/hh={hour}/{HHMM}/revision={revision:010d}/part={chunk_key}.json.gz
 silver·quarantine   {layer}/{source_id}/dt={date}/hh={hour}/{HHMM}.{ext}
 _manifest           _manifest/{source_id}/dt={date}/hh={hour}/{HHMM}.json
 _retry_queue        _retry_queue/{source_id}/{window_start}.json
@@ -561,47 +561,48 @@ part=grid-060x127.json.gz         기상청 — 격자 좌표
 ```python
 manifest = manifest.load(source_id, window_start)   # 없으면 None
 
-if manifest and manifest.stage == Stage.COMPLETED and not force:
-    if backfill and manifest.missing.parts:                   # ← 분기 4 (백필)
-        have   = set(manifest.artifacts.bronze.parts)         # clear_bronze 하지 않는다
-        chunks = storage.read_bronze(manifest.artifacts.bronze)
-        new, missing = fetch_with_rounds(                     # 누락 조각만 호출
-            adapter, config, window,
-            skip=have, expected_total=manifest.counts.expected)
-        chunks += new
-        manifest.update(parts=have | new.keys(), missing=missing)
-    else:
-        return SKIPPED                                        # 멱등 — 재실행해도 안전
+if completed_authority and not force and not requested_correction:
+    verify_authority()
+    return SKIPPED
 
-elif manifest and manifest.stage >= Stage.BRONZE_WRITTEN and not force:
-    chunks = storage.read_bronze(manifest.artifacts.bronze)   # 조각을 순서대로 읽는다
+if retry_missing or requested_backfill:
+    prior = read_manifest_revision()
+    bronze_revision = next_bronze_revision()
+    copy_successful_parts(prior, bronze_revision)
+    new, missing = fetch_with_rounds(skip=prior.parts, retry_mode="retry_missing")
+    chunks = prior.chunks | new
 
-else:
-    storage.clear_bronze(source_id, window_start)             # 이전 실행의 조각을 비운다
-    chunks, missing = fetch_with_rounds(adapter, config, window)   # 8절 — 라운드·저장 포함
-    manifest.update(stage=Stage.BRONZE_WRITTEN, parts=[...], missing=missing)
+elif reusable_bronze or stale_daily_fetch_error:
+    bronze_revision = manifest.artifacts.bronze.revision
+    chunks = read_manifest_revision()                         # 외부 API 호출 없음
+
+else:                                                         # 최초·force·refetch_all
+    bronze_revision = next_bronze_revision()
+    chunks, missing = fetch_with_rounds(retry_mode=source.retry_mode)
+    # refetch_all의 transient 새 round도 새 immutable revision을 사용한다.
 
 rows = adapter.normalize(chunks)                              # 항상 다시 수행
-# 이후 게이트 → 검증 → silver → manifest 갱신 (백필이면 revision +1)
+# 이후 게이트 → 검증 → immutable silver → authority manifest 갱신
 ```
 
 분기는 넷이다.
 
 | # | 조건 | 동작 |
 | --- | --- | --- |
-| 1 | `stage=completed` & 누락 없음 & `!force` | SKIPPED |
-| 2 | `stage>=bronze_written` & `!force` | bronze 재사용 |
-| 3 | 그 외 (또는 `--force`) | `clear_bronze` + 전체 fetch |
-| 4 | `stage=completed` & 누락 존재 & `--backfill` | **`clear_bronze` 없이 누락 조각만 fetch → 기존 조각과 합쳐 전체 재처리 → silver 덮어쓰기, `revision` +1** |
+| 1 | 완료 authority & 일반 재실행 | authority 검증 후 SKIPPED |
+| 2 | `storage_error`·`quality_gate` 또는 지난 일일 `fetch_error` | manifest가 가리키는 Bronze revision 재사용 |
+| 3 | 최초 실행·`--force`·`refetch_all` | 새 Hot revision에 전체 fetch, 이전 revision 보존 |
+| 4 | `retry_missing` 또는 누락 존재 & `--backfill` | 기존 성공 조각과 새 누락 조각을 새 Hot revision에 합쳐 전체 재처리 |
 
 `stage`를 `bronze_written`으로 올리는 것은 **fetch 단계를 마친 뒤**다. 라운드를 소진했든
 예산이 끝났든, 더 이상 호출하지 않기로 결정한 시점이다. 그 전에 죽으면
-조각이 S3에 남아 있어도 미완결로 취급되고 재실행은 fetch부터 다시 한다. **조각 단위 재개는
-백필 모드에서만 한다.**
+조각이 S3에 남아 있어도 authority로 공개되지 않는다. `refetch_all`은 새 전체 snapshot을,
+`retry_missing`은 manifest가 식별한 누락 조각만 다시 받는다.
 
-`clear_bronze`가 필요한 이유는 조각 수가 실행마다 달라질 수 있기 때문이다. 1회차에 5조각,
-2회차에 3조각이 나오면 이전 조각 2개가 유령으로 남는다. **백필 모드는 예외다** — 기존 조각을
-살리는 것이 목적이고, 유령 조각은 "`parts`에 없는 조각은 읽지 않는다"는 규칙이 막는다.
+재수집 전에 기존 Bronze를 지우지 않는다. 매번 새 revision을 만들고 manifest가 선택한
+revision과 part만 읽으므로 1회차 5조각, 2회차 3조각이어도 이전 두 조각은 유령 데이터로
+섞이지 않는다. manifest 저장 전에 중단된 orphan revision도 다음 revision 번호 계산에서
+피하며, 검증된 날짜의 모든 Hot revision은 일 단위 Cold Bronze로 보존한다.
 
 `normalize`는 bronze 재사용 여부와 무관하게 **항상 다시 수행한다.** 네트워크를 타지 않는 순수 변환이라 비용이 없고, bronze가 정규화 전 원본을 담고 있으므로 이 편이 단순하다.
 
@@ -821,8 +822,8 @@ Airflow는 소스별 태스크에서 `data_interval_start`를 `--window-start`�
 
 | 플래그 | 의미 | bronze |
 | --- | --- | --- |
-| `--force` | 재개 분기를 무시하고 처음부터 다시 | `clear_bronze` 후 전체 재수집 |
-| `--backfill` | 완결된 window의 **누락 조각만** 채움 | 기존 조각 유지, 빠진 것만 호출 |
+| `--force` | 재개 분기를 무시하고 처음부터 다시 | 새 Hot revision에 전체 재수집, 이전 원본 보존 |
+| `--backfill` | 완결된 window의 **누락 조각만** 채움 | 기존 성공 조각과 새 누락 조각을 새 revision에 합침 |
 
 둘을 함께 주는 것은 `--force`와 같으므로 오류로 막는다. 백필 DAG가 호출하는 쪽은 `--backfill`이다([8.5절](#85-백필)).
 
@@ -881,7 +882,8 @@ cd collector && uv run pytest
 - 어댑터 `normalize`: 기상청 long → wide pivot이 관측 항목을 컬럼으로 올바르게 펴는지 검증
 - bronze 조각 왕복: 저장한 조각들을 `read_bronze`로 읽은 결과가 `fetch`가 흘려보낸 원본과
   **순서까지** 같은지 검증
-- `clear_bronze`: 조각 수가 줄어든 재실행(5조각 → 3조각)에서 유령 조각이 남지 않는지 검증
+- immutable Bronze revision: 조각 수가 줄어든 재실행(5조각 → 3조각)에서도 이전
+  revision이 보존되고 manifest가 선택한 현재 조각만 읽는지 검증
 
 부분 실패·백필 관련([8절](#8-부분-실패와-백필))
 

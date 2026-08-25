@@ -610,7 +610,10 @@ class TestSeoulSourcesEndToEnd:
         )
 
         bronze = storage.read_bronze(
-            config.source_id, window_start, result.artifacts.bronze.parts
+            config.source_id,
+            window_start,
+            result.artifacts.bronze.parts,
+            result.artifacts.bronze.revision,
         )
         assert json.loads(bronze[0])["rentBikeStatus"]["row"] == [row]
         assert result.status is RunStatus.SUCCEEDED
