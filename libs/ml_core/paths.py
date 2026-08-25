@@ -70,6 +70,30 @@ MODELS_PREFIX = os.environ.get("MODELS_PREFIX", "models")
 # 나뉘어 있어 "언제 어떤 프로필로 학습했는지"를 그대로 찾을 수 있다.
 MODELS_ARCHIVE_PREFIX = os.environ.get("MODELS_ARCHIVE_PREFIX", f"{MODELS_PREFIX}/archive")
 
+# YARN distributed-shell 워커들이 서로의 host:port를 찾는 barrier 등록 위치
+# (`training/scripts/yarn_worker_bootstrap.py`, ADR-0007 참고). 학습 아티팩트가
+# 아니라 한 학습 시도 동안만 쓰고 버리는 임시 조율(coordination) 데이터라
+# MODELS_ARCHIVE_PREFIX와 분리한다.
+TRAINING_RUNS_PREFIX = os.environ.get("TRAINING_RUNS_PREFIX", f"{MODELS_PREFIX}/training-runs")
+
+
+def training_run_worker_key(run_id: str, worker_id: str) -> str:
+    """YARN distributed-shell 워커 하나가 자기 host:port를 등록하는 barrier 파일 키.
+
+    분산 학습(`LGB_NUM_MACHINES>1`) 워커들은 서로의 주소를 미리 알 수 없다 — 각자
+    이 키에 자기 정보를 쓰고, `run_id` 하나가 공유하는 워커 등록이
+    `LGB_NUM_MACHINES`개 다 모일 때까지 폴링한다(`yarn_worker_bootstrap.py` 참고).
+    `run_id`는 학습 시도 하나(모델 하나, 프로필 하나) 전체가 공유하는 값이어야
+    하고, `worker_id`는 그 시도 안에서 워커마다 달라야 한다(YARN `CONTAINER_ID` 등).
+
+    args:
+        run_id: 이 학습 시도 전체가 공유하는 식별자
+        worker_id: 워커(컨테이너)마다 고유한 식별자
+    returns:
+        str: "{TRAINING_RUNS_PREFIX}/{run_id}/workers/{worker_id}.json"
+    """
+    return f"{TRAINING_RUNS_PREFIX}/{run_id}/workers/{worker_id}.json"
+
 
 def archive_models_prefix(date: str, profile_name: str) -> str:
     """한 번의 학습 시도(날짜 + 프로필 조합)가 쓸 아카이브 prefix를 만든다.

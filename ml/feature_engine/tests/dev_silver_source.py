@@ -2,7 +2,8 @@
 
 - station_master 컬럼명 변환
 - fact 네 소스가 flat daily Archive 파일만 정확한 날짜 목록으로 읽는지
-- 날짜 누락·필수 물리 컬럼 누락을 fail-closed하는지
+- 날짜 일부 누락은 경고 후 건너뛰고(2026-08), 전체 누락·필수 물리 컬럼 누락은
+  여전히 fail-closed하는지
 - 파일 안 범위 밖 행을 실제 timestamp로 다시 제거하는지
 - 재고 `_window_start`, 날씨 `baseDate+baseTime`, 인구 `YMD+TT` 계약
 - 생활인구 actual/최신 우선 중복 규칙과 메타 없는 과거 실측 호환
@@ -539,8 +540,10 @@ def test_weather_context_includes_exact_three_hour_stale_boundary_only(spark):
     assert target_window.iloc[0]["temp"] == pytest.approx(7.0)
 
 
-def test_missing_daily_archive_partition_fails_closed(spark, _data_roots):
-    """요청 구간의 하루라도 없으면 존재하는 날짜만 조용히 읽지 않는다."""
+def test_missing_daily_archive_partition_is_skipped_with_warning(spark, _data_roots, capsys):
+    """요청 구간 중 일부 날짜만 없으면 그 날짜는 건너뛰고 존재하는 날짜만으로
+    계속한다(2026-08 완화 — 월간 재학습이 하루치 결측 때문에 통째로 실패하면 안
+    됨). 요청 범위 전체가 다 없을 때만 실제로 실패한다(다른 테스트)."""
     archive_root = _data_roots["archive"]
     _write_parquet(
         archive_root / "weather_ultra_short_live" / "dt=2025-06-01.parquet",
@@ -550,10 +553,24 @@ def test_missing_daily_archive_partition_fails_closed(spark, _data_roots):
         }]),
     )
 
-    with pytest.raises(FileNotFoundError, match="2025-06-02"):
+    result = read_weather(
+        spark,
+        since="2025-06-01 00:00:00",
+        until="2025-06-03 00:00:00",
+    ).toPandas()
+
+    assert "2025-06-02" in capsys.readouterr().out
+    assert len(result) == 1
+    assert result.iloc[0]["temp"] == 20.0
+
+
+def test_missing_entire_archive_range_still_fails(spark, _data_roots):
+    """요청 범위 전체가 다 없으면(부분이 아니라) 여전히 실패해야 한다 — 채울
+    데이터가 아예 없는데 조용히 빈 결과를 만들면 안 된다."""
+    with pytest.raises(FileNotFoundError, match="2025-06-01"):
         read_weather(
             spark,
-            since="2025-06-01 12:00:00",
+            since="2025-06-01 00:00:00",
             until="2025-06-03 00:00:00",
         )
 
@@ -625,12 +642,14 @@ def test_target_reader_keeps_cross_boundary_return_and_late_archive_arrival(
     assert return_at_00.iloc[0]["count"] == 1
 
 
-def test_target_reader_missing_lookback_partition_fails_closed(
+def test_target_reader_missing_lookback_partition_is_skipped_with_warning(
     spark,
     _data_roots,
     monkeypatch,
+    capsys,
 ):
-    """target 날짜가 있어도 앞쪽 return context archive가 없으면 실패한다."""
+    """target 날짜는 있는데 앞쪽 return context(lookback) archive가 없어도
+    실패하지 않고 그 날짜만 건너뛴 채 나머지로 target을 만든다(2026-08 완화)."""
     silver_root = _data_roots["silver"]
     archive_root = _data_roots["archive"]
     monkeypatch.setattr(fe_config, "INCREMENTAL_LOOKBACK_HOURS", 24)
@@ -651,12 +670,19 @@ def test_target_reader_missing_lookback_partition_fails_closed(
         }]),
     )
 
-    with pytest.raises(FileNotFoundError, match="2025-06-01"):
-        build_targets(
-            spark,
-            since="2025-06-02 00:00:00",
-            until="2025-06-03 00:00:00",
-        )
+    rental_targets, _return_targets = build_targets(
+        spark,
+        since="2025-06-02 00:00:00",
+        until="2025-06-03 00:00:00",
+    )
+
+    assert "2025-06-01" in capsys.readouterr().out
+    rental_query = spark.createDataFrame(
+        [("ST-1", pd.Timestamp("2025-06-02 12:00:00").to_pydatetime())],
+        ["station_id", "tick"],
+    )
+    rental_at_noon = lookup_count_at_ticks(rental_targets, rental_query).toPandas()
+    assert rental_at_noon.iloc[0]["count"] == 1
 
 
 def test_incompatible_daily_archive_schema_fails_closed(spark, _data_roots):

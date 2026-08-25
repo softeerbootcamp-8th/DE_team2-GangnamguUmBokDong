@@ -65,3 +65,79 @@ resource "aws_iam_instance_profile" "emr_ec2" {
   name     = "${var.project}-emr-ec2"
   role     = aws_iam_role.emr_ec2.name
 }
+
+# --- 상시 EC2(Airflow)가 EC2/EMR을 직접 호출하는 데 필요한 권한 ---
+#
+# `airflow/orchestration/aws_infra_task.py`는 별도 access key 없이 상시 EC2의
+# instance profile(`aws_iam_role.app`, compute_app.tf)로 boto3를 호출한다. 지금까지
+# 이 role에는 S3 데이터 접근과 "이 인스턴스가 SSM으로 관리되는" 권한만 있었고,
+# ec2:Start/StopInstances·elasticmapreduce:* 처럼 "이 인스턴스가 다른 리소스를
+# 제어하는" 권한이 전혀 없었다 — 실제로 호출했다면 전부 AccessDenied였을 것이다
+# (SSM SendCommand는 이 권한을 줘도 별도로 SCP가 계정 전체에서 막는다, emr_ec2_ssm
+# 주석 참고 — 그래도 정책 자체는 갖춰 둔다).
+#
+# `elasticmapreduce:RunJobFlow`가 넘기는 ServiceRole/JobFlowRole을 실제로 assume
+# 하려면 호출자에게 그 두 역할에 대한 iam:PassRole도 있어야 한다 — 이 role들은
+# 바로 위 emr_service/emr_ec2이므로, `AWS_EMR_SERVICE_ROLE`/`AWS_EMR_JOB_FLOW_ROLE`
+# 환경변수를 `terraform output emr_service_role`/`emr_instance_profile` 값으로
+# 맞춰야 한다(app EC2의 .env는 Terraform이 아니라 `make deploy-env`가 S3에서 내려받으므로
+# 이 파일에서 직접 wiring할 수 없다 — 배포 설정 쪽에서 반영할 것) — aws_infra_task.py의
+# 기본값(`EMR_DefaultRole`/
+# `EMR_EC2_DefaultRole`)은 AWS CLI `create-default-roles`가 만드는 별개 이름이라
+# 이 계정에 그 기본 역할이 실제로 존재하는지 별도 확인이 필요하다.
+data "aws_iam_policy_document" "airflow_infra_control" {
+  statement {
+    sid    = "Ec2TrainingLifecycle"
+    effect = "Allow"
+    actions = [
+      "ec2:StartInstances",
+      "ec2:StopInstances",
+      "ec2:DescribeInstances",
+    ]
+    resources = ["*"]
+  }
+
+  statement {
+    sid    = "SsmRunCommand"
+    effect = "Allow"
+    actions = [
+      "ssm:SendCommand",
+      "ssm:GetCommandInvocation",
+    ]
+    resources = ["*"]
+  }
+
+  statement {
+    sid    = "EmrClusterLifecycle"
+    effect = "Allow"
+    actions = [
+      "elasticmapreduce:RunJobFlow",
+      "elasticmapreduce:DescribeCluster",
+      "elasticmapreduce:TerminateJobFlows",
+      "elasticmapreduce:AddJobFlowSteps",
+      "elasticmapreduce:DescribeStep",
+      "elasticmapreduce:ModifyInstanceGroups",
+      "elasticmapreduce:ListInstanceGroups",
+    ]
+    resources = ["*"]
+  }
+
+  statement {
+    sid       = "PassEmrRoles"
+    effect    = "Allow"
+    actions   = ["iam:PassRole"]
+    resources = [aws_iam_role.emr_service.arn, aws_iam_role.emr_ec2.arn]
+  }
+}
+
+resource "aws_iam_policy" "airflow_infra_control" {
+  provider    = aws.untagged
+  name        = "${var.project}-airflow-infra-control"
+  description = "Airflow 상시 EC2가 학습 EC2/EMR 클러스터를 직접 제어하는 데 필요한 권한"
+  policy      = data.aws_iam_policy_document.airflow_infra_control.json
+}
+
+resource "aws_iam_role_policy_attachment" "app_infra_control" {
+  role       = aws_iam_role.app.name
+  policy_arn = aws_iam_policy.airflow_infra_control.arn
+}

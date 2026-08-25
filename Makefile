@@ -413,15 +413,20 @@ train-status:
 	  --query 'Reservations[0].Instances[0].[InstanceId,InstanceType,State.Name]' --output text
 
 # EMR 노드가 PYTHONPATH로 쓸 레포 패키지를 묶어 올린다.
-# core/ml_core/feature_engine 세 패키지 루트가 tar 최상위에 오도록 배치한다.
+# core/ml_core/feature_engine/training 네 패키지 루트가 tar 최상위에 오도록 배치한다.
+# training은 월간 재학습을 단일 EMR 클러스터로 통합하면서 추가됐다(evaluation
+# 스텝의 training.scripts.monthly_retrain_check, YARN distributed-shell 학습의
+# training.scripts.yarn_worker_bootstrap이 이 노드에서 직접 실행되므로 필요 —
+# docs/adr/0007-yarn-distributed-shell-workers.md 참고).
 emr-package:
 	@rm -rf $(EMR_STAGE) && mkdir -p $(EMR_STAGE)
 	@cp -R libs/core/src/core   $(EMR_STAGE)/core
 	@cp -R libs/ml_core         $(EMR_STAGE)/ml_core
 	@cp -R ml/feature_engine    $(EMR_STAGE)/feature_engine
+	@cp -R ml/training          $(EMR_STAGE)/training
 	@find $(EMR_STAGE) \( -name '.venv' -o -name '__pycache__' -o -name '.ruff_cache' \
 	    -o -name 'tests' -o -name '.pytest_cache' \) -prune -exec rm -rf {} + 2>/dev/null || true
-	@tar -czf $(EMR_STAGE)/pyfiles.tar.gz -C $(EMR_STAGE) core ml_core feature_engine
+	@tar -czf $(EMR_STAGE)/pyfiles.tar.gz -C $(EMR_STAGE) core ml_core feature_engine training
 	@set -a; . $(PROD_ENV) 2>/dev/null || true; set +a; \
 	BUCKET=$${S3_BUCKET:-$$($(TF) output -raw s3_bucket)}; \
 	aws s3 cp $(EMR_STAGE)/pyfiles.tar.gz "s3://$$BUCKET/emr/pyfiles.tar.gz"; \
