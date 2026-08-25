@@ -34,7 +34,9 @@ bronze/hot/<source_id>/dt=YYYY-MM-DD/hh=HH/HHMM/revision=NNNNNNNNNN/part=<part_k
 - part가 도착할 때마다 즉시 쓴다.
 - 일반 재시도는 manifest가 가리키는 Hot Bronze revision을 재사용한다.
 - `--force`와 backfill correction은 기존 원본을 지우지 않고 새 immutable revision을 만든다.
-- 검증된 날짜의 모든 revision은 `bronze/cold/<source_id>/dt=YYYY-MM-DD/sha256=...parquet`에 원본 gzip bytes 그대로 장기 보관한다.
+- Silver Archive 대상 여부와 관계없이 모든 Collector source의 검증된 날짜 revision은
+  `bronze/cold/<source_id>/dt=YYYY-MM-DD/sha256=...parquet`에 원본 gzip bytes 그대로
+  장기 보관한다.
 - Cold Bronze와 일 단위 Archive가 검증되면 최신 authority가 아닌 Silver를 객체 생성
   후 30일간 보존한 다음 삭제하고
   `_silver_gc_manifest/<source_id>/dt=YYYY-MM-DD.json`에 삭제 key와 복구 근거를 남긴다.

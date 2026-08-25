@@ -14,6 +14,19 @@ DAILY_EVENT_SOURCE = "cultural_event"
 PERFORMANCE_EVENT_SOURCE = "performance_event"
 STATION_MASTER_SOURCE = "bike_station_master"
 
+# Hot Bronze는 source별 Silver Archive 가치와 관계없이 모든 수집 revision의 장기
+# 복구 근거다. 전 source를 Cold Bronze로 옮긴 뒤에만 공통 30일 Lifecycle에 맡긴다.
+COLD_BRONZE_SOURCES = (
+    *REALTIME_5MIN_SOURCES,
+    WEATHER_10MIN_SOURCE,
+    WEATHER_ULTRA_SHORT_FORECAST_SOURCE,
+    WEATHER_3H_SOURCE,
+    DAILY_POPULATION_SOURCE,
+    DAILY_EVENT_SOURCE,
+    PERFORMANCE_EVENT_SOURCE,
+    STATION_MASTER_SOURCE,
+)
+
 # 하루치 silver를 archive로 묶을 대상. 예보 2종(weather_ultra_short_forecast,
 # weather_short_term_forecast)은 사후 재현이 불가해 archive 가치가 낮아 제외한다.
 # cultural_event·performance_event·living_population_grid는 하루 1파일이라 묶을 것이 없다.
