@@ -112,7 +112,19 @@ data "aws_iam_policy_document" "airflow_infra_control" {
     effect = "Allow"
     actions = [
       "elasticmapreduce:RunJobFlow",
+      # RunJobFlow 요청에 Tags를 같이 넣으면(aws_infra_task.create_emr_cluster()가
+      # 항상 그렇게 함) EC2 RunInstances+CreateTags 조합과 같은 이유로 AddTags도
+      # 별도로 필요하다 — 2026-08-25 첫 실제 실행에서 이게 없어서
+      # AccessDeniedException으로 즉시 실패한 걸 실측으로 확인.
+      "elasticmapreduce:AddTags",
       "elasticmapreduce:DescribeCluster",
+      # emr_orphan_reaper.py의 list_active_emr_clusters()/get_cluster_step_activity()가
+      # 쓰는 액션 — 이게 빠져있으면 15분마다 도는 안전망(reaper)이 매번 조용히
+      # 실패해서 "EMR은 무슨 일이 있어도 삭제돼야 한다"는 요구사항이 실제로는
+      # 전혀 보장되지 않는다(2026-08-25, 코드 대조로 발견 — 실측 에러는 아직
+      # 안 남, RunJobFlow 실패가 먼저 나서 reaper 호출까지 못 가봤을 뿐).
+      "elasticmapreduce:ListClusters",
+      "elasticmapreduce:ListSteps",
       "elasticmapreduce:TerminateJobFlows",
       "elasticmapreduce:AddJobFlowSteps",
       "elasticmapreduce:DescribeStep",
