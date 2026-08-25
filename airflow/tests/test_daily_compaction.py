@@ -34,10 +34,11 @@ class TestCompactionSources:
         assert "weather_ultra_short_forecast" not in COMPACTION_SOURCES
         assert "weather_short_term_forecast" not in COMPACTION_SOURCES
 
-    def test_covers_the_three_target_sources(self):
+    def test_covers_the_four_target_sources(self):
         assert set(COMPACTION_SOURCES) == {
             "bike_rental_history",
             "bike_station_realtime",
+            "population_realtime",
             "weather_ultra_short_live",
         }
 
@@ -101,7 +102,11 @@ class TestDag:
         assert task.trigger_rule == TriggerRule.ALL_DONE
 
     def test_other_compactions_are_independent_from_replay(self):
-        for source in ("bike_station_realtime", "weather_ultra_short_live"):
+        for source in (
+            "bike_station_realtime",
+            "population_realtime",
+            "weather_ultra_short_live",
+        ):
             task = dag.get_task(f"compact_{source}")
             assert task.upstream_task_ids == set()
             assert task.trigger_rule == TriggerRule.ALL_SUCCESS
@@ -117,13 +122,16 @@ class TestDag:
             assert task.upstream_task_ids == expected_upstream
 
     def test_non_authority_silver_gc_runs_after_thirty_day_retention(self):
-        for source in COMPACTION_SOURCES:
+        for source in COLD_BRONZE_SOURCES:
             task = dag.get_task(f"gc_silver_{source}")
             assert task.upstream_task_ids == {f"cold_compact_{source}"}
             assert "silver_gc_cli.py" in task.bash_command
             assert "macros.timedelta(days=36)" in task.bash_command
+            assert ("--require-archive" in task.bash_command) is (
+                source in COMPACTION_SOURCES
+            )
 
     def test_expected_task_count(self):
         assert len(dag.task_ids) == (
-            24 + 2 * len(COMPACTION_SOURCES) + len(COLD_BRONZE_SOURCES)
+            24 + len(COMPACTION_SOURCES) + 2 * len(COLD_BRONZE_SOURCES)
         )

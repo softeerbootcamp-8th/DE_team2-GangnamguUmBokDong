@@ -70,9 +70,14 @@ with DAG(
         if source_id in compaction_tasks:
             compaction_tasks[source_id] >> cold
 
-    for source_id in COMPACTION_SOURCES:
+    for source_id in COLD_BRONZE_SOURCES:
         gc_target_date = kst_date_days_ago(
             DAILY_ARCHIVE_DELAY_DAYS + SILVER_GC_RETENTION_DAYS
         )
-        gc = build_silver_gc_task(dag, source_id, gc_target_date)
+        gc = build_silver_gc_task(
+            dag,
+            source_id,
+            gc_target_date,
+            require_archive=source_id in COMPACTION_SOURCES,
+        )
         cold_tasks[source_id] >> gc

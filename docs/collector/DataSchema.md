@@ -40,8 +40,9 @@ bronze/hot/<source_id>/dt=YYYY-MM-DD/hh=HH/HHMM/revision=NNNNNNNNNN/part=<part_k
 - Silver Archive 대상 여부와 관계없이 모든 Collector source의 검증된 날짜 revision은
   `bronze/cold/<source_id>/dt=YYYY-MM-DD/sha256=...parquet`에 원본 gzip bytes 그대로
   장기 보관한다.
-- Cold Bronze와 일 단위 Archive가 검증되면 최신 authority가 아닌 Silver를 객체 생성
-  후 30일간 보존한 다음 삭제하고
+- 모든 source에서 Cold Bronze가 검증되면 최신 authority가 아닌 Silver를 객체 생성 후
+  30일간 보존한 다음 삭제한다. 일 단위 Archive 대상 source는 Archive와 현재 authority
+  signature 일치도 추가로 검증하고
   `_silver_gc_manifest/<source_id>/dt=YYYY-MM-DD.json`에 삭제 key와 복구 근거를 남긴다.
 - 과거 Source Snapshot manifest는 immutable 감사 기록으로 유지되지만 GC된 Silver
   URI는 직접 읽을 수 없다. 과거 데이터를 다시 만들 때는 Cold Bronze를 입력으로 쓴다.

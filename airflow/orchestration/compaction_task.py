@@ -63,12 +63,14 @@ def build_silver_gc_task(
     source_id: str,
     target_date: str,
     *,
+    require_archive: bool = False,
     trigger_rule: str = TriggerRule.ALL_SUCCESS,
 ):
-    """Cold와 Archive가 검증되고 보존기간이 지난 non-authority Silver를 정리한다."""
+    """Cold와 선택적인 Archive 검증 뒤 보존기간 지난 Silver를 정리한다."""
+    archive_arg = " --require-archive" if require_archive else ""
     cmd = (
         f"uv run --frozen python silver_gc_cli.py --source {source_id} "
-        f"--date {target_date}"
+        f"--date {target_date}{archive_arg}"
     )
     return build_module_task(
         dag,

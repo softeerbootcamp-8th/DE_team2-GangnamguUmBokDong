@@ -152,13 +152,14 @@ KST 날짜에만 허용한다. 다음 날 과거 task를 clear해도 현재 응�
 
 ## Archive 대상
 
-현재 daily compaction 대상은 다음 세 source다.
+현재 daily compaction 대상은 다음 네 source다.
 
 - `bike_rental_history`
 - `bike_station_realtime`
+- `population_realtime`
 - `weather_ultra_short_live`
 
-예보 source는 사후 재현 가치가 낮아 compaction하지 않는다. 행사와 일별 생활인구는 하루 1개 window라 작은 파일을 다시 묶을 필요가 없다.
+예보 source는 사후 재현 가치가 낮아 compaction하지 않는다. 행사와 일별 생활인구는 하루 1개 window라 작은 파일을 다시 묶을 필요가 없다. `population_realtime`은 5분 Silver가 하루 최대 288개 생기므로 일별 Archive로 묶는다.
 
 Archive는 source YAML에서 만든 고정 schema와 `_row_status`, `_window_start`, `_source_kind`를 가진다. 최신 authority Silver는 계속 유지하고, non-authority Silver는 생성 후 30일 동안 보존한 뒤 검증된 Cold Bronze를 복구 근거로 삭제한다.
 
