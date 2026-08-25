@@ -13,6 +13,7 @@ from datetime import timedelta
 
 from airflow.providers.standard.operators.python import ShortCircuitOperator
 from airflow.task.trigger_rule import TriggerRule
+
 from callbacks.task_callbacks import on_failure_callback, on_success_callback
 from config.schedules import (
     DEFAULT_EXECUTION_TIMEOUT,
@@ -20,7 +21,7 @@ from config.schedules import (
     DEFAULT_RETRY_DELAY,
     EXECUTION_TIMEOUT_OVERRIDES,
 )
-
+from orchestration.poi_master_task import poi_master_ref_env
 from orchestration.task_builder import (
     REPO_ROOT,
     build_module_task,
@@ -106,6 +107,33 @@ def build_collector_task(
         execution_timeout=timeout,
         retries=retries,
         retry_delay=retry_delay,
+    )
+
+
+def build_population_collector_task(
+    dag,
+    *,
+    poi_master_task_id: str,
+    retries: int = DEFAULT_RETRIES,
+):
+    """Resolver가 고정한 POI Master로 실시간 인구를 수집하는 태스크를 만든다."""
+    source_id = "population_realtime"
+    timeout = EXECUTION_TIMEOUT_OVERRIDES.get(source_id, DEFAULT_EXECUTION_TIMEOUT)
+    cmd = (
+        f"uv run --frozen python main.py --source {source_id} "
+        f"--window-start {KST_WINDOW_START} "
+        '--poi-master-mode "$POI_MASTER_MODE" '
+        '--poi-master-manifest-uri "$POI_MASTER_MANIFEST_URI" '
+        '--poi-master-manifest-sha256 "$POI_MASTER_MANIFEST_SHA256"'
+    )
+    return build_module_task(
+        dag,
+        f"collect_{source_id}",
+        COLLECTOR_DIR,
+        cmd,
+        execution_timeout=timeout,
+        retries=retries,
+        env=poi_master_ref_env(poi_master_task_id),
     )
 
 

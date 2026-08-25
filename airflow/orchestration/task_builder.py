@@ -1,4 +1,4 @@
-"""6개 모듈(collector/normalizer/nowcasting/ml-inference/loader/rebalance)이 쓰는
+"""7개 모듈(collector/poi-master/normalizer/nowcasting/ml-inference/loader/rebalance)이 쓰는
 공용 subprocess-CLI BashOperator 팩토리.
 
 Airflow는 각 모듈을 독립된 CLI로만 호출한다 — 모듈 내부 코드를 import하지 않는다.
@@ -17,6 +17,7 @@ from typing import Any
 
 from airflow.providers.standard.operators.bash import BashOperator
 from airflow.task.trigger_rule import TriggerRule
+
 from callbacks.task_callbacks import on_failure_callback, on_success_callback
 from config.schedules import (
     DEFAULT_EXECUTION_TIMEOUT,

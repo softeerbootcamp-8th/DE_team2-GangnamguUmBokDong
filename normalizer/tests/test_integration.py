@@ -11,16 +11,16 @@ import json
 from datetime import datetime, timedelta
 
 import boto3
+import pyarrow as pa
+import pyarrow.parquet as pq
+import pytest
+from core.forecast import POPULATION_FORECAST_SLOT_COUNT
+
 import grid
 import main
 import merge
 import poi
-import pyarrow as pa
-import pyarrow.parquet as pq
-import pytest
 import storage
-from core.forecast import POPULATION_FORECAST_SLOT_COUNT
-
 from tests.conftest import KST, TEST_BUCKET, put_source_snapshot
 
 # POI001("강남 MICE 관광특구")와 실제로 크게 겹치는 격자(약 97.9% 겹침, 이번 조사에서 확인).
@@ -230,6 +230,12 @@ class TestEndToEndRun:
         assert body["baseline_dates"] == ["2026-08-15", "2026-08-16"]
         assert body["cell_count"] == 2
         assert body["poi_matched_count"] == 1
+        assert body["poi_master"] == {
+            "mode": "static",
+            "manifest_uri": None,
+            "manifest_sha256": None,
+        }
+        assert body["poi_master_row_count"] == 121
         assert body["poi_forecast_count"] == 1
         assert body["forecast_horizons"] == 12
         assert len(body["written_keys"]) == 13

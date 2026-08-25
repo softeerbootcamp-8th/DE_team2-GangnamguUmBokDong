@@ -22,7 +22,7 @@
 |---|---|
 | `main.py` | CLI 진입점, 보정 대상 시각 결정(현재 + `FCST_n_TIME`), 시간대(`TT`) 필터링 및 파이프라인 실행 |
 | `grid.py` | 국가지점번호 `CELL_ID`를 EPSG:5179 좌표로 변환하고 250m 정사각 격자 폴리곤 생성 |
-| `poi.py` | 121개 POI Shapefile 로딩, 위상 오류(`make_valid`) 복구, EPSG:5179 좌표계 변환 및 메모리 캐싱 |
+| `poi.py` | 실행에 고정된 S3 POI Master 로딩·검증, 최초 activation 전 repository Shapefile fallback, 메모리 캐싱 |
 | `merge.py` | `STRtree` 공간 조인(지오메트리 기준 1회, 전 시각 재사용), 면적 가중 밀도 합성, 연령·성별 재분배(현재) / 총량 스케일(미래), 면적 내림차순 순차 갱신 |
 | `station_master.py` | 대여소 master에 생활인구 250m `CELL_ID`(`grid_id`, STRtree 공간 조인)와 기상청 5km 격자(`weather_nx`/`weather_ny`, `core.weather_grid`)를 보강 |
 | `storage.py` | S3 실버 읽기/쓰기 및 실행 메타데이터 Manifest JSON 저장 |

@@ -46,6 +46,24 @@ data "aws_iam_policy_document" "data_access" {
     resources = ["${aws_s3_bucket.data.arn}/*"]
   }
 
+  # POI Master는 content-addressed artifact와 append-only activation history다.
+  # 실행 역할의 실수나 잘못된 정리 작업이 최초 게시 이후 static fixture로 되돌리는
+  # 상태를 만들지 못하도록 이 네 namespace의 삭제를 명시적으로 거부한다.
+  statement {
+    sid    = "DenyDeletePoiMasterHistory"
+    effect = "Deny"
+    actions = [
+      "s3:DeleteObject",
+      "s3:DeleteObjectVersion",
+    ]
+    resources = [
+      "${aws_s3_bucket.data.arn}/silver/poi_master/*",
+      "${aws_s3_bucket.data.arn}/source_snapshot_manifest/poi_master/*",
+      "${aws_s3_bucket.data.arn}/source_snapshot_pointer/poi_master/*",
+      "${aws_s3_bucket.data.arn}/source_snapshot_raw/poi_master/*",
+    ]
+  }
+
 }
 
 resource "aws_iam_policy" "data_access" {
