@@ -43,7 +43,13 @@ def _prediction(
         horizon=horizon,
         target_dttm=target or base + timedelta(hours=horizon - 1),
         rental_pred_mean=rental,
+        rental_pred_p10=0.5,
+        rental_pred_p50=1.5,
+        rental_pred_p90=2.5,
         return_pred_mean=returned,
+        return_pred_p10=1.0,
+        return_pred_p50=2.0,
+        return_pred_p90=3.0,
     )
 
 
@@ -96,7 +102,7 @@ def test_projection_accepts_plan_expected_subset_of_active_model_support() -> No
 def _inference_authority_payload(
     station_ids: tuple[str, ...] = ("ST-1",),
 ) -> bytes:
-    """Core contract로 canonical 7-column inference authority bytes를 만든다."""
+    """Core contract로 canonical 13-column inference authority bytes를 만든다."""
     local_base = BASE + timedelta(hours=9)
     rows = []
     for station_id in station_ids:
@@ -110,8 +116,13 @@ def _inference_authority_payload(
                     "minute": target.minute,
                     "horizon": horizon,
                     "rental_pred_mean": float(horizon) + 0.5,
+                    "rental_pred_p10": -0.5,
+                    "rental_pred_p50": float(horizon) + 0.25,
+                    "rental_pred_p90": float(horizon) + 1.0,
                     "return_pred_mean": float(horizon) + 1.5,
-                    "rental_pred_p50": 999.0,
+                    "return_pred_p10": -1.5,
+                    "return_pred_p50": float(horizon) + 1.25,
+                    "return_pred_p90": float(horizon) + 2.0,
                 }
             )
     table = canonicalize_inference_output_table(
@@ -137,7 +148,13 @@ def test_inference_authority_adapter_uses_core_exact_schema_and_utc_anchor() -> 
         horizon=1,
         target_dttm=BASE,
         rental_pred_mean=1.5,
+        rental_pred_p10=-0.5,
+        rental_pred_p50=1.25,
+        rental_pred_p90=2.0,
         return_pred_mean=2.5,
+        return_pred_p10=-1.5,
+        return_pred_p50=2.25,
+        return_pred_p90=3.0,
     )
     assert records[-1].target_dttm == BASE + timedelta(hours=11)
 
@@ -195,7 +212,13 @@ def test_prediction_wraps_datetime_overflow_as_contract_failure() -> None:
             horizon=2,
             target_dttm=datetime.max.replace(tzinfo=UTC),
             rental_pred_mean=1.0,
+            rental_pred_p10=0.0,
+            rental_pred_p50=1.0,
+            rental_pred_p90=2.0,
             return_pred_mean=1.0,
+            return_pred_p10=0.0,
+            return_pred_p50=1.0,
+            return_pred_p90=2.0,
         )
 
 

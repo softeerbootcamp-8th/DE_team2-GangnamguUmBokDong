@@ -39,7 +39,11 @@ from core.model_snapshot import (
     build_model_snapshot_manifest,
 )
 from gold import demand as demand_module
-from gold.demand import HORIZON_COUNT, publish_station_demand_forecast
+from gold.demand import (
+    HORIZON_COUNT,
+    demand_predictions_from_publication_lineage,
+    publish_station_demand_forecast,
+)
 from gold.state import load_dependencies
 from psycopg import Connection
 
@@ -108,6 +112,12 @@ def test_demand_publish_replay_stale_correction_empty_and_atomic_rollback(
         "rental_model_manifest",
         "return_model_manifest",
     )
+    lineage = demand_predictions_from_publication_lineage(
+        store,
+        first.evidence[0].manifest,
+    )
+    assert lineage[0].rental_pred_p10 == 0.25
+    assert lineage[0].return_pred_p90 == 3.5
 
     replay = _publish(gold_connection, store, first_uri, first_sha)
     assert replay.result.outcome is PublicationOutcome.EXACT_REPLAY
@@ -363,8 +373,13 @@ def _inference_output_bytes(
                     "minute": target.minute,
                     "horizon": horizon,
                     "rental_pred_mean": rental_offset + 1.0,
+                    "rental_pred_p10": 0.25,
+                    "rental_pred_p50": rental_offset + 0.5,
+                    "rental_pred_p90": rental_offset + 1.5,
                     "return_pred_mean": 2.5,
-                    "rental_pred_p50": 999.0,
+                    "return_pred_p10": 1.0,
+                    "return_pred_p50": 2.5,
+                    "return_pred_p90": 3.5,
                 }
             )
     table = canonicalize_inference_output_table(

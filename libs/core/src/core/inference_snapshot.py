@@ -35,7 +35,7 @@ from .model_snapshot import (
     validate_model_snapshot_manifest,
 )
 
-INFERENCE_SNAPSHOT_MANIFEST_SCHEMA_VERSION = "ml-inference-snapshot-manifest-v1"
+INFERENCE_SNAPSHOT_MANIFEST_SCHEMA_VERSION = "ml-inference-snapshot-manifest-v2"
 """Gold ``inference_output`` role이 가리키는 manifest schema version이다."""
 
 INFERENCE_HORIZON_COUNT = 12
@@ -48,7 +48,13 @@ INFERENCE_OUTPUT_COLUMN_NAMES = (
     "minute",
     "horizon",
     "rental_pred_mean",
+    "rental_pred_p10",
+    "rental_pred_p50",
+    "rental_pred_p90",
     "return_pred_mean",
+    "return_pred_p10",
+    "return_pred_p50",
+    "return_pred_p90",
 )
 """Gold demand가 소비하는 inference output의 exact column 순서다."""
 
@@ -60,7 +66,13 @@ INFERENCE_OUTPUT_ARROW_SCHEMA = pa.schema(
         pa.field("minute", pa.uint8(), nullable=False),
         pa.field("horizon", pa.uint8(), nullable=False),
         pa.field("rental_pred_mean", pa.float64(), nullable=False),
+        pa.field("rental_pred_p10", pa.float64(), nullable=False),
+        pa.field("rental_pred_p50", pa.float64(), nullable=False),
+        pa.field("rental_pred_p90", pa.float64(), nullable=False),
         pa.field("return_pred_mean", pa.float64(), nullable=False),
+        pa.field("return_pred_p10", pa.float64(), nullable=False),
+        pa.field("return_pred_p50", pa.float64(), nullable=False),
+        pa.field("return_pred_p90", pa.float64(), nullable=False),
     )
 )
 """Inference authority Parquet의 metadata 없는 exact non-null Arrow schema다."""
@@ -397,7 +409,7 @@ def canonicalize_inference_output_table(
     logical_dttm: datetime,
     expected_sta_ids: IdSet,
 ) -> pa.Table:
-    """Producer row를 Gold가 소비하는 7-column authority로 정규화한다.
+    """Producer row를 Gold가 소비하는 13-column authority로 정규화한다.
 
     Extra producer metadata column은 authority에서 제외하고, station×12
     완전성과 KST target time을 검증한 뒤 station UTF-8 byte·horizon
@@ -498,9 +510,33 @@ def canonicalize_inference_output_table(
                     raw["rental_pred_mean"],
                     f"inference output row {index} rental_pred_mean",
                 ),
+                "rental_pred_p10": _require_quantile_prediction(
+                    raw["rental_pred_p10"],
+                    f"inference output row {index} rental_pred_p10",
+                ),
+                "rental_pred_p50": _require_quantile_prediction(
+                    raw["rental_pred_p50"],
+                    f"inference output row {index} rental_pred_p50",
+                ),
+                "rental_pred_p90": _require_quantile_prediction(
+                    raw["rental_pred_p90"],
+                    f"inference output row {index} rental_pred_p90",
+                ),
                 "return_pred_mean": _require_prediction(
                     raw["return_pred_mean"],
                     f"inference output row {index} return_pred_mean",
+                ),
+                "return_pred_p10": _require_quantile_prediction(
+                    raw["return_pred_p10"],
+                    f"inference output row {index} return_pred_p10",
+                ),
+                "return_pred_p50": _require_quantile_prediction(
+                    raw["return_pred_p50"],
+                    f"inference output row {index} return_pred_p50",
+                ),
+                "return_pred_p90": _require_quantile_prediction(
+                    raw["return_pred_p90"],
+                    f"inference output row {index} return_pred_p90",
                 ),
             }
         )
@@ -539,7 +575,7 @@ def canonicalize_inference_output_table(
 
 
 def serialize_inference_output_parquet(table: pa.Table) -> bytes:
-    """Exact 7-column authority table을 고정 writer option의 Parquet bytes로 만든다."""
+    """Exact 13-column authority table을 고정 writer option의 Parquet bytes로 만든다."""
     _require_exact_output_schema(table)
     _require_canonical_output_order(table)
     sink = pa.BufferOutputStream()
@@ -1098,7 +1134,7 @@ def _to_arrow_table(value: pa.Table | pd.DataFrame) -> pa.Table:
 
 
 def _require_exact_output_schema(table: pa.Table) -> None:
-    """Arrow table이 metadata 없는 exact 7-column non-null schema인지 확인한다."""
+    """Arrow table이 metadata 없는 exact 13-column non-null schema인지 확인한다."""
     if type(table) is not pa.Table:
         raise InferenceSnapshotContractError(
             "inference output authority는 exact pyarrow.Table이어야 합니다."
@@ -1108,7 +1144,7 @@ def _require_exact_output_schema(table: pa.Table) -> None:
         check_metadata=True,
     ):
         raise InferenceSnapshotContractError(
-            "inference output Arrow schema가 exact 7-column contract와 다릅니다."
+            "inference output Arrow schema가 exact 13-column contract와 다릅니다."
         )
     if any(column.null_count for column in table.columns):
         raise InferenceSnapshotContractError(
@@ -1148,6 +1184,18 @@ def _require_canonical_output_order(table: pa.Table) -> None:
             raw["rental_pred_mean"],
             f"inference output row {index} rental_pred_mean",
         )
+        for name in (
+            "rental_pred_p10",
+            "rental_pred_p50",
+            "rental_pred_p90",
+            "return_pred_p10",
+            "return_pred_p50",
+            "return_pred_p90",
+        ):
+            _require_quantile_prediction(
+                raw[name],
+                f"inference output row {index} {name}",
+            )
         _require_prediction(
             raw["return_pred_mean"],
             f"inference output row {index} return_pred_mean",
@@ -1210,6 +1258,18 @@ def _require_prediction(value: Any, label: str) -> float:
         raise InferenceSnapshotContractError(
             f"{label}은 finite nonnegative float64여야 합니다."
         )
+    return 0.0 if normalized == 0 else normalized
+
+
+def _require_quantile_prediction(value: Any, label: str) -> float:
+    """Quantile scalar를 부호와 순서를 바꾸지 않고 finite float64로 정규화한다."""
+    if type(value) not in {int, float} or type(value) is bool:
+        raise InferenceSnapshotContractError(
+            f"{label}은 float64-compatible 숫자여야 합니다."
+        )
+    normalized = float(value)
+    if not math.isfinite(normalized):
+        raise InferenceSnapshotContractError(f"{label}은 finite float64여야 합니다.")
     return 0.0 if normalized == 0 else normalized
 
 
