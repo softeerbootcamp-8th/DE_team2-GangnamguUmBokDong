@@ -459,10 +459,10 @@ def _upsert_weather_forecast_records(
     cursor: Cursor[tuple[Any, ...]],
     records: tuple[WeatherForecastRecord, ...],
 ) -> None:
-    """incoming weather PK를 upsert하며 DB 최초 생성 시각을 보존한다."""
+    """incoming weather PK를 단일 SQL로 upsert하며 최초 생성 시각을 보존한다."""
     if not records:
         return
-    cursor.executemany(
+    cursor.execute(
         """
         INSERT INTO weather_forecast AS current_forecast (
             weather_grid_id,
@@ -477,7 +477,43 @@ def _upsert_weather_forecast_records(
             humidity,
             wind_speed
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        SELECT incoming.weather_grid_id,
+               incoming.forecast_dttm,
+               incoming.source_product_cd,
+               incoming.base_dttm,
+               incoming.sky_condition_cd,
+               incoming.precipitation_type_cd,
+               incoming.temperature,
+               incoming.precipitation_prob,
+               incoming.precipitation_amount,
+               incoming.humidity,
+               incoming.wind_speed
+          FROM unnest(
+                   %s::TEXT[],
+                   %s::TIMESTAMPTZ[],
+                   %s::TEXT[],
+                   %s::TIMESTAMPTZ[],
+                   %s::TEXT[],
+                   %s::TEXT[],
+                   %s::DOUBLE PRECISION[],
+                   %s::DOUBLE PRECISION[],
+                   %s::DOUBLE PRECISION[],
+                   %s::DOUBLE PRECISION[],
+                   %s::DOUBLE PRECISION[]
+               ) AS incoming(
+                   weather_grid_id,
+                   forecast_dttm,
+                   source_product_cd,
+                   base_dttm,
+                   sky_condition_cd,
+                   precipitation_type_cd,
+                   temperature,
+                   precipitation_prob,
+                   precipitation_amount,
+                   humidity,
+                   wind_speed
+               )
+         ORDER BY incoming.weather_grid_id COLLATE "C", incoming.forecast_dttm
         ON CONFLICT (weather_grid_id, forecast_dttm) DO UPDATE
         SET source_product_cd = EXCLUDED.source_product_cd,
             base_dttm = EXCLUDED.base_dttm,
@@ -510,21 +546,18 @@ def _upsert_weather_forecast_records(
             EXCLUDED.wind_speed
         )
         """,
-        tuple(
-            (
-                record.weather_grid_id,
-                record.forecast_dttm,
-                record.source_product_cd,
-                record.base_dttm,
-                record.sky_condition_cd,
-                record.precipitation_type_cd,
-                record.temperature,
-                record.precipitation_prob,
-                record.precipitation_amount,
-                record.humidity,
-                record.wind_speed,
-            )
-            for record in records
+        (
+            [record.weather_grid_id for record in records],
+            [record.forecast_dttm for record in records],
+            [record.source_product_cd for record in records],
+            [record.base_dttm for record in records],
+            [record.sky_condition_cd for record in records],
+            [record.precipitation_type_cd for record in records],
+            [record.temperature for record in records],
+            [record.precipitation_prob for record in records],
+            [record.precipitation_amount for record in records],
+            [record.humidity for record in records],
+            [record.wind_speed for record in records],
         ),
     )
 

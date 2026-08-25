@@ -850,11 +850,11 @@ def _reconcile_demand_records(
             predicted_rent_cnt INTEGER NOT NULL,
             predicted_rtn_cnt INTEGER NOT NULL,
             PRIMARY KEY (sta_id, predicted_dttm)
-        ) ON COMMIT DROP
-        """
+    ) ON COMMIT DROP
+    """
     )
     if records:
-        cursor.executemany(
+        cursor.execute(
             """
             INSERT INTO gold_demand_staging (
                 base_dttm,
@@ -862,18 +862,34 @@ def _reconcile_demand_records(
                 predicted_dttm,
                 predicted_rent_cnt,
                 predicted_rtn_cnt
-            ) VALUES (%s, %s, %s, %s, %s)
+            )
+            SELECT incoming.base_dttm,
+                   incoming.sta_id,
+                   incoming.predicted_dttm,
+                   incoming.predicted_rent_cnt,
+                   incoming.predicted_rtn_cnt
+              FROM unnest(
+                       %s::TIMESTAMPTZ[],
+                       %s::TEXT[],
+                       %s::TIMESTAMPTZ[],
+                       %s::INTEGER[],
+                       %s::INTEGER[]
+                   ) AS incoming(
+                       base_dttm,
+                       sta_id,
+                       predicted_dttm,
+                       predicted_rent_cnt,
+                       predicted_rtn_cnt
+                   )
+             ORDER BY incoming.sta_id COLLATE "C", incoming.predicted_dttm
             """,
-            [
-                (
-                    record.base_dttm,
-                    record.sta_id,
-                    record.predicted_dttm,
-                    record.predicted_rent_cnt,
-                    record.predicted_rtn_cnt,
-                )
-                for record in records
-            ],
+            (
+                [record.base_dttm for record in records],
+                [record.sta_id for record in records],
+                [record.predicted_dttm for record in records],
+                [record.predicted_rent_cnt for record in records],
+                [record.predicted_rtn_cnt for record in records],
+            ),
         )
         cursor.execute(
             """
