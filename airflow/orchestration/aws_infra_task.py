@@ -24,6 +24,12 @@ EMR_RELEASE_LABEL = os.environ.get("AWS_EMR_RELEASE_LABEL", "emr-7.2.0")
 EMR_MASTER_INSTANCE_TYPE = os.environ.get("AWS_EMR_MASTER_INSTANCE_TYPE", "m4.large")
 EMR_CORE_INSTANCE_TYPE = os.environ.get("AWS_EMR_CORE_INSTANCE_TYPE", "m4.large")
 EMR_CORE_INSTANCE_COUNT = int(os.environ.get("AWS_EMR_CORE_INSTANCE_COUNT", "2"))
+# m4.large는 EC2-Classic을 지원하지 않아 반드시 VPC 서브넷을 명시해야 한다 — 이게
+# 없어서 첫 실제 실행에서 RunJobFlow가 "Subnet is required" VALIDATION_ERROR로
+# 즉시 실패했다(2026-08-25, 실측). 계정/리전마다 값이 다른 실제 리소스 ID라
+# 합리적인 기본값이 없으므로, terraform이 `config/prod.env`에 자동으로 채워주는
+# 값(`aws_subnet.public[0].id`, `terraform/data.tf`)을 그대로 읽는다.
+EMR_SUBNET_ID = os.environ.get("AWS_EMR_SUBNET_ID", "")
 # 기본값은 AWS CLI가 관례적으로 쓰는 이름(EMR_DefaultRole 등)이 아니라 이
 # 프로젝트의 terraform(`terraform/emr.tf`)이 실제로 만드는 역할 이름
 # (`${var.project}-emr-service`/`${var.project}-emr-ec2`, `variables.tf`의
@@ -397,6 +403,12 @@ def run_emr_feature_mart_job(
         logger.info("[Mock EMR] 프로필 '%s' 피처마트 생성 EMR 클러스터 실행 및 완료 (Mock: %s)", profile_name, mock_job_id)
         return mock_job_id
 
+    if not EMR_SUBNET_ID:
+        raise RuntimeError(
+            "AWS_EMR_SUBNET_ID가 비어 있습니다 — m4.large는 VPC 서브넷 지정 없이 못 뜹니다. "
+            "terraform output -raw subnet_id 값을 config/prod.env(AWS_EMR_SUBNET_ID)에 채우세요."
+        )
+
     master_type = master_instance_type or EMR_MASTER_INSTANCE_TYPE
     core_type = core_instance_type or EMR_CORE_INSTANCE_TYPE
     core_count = core_instance_count or EMR_CORE_INSTANCE_COUNT
@@ -467,6 +479,7 @@ def run_emr_feature_mart_job(
                     "InstanceCount": core_count,
                 },
             ],
+            "Ec2SubnetId": EMR_SUBNET_ID,
             "KeepJobFlowAliveWhenNoSteps": False,
             "TerminationProtected": False,
         },
@@ -659,6 +672,12 @@ def create_emr_cluster(
         logger.info("[Mock EMR] 상시 클러스터 '%s' 생성 (Mock: %s)", cluster_name or "monthly-retrain", mock_cluster_id)
         return mock_cluster_id
 
+    if not EMR_SUBNET_ID:
+        raise RuntimeError(
+            "AWS_EMR_SUBNET_ID가 비어 있습니다 — m4.large는 VPC 서브넷 지정 없이 못 뜹니다. "
+            "terraform output -raw subnet_id 값을 config/prod.env(AWS_EMR_SUBNET_ID)에 채우세요."
+        )
+
     master_type = master_instance_type or EMR_MASTER_INSTANCE_TYPE
     core_type = core_instance_type or EMR_CORE_INSTANCE_TYPE
     core_count = core_instance_count or EMR_CORE_INSTANCE_COUNT
@@ -688,6 +707,7 @@ def create_emr_cluster(
                     "InstanceCount": core_count,
                 },
             ],
+            "Ec2SubnetId": EMR_SUBNET_ID,
             "KeepJobFlowAliveWhenNoSteps": True,
             "TerminationProtected": False,
         },

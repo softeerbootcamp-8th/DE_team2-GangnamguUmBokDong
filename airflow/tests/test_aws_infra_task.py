@@ -24,6 +24,15 @@ def _no_dummy_access_key(monkeypatch):
     monkeypatch.delenv("MOCK_AWS_INFRA", raising=False)
 
 
+@pytest.fixture(autouse=True)
+def _default_emr_subnet(monkeypatch):
+    """EMR_SUBNET_ID는 모듈 import 시점에 환경변수로 고정되므로 monkeypatch.setenv가
+    안 먹는다 — 대신 모듈 속성 자체를 덮어써서 대부분의 테스트가 "서브넷이
+    설정된 정상 상태"를 기본으로 가정하게 한다. 빈 값일 때의 동작만 검증하는
+    테스트는 이 값을 다시 ""로 덮어쓴다."""
+    monkeypatch.setattr(infra, "EMR_SUBNET_ID", "subnet-0123456789abcdef0")
+
+
 def _stub_emr_client(monkeypatch) -> Stubber:
     client = boto3.client("emr", region_name="ap-northeast-2")
     stubber = Stubber(client)
@@ -90,6 +99,9 @@ def test_create_emr_cluster_sets_keep_alive_and_managed_policy_tag(monkeypatch):
     assert captured["Instances"]["KeepJobFlowAliveWhenNoSteps"] is True
     assert {"Key": "for-use-with-amazon-emr-managed-policies", "Value": "true"} in captured["Tags"]
     assert captured["Instances"]["InstanceGroups"][1]["InstanceCount"] == 3
+    # m4.large는 서브넷 없이 못 뜬다 — 첫 실제 실행에서 이게 빠져 "Subnet is
+    # required" VALIDATION_ERROR로 실패했다(2026-08-25).
+    assert captured["Instances"]["Ec2SubnetId"] == infra.EMR_SUBNET_ID
     # 기본값(AWS_EMR_BOOTSTRAP_SCRIPT_S3_URI 미설정)에서도 BootstrapActions가
     # 실려야 한다 — 예전엔 빈 문자열이 기본값이라 아무도 안 채우면 training
     # 패키지가 안 깔린 클러스터가 뜨고 첫 스텝이 ImportError로 조용히
@@ -177,6 +189,21 @@ def test_create_emr_cluster_terminates_itself_on_waiting_timeout(monkeypatch):
         )
 
     stubber.assert_no_pending_responses()
+
+
+def test_create_emr_cluster_raises_immediately_when_subnet_id_missing(monkeypatch):
+    """AWS_EMR_SUBNET_ID가 비어 있으면 boto3를 부르기도 전에 즉시 실패해야 한다 —
+    안 그러면 AWS가 훨씬 늦게(클러스터 생성 요청 자체가 거부된 뒤) 알려줘서
+    원인 파악이 느려진다(2026-08-25 첫 실제 실행에서 실측)."""
+    monkeypatch.setattr(infra, "EMR_SUBNET_ID", "")
+
+    def _fail(*args, **kwargs):
+        raise AssertionError("서브넷 검증에서 걸러졌어야 하므로 boto3 클라이언트를 만들면 안 됨")
+
+    monkeypatch.setattr(infra, "_get_boto3_client", _fail)
+
+    with pytest.raises(RuntimeError, match="AWS_EMR_SUBNET_ID"):
+        infra.create_emr_cluster(core_instance_count=3, mock_override=infra.MOCK_OVERRIDE_FORCE_REAL)
 
 
 def test_create_emr_cluster_mock_mode_returns_without_calling_aws(monkeypatch):

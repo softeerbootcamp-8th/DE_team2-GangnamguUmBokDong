@@ -217,6 +217,10 @@ locals {
 
     S3_BUCKET=${aws_s3_bucket.data.id}
     MODELS_PREFIX=models
+    # m4.large는 VPC 서브넷 지정 없이 못 뜬다 — 계정/리전마다 다른 실제 리소스
+    # ID라 aws_infra_task.py에 합리적인 기본값을 둘 수 없어 여기서 채운다
+    # (2026-08-25, 첫 실제 EMR 실행에서 이게 빠져 실패한 걸 발견).
+    AWS_EMR_SUBNET_ID=${aws_subnet.public[0].id}
     GOLD_STATION_MASTER_LOOKBACK_HOURS=168
     GOLD_STATION_REALTIME_LOOKBACK_HOURS=24
 
