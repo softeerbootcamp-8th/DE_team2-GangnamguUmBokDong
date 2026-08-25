@@ -236,10 +236,16 @@ locals {
     GOLD_STATION_REALTIME_LOOKBACK_HOURS=24
 
     # 컨테이너 안에서 mlflow 서비스는 compose 네트워크 이름으로 붙는다.
-    # 학습 EC2는 이 값 대신 상시 EC2의 사설 IP를 쓴다.
+    # 학습 EC2/EMR은 이 값 대신 상시 EC2의 사설 IP를 쓴다(아래
+    # AWS_EMR_MLFLOW_TRACKING_URI).
     # 끝의 /mlflow는 오타가 아니다 — 트래킹 서버를 --static-prefix /mlflow로 띄워
     # UI를 web(nginx)의 /mlflow/ 아래에 붙였고, API 경로도 같은 접두를 갖는다.
     MLFLOW_TRACKING_URI=http://mlflow:5000/mlflow
+    # EMR 노드에서는 docker 네트워크 이름("mlflow")이 안 풀리므로 상시 EC2의 사설
+    # IP를 직접 쓴다 — network.tf의 app_mlflow_from_emr_master/core 인그레스 규칙이
+    # 이 접근을 허용한다(PR 리뷰 지적, 2026-08 — 학습 스텝이 MLflow에 못 붙어
+    # 실패할 것이었다).
+    AWS_EMR_MLFLOW_TRACKING_URI=http://${aws_instance.app.private_ip}:5000/mlflow
   EOT
 }
 
