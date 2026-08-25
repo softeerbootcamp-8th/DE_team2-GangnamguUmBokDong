@@ -37,6 +37,7 @@ from airflow.sdk import Param
 from airflow.timetables.trigger import CronTriggerTimetable
 from config.schedules import (
     CATCHUP,
+    EMR_FEATURE_MART_TIMEOUT,
     MAX_ACTIVE_RUNS,
     MONTHLY_CLUSTER_CREATE_TIMEOUT,
     MONTHLY_EVALUATION_TIMEOUT,
@@ -51,6 +52,7 @@ from orchestration.aws_infra_task import (
     EMR_S3_SCRIPTS_PREFIX,
     MOCK_OVERRIDE_FORCE_MOCK,
     MOCK_OVERRIDE_FORCE_REAL,
+    MODELS_PREFIX,
     S3_BUCKET,
     TRAINING_RUNS_PREFIX,
     create_emr_cluster,
@@ -96,6 +98,50 @@ def _result_s3_key(run_id: str, name: str) -> str:
     return f"{TRAINING_RUNS_PREFIX}/{run_id}/{name}.json"
 
 
+def _feature_mart_spark_steps(profile: str) -> tuple[tuple[str, list[str]], tuple[str, list[str]]]:
+    """`profile`로 feature mart(2차 정제)를 (재)생성하는 두 Spark 스텝(name, args)을
+    반환한다 — run_pipeline.py는 watermark 기반 증분이라 매번 불러도 안전하다
+    (평가 전 최신화용 `refresh_feature_mart`와 재학습 루프 양쪽에서 재사용)."""
+    common_confs = [
+        "--conf",
+        f"spark.yarn.appMasterEnv.ML_PROFILE={profile}",
+        "--conf",
+        f"spark.executorEnv.ML_PROFILE={profile}",
+        # S3_BUCKET도 ML_PROFILE과 같은 이유로 명시해야 한다 — 없으면
+        # ml/feature_engine/spark/config.py가 "local-dev"로 떨어진다.
+        "--conf",
+        f"spark.yarn.appMasterEnv.S3_BUCKET={S3_BUCKET}",
+        "--conf",
+        f"spark.executorEnv.S3_BUCKET={S3_BUCKET}",
+    ]
+    return (
+        (
+            f"Spark-RunPipeline-{profile}",
+            ["spark-submit", "--deploy-mode", "cluster", "--master", "yarn", *common_confs,
+             f"{EMR_S3_SCRIPTS_PREFIX}/run_pipeline.py"],
+        ),
+        (
+            f"Spark-BuildMultiHorizon-{profile}",
+            ["spark-submit", "--deploy-mode", "cluster", "--master", "yarn", *common_confs,
+             f"{EMR_S3_SCRIPTS_PREFIX}/build_multi_horizon_features.py"],
+        ),
+    )
+
+
+def _champion_profile_name(model_name: str) -> str | None:
+    """지금 챔피언이 학습될 때 쓴 프로필 이름 — `training.scripts.monthly_retrain_check.
+    _champion_profile_name()`과 같은 로직이다. airflow venv는 ml_core/core를 설치하지
+    않으므로(파일 상단 S3_BUCKET 주석 참고) `read_champion_prefix()`/`model_json_key()`를
+    import하지 못하고, 그 두 함수가 만드는 S3 키 형식을 `read_s3_json()`으로 직접
+    재현한다 — 키 형식이 바뀌면 (`libs/ml_core/paths.py`) 이쪽도 같이 고칠 것."""
+    pointer = read_s3_json(f"{MODELS_PREFIX}/champion/{model_name}.json")
+    archive_prefix = (pointer or {}).get("archive_prefix")
+    if not archive_prefix:
+        return None
+    payload = read_s3_json(f"{archive_prefix}/{model_name}_profile.json")
+    return (payload or {}).get("profile_name")
+
+
 def _bash_step(name: str, command: str) -> tuple[str, list[str]]:
     # command-runner.jar이 물려주는 환경(EMR controller.gz 실측 확인, 2026-08-25)에는
     # S3_BUCKET이 없어 core.s3/ml_core가 잘못된 기본 버킷("gangnamgu")으로 떨어진다
@@ -136,6 +182,38 @@ def make_task_create_cluster(model_name: str) -> Any:
         return cluster_id
 
     return task_create_cluster
+
+
+def make_task_refresh_feature_mart(model_name: str) -> Any:
+    """평가(evaluate) 직전에, 지금 챔피언이 실제로 학습된 프로필 기준으로 feature
+    mart를 증분 최신화하는 callable을 반환한다.
+
+    **왜 필요한가(2026-08 발견)**: `evaluate`는 이미 만들어진 feature mart 테이블을
+    그냥 읽기만 하고 절대 스스로 최신화하지 않는다 — feature mart를 실제로 만드는
+    Spark 스텝은 원래 `orchestrate_retrain_loop`(재학습이 필요하다고 판단된 *뒤*)
+    안에만 있었다. 즉 evaluate가 참고할 최근 구간(`MONITOR_LOOKBACK_MONTHS`,
+    `TRAINING_SAFETY_MARGIN_DAYS`만큼 뺀 최근 구간)이 최신인지 아무도 보장하지
+    않는 채로 순환 참조에 걸려 있었다: feature mart가 없거나 오래되면 evaluate가
+    실패/구식 데이터로 판단하는데, feature mart를 새로 만드는 유일한 경로가 그
+    evaluate의 판단 결과에 갇혀 있었다. `run_pipeline.py`는 watermark 기반
+    증분이라(`feature_engine/spark/run_pipeline.py` 모듈 docstring) 매 사이클마다
+    불러도 이미 최신이면 비용이 작다."""
+
+    def task_refresh_feature_mart(**context: Any) -> None:
+        ti = context["ti"]
+        params = context.get("params", {})
+        mock_override = _mock_override_from_params(params)
+        cluster_id = ti.xcom_pull(task_ids=_task_id(model_name, "create_cluster"), key="cluster_id")
+
+        profile = _champion_profile_name(model_name) or "builtin-default"
+        logger.info(
+            "[%s 월별 재학습] 1.5단계: 챔피언 프로필 '%s' 기준으로 feature mart 증분 갱신", model_name, profile
+        )
+        for step_name, spark_args in _feature_mart_spark_steps(profile):
+            submit_emr_step(cluster_id, step_name, spark_args, mock_override=mock_override)
+        ti.xcom_push(key="profile", value=profile)
+
+    return task_refresh_feature_mart
 
 
 def make_task_evaluate(model_name: str) -> Any:
@@ -222,48 +300,7 @@ def make_task_orchestrate_retrain_loop(model_name: str) -> Any:
         for profile in candidate_profiles:
             logger.info("=== [%s 프로필: %s] EMR 피처마트 스텝 제출 ===", model_name, profile)
             try:
-                for step_name, spark_args in (
-                    (
-                        f"Spark-RunPipeline-{profile}",
-                        [
-                            "spark-submit",
-                            "--deploy-mode",
-                            "cluster",
-                            "--master",
-                            "yarn",
-                            "--conf",
-                            f"spark.yarn.appMasterEnv.ML_PROFILE={profile}",
-                            "--conf",
-                            f"spark.executorEnv.ML_PROFILE={profile}",
-                            # S3_BUCKET도 ML_PROFILE과 같은 이유로 명시해야 한다 — 없으면
-                            # ml/feature_engine/spark/config.py가 "local-dev"로 떨어진다.
-                            "--conf",
-                            f"spark.yarn.appMasterEnv.S3_BUCKET={S3_BUCKET}",
-                            "--conf",
-                            f"spark.executorEnv.S3_BUCKET={S3_BUCKET}",
-                            f"{EMR_S3_SCRIPTS_PREFIX}/run_pipeline.py",
-                        ],
-                    ),
-                    (
-                        f"Spark-BuildMultiHorizon-{profile}",
-                        [
-                            "spark-submit",
-                            "--deploy-mode",
-                            "cluster",
-                            "--master",
-                            "yarn",
-                            "--conf",
-                            f"spark.yarn.appMasterEnv.ML_PROFILE={profile}",
-                            "--conf",
-                            f"spark.executorEnv.ML_PROFILE={profile}",
-                            "--conf",
-                            f"spark.yarn.appMasterEnv.S3_BUCKET={S3_BUCKET}",
-                            "--conf",
-                            f"spark.executorEnv.S3_BUCKET={S3_BUCKET}",
-                            f"{EMR_S3_SCRIPTS_PREFIX}/build_multi_horizon_features.py",
-                        ],
-                    ),
-                ):
+                for step_name, spark_args in _feature_mart_spark_steps(profile):
                     submit_emr_step(cluster_id, step_name, spark_args, mock_override=mock_override)
                 logger.info("=== [%s 프로필: %s] EMR 피처마트 완료 ===", model_name, profile)
 
@@ -354,6 +391,12 @@ def build_model_task_chain(model_name: str) -> dict[str, Any]:
         execution_timeout=MONTHLY_CLUSTER_CREATE_TIMEOUT,
     )
 
+    refresh_feature_mart = PythonOperator(
+        task_id=_task_id(model_name, "refresh_feature_mart"),
+        python_callable=make_task_refresh_feature_mart(model_name),
+        execution_timeout=EMR_FEATURE_MART_TIMEOUT,
+    )
+
     evaluate = PythonOperator(
         task_id=_task_id(model_name, "evaluate"),
         python_callable=make_task_evaluate(model_name),
@@ -381,7 +424,7 @@ def build_model_task_chain(model_name: str) -> dict[str, Any]:
     )
 
     # 태스크 흐름 정의 (비순환 단방향 그래프)
-    create_cluster >> evaluate >> check_retrain_branch
+    create_cluster >> refresh_feature_mart >> evaluate >> check_retrain_branch
     check_retrain_branch >> [orchestrate_retrain_loop, skip_monthly_retrain]
     orchestrate_retrain_loop >> terminate_cluster
     skip_monthly_retrain >> terminate_cluster

@@ -20,6 +20,7 @@ def test_monthly_retrain_is_a_single_combined_dag() -> None:
         for model in ("rental", "return")
         for name in (
             "create_cluster",
+            "refresh_feature_mart",
             "evaluate",
             "check_retrain_branch",
             "orchestrate_retrain_loop",
@@ -78,6 +79,16 @@ def test_monthly_retrain_evaluate_is_not_a_setup() -> None:
         assert evaluate.is_setup is False
 
 
+def test_refresh_feature_mart_runs_between_create_cluster_and_evaluate() -> None:
+    """evaluate가 최근 구간을 읽기 전에 feature mart를 먼저 최신화해야 한다
+    (2026-08 발견 — evaluate는 스스로 feature mart를 최신화하지 않는데, 그걸
+    만드는 유일한 경로가 원래 재학습 필요 판정 *뒤*에만 있어 순환 참조였다)."""
+    for model_name in ("rental", "return"):
+        refresh = _DAG.get_task(f"refresh_feature_mart_{model_name}")
+        assert refresh.upstream_task_ids == {f"create_cluster_{model_name}"}
+        assert refresh.downstream_task_ids == {f"evaluate_{model_name}"}
+
+
 def test_check_retrain_branch_decisions() -> None:
     """needs_retrain 값에 따라 올바른(모델 접미사가 붙은) 다운스트림 태스크로 분기한다."""
     mock_ti = MagicMock()
@@ -105,6 +116,72 @@ def test_create_cluster_pushes_cluster_id(monkeypatch) -> None:
     assert result == "j-created"
     pushed = {call.kwargs["key"]: call.kwargs["value"] for call in mock_ti.xcom_push.call_args_list}
     assert pushed["cluster_id"] == "j-created"
+
+
+def test_champion_profile_name_reads_pointer_then_profile_json(monkeypatch) -> None:
+    """챔피언 포인터의 archive_prefix를 따라가 그 안의 {model}_profile.json에서
+    profile_name을 읽는다 — training.scripts.monthly_retrain_check의 같은 이름
+    함수와 같은 S3 키 형식을 airflow venv에서 boto3만으로 재현한 것."""
+    reads = {}
+
+    def fake_read_s3_json(key):
+        reads[key] = True
+        if key == "models/champion/rental.json":
+            return {"archive_prefix": "models/archive/2026-01-01/leaves127"}
+        if key == "models/archive/2026-01-01/leaves127/rental_profile.json":
+            return {"profile_name": "leaves127"}
+        return None
+
+    monkeypatch.setattr(monthly_dag, "read_s3_json", fake_read_s3_json)
+
+    assert monthly_dag._champion_profile_name("rental") == "leaves127"
+    assert "models/champion/rental.json" in reads
+
+
+def test_champion_profile_name_none_when_no_champion_yet(monkeypatch) -> None:
+    monkeypatch.setattr(monthly_dag, "read_s3_json", lambda key: None)
+    assert monthly_dag._champion_profile_name("rental") is None
+
+
+def test_refresh_feature_mart_submits_feature_mart_steps_for_champion_profile(monkeypatch) -> None:
+    """create_cluster가 남긴 cluster_id 위에, 챔피언이 실제로 학습된 프로필로
+    feature mart 스텝(run_pipeline + build_multi_horizon)을 제출해야 한다."""
+    mock_ti = MagicMock()
+    mock_ti.xcom_pull.return_value = "j-created"
+    monkeypatch.setattr(monthly_dag, "_champion_profile_name", lambda model_name: "leaves127")
+
+    submitted_steps = []
+    monkeypatch.setattr(
+        monthly_dag,
+        "submit_emr_step",
+        lambda cluster_id, name, command, **kwargs: submitted_steps.append((cluster_id, name)),
+    )
+
+    task_fn = monthly_dag.make_task_refresh_feature_mart("rental")
+    task_fn(ti=mock_ti, params={})
+
+    assert ("j-created", "Spark-RunPipeline-leaves127") in submitted_steps
+    assert ("j-created", "Spark-BuildMultiHorizon-leaves127") in submitted_steps
+    pushed = {call.kwargs["key"]: call.kwargs["value"] for call in mock_ti.xcom_push.call_args_list}
+    assert pushed["profile"] == "leaves127"
+
+
+def test_refresh_feature_mart_falls_back_to_builtin_default_when_no_champion(monkeypatch) -> None:
+    mock_ti = MagicMock()
+    mock_ti.xcom_pull.return_value = "j-created"
+    monkeypatch.setattr(monthly_dag, "_champion_profile_name", lambda model_name: None)
+
+    submitted_steps = []
+    monkeypatch.setattr(
+        monthly_dag,
+        "submit_emr_step",
+        lambda cluster_id, name, command, **kwargs: submitted_steps.append(name),
+    )
+
+    task_fn = monthly_dag.make_task_refresh_feature_mart("rental")
+    task_fn(ti=mock_ti, params={})
+
+    assert any("builtin-default" in s for s in submitted_steps)
 
 
 def test_evaluate_pushes_needs_retrain(monkeypatch) -> None:

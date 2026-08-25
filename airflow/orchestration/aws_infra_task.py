@@ -56,8 +56,8 @@ EMR_S3_SCRIPTS_PREFIX = os.environ.get("AWS_EMR_S3_SCRIPTS_PREFIX", "s3://local-
 # 독립적으로 다시 정의하는 것과 동일한 패턴), boto3만으로 직접 읽는다. 값이 서로
 # 어긋나면 안 되므로 한쪽을 고치면 반드시 다른 쪽도 같이 고칠 것.
 S3_BUCKET = os.environ.get("S3_BUCKET", "gangnamgu")
-_MODELS_PREFIX = os.environ.get("MODELS_PREFIX", "models")
-TRAINING_RUNS_PREFIX = os.environ.get("TRAINING_RUNS_PREFIX", f"{_MODELS_PREFIX}/training-runs")
+MODELS_PREFIX = os.environ.get("MODELS_PREFIX", "models")
+TRAINING_RUNS_PREFIX = os.environ.get("TRAINING_RUNS_PREFIX", f"{MODELS_PREFIX}/training-runs")
 
 # `make emr-package`가 올리는 위치(core/ml_core/feature_engine/training 번들 +
 # bootstrap.sh)와 반드시 같은 값이어야 한다 — `create_emr_cluster()`의
