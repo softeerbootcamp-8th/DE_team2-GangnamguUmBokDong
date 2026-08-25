@@ -5,17 +5,21 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 from dataclasses import fields
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Mapping
 from zoneinfo import ZoneInfo
 
 import pytest
 from core.scoring_config import URGENCY_SCORING_CONFIG_VERSION
 from evaluation.backtest_contract import BACKTEST_CONTRACT_VERSION, EvaluationContract
 from evaluation.confirmatory_matrix import (
+    ARCHIVED_V1_MANIFEST_SHA256,
     CANDIDATE_LOCK_SCHEMA_VERSION,
     MANIFEST_SCHEMA_VERSION,
     REGISTERED_MANIFEST_FILENAME,
@@ -40,10 +44,16 @@ from evaluation.confirmatory_matrix import (
     _validate_job_audits,
     _validate_manifest_document,
     candidate_lock_document,
+    candidate_identity_sha256,
+    bind_completion_authority,
+    create_completion_authority,
+    holdout_identity_sha256,
+    holdout_run_registry_ref,
     load_candidate_lock,
     load_confirmatory_manifest,
     load_raw_result,
     load_run_claim,
+    raw_result_envelope,
     validate_confirmatory_results,
     write_candidate_lock,
     write_confirmatory_result,
@@ -55,6 +65,7 @@ from evaluation.production_policy_contract import (
     production_policy_configuration,
 )
 from evaluation.policy_simulator import JobAudit, SimulationMetrics, StopAudit
+from evaluation.population_contract import population_source_date_contract
 from evaluation.run_policy_backtest import (
     DurationResult,
     PolicyBacktestResult,
@@ -70,10 +81,16 @@ from evaluation.run_confirmatory_matrix import (
     candidate_run_claim_path,
     create_run_claim,
     execute_confirmatory_matrix,
+    parse_args,
     read_git_state,
+    validate_candidate_ancestry,
+    validate_center_seed_binding,
     validate_git_state,
+    validate_import_bindings,
+    validate_existing_results,
 )
 from evaluation import run_confirmatory_matrix as runner_module
+from evaluation import confirmatory_matrix as matrix_module
 from gold.rebalance_policy import DEFAULT_REBALANCE_POLICY, LEGACY_REBALANCE_POLICY
 from gold.rebalance_route import MAX_STOPS_PER_ROUTE, ROUTE_ALGORITHM_VERSION
 
@@ -85,13 +102,78 @@ MANIFEST_PATH = (
 SIDECAR_PATH = (
     REPO_ROOT / "loader/evaluation/manifests" / REGISTERED_SIDECAR_FILENAME
 )
-ARCHIVED_MANIFEST_PATH = (
+ARCHIVED_V1_MANIFEST_PATH = (
     REPO_ROOT / "loader/evaluation/manifests/confirmatory-matrix-v1.json"
 )
-ARCHIVED_SIDECAR_PATH = (
+ARCHIVED_V1_SIDECAR_PATH = (
     REPO_ROOT / "loader/evaluation/manifests/confirmatory-matrix-v1.sha256"
 )
+ARCHIVED_V2_MANIFEST_PATH = (
+    REPO_ROOT / "loader/evaluation/manifests/confirmatory-matrix-v2.json"
+)
+ARCHIVED_V2_SIDECAR_PATH = (
+    REPO_ROOT / "loader/evaluation/manifests/confirmatory-matrix-v2.sha256"
+)
 GIT_COMMIT = "a" * 40
+
+
+@dataclass
+class FakeGitRepository:
+    """Git blob/ref 명령의 원자 CAS를 메모리에서 재현한다."""
+
+    root: Path
+    commit: str = GIT_COMMIT
+    objects: dict[str, bytes] = field(default_factory=dict)
+    refs: dict[str, str] = field(default_factory=dict)
+    mutex: threading.Lock = field(default_factory=threading.Lock)
+
+    def run(self, arguments, **kwargs) -> SimpleNamespace:
+        """Authority 코드가 사용하는 Git subcommand만 결정적으로 실행한다."""
+        del kwargs["cwd"], kwargs["check"], kwargs["capture_output"]
+        stdin = kwargs.pop("input", None)
+        kwargs.pop("text", None)
+        if kwargs:
+            raise AssertionError(f"예상하지 못한 subprocess 인자입니다: {kwargs}")
+        command = tuple(arguments)
+        if command[1:4] == ("hash-object", "-w", "--stdin"):
+            assert isinstance(stdin, bytes)
+            header = f"blob {len(stdin)}\0".encode("ascii")
+            oid = hashlib.sha1(header + stdin).hexdigest()
+            with self.mutex:
+                self.objects[oid] = stdin
+            return SimpleNamespace(returncode=0, stdout=f"{oid}\n".encode(), stderr=b"")
+        if command[1] == "update-ref":
+            ref, new_oid, old_oid = command[2:5]
+            with self.mutex:
+                if old_oid == "0" * 40 and ref in self.refs:
+                    return SimpleNamespace(returncode=1, stdout=b"", stderr=b"exists")
+                self.refs[ref] = new_oid
+            return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+        if command[1:4] == ("show-ref", "--verify", "--hash"):
+            with self.mutex:
+                oid = self.refs.get(command[4])
+            return SimpleNamespace(
+                returncode=int(oid is None),
+                stdout=b"" if oid is None else f"{oid}\n".encode(),
+                stderr=b"",
+            )
+        if command[1:3] == ("cat-file", "-t"):
+            with self.mutex:
+                exists = command[3] in self.objects
+            return SimpleNamespace(
+                returncode=int(not exists),
+                stdout=b"blob\n" if exists else b"",
+                stderr=b"",
+            )
+        if command[1:3] == ("cat-file", "blob"):
+            with self.mutex:
+                payload = self.objects.get(command[3])
+            return SimpleNamespace(
+                returncode=int(payload is None),
+                stdout=b"" if payload is None else payload,
+                stderr=b"",
+            )
+        raise AssertionError(f"예상하지 못한 Git 명령입니다: {command}")
 
 
 @pytest.fixture
@@ -101,15 +183,26 @@ def manifest() -> ConfirmatoryManifest:
 
 
 @pytest.fixture
+def candidate_repo(
+    monkeypatch: pytest.MonkeyPatch,
+) -> FakeGitRepository:
+    """Private authority ref를 격리할 원자적 fake Git repository를 만든다."""
+    fake = FakeGitRepository(REPO_ROOT)
+    monkeypatch.setattr(matrix_module.subprocess, "run", fake.run)
+    return fake
+
+
+@pytest.fixture
 def candidate_lock(
     tmp_path: Path,
     manifest: ConfirmatoryManifest,
+    candidate_repo: FakeGitRepository,
 ) -> CandidateLock:
     """합성 결과 검증에 쓸 exact production candidate lock을 만든다."""
     return write_candidate_lock(
         tmp_path / "candidate-lock.json",
         manifest_sha256=manifest.sha256,
-        git_commit=GIT_COMMIT,
+        git_commit=candidate_repo.commit,
     )
 
 
@@ -117,17 +210,28 @@ def candidate_lock(
 def run_claim(
     manifest: ConfirmatoryManifest,
     candidate_lock: CandidateLock,
+    candidate_repo: FakeGitRepository,
 ) -> RunClaim:
     """합성 결과가 한 번의 실행에서 나왔음을 고정하는 claim을 만든다."""
     path = candidate_run_claim_path(candidate_lock)
-    create_run_claim(path, manifest=manifest, candidate_lock=candidate_lock)
-    return load_run_claim(path, manifest=manifest, candidate_lock=candidate_lock)
+    create_run_claim(
+        path,
+        manifest=manifest,
+        candidate_lock=candidate_lock,
+        repo_root=candidate_repo.root,
+    )
+    return load_run_claim(
+        path,
+        manifest=manifest,
+        candidate_lock=candidate_lock,
+        repo_root=candidate_repo.root,
+    )
 
 
 def test_registered_manifest_sidecar_and_exact_cells_are_valid(
     manifest: ConfirmatoryManifest,
 ) -> None:
-    """V2 sidecar SHA·v1 계승·12셀 exact set을 독립적으로 고정한다."""
+    """V3 sidecar SHA·v2 계승·12셀 exact set을 독립적으로 고정한다."""
     assert manifest.sha256 == REGISTERED_MANIFEST_SHA256
     assert manifest.document["schema_version"] == MANIFEST_SCHEMA_VERSION
     assert manifest.document["supersedes_manifest_sha256"] == (
@@ -147,21 +251,43 @@ def test_registered_manifest_sidecar_and_exact_cells_are_valid(
     assert RESULT_MARKDOWN_FILENAME == f"{RESULT_SCHEMA_VERSION}.md"
 
 
-def test_v1_manifest_is_byte_preserved_and_v2_keeps_its_selection() -> None:
-    """V1 bytes는 archival로 보존하고 v2는 동일 selection·12셀만 계승한다."""
-    archived_payload = ARCHIVED_MANIFEST_PATH.read_bytes()
-    assert hashlib.sha256(archived_payload).hexdigest() == SUPERSEDED_MANIFEST_SHA256
-    assert ARCHIVED_SIDECAR_PATH.read_bytes() == (
-        f"{SUPERSEDED_MANIFEST_SHA256}  confirmatory-matrix-v1.json\n"
+def test_v1_v2_manifests_are_byte_preserved_and_v3_keeps_v2_contract() -> None:
+    """V1·v2 bytes를 보존하고 v3가 v2 평가 계약을 exact 계승한다."""
+    v1_payload = ARCHIVED_V1_MANIFEST_PATH.read_bytes()
+    v2_payload = ARCHIVED_V2_MANIFEST_PATH.read_bytes()
+    assert ARCHIVED_V1_MANIFEST_SHA256 == (
+        "5949e4305ae33294a7b5a07efc1bd45063ae4e9f40c2d6349b3c956e51b0faf0"
+    )
+    assert SUPERSEDED_MANIFEST_SHA256 == (
+        "91f2bac169832fc7c39b855349d376d50deee93250c298fd0ba6fb6290ee1c97"
+    )
+    assert hashlib.sha256(v1_payload).hexdigest() == ARCHIVED_V1_MANIFEST_SHA256
+    assert hashlib.sha256(v2_payload).hexdigest() == SUPERSEDED_MANIFEST_SHA256
+    assert ARCHIVED_V1_SIDECAR_PATH.read_bytes() == (
+        f"{ARCHIVED_V1_MANIFEST_SHA256}  confirmatory-matrix-v1.json\n"
     ).encode("ascii")
-    archived = _loads_strict_json(archived_payload, "archived v1 manifest")
+    assert ARCHIVED_V2_SIDECAR_PATH.read_bytes() == (
+        f"{SUPERSEDED_MANIFEST_SHA256}  confirmatory-matrix-v2.json\n"
+    ).encode("ascii")
+    archived_v1 = _loads_strict_json(v1_payload, "archived v1 manifest")
+    archived_v2 = _loads_strict_json(v2_payload, "archived v2 manifest")
     registered = _loads_strict_json(
         MANIFEST_PATH.read_bytes(),
-        "registered v2 manifest",
+        "registered v3 manifest",
     )
-    assert registered["selection_policy"] == archived["selection_policy"]
-    assert registered["evaluation_contract"] == archived["evaluation_contract"]
-    assert registered["cells"] == archived["cells"]
+    assert archived_v2["supersedes_manifest_sha256"] == (
+        ARCHIVED_V1_MANIFEST_SHA256
+    )
+    assert archived_v2["selection_policy"] == archived_v1["selection_policy"]
+    assert archived_v2["evaluation_contract"] == archived_v1["evaluation_contract"]
+    assert archived_v2["cells"] == archived_v1["cells"]
+    for field in (
+        "selection_policy",
+        "evaluation_contract",
+        "acceptance_gate",
+        "cells",
+    ):
+        assert registered[field] == archived_v2[field]
 
 
 def test_validator_key_contract_tracks_actual_raw_dataclasses() -> None:
@@ -243,14 +369,14 @@ def test_manifest_semantics_reject_missing_cell_or_operation_change(
         _validate_manifest_document(document)
 
 
-def test_manifest_rejects_wrong_superseded_v1_sha(
+def test_manifest_rejects_wrong_superseded_v2_sha(
     manifest: ConfirmatoryManifest,
 ) -> None:
-    """V2는 archival v1의 등록 SHA 외 다른 계약을 계승할 수 없다."""
+    """V3는 archival v2의 등록 SHA 외 다른 계약을 계승할 수 없다."""
     document = copy.deepcopy(manifest.document)
     document["supersedes_manifest_sha256"] = "0" * 64
 
-    with pytest.raises(ValueError, match="v1 SHA"):
+    with pytest.raises(ValueError, match="v2 SHA"):
         _validate_manifest_document(document)
 
 
@@ -270,6 +396,9 @@ def test_candidate_lock_is_exact_and_cannot_be_created_twice(
         "policy": PRODUCTION_POLICY_NAME,
         "policy_configuration": DEFAULT_REBALANCE_POLICY.audit_document(),
         "max_stops_per_route": MAX_STOPS_PER_ROUTE,
+        "route_algorithm_version": ROUTE_ALGORITHM_VERSION,
+        "urgency_scoring_config_version": URGENCY_SCORING_CONFIG_VERSION,
+        "backtest_contract_version": BACKTEST_CONTRACT_VERSION,
     }
     with pytest.raises(ValueError, match="이미 존재"):
         write_candidate_lock(
@@ -281,13 +410,22 @@ def test_candidate_lock_is_exact_and_cannot_be_created_twice(
 
 @pytest.mark.parametrize(
     "field",
-    ("manifest_sha256", "git_commit", "policy_configuration", "max_stops_per_route"),
+    (
+        "manifest_sha256",
+        "git_commit",
+        "policy",
+        "policy_configuration",
+        "max_stops_per_route",
+        "route_algorithm_version",
+        "urgency_scoring_config_version",
+        "backtest_contract_version",
+    ),
 )
 def test_candidate_lock_rejects_any_identity_change(
     manifest: ConfirmatoryManifest,
     field: str,
 ) -> None:
-    """Candidate identity 네 축 중 하나라도 다르면 실행 전 거부한다."""
+    """Candidate identity의 어느 축이라도 다르면 실행 전 거부한다."""
     document = candidate_lock_document(manifest.sha256, GIT_COMMIT)
     if field == "manifest_sha256":
         document[field] = "b" * 64
@@ -295,8 +433,10 @@ def test_candidate_lock_rejects_any_identity_change(
         document[field] = "b" * 40
     elif field == "policy_configuration":
         document["candidate"][field]["max_pickup_stock_fraction"] = 0.09
-    else:
+    elif field == "max_stops_per_route":
         document["candidate"][field] = MAX_STOPS_PER_ROUTE + 1
+    else:
+        document["candidate"][field] = "mutated"
 
     with pytest.raises(ValueError, match="candidate lock"):
         _validate_candidate_lock_document(
@@ -325,6 +465,196 @@ def test_candidate_lock_loader_rejects_duplicate_key(
         )
 
 
+def test_semantic_candidate_and_holdout_ids_ignore_path_bytes_and_gate(
+    tmp_path: Path,
+    manifest: ConfirmatoryManifest,
+    candidate_lock: CandidateLock,
+) -> None:
+    """Candidate ID는 lock 표현을, holdout ID는 gate·manifest 순서를 무시한다."""
+    compact_path = tmp_path / "compact-candidate-lock.json"
+    compact_path.write_text(
+        json.dumps(candidate_lock.document, sort_keys=False),
+        encoding="utf-8",
+    )
+    compact_lock = load_candidate_lock(
+        compact_path,
+        expected_manifest_sha256=manifest.sha256,
+        expected_git_commit=candidate_lock.git_commit,
+    )
+    assert compact_lock.sha256 != candidate_lock.sha256
+    assert candidate_identity_sha256(manifest, compact_lock) == (
+        candidate_identity_sha256(manifest, candidate_lock)
+    )
+
+    changed_document = copy.deepcopy(manifest.document)
+    changed_document["acceptance_gate"]["improved_180m_cells_min"] = 12
+    reordered = ConfirmatoryManifest(
+        sha256="b" * 64,
+        document=changed_document,
+        cells=tuple(reversed(manifest.cells)),
+    )
+    assert holdout_identity_sha256(reordered) == holdout_identity_sha256(manifest)
+
+    changed_cells = list(manifest.cells)
+    changed_cells[0] = ConfirmatoryCell(
+        changed_cells[0].center_id,
+        changed_cells[0].target_date,
+        changed_cells[0].start_hour + 1,
+    )
+    changed_holdout = ConfirmatoryManifest(
+        sha256=manifest.sha256,
+        document=manifest.document,
+        cells=tuple(changed_cells),
+    )
+    assert holdout_identity_sha256(changed_holdout) != holdout_identity_sha256(
+        manifest
+    )
+
+
+@pytest.mark.parametrize("invalid_id", ("short", "A" * 64, "a" * 63 + "/"))
+def test_holdout_registry_ref_rejects_every_malformed_component(
+    invalid_id: str,
+) -> None:
+    """Run ref의 유일한 동적 component는 strict lowercase SHA-256이어야 한다."""
+    with pytest.raises(ValueError, match="component"):
+        holdout_run_registry_ref(invalid_id)
+
+
+def test_alternate_lock_path_cannot_claim_same_holdout_twice(
+    tmp_path: Path,
+    manifest: ConfirmatoryManifest,
+    candidate_lock: CandidateLock,
+    candidate_repo: FakeGitRepository,
+) -> None:
+    """같은 candidate를 다른 lock 경로·JSON bytes로 복제해도 두 번째 CAS는 실패한다."""
+    alternate_path = tmp_path / "alternate-lock.json"
+    alternate_path.write_text(
+        json.dumps(candidate_lock.document, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    alternate_lock = load_candidate_lock(
+        alternate_path,
+        expected_manifest_sha256=manifest.sha256,
+        expected_git_commit=candidate_lock.git_commit,
+    )
+    assert alternate_lock.sha256 != candidate_lock.sha256
+    first_claim = candidate_run_claim_path(candidate_lock)
+    second_claim = candidate_run_claim_path(alternate_lock)
+    create_run_claim(
+        first_claim,
+        manifest=manifest,
+        candidate_lock=candidate_lock,
+        repo_root=candidate_repo.root,
+    )
+
+    with pytest.raises(ValueError, match="registry ref.*이미 존재|CAS"):
+        create_run_claim(
+            second_claim,
+            manifest=manifest,
+            candidate_lock=alternate_lock,
+            repo_root=candidate_repo.root,
+        )
+    assert first_claim.is_file()
+    assert not second_claim.exists()
+
+
+def test_concurrent_alternate_claims_have_exactly_one_cas_winner(
+    tmp_path: Path,
+    manifest: ConfirmatoryManifest,
+    candidate_lock: CandidateLock,
+    candidate_repo: FakeGitRepository,
+) -> None:
+    """동시 alternate 경로 claim도 repository-wide old-zero CAS에서 하나만 성공한다."""
+    alternate_path = tmp_path / "race-lock.json"
+    alternate_path.write_bytes(Path(candidate_lock.path).read_bytes())
+    alternate_lock = load_candidate_lock(
+        alternate_path,
+        expected_manifest_sha256=manifest.sha256,
+        expected_git_commit=candidate_lock.git_commit,
+    )
+    locks = (candidate_lock, alternate_lock)
+    barrier = threading.Barrier(2)
+
+    def claim(lock: CandidateLock) -> bool:
+        """두 worker를 같은 CAS 직전 구간에 진입시켜 성공 여부를 반환한다."""
+        barrier.wait()
+        try:
+            create_run_claim(
+                candidate_run_claim_path(lock),
+                manifest=manifest,
+                candidate_lock=lock,
+                repo_root=candidate_repo.root,
+            )
+        except ValueError:
+            return False
+        return True
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        outcomes = list(executor.map(claim, locks))
+
+    assert sorted(outcomes) == [False, True]
+    assert sum(candidate_run_claim_path(lock).exists() for lock in locks) == 1
+
+
+@pytest.mark.parametrize("failure_stage", ("hash-object", "update-ref"))
+def test_run_claim_fails_closed_on_git_authority_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    manifest: ConfirmatoryManifest,
+    candidate_lock: CandidateLock,
+    candidate_repo: FakeGitRepository,
+    failure_stage: str,
+) -> None:
+    """Git blob 저장이나 CAS 오류는 외부 claim 파일 없이 fail-closed한다."""
+    original_run = candidate_repo.run
+
+    def fail_stage(arguments, **kwargs):
+        """선택한 Git 단계만 오류로 바꾸고 나머지는 fake Git에 위임한다."""
+        command = tuple(arguments)
+        if command[1] == failure_stage:
+            return SimpleNamespace(returncode=128, stdout=b"", stderr=b"failure")
+        return original_run(arguments, **kwargs)
+
+    monkeypatch.setattr(matrix_module.subprocess, "run", fail_stage)
+    claim_path = tmp_path / f"{failure_stage}.claim.json"
+
+    with pytest.raises(ValueError, match="Git blob 저장|CAS"):
+        create_run_claim(
+            claim_path,
+            manifest=manifest,
+            candidate_lock=candidate_lock,
+            repo_root=candidate_repo.root,
+        )
+    assert not claim_path.exists()
+
+
+@pytest.mark.parametrize("mutation", ("missing", "mismatched_blob"))
+def test_run_claim_validation_requires_exact_registry_ref_and_blob(
+    manifest: ConfirmatoryManifest,
+    candidate_lock: CandidateLock,
+    run_claim: RunClaim,
+    candidate_repo: FakeGitRepository,
+    mutation: str,
+) -> None:
+    """Claim loader는 missing ref와 다른 blob target을 모두 거부한다."""
+    if mutation == "missing":
+        del candidate_repo.refs[run_claim.registry_ref]
+    else:
+        payload = b'{"forged":true}\n'
+        header = f"blob {len(payload)}\0".encode("ascii")
+        oid = hashlib.sha1(header + payload).hexdigest()
+        candidate_repo.objects[oid] = payload
+        candidate_repo.refs[run_claim.registry_ref] = oid
+
+    with pytest.raises(ValueError, match="registry ref가 없습니다|registry blob bytes"):
+        load_run_claim(
+            Path(run_claim.path),
+            manifest=manifest,
+            candidate_lock=candidate_lock,
+            repo_root=candidate_repo.root,
+        )
+
+
 def test_result_validation_rejects_run_claim_changed_after_preflight(
     manifest: ConfirmatoryManifest,
     candidate_lock: CandidateLock,
@@ -339,7 +669,40 @@ def test_result_validation_rejects_run_claim_changed_after_preflight(
 
     with pytest.raises(ValueError, match="run claim"):
         validate_confirmatory_results(
-            _passing_artifacts(manifest),
+            _passing_artifacts(manifest, run_claim),
+            manifest=manifest,
+            candidate_lock=candidate_lock,
+            run_claim=run_claim,
+        )
+
+
+@pytest.mark.parametrize(
+    "field",
+    (
+        "holdout_id",
+        "candidate_id",
+        "run_claim_sha256",
+        "run_registry_ref",
+        "run_registry_blob_oid",
+    ),
+)
+def test_raw_artifact_rejects_any_run_authority_mismatch(
+    manifest: ConfirmatoryManifest,
+    candidate_lock: CandidateLock,
+    run_claim: RunClaim,
+    field: str,
+) -> None:
+    """Raw envelope의 authority 어느 축도 다른 실행과 결합할 수 없다."""
+    artifacts = _passing_artifacts(manifest, run_claim)
+    artifact = artifacts[0]
+    replacement = "b" * (40 if field == "run_registry_blob_oid" else 64)
+    if field == "run_registry_ref":
+        replacement = "refs/confirmatory-runs/" + "b" * 64
+    object.__setattr__(artifact, field, replacement)
+
+    with pytest.raises(ValueError, match="raw result"):
+        validate_confirmatory_results(
+            artifacts,
             manifest=manifest,
             candidate_lock=candidate_lock,
             run_claim=run_claim,
@@ -375,6 +738,8 @@ def test_git_state_includes_untracked_files_in_repo_cleanliness(
         del kwargs
         command = tuple(arguments)
         calls.append(command)
+        if command[1:3] == ("rev-parse", "--show-toplevel"):
+            return SimpleNamespace(stdout=f"{tmp_path.resolve()}\n")
         if command[1:3] == ("branch", "--show-current"):
             return SimpleNamespace(stdout="feature/rebalance-policy-v3\n")
         if command[1:3] == ("rev-parse", "HEAD"):
@@ -392,6 +757,164 @@ def test_git_state_includes_untracked_files_in_repo_cleanliness(
         "--porcelain",
         "--untracked-files=all",
     ) in calls
+
+
+def test_git_state_rejects_nested_or_incorrect_repo_root(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """명시 경로가 Git이 보고한 실제 top-level과 다르면 즉시 거부한다."""
+    repo = tmp_path / "repo"
+    nested = repo / "loader"
+    nested.mkdir(parents=True)
+
+    def fake_run(arguments, **kwargs):
+        """실제 top-level 조회 외 명령은 호출되면 테스트를 실패시킨다."""
+        del kwargs
+        command = tuple(arguments)
+        if command[1:3] == ("rev-parse", "--show-toplevel"):
+            return SimpleNamespace(stdout=f"{repo.resolve()}\n")
+        raise AssertionError(f"root 불일치 뒤 Git 상태를 읽었습니다: {command}")
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
+
+    with pytest.raises(ValueError, match="실제 Git repository root"):
+        read_git_state(nested)
+
+
+def test_import_binding_rejects_legacy_or_other_worktree_module(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Repo root가 맞아도 core 등 import가 다른 worktree면 preflight를 거부한다."""
+    validate_import_bindings(REPO_ROOT)
+    monkeypatch.setattr(
+        runner_module.core,
+        "__file__",
+        str(REPO_ROOT.parent / "legacy/libs/core/src/core/__init__.py"),
+    )
+
+    with pytest.raises(ValueError, match="core import source"):
+        validate_import_bindings(REPO_ROOT)
+
+
+def test_center_seed_binding_rejects_same_name_outside_candidate_repo(
+    tmp_path: Path,
+) -> None:
+    """같은 basename의 다른 worktree seed로 route timing을 바꿀 수 없다."""
+    validate_center_seed_binding(
+        REPO_ROOT,
+        REPO_ROOT / "docs/gold/dispatch-center-seed.yaml",
+    )
+    with pytest.raises(ValueError, match="center-seed.*exact seed"):
+        validate_center_seed_binding(
+            REPO_ROOT,
+            tmp_path / "docs/gold/dispatch-center-seed.yaml",
+        )
+
+
+@pytest.mark.parametrize("missing_label", ("develop base", "candidate"))
+def test_candidate_ancestry_rejects_missing_commit(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    manifest: ConfirmatoryManifest,
+    missing_label: str,
+) -> None:
+    """Base나 candidate object가 없으면 merge-base 전에 fail-closed한다."""
+    base_commit = manifest.document["develop_base_commit"]
+    missing_commit = base_commit if missing_label == "develop base" else GIT_COMMIT
+    calls: list[tuple[str, ...]] = []
+
+    def fake_run(arguments, **kwargs):
+        """지정 commit의 cat-file만 missing으로 모사한다."""
+        del kwargs
+        command = tuple(arguments)
+        calls.append(command)
+        return SimpleNamespace(
+            returncode=int(command[-1] == f"{missing_commit}^{{commit}}")
+        )
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
+
+    with pytest.raises(ValueError, match=rf"{missing_label} commit.*없습니다"):
+        validate_candidate_ancestry(tmp_path, manifest, GIT_COMMIT)
+    assert not any(command[1:3] == ("merge-base", "--is-ancestor") for command in calls)
+
+
+def test_candidate_ancestry_rejects_non_ancestor(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    manifest: ConfirmatoryManifest,
+) -> None:
+    """존재하는 stale candidate라도 등록 base의 후손이 아니면 거부한다."""
+
+    def fake_run(arguments, **kwargs):
+        """Commit은 존재하지만 merge-base 관계는 false로 모사한다."""
+        del kwargs
+        command = tuple(arguments)
+        return SimpleNamespace(
+            returncode=int(command[1:3] == ("merge-base", "--is-ancestor"))
+        )
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
+
+    with pytest.raises(ValueError, match="develop base의 후손이 아닙니다"):
+        validate_candidate_ancestry(tmp_path, manifest, GIT_COMMIT)
+
+
+def test_candidate_ancestry_accepts_existing_descendant(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    manifest: ConfirmatoryManifest,
+) -> None:
+    """두 commit이 존재하고 base가 candidate ancestor이면 검증을 통과한다."""
+    calls: list[tuple[str, ...]] = []
+
+    def fake_run(arguments, **kwargs):
+        """모든 Git object·ancestry 검사를 성공으로 모사한다."""
+        del kwargs
+        command = tuple(arguments)
+        calls.append(command)
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
+
+    validate_candidate_ancestry(tmp_path, manifest, GIT_COMMIT)
+
+    base_commit = manifest.document["develop_base_commit"]
+    assert calls == [
+        ("git", "cat-file", "-e", f"{base_commit}^{{commit}}"),
+        ("git", "cat-file", "-e", f"{GIT_COMMIT}^{{commit}}"),
+        ("git", "merge-base", "--is-ancestor", base_commit, GIT_COMMIT),
+    ]
+
+
+def test_candidate_ancestry_fails_closed_on_git_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    manifest: ConfirmatoryManifest,
+) -> None:
+    """Merge-base 자체 오류를 non-ancestor 성공처럼 취급하지 않는다."""
+
+    def fake_run(arguments, **kwargs):
+        """Commit 조회는 성공하고 merge-base는 Git 오류를 반환한다."""
+        del kwargs
+        command = tuple(arguments)
+        return SimpleNamespace(
+            returncode=(
+                128 if command[1:3] == ("merge-base", "--is-ancestor") else 0
+            )
+        )
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
+
+    with pytest.raises(ValueError, match="Git 검증이 실패"):
+        validate_candidate_ancestry(tmp_path, manifest, GIT_COMMIT)
+
+
+def test_cli_requires_explicit_repo_root(tmp_path: Path) -> None:
+    """Candidate preflight는 암묵적 현재 경로 대신 명시 repo root를 요구한다."""
+    with pytest.raises(SystemExit):
+        parse_args(("lock", "--candidate-lock", str(tmp_path / "lock.json")))
 
 
 def test_candidate_lock_and_output_paths_must_be_outside_repository(
@@ -412,7 +935,7 @@ def test_complete_synthetic_matrix_passes_registered_gate(
     run_claim: RunClaim,
 ) -> None:
     """12셀 중 8셀의 180분 품절 10% 개선은 모든 no-harm gate를 통과한다."""
-    artifacts = _passing_artifacts(manifest)
+    artifacts = _passing_artifacts(manifest, run_claim)
 
     result = validate_confirmatory_results(
         artifacts,
@@ -426,6 +949,21 @@ def test_complete_synthetic_matrix_passes_registered_gate(
     assert gate["every_cell_and_duration_new_unfulfilled_request_set_empty"] is True
     assert gate["aggregate_180m_unfulfilled_delta"] == -8
     assert gate["aggregate_180m_unfulfilled_strict_improvement"] is True
+    assert gate["primary_metric"] == "observed_demand_fulfillment_rate"
+    assert gate["primary_metric_matches"] is True
+    assert gate["aggregate_180m_observed_requests"] == 1200
+    assert gate["aggregate_180m_baseline_fulfilled_requests"] == 1080
+    assert gate["aggregate_180m_candidate_fulfilled_requests"] == 1088
+    assert gate[
+        "aggregate_180m_baseline_observed_demand_fulfillment_rate"
+    ] == pytest.approx(0.9)
+    assert gate[
+        "aggregate_180m_candidate_observed_demand_fulfillment_rate"
+    ] == pytest.approx(1088 / 1200)
+    assert gate["aggregate_180m_fulfillment_rate_delta_percentage_points"] == (
+        pytest.approx(2 / 3)
+    )
+    assert gate["aggregate_180m_fulfillment_rate_strict_improvement"] is True
     assert gate["observed_max_pickup_dispatch_lag_minutes"] == 10.0
     assert gate["every_cell_and_duration_pickup_dispatch_lag_within_limit"] is True
     assert gate["improved_180m_cell_count"] == 8
@@ -434,6 +972,27 @@ def test_complete_synthetic_matrix_passes_registered_gate(
     )
     assert gate["planned_bikes_equal_moved_bikes"] is True
     assert gate["all_routes_finished_by_cutoff"] is True
+
+
+def test_raw_result_rejects_impossible_empty_station_minutes(
+    manifest: ConfirmatoryManifest,
+    candidate_lock: CandidateLock,
+    run_claim: RunClaim,
+) -> None:
+    """품절 대여소-분은 station_count와 평가시간의 물리 상한을 넘지 않는다."""
+    artifacts = _passing_artifacts(manifest, run_claim)
+    duration = artifacts[0].document["durations"][0]
+    duration["no_rebalance"]["empty_station_minutes"] = (
+        duration["station_count"] * duration["evaluation_minutes"] + 0.001
+    )
+
+    with pytest.raises(ValueError, match="물리 상한"):
+        validate_confirmatory_results(
+            artifacts,
+            manifest=manifest,
+            candidate_lock=candidate_lock,
+            run_claim=run_claim,
+        )
 
 
 @pytest.mark.parametrize(
@@ -470,7 +1029,7 @@ def test_acceptance_gate_fails_each_registered_condition(
     failed_check: str,
 ) -> None:
     """Manifest의 각 acceptance 조건은 독립적으로 false를 만든다."""
-    artifacts = _passing_artifacts(manifest)
+    artifacts = _passing_artifacts(manifest, run_claim)
     _mutate_gate_input(artifacts, mutation)
 
     result = validate_confirmatory_results(
@@ -490,7 +1049,7 @@ def test_equal_total_failure_transfer_is_reported_by_event_and_station(
     run_claim: RunClaim,
 ) -> None:
     """총 미충족이 같아도 새 요청·대여소로 전가하면 파생 결과와 gate에 남긴다."""
-    artifacts = _passing_artifacts(manifest)
+    artifacts = _passing_artifacts(manifest, run_claim)
     _mutate_gate_input(artifacts, "new_unfulfilled_transfer")
 
     result = validate_confirmatory_results(
@@ -537,7 +1096,7 @@ def test_raw_result_rejects_invalid_unfulfilled_event_log(
     message: str,
 ) -> None:
     """미충족 log의 schema·고유성·창·개수·타입을 fail-closed 검증한다."""
-    artifacts = _passing_artifacts(manifest)
+    artifacts = _passing_artifacts(manifest, run_claim)
     policy = artifacts[0].document["durations"][0]["no_rebalance"]
     log = policy["unfulfilled_request_log"]
     if mutation == "missing_key":
@@ -578,7 +1137,7 @@ def test_raw_result_rejects_incomplete_pickup_job_audit(
     message: str,
 ) -> None:
     """Pickup audit를 누락하거나 action을 숨기면 lag 0으로 우회하지 못한다."""
-    artifacts = _passing_artifacts(manifest)
+    artifacts = _passing_artifacts(manifest, run_claim)
     candidate = artifacts[0].document["durations"][0]["model_policies"][0]
     if mutation == "missing_job":
         candidate["job_audits"].clear()
@@ -602,7 +1161,7 @@ def test_results_reject_missing_or_duplicate_cell(
     run_claim: RunClaim,
 ) -> None:
     """Raw 결과는 manifest 12셀과 정확히 한 번씩 대응해야 한다."""
-    artifacts = _passing_artifacts(manifest)
+    artifacts = _passing_artifacts(manifest, run_claim)
     with pytest.raises(ValueError, match="셀 집합"):
         validate_confirmatory_results(
             artifacts[:-1],
@@ -625,7 +1184,7 @@ def test_raw_result_rejects_model_mismatch(
     run_claim: RunClaim,
 ) -> None:
     """Raw 결과의 model SHA가 고정 production bundle과 다르면 거부한다."""
-    model_artifacts = _passing_artifacts(manifest)
+    model_artifacts = _passing_artifacts(manifest, run_claim)
     model_artifacts[0].document["model_bundle_sha256"] = "b" * 64
     with pytest.raises(ValueError, match="model bundle SHA"):
         validate_confirmatory_results(
@@ -642,7 +1201,7 @@ def test_raw_result_rejects_policy_mismatch(
     run_claim: RunClaim,
 ) -> None:
     """Raw candidate config가 lock의 production 정책과 다르면 거부한다."""
-    policy_artifacts = _passing_artifacts(manifest)
+    policy_artifacts = _passing_artifacts(manifest, run_claim)
     policy_artifacts[0].document["durations"][0]["model_policies"][0][
         "policy_configuration"
     ]["max_pickup_stock_fraction"] = 0.09
@@ -661,7 +1220,7 @@ def test_cell_specific_station_surfaces_are_preserved_not_forced_equal(
     run_claim: RunClaim,
 ) -> None:
     """선택된 station surface SHA는 서로 다른 센터·날짜마다 독립 보존한다."""
-    artifacts = _passing_artifacts(manifest)
+    artifacts = _passing_artifacts(manifest, run_claim)
     expected = {}
     for artifact in artifacts:
         document = artifact.document
@@ -683,20 +1242,21 @@ def test_cell_specific_station_surfaces_are_preserved_not_forced_equal(
     assert result["station_surface_sha256_by_cell"] == expected
 
 
-def test_source_provenance_rejects_future_wrong_month_or_same_date_change(
+def test_source_provenance_rejects_future_population_or_wrong_source_month(
     manifest: ConfirmatoryManifest,
     candidate_lock: CandidateLock,
     run_claim: RunClaim,
 ) -> None:
-    """Source는 target 월·과거 인구·같은 날짜 exact 입력을 강제한다."""
-    future_artifacts = _passing_artifacts(manifest)
+    """Source는 target 월과 point-in-time 과거 생활인구만 허용한다."""
+    future_artifacts = _passing_artifacts(manifest, run_claim)
     cell = future_artifacts[0].document
     target = datetime.fromisoformat(cell["target_date"]).date()
     population = cell["source_provenance"]["population_csvs"][0]
     population["path"] = (
         f"/fixture/250_LOCAL_RESD_{target + timedelta(days=1):%Y%m%d}.csv"
     )
-    with pytest.raises(ValueError, match="point-in-time"):
+    cell["source_provenance"]["population_csvs"].sort(key=lambda row: row["path"])
+    with pytest.raises(ValueError, match="필수 후보일|후보일 계약"):
         validate_confirmatory_results(
             future_artifacts,
             manifest=manifest,
@@ -704,7 +1264,7 @@ def test_source_provenance_rejects_future_wrong_month_or_same_date_change(
             run_claim=run_claim,
         )
 
-    wrong_month_artifacts = _passing_artifacts(manifest)
+    wrong_month_artifacts = _passing_artifacts(manifest, run_claim)
     wrong_month_artifacts[0].document["source_provenance"]["rental_csv"][
         "path"
     ] = "/fixture/서울특별시 공공자전거 대여이력 정보_2512.csv"
@@ -716,15 +1276,213 @@ def test_source_provenance_rejects_future_wrong_month_or_same_date_change(
             run_claim=run_claim,
         )
 
-    source_artifacts = _passing_artifacts(manifest)
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("missing_base", "unexpected_date", "nine_weeks_old", "duplicate_date"),
+)
+def test_source_provenance_enforces_exact_population_date_contract(
+    manifest: ConfirmatoryManifest,
+    candidate_lock: CandidateLock,
+    run_claim: RunClaim,
+    mutation: str,
+) -> None:
+    """생활인구 provenance는 필수 후보와 허용 fallback 날짜만 포함한다."""
+    artifacts = _passing_artifacts(manifest, run_claim)
+    document = artifacts[0].document
+    target = date.fromisoformat(document["target_date"])
+    populations = document["source_provenance"]["population_csvs"]
+    if mutation == "missing_base":
+        populations.pop(0)
+        expected = "필수 후보일"
+    elif mutation in {"unexpected_date", "nine_weeks_old"}:
+        source_date = (
+            target - timedelta(days=8)
+            if mutation == "unexpected_date"
+            else target - timedelta(weeks=9)
+        )
+        populations.append(
+            _source_file(
+                f"/fixture/250_LOCAL_RESD_{source_date:%Y%m%d}.csv"
+            )
+        )
+        populations.sort(key=lambda row: row["path"])
+        expected = "후보일 계약"
+    else:
+        duplicate_name = Path(populations[0]["path"]).name
+        populations.append(_source_file(f"/alternate/{duplicate_name}"))
+        populations.sort(key=lambda row: row["path"])
+        expected = "source date가 중복"
+
+    with pytest.raises(ValueError, match=expected):
+        validate_confirmatory_results(
+            artifacts,
+            manifest=manifest,
+            candidate_lock=candidate_lock,
+            run_claim=run_claim,
+        )
+
+
+def test_source_provenance_allows_all_population_fallback_dates(
+    manifest: ConfirmatoryManifest,
+    candidate_lock: CandidateLock,
+    run_claim: RunClaim,
+) -> None:
+    """한 셀은 결측 보완에 실제 허용된 5~8주 전 파일을 모두 쓸 수 있다."""
+    artifacts = _passing_artifacts(manifest, run_claim)
+    document = artifacts[0].document
+    target = date.fromisoformat(document["target_date"])
+    populations = document["source_provenance"]["population_csvs"]
+    populations.extend(
+        _source_file(f"/fixture/250_LOCAL_RESD_{source_date:%Y%m%d}.csv")
+        for source_date in population_source_date_contract(target).fallback_dates
+    )
+    populations.sort(key=lambda row: row["path"])
+
+    result = validate_confirmatory_results(
+        artifacts,
+        manifest=manifest,
+        candidate_lock=candidate_lock,
+        run_claim=run_claim,
+    )
+
+    assert result["acceptance_gate"]["passed"] is True
+
+
+@pytest.mark.parametrize("surface", ("population_csvs", "excluded_surface"))
+def test_same_date_centers_allow_cell_specific_population_provenance(
+    manifest: ConfirmatoryManifest,
+    candidate_lock: CandidateLock,
+    run_claim: RunClaim,
+    surface: str,
+) -> None:
+    """같은 날짜라도 센터별 population fallback·제외 surface는 독립 보존한다."""
+    artifacts = _passing_artifacts(manifest, run_claim)
+    first = artifacts[0]
+    target_date = first.document["target_date"]
+    same_date = next(
+        artifact
+        for artifact in artifacts[1:]
+        if artifact.document["target_date"] == target_date
+    )
+    provenance = same_date.document["source_provenance"]
+    if surface == "population_csvs":
+        target = datetime.fromisoformat(target_date).date()
+        date_contract = population_source_date_contract(target)
+        provenance["population_csvs"] = sorted(
+            [
+                _source_file(
+                    f"/fixture/250_LOCAL_RESD_{source_date:%Y%m%d}.csv"
+                )
+                for source_date in date_contract.base_dates
+            ]
+            + [
+                _source_file(
+                    "/fixture/250_LOCAL_RESD_"
+                    f"{date_contract.fallback_dates[0]:%Y%m%d}.csv"
+                )
+            ],
+            key=lambda row: row["path"],
+        )
+    else:
+        provenance["population_excluded_station_count"] = 1
+        provenance["population_excluded_grid_ids"] = ["GRID-FIXTURE-001"]
+
+    result = validate_confirmatory_results(
+        artifacts,
+        manifest=manifest,
+        candidate_lock=candidate_lock,
+        run_claim=run_claim,
+    )
+
+    def result_key(artifact: RawResultArtifact) -> str:
+        """Raw artifact의 result provenance mapping key를 만든다."""
+        document = artifact.document
+        return (
+            f"{document['center_id']}|{document['target_date']}|"
+            f"{document['start_hour']:02d}"
+        )
+
+    hashes = result["source_provenance_sha256_by_cell"]
+    assert hashes[result_key(first)] != hashes[result_key(same_date)]
+
+
+def test_same_date_centers_reject_overlapping_population_metadata_mismatch(
+    manifest: ConfirmatoryManifest,
+    candidate_lock: CandidateLock,
+    run_claim: RunClaim,
+) -> None:
+    """같은 target·source date의 생활인구 file metadata 불일치를 거부한다."""
+    artifacts = _passing_artifacts(manifest, run_claim)
+    first = artifacts[0]
+    same_date = next(
+        artifact
+        for artifact in artifacts[1:]
+        if artifact.document["target_date"] == first.document["target_date"]
+    )
+    target = date.fromisoformat(first.document["target_date"])
+    fallback = population_source_date_contract(target).fallback_dates[0]
+    name = f"250_LOCAL_RESD_{fallback:%Y%m%d}.csv"
+    first.document["source_provenance"]["population_csvs"].append(
+        _source_file(f"/fixture/{name}")
+    )
+    same_date.document["source_provenance"]["population_csvs"].append(
+        _source_file(f"/alternate/{name}")
+    )
+    for artifact in (first, same_date):
+        artifact.document["source_provenance"]["population_csvs"].sort(
+            key=lambda row: row["path"]
+        )
+
+    with pytest.raises(ValueError, match="생활인구 source authority"):
+        validate_confirmatory_results(
+            artifacts,
+            manifest=manifest,
+            candidate_lock=candidate_lock,
+            run_claim=run_claim,
+        )
+
+
+@pytest.mark.parametrize(
+    "surface",
+    (
+        "rental_csv",
+        "stock_csv",
+        "weather_csv",
+        "station_crosswalk_count",
+        "station_crosswalk_sha256",
+        "backtest_contract_version",
+        "route_algorithm_version",
+        "urgency_scoring_config_version",
+    ),
+)
+def test_same_date_centers_reject_shared_source_authority_mismatch(
+    manifest: ConfirmatoryManifest,
+    candidate_lock: CandidateLock,
+    run_claim: RunClaim,
+    surface: str,
+) -> None:
+    """날짜 공통 원천·crosswalk·semantic version 차이는 fail-closed한다."""
+    source_artifacts = _passing_artifacts(manifest, run_claim)
     first_date = source_artifacts[0].document["target_date"]
     same_date = next(
         artifact
         for artifact in source_artifacts[1:]
         if artifact.document["target_date"] == first_date
     )
-    same_date.document["source_provenance"]["rental_csv"]["sha256"] = "b" * 64
-    with pytest.raises(ValueError, match="source provenance"):
+    provenance = same_date.document["source_provenance"]
+    if surface in {"rental_csv", "stock_csv"}:
+        provenance[surface]["sha256"] = "b" * 64
+    elif surface == "weather_csv":
+        provenance[surface]["size_bytes"] += 1
+    elif surface == "station_crosswalk_count":
+        provenance[surface] += 1
+    else:
+        provenance[surface] = (
+            "b" * 64 if surface == "station_crosswalk_sha256" else "mutated"
+        )
+
+    with pytest.raises(ValueError, match="공통 source authority|source provenance"):
         validate_confirmatory_results(
             source_artifacts,
             manifest=manifest,
@@ -741,7 +1499,7 @@ def test_raw_result_rejects_cell_duration_or_contract_mismatch(
     surface: str,
 ) -> None:
     """Raw center/date/hour·60/120/180·운영 계약은 manifest와 exact해야 한다."""
-    artifacts = _passing_artifacts(manifest)
+    artifacts = _passing_artifacts(manifest, run_claim)
     if surface == "cell":
         artifacts[0].document["start_hour"] = 8
     elif surface == "duration":
@@ -771,14 +1529,23 @@ def test_result_writes_json_and_markdown_once(
     manifest: ConfirmatoryManifest,
     candidate_lock: CandidateLock,
     run_claim: RunClaim,
+    candidate_repo: FakeGitRepository,
 ) -> None:
     """Gate 결과는 JSON·Markdown으로 남고 기존 증거를 덮어쓰지 않는다."""
+    artifacts = _passing_artifacts(manifest, run_claim)
     result = validate_confirmatory_results(
-        _passing_artifacts(manifest),
+        artifacts,
         manifest=manifest,
         candidate_lock=candidate_lock,
         run_claim=run_claim,
     )
+    completion = create_completion_authority(
+        candidate_repo.root,
+        artifacts=artifacts,
+        result=result,
+        run_claim=run_claim,
+    )
+    result = bind_completion_authority(result, completion)
     json_path = tmp_path / "result.json"
     markdown_path = tmp_path / "result.md"
 
@@ -806,11 +1573,22 @@ def test_result_writes_json_and_markdown_once(
 
 
 def test_runner_claim_prevents_second_execution_before_cell_access(
+    monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     manifest: ConfirmatoryManifest,
     candidate_lock: CandidateLock,
+    candidate_repo: FakeGitRepository,
 ) -> None:
     """Run claim은 첫 셀 접근 전에 생기고 두 번째 실행 callback을 호출하지 않는다."""
+    monkeypatch.setattr(
+        runner_module,
+        "read_git_state",
+        lambda _: GitState(
+            manifest.document["branch"],
+            candidate_lock.git_commit,
+            False,
+        ),
+    )
     by_key = {
         cell.key: artifact.document
         for cell, artifact in zip(
@@ -831,25 +1609,121 @@ def test_runner_claim_prevents_second_execution_before_cell_access(
         candidate_lock=candidate_lock,
         output_dir=tmp_path / "run",
         cell_runner=run,
+        repo_root=candidate_repo.root,
     )
     assert result["acceptance_gate"]["passed"] is True
+    assert result["completion_registry_ref"].startswith(
+        "refs/confirmatory-completions/"
+    )
     assert len(calls) == 12
     assert (tmp_path / "run" / RESULT_JSON_FILENAME).is_file()
     assert (tmp_path / "run" / RESULT_MARKDOWN_FILENAME).is_file()
+    raw_paths = sorted((tmp_path / "run/raw").glob("*.json"))
+    validated = validate_existing_results(
+        manifest=manifest,
+        candidate_lock=candidate_lock,
+        raw_paths=raw_paths,
+        output_dir=tmp_path / "validated-copy",
+        repo_root=candidate_repo.root,
+    )
+    assert validated["completion_authority_sha256"] == (
+        result["completion_authority_sha256"]
+    )
+
+    tampered_path = tmp_path / "copied-with-different-bytes.json"
+    tampered_path.write_bytes(raw_paths[0].read_bytes() + b"\n")
+    tampered_paths = [tampered_path, *raw_paths[1:]]
+    with pytest.raises(ValueError, match="completion authority registry blob bytes"):
+        validate_existing_results(
+            manifest=manifest,
+            candidate_lock=candidate_lock,
+            raw_paths=tampered_paths,
+            output_dir=tmp_path / "tampered-validation",
+            repo_root=candidate_repo.root,
+        )
     with pytest.raises(ValueError, match="run claim"):
         execute_confirmatory_matrix(
             manifest=manifest,
             candidate_lock=candidate_lock,
             output_dir=tmp_path / "different-run-output",
             cell_runner=run,
+            repo_root=candidate_repo.root,
         )
     assert len(calls) == 12
+
+
+@pytest.mark.parametrize("mutation", ("head", "dirty", "import"))
+def test_runner_postflight_rechecks_git_and_import_after_all_cells(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    manifest: ConfirmatoryManifest,
+    candidate_lock: CandidateLock,
+    candidate_repo: FakeGitRepository,
+    mutation: str,
+) -> None:
+    """12셀 뒤 HEAD·cleanliness·import가 바뀌면 결과 등록 전에 fail-closed한다."""
+    documents = {
+        cell.key: artifact.document
+        for cell, artifact in zip(
+            manifest.cells,
+            _passing_artifacts(manifest),
+            strict=True,
+        )
+    }
+    calls: list[tuple[str, str, int]] = []
+    import_checks = 0
+    original_import_check = runner_module.validate_import_bindings
+
+    def run(cell: ConfirmatoryCell) -> dict[str, Any]:
+        """Postflight 시점을 증명하도록 실행된 셀을 기록한다."""
+        calls.append(cell.key)
+        return copy.deepcopy(documents[cell.key])
+
+    if mutation == "head":
+        state = GitState(manifest.document["branch"], "b" * 40, False)
+    elif mutation == "dirty":
+        state = GitState(
+            manifest.document["branch"],
+            candidate_lock.git_commit,
+            True,
+        )
+    else:
+        state = GitState(
+            manifest.document["branch"],
+            candidate_lock.git_commit,
+            False,
+        )
+
+        def check_imports(repo_root: Path) -> None:
+            """Preflight는 통과시키고 postflight import 재검사만 실패시킨다."""
+            nonlocal import_checks
+            import_checks += 1
+            if import_checks == 2:
+                raise ValueError("import source changed")
+            original_import_check(repo_root)
+
+        monkeypatch.setattr(runner_module, "validate_import_bindings", check_imports)
+    monkeypatch.setattr(runner_module, "read_git_state", lambda _: state)
+
+    with pytest.raises(ValueError, match="HEAD|dirty|import source"):
+        execute_confirmatory_matrix(
+            manifest=manifest,
+            candidate_lock=candidate_lock,
+            output_dir=tmp_path / f"postflight-{mutation}",
+            cell_runner=run,
+            repo_root=candidate_repo.root,
+        )
+    assert len(calls) == len(manifest.cells) == 12
+    assert not (
+        tmp_path / f"postflight-{mutation}" / RESULT_JSON_FILENAME
+    ).exists()
 
 
 def test_runner_rejects_nonempty_output_before_consuming_run_claim(
     tmp_path: Path,
     manifest: ConfirmatoryManifest,
     candidate_lock: CandidateLock,
+    candidate_repo: FakeGitRepository,
 ) -> None:
     """예측 가능한 output 충돌은 claim 생성이나 셀 접근 전에 거부한다."""
     output_dir = tmp_path / "nonempty"
@@ -869,6 +1743,7 @@ def test_runner_rejects_nonempty_output_before_consuming_run_claim(
             candidate_lock=candidate_lock,
             output_dir=output_dir,
             cell_runner=forbidden,
+            repo_root=candidate_repo.root,
         )
 
     assert called is False
@@ -888,6 +1763,8 @@ def test_cli_rejects_head_lock_mismatch_before_building_data_runner(
         "read_git_state",
         lambda _: GitState("feature/rebalance-policy-v3", "b" * 40, False),
     )
+    monkeypatch.setattr(runner_module, "validate_candidate_ancestry", lambda *args: None)
+    monkeypatch.setattr(runner_module, "validate_import_bindings", lambda *args: None)
     runner_built = False
 
     def forbidden_runner(*args, **kwargs):
@@ -929,17 +1806,38 @@ def _copy_registered_manifest(tmp_path: Path) -> tuple[Path, Path]:
 
 def _passing_artifacts(
     manifest: ConfirmatoryManifest,
+    run_claim: RunClaim | None = None,
 ) -> list[RawResultArtifact]:
     """8/12 셀 180분 empty 개선을 갖는 합성 raw artifact를 만든다."""
     artifacts = []
     for index, cell in enumerate(manifest.cells):
         document = _raw_document(cell, improves_180=index < 8)
-        payload = json.dumps(document, sort_keys=True, default=str).encode("utf-8")
+        if run_claim is None:
+            holdout_id = "0" * 64
+            candidate_id = "0" * 64
+            run_claim_sha256 = "0" * 64
+            run_registry_ref = "refs/confirmatory-runs/fixture/fixture"
+            run_registry_blob_oid = "0" * 40
+            serializable: Mapping[str, Any] = document
+        else:
+            envelope = raw_result_envelope(document, run_claim)
+            holdout_id = run_claim.holdout_id
+            candidate_id = run_claim.candidate_id
+            run_claim_sha256 = run_claim.sha256
+            run_registry_ref = run_claim.registry_ref
+            run_registry_blob_oid = run_claim.registry_blob_oid
+            serializable = envelope
+        payload = json.dumps(serializable, sort_keys=True, default=str).encode("utf-8")
         artifacts.append(
             RawResultArtifact(
                 path=f"/fixture/{cell.slug}-policy.json",
                 sha256=hashlib.sha256(payload).hexdigest(),
                 document=document,
+                holdout_id=holdout_id,
+                candidate_id=candidate_id,
+                run_claim_sha256=run_claim_sha256,
+                run_registry_ref=run_registry_ref,
+                run_registry_blob_oid=run_registry_blob_oid,
             )
         )
     return artifacts
@@ -1024,9 +1922,9 @@ def _raw_document(cell: ConfirmatoryCell, *, improves_180: bool) -> dict[str, An
                 "sha256": PRODUCTION_WEATHER_SHA256,
             },
             "population_csvs": [
-                _source_file(
-                    "/fixture/250_LOCAL_RESD_"
-                    f"{cell.target_date - timedelta(days=7):%Y%m%d}.csv"
+                _source_file(f"/fixture/250_LOCAL_RESD_{source_date:%Y%m%d}.csv")
+                for source_date in sorted(
+                    population_source_date_contract(cell.target_date).base_dates
                 )
             ],
             "station_master_content_sha256": "c" * 64,

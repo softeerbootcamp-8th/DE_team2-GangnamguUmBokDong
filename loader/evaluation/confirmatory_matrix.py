@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 import re
+import subprocess
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -21,7 +22,9 @@ from .backtest_contract import (
     BACKTEST_CONTRACT_VERSION,
     EVIDENCE_GRADE,
     EvaluationContract,
+    PRIMARY_METRIC,
 )
+from .population_contract import population_source_date_contract
 from .production_policy_contract import (
     PRODUCTION_MODEL_BUNDLE_SHA256,
     PRODUCTION_POLICY_NAME,
@@ -29,23 +32,33 @@ from .production_policy_contract import (
     production_policy_configuration,
 )
 
-MANIFEST_SCHEMA_VERSION = "confirmatory-matrix-v2"
-CANDIDATE_LOCK_SCHEMA_VERSION = "confirmatory-candidate-lock-v2"
-RUN_CLAIM_SCHEMA_VERSION = "confirmatory-run-claim-v2"
-RESULT_SCHEMA_VERSION = "confirmatory-matrix-result-v2"
-REGISTERED_MANIFEST_FILENAME = "confirmatory-matrix-v2.json"
-REGISTERED_SIDECAR_FILENAME = "confirmatory-matrix-v2.sha256"
+MANIFEST_SCHEMA_VERSION = "confirmatory-matrix-v3"
+CANDIDATE_LOCK_SCHEMA_VERSION = "confirmatory-candidate-lock-v3"
+RUN_CLAIM_SCHEMA_VERSION = "confirmatory-run-claim-v3"
+RESULT_SCHEMA_VERSION = "confirmatory-matrix-result-v3"
+RAW_RESULT_ENVELOPE_SCHEMA_VERSION = "confirmatory-raw-result-envelope-v3"
+COMPLETION_AUTHORITY_SCHEMA_VERSION = "confirmatory-completion-authority-v3"
+REGISTERED_MANIFEST_FILENAME = "confirmatory-matrix-v3.json"
+REGISTERED_SIDECAR_FILENAME = "confirmatory-matrix-v3.sha256"
 REGISTERED_MANIFEST_SHA256 = (
-    "91f2bac169832fc7c39b855349d376d50deee93250c298fd0ba6fb6290ee1c97"
+    "3d31517d57e3a460f1c9d0acc9637f5a91beaffcb6936514c61026263386ca15"
 )
 SUPERSEDED_MANIFEST_SHA256 = (
+    "91f2bac169832fc7c39b855349d376d50deee93250c298fd0ba6fb6290ee1c97"
+)
+ARCHIVED_V1_MANIFEST_SHA256 = (
     "5949e4305ae33294a7b5a07efc1bd45063ae4e9f40c2d6349b3c956e51b0faf0"
 )
 REGISTERED_BRANCH = "feature/rebalance-policy-v3"
-REGISTERED_DEVELOP_BASE_COMMIT = "3b2c87f69d3e4ee404cb1351a3f3cf883ff54da5"
+REGISTERED_DEVELOP_BASE_COMMIT = "3f6c7977550efaa3e03f9bd847480517e04f690b"
 SEOUL = ZoneInfo("Asia/Seoul")
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _GIT_COMMIT = re.compile(r"[0-9a-f]{40}\Z")
+_GIT_OBJECT_ID = re.compile(r"[0-9a-f]{40}\Z")
+_GIT_REF_COMPONENT = re.compile(r"[a-z0-9][a-z0-9.-]*\Z")
+_ZERO_GIT_OBJECT_ID = "0" * 40
+_RUN_REGISTRY_REF_COMPONENTS = ("refs", "confirmatory-runs")
+_COMPLETION_REGISTRY_REF_COMPONENTS = ("refs", "confirmatory-completions")
 _FLOAT_TOLERANCE = 1e-9
 _EXPECTED_CELLS = frozenset(
     {
@@ -141,6 +154,29 @@ _RAW_RESULT_KEYS = frozenset(
         "evidence_gate",
         "contracts",
         "durations",
+    }
+)
+_RAW_RESULT_ENVELOPE_KEYS = frozenset(
+    {
+        "schema_version",
+        "holdout_id",
+        "candidate_id",
+        "run_claim_sha256",
+        "run_registry_ref",
+        "run_registry_blob_oid",
+        "result",
+    }
+)
+_COMPLETION_AUTHORITY_KEYS = frozenset(
+    {
+        "schema_version",
+        "holdout_id",
+        "candidate_id",
+        "run_claim_sha256",
+        "run_registry_ref",
+        "run_registry_blob_oid",
+        "evaluation_result_sha256",
+        "raw_result_sha256_by_cell",
     }
 )
 _DURATION_KEYS = frozenset(
@@ -256,19 +292,40 @@ class CandidateLock:
 
 @dataclass(frozen=True, slots=True)
 class RawResultArtifact:
-    """중복 key 검사를 통과한 raw 결과와 파일 내용을 묶는다."""
+    """실행 authority envelope와 중복 key 검사를 통과한 raw 결과를 묶는다."""
 
     path: str
     sha256: str
     document: Mapping[str, Any]
+    holdout_id: str
+    candidate_id: str
+    run_claim_sha256: str
+    run_registry_ref: str
+    run_registry_blob_oid: str
 
 
 @dataclass(frozen=True, slots=True)
 class RunClaim:
-    """Candidate lock에 결속된 단 한 번의 confirmatory 실행 claim을 표현한다."""
+    """Git authority에 결속된 단 한 번의 confirmatory 실행 claim을 표현한다."""
 
     path: str
     sha256: str
+    holdout_id: str
+    candidate_id: str
+    registry_ref: str
+    registry_blob_oid: str
+    repo_root: str
+    document: Mapping[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class CompletionAuthority:
+    """완결된 exact raw 집합을 봉인한 Git completion authority를 표현한다."""
+
+    sha256: str
+    registry_ref: str
+    registry_blob_oid: str
+    repo_root: str
     document: Mapping[str, Any]
 
 
@@ -319,6 +376,9 @@ def candidate_lock_document(manifest_sha256: str, git_commit: str) -> dict[str, 
             "policy": PRODUCTION_POLICY_NAME,
             "policy_configuration": DEFAULT_REBALANCE_POLICY.audit_document(),
             "max_stops_per_route": MAX_STOPS_PER_ROUTE,
+            "route_algorithm_version": ROUTE_ALGORITHM_VERSION,
+            "urgency_scoring_config_version": URGENCY_SCORING_CONFIG_VERSION,
+            "backtest_contract_version": BACKTEST_CONTRACT_VERSION,
         },
     }
 
@@ -371,14 +431,155 @@ def run_claim_document(
     manifest: ConfirmatoryManifest,
     candidate_lock: CandidateLock,
 ) -> dict[str, Any]:
-    """Manifest와 candidate lock에 결속된 exact 단일 실행 claim을 만든다."""
+    """Semantic candidate와 canonical Git ref에 결속된 실행 claim을 만든다."""
+    holdout_id = holdout_identity_sha256(manifest)
+    candidate_id = candidate_identity_sha256(manifest, candidate_lock)
     return {
         "schema_version": RUN_CLAIM_SCHEMA_VERSION,
+        "holdout_id": holdout_id,
+        "candidate_id": candidate_id,
         "manifest_sha256": manifest.sha256,
-        "candidate_lock_sha256": candidate_lock.sha256,
         "git_commit": candidate_lock.git_commit,
         "candidate": candidate_lock.document["candidate"],
+        "run_registry_ref": holdout_run_registry_ref(holdout_id),
     }
+
+
+def candidate_identity_document(
+    manifest: ConfirmatoryManifest,
+    candidate_lock: CandidateLock,
+) -> dict[str, Any]:
+    """Lock 경로·직렬화와 무관한 semantic candidate identity를 만든다."""
+    _require_sha256(manifest.sha256, "candidate identity manifest_sha256")
+    _require_git_commit(candidate_lock.git_commit, "candidate identity git_commit")
+    candidate = _require_mapping(
+        candidate_lock.document.get("candidate"),
+        "candidate identity candidate",
+    )
+    return {
+        "manifest_sha256": manifest.sha256,
+        "git_commit": candidate_lock.git_commit,
+        "candidate": candidate,
+    }
+
+
+def candidate_identity_sha256(
+    manifest: ConfirmatoryManifest,
+    candidate_lock: CandidateLock,
+) -> str:
+    """Semantic candidate identity의 canonical JSON SHA-256을 반환한다."""
+    payload = _canonical_json(candidate_identity_document(manifest, candidate_lock))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def holdout_identity_sha256(manifest: ConfirmatoryManifest) -> str:
+    """정렬된 exact holdout 셀 집합만의 안정적인 SHA-256 ID를 반환한다."""
+    cells = [
+        {
+            "center_id": cell.center_id,
+            "target_date": cell.target_date.isoformat(),
+            "start_hour": cell.start_hour,
+        }
+        for cell in sorted(manifest.cells, key=lambda cell: cell.key)
+    ]
+    payload = _canonical_json({"cells": cells})
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def holdout_run_registry_ref(holdout_id: str) -> str:
+    """Exact holdout 셀 집합으로 결정되는 repository-wide run ref를 반환한다."""
+    holdout_component = _require_sha256(
+        holdout_id,
+        "run registry holdout component",
+    )
+    return _git_ref(
+        (*_RUN_REGISTRY_REF_COMPONENTS, holdout_component),
+        "run registry ref",
+    )
+
+
+def completion_registry_ref(holdout_id: str) -> str:
+    """Exact holdout 셀 집합으로 결정되는 repository-wide completion ref를 반환한다."""
+    holdout_component = _require_sha256(
+        holdout_id,
+        "completion registry holdout component",
+    )
+    return _git_ref(
+        (*_COMPLETION_REGISTRY_REF_COMPONENTS, holdout_component),
+        "completion registry ref",
+    )
+
+
+def register_git_blob_authority(
+    repo_root: Path,
+    *,
+    registry_ref: str,
+    payload: bytes,
+    label: str,
+) -> str:
+    """Exact bytes를 Git blob으로 저장하고 old-zero CAS로 ref를 최초 생성한다."""
+    _require_git_ref(registry_ref, f"{label} registry ref")
+    if type(payload) is not bytes:
+        raise ValueError(f"{label} payload는 bytes여야 합니다.")
+    hashed = _run_git_bytes(
+        repo_root,
+        ("hash-object", "-w", "--stdin"),
+        label=f"{label} blob 저장",
+        stdin=payload,
+    )
+    if hashed.returncode != 0:
+        raise ValueError(f"{label} Git blob 저장이 실패했습니다.")
+    blob_oid = _decode_git_oid(hashed.stdout, f"{label} blob OID")
+    updated = _run_git_bytes(
+        repo_root,
+        (
+            "update-ref",
+            registry_ref,
+            blob_oid,
+            _ZERO_GIT_OBJECT_ID,
+        ),
+        label=f"{label} registry CAS",
+    )
+    if updated.returncode != 0:
+        raise ValueError(
+            f"{label} registry ref가 이미 존재하거나 Git CAS가 실패해 "
+            f"재실행할 수 없습니다: {registry_ref}"
+        )
+    return blob_oid
+
+
+def validate_git_blob_authority(
+    repo_root: Path,
+    *,
+    registry_ref: str,
+    expected_payload: bytes,
+    label: str,
+) -> str:
+    """Ref가 가리키는 Git blob의 type·bytes와 ref 불변성을 exact 검증한다."""
+    _require_git_ref(registry_ref, f"{label} registry ref")
+    if type(expected_payload) is not bytes:
+        raise ValueError(f"{label} expected payload는 bytes여야 합니다.")
+    initial_oid = _read_git_ref(repo_root, registry_ref, label)
+    object_type = _run_git_bytes(
+        repo_root,
+        ("cat-file", "-t", initial_oid),
+        label=f"{label} object type 조회",
+    )
+    if object_type.returncode != 0 or _decode_git_text(object_type.stdout) != "blob":
+        raise ValueError(f"{label} registry ref가 Git blob을 가리키지 않습니다.")
+    content = _run_git_bytes(
+        repo_root,
+        ("cat-file", "blob", initial_oid),
+        label=f"{label} blob 조회",
+    )
+    if content.returncode != 0:
+        raise ValueError(f"{label} registry blob을 읽을 수 없습니다.")
+    if _stdout_bytes(content.stdout) != expected_payload:
+        raise ValueError(f"{label} registry blob bytes가 claim과 다릅니다.")
+    final_oid = _read_git_ref(repo_root, registry_ref, label)
+    if final_oid != initial_oid:
+        raise ValueError(f"{label} registry ref가 검증 중 변경됐습니다.")
+    return initial_oid
 
 
 def load_run_claim(
@@ -386,30 +587,266 @@ def load_run_claim(
     *,
     manifest: ConfirmatoryManifest,
     candidate_lock: CandidateLock,
+    repo_root: Path,
 ) -> RunClaim:
-    """실행 claim의 duplicate key와 manifest·candidate exact 결속을 검증한다."""
+    """Claim JSON과 repository Git blob/ref authority를 함께 검증한다."""
     payload = path.read_bytes()
     document = _loads_strict_json(payload, "confirmatory run claim")
+    expected_document = run_claim_document(manifest, candidate_lock)
     _require_canonical_equal(
         document,
-        run_claim_document(manifest, candidate_lock),
+        expected_document,
         "confirmatory run claim",
+    )
+    registry_ref = expected_document["run_registry_ref"]
+    registry_blob_oid = validate_git_blob_authority(
+        repo_root,
+        registry_ref=registry_ref,
+        expected_payload=payload,
+        label="confirmatory run claim",
     )
     return RunClaim(
         path=str(path),
         sha256=hashlib.sha256(payload).hexdigest(),
+        holdout_id=expected_document["holdout_id"],
+        candidate_id=expected_document["candidate_id"],
+        registry_ref=registry_ref,
+        registry_blob_oid=registry_blob_oid,
+        repo_root=str(repo_root.resolve()),
         document=document,
     )
 
 
+def raw_result_envelope(
+    document: Mapping[str, Any],
+    run_claim: RunClaim,
+) -> dict[str, Any]:
+    """Raw backtest 결과를 실행 candidate·claim authority에 결속한다."""
+    result = _require_mapping(document, "raw result envelope result")
+    _require_sha256(run_claim.holdout_id, "raw envelope holdout_id")
+    _require_sha256(run_claim.candidate_id, "raw envelope candidate_id")
+    _require_sha256(run_claim.sha256, "raw envelope run_claim_sha256")
+    _require_git_ref(run_claim.registry_ref, "raw envelope run_registry_ref")
+    _require_git_object_id(
+        run_claim.registry_blob_oid,
+        "raw envelope run_registry_blob_oid",
+    )
+    return {
+        "schema_version": RAW_RESULT_ENVELOPE_SCHEMA_VERSION,
+        "holdout_id": run_claim.holdout_id,
+        "candidate_id": run_claim.candidate_id,
+        "run_claim_sha256": run_claim.sha256,
+        "run_registry_ref": run_claim.registry_ref,
+        "run_registry_blob_oid": run_claim.registry_blob_oid,
+        "result": result,
+    }
+
+
 def load_raw_result(path: Path) -> RawResultArtifact:
-    """Raw JSON의 byte SHA와 duplicate key 검증 결과를 반환한다."""
+    """Raw envelope의 exact authority surface와 결과 문서를 읽는다."""
     payload = path.read_bytes()
+    envelope = _loads_strict_json(payload, f"raw result {path}")
+    _require_exact_keys(
+        envelope,
+        _RAW_RESULT_ENVELOPE_KEYS,
+        f"raw result envelope {path}",
+    )
+    if envelope.get("schema_version") != RAW_RESULT_ENVELOPE_SCHEMA_VERSION:
+        raise ValueError(f"raw result envelope schema_version이 잘못됐습니다: {path}")
+    candidate_id = _require_sha256(
+        envelope.get("candidate_id"),
+        f"raw result envelope {path} candidate_id",
+    )
+    holdout_id = _require_sha256(
+        envelope.get("holdout_id"),
+        f"raw result envelope {path} holdout_id",
+    )
+    run_claim_sha256 = _require_sha256(
+        envelope.get("run_claim_sha256"),
+        f"raw result envelope {path} run_claim_sha256",
+    )
+    run_registry_ref = _require_git_ref(
+        envelope.get("run_registry_ref"),
+        f"raw result envelope {path} run_registry_ref",
+    )
+    run_registry_blob_oid = _require_git_object_id(
+        envelope.get("run_registry_blob_oid"),
+        f"raw result envelope {path} run_registry_blob_oid",
+    )
     return RawResultArtifact(
         path=str(path),
         sha256=hashlib.sha256(payload).hexdigest(),
-        document=_loads_strict_json(payload, f"raw result {path}"),
+        document=_require_mapping(
+            envelope.get("result"),
+            f"raw result envelope {path} result",
+        ),
+        holdout_id=holdout_id,
+        candidate_id=candidate_id,
+        run_claim_sha256=run_claim_sha256,
+        run_registry_ref=run_registry_ref,
+        run_registry_blob_oid=run_registry_blob_oid,
     )
+
+
+def completion_authority_document(
+    artifacts: Sequence[RawResultArtifact],
+    *,
+    result: Mapping[str, Any],
+    run_claim: RunClaim,
+) -> dict[str, Any]:
+    """완결된 raw exact set과 경로 독립 평가 결과 digest를 만든다."""
+    raw_sha256_by_cell: dict[str, str] = {}
+    for artifact in artifacts:
+        key = _raw_cell_key(artifact.document)
+        cell = ConfirmatoryCell(key[0], date.fromisoformat(key[1]), key[2])
+        if cell.slug in raw_sha256_by_cell:
+            raise ValueError(f"completion authority raw 셀이 중복됐습니다: {cell.slug}")
+        raw_sha256_by_cell[cell.slug] = _require_sha256(
+            artifact.sha256,
+            f"completion authority {cell.slug} raw SHA",
+        )
+    expected_slugs = {cell.slug for cell in _manifest_cells_from_result(result)}
+    if set(raw_sha256_by_cell) != expected_slugs:
+        raise ValueError("completion authority raw 셀 집합이 평가 결과와 다릅니다.")
+    evaluation_payload = _canonical_json(_completion_result_projection(result))
+    return {
+        "schema_version": COMPLETION_AUTHORITY_SCHEMA_VERSION,
+        "holdout_id": run_claim.holdout_id,
+        "candidate_id": run_claim.candidate_id,
+        "run_claim_sha256": run_claim.sha256,
+        "run_registry_ref": run_claim.registry_ref,
+        "run_registry_blob_oid": run_claim.registry_blob_oid,
+        "evaluation_result_sha256": hashlib.sha256(
+            evaluation_payload.encode("utf-8")
+        ).hexdigest(),
+        "raw_result_sha256_by_cell": dict(sorted(raw_sha256_by_cell.items())),
+    }
+
+
+def _manifest_cells_from_result(
+    result: Mapping[str, Any],
+) -> tuple[ConfirmatoryCell, ...]:
+    """검증 결과의 cell identity를 completion 비교용으로 읽는다."""
+    rows = _require_sequence(result.get("cells"), "completion result cells")
+    cells: list[ConfirmatoryCell] = []
+    for row in rows:
+        cell = _require_mapping(row, "completion result cell")
+        center_id = _require_nonblank(cell.get("center_id"), "completion center_id")
+        target_date = date.fromisoformat(
+            _require_nonblank(cell.get("target_date"), "completion target_date")
+        )
+        start_hour = cell.get("start_hour")
+        if type(start_hour) is not int or not 0 <= start_hour <= 23:
+            raise ValueError("completion start_hour가 0~23 정수가 아닙니다.")
+        cells.append(ConfirmatoryCell(center_id, target_date, start_hour))
+    return tuple(cells)
+
+
+def _completion_result_projection(result: Mapping[str, Any]) -> dict[str, Any]:
+    """경로·lock 직렬화 차이를 제외한 stable 평가 결과 projection을 만든다."""
+    projected = dict(result)
+    projected.pop("candidate_lock_sha256", None)
+    for key in (
+        "completion_authority_sha256",
+        "completion_registry_ref",
+        "completion_registry_blob_oid",
+    ):
+        projected.pop(key, None)
+    cells = _require_sequence(projected.get("cells"), "completion result cells")
+    stable_cells: list[dict[str, Any]] = []
+    for value in cells:
+        cell = dict(_require_mapping(value, "completion result cell"))
+        cell.pop("raw_result_path", None)
+        stable_cells.append(cell)
+    projected["cells"] = stable_cells
+    return projected
+
+
+def create_completion_authority(
+    repo_root: Path,
+    *,
+    artifacts: Sequence[RawResultArtifact],
+    result: Mapping[str, Any],
+    run_claim: RunClaim,
+) -> CompletionAuthority:
+    """검증 완료 raw 집합을 canonical Git blob과 old-zero completion ref로 봉인한다."""
+    document = completion_authority_document(
+        artifacts,
+        result=result,
+        run_claim=run_claim,
+    )
+    payload = _canonical_json(document).encode("utf-8")
+    registry_ref = completion_registry_ref(run_claim.holdout_id)
+    registry_blob_oid = register_git_blob_authority(
+        repo_root,
+        registry_ref=registry_ref,
+        payload=payload,
+        label="confirmatory completion authority",
+    )
+    return CompletionAuthority(
+        sha256=hashlib.sha256(payload).hexdigest(),
+        registry_ref=registry_ref,
+        registry_blob_oid=registry_blob_oid,
+        repo_root=str(repo_root.resolve()),
+        document=document,
+    )
+
+
+def load_completion_authority(
+    repo_root: Path,
+    *,
+    artifacts: Sequence[RawResultArtifact],
+    result: Mapping[str, Any],
+    run_claim: RunClaim,
+) -> CompletionAuthority:
+    """Official validate용 completion ref→blob과 exact raw SHA 집합을 검증한다."""
+    expected = completion_authority_document(
+        artifacts,
+        result=result,
+        run_claim=run_claim,
+    )
+    _require_exact_keys(
+        expected,
+        _COMPLETION_AUTHORITY_KEYS,
+        "confirmatory completion authority",
+    )
+    payload = _canonical_json(expected).encode("utf-8")
+    registry_ref = completion_registry_ref(run_claim.holdout_id)
+    registry_blob_oid = validate_git_blob_authority(
+        repo_root,
+        registry_ref=registry_ref,
+        expected_payload=payload,
+        label="confirmatory completion authority",
+    )
+    return CompletionAuthority(
+        sha256=hashlib.sha256(payload).hexdigest(),
+        registry_ref=registry_ref,
+        registry_blob_oid=registry_blob_oid,
+        repo_root=str(repo_root.resolve()),
+        document=expected,
+    )
+
+
+def bind_completion_authority(
+    result: Mapping[str, Any],
+    completion: CompletionAuthority,
+) -> dict[str, Any]:
+    """검증 결과에 immutable completion Git provenance를 추가한다."""
+    if any(
+        key in result
+        for key in (
+            "completion_authority_sha256",
+            "completion_registry_ref",
+            "completion_registry_blob_oid",
+        )
+    ):
+        raise ValueError("confirmatory 결과에 completion authority가 이미 있습니다.")
+    return {
+        **result,
+        "completion_authority_sha256": completion.sha256,
+        "completion_registry_ref": completion.registry_ref,
+        "completion_registry_blob_oid": completion.registry_blob_oid,
+    }
 
 
 def validate_confirmatory_results(
@@ -431,22 +868,40 @@ def validate_confirmatory_results(
         Path(run_claim.path),
         manifest=manifest,
         candidate_lock=current_lock,
+        repo_root=Path(run_claim.repo_root),
     )
     if current_claim.sha256 != run_claim.sha256:
         raise ValueError("검증 중 confirmatory run claim byte SHA가 변경됐습니다.")
+    if (
+        current_claim.registry_blob_oid != run_claim.registry_blob_oid
+        or current_claim.registry_ref != run_claim.registry_ref
+        or current_claim.candidate_id != run_claim.candidate_id
+    ):
+        raise ValueError("검증 중 confirmatory run Git authority가 변경됐습니다.")
     if not isinstance(artifacts, Sequence) or isinstance(
         artifacts, (str, bytes, bytearray)
     ):
         raise ValueError("raw result artifacts는 sequence여야 합니다.")
     summaries: list[dict[str, Any]] = []
     seen_cells: set[tuple[str, str, int]] = set()
-    source_by_date: dict[str, str] = {}
+    shared_source_by_date: dict[str, str] = {}
+    population_source_by_date: dict[str, dict[str, str]] = {}
     model_root: str | None = None
     for artifact in artifacts:
         if type(artifact) is not RawResultArtifact:
             raise ValueError("raw result artifact 타입이 잘못됐습니다.")
         _require_nonblank(artifact.path, "raw result artifact path")
         _require_sha256(artifact.sha256, "raw result artifact sha256")
+        if artifact.holdout_id != current_claim.holdout_id:
+            raise ValueError("raw result holdout_id가 run claim과 다릅니다.")
+        if artifact.candidate_id != current_claim.candidate_id:
+            raise ValueError("raw result candidate_id가 run claim과 다릅니다.")
+        if artifact.run_claim_sha256 != current_claim.sha256:
+            raise ValueError("raw result run_claim_sha256이 run claim과 다릅니다.")
+        if artifact.run_registry_ref != current_claim.registry_ref:
+            raise ValueError("raw result run registry ref가 run claim과 다릅니다.")
+        if artifact.run_registry_blob_oid != current_claim.registry_blob_oid:
+            raise ValueError("raw result run registry blob OID가 run claim과 다릅니다.")
         key = _raw_cell_key(artifact.document)
         if key not in _EXPECTED_CELLS:
             raise ValueError(f"사전 등록되지 않은 confirmatory 셀입니다: {key}")
@@ -454,7 +909,7 @@ def validate_confirmatory_results(
             raise ValueError(f"중복 confirmatory raw 셀입니다: {key}")
         seen_cells.add(key)
         cell = ConfirmatoryCell(key[0], date.fromisoformat(key[1]), key[2])
-        summary, source_signature, current_model_root = (
+        summary, shared_source_signature, current_model_root = (
             _validate_raw_result(
                 artifact.document,
                 artifact=artifact,
@@ -462,11 +917,25 @@ def validate_confirmatory_results(
                 manifest=manifest,
             )
         )
-        previous_source = source_by_date.setdefault(key[1], source_signature)
-        if previous_source != source_signature:
+        previous_source = shared_source_by_date.setdefault(
+            key[1], shared_source_signature
+        )
+        if previous_source != shared_source_signature:
             raise ValueError(
-                f"같은 날짜 raw 결과의 source provenance가 다릅니다: {key[1]}"
+                "같은 날짜 raw 결과의 공통 source authority가 다릅니다: "
+                f"{key[1]}"
             )
+        shared_population = population_source_by_date.setdefault(key[1], {})
+        for source_date, signature in _population_authority_by_source_date(
+            artifact.document.get("source_provenance"),
+            cell,
+        ).items():
+            previous_population = shared_population.setdefault(source_date, signature)
+            if previous_population != signature:
+                raise ValueError(
+                    "같은 날짜 raw 결과의 생활인구 source authority가 다릅니다: "
+                    f"target={key[1]}, source={source_date}"
+                )
         if model_root is None:
             model_root = current_model_root
         elif model_root != current_model_root:
@@ -493,6 +962,10 @@ def validate_confirmatory_results(
         "manifest_sha256": manifest.sha256,
         "candidate_lock_sha256": candidate_lock.sha256,
         "run_claim_sha256": run_claim.sha256,
+        "holdout_id": run_claim.holdout_id,
+        "candidate_id": run_claim.candidate_id,
+        "run_registry_ref": run_claim.registry_ref,
+        "run_registry_blob_oid": run_claim.registry_blob_oid,
         "git_commit": candidate_lock.git_commit,
         "candidate": candidate_lock.document["candidate"],
         "model_bundle_root": model_root,
@@ -526,9 +999,25 @@ def result_markdown(result: Mapping[str, Any]) -> str:
         f"- Manifest SHA-256: `{result['manifest_sha256']}`",
         f"- Candidate lock SHA-256: `{result['candidate_lock_sha256']}`",
         f"- Run claim SHA-256: `{result['run_claim_sha256']}`",
+        f"- Holdout ID: `{result['holdout_id']}`",
+        f"- Candidate ID: `{result['candidate_id']}`",
+        f"- Run registry ref: `{result['run_registry_ref']}`",
+        f"- Run registry blob: `{result['run_registry_blob_oid']}`",
+        f"- Completion authority SHA-256: `{result['completion_authority_sha256']}`",
+        f"- Completion registry ref: `{result['completion_registry_ref']}`",
+        f"- Completion registry blob: `{result['completion_registry_blob_oid']}`",
         f"- Git commit: `{result['git_commit']}`",
         f"- Candidate: `{result['candidate']['policy']}`",
         f"- 최종 통과: **{gate['passed']}**",
+        f"- Primary metric: `{gate['primary_metric']}`",
+        (
+            "- 180분 aggregate 관측 대여 충족률: "
+            f"**{gate['aggregate_180m_baseline_observed_demand_fulfillment_rate']:.6%}"
+            "→"
+            f"{gate['aggregate_180m_candidate_observed_demand_fulfillment_rate']:.6%}** "
+            "("
+            f"{gate['aggregate_180m_fulfillment_rate_delta_percentage_points']:+.6f}%p)"
+        ),
         (
             "- 모든 셀·구간 신규 미충족 요청 0건: "
             f"**{gate['every_cell_and_duration_new_unfulfilled_request_set_empty']}**"
@@ -600,6 +1089,12 @@ def write_confirmatory_result(
     markdown_path: Path,
 ) -> tuple[Path, Path]:
     """최종 JSON과 Markdown을 기존 파일을 덮지 않고 한 번만 기록한다."""
+    for key, validator in (
+        ("completion_authority_sha256", _require_sha256),
+        ("completion_registry_ref", _require_git_ref),
+        ("completion_registry_blob_oid", _require_git_object_id),
+    ):
+        validator(result.get(key), f"confirmatory result {key}")
     if json_path.exists() or markdown_path.exists():
         raise ValueError("confirmatory 최종 결과 파일이 이미 존재합니다.")
     json_path.parent.mkdir(parents=True, exist_ok=True)
@@ -625,7 +1120,7 @@ def _validate_manifest_document(
     if document.get("schema_version") != MANIFEST_SCHEMA_VERSION:
         raise ValueError("confirmatory manifest schema_version이 잘못됐습니다.")
     if document.get("supersedes_manifest_sha256") != SUPERSEDED_MANIFEST_SHA256:
-        raise ValueError("confirmatory manifest가 등록된 v1 SHA를 계승하지 않습니다.")
+        raise ValueError("confirmatory manifest가 등록된 v2 SHA를 계승하지 않습니다.")
     if document.get("registration_state") != "locked_before_candidate_evaluation":
         raise ValueError("confirmatory manifest registration_state가 잠기지 않았습니다.")
     if document.get("branch") != REGISTERED_BRANCH:
@@ -870,6 +1365,19 @@ def _validate_raw_result(
             raise ValueError(
                 f"{expected_cell.slug} {minutes}분 candidate와 baseline 관측 수요가 다릅니다."
             )
+        maximum_empty_minutes = current_station_count * minutes
+        for policy_label, policy_summary in (
+            ("baseline", baseline_summary),
+            ("candidate", candidate_summary),
+        ):
+            if (
+                policy_summary["empty_station_minutes"]
+                > maximum_empty_minutes + _FLOAT_TOLERANCE
+            ):
+                raise ValueError(
+                    f"{expected_cell.slug} {minutes}분 {policy_label} 품절 시간이 "
+                    "station_count×평가시간 물리 상한을 넘습니다."
+                )
         baseline_unfulfilled = baseline_summary["unfulfilled_request_keys"]
         candidate_unfulfilled = candidate_summary["unfulfilled_request_keys"]
         new_unfulfilled = candidate_unfulfilled - baseline_unfulfilled
@@ -877,6 +1385,19 @@ def _validate_raw_result(
         summaries.append(
             {
                 "evaluation_minutes": minutes,
+                "observed_requests": baseline_summary["observed_requests"],
+                "baseline_fulfilled_requests": baseline_summary[
+                    "fulfilled_requests"
+                ],
+                "candidate_fulfilled_requests": candidate_summary[
+                    "fulfilled_requests"
+                ],
+                "baseline_observed_demand_fulfillment_rate": baseline_summary[
+                    "observed_demand_fulfillment_rate"
+                ],
+                "candidate_observed_demand_fulfillment_rate": candidate_summary[
+                    "observed_demand_fulfillment_rate"
+                ],
                 "baseline_unfulfilled_requests": baseline_summary[
                     "unfulfilled_requests"
                 ],
@@ -958,7 +1479,12 @@ def _validate_source_provenance(
     value: object,
     cell: ConfirmatoryCell,
 ) -> tuple[str, str, str]:
-    """Raw 원천 hash·코드 version을 검증하고 날짜 공통 signature를 만든다."""
+    """Raw 원천 hash·코드 version과 날짜 공통 authority를 검증한다.
+
+    대여·재고·날씨·crosswalk와 코드 version은 같은 날짜의 모든 센터가 공유한다.
+    생활인구 파일 및 제외 surface는 센터별 결측 fallback 결과이므로 셀별 full
+    provenance SHA에 보존하되 날짜 공통 signature에는 넣지 않는다.
+    """
     source = _require_mapping(value, f"{cell.slug} source_provenance")
     _require_exact_keys(
         source,
@@ -1017,11 +1543,27 @@ def _validate_source_provenance(
         ).date()
         for row in populations
     )
-    if any(
-        not 1 <= (cell.target_date - source_date).days <= 60
-        for source_date in population_dates
-    ):
-        raise ValueError(f"{cell.slug} population CSV가 point-in-time 과거 범위 밖입니다.")
+    if len(set(population_dates)) != len(population_dates):
+        raise ValueError(
+            f"{cell.slug} population CSV에 같은 source date가 중복됩니다."
+        )
+    date_contract = population_source_date_contract(cell.target_date)
+    base_dates = frozenset(date_contract.base_dates)
+    fallback_dates = frozenset(date_contract.fallback_dates)
+    actual_dates = frozenset(population_dates)
+    missing_base_dates = sorted(base_dates - actual_dates)
+    if missing_base_dates:
+        raise ValueError(
+            f"{cell.slug} population CSV에 필수 후보일이 없습니다: "
+            f"{[value.isoformat() for value in missing_base_dates]}"
+        )
+    unexpected_dates = sorted(actual_dates - base_dates - fallback_dates)
+    if unexpected_dates:
+        raise ValueError(
+            f"{cell.slug} population CSV가 nowcaster 후보일 계약 밖입니다: "
+            f"{[value.isoformat() for value in unexpected_dates]}"
+        )
+    population_by_date = dict(zip(population_dates, populations, strict=True))
     station_sha = _require_sha256(
         source.get("station_master_content_sha256"),
         f"{cell.slug} station_master_content_sha256",
@@ -1048,7 +1590,9 @@ def _validate_source_provenance(
         "rental_csv": rental,
         "stock_csv": stock,
         "weather_csv": weather,
-        "population_csvs": populations,
+        "base_population_csvs": [
+            population_by_date[source_date] for source_date in sorted(base_dates)
+        ],
         "station_crosswalk_count": crosswalk_count,
         "station_crosswalk_sha256": crosswalk_sha,
         **expected_versions,
@@ -1069,6 +1613,35 @@ def _validate_source_file(value: object, label: str) -> dict[str, Any]:
         raise ValueError(f"{label} size_bytes가 양수가 아닙니다.")
     sha256 = _require_sha256(source.get("sha256"), f"{label} sha256")
     return {"path": path, "size_bytes": size, "sha256": sha256}
+
+
+def _population_authority_by_source_date(
+    value: object,
+    cell: ConfirmatoryCell,
+) -> dict[str, str]:
+    """한 셀의 생활인구 파일 metadata를 source date별 canonical 값으로 만든다."""
+    source = _require_mapping(value, f"{cell.slug} source_provenance")
+    populations = _require_sequence(
+        source.get("population_csvs"),
+        f"{cell.slug} population_csvs",
+    )
+    result: dict[str, str] = {}
+    for index, row in enumerate(populations):
+        validated = _validate_source_file(
+            row,
+            f"{cell.slug} population_csvs[{index}]",
+        )
+        source_date = Path(validated["path"]).stem.removeprefix(
+            "250_LOCAL_RESD_"
+        )
+        signature = _canonical_json(validated)
+        previous = result.setdefault(source_date, signature)
+        if previous != signature:
+            raise ValueError(
+                f"{cell.slug} population source date metadata가 중복·불일치합니다: "
+                f"{source_date}"
+            )
+    return result
 
 
 def _validate_policy_metrics(
@@ -1396,6 +1969,7 @@ def _evaluate_acceptance_gate(
 ) -> dict[str, Any]:
     """Manifest의 요청 event no-harm·180분 개선·실행 완결 기준을 계산한다."""
     durations = [duration for cell in cells for duration in cell["durations"]]
+    primary_metric_matches = contract.get("primary_metric") == PRIMARY_METRIC
     new_unfulfilled_limit = contract[
         "every_cell_and_duration_new_unfulfilled_request_count_max"
     ]
@@ -1437,6 +2011,23 @@ def _evaluate_acceptance_gate(
         for duration in cell["durations"]
         if duration["evaluation_minutes"] == 180
     ]
+    observed_requests = sum(duration["observed_requests"] for duration in duration_180)
+    baseline_fulfilled = sum(
+        duration["baseline_fulfilled_requests"] for duration in duration_180
+    )
+    candidate_fulfilled = sum(
+        duration["candidate_fulfilled_requests"] for duration in duration_180
+    )
+    baseline_fulfillment_rate = (
+        baseline_fulfilled / observed_requests if observed_requests else 1.0
+    )
+    candidate_fulfillment_rate = (
+        candidate_fulfilled / observed_requests if observed_requests else 1.0
+    )
+    fulfillment_rate_delta_percentage_points = (
+        candidate_fulfillment_rate - baseline_fulfillment_rate
+    ) * 100.0
+    aggregate_fulfillment_strict = candidate_fulfilled > baseline_fulfilled
     baseline_unfulfilled = sum(
         duration["baseline_unfulfilled_requests"] for duration in duration_180
     )
@@ -1479,9 +2070,11 @@ def _evaluate_acceptance_gate(
         (
             exact_cell_count,
             exact_duration_count,
+            primary_metric_matches,
             no_new_unfulfilled,
             unfulfilled_no_worse,
             aggregate_unfulfilled_strict,
+            aggregate_fulfillment_strict,
             pickup_lag_within_limit,
             empty_no_worse,
             aggregate_reduction_passed,
@@ -1493,6 +2086,8 @@ def _evaluate_acceptance_gate(
     )
     return {
         "passed": passed,
+        "primary_metric": PRIMARY_METRIC,
+        "primary_metric_matches": primary_metric_matches,
         "exact_cell_count": exact_cell_count,
         "exact_duration_count": exact_duration_count,
         "every_cell_and_duration_new_unfulfilled_request_set_empty": (
@@ -1510,6 +2105,24 @@ def _evaluate_acceptance_gate(
         ),
         "aggregate_180m_unfulfilled_strict_improvement": (
             aggregate_unfulfilled_strict
+        ),
+        "aggregate_180m_observed_requests": observed_requests,
+        "aggregate_180m_baseline_fulfilled_requests": baseline_fulfilled,
+        "aggregate_180m_candidate_fulfilled_requests": candidate_fulfilled,
+        "aggregate_180m_baseline_observed_demand_fulfillment_rate": round(
+            baseline_fulfillment_rate,
+            12,
+        ),
+        "aggregate_180m_candidate_observed_demand_fulfillment_rate": round(
+            candidate_fulfillment_rate,
+            12,
+        ),
+        "aggregate_180m_fulfillment_rate_delta_percentage_points": round(
+            fulfillment_rate_delta_percentage_points,
+            9,
+        ),
+        "aggregate_180m_fulfillment_rate_strict_improvement": (
+            aggregate_fulfillment_strict
         ),
         "every_cell_and_duration_pickup_dispatch_lag_within_limit": (
             pickup_lag_within_limit
@@ -1615,6 +2228,91 @@ def _require_git_commit(value: object, label: str) -> str:
     if type(value) is not str or _GIT_COMMIT.fullmatch(value) is None:
         raise ValueError(f"{label} 형식이 잘못됐습니다.")
     return value
+
+
+def _require_git_object_id(value: object, label: str) -> str:
+    """값이 repository의 full lowercase Git object ID인지 검증해 반환한다."""
+    if type(value) is not str or _GIT_OBJECT_ID.fullmatch(value) is None:
+        raise ValueError(f"{label} 형식이 잘못됐습니다.")
+    return value
+
+
+def _git_ref(components: Sequence[str], label: str) -> str:
+    """모든 component를 독립 검증해 안전한 private Git ref를 조립한다."""
+    validated: list[str] = []
+    for index, component in enumerate(components):
+        if (
+            type(component) is not str
+            or _GIT_REF_COMPONENT.fullmatch(component) is None
+            or component.endswith(".lock")
+            or ".." in component
+        ):
+            raise ValueError(f"{label} component {index} 형식이 잘못됐습니다.")
+        validated.append(component)
+    if len(validated) < 3 or validated[0] != "refs":
+        raise ValueError(f"{label}는 refs 아래 private ref여야 합니다.")
+    return "/".join(validated)
+
+
+def _require_git_ref(value: object, label: str) -> str:
+    """외부 Git ref 문자열의 모든 component를 검증해 반환한다."""
+    if type(value) is not str:
+        raise ValueError(f"{label} 형식이 잘못됐습니다.")
+    components = value.split("/")
+    return _git_ref(components, label)
+
+
+def _run_git_bytes(
+    repo_root: Path,
+    arguments: Sequence[str],
+    *,
+    label: str,
+    stdin: bytes | None = None,
+) -> subprocess.CompletedProcess[bytes]:
+    """Shell 없이 Git을 실행하고 실행 자체의 실패를 검증 오류로 바꾼다."""
+    try:
+        return subprocess.run(
+            ("git", *arguments),
+            cwd=repo_root,
+            check=False,
+            capture_output=True,
+            input=stdin,
+        )
+    except OSError as exc:
+        raise ValueError(f"{label} Git 명령을 실행할 수 없습니다.") from exc
+
+
+def _stdout_bytes(value: bytes | str) -> bytes:
+    """실제 subprocess와 테스트 double의 stdout을 bytes로 정규화한다."""
+    return value.encode("utf-8") if isinstance(value, str) else value
+
+
+def _decode_git_text(value: bytes | str) -> str:
+    """Git stdout을 strict UTF-8 단일 문자열로 변환한다."""
+    payload = _stdout_bytes(value)
+    try:
+        return payload.decode("utf-8").strip()
+    except UnicodeDecodeError as exc:
+        raise ValueError("Git stdout이 UTF-8이 아닙니다.") from exc
+
+
+def _decode_git_oid(value: bytes | str, label: str) -> str:
+    """Git stdout의 단일 object ID를 형식 검증해 반환한다."""
+    return _require_git_object_id(_decode_git_text(value), label)
+
+
+def _read_git_ref(repo_root: Path, registry_ref: str, label: str) -> str:
+    """Private ref의 direct object ID를 읽고 missing·Git 오류를 구분한다."""
+    resolved = _run_git_bytes(
+        repo_root,
+        ("show-ref", "--verify", "--hash", registry_ref),
+        label=f"{label} registry ref 조회",
+    )
+    if resolved.returncode == 1:
+        raise ValueError(f"{label} registry ref가 없습니다: {registry_ref}")
+    if resolved.returncode != 0:
+        raise ValueError(f"{label} registry ref Git 조회가 실패했습니다.")
+    return _decode_git_oid(resolved.stdout, f"{label} registry ref OID")
 
 
 def _canonical_json(value: object) -> str:

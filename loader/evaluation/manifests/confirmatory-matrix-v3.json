@@ -1,0 +1,123 @@
+{
+  "schema_version": "confirmatory-matrix-v3",
+  "registered_at_utc": "2026-08-25T07:37:24Z",
+  "registration_state": "locked_before_candidate_evaluation",
+  "supersedes_manifest_sha256": "91f2bac169832fc7c39b855349d376d50deee93250c298fd0ba6fb6290ee1c97",
+  "purpose": "등록된 v2의 selection·평가·acceptance 계약을 바꾸지 않고 최신 develop base ancestry와 production 후보의 semantic version을 fail-closed로 고정한다.",
+  "branch": "feature/rebalance-policy-v3",
+  "develop_base_commit": "3f6c7977550efaa3e03f9bd847480517e04f690b",
+  "selection_policy": {
+    "calibration_centers_excluded": [
+      "gaehwa",
+      "hangnyeoul",
+      "isu",
+      "yeongnam"
+    ],
+    "centers": [
+      "cheonho",
+      "cheonwang",
+      "jungnang",
+      "sangam"
+    ],
+    "hours": [
+      7,
+      13,
+      18
+    ],
+    "rationale": "서울 동남·서남·동북·서북의 미열람 권역과 출근·비첨두·퇴근 시간대를 균형 있게 고정한다.",
+    "candidate_must_be_locked_before_first_run": true,
+    "matrix_must_not_change_after_registration": true
+  },
+  "evaluation_contract": {
+    "evaluation_minutes": [
+      60,
+      120,
+      180
+    ],
+    "tick_minutes": 5,
+    "fleet_size": 3,
+    "truck_capacity": 20,
+    "speed_kmh": 20.0,
+    "service_minutes_per_stop": 3.0,
+    "approval_delay_minutes": 0,
+    "weather_publication_lag_minutes": 60,
+    "population_lookback_weeks": 4,
+    "model_bundle": "aws-temporary-model-2025-d20-h12-r20",
+    "heldout_rule": "2025년 17일은 고정 모델 학습에서 제외된 test split이다."
+  },
+  "acceptance_gate": {
+    "primary_metric": "observed_demand_fulfillment_rate",
+    "every_cell_and_duration_new_unfulfilled_request_count_max": 0,
+    "every_cell_and_duration_unfulfilled_delta_max": 0,
+    "aggregate_180m_unfulfilled_delta_max_exclusive": 0,
+    "every_cell_and_duration_max_pickup_dispatch_lag_minutes": 30.0,
+    "every_cell_and_duration_empty_station_minutes_delta_max": 0.0,
+    "aggregate_180m_empty_station_minutes_reduction_min_pct": 5.0,
+    "improved_180m_cells_min": 8,
+    "planned_bikes_must_equal_moved_bikes": true,
+    "all_routes_must_finish_by_cutoff": true,
+    "single_confirmatory_run": true
+  },
+  "cells": [
+    {
+      "center_id": "sangam",
+      "target_date": "2025-03-17",
+      "start_hour": 7
+    },
+    {
+      "center_id": "sangam",
+      "target_date": "2025-06-17",
+      "start_hour": 13
+    },
+    {
+      "center_id": "sangam",
+      "target_date": "2025-10-17",
+      "start_hour": 18
+    },
+    {
+      "center_id": "jungnang",
+      "target_date": "2025-05-17",
+      "start_hour": 7
+    },
+    {
+      "center_id": "jungnang",
+      "target_date": "2025-09-17",
+      "start_hour": 13
+    },
+    {
+      "center_id": "jungnang",
+      "target_date": "2025-11-17",
+      "start_hour": 18
+    },
+    {
+      "center_id": "cheonwang",
+      "target_date": "2025-03-17",
+      "start_hour": 13
+    },
+    {
+      "center_id": "cheonwang",
+      "target_date": "2025-06-17",
+      "start_hour": 18
+    },
+    {
+      "center_id": "cheonwang",
+      "target_date": "2025-10-17",
+      "start_hour": 7
+    },
+    {
+      "center_id": "cheonho",
+      "target_date": "2025-05-17",
+      "start_hour": 13
+    },
+    {
+      "center_id": "cheonho",
+      "target_date": "2025-09-17",
+      "start_hour": 18
+    },
+    {
+      "center_id": "cheonho",
+      "target_date": "2025-11-17",
+      "start_hour": 7
+    }
+  ]
+}

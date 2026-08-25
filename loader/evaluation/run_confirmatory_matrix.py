@@ -12,6 +12,10 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
+import core
+import evaluation
+import gold
+import ml_core
 from gold.rebalance_policy import DEFAULT_REBALANCE_POLICY
 from gold.rebalance_route import MAX_STOPS_PER_ROUTE
 
@@ -21,10 +25,16 @@ from .confirmatory_matrix import (
     ConfirmatoryManifest,
     RawResultArtifact,
     RESULT_SCHEMA_VERSION,
+    _GIT_COMMIT,
+    bind_completion_authority,
+    create_completion_authority,
     load_candidate_lock,
+    load_completion_authority,
     load_confirmatory_manifest,
     load_raw_result,
     load_run_claim,
+    raw_result_envelope,
+    register_git_blob_authority,
     run_claim_document,
     validate_confirmatory_results,
     write_candidate_lock,
@@ -34,10 +44,10 @@ from .production_policy_contract import PRODUCTION_POLICY_NAME
 from .run_policy_backtest import PolicyVariant, run_policy_backtest
 
 DEFAULT_MANIFEST_PATH = (
-    Path(__file__).with_name("manifests") / "confirmatory-matrix-v2.json"
+    Path(__file__).with_name("manifests") / "confirmatory-matrix-v3.json"
 )
 DEFAULT_SIDECAR_PATH = (
-    Path(__file__).with_name("manifests") / "confirmatory-matrix-v2.sha256"
+    Path(__file__).with_name("manifests") / "confirmatory-matrix-v3.sha256"
 )
 RESULT_JSON_FILENAME = f"{RESULT_SCHEMA_VERSION}.json"
 RESULT_MARKDOWN_FILENAME = f"{RESULT_SCHEMA_VERSION}.md"
@@ -56,7 +66,7 @@ CellRunner = Callable[[ConfirmatoryCell], Mapping[str, Any]]
 
 
 def read_git_state(repo_root: Path) -> GitState:
-    """Shell 확장 없이 Git branch·commit·전체 worktree 변경 여부를 읽는다."""
+    """명시한 실제 repository root에서 Git branch·commit·dirty 상태를 읽는다."""
 
     def run(*arguments: str) -> str:
         """한 Git 명령의 stdout을 반환하고 실패는 설명 가능한 오류로 바꾼다."""
@@ -71,6 +81,15 @@ def read_git_state(repo_root: Path) -> GitState:
         except (OSError, subprocess.CalledProcessError) as exc:
             raise ValueError(f"Git 상태를 읽을 수 없습니다: {' '.join(arguments)}") from exc
         return completed.stdout.strip()
+
+    actual_root_text = run("rev-parse", "--show-toplevel")
+    actual_root = Path(actual_root_text).resolve()
+    expected_root = repo_root.resolve()
+    if actual_root != expected_root:
+        raise ValueError(
+            "--repo-root가 실제 Git repository root와 다릅니다: "
+            f"expected={expected_root}, actual={actual_root}"
+        )
 
     return GitState(
         branch=run("branch", "--show-current"),
@@ -94,16 +113,124 @@ def validate_git_state(state: GitState, manifest: ConfirmatoryManifest) -> None:
         raise ValueError("현재 Git commit이 full lowercase SHA-1이 아닙니다.")
 
 
+def validate_import_bindings(repo_root: Path) -> None:
+    """실행 모듈이 명시 candidate repository에서 import됐는지 exact 검증한다."""
+    resolved_repo = repo_root.resolve()
+    expected_run_file = (
+        resolved_repo / "loader/evaluation/run_confirmatory_matrix.py"
+    ).resolve()
+    actual_run_file = Path(__file__).resolve()
+    if actual_run_file != expected_run_file:
+        raise ValueError(
+            "confirmatory runner import source가 --repo-root와 다릅니다: "
+            f"expected={expected_run_file}, actual={actual_run_file}"
+        )
+    bindings = (
+        (evaluation, resolved_repo / "loader/evaluation", "evaluation"),
+        (gold, resolved_repo / "loader/gold", "gold"),
+        (core, resolved_repo / "libs/core/src/core", "core"),
+        (ml_core, resolved_repo / "libs/ml_core", "ml_core"),
+    )
+    for module, expected_root, label in bindings:
+        module_file = getattr(module, "__file__", None)
+        if type(module_file) is not str:
+            raise ValueError(f"{label} import source __file__이 없습니다.")
+        actual_file = Path(module_file).resolve()
+        resolved_expected_root = expected_root.resolve()
+        if (
+            actual_file != resolved_expected_root
+            and resolved_expected_root not in actual_file.parents
+        ):
+            raise ValueError(
+                f"{label} import source가 --repo-root candidate 밖입니다: "
+                f"expected_root={resolved_expected_root}, actual={actual_file}"
+            )
+
+
+def validate_center_seed_binding(repo_root: Path, center_seed: Path) -> None:
+    """Route 거리 입력 seed가 candidate repository의 exact 파일인지 검증한다."""
+    expected = (repo_root.resolve() / "docs/gold/dispatch-center-seed.yaml").resolve()
+    actual = center_seed.resolve()
+    if actual != expected:
+        raise ValueError(
+            "--center-seed가 --repo-root candidate의 exact seed와 다릅니다: "
+            f"expected={expected}, actual={actual}"
+        )
+
+
+def validate_candidate_ancestry(
+    repo_root: Path,
+    manifest: ConfirmatoryManifest,
+    candidate_commit: str,
+) -> None:
+    """등록 develop base와 candidate commit 존재 및 ancestor 관계를 검증한다."""
+    base_commit = manifest.document.get("develop_base_commit")
+    if type(base_commit) is not str or _GIT_COMMIT.fullmatch(base_commit) is None:
+        raise ValueError("develop base commit이 full lowercase SHA-1이 아닙니다.")
+    if _GIT_COMMIT.fullmatch(candidate_commit) is None:
+        raise ValueError("candidate commit이 full lowercase SHA-1이 아닙니다.")
+
+    for label, commit in (
+        ("develop base", base_commit),
+        ("candidate", candidate_commit),
+    ):
+        try:
+            existence = subprocess.run(
+                ("git", "cat-file", "-e", f"{commit}^{{commit}}"),
+                cwd=repo_root,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        except OSError as exc:
+            raise ValueError(f"{label} commit 존재 여부를 확인할 수 없습니다.") from exc
+        if existence.returncode != 0:
+            raise ValueError(f"{label} commit이 repository에 없습니다: {commit}")
+
+    try:
+        ancestry = subprocess.run(
+            ("git", "merge-base", "--is-ancestor", base_commit, candidate_commit),
+            cwd=repo_root,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError as exc:
+        raise ValueError("candidate commit ancestry를 확인할 수 없습니다.") from exc
+    if ancestry.returncode == 1:
+        raise ValueError(
+            "candidate commit이 등록 develop base의 후손이 아닙니다: "
+            f"base={base_commit}, candidate={candidate_commit}"
+        )
+    if ancestry.returncode != 0:
+        raise ValueError(
+            "candidate commit ancestry Git 검증이 실패했습니다: "
+            f"returncode={ancestry.returncode}"
+        )
+
+
 def create_run_claim(
     path: Path,
     *,
     manifest: ConfirmatoryManifest,
     candidate_lock: CandidateLock,
+    repo_root: Path,
 ) -> Path:
-    """원천 접근 전에 단일 confirmatory 시도를 배타적으로 기록한다."""
+    """원천 접근 전에 Git CAS와 외부 파일로 단일 실행 시도를 기록한다."""
     document = run_claim_document(manifest, candidate_lock)
     payload = _json_bytes(document)
     path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        raise ValueError(
+            "confirmatory run claim이 이미 존재해 단일 실행 계약상 재실행할 수 "
+            f"없습니다: {path}"
+        )
+    register_git_blob_authority(
+        repo_root,
+        registry_ref=document["run_registry_ref"],
+        payload=payload,
+        label="confirmatory run claim",
+    )
     try:
         with path.open("xb") as stream:
             stream.write(payload)
@@ -127,8 +254,10 @@ def execute_confirmatory_matrix(
     candidate_lock: CandidateLock,
     output_dir: Path,
     cell_runner: CellRunner,
+    repo_root: Path,
 ) -> dict[str, Any]:
     """Claim을 먼저 고정하고 exact 12셀을 실행·검증·기록한다."""
+    validate_import_bindings(repo_root)
     current_lock = load_candidate_lock(
         Path(candidate_lock.path),
         expected_manifest_sha256=manifest.sha256,
@@ -145,11 +274,13 @@ def execute_confirmatory_matrix(
         claim_path,
         manifest=manifest,
         candidate_lock=candidate_lock,
+        repo_root=repo_root,
     )
     run_claim = load_run_claim(
         claim_path,
         manifest=manifest,
         candidate_lock=candidate_lock,
+        repo_root=repo_root,
     )
     raw_dir = output_dir / "raw"
     artifacts: list[RawResultArtifact] = []
@@ -161,11 +292,12 @@ def execute_confirmatory_matrix(
         document = cell_runner(cell)
         if not isinstance(document, Mapping):
             raise ValueError(f"{cell.slug} runner가 JSON object를 반환하지 않았습니다.")
+        envelope = raw_result_envelope(document, run_claim)
         raw_path = raw_dir / f"{cell.slug}-policy.json"
         raw_path.parent.mkdir(parents=True, exist_ok=True)
         try:
             with raw_path.open("xb") as stream:
-                stream.write(_json_bytes(document))
+                stream.write(_json_bytes(envelope))
         except FileExistsError as exc:
             raise ValueError(f"confirmatory raw 결과가 이미 존재합니다: {raw_path}") from exc
         artifacts.append(load_raw_result(raw_path))
@@ -173,12 +305,24 @@ def execute_confirmatory_matrix(
             f"[{index}/{len(manifest.cells)}] {cell.slug} confirmatory 완료",
             flush=True,
         )
+    _validate_execution_postflight(
+        repo_root,
+        manifest=manifest,
+        candidate_lock=candidate_lock,
+    )
     result = validate_confirmatory_results(
         artifacts,
         manifest=manifest,
         candidate_lock=candidate_lock,
         run_claim=run_claim,
     )
+    completion = create_completion_authority(
+        repo_root,
+        artifacts=artifacts,
+        result=result,
+        run_claim=run_claim,
+    )
+    result = bind_completion_authority(result, completion)
     write_confirmatory_result(
         result,
         json_path=output_dir / RESULT_JSON_FILENAME,
@@ -193,6 +337,7 @@ def validate_existing_results(
     candidate_lock: CandidateLock,
     raw_paths: Sequence[Path],
     output_dir: Path,
+    repo_root: Path,
 ) -> dict[str, Any]:
     """이미 생성된 raw 파일을 실행 없이 검증하고 최종 결과를 기록한다."""
     artifacts = tuple(load_raw_result(path) for path in raw_paths)
@@ -200,6 +345,7 @@ def validate_existing_results(
         candidate_run_claim_path(candidate_lock),
         manifest=manifest,
         candidate_lock=candidate_lock,
+        repo_root=repo_root,
     )
     result = validate_confirmatory_results(
         artifacts,
@@ -207,6 +353,13 @@ def validate_existing_results(
         candidate_lock=candidate_lock,
         run_claim=run_claim,
     )
+    completion = load_completion_authority(
+        repo_root,
+        artifacts=artifacts,
+        result=result,
+        run_claim=run_claim,
+    )
+    result = bind_completion_authority(result, completion)
     write_confirmatory_result(
         result,
         json_path=output_dir / RESULT_JSON_FILENAME,
@@ -285,6 +438,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     manifest = load_confirmatory_manifest(args.manifest, args.sidecar)
     state = read_git_state(args.repo_root)
     validate_git_state(state, manifest)
+    validate_candidate_ancestry(args.repo_root, manifest, state.commit)
+    validate_import_bindings(args.repo_root)
     if args.command == "lock":
         _require_outside_repo(args.candidate_lock, args.repo_root, "candidate lock")
         lock = write_candidate_lock(
@@ -308,9 +463,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             candidate_lock=candidate_lock,
             raw_paths=args.raw_results,
             output_dir=args.output_dir,
+            repo_root=args.repo_root,
         )
     else:
         _require_outside_repo(args.output_dir, args.repo_root, "output dir")
+        validate_center_seed_binding(args.repo_root, args.center_seed)
         expected_model_name = manifest.document["evaluation_contract"]["model_bundle"]
         if args.model_bundle.name != expected_model_name:
             raise ValueError(
@@ -322,6 +479,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             candidate_lock=candidate_lock,
             output_dir=args.output_dir,
             cell_runner=_backtest_runner(args, manifest),
+            repo_root=args.repo_root,
         )
     json_path = args.output_dir / RESULT_JSON_FILENAME
     markdown_path = args.output_dir / RESULT_MARKDOWN_FILENAME
@@ -341,8 +499,25 @@ def _add_preflight_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--repo-root",
         type=Path,
-        default=Path(__file__).resolve().parents[2],
+        required=True,
     )
+
+
+def _validate_execution_postflight(
+    repo_root: Path,
+    *,
+    manifest: ConfirmatoryManifest,
+    candidate_lock: CandidateLock,
+) -> None:
+    """12셀 후에도 branch·HEAD·cleanliness·import source가 같음을 검증한다."""
+    state = read_git_state(repo_root)
+    validate_git_state(state, manifest)
+    if state.commit != candidate_lock.git_commit:
+        raise ValueError(
+            "Confirmatory 실행 중 Git HEAD가 candidate commit에서 변경됐습니다: "
+            f"expected={candidate_lock.git_commit}, actual={state.commit}"
+        )
+    validate_import_bindings(repo_root)
 
 
 def _add_lock_argument(parser: argparse.ArgumentParser) -> None:
