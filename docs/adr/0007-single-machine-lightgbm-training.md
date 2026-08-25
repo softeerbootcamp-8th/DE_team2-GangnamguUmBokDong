@@ -1,10 +1,10 @@
 # ADR-0007: 모델 학습은 단일 EC2에서 lazy LightGBM으로 실행한다
 
-- 상태: 채택
+- 상태: 대체됨
 - 결정일: 2026-08-24
 - 작성자: Data Engineering 2팀
 - 대체 대상: ADR-0005
-- 대체한 ADR: 없음
+- 대체한 ADR: [ADR-0008](0008-yarn-distributed-shell-workers.md)
 
 ## 배경
 
@@ -34,6 +34,8 @@ Feature mart는 기간이 늘수록 입력량이 커져 일회성 EMR Classic �
 현재 인프라와 학습 경로가 일치하며 단일 머신 실행은 테스트할 수 있다. 학습 규모가 EC2 memory나 허용 시간을 넘어가면 instance type, 학습 window와 sampling profile을 먼저 조정한다.
 
 다중 머신이 필요해지면 lazy dataset shard, 전체 validation·conformal 집계, 워커 네트워크, 동시 실행과 장애 복구를 구현하고 별도 ADR로 결정한다. 환경변수와 LightGBM parameter 전달 코드만 존재하는 상태는 분산 학습 지원으로 보지 않는다.
+
+**추가(2026-08-25)**: 학습용 EC2를 더 이상 못 쓰게 되면서 다중 머신이 실제로 필요해졌다. lazy dataset shard와 워커 네트워크(YARN Distributed Shell)를 구현해 이 ADR을 [ADR-0008](0008-yarn-distributed-shell-workers.md)로 대체했다 — conformal 집계 근사 한계는 그 ADR에도 그대로 남아있다.
 
 ## 구현 및 검증 근거
 

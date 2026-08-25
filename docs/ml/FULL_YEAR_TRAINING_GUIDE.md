@@ -22,6 +22,13 @@
 | adaptive anchor | 활성화 |
 | 평일/휴일 peak | 07–21시 / 08–21시 |
 
+`feature_engine.spark.silver_source`는 historical fact(트립/재고/날씨/인구)를
+날짜별 Archive에서 읽는다. 요청 구간 중 일부 날짜만 없으면(2026-08부터) 그
+날짜만 건너뛰고 경고를 남긴 채 계속하고, 요청 구간 **전체**가 다 없을 때만
+fail-closed한다(대여/반납처럼 타겟에 가까운 소스도 포함 — 결측 날짜가 조용히
+"수요 0"으로 들어갈 수 있다는 트레이드오프를 감수하고 학습이 절대 실패하지
+않는 쪽을 택한 결정).
+
 Feature Engine은 horizon 1..12 mart를 생성하지만 Training은 기본적으로
 `TRAIN_HORIZONS`의 8개 horizon만 읽는다. 또한 `ADAPTIVE_TRAIN_ANCHORS=true`이므로
 모든 시간대를 같은 밀도로 학습하지 않는다. 실행 manifest에는 effective profile과
@@ -37,8 +44,10 @@ Feature Engine은 horizon 1..12 mart를 생성하지만 Training은 기본적으
 - `archive/living_population_grid/dt=YYYY-MM-DD.parquet`
 - 최신 `silver/station_master_enriched/...` snapshot
 
-Historical reader는 누락된 Archive 날짜나 잘못된 스키마를 Silver로 대체하지 않고
-실패한다. 정류소 마스터만 historical dimension이 없어 최신 Silver를 사용한다.
+Historical reader는 누락된 Archive 날짜를 Silver로 대체하지 않는다. 요청 구간 중
+일부 날짜만 없으면 그 날짜만 건너뛰고 경고를 남긴 채 계속하고, 요청 구간
+**전체**가 다 없거나 스키마가 잘못됐을 때만 실패한다. 정류소 마스터만 historical
+dimension이 없어 최신 Silver를 사용한다.
 
 대여 이력은 기본적으로 앞 35일과 뒤 7일 context가 필요하다. 날씨는 첫 target의
 as-of 조회를 위해 시작 전 3시간 context가 필요하다. 실제 요구 날짜는 Feature Engine
