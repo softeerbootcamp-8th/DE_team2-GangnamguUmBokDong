@@ -37,10 +37,10 @@ from airflow.sdk import Param
 from airflow.timetables.trigger import CronTriggerTimetable
 from config.schedules import (
     CATCHUP,
-    EMR_FEATURE_MART_TIMEOUT,
     MAX_ACTIVE_RUNS,
     MONTHLY_CLUSTER_CREATE_TIMEOUT,
     MONTHLY_EVALUATION_TIMEOUT,
+    MONTHLY_FEATURE_REFRESH_TIMEOUT,
     MONTHLY_RETRAIN_CRON,
     MONTHLY_RETRAIN_ORCHESTRATION_TIMEOUT,
     MONTHLY_RETRAIN_TOTAL_TIMEOUT,
@@ -394,7 +394,7 @@ def build_model_task_chain(model_name: str) -> dict[str, Any]:
     refresh_feature_mart = PythonOperator(
         task_id=_task_id(model_name, "refresh_feature_mart"),
         python_callable=make_task_refresh_feature_mart(model_name),
-        execution_timeout=EMR_FEATURE_MART_TIMEOUT,
+        execution_timeout=MONTHLY_FEATURE_REFRESH_TIMEOUT,
     )
 
     evaluate = PythonOperator(
