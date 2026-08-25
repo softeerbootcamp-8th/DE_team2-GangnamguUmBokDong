@@ -87,6 +87,7 @@ raw 스키마 자체(`fcstDate`/`fcstTime`/`TMP`/`PCP`)는 `loader/transform.py`
 
 import gc
 import io
+import json
 import re
 import sys
 import threading
@@ -101,10 +102,14 @@ import numpy as np
 import pandas as pd
 from core import s3 as s3_io
 from core.source_snapshot_io import (
+    PartialConsumptionPolicy,
+    SourceDataStatus,
+    SourceFreshness,
+    SourceResolution,
+    SourceSelectionMetadata,
     SourceSnapshotNotFoundError,
     SourceSnapshotReadError,
     read_exact_source_snapshot,
-    read_partial_source_snapshot,
 )
 from ml_core import scoring as scoring_io
 from ml_core import silver_schema
@@ -357,29 +362,58 @@ def _read_authoritative_collector_many(
         return []
     with ThreadPoolExecutor(max_workers=min(16, len(logical_keys))) as pool:
         snapshots = list(pool.map(_read, logical_keys))
+    _emit_source_selection_metadata(logical_keys, snapshots)
+    return snapshots
 
-    # 공통 5단계 중 현재 PARTIAL은 현재 logical tick에만 허용한다. 과거 tick은
-    # COMPLETE authority만 후보가 되어 PARTIAL → 과거 성공의 순서가 뒤집히지 않는다.
-    if snapshots[-1] is None:
-        match = _COLLECTOR_LOGICAL_KEY.fullmatch(logical_keys[-1])
-        assert match is not None  # 각 key는 위의 _read에서 이미 검증됐다.
+
+def _emit_source_selection_metadata(
+    logical_keys: list[str], snapshots: list[pd.DataFrame | None]
+) -> None:
+    """이미 읽은 결과에서 공통 metadata를 계산해 구조화 로그로 남긴다."""
+    parsed: list[tuple[str, datetime]] = []
+    for key in logical_keys:
+        match = _COLLECTOR_LOGICAL_KEY.fullmatch(key)
+        assert match is not None
         logical = pd.Timestamp(
             f"{match.group('date')} {match.group('minute')[:2]}:{match.group('minute')[2:]}"
         ).tz_localize("Asia/Seoul")
-        try:
-            partial = read_partial_source_snapshot(
-                match.group("source"), logical.to_pydatetime(), columns=columns
-            )
-        except SourceSnapshotNotFoundError:
-            pass
-        except SourceSnapshotReadError as exc:
-            raise ValueError(
-                "Collector partial source snapshot 계약 위반: "
-                f"logical_key={logical_keys[-1]}, error={exc}"
-            ) from exc
-        else:
-            snapshots[-1] = partial.to_pandas()
-    return snapshots
+        parsed.append((match.group("source"), logical.to_pydatetime()))
+    source_id, requested = parsed[-1]
+    selected_index = next(
+        (index for index in range(len(snapshots) - 1, -1, -1) if snapshots[index] is not None),
+        None,
+    )
+    if selected_index is None:
+        metadata = SourceSelectionMetadata(
+            source_id=source_id,
+            status=SourceDataStatus.FAILED,
+            freshness=SourceFreshness.CURRENT,
+            partial_policy=PartialConsumptionPolicy.REJECT,
+            resolution=SourceResolution.UNAVAILABLE,
+            requested_dttm=requested,
+            selected_dttm=None,
+        )
+    else:
+        selected_source, selected = parsed[selected_index]
+        assert selected_source == source_id
+        metadata = SourceSelectionMetadata(
+            source_id=source_id,
+            status=SourceDataStatus.SUCCESS,
+            freshness=(
+                SourceFreshness.CURRENT
+                if selected_index == len(snapshots) - 1
+                else SourceFreshness.STALE
+            ),
+            partial_policy=PartialConsumptionPolicy.REJECT,
+            resolution=SourceResolution.OBSERVED,
+            requested_dttm=requested,
+            selected_dttm=selected,
+        )
+    print(
+        "Source selection metadata: "
+        + json.dumps(metadata.as_dict(), ensure_ascii=False, sort_keys=True),
+        file=sys.stderr,
+    )
 
 
 def _fetch_recent_rental_trips(

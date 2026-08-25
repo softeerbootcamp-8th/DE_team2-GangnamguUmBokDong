@@ -174,7 +174,44 @@ def load(source_id: str, window_start: datetime) -> Manifest | None:
     """해당 윈도우의 manifest를 읽어 모델로 변환한다. 없으면 None을 반환한다."""
 
     data = storage.read_manifest(source_id, window_start)
-    return None if data is None else Manifest.model_validate(data)
+    return None if data is None else Manifest.model_validate(_upgrade_legacy_manifest(data))
+
+
+def _upgrade_legacy_manifest(data: object) -> object:
+    """과거 bronze nested revision을 현재 top-level revision으로 승격한다.
+
+    허용하는 호환 예외는 ``artifacts.bronze.revision`` 하나뿐이다. 다른 extra
+    field는 현재 Pydantic ``extra=forbid`` 계약이 계속 거부한다. 입력 dict는 S3에서
+    읽은 감사 원본이므로 제자리에서 변경하지 않는다.
+    """
+    if type(data) is not dict:
+        return data
+    upgraded = data.copy()
+    artifacts = upgraded.get("artifacts")
+    if type(artifacts) is not dict:
+        return upgraded
+    bronze = artifacts.get("bronze")
+    if type(bronze) is not dict or "revision" not in bronze:
+        return upgraded
+    legacy_revision = bronze["revision"]
+    if (
+        type(legacy_revision) is not int
+        or legacy_revision < 0
+        or (
+            "revision" in upgraded
+            and upgraded["revision"] != legacy_revision
+        )
+    ):
+        raise ValueError(
+            "legacy artifacts.bronze.revision이 top-level revision과 호환되지 않습니다."
+        )
+    upgraded_artifacts = artifacts.copy()
+    upgraded_bronze = bronze.copy()
+    upgraded_bronze.pop("revision")
+    upgraded_artifacts["bronze"] = upgraded_bronze
+    upgraded["artifacts"] = upgraded_artifacts
+    upgraded.setdefault("revision", legacy_revision)
+    return upgraded
 
 
 def save(manifest: Manifest) -> None:

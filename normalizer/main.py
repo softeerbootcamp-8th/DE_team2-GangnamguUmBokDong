@@ -309,6 +309,11 @@ def run(window_start: datetime) -> int:
     """
     realtime_snapshot = storage.read_realtime_snapshot(window_start)
     realtime_table = realtime_snapshot.table
+    source_selection = realtime_snapshot.selection_metadata(
+        storage.REALTIME_SOURCE_ID,
+        window_start,
+        partial_policy=storage.PARTIAL_POLICY,
+    )
     poi_areas = poi.load_poi_areas(poi.DEFAULT_POI_SHP_PATH)
 
     forecasts_by_code = _collect_forecasts(realtime_table, window_start)
@@ -382,7 +387,15 @@ def run(window_start: datetime) -> int:
     storage.write_manifest(
         window_start,
         {
-            "availability_tier": realtime_snapshot.tier.value,
+            "input_status": realtime_snapshot.status.value,
+            "input_freshness": realtime_snapshot.freshness.value,
+            "partial_policy": "repair",
+            "resolution": (
+                "repaired"
+                if realtime_snapshot.status.value == "partial"
+                else "observed"
+            ),
+            "source_selection": source_selection.as_dict(),
             "source_observed_at": realtime_snapshot.logical_dttm.isoformat(),
             "baseline_dates": sorted(d.isoformat() for d in baseline_cache),
             "cell_count": len(union_cells),

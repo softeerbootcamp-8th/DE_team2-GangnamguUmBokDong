@@ -21,7 +21,12 @@ import pytest
 import storage
 from core.forecast import POPULATION_FORECAST_SLOT_COUNT
 
-from tests.conftest import KST, TEST_BUCKET, put_source_snapshot
+from tests.conftest import (
+    KST,
+    TEST_BUCKET,
+    put_partial_source_snapshot,
+    put_source_snapshot,
+)
 
 # POI001("강남 MICE 관광특구")와 실제로 크게 겹치는 격자(약 97.9% 겹침, 이번 조사에서 확인).
 OVERLAPPING_CELL_ID = "다사61004575"
@@ -73,7 +78,9 @@ def _seed_nowcast_baseline() -> None:
     )
 
 
-def _seed_realtime_silver(*, with_forecast: bool = True) -> None:
+def _seed_realtime_silver(
+    *, with_forecast: bool = True, partial: bool = False
+) -> None:
     row = {
         "AREA_NM": "강남 MICE 관광특구",
         "AREA_CD": "POI001",
@@ -91,9 +98,8 @@ def _seed_realtime_silver(*, with_forecast: bool = True) -> None:
         )
         row[f"FCST_{slot}_PPLTN_MIN"] = 3000 if with_forecast else None
         row[f"FCST_{slot}_PPLTN_MAX"] = 3400 if with_forecast else None
-    put_source_snapshot(
-        "population_realtime", WINDOW_START, pa.Table.from_pylist([row])
-    )
+    writer = put_partial_source_snapshot if partial else put_source_snapshot
+    writer("population_realtime", WINDOW_START, pa.Table.from_pylist([row]))
 
 
 def _read_normalized(key: str) -> dict[str, dict]:
@@ -228,7 +234,19 @@ class TestEndToEndRun:
         body = json.loads(_s3().get_object(Bucket=TEST_BUCKET, Key=key)["Body"].read())
 
         assert body["baseline_dates"] == ["2026-08-15", "2026-08-16"]
-        assert body["availability_tier"] == "complete"
+        assert body["input_status"] == "success"
+        assert body["input_freshness"] == "current"
+        assert body["partial_policy"] == "repair"
+        assert body["resolution"] == "observed"
+        assert body["source_selection"] == {
+            "freshness": "current",
+            "partial_policy": "repair",
+            "requested_dttm": WINDOW_START.astimezone(UTC).isoformat(),
+            "resolution": "observed",
+            "selected_dttm": WINDOW_START.astimezone(UTC).isoformat(),
+            "source_id": "population_realtime",
+            "status": "success",
+        }
         assert body["source_observed_at"] == WINDOW_START.astimezone(UTC).isoformat()
         assert body["cell_count"] == 2
         assert body["poi_matched_count"] == 1
@@ -236,6 +254,21 @@ class TestEndToEndRun:
         assert body["forecast_horizons"] == 12
         assert len(body["written_keys"]) == 13
         assert body["skipped_targets"] == []
+
+    def test_partial_input_is_explicitly_repaired_and_recorded(self):
+        """Normalizer만 PARTIAL을 opt-in하고 baseline merge 결과를 repaired로 남긴다."""
+        _seed_nowcast_baseline()
+        _seed_realtime_silver(partial=True)
+
+        main.run(WINDOW_START)
+
+        key = "_manifest/living_population_normalized/dt=2026-08-15/hh=14/1405.json"
+        body = json.loads(_s3().get_object(Bucket=TEST_BUCKET, Key=key)["Body"].read())
+        assert body["input_status"] == "partial"
+        assert body["input_freshness"] == "current"
+        assert body["partial_policy"] == "repair"
+        assert body["resolution"] == "repaired"
+        assert body["source_selection"]["resolution"] == "repaired"
 
     def test_missing_future_baseline_skips_that_hour_only(self):
         """내일 추정치가 없으면 자정 이후 시각만 건너뛰고 나머지는 쓴다."""

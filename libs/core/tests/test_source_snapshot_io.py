@@ -16,7 +16,9 @@ from core.source_snapshot import (
     build_source_snapshot_manifest,
 )
 from core.source_snapshot_io import (
-    SourceAvailabilityTier,
+    PartialConsumptionPolicy,
+    SourceDataStatus,
+    SourceFreshness,
     SourceSnapshotNotFoundError,
     SourceSnapshotReadError,
     read_available_source_snapshot,
@@ -196,11 +198,36 @@ def test_available_prefers_current_partial_to_past_complete() -> None:
     )
 
     selected = read_available_source_snapshot(
-        "population_realtime", logical, lookback=timedelta(hours=1)
+        "population_realtime",
+        logical,
+        lookback=timedelta(hours=1),
+        partial_policy=PartialConsumptionPolicy.REPAIR,
     )
 
-    assert selected.tier is SourceAvailabilityTier.PARTIAL
+    assert selected.status is SourceDataStatus.PARTIAL
+    assert selected.freshness is SourceFreshness.CURRENT
     assert selected.table.column("value").to_pylist() == [2]
+    metadata = selected.selection_metadata(
+        "population_realtime",
+        logical,
+        partial_policy=PartialConsumptionPolicy.REPAIR,
+    )
+    assert metadata.as_dict() == {
+        "freshness": "current",
+        "partial_policy": "repair",
+        "requested_dttm": logical.astimezone(UTC).isoformat(),
+        "resolution": "repaired",
+        "selected_dttm": logical.astimezone(UTC).isoformat(),
+        "source_id": "population_realtime",
+        "status": "partial",
+    }
+
+    rejected = read_available_source_snapshot(
+        "population_realtime", logical, lookback=timedelta(hours=1)
+    )
+    assert rejected.status is SourceDataStatus.SUCCESS
+    assert rejected.freshness is SourceFreshness.STALE
+    assert rejected.table.column("value").to_pylist() == [1]
 
 
 def test_available_uses_past_complete_after_current_is_missing() -> None:
@@ -213,5 +240,6 @@ def test_available_uses_past_complete_after_current_is_missing() -> None:
         "population_realtime", logical, lookback=timedelta(hours=1)
     )
 
-    assert selected.tier is SourceAvailabilityTier.STALE
+    assert selected.status is SourceDataStatus.SUCCESS
+    assert selected.freshness is SourceFreshness.STALE
     assert selected.logical_dttm == prior.astimezone(UTC)

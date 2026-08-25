@@ -1,12 +1,16 @@
 """main.py: CLI 인자 파싱과 예측 시각 해석 테스트."""
 
 from datetime import datetime, timedelta
-from types import SimpleNamespace
 
 import main
 import poi
 import pyarrow as pa
 import pytest
+from core.source_snapshot_io import (
+    AvailableSourceSnapshot,
+    SourceDataStatus,
+    SourceFreshness,
+)
 from shapely.geometry import box
 
 from tests.conftest import KST
@@ -262,10 +266,12 @@ def test_run_rejects_empty_current_window_cells(monkeypatch):
     monkeypatch.setattr(
         main.storage,
         "read_realtime_snapshot",
-        lambda _window: SimpleNamespace(
-            table=pa.table({}),
-            tier=SimpleNamespace(value="complete"),
+        lambda _window: AvailableSourceSnapshot(
+            status=SourceDataStatus.SUCCESS,
+            freshness=SourceFreshness.CURRENT,
             logical_dttm=_window,
+            table=pa.table({}),
+            manifest=None,
         ),
     )
     monkeypatch.setattr(main.poi, "load_poi_areas", lambda _path: ())

@@ -133,7 +133,8 @@ class TestReadRealtimeSilver:
 
         result = storage.read_realtime_snapshot(window_start)
 
-        assert result.tier.value == "stale"
+        assert result.status.value == "success"
+        assert result.freshness.value == "stale"
         assert result.table.column("AREA_CD").to_pylist() == ["POI001"]
 
 

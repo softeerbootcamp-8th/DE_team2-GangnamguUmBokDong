@@ -21,6 +21,7 @@ from core.s3 import (
 )
 from core.source_snapshot_io import (
     AvailableSourceSnapshot,
+    PartialConsumptionPolicy,
     SourceSnapshotNotFoundError,
     SourceSnapshotReadError,
     read_available_source_snapshot,
@@ -32,6 +33,7 @@ from core.source_snapshot_io import (
 GRID_SOURCE_ID = "living_population_grid"
 REALTIME_SOURCE_ID = "population_realtime"
 NORMALIZED_SOURCE_ID = "living_population_normalized"
+PARTIAL_POLICY = PartialConsumptionPolicy.REPAIR
 STATION_MASTER_SOURCE_ID = "bike_station_master"
 BIKE_REALTIME_SOURCE_ID = "bike_station_realtime"
 ENRICHED_STATION_MASTER_SOURCE_ID = "station_master_enriched"
@@ -132,6 +134,7 @@ def read_realtime_snapshot(window_start: datetime) -> AvailableSourceSnapshot:
             REALTIME_SOURCE_ID,
             window_start,
             lookback=timedelta(hours=1),
+            partial_policy=PARTIAL_POLICY,
         )
     except SourceSnapshotReadError as exc:
         raise PartitionNotFoundError(str(exc)) from exc
