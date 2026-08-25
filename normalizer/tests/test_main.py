@@ -2,12 +2,17 @@
 
 from datetime import datetime, timedelta
 
-import pyarrow as pa
-import pytest
-from shapely.geometry import box
-
 import main
 import poi
+import pyarrow as pa
+import pytest
+from core.source_snapshot_io import (
+    AvailableSourceSnapshot,
+    SourceDataStatus,
+    SourceFreshness,
+)
+from shapely.geometry import box
+
 from tests.conftest import KST
 
 
@@ -203,8 +208,14 @@ class TestRealtimePoiContract:
         )
         monkeypatch.setattr(
             main.storage,
-            "read_realtime_silver",
-            lambda _window: realtime,
+            "read_realtime_snapshot",
+            lambda _window: AvailableSourceSnapshot(
+                status=SourceDataStatus.SUCCESS,
+                freshness=SourceFreshness.CURRENT,
+                logical_dttm=_window,
+                table=realtime,
+                manifest=None,
+            ),
         )
         monkeypatch.setattr(
             main.poi,
@@ -357,11 +368,16 @@ class TestFilterGridRowsForHour:
 def test_run_rejects_empty_current_window_cells(monkeypatch):
     """현재 target이 비면 미래와 달리 성공 manifest를 남기지 않고 실패한다."""
     window_start = datetime(2026, 8, 12, 14, 5, tzinfo=KST)
-    empty_realtime = pa.table({"AREA_CD": pa.array([], type=pa.string())})
     monkeypatch.setattr(
         main.storage,
-        "read_realtime_silver",
-        lambda _window: empty_realtime,
+        "read_realtime_snapshot",
+        lambda _window: AvailableSourceSnapshot(
+            status=SourceDataStatus.SUCCESS,
+            freshness=SourceFreshness.CURRENT,
+            logical_dttm=_window,
+            table=pa.table({"AREA_CD": pa.array([], type=pa.string())}),
+            manifest=None,
+        ),
     )
     monkeypatch.setattr(main.poi, "load_poi_master_areas", lambda _ref: ())
     monkeypatch.setattr(main, "_baseline_cells", lambda _cache, _target: {})

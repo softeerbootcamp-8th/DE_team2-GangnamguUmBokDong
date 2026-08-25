@@ -440,6 +440,65 @@ class TestMissingRatioGate:
         assert result.artifacts.silver is not None
         assert result.missing.parts == ("b",)
 
+    @pytest.mark.parametrize(
+        ("fetched_rows", "expected_status", "has_silver"),
+        [
+            pytest.param(17, RunStatus.PARTIAL, True, id="exactly-15-percent"),
+            pytest.param(16, RunStatus.FAILED, False, id="above-15-percent"),
+        ],
+    )
+    def test_configured_15_percent_fault_boundary(
+        self,
+        scripted_adapter,
+        client,
+        monkeypatch,
+        fetched_rows,
+        expected_status,
+        has_silver,
+    ):
+        """15% 누락은 PARTIAL, 15%를 넘으면 FAILED로 닫힌다."""
+        scripted_adapter.results = [[
+            FetchResult(
+                key="page=1",
+                payload=_chunk("page=1"),
+                error=None,
+                expected_total=20,
+            ),
+            FetchResult(
+                key="page=2",
+                payload=None,
+                error=FetchErrorKind.PERMANENT,
+                expected_total=None,
+            ),
+        ]]
+        monkeypatch.setattr(
+            scripted_adapter,
+            "normalize",
+            staticmethod(
+                lambda chunks, config: [
+                    {"k": str(index)} for index in range(fetched_rows)
+                ]
+            ),
+        )
+        config = _config(
+            quality=Quality(
+                max_drop_ratio=1.0,
+                max_missing_ratio=0.15,
+                allow_empty=True,
+            )
+        )
+
+        result = pipeline.execute_window(
+            config, WINDOW_START, client=client, sleep_fn=lambda seconds: None
+        )
+
+        assert result.status == expected_status
+        assert (result.artifacts.silver is not None) is has_silver
+        if has_silver:
+            assert result.completeness == pytest.approx(fetched_rows / 20)
+        else:
+            assert result.completeness is None
+
     def test_fetched_rows_above_expected_fail_closed_on_snapshot_drift(
         self,
         scripted_adapter,

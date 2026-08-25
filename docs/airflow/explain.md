@@ -167,7 +167,7 @@ manifest가 일치하면 Gold 행과 state를 변경하지 않고 CLI는 `stale`
 
 ### 일별 compaction
 
-D-6의 대여이력 24개 시간대를 순차적으로 강제 재조회한다. 각 시간대는 `ALL_DONE`으로 다음 시간대를 계속 시도하며, 마지막에는 성공 여부와 무관하게 대여이력 compaction을 실행한다. 대여소 실시간·실시간 생활인구·초단기실황 compaction은 이 replay chain과 독립적으로 실행된다. Silver Archive 대상은 4개 source지만, 공통 Hot Bronze 30일 Lifecycle 전에 모든 Collector source를 D-6 날짜 단위 Cold Bronze로 장기 보존한다. D-36 날짜에서는 모든 source의 30일 지난 non-authority Silver를 정리한다. Archive 대상 4개는 Cold와 Archive를 모두 검증하고, 나머지는 Cold를 검증하며 최신 authority는 항상 유지한다.
+D-6의 대여이력 24개 시간대를 순차적으로 강제 재조회한다. 각 시간대는 `ALL_DONE`으로 다음 시간대를 계속 시도하며, 마지막에는 성공 여부와 무관하게 대여이력 compaction과 Cold recovery를 각각 실행한다. 두 작업은 서로 의존하지 않는다. 대여소 실시간·실시간 생활인구·초단기실황 compaction도 Cold와 독립적이다. Cold worker는 전체 날짜 범위를 훑지 않고 모든 Collector source의 `_cold_pending` marker 중 6일이 지난 날짜만 처리한다. 검증 완료 Hot에만 `cold_compacted=true`를 붙여 30일 Lifecycle을 허용한다. D-36 날짜에서는 모든 source의 30일 지난 non-authority Silver를 정리한다. Archive 대상 4개는 Cold와 Archive를 모두 검증하고, 나머지는 Cold를 검증하며 최신 authority는 항상 유지한다.
 
 ### 월별 모델 점검
 
