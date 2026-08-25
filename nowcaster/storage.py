@@ -24,12 +24,6 @@ from core.layout import archive_key as _archive_key
 from core.layout import archive_prefix
 
 # pyrefly: ignore [missing-import]
-from core.source_snapshot_io import (
-    SourceSnapshotNotFoundError,
-    read_exact_source_snapshot,
-)
-
-# pyrefly: ignore [missing-import]
 from core.s3 import (
     delete_object,
     list_keys,
@@ -38,6 +32,12 @@ from core.s3 import (
     read_parquet,
     write_json,
     write_parquet,
+)
+
+# pyrefly: ignore [missing-import]
+from core.source_snapshot_io import (
+    SourceSnapshotNotFoundError,
+    read_exact_source_snapshot,
 )
 
 GRID_SOURCE_ID = "living_population_grid"

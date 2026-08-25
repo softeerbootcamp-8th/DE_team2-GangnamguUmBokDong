@@ -14,8 +14,6 @@ from core.db import get_connection
 from core.gold_publication import PublicationOutcome, S3ImmutableObjectStore
 from core.gold_publication.errors import ContractViolation
 from core.source_snapshot_io import read_partial_source_snapshot
-from psycopg import Connection
-
 from gold.dispatch_center import (
     load_dispatch_center_seed,
     publish_dispatch_center,
@@ -24,6 +22,7 @@ from gold.event import publish_cultural_event, publish_performance_event
 from gold.source_catalog import S3SourceSnapshotCatalog, SourceManifestArtifact
 from gold.state import load_publication_state, read_state_manifest
 from gold.weather_grid import load_weather_grid_seed, publish_weather_grid
+from psycopg import Connection
 
 _ACTIVE_PUBLICATIONS = (
     "event:cultural_event",
