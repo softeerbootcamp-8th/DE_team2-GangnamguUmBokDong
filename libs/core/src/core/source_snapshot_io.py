@@ -14,10 +14,18 @@ from zoneinfo import ZoneInfo
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+from botocore.exceptions import BotoCoreError, ClientError
 
-from .gold_publication.canonical import format_utc_dttm, sha256_hex
+from .gold_publication.canonical import (
+    format_utc_dttm,
+    sha256_hex,
+    validate_sha256_hex,
+)
+from .gold_publication.errors import HashFormatError, ImmutableObjectError
+from .gold_publication.storage import S3ImmutableObjectStore
 from .s3 import get_object_bytes, list_keys
 from .source_snapshot import (
+    SourceSnapshotContractError,
     SourceSnapshotManifest,
     SourceSnapshotStatus,
     parse_source_snapshot_manifest,
@@ -25,6 +33,13 @@ from .source_snapshot import (
 
 _SOURCE_ID = re.compile(r"[a-z][a-z0-9_]*\Z")
 _REVISION_KEY = re.compile(r"revision=([0-9]{10})\.json\Z")
+_MANIFEST_KEY = re.compile(
+    r"\Asource_snapshot_manifest/(?P<source_id>[a-z][a-z0-9_]*)/"
+    r"dt=(?P<partition_day>\d{4}-\d{2}-\d{2})/"
+    r"hh=(?P<partition_hour>\d{2})/"
+    r"logical=(?P<logical>\d{8}T\d{12}Z)/"
+    r"revision=(?P<revision>\d{10})\.json\Z"
+)
 
 
 class SourceSnapshotReadError(RuntimeError):
@@ -226,6 +241,65 @@ def read_available_source_snapshot(
     )
 
 
+def read_exact_source_snapshot_manifest(
+    manifest_uri: str,
+    expected_sha256: str,
+    *,
+    columns: list[str] | None = None,
+) -> SourceSnapshotData:
+    """고정한 manifest URI와 SHA로 특정 source revision을 정확히 읽는다.
+
+    Logical window의 최신 revision을 다시 선택하지 않는다. 호출자가 고정한 manifest
+    object 자체를 checksum과 canonical JSON으로 검증하고, key에 표현된 source·logical
+    time·revision이 본문 identity와 정확히 같은지 확인한 뒤 연결된 Silver의 checksum과
+    행 수도 검증한다. 따라서 같은 logical window에 더 최신 correction이 게시되어도
+    이 함수의 결과는 바뀌지 않는다.
+
+    args:
+        manifest_uri: 정확한 ``s3://bucket/source_snapshot_manifest/...json`` URI
+        expected_sha256: manifest canonical bytes의 lowercase SHA-256
+        columns: Silver에서 선택할 컬럼 목록. 생략하면 전체 컬럼을 읽는다.
+    returns:
+        고정한 manifest와 선택적인 Silver Table
+    raises:
+        ValueError: URI 또는 expected SHA 형식이 잘못됐을 때
+        SourceSnapshotReadError: manifest나 Silver가 계약을 위반하거나 읽히지 않을 때
+    """
+    key = _exact_manifest_key_from_uri(manifest_uri)
+    try:
+        checksum = validate_sha256_hex(expected_sha256)
+    except HashFormatError as exc:
+        raise ValueError("expected_sha256 형식이 잘못됐습니다.") from exc
+
+    try:
+        payload = S3ImmutableObjectStore().read_bytes(
+            manifest_uri,
+            checksum,
+            require_canonical_json=True,
+        )
+    except ImmutableObjectError as exc:
+        raise SourceSnapshotReadError(
+            f"고정한 source manifest를 검증해 읽을 수 없습니다: {manifest_uri}"
+        ) from exc
+
+    try:
+        manifest = parse_source_snapshot_manifest(payload)
+    except SourceSnapshotContractError as exc:
+        raise SourceSnapshotReadError(
+            f"고정한 source manifest 본문이 계약을 위반했습니다: {manifest_uri}"
+        ) from exc
+    if key != _manifest_key(manifest):
+        raise SourceSnapshotReadError(
+            f"고정한 source manifest key와 본문 identity가 다릅니다: {manifest_uri}"
+        )
+    if manifest.status is SourceSnapshotStatus.EMPTY:
+        return SourceSnapshotData(manifest=manifest, table=None)
+    return SourceSnapshotData(
+        manifest=manifest,
+        table=_read_manifest_parquet(manifest, columns=columns),
+    )
+
+
 def read_exact_source_snapshot(
     source_id: str,
     logical_dttm: datetime,
@@ -418,7 +492,12 @@ def _read_content_addressed_parquet(
     columns: list[str] | None,
 ) -> pa.Table:
     """Exact key의 checksum·Parquet·행 수를 검증한다."""
-    body = get_object_bytes(key)
+    try:
+        body = get_object_bytes(key)
+    except (BotoCoreError, ClientError) as exc:
+        raise SourceSnapshotReadError(
+            f"source Silver를 읽을 수 없습니다: {key}"
+        ) from exc
     if body is None:
         raise SourceSnapshotReadError(f"source Silver가 없습니다: {key}")
     if sha256_hex(body) != checksum:
@@ -454,6 +533,23 @@ def _aware_utc(value: datetime) -> datetime:
         raise ValueError("logical_dttm은 timezone-aware datetime이어야 합니다.")
     format_utc_dttm(value)
     return value.astimezone(UTC)
+
+
+def _exact_manifest_key_from_uri(uri: str) -> str:
+    """현재 bucket의 canonical source manifest URI에서 exact key를 반환한다."""
+    if type(uri) is not str or not uri or "?" in uri or "#" in uri:
+        raise ValueError("manifest_uri는 query와 fragment 없는 S3 URI여야 합니다.")
+    try:
+        parsed = urlsplit(uri)
+    except ValueError as exc:
+        raise ValueError("manifest_uri를 해석할 수 없습니다.") from exc
+    bucket = os.environ.get("S3_BUCKET", "gangnamgu")
+    if parsed.scheme != "s3" or parsed.netloc != bucket:
+        raise ValueError("manifest_uri bucket이 현재 런타임과 다릅니다.")
+    key = parsed.path.removeprefix("/")
+    if parsed.path != f"/{key}" or _MANIFEST_KEY.fullmatch(key) is None:
+        raise ValueError("manifest_uri가 canonical source manifest 경로가 아닙니다.")
+    return key
 
 
 def _hour_prefix(source_id: str, value: datetime) -> str:

@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo
 
 import httpx
 import pytest
+
 from adapters.base import FetchErrorKind, Window, fetch_with_rounds
 from adapters.seoul_openapi import NaturalKeyCardinalityError, SeoulOpenApiAdapter
 
@@ -488,6 +489,64 @@ def test_population_fetch_excludes_configured_poi_gaps():
         "poi-POI023",
     ]
     assert calls == ["POI020", "POI021", "POI023"]
+
+
+def test_population_fetch_uses_exact_dynamic_poi_codes_without_legacy_range():
+    """S3 Master에서 주입한 코드는 legacy 범위 없이 계획과 요청에 똑같이 쓰인다."""
+    config = _StubConfig(
+        {
+            "service": "citydata_ppltn",
+            "page_size": 1000,
+            "root_key": "SeoulRtd.citydata_ppltn",
+            "root_key_literal": True,
+            "poi_codes": ("POI001", "POI132"),
+        }
+    )
+    calls = []
+
+    def handler(request):
+        poi_id = request.url.path.rstrip("/").rsplit("/", 1)[-1]
+        calls.append(poi_id)
+        body = {
+            "RESULT": {"RESULT.CODE": "INFO-000"},
+            "SeoulRtd.citydata_ppltn": [{"AREA_CD": poi_id}],
+        }
+        return httpx.Response(200, content=json.dumps(body).encode())
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    planned = SeoulOpenApiAdapter.planned_parts(config, window=None)
+    results = list(SeoulOpenApiAdapter.fetch(config, window=None, client=client))
+
+    assert planned == {"poi-POI001", "poi-POI132"}
+    assert [result.key for result in results] == ["poi-POI001", "poi-POI132"]
+    assert calls == ["POI001", "POI132"]
+
+
+@pytest.mark.parametrize(
+    "poi_codes",
+    [
+        (),
+        ["POI001"],
+        ("POI001", "POI001"),
+        ("POI132", "POI001"),
+        ("POI1",),
+        ("POI１２３",),
+        (1,),
+    ],
+)
+def test_population_dynamic_poi_codes_are_strictly_validated(poi_codes):
+    config = _StubConfig(
+        {
+            "service": "citydata_ppltn",
+            "page_size": 1000,
+            "root_key": "SeoulRtd.citydata_ppltn",
+            "root_key_literal": True,
+            "poi_codes": poi_codes,
+        }
+    )
+
+    with pytest.raises(ValueError, match="poi_codes|POI 요청 대상"):
+        SeoulOpenApiAdapter.planned_parts(config, window=None)
 
 
 def test_population_fetch_requests_pois_concurrently_and_preserves_order():

@@ -13,11 +13,22 @@ import pendulum
 from airflow.task.trigger_rule import TriggerRule
 from airflow.timetables.trigger import CronTriggerTimetable
 from config.schedules import CATCHUP, COMPACTION_CRON, MAX_ACTIVE_RUNS, TIMEZONE
-from config.sources import COMPACTION_SOURCES, DAILY_ARCHIVE_DELAY_DAYS
+from config.sources import (
+    COLD_BRONZE_SOURCES,
+    COMPACTION_SOURCES,
+    DAILY_ARCHIVE_DELAY_DAYS,
+)
 from orchestration.collector_task import build_daily_history_replay_task
-from orchestration.compaction_task import build_compaction_task
+from orchestration.compaction_task import (
+    build_cold_bronze_compaction_task,
+    build_compaction_task,
+    build_silver_gc_task,
+)
+from orchestration.templates import kst_date_days_ago
 
 from airflow import DAG
+
+SILVER_GC_RETENTION_DAYS = 30
 
 with DAG(
     dag_id="daily_compaction",
@@ -36,6 +47,7 @@ with DAG(
             replay_chain >> replay
         replay_chain = replay
 
+    compaction_tasks = {}
     for source_id in COMPACTION_SOURCES:
         if source_id == "bike_rental_history":
             compact = build_compaction_task(
@@ -43,4 +55,29 @@ with DAG(
             )
             replay_chain >> compact
         else:
-            build_compaction_task(dag, source_id)
+            compact = build_compaction_task(dag, source_id)
+        compaction_tasks[source_id] = compact
+
+    target_date = kst_date_days_ago(DAILY_ARCHIVE_DELAY_DAYS)
+    cold_tasks = {}
+    for source_id in COLD_BRONZE_SOURCES:
+        cold = build_cold_bronze_compaction_task(
+            dag,
+            source_id,
+            target_date,
+        )
+        cold_tasks[source_id] = cold
+        if source_id in compaction_tasks:
+            compaction_tasks[source_id] >> cold
+
+    for source_id in COLD_BRONZE_SOURCES:
+        gc_target_date = kst_date_days_ago(
+            DAILY_ARCHIVE_DELAY_DAYS + SILVER_GC_RETENTION_DAYS
+        )
+        gc = build_silver_gc_task(
+            dag,
+            source_id,
+            gc_target_date,
+            require_archive=source_id in COMPACTION_SOURCES,
+        )
+        cold_tasks[source_id] >> gc

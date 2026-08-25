@@ -5,7 +5,12 @@
 
 import pendulum
 from airflow.timetables.trigger import CronTriggerTimetable
-from config.schedules import CATCHUP, DAILY_CRON, MAX_ACTIVE_RUNS, TIMEZONE
+from config.schedules import (
+    CATCHUP,
+    DAILY_CRON,
+    MAX_ACTIVE_RUNS,
+    TIMEZONE,
+)
 from config.sources import (
     DAILY_EVENT_SOURCE,
     DAILY_POPULATION_SOURCE,

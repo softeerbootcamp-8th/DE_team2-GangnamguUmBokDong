@@ -37,7 +37,7 @@ latest successful nowcast ┘
 - Station master 보강은 정적인 CELL geometry만 필요하므로 미래 파일을 제외한 최신 성공
   nowcast를 사용할 수 있다.
 - Collector 입력은 source snapshot authority가 가리키는 Parquet을 읽는다. EMPTY는
-  실패하며, 허용된 source만 PARTIAL fallback을 사용할 수 있다.
+  실패하며, 현재 `population_realtime`만 검증된 exact PARTIAL fallback을 사용할 수 있다.
 
 ## 공간 계약
 
@@ -55,9 +55,14 @@ Y = 1,300,000 + 남북 문자 index × 100,000 + 남북 숫자 × 10
 
 ### POI
 
-`poi.py`는 repository의 121개 장소 Shapefile을 읽고 WGS84에서 EPSG:5179로 변환한다.
-유효하지 않은 geometry는 `make_valid`로 복구하고, 결과가 여러 Polygon이면 가장 큰
-조각을 사용한다. Polygon을 얻지 못하면 실패한다.
+정상 운영 경로는 `resolve_poi_master`가 고정한 exact manifest URI와 SHA로 S3 POI Master
+Silver를 읽고, `GEOMETRY_WKB`와 schema metadata의 `EPSG:5179` geometry를 그대로 사용한다.
+Normalizer 출력 manifest에는 선택한 `poi_master` ref와 `poi_master_row_count`를 기록한다.
+
+아직 activation이 없는 `mode=static`에서만 repository의 121개 장소 Shapefile을 bootstrap
+fallback으로 읽어 WGS84에서 EPSG:5179로 변환한다. 유효하지 않은 geometry는
+`make_valid`로 복구하고, 여러 Polygon이면 가장 큰 조각을 사용한다. 고정된 exact S3
+manifest나 artifact가 잘못된 경우에는 static으로 전환하지 않고 실패한다.
 
 ## 밀도 합성
 

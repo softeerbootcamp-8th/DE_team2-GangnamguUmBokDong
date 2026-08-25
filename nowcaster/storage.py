@@ -1,19 +1,17 @@
-"""S3 read/write: 아카이브(4주 lookback), collector 실측 silver 읽기, nowcast 추정 파일 쓰기/삭제.
+"""S3 read/write: 아카이브, authoritative 실측 Silver, nowcast와 cache를 다룬다.
 
 생활인구 격자(`living_population_grid`) 한 소스만 다룬다.
 
 archive 경로 규칙은 `core.layout`이 갖는다 — collector의 compaction도 같은 계층에
 쓰므로 한쪽만 바뀌면 조용히 어긋난다.
 
-silver 경로 컨벤션(`silver/{source_id}/dt=.../hh=.../HHMM.parquet`)은 아직 여기서 다시
-구현한다. collector·loader·ml_core에도 같은 규칙이 흩어져 있어, 옮기려면 네 모듈을
-동시에 건드려야 하므로 별도 작업으로 둔다.
+실측 Silver는 경로를 직접 조합하지 않고 공용 source authority reader로 선택한다.
+Nowcast 산출물 경로만 이 모듈이 소유한다.
 """
 
 from __future__ import annotations
 
-from datetime import date, datetime, time, timedelta
-from zoneinfo import ZoneInfo
+from datetime import date, datetime
 
 # pyrefly: ignore [missing-import]
 import pandas as pd
@@ -35,15 +33,16 @@ from core.s3 import (
     write_json,
     write_parquet,
 )
+
+# pyrefly: ignore [missing-import]
 from core.source_snapshot_io import (
     SourceSnapshotNotFoundError,
-    read_latest_source_snapshot,
+    read_exact_source_snapshot,
 )
 
 GRID_SOURCE_ID = "living_population_grid"
 _NOWCAST_FILENAME = "nowcast.parquet"
 _HISTORICAL_CACHE_PREFIX = f"derived/{GRID_SOURCE_ID}/historical_avg_cache"
-_KST = ZoneInfo("Asia/Seoul")
 
 
 def _grid_date_prefix(target_date: date) -> str:
@@ -56,24 +55,16 @@ def _nowcast_key(target_date: date) -> str:
     return f"{_grid_date_prefix(target_date)}hh=00/{_NOWCAST_FILENAME}"
 
 
-def read_real_grid_silver(target_date: date) -> pa.Table | None:
-    """해당 수집일의 최신 authoritative 실측 Silver만 읽는다.
+def read_real_grid_silver(logical_dttm: datetime) -> pa.Table | None:
+    """Exact authority가 확인된 생활인구 Silver만 실측 테이블로 읽는다.
 
-    Collector는 PARTIAL에도 immutable Silver를 쓸 수 있으므로 Silver prefix를 직접
-    나열하면 아직 게시되지 않은 부분 성공이 nowcast baseline으로 승격될 수 있다.
-    Source snapshot manifest가 연 ``SUCCEEDED`` authority만 읽고, 해당 KST 날짜에
-    성공 authority가 없으면 None을 반환한다. 계약 위반은 숨기지 않고 전파한다.
+    완료된 PARTIAL과 authority 게시 전 immutable Silver는 실측으로 승격하지 않는다.
+    Exact authority 자체가 없으면 None을 반환하지만, authority나 연결 artifact가
+    손상된 경우에는 예외를 그대로 전파해 데이터 오염을 숨기지 않는다.
     """
-    cutoff = datetime.combine(target_date, time.max, tzinfo=_KST)
     try:
-        snapshot = read_latest_source_snapshot(
-            GRID_SOURCE_ID,
-            cutoff,
-            lookback=timedelta(days=1),
-        )
+        snapshot = read_exact_source_snapshot(GRID_SOURCE_ID, logical_dttm)
     except SourceSnapshotNotFoundError:
-        return None
-    if snapshot.manifest.logical_dttm.astimezone(_KST).date() != target_date:
         return None
     return snapshot.table
 

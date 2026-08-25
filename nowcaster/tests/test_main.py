@@ -2,7 +2,6 @@
 
 import io
 from datetime import date, datetime, timedelta
-from zoneinfo import ZoneInfo
 
 import boto3
 import main
@@ -11,62 +10,11 @@ import pyarrow.parquet as pq
 import pytest
 import storage
 from botocore.exceptions import ClientError
-from core.gold_publication.canonical import sha256_hex
-from core.source_snapshot import (
-    SourceSnapshotCounts,
-    SourceSnapshotStatus,
-    build_source_snapshot_manifest,
-)
-from tests.conftest import TEST_BUCKET
+from tests.conftest import KST, TEST_BUCKET
 
 
 def _s3():
     return boto3.client("s3", region_name="us-east-1")
-
-
-def _put_parquet(key: str, table: pa.Table) -> None:
-    buffer = io.BytesIO()
-    pq.write_table(table, buffer)
-    _s3().put_object(Bucket=TEST_BUCKET, Key=key, Body=buffer.getvalue())
-
-
-def _put_authoritative_grid(day: date, table: pa.Table) -> None:
-    logical = datetime.combine(day, datetime.min.time(), tzinfo=ZoneInfo("Asia/Seoul")).replace(
-        hour=3
-    )
-    buffer = io.BytesIO()
-    pq.write_table(table, buffer)
-    body = buffer.getvalue()
-    checksum = sha256_hex(body)
-    silver_key = (
-        f"silver/living_population_grid/dt={day:%Y-%m-%d}/hh=03/"
-        f"0300/sha256={checksum}.parquet"
-    )
-    manifest = build_source_snapshot_manifest(
-        source_id="living_population_grid",
-        logical_dttm=logical,
-        revision_no=0,
-        status=SourceSnapshotStatus.SUCCEEDED,
-        config_version="fixture-v1",
-        silver_uri=f"s3://{TEST_BUCKET}/{silver_key}",
-        silver_byte_sha256=checksum,
-        counts=SourceSnapshotCounts(table.num_rows, table.num_rows, table.num_rows, 0, 0),
-        planned_parts=("page=1",),
-        completed_parts=("page=1",),
-    )
-    utc = logical.astimezone(ZoneInfo("UTC"))
-    manifest_key = (
-        "source_snapshot_manifest/living_population_grid/"
-        f"dt={utc:%Y-%m-%d}/hh={utc:%H}/"
-        f"logical={utc:%Y%m%dT%H%M%S}{utc.microsecond:06d}Z/"
-        "revision=0000000000.json"
-    )
-    _s3().put_object(Bucket=TEST_BUCKET, Key=silver_key, Body=body)
-    _s3().put_object(
-        Bucket=TEST_BUCKET,
-        Key=manifest_key,
-        Body=manifest.canonical_bytes,
-    )
 
 
 def _key_exists(key: str) -> bool:
@@ -78,33 +26,57 @@ def _key_exists(key: str) -> bool:
 
 
 class TestRunEstimateArchivesD4Data:
-    def test_archives_real_data_from_todays_partition_using_actual_ymd(self):
+    def test_archives_authoritative_data_using_actual_ymd(self, monkeypatch):
         today = date(2026, 8, 20)
+        source_window_start = datetime(2026, 8, 20, 3, tzinfo=KST)
         # collector의 dt= 파티션은 "수집 실행일"이다. 실제 대상(biz) 날짜는
         # 그 안의 YMD 컬럼 값으로만 알 수 있다(예: 오늘 실행분의 YMD가 D-4).
         biz_date = today - timedelta(days=4)  # 2026-08-16
-
-        _put_authoritative_grid(
-            today,
-            pa.table(
-                {
-                    "YMD": [f"{biz_date:%Y%m%d}"],
-                    "H_DNG_CD": ["H1"],
-                    "CELL_ID": ["C1"],
-                    "TT": ["10"],
-                    "SPOP": [123.0],
-                }
-            ),
+        source_table = pa.table(
+            {
+                "YMD": [f"{biz_date:%Y%m%d}"],
+                "H_DNG_CD": ["H1"],
+                "CELL_ID": ["C1"],
+                "TT": ["10"],
+                "SPOP": [123.0],
+            }
         )
+        observed = {}
+
+        def read_real(logical):
+            """요청한 exact logical window를 기록하고 authoritative fixture를 반환한다."""
+            observed["logical"] = logical
+            return source_table
+
+        monkeypatch.setattr(storage, "read_real_grid_silver", read_real)
         # 예전에 이 날짜를 추정치로 채워뒀던 잔재
         storage.write_nowcast(biz_date, pa.table({"CELL_ID": ["C1"], "SPOP": [999.0]}))
 
-        main.run_estimate(today)
+        main.run_estimate(today, source_window_start=source_window_start)
 
         archived = storage.read_archive(biz_date)
         assert archived is not None
         assert archived.column("is_estimated").to_pylist() == [False]
         assert storage.nowcast_exists(biz_date) is False
+        assert observed["logical"] == source_window_start
+
+    def test_skips_actual_promotion_without_exact_window(self, monkeypatch):
+        today = date(2026, 8, 20)
+
+        def unexpected_read(_logical):
+            """Exact window가 없을 때 Silver prefix scan을 테스트 실패로 바꾼다."""
+            pytest.fail("exact source window 없이 실측 Silver를 읽었다")
+
+        monkeypatch.setattr(storage, "read_real_grid_silver", unexpected_read)
+
+        assert main.run_estimate(today) == 0
+
+    def test_rejects_source_window_from_another_kst_date(self):
+        with pytest.raises(ValueError, match="KST 날짜"):
+            main.run_estimate(
+                date(2026, 8, 20),
+                source_window_start=datetime(2026, 8, 19, 3, tzinfo=KST),
+            )
 
 
 class TestRunEstimateWritesNowcast:
@@ -119,7 +91,10 @@ class TestRunEstimateWritesNowcast:
                 pa.table({"H_DNG_CD": ["H1"], "CELL_ID": ["C1"], "TT": ["10"], "SPOP": [value]}),
             )
 
-        main.run_estimate(today)
+        main.run_estimate(
+            today,
+            source_window_start=datetime(2026, 8, 10, 3, tzinfo=KST),
+        )
 
         key = f"silver/living_population_grid/dt={target:%Y-%m-%d}/hh=00/nowcast.parquet"
         assert _key_exists(key)
@@ -239,11 +214,62 @@ class TestBootstrapLookback:
 class TestCliDispatch:
     def test_estimate_command_calls_run_estimate_with_parsed_date(self, monkeypatch):
         captured = {}
-        monkeypatch.setattr(main, "run_estimate", lambda today: captured.setdefault("today", today))
 
-        main.main(["estimate", "--target-date", "2026-08-12"])
+        def fake_run(today, *, source_window_start):
+            """Estimate CLI가 파싱한 날짜와 exact source window를 기록한다."""
+            captured.update(today=today, source_window_start=source_window_start)
+            return 0
 
-        assert captured["today"] == date(2026, 8, 12)
+        monkeypatch.setattr(main, "run_estimate", fake_run)
+
+        main.main(
+            [
+                "estimate",
+                "--target-date",
+                "2026-08-12",
+                "--source-window-start",
+                "2026-08-12T03:00:00+09:00",
+            ]
+        )
+
+        assert captured == {
+            "today": date(2026, 8, 12),
+            "source_window_start": datetime(2026, 8, 12, 3, tzinfo=KST),
+        }
+
+    def test_estimate_command_rejects_naive_source_window(self):
+        with pytest.raises(ValueError, match="timezone offset"):
+            main.main(
+                [
+                    "estimate",
+                    "--target-date",
+                    "2026-08-12",
+                    "--source-window-start",
+                    "2026-08-12T03:00:00",
+                ]
+            )
+
+    def test_estimate_without_source_window_warns_about_skipped_actual(
+        self,
+        monkeypatch,
+        capsys,
+    ):
+        """하위호환 수동 실행이 actual 미승격을 조용히 숨기지 않는다."""
+        observed = {}
+
+        def fake_run(today, *, source_window_start):
+            """Nowcast-only dispatch 인자를 기록한다."""
+            observed.update(today=today, source_window_start=source_window_start)
+            return 0
+
+        monkeypatch.setattr(main, "run_estimate", fake_run)
+
+        assert main.main(["estimate", "--target-date", "2026-08-12"]) == 0
+        assert observed == {
+            "today": date(2026, 8, 12),
+            "source_window_start": None,
+        }
+        assert "actual Archive 승격을 생략" in capsys.readouterr().err
 
     def test_backfill_archive_command_calls_run_backfill_archive_with_csv_dir(self, monkeypatch):
         captured = {}

@@ -18,6 +18,7 @@ from ml_core import common_config, profile_contract
 from training.lazy_train_dataset import (
     ChunkCache,
     _read_date_chunk,
+    _shard_for_this_machine,
     build_lazy_dataset,
     predict_over_dates,
     station_categories_for_dates,
@@ -74,6 +75,45 @@ def test_station_categories_for_dates_returns_sorted_unique_station_no():
     assert station_categories_for_dates(TABLE_PATH, DATES, filters=None) == [1, 2, 3, 4]
 
 
+def test_station_categories_for_dates_skips_missing_date_with_warning(capsys):
+    """날짜 하나가 아예 없어도(예: 그날 feature mart 생성 실패) 나머지 날짜만으로
+    전역 station 목록을 계속 만들어야 한다 — 한 날짜 결측이 전체 실패로 번지면 안 됨."""
+    _seed()
+    dates_with_gap = [*DATES, "2026-01-09"]  # 이 날짜는 seed되지 않음(파티션 자체가 없음)
+
+    result = station_categories_for_dates(TABLE_PATH, dates_with_gap, filters=None)
+
+    assert result == [1, 2, 3, 4]
+    assert "2026-01-09" in capsys.readouterr().out
+
+
+def test_shard_for_this_machine_partitions_stations_without_overlap_or_gaps():
+    """여러 머신에 station_no를 나누면 겹치지 않고 합이 전체 목록과 정확히 같아야 한다."""
+    stations = list(range(1, 101))
+    num_machines = 4
+    shards = [_shard_for_this_machine(stations, num_machines, rank) for rank in range(num_machines)]
+
+    for i in range(num_machines):
+        for j in range(i + 1, num_machines):
+            assert not (shards[i] & shards[j]), f"rank {i}/{j} 배정이 겹침"
+    assert frozenset().union(*shards) == frozenset(stations)
+
+
+def test_shard_for_this_machine_is_deterministic():
+    """`hash()` 대신 `zlib.crc32`를 쓰므로 몇 번을 다시 불러도 같은 배정이 나와야 한다
+    (PYTHONHASHSEED와 무관 — ADR-0005/0007 근거)."""
+    stations = [10, 20, 30, 40, 50]
+    first = _shard_for_this_machine(stations, 3, 1)
+    second = _shard_for_this_machine(stations, 3, 1)
+    assert first == second
+
+
+def test_shard_for_this_machine_single_machine_gets_everything():
+    """num_machines=1이면 유일한 머신(rank 0)이 전체를 담당해야 한다(분산 미사용과 동치)."""
+    stations = [1, 2, 3]
+    assert _shard_for_this_machine(stations, 1, 0) == frozenset(stations)
+
+
 def test_read_date_chunk_safely_promotes_compatible_part_schemas():
     """같은 날짜에 신구 part가 공존해도 값 손실 없는 숫자 타입 변화는 결합한다."""
     path = "processed_v2/test/schema_drift"
@@ -109,6 +149,56 @@ def test_read_date_chunk_rejects_column_missing_from_every_part():
         _read_date_chunk(path, day, ["unknown_feature"], filters=None)
 
 
+def test_read_date_chunk_applies_station_shard_filter_and_drops_temp_column():
+    """station_shard가 주어지면 그 station_no만 남기고, station_no를 원래 요청하지
+    않았으면 결과 컬럼에도 안 남아야 한다("minute"의 기존 temp-column 패턴과 동일)."""
+    path = "processed_v2/test/station_shard_table"
+    day = "2026-06-01"
+    df = pd.DataFrame({"station_no": [1, 2, 3, 4], "x1": [10.0, 20.0, 30.0, 40.0]})
+    s3_io.write_parquet(df, f"{path}/date={day}/part-0000.parquet")
+
+    result = _read_date_chunk(path, day, ["x1"], filters=None, station_shard=frozenset({2, 4}))
+
+    assert list(result.columns) == ["x1"]
+    assert sorted(result["x1"].tolist()) == [20.0, 40.0]
+
+
+def test_read_date_chunk_station_shard_keeps_explicitly_requested_station_no():
+    """station_no를 원래 요청한 컬럼에 포함했으면 필터 후에도 결과에 남아야 한다."""
+    path = "processed_v2/test/station_shard_table_keep"
+    day = "2026-06-01"
+    df = pd.DataFrame({"station_no": [1, 2, 3, 4], "x1": [10.0, 20.0, 30.0, 40.0]})
+    s3_io.write_parquet(df, f"{path}/date={day}/part-0000.parquet")
+
+    result = _read_date_chunk(path, day, ["station_no", "x1"], filters=None, station_shard=frozenset({2, 4}))
+
+    assert list(result.columns) == ["station_no", "x1"]
+    assert sorted(result["station_no"].tolist()) == [2, 4]
+
+
+def test_read_date_chunk_combines_adaptive_anchor_and_station_shard_as_both_temp_columns():
+    """가변 앵커("minute")와 station 샤딩("station_no")을 둘 다 요청하지 않은 채 같이 켜도
+    — 즉 둘 다 임시로 추가됐다가 지워지는 경로가 겹쳐도 — 결과 컬럼은 원래 요청한
+    것만 남고, 두 필터가 각각 실제로 적용돼야 한다(임시 컬럼 정리 순서 회귀 방지)."""
+    path = "processed_v2/test/station_shard_adaptive"
+    day = "2025-01-02"  # 평일, 비심야일 — test_read_date_chunk_applies_adaptive_anchor_filter와 동일 날짜
+    df = pd.DataFrame({
+        "station_no": [1, 2, 1],
+        "minute": [60, 600, 780],  # 60=심야(탈락), 600/780=주간 피크(생존)
+        "x1": [111.0, 222.0, 333.0],
+    })
+    s3_io.write_parquet(df, f"{path}/date={day}/part-0000.parquet")
+
+    result = _read_date_chunk(
+        path, day, ["x1"], filters=None, adaptive_anchors=True, station_shard=frozenset({2}),
+    )
+
+    # minute=60(station 1)은 adaptive 필터에서 탈락, minute=780(station 1)은 adaptive는
+    # 통과하지만 station shard에서 탈락 — minute=600(station 2)만 최종 생존해야 한다.
+    assert list(result.columns) == ["x1"]
+    assert result["x1"].tolist() == [222.0]
+
+
 def test_build_lazy_dataset_label_matches_date_order():
     """dates 순서대로 이어붙인 y가 실제로 그 날짜의 라벨과 일치하는지(라벨-feature 정렬)."""
     _seed()
@@ -122,6 +212,33 @@ def test_build_lazy_dataset_label_matches_date_order():
     assert list(y[8:12]) == [30.0] * 4  # 2026-01-04
     assert isinstance(y, np.memmap)
     assert not __import__("pathlib").Path(y.filename).exists()
+
+
+def test_build_lazy_dataset_skips_missing_date_and_warns_instead_of_failing(capsys):
+    """조인/feature mart 결과 일부 날짜가 통째로 없어도(사용자 요구사항: 학습이
+    실패하면 안 됨) 그 날짜만 빼고 나머지로 학습 데이터셋을 만들고, 표준출력에
+    경고를 남긴다. 날짜 전체가 다 없을 때만(다른 테스트) 진짜로 실패해야 한다."""
+    _seed()
+    dates_with_gap = [*DATES, "2026-01-09"]  # seed되지 않은 날짜 — S3에 파티션 자체가 없음
+    cache = ChunkCache()
+
+    _dataset, y, exposure = build_lazy_dataset(
+        TABLE_PATH, dates_with_gap, FEATURE_COLUMNS, STATION_DTYPE, None, "y", None, cache
+    )
+
+    assert exposure is None
+    assert len(y) == 12  # 결측 날짜(2026-01-09)는 0행으로 취급되어 총 행수에서 빠짐
+    assert list(y) == [10.0] * 4 + [20.0] * 4 + [30.0] * 4
+    assert "2026-01-09" in capsys.readouterr().out
+
+
+def test_stream_prepass_arrays_raises_only_when_every_date_is_missing():
+    """일부가 아니라 전체 날짜 구간에 실제 데이터가 하나도 없을 때만 실패해야 한다."""
+    cache = ChunkCache()
+    with pytest.raises(ValueError, match="학습 구간에 데이터가 없음"):
+        build_lazy_dataset(
+            TABLE_PATH, ["2026-02-01", "2026-02-02"], FEATURE_COLUMNS, STATION_DTYPE, None, "y", None, cache
+        )
 
 
 def test_build_lazy_dataset_streams_exposure_to_unlinked_memmap():
@@ -202,6 +319,31 @@ def test_build_lazy_dataset_keeps_reference_positional_argument_compatible():
     )
 
     assert valid_set.reference is train_set
+
+
+def test_build_lazy_dataset_with_station_shard_partitions_and_reunifies_to_unsharded():
+    """station_shard로 두 머신에 나눠 각각 build_lazy_dataset()을 만들면, 두 결과를
+    합친 라벨 집합이 샤딩 없이 읽은 것과 정확히 같아야 한다(겹침도 누락도 없음) —
+    분산 학습에서 이 두 조각을 합치면 원래 데이터 전체가 정확히 복원된다는 뜻이다.
+    """
+    _seed()
+    all_stations = station_categories_for_dates(TABLE_PATH, DATES, filters=None)
+    shard0 = _shard_for_this_machine(all_stations, 2, 0)
+    shard1 = _shard_for_this_machine(all_stations, 2, 1)
+    assert shard0 and shard1, "이 테스트의 station 4개가 2대에 실제로 나뉘어야 의미가 있음"
+
+    _dataset0, y0, _ = build_lazy_dataset(
+        TABLE_PATH, DATES, FEATURE_COLUMNS, STATION_DTYPE, None, "y", None, ChunkCache(), station_shard=shard0
+    )
+    _dataset1, y1, _ = build_lazy_dataset(
+        TABLE_PATH, DATES, FEATURE_COLUMNS, STATION_DTYPE, None, "y", None, ChunkCache(), station_shard=shard1
+    )
+    _dataset_full, y_full, _ = build_lazy_dataset(
+        TABLE_PATH, DATES, FEATURE_COLUMNS, STATION_DTYPE, None, "y", None, ChunkCache()
+    )
+
+    assert len(y0) + len(y1) == len(y_full)
+    assert sorted(np.concatenate([y0, y1]).tolist()) == sorted(y_full.tolist())
 
 
 def test_chunk_cache_never_exceeds_max_size_and_evicts_lru():
@@ -432,6 +574,21 @@ def test_predict_over_dates_matches_per_date_eager_predict():
     assert np.array_equal(result["y"], expected_y)
     assert np.allclose(result["poisson"], expected_preds)
     assert result["exposure"] is None
+
+
+def test_predict_over_dates_skips_missing_date_and_warns_instead_of_failing(capsys):
+    """평가(conformal correction/test 채점)도 학습과 같은 원칙 — 날짜 하나가 없다고
+    평가 전체가 실패하면 안 되고, 그 날짜만 빼고 계속하되 경고는 남겨야 한다."""
+    _seed()
+    booster = lgb.train(LGB_PARAMS, lgb.Dataset(*_eager_arrays(), categorical_feature=[0]), num_boost_round=3)
+    dates_with_gap = [*DATES, "2026-01-09"]
+
+    result = predict_over_dates(
+        TABLE_PATH, dates_with_gap, FEATURE_COLUMNS, STATION_DTYPE, None, "y", None, {"poisson": booster}
+    )
+
+    assert len(result["y"]) == 12
+    assert "2026-01-09" in capsys.readouterr().out
 
 
 def test_adaptive_anchor_mask_rules():

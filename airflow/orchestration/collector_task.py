@@ -13,14 +13,20 @@ from datetime import timedelta
 
 from airflow.providers.standard.operators.python import ShortCircuitOperator
 from airflow.task.trigger_rule import TriggerRule
+
 from callbacks.task_callbacks import on_failure_callback, on_success_callback
 from config.schedules import (
     DEFAULT_EXECUTION_TIMEOUT,
     DEFAULT_RETRIES,
+    DEFAULT_RETRY_DELAY,
     EXECUTION_TIMEOUT_OVERRIDES,
 )
-
-from orchestration.task_builder import REPO_ROOT, build_module_task, module_subprocess_env
+from orchestration.poi_master_task import poi_master_ref_env
+from orchestration.task_builder import (
+    REPO_ROOT,
+    build_module_task,
+    module_subprocess_env,
+)
 from orchestration.templates import (
     KST_WINDOW_START,
     kst_day_hour_replay_days_ago,
@@ -32,11 +38,12 @@ _FRESHNESS_CHECK_TIMEOUT_SECONDS = 30
 
 
 def _check_source_due(source_id: str, min_interval_seconds: int) -> bool:
-    """collector CLI를 서브프로세스로 불러 마지막 성공 수집 이후 충분히 지났는지 묻는다.
+    """collector CLI에 수집 주기 또는 source 설정 변경으로 재수집이 필요한지 묻는다.
 
     실제 실행 시각(`datetime.now()`) 기준으로 판단한다 — DAG의 논리 시각
     (`logical_date`)은 이전 run이 늦게 끝나면 실제 시각보다 뒤처질 수 있어서,
-    "지금 진짜로 얼마나 지났는지"를 묻는 이 판단에는 맞지 않는다.
+    "지금 진짜로 얼마나 지났는지"를 묻는 이 판단에는 맞지 않는다. 최신 authority가
+    현재 배포 YAML과 다른 config version이면 시간 간격이 짧아도 즉시 due가 된다.
     """
     env = module_subprocess_env(COLLECTOR_DIR)
     result = subprocess.run(
@@ -57,7 +64,7 @@ def _check_source_due(source_id: str, min_interval_seconds: int) -> bool:
 
 
 def build_weather_freshness_gate_task(dag, source_id: str, *, min_interval: timedelta):
-    """마지막 성공 수집 이후 `min_interval`이 안 지났으면 이후 태스크를 스킵하는 게이트.
+    """현재 설정의 성공 수집이 `min_interval` 안에 있으면 수집을 스킵하는 게이트.
 
     `ShortCircuitOperator`가 `False`를 반환하면 직접 하위 태스크(이 소스의
     `collect_{source_id}`)만 스킵된다 — `ignore_downstream_trigger_rules=False`를
@@ -84,8 +91,10 @@ def build_collector_task(
     source_id: str,
     *,
     retries: int = DEFAULT_RETRIES,
+    retry_delay: timedelta = DEFAULT_RETRY_DELAY,
     execution_timeout: timedelta | None = None,
 ):
+    """소스별 retry와 timeout을 적용해 Collector 태스크를 만든다."""
     timeout = execution_timeout or EXECUTION_TIMEOUT_OVERRIDES.get(
         source_id, DEFAULT_EXECUTION_TIMEOUT
     )
@@ -97,6 +106,34 @@ def build_collector_task(
         cmd,
         execution_timeout=timeout,
         retries=retries,
+        retry_delay=retry_delay,
+    )
+
+
+def build_population_collector_task(
+    dag,
+    *,
+    poi_master_task_id: str,
+    retries: int = DEFAULT_RETRIES,
+):
+    """Resolver가 고정한 POI Master로 실시간 인구를 수집하는 태스크를 만든다."""
+    source_id = "population_realtime"
+    timeout = EXECUTION_TIMEOUT_OVERRIDES.get(source_id, DEFAULT_EXECUTION_TIMEOUT)
+    cmd = (
+        f"uv run --frozen python main.py --source {source_id} "
+        f"--window-start {KST_WINDOW_START} "
+        '--poi-master-mode "$POI_MASTER_MODE" '
+        '--poi-master-manifest-uri "$POI_MASTER_MANIFEST_URI" '
+        '--poi-master-manifest-sha256 "$POI_MASTER_MANIFEST_SHA256"'
+    )
+    return build_module_task(
+        dag,
+        f"collect_{source_id}",
+        COLLECTOR_DIR,
+        cmd,
+        execution_timeout=timeout,
+        retries=retries,
+        env=poi_master_ref_env(poi_master_task_id),
     )
 
 

@@ -2,9 +2,12 @@
 
 from datetime import timedelta
 
+from airflow.task.trigger_rule import TriggerRule
 from airflow.timetables.trigger import CronTriggerTimetable
 from config.schedules import (
     DAILY_CRON,
+    DEFAULT_RETRIES,
+    DEFAULT_RETRY_DELAY,
     EXECUTION_TIMEOUT_OVERRIDES,
     NOWCASTING_EXECUTION_TIMEOUT,
 )
@@ -45,6 +48,7 @@ def test_population_then_nowcasting():
     nowcasting = dag.get_task("run_nowcasting_estimate")
     assert nowcasting.task_id in {t.task_id for t in collect_population.downstream_list}
     assert nowcasting.execution_timeout == NOWCASTING_EXECUTION_TIMEOUT
+    assert nowcasting.trigger_rule == TriggerRule.ALL_SUCCESS
 
 
 def test_events_then_publish_source_scoped_projection():
@@ -54,8 +58,10 @@ def test_events_then_publish_source_scoped_projection():
     publish_performance = dag.get_task("publish_event_performance_event")
 
     assert publish_events.upstream_task_ids == {collect_events.task_id}
+    assert publish_events.trigger_rule == TriggerRule.ALL_SUCCESS
     assert "--publication event:cultural_event" in publish_events.bash_command
     assert publish_performance.upstream_task_ids == {collect_performance.task_id}
+    assert publish_performance.trigger_rule == TriggerRule.ALL_SUCCESS
     assert "--publication event:performance_event" in publish_performance.bash_command
 
 
@@ -66,3 +72,32 @@ def test_living_population_grid_uses_long_timeout():
         == EXECUTION_TIMEOUT_OVERRIDES["living_population_grid"]
     )
     assert collect_population.execution_timeout == timedelta(seconds=1200)
+
+
+def test_nowcaster_receives_same_exact_window_as_collector():
+    """생활인구 actual 승격은 날짜 prefix가 아니라 같은 logical window를 사용한다."""
+    task = dag.get_task("run_nowcasting_estimate")
+
+    assert "--target-date" in task.bash_command
+    assert "--source-window-start" in task.bash_command
+
+
+def test_living_population_grid_keeps_default_retry_policy():
+    """생활인구 collector는 다른 일일 source와 같은 기본 재시도를 사용한다."""
+    collect_population = dag.get_task("collect_living_population_grid")
+
+    assert collect_population.retries == DEFAULT_RETRIES
+    assert collect_population.retry_delay == DEFAULT_RETRY_DELAY
+    assert "--force" not in collect_population.bash_command
+    assert "--backfill" not in collect_population.bash_command
+
+
+def test_event_collectors_keep_default_retry_policy():
+    """행사 collector는 공용 retry와 기존 일반 수집 명령을 유지한다."""
+    for source_id in ("cultural_event", "performance_event"):
+        task = dag.get_task(f"collect_{source_id}")
+
+        assert task.retries == DEFAULT_RETRIES
+        assert task.retry_delay == DEFAULT_RETRY_DELAY
+        assert "--force" not in task.bash_command
+        assert "--backfill" not in task.bash_command

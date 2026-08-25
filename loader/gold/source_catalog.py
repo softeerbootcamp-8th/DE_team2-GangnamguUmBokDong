@@ -140,14 +140,32 @@ class S3SourceSnapshotCatalog:
         logical_dttm: datetime,
     ) -> SourceManifestArtifact:
         """exact logical window의 최대 correction revision을 반환한다."""
+        artifact = self.exact_window_or_none(source_id, logical_dttm)
+        if artifact is not None:
+            return artifact
+        source = _validated_source_id(source_id)
+        logical = _utc_dttm(logical_dttm, "logical_dttm")
+        raise ContractViolation(
+            f"{source} exact source authority window가 없습니다: "
+            f"{format_utc_dttm(logical)}"
+        )
+
+    def exact_window_or_none(
+        self,
+        source_id: str,
+        logical_dttm: datetime,
+    ) -> SourceManifestArtifact | None:
+        """Exact authority prefix가 비었을 때만 None을 반환한다.
+
+        Prefix에 객체가 하나라도 있으면 revision chain과 actual manifest를 기존 exact
+        경로와 동일하게 검증한다. 따라서 손상된 authority가 단순 부재로 축소되지
+        않는다.
+        """
         source = _validated_source_id(source_id)
         logical = _utc_dttm(logical_dttm, "logical_dttm")
         keys = self._list_keys(_logical_prefix(source, logical))
         if not keys:
-            raise ContractViolation(
-                f"{source} exact source authority window가 없습니다: "
-                f"{format_utc_dttm(logical)}"
-            )
+            return None
         return self._latest_revision(source, logical, keys)
 
     def recent_windows(

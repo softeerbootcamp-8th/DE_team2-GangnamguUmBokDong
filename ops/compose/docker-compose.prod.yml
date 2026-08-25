@@ -61,7 +61,7 @@ x-airflow-common: &airflow-common
       max-file: "3"
 
 services:
-  # 1회성: airflow DB 마이그레이션 + 모듈 venv 6개 예열.
+  # 1회성: airflow DB 마이그레이션 + 모듈 venv 7개 예열.
   # 첫 실행은 10~20분 걸린다 — 멈춘 게 아니다.
   airflow-init:
     <<: *airflow-common

@@ -250,6 +250,12 @@ class TestEndToEndRun:
         assert body["source_observed_at"] == WINDOW_START.astimezone(UTC).isoformat()
         assert body["cell_count"] == 2
         assert body["poi_matched_count"] == 1
+        assert body["poi_master"] == {
+            "mode": "static",
+            "manifest_uri": None,
+            "manifest_sha256": None,
+        }
+        assert body["poi_master_row_count"] == 121
         assert body["poi_forecast_count"] == 1
         assert body["forecast_horizons"] == 12
         assert len(body["written_keys"]) == 13

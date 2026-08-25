@@ -6,7 +6,7 @@
 #
 # 하는 일 두 가지:
 #   1. Python 3.11 + 서드파티 의존성 설치
-#   2. 레포 내부 패키지(core, ml_core, feature_engine)를 S3에서 내려 /opt/gng에 풀기
+#   2. 레포 내부 패키지(core, ml_core, feature_engine, training)를 S3에서 내려 /opt/gng에 풀기
 #
 # EMR Serverless의 venv-pack 방식 대신 이걸 쓰는 이유: 노드 위에서 직접 pip install하므로
 # 플랫폼 정합을 신경 쓸 필요가 없다(Serverless는 amazonlinux:2023에서 미리 빌드해야 하고
@@ -32,16 +32,23 @@ echo "[emr-bootstrap] Python 3.11 설치"
 sudo dnf install -y python3.11 python3.11-pip
 
 echo "[emr-bootstrap] 서드파티 의존성 설치"
-# 목록은 ml/feature_engine/pyproject.toml 기준이다. requirements.txt에는 pyproj가
-# 빠져 있어(이중 관리 drift) 그쪽을 따르면 런타임에 ImportError가 난다.
-# boto3는 watermark.py가 Spark가 아니라 plain boto3로 워터마크 JSON을 읽기 때문에 필요하다.
+# 목록은 ml/feature_engine/pyproject.toml + ml/training/pyproject.toml 기준이다.
+# requirements.txt에는 pyproj가 빠져 있어(이중 관리 drift) 그쪽을 따르면 런타임에
+# ImportError가 난다. boto3는 watermark.py가 Spark가 아니라 plain boto3로 워터마크
+# JSON을 읽기 때문에 필요하다. lightgbm/scikit-learn/mlflow-skinny는 training
+# 패키지(월간 재학습 evaluation·YARN distributed-shell 학습)가 이 노드에서 직접
+# 실행되면서 추가됐다.
 sudo python3.11 -m pip install --quiet --upgrade pip
 sudo python3.11 -m pip install --quiet \
     pandas \
     pyarrow \
     boto3 \
     holidays \
-    pyproj
+    pyproj \
+    numpy \
+    lightgbm \
+    scikit-learn \
+    "mlflow-skinny>=2.14"
 
 echo "[emr-bootstrap] 레포 패키지 내려받기: s3://${S3_BUCKET}/${PYFILES_KEY}"
 # pip 설치가 아니라 PYTHONPATH에 얹는 방식이다. libs/ml_core와 ml/feature_engine이
@@ -57,10 +64,11 @@ echo "[emr-bootstrap] 설치 확인"
 sudo env PYTHONPATH="${TARGET_DIR}" python3.11 -c "
 import sys
 assert sys.version_info >= (3, 11), sys.version
-import pandas, pyarrow, boto3, holidays, pyproj  # noqa: F401
+import pandas, pyarrow, boto3, holidays, pyproj, lightgbm, sklearn, mlflow  # noqa: F401
 from core import s3  # noqa: F401
 from ml_core import common_config, silver_schema  # noqa: F401
-print('[emr-bootstrap] python', sys.version.split()[0], '+ core/ml_core import OK')
+from training import config as training_config  # noqa: F401
+print('[emr-bootstrap] python', sys.version.split()[0], '+ core/ml_core/training import OK')
 "
 
 echo "[emr-bootstrap] 완료."

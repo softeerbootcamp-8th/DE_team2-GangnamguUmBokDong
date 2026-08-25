@@ -35,9 +35,10 @@ def test_airflow_init_prewarms_every_bash_operator_project():
     entrypoint = _ENTRYPOINT_PATH.read_text(encoding="utf-8")
 
     assert (
-        "for proj in collector normalizer nowcaster ml/inference loader rebalance; do"
+        "for proj in collector poi_master normalizer nowcaster ml/inference loader rebalance; do"
         in entrypoint
     )
+    assert 'env_name="${env_name//_/-}"' in entrypoint
     assert 'UV_PROJECT_ENVIRONMENT="/opt/venvs/modules/$env_name"' in entrypoint
 
 

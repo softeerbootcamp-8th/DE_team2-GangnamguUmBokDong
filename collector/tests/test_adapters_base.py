@@ -7,6 +7,7 @@ from unittest.mock import MagicMock
 from zoneinfo import ZoneInfo
 
 import pytest
+
 from adapters.base import (
     DuplicateAdapterError,
     FetchErrorKind,
@@ -248,6 +249,40 @@ def test_fetch_with_rounds_retries_transient_failure_in_next_round(window):
     assert result.chunks == {"a": b"1", "b": b"2"}
     assert result.missing == {}
     sleep_fn.assert_called_once_with(15)
+
+
+def test_fetch_with_rounds_keeps_successes_from_prior_round(window):
+    """다음 round는 앞 round 성공분을 유지하고 누락 조각만 다시 받는다."""
+    calls = []
+
+    def fetch_fn(config, win, *, client, skip, expected_total):
+        """첫 round만 실패하고 두 번째 round에서 바뀐 전체본을 반환한다."""
+        calls.append(frozenset(skip))
+        if len(calls) == 1:
+            yield FetchResult(
+                key="a", payload=b"old-a", error=None, expected_total=2
+            )
+            yield FetchResult(
+                key="b",
+                payload=None,
+                error=FetchErrorKind.TRANSIENT,
+                expected_total=None,
+            )
+        else:
+            yield FetchResult(
+                key="b", payload=b"new-b", error=None, expected_total=None
+            )
+
+    result = fetch_with_rounds(
+        fetch_fn,
+        _FakeBudgetConfig(),
+        window,
+        client=object(),
+        sleep_fn=lambda seconds: None,
+    )
+
+    assert calls == [frozenset(), frozenset({"a"})]
+    assert result.chunks == {"a": b"old-a", "b": b"new-b"}
 
 
 def test_fetch_with_rounds_fatal_aborts_immediately_without_further_calls(window):

@@ -2,7 +2,7 @@
 
 > 상태: 현재 코드 기준 요약<br>
 > 최초 API 실측: 2026-08-19<br>
-> 코드 재확인: 2026-08-24
+> 코드 재확인: 2026-08-25
 
 이 문서는 외부 API 응답이 Collector를 거쳐 어떤 source 계약으로 저장되는지 설명한다. 정확한 column, type, range, enum과 정책의 최종 기준은 `collector/sources/*.yaml`이다.
 
@@ -14,7 +14,7 @@ YAML의 `schedule.interval`은 source 자체의 기대 주기를 설명하는 me
 | --- | --- | --- | --- |
 | `bike_rental_history` | 서울 `tbCycleRentData` | 5분 | 해당 시간대 누적 대여·반납 이력, 1시간 replay와 D-6 보강 |
 | `bike_station_realtime` | 서울 `bikeList` | 5분 | 빈 페이지까지 탐색, `stationId` 자연키 중복 검증 |
-| `population_realtime` | 서울 `citydata_ppltn` | 5분 | POI001~121 병렬 조회, 중첩 예측 12개를 scalar column으로 flatten |
+| `population_realtime` | 서울 `citydata_ppltn` | 5분 | 중앙 POI Master의 `AREA_CD`를 병렬 조회, 중첩 예측 12개를 scalar column으로 flatten |
 | `weather_ultra_short_live` | 기상청 `getUltraSrtNcst` | 10분 경계 | 34개 격자 병렬 조회, category pivot |
 | `weather_ultra_short_forecast` | 기상청 `getUltraSrtFcst` | 10분 경계 | 34개 격자 병렬 조회, category pivot, 강수 범주 변환 |
 | `weather_short_term_forecast` | 기상청 `getVilageFcst` | 3시간 경계 | 격자별 다중 page 수집, category pivot, 강수 범주 변환 |
@@ -23,7 +23,8 @@ YAML의 `schedule.interval`은 source 자체의 기대 주기를 설명하는 me
 | `performance_event` | 서울 `stadiumScheduleInfo` | 매일 03:00 | 체육시설 행사 정보 수집 |
 | `bike_station_master` | 서울 `bikeStationMaster` | 매일 03:04 | 대여소 ID·주소·좌표 수집 후 별도 enrichment |
 
-날씨 source는 독립 날씨 DAG가 아니라 해당 시각의 `realtime_tick` 계열 DAG 안에서 실행된다. 자세한 이유는 [Airflow 운영 구조](../airflow/explain.md)를 참고한다.
+날씨 source는 독립 날씨 DAG가 아니라 단일 `realtime_tick`의 source별 freshness gate
+뒤에서 필요할 때 실행된다. 실제 기준은 `airflow/dags/realtime_tick.py`다.
 
 ## 공통 처리 계약
 
@@ -71,7 +72,25 @@ Column은 다음 순서로 판정한다.
 
 행이 0개일 때 `allow_empty=true`인 문화·공연행사만 정상 `EMPTY`가 될 수 있다. 나머지는 `quality_gate` 실패다.
 
-품질 gate를 통과했지만 일부 part나 row가 빠지면 `PARTIAL`로 게시할 수 있다. downstream은 prefix에서 임의 파일을 고르지 않고 authoritative source snapshot manifest가 지정한 exact Silver URI와 SHA를 읽는다.
+품질 gate를 통과했지만 일부 part나 row가 빠지면 진단 Silver와 `PARTIAL` manifest를
+남길 수 있지만 authoritative source snapshot으로 게시하지 않는다. 기존 운영 합의에
+따라 생활인구·문화행사·공연행사는 모두 10% 이내 누락을 `PARTIAL`로 처리해 Collector
+task를 성공 종료한다. 이 때문에 Airflow는 downstream task를 스케줄하지만 PARTIAL
+Silver의 사용 여부는 소비자별로 다르다. 생활인구는 actual Archive 승격을 건너뛰고
+추정만 계속하며, 행사는 기존 `publication_state`와 content-addressed publication
+manifest가 일치할 때 Gold 행과 state를 변경하지 않는다. 유지할 state가 없는 행사는
+fail-closed한다. 허용치를 초과한 경우에만 Collector 자체가 `FAILED/fetch_error`가 된다.
+
+| Source/소비자 | Completed `PARTIAL` 처리 |
+| --- | --- |
+| `population_realtime` → Normalizer | Exact diagnostic과 checksum을 검증해 보정 입력으로 사용 |
+| `living_population_grid` → Nowcaster | Actual Archive 승격은 생략, 기존 Archive 기반 추정은 계속 |
+| `cultural_event`·`performance_event` → Gold | 기존 state·manifest가 일치하면 행/state 무변경, 기존 state가 없으면 실패 |
+| 그 밖의 authority 기반 소비자 | 명시적 허용 정책이 없으면 입력으로 사용하지 않음 |
+
+이 표는 Collector status를 API의 `ready`·`stale` 또는 전체 `degraded` 상태로 직접
+매핑하지 않는다. 최종 serving 상태는 기존 publication 시각과 endpoint freshness 계약이
+별도로 판정한다.
 
 ## 서울 열린데이터광장 Adapter
 
@@ -81,7 +100,7 @@ Column은 다음 순서로 판정한다.
 | --- | --- | --- |
 | `INFO-000` | 성공 | 정상 처리 |
 | `INFO-200` | 정상 빈 결과 | 빈 part로 처리 |
-| `INFO-100` | 치명적 인증 오류 | 재시도·backfill 없이 실패 |
+| `INFO-100` | 치명적 인증 오류 | 같은 실행의 추가 round를 중단하고 실패 |
 | `ERROR-5xx`·network 오류 | 일시적 오류 | round 재시도 대상 |
 | 그 외 요청 오류 | 영구 오류 | 해당 part 실패 |
 
@@ -91,7 +110,7 @@ API key가 URL path에 들어가므로 예외와 로그에서는 `***`로 가린
 
 - `bikeList`의 `list_total_count`는 전체 건수가 아니므로 `probe_until_empty`로 빈 page까지 조회한다. 최대 10 page를 넘기면 조용히 truncate하지 않고 실패한다.
 - `tbCycleRentData`는 날짜와 시간을 path에 함께 줘야 한다. 5분 tick이 속한 시간의 누적 결과를 받아 Archive compaction에서 중복을 제거한다.
-- `citydata_ppltn`은 단일 paged table이 아니라 POI별 endpoint다. POI001~121을 조회하고 `FCST_PPLTN`을 예측시각 순서로 최대 12개 slot에 펼친다.
+- `citydata_ppltn`은 단일 paged table이 아니라 POI별 endpoint다. 정상 경로는 Airflow가 고정한 exact POI Master manifest URI·SHA에서 `AREA_CD` 목록을 읽는다. activation이 아직 없는 `static` fallback에서만 source YAML의 `poi_start`, `poi_end`, `poi_exclude`로 기존 범위와 제외 목록을 만든다. `FCST_PPLTN`은 예측시각 순서로 최대 12개 slot에 펼친다.
 - 병렬 조회는 source YAML에 `concurrency`가 선언된 source만 사용한다.
 
 ## 기상청 Adapter
@@ -107,25 +126,35 @@ API key가 URL path에 들어가므로 예외와 로그에서는 `***`로 가린
 
 본문 `resultCode=00`만 성공이다. 미발표·연결·quota 계열은 일시 오류, 인증·권한 계열은 치명적 오류로 분류한다.
 
-## 재개와 Backfill
+## 재개와 즉시 복구
 
-Bronze가 저장된 뒤 Silver 쓰기가 실패하면 다음 실행은 외부 API를 다시 호출하지 않고 같은 Bronze를 재사용한다. 실시간 snapshot이 다른 시각의 값으로 바뀌는 것을 막기 위한 계약이다.
+Bronze가 저장된 뒤 Silver 쓰기나 품질 검증이 실패하면 다음 실행은 외부 API를 다시
+호출하지 않고 같은 Bronze를 재사용한다. 저장 실패 때문에 이미 확보한 원본을 잃지
+않기 위한 계약이다.
 
-Backfill이 활성화된 source는 누락 part가 남으면 `_retry_queue` marker를 기록한다. Backfill 실행은 성공한 Bronze part를 유지하고 누락된 part만 다시 조회한 뒤 window 전체를 재검증한다.
+같은 실행의 transient 다음 round는 source 종류와 관계없이 성공 조각을 유지하고 누락
+조각만 재시도한다. Airflow가 같은 window를 다시 실행하면 외부 API를 호출하지 않고
+manifest가 가리키는 기존 Bronze를 재사용한다.
 
-`--force`는 기존 Bronze부터 지우고 전체를 다시 받는 명령이며 `--backfill`과 동시에 사용할 수 없다.
+현재 운영 source에는 delayed `backfill` 설정이 없고 범용 Backfill DAG도 없다.
+`--backfill`, `_retry_queue`와 manifest 필드는 기존 코드·저장 포맷 파싱 호환을 위해
+남아 있지만 기존 marker는 발견·소비되지 않는 정리 대상이다.
+
+`--force`는 기존 Bronze를 보존한 채 새 Hot revision에 전체를 다시 받는 명령이며
+`--backfill`과 동시에 사용할 수 없다.
 
 ## Archive 대상
 
-현재 daily compaction 대상은 다음 세 source다.
+현재 daily compaction 대상은 다음 네 source다.
 
 - `bike_rental_history`
 - `bike_station_realtime`
+- `population_realtime`
 - `weather_ultra_short_live`
 
-예보 source는 사후 재현 가치가 낮아 compaction하지 않는다. 행사와 일별 생활인구는 하루 1개 window라 작은 파일을 다시 묶을 필요가 없다.
+예보 source는 사후 재현 가치가 낮아 compaction하지 않는다. 행사와 일별 생활인구는 하루 1개 window라 작은 파일을 다시 묶을 필요가 없다. `population_realtime`은 5분 Silver가 하루 최대 288개 생기므로 일별 Archive로 묶는다.
 
-Archive는 source YAML에서 만든 고정 schema와 `_row_status`, `_window_start`, `_source_kind`를 가진다. 원본 Silver는 삭제하지 않는다.
+Archive는 source YAML에서 만든 고정 schema와 `_row_status`, `_window_start`, `_source_kind`를 가진다. 최신 authority Silver는 계속 유지하고, non-authority Silver는 생성 후 30일 동안 보존한 뒤 검증된 Cold Bronze를 복구 근거로 삭제한다.
 
 ## 현재 알려진 데이터 해석 경계
 
