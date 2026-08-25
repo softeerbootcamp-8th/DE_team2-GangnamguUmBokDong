@@ -1,6 +1,28 @@
 # Airflow 구현 계획
 
-> **보관 문서:** 구현 당시의 상세 계획을 보존한 자료다. 현재 DAG 이름, 주기와 인프라 구성은 이 문서가 아니라 [Airflow 운영 구조와 데이터 흐름](./explain.md) 및 실제 코드를 기준으로 판단한다.
+> **보관 문서:** 구현 당시의 상세 계획을 보존한 자료다. 아래 본문에 남은
+> Backfill·Bronze Compaction 설계는 현재 운영 계약이 아니다. 현행 DAG 이름, 주기와
+> 인프라 구성은 실제 `airflow/dags/`, `airflow/orchestration/` 및 Collector 코드를
+> 기준으로 판단한다.
+>
+> 현행 책임과 구현 상태는 다음과 같다.
+>
+> - 범용 Backfill DAG는 없다. 일일 source의 누락이 합의된 허용치를 넘어서
+>   `fetch_error`가 되면 당일 task retry에서 Collector가 기존 부분 Bronze를 비우고
+>   전체를 다시 수집한다. 허용치 이내 누락은 `PARTIAL`(exit 0)이어서 downstream
+>   task가 스케줄되지만 데이터 사용 여부는 소비자별 정책이 결정한다. 생활인구는
+>   actual 승격을 건너뛰고 추정을 계속하며, 행사는 기존 state·manifest가 일치할 때만
+>   Gold 행과 state를 변경하지 않는다. Bronze 확보 후 실패 manifest가 남은 품질·후속
+>   저장 실패는 기존 Bronze를 재사용한다.
+> - 대여이력은 일반 백필이 아니라 `+1시간`과 `D-6`의 `--force` correction으로
+>   늦은 반납 기록을 보강한다.
+> - `daily_compaction`은 대여이력 D-6 correction 뒤 Silver를 날짜별 Archive로 묶는다.
+>   대여소 실시간·기상 실황 Archive는 이 replay와 독립적으로 처리한다. Bronze를
+>   압축하는 작업이 아니다.
+> - 영구 원본용 Cold Bronze archive/compaction은 아직 구현하지 않았다.
+> - `--backfill`, retry marker와 manifest의 backfill 필드는 기존 코드·manifest 파싱
+>   호환을 위해 유지한다. 운영 설정은 marker를 만들거나 발견하지 않으며, 기존
+>   `_retry_queue` 객체는 비활성 상태로 별도 정리할 대상이다.
 
 ## 1. 목적
 
@@ -161,7 +183,11 @@ Airflow는 Collector 내부 품질 게이트를 다시 판정하지 않고 **프
 | `SKIPPED` | `0` | `SUCCESS` |
 | `FAILED` | non-zero | Task 실패 → Airflow retry |
 
-`PARTIAL`은 일부 quarantine 또는 일부 조각 누락이 존재하더라도 Collector의 `max_missing_ratio`·`max_drop_ratio` 게이트를 통과하고 `stage=completed`까지 간 상태다. Airflow는 이를 다시 실패로 재판정하지 않는다.
+`PARTIAL`은 일부 quarantine 또는 일부 조각 누락이 존재하더라도 Collector의
+`max_missing_ratio`·`max_drop_ratio` 게이트를 통과하고 `stage=completed`까지 간
+상태다. Airflow는 Collector task를 다시 실패로 재판정하지 않지만, 이는 PARTIAL
+Silver가 모든 downstream 입력으로 허용된다는 뜻이 아니다. 각 소비자가 authority,
+명시적 PARTIAL 보정 또는 기존 publication 유지 중 자기 source 정책을 적용한다.
 
 Collector 세부 결과의 최종 근거는 S3 `_manifest/{source_id}/.../{HHMM}.json`이다. manifest에는 `status`, `stage`, `failure_reason`, `attempt`, `revision`, `counts`, `missing`, `drop_ratio`, `completeness`, `artifacts`, `backfill_status` 등이 기록될 수 있다.
 
@@ -205,6 +231,43 @@ Collector 문서에는 `data_interval_start`를 `--window-start`로 넘긴다고
 반면 Bronze Compaction이나 Training처럼 특정 기간을 처리하는 Batch DAG는 실제 `data_interval_start`와 `data_interval_end`를 사용한다.
 
 중요한 계약은 Airflow 내부 객체 이름이 아니라 **Collector에 전달되는 `window_start`가 해당 수집 window의 시작 시각이며 retry 시 변하지 않는 것**이다.
+
+---
+
+## 4.1 POI Master 자동 갱신과 실행 고정
+
+`poi_master_refresh` DAG는 매일 `02:04 KST`에 서울 열린데이터광장 자료 페이지를 확인한다. 첨부 이름에서 `서울시 주요 <N>장소 목록.xlsx`와 `서울시 주요 <N>장소 영역.zip`을 찾아 내려받고, 내용이 바뀌어 검증을 통과한 경우에만 새 POI Master를 게시한다. 두 파일명이 선언한 `<N>`, XLSX·Shape의 고유 `AREA_CD` 수, 최종 Master 행 수는 모두 같아야 하며 파일 bytes가 같더라도 이 선언이 바뀌면 다시 검증한다. 운영 환경의 전역 `dags_are_paused_at_creation=true`와 무관하게 이 무인 유지관리 DAG만 `is_paused_upon_creation=False`로 최초 배포부터 자동 활성화한다.
+
+```bash
+cd /workspace/poi_master && uv run --frozen python main.py refresh
+```
+
+S3에는 원본과 통합 Parquet을 content hash 주소로 불변 저장한다. 원본은 일반
+Collector Bronze의 30일 만료 정책과 분리된 `source_snapshot_raw/`에 영구 보존한다.
+
+```text
+source_snapshot_raw/poi_master/list/sha256=<xlsx-byte-sha256>.xlsx
+source_snapshot_raw/poi_master/areas/sha256=<zip-byte-sha256>.zip
+silver/poi_master/sha256=<parquet-byte-sha256>.parquet
+source_snapshot_manifest/poi_master/dt=YYYY-MM-DD/hh=HH/logical=<UTC timestamp>/revision=0000000000.json
+source_snapshot_pointer/poi_master/activated=<UTC timestamp>.json
+```
+
+게시 순서는 `source raw → Silver → source manifest → activation`이며 activation을 마지막에 append-only로 추가한다. 변경 가능한 `current.json`은 두지 않는다. activation key는 시각당 하나뿐이고 조건부 PUT으로 생성하므로 동시 실행에서도 한 manifest만 그 시각의 승자가 된다. 같은 내용이면 새 활성본을 만들지 않고, 페이지 조회·다운로드·검증·게시 중 실패하면 새 activation 없이 이전 활성본을 계속 사용한다. 기존 대비 POI가 과도하게 줄면 `--max-drop-ratio` 게이트가 게시를 막으며 기본값은 `0.2`다. 최초 activation도 repository의 legacy POI Shapefile 행 수를 기존 기준으로 사용한다.
+
+변경 없음 판단에는 두 원천 checksum뿐 아니라 `poi_master_schema_version`도 포함한다. 따라서 변환 계약을 올리면 원천 파일이 같아도 새 artifact를 게시하며, consumer는 지원하지 않는 schema version을 거부한다. Schema 전환은 새 version을 writer에 지정하면서 같은 물리 schema의 직전 version을 `POI_MASTER_READABLE_SCHEMA_VERSIONS`에 유지하고, refresh activation을 확인한 다음 별도 배포에서 제거하는 2단계로 수행한다. 실행 역할에는 위 네 POI Master namespace의 `DeleteObject`를 명시적으로 거부해 append-only history가 정리 작업으로 삭제되지 않게 한다.
+
+각 `realtime_tick`은 수집 전에 해당 KST window 기준 활성본 하나를 고정한다.
+
+```text
+resolve_poi_master
+  → collect_population_realtime
+  → run_normalizer
+```
+
+`resolve_poi_master`는 `python main.py resolve --as-of <KST-window>` 결과인 `POI_MASTER_MODE`, `POI_MASTER_MANIFEST_URI`, `POI_MASTER_MANIFEST_SHA256`을 두 downstream Task에 동일하게 전달한다. 따라서 두 Task 사이에 refresh가 실행돼도 한 run 안에서 POI 목록과 geometry 버전이 섞이지 않는다.
+
+activation이 아직 하나도 없으면 `mode=static`으로 기존 Collector YAML과 repository Shapefile을 사용한다. 반면 한 번 고정된 exact S3 manifest나 artifact가 손상됐으면 다른 버전이나 static으로 조용히 전환하지 않고 해당 run을 실패시킨다.
 
 ---
 

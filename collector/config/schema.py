@@ -143,7 +143,7 @@ class Quality(BaseModel):
 
 
 class Fetch(BaseModel):
-    """API 호출할 때, 얼마나 오랫동안 시도할지 설정하는 모델"""
+    """API 호출 예산을 설정하는 모델."""
 
     # Pydantic 모델 configuration
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -151,7 +151,6 @@ class Fetch(BaseModel):
     # API 호출에 사용할 수 있는 최대 시간
     # None으로 두어도, SourceConfig 모델에서 자동 설정됨.
     budget: Duration | None = None
-
 
 class Backfill(BaseModel):
     """누락된 과거 데이터를 나중에 채워넣는 백필 작업에 대한 설정을 담당."""

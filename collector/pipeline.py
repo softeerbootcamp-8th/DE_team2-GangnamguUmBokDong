@@ -2,33 +2,33 @@
 
 실행 순서는 config 로드, manifest 로드, 재개 분기, (라운드를 돌며 조각마다 fetch
 후 bronze 즉시 저장), 완결도 게이트, normalize, 검증·정책 적용, silver·quarantine
-저장, manifest 마감, (불완전하면) 백필 마커 순이다. 단계를 넘어갈 때마다 manifest의
-`stage`를 갱신해, 중간에 죽어도 다음 실행이 어디서부터 재개할지 알 수 있게 한다.
+저장, manifest 마감(legacy 설정이면 retry marker 동기화) 순이다. 단계를 넘어갈
+때마다 manifest의 `stage`를 갱신해, 중간에 죽어도 다음 실행이 어디서부터 재개할지
+알 수 있게 한다.
 
 재개 분기:
 
 | 조건 | 동작 |
 | --- | --- |
-| `stage=completed` & 누락 없음 | `SKIPPED` 반환(백필 모드 포함) |
-| `stage>=bronze_written` & 누락 존재 & `--backfill` | 기존 bronze 유지, 누락 조각만 fetch하고 전체 재처리 |
-| `stage>=bronze_written` (일반 실행) | 기존 bronze 로드(fetch 건너뜀) |
-| 그 외 (또는 `--force`) | `clear_bronze` 후 전체 fetch |
+| `stage=completed` (일반 실행) | authority 검증 후 `SKIPPED` 반환 |
+| `stage>=bronze_written` (일반 재실행) | 기존 revision의 bronze 로드(fetch 건너뜀) |
+| 누락 존재 & legacy `--backfill` | 기존 성공 조각 + 새 누락 조각을 새 Hot revision에 저장 |
+| 그 외 (또는 `--force`) | 새 immutable Hot revision에 전체 fetch |
 
 bronze 재사용이 재개의 핵심인 이유: 실시간 API(5분 주기)는 몇 분만 지나도 그 시점
 데이터를 영영 받을 수 없다. 저장 실패 후 fetch부터 다시 하면 지금 시점의 다른
 데이터로 덮어쓰게 된다.
 
     1회차: bronze ✓ → 정제 ✓ → silver ✗   stage=validated, status=FAILED
-    2회차: fetch 건너뜀(bronze 재사용) → 정제 ✓ → silver ✓   stage=completed, PARTIAL
+    2회차: fetch 건너뜀(bronze 재사용) → 정제 ✓ → silver ✓   stage=completed, SUCCEEDED
 
 그 외 알아둘 점:
 - 조각 저장은 pipeline의 책임이다. 어댑터는 `yield`만 하고 저장소를 모른다.
 - `stage`는 fetch를 마친 뒤(라운드 소진 또는 예산 종료 시점)에만 올린다. 조각이
   다 모였는지는 `stage`가 아니라 `completeness`·`missing`이 따로 표현하므로,
   `stage=completed`이면서 불완전한 window도 있을 수 있다.
-- `clear_bronze`는 조각 수가 실행마다 달라질 수 있어서 필요하다(5조각→3조각).
-  백필 모드는 예외로 기존 조각을 살리며, manifest `parts`에 없는 조각은 읽지
-  않는 규칙이 유령 조각을 막는다.
+- 수집 실행마다 별도 Hot revision을 쓰므로 조각 수가 달라져도 이전 revision의
+  유령 조각이 섞이지 않는다. manifest가 가리키는 revision과 `parts`만 읽는다.
 - `normalize`는 bronze 재사용 여부와 무관하게 항상 수행한다. 네트워크를 타지
   않는 순수 변환이라 비용이 없다.
 - 검증은 window 전체가 모인 뒤 배치로 하므로 조각을 메모리에서 놓지 않는다(ADR 0003).
@@ -40,9 +40,8 @@ bronze 재사용이 재개의 핵심인 이유: 실시간 API(5분 주기)는 �
       max_missing_ratio 이내면 normalize → 검증 → drop_ratio 판정 → silver,
       초과하면 silver 없이 FAILED(failure_reason=fetch_error)
 
-`FATAL`(인증 오류)만 예외다. 게이트도 마커도 타지 않고 즉시 `fetch_error`로
-끝낸다. 재시도·백필이 무의미하고 키를 고쳐 `--force`로 재실행할 문제이기
-때문이다.
+`FATAL`(인증 오류)만 예외다. 같은 실행의 추가 round를 돌지 않고 즉시
+`fetch_error`로 끝낸다.
 
 status 결정 규칙:
 
@@ -62,17 +61,16 @@ status 결정 규칙:
 silver가 있으면 하류가 manifest 확인 없이 읽을 위험이 있다. quarantine은 실패
 원인 분석에 필요해 이 경우에도 쓰지만, 폐기 행이 0건이면 만들지 않는다. 두
 게이트는 독립이고 `drop_ratio`의 분모는 `fetched`다. `quality_gate` 실패는 같은
-bronze·config로 재시도해도 결과가 같아 config를 고쳐야 하고, `fetch_error`는
-백필로 회복 가능하다 — 그래서 `failure_reason`으로 둘을 구분해 남긴다.
+bronze·config로 재시도해도 결과가 같아 config를 고쳐야 하고, `fetch_error`는 수집
+누락을 뜻한다 — 그래서 `failure_reason`으로 둘을 구분해 남긴다.
 
-백필 마커: `backfill.enabled`이고 누락이 남으면(게이트 초과로 FAILED가 된 window
-포함) `_retry_queue/{source_id}/{window_start}.json`을 쓴다. 백필로 완결되면
-지우고, 부분적으로만 채웠으면 `missing_parts`를 줄여 유지한다. 한 번에 완결될
-필요는 없다.
+legacy 백필 호환: 예전 설정처럼 `backfill.enabled`이면 `_retry_queue` 마커와
+`--backfill` 동작을 유지한다. 현재 운영 source 설정은 이 지연 백필을 켜지 않으므로
+기존 marker도 발견하지 않는다.
 
 `stage`의 최종 정지점은 실패 종류별로 다르다.
 - `fetch_error`·`FATAL` — fetch 단계에서 끝났으므로 `BRONZE_WRITTEN`. 다음
-  실행은 bronze 재사용 분기로 들어가 게이트를 다시 계산한다.
+  실행은 manifest가 가리키는 기존 Bronze를 재사용한다.
 - `storage_error`·`quality_gate` — normalize·검증까지는 끝났으므로 `VALIDATED`.
   `quality_gate`는 재시도해도 결과가 같지만 `COMPLETED`로 올리지 않는다.
   그러면 다음 실행이 `missing.parts`가 빈 채로 곧장 `SKIPPED`(종료 코드 0)로
@@ -88,8 +86,10 @@ bronze·config로 재시도해도 결과가 같아 config를 고쳐야 하고, `
 - `attempt`는 mutable 진단 실행 횟수다. `revision`은 authoritative source content의
   correction ordinal이며 최초 성공은 0, exact replay는 유지, changed content만 증가한다.
 - 각 단계 경계에서 로그 한 줄씩만 남긴다. 조각마다, 라운드마다 남기지 않는다.
-- 부분 성공의 종료 코드는 0이다. 재실행하면 `SKIPPED`로 빠지므로 백필 잡이
-  나머지를 채운다.
+- 부분 성공의 종료 코드는 0이다. source별 누락 허용치 이내면 `PARTIAL`로 downstream
+  task를 스케줄하고, PARTIAL Silver를 실제 입력으로 사용할지는 각 소비자가 명시적으로
+  결정한다. 누락 허용치 초과를 포함한 모든 `FAILED`와 처리되지 않은 예외는 non-zero로
+  Airflow retry 대상이다.
 """
 
 from __future__ import annotations
@@ -99,12 +99,13 @@ import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-import manifest as manifest_module
 import pyarrow as pa
+from core.source_snapshot import SourceSnapshotStatus
+
+import manifest as manifest_module
 import storage
 from adapters.base import FetchErrorKind, Window, fetch_with_rounds, get_adapter
 from config.schema import SourceConfig
-from core.source_snapshot import SourceSnapshotStatus
 from manifest import (
     Artifacts,
     BronzeArtifacts,
@@ -182,8 +183,8 @@ def _sync_retry_marker(
     그대로 두고(나이는 처음 실패한 시점부터 잰다) `missing_parts`만 최신값으로
     바꾸고 `attempts`를 늘린다. 누락이 없어졌으면(이번에 다 채웠거나 애초에
     없었으면) 기존 마커를 지운다. `backfill.enabled`가 아닌 소스는 채울 방법이
-    없는 마커를 쌓지 않도록 아예 건드리지 않는다 — 마커 만료 판정은 Airflow
-    백필 DAG의 책임이라 여기서는 `expires_at`만 계산해 남긴다.
+    없는 마커를 쌓지 않도록 아예 건드리지 않는다. 이 경로는 기존 설정과 수동
+    도구의 호환용이며, 여기서는 `expires_at`만 계산해 남긴다.
 
     args:
         config: `backfill` 설정을 담은 소스 설정.
@@ -232,9 +233,9 @@ def _now() -> datetime:
 
 
 def get_backfill_targets(config: SourceConfig) -> list[dict[str, str]]:
-    """Airflow 백필 DAG에 반환할 백필 대상 목록을 조회한다.
+    """legacy 백필 실행 도구에 반환할 백필 대상 목록을 조회한다.
 
-    만료된 마커나 백필이 비활성화된 소스는 거르고, Airflow가 실행에 필요한 최소한의
+    만료된 마커나 백필이 비활성화된 소스는 거르고, 실행에 필요한 최소한의
     정보(source_id, window_start)만 JSON 반환용 dict로 추려 반환한다.
     """
     if config.backfill is None or not config.backfill.enabled:
@@ -302,7 +303,6 @@ def execute_window(
         if hasattr(adapter_cls, "planned_parts")
         else None
     )
-
     def _effective_plan(
         completed: tuple[str, ...],
         missing: tuple[str, ...] = (),
@@ -384,16 +384,25 @@ def execute_window(
         and existing.stage.value >= Stage.BRONZE_WRITTEN.value
         and not force
     ):
-        # 분기 4: 백필 — 기존 조각은 그대로 두고(clear_bronze 없이) 누락분만 받는다.
-        # COMPLETED에서 누락이 있든(PARTIAL), FETCH_ERROR로 BRONZE_WRITTEN에서 멈췄든
-        # 둘 다 이 분기를 타서 남은 조각을 마저 채운다.
+        # 분기 4: legacy 백필. 기존 snapshot은 보존하고, 기존 성공 조각과 새 누락
+        # 조각을 합친 새 Hot revision을 만든다.
         have_parts = existing.artifacts.bronze.parts
+        prior_revision = existing.artifacts.bronze.revision
         prior_chunks = dict(
             zip(
                 have_parts,
-                storage.read_bronze(config.source_id, window_start, have_parts),
+                storage.read_bronze(
+                    config.source_id, window_start, have_parts, prior_revision
+                ),
             )
         )
+        bronze_revision = storage.next_bronze_revision(
+            config.source_id, window_start
+        )
+        for key, payload in prior_chunks.items():
+            storage.write_bronze_part(
+                config.source_id, window_start, key, payload, bronze_revision
+            )
         round_result = fetch_with_rounds(
             adapter_cls.fetch,
             config,
@@ -403,7 +412,7 @@ def execute_window(
             expected_total=existing.counts.expected,
             sleep_fn=sleep_fn,
             on_chunk=lambda key, payload: storage.write_bronze_part(
-                config.source_id, window_start, key, payload
+                config.source_id, window_start, key, payload, bronze_revision
             ),
             planned_parts=planned_parts,
         )
@@ -417,14 +426,24 @@ def execute_window(
         )
         attempt = existing.attempt + 1
         revision_base = existing.revision
-    elif existing and existing.stage.value >= Stage.BRONZE_WRITTEN.value and not force:
+    elif (
+        existing
+        and existing.stage.value >= Stage.BRONZE_WRITTEN.value
+        and not force
+    ):
         # 분기 2: bronze 재사용 — 이전 실행이 fetch까지는 끝냈지만(예: silver 쓰기
         # 실패로 VALIDATED에서 멈췄음) 그 뒤에서 죽은 경우다. 지금 다시 fetch하면
         # 실시간 API에서는 그 시점의 다른 데이터를 받게 되므로, 반드시 이전에 저장된
         # bronze 조각을 그대로 재사용한다.
         parts = existing.artifacts.bronze.parts
+        bronze_revision = existing.artifacts.bronze.revision
         chunks = dict(
-            zip(parts, storage.read_bronze(config.source_id, window_start, parts))
+            zip(
+                parts,
+                storage.read_bronze(
+                    config.source_id, window_start, parts, bronze_revision
+                ),
+            )
         )
         # 조각 자체는 재시도하지 않으므로 실제 실패 종류는 중요하지 않다 — 아래
         # 게이트 계산이 "재시도 불가능한 누락"으로만 취급하면 되므로 PERMANENT로 채운다.
@@ -433,9 +452,12 @@ def execute_window(
         attempt = existing.attempt + 1
         revision_base = existing.revision
     else:
-        # 분기 3(또는 --force): 처음부터 전체 fetch. 조각 수가 실행마다 달라질 수
-        # 있으므로(예: 5조각 → 3조각) 이전 실행의 유령 조각이 남지 않도록 먼저 지운다.
-        storage.clear_bronze(config.source_id, window_start)
+        # 분기 3(또는 --force): 처음부터 전체 fetch하되 이전 원본은 지우지 않는다.
+        # 새 immutable revision 경로라 조각 수가 줄어도 이전 실행의 유령 조각이
+        # 현재 snapshot에 섞이지 않는다.
+        bronze_revision = storage.next_bronze_revision(
+            config.source_id, window_start
+        )
         round_result = fetch_with_rounds(
             adapter_cls.fetch,
             config,
@@ -443,7 +465,7 @@ def execute_window(
             client=client,
             sleep_fn=sleep_fn,
             on_chunk=lambda key, payload: storage.write_bronze_part(
-                config.source_id, window_start, key, payload
+                config.source_id, window_start, key, payload, bronze_revision
             ),
             planned_parts=planned_parts,
         )
@@ -456,7 +478,13 @@ def execute_window(
     bronze_parts = tuple(sorted(chunks))
     authority_planned_parts = _effective_plan(bronze_parts, tuple(sorted(missing_keys)))
     artifacts = Artifacts(
-        bronze=BronzeArtifacts(prefix=config.source_id, parts=bronze_parts)
+        bronze=BronzeArtifacts(
+            prefix=storage.bronze_prefix(
+                config.source_id, window_start, bronze_revision
+            ),
+            parts=bronze_parts,
+            revision=bronze_revision,
+        )
     )
 
     def _base_manifest(**over) -> Manifest:
@@ -557,7 +585,7 @@ def execute_window(
     if FetchErrorKind.FATAL in missing_keys.values():
         # FATAL(인증 오류 등)은 나머지 조각도 같은 이유로 실패할 게 뻔하므로, 게이트
         # 계산도 검증도 건너뛰고 즉시 끝낸다. stage는 기본값 BRONZE_WRITTEN 그대로
-        # 둔다 — 다음 실행이 분기 2로 들어가 재계산하게 하기 위해서다.
+        # 둔다 — 실행 내부 round는 중단하고 Airflow 재실행 정책에 판정을 넘긴다.
         logger.error(
             "stage=bronze_written status=failed failure_reason=fetch_error reason=fatal"
         )
@@ -639,7 +667,7 @@ def execute_window(
 
     if ratio > config.quality.max_missing_ratio:
         # 완결도 게이트 초과 — silver를 쓰지 않고 fetch_error로 끝낸다. stage는
-        # BRONZE_WRITTEN 그대로라 재실행(또는 백필)하면 분기 2/4로 들어간다.
+        # BRONZE_WRITTEN 그대로라 재실행하면 기존 Bronze 재사용 분기로 들어간다.
         logger.error(
             "stage=bronze_written status=failed failure_reason=fetch_error "
             f"parts={parts_summary} missing_ratio={ratio:.3f}"

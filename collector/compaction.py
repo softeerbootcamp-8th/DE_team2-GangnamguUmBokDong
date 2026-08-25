@@ -4,8 +4,8 @@
 
 수집은 윈도우마다 파일 하나를 쓴다. 5분 소스는 하루 288개다. 하루치를 읽으려면 수백
 개를 열어야 하고 작은 파일이 계속 쌓인다. 이 모듈은 그것을 날짜당 하나로 묶는다.
-**무손실 재배치이며 원본 silver는 지우지 않는다** — loader·ml_core·nowcaster가 읽고
-있다.
+이 단계 자체는 Silver를 지우지 않는다. 후속 GC가 검증된 Archive와 Cold Bronze가
+있는 날짜에서 최신 authority가 아닌 Silver만 별도로 정리한다.
 
 ## 설계상 중요한 네 가지
 
@@ -41,13 +41,12 @@ from datetime import date, datetime, timedelta
 from math import ceil
 from zoneinfo import ZoneInfo
 
-import pyarrow as pa
-from core.s3 import S3Object, read_parquet
-from core.source_snapshot import SourceSnapshotManifest, SourceSnapshotStatus
-
 import manifest as manifest_module
+import pyarrow as pa
 import storage
 from config.schema import SourceConfig
+from core.s3 import S3Object, read_parquet
+from core.source_snapshot import SourceSnapshotManifest, SourceSnapshotStatus
 from manifest import RunStatus, Stage
 
 logger = logging.getLogger(__name__)
@@ -55,9 +54,10 @@ logger = logging.getLogger(__name__)
 _KST = ZoneInfo("Asia/Seoul")
 
 # 배치가 안 돈 날을 되채우는 하한. airflow가 CATCHUP=False로 돌아서 놓친 스케줄은
-# 다시 실행되지 않으므로, 검사 범위가 그걸 복구하는 유일한 수단이다. 백필 설정과는
-# 목적이 다르므로 값을 따로 둔다.
-RECOVERY_DAYS = 7
+# 다시 실행되지 않으므로, 검사 범위가 그걸 복구하는 유일한 수단이다. D-6 대여이력
+# correction 뒤 compaction만 실패해도 다음 날 D-7에서 한 번 더 복구할 수 있도록
+# 오늘을 포함한 8일을 본다. 지연 fetch backfill 설정과는 목적이 다르다.
+RECOVERY_DAYS = 8
 
 # yaml의 types는 선언 순서대로 시도해 첫 성공을 채택하므로(validation/engine.py:42)
 # types[0]이 곧 실효 타입이다. `[str, int]`는 str()이 거의 실패하지 않아 항상 str이 된다.
@@ -520,6 +520,16 @@ def _authority_signature(authority: _DateAuthority) -> str:
     ).hexdigest()
 
 
+def resolve_date_authority(
+    config: SourceConfig, day: date
+) -> tuple[_DateAuthority, str]:
+    """날짜의 최신 Silver authority와 변경 감지 signature를 함께 반환한다."""
+    objects = storage.list_silver_objects(config.source_id, day)
+    windows = storage.list_source_snapshot_windows(config.source_id, day)
+    authority = _select_date_authority(config, objects, windows)
+    return authority, _authority_signature(authority)
+
+
 def _backfill_window_closed(config: SourceConfig, day: date, today: date) -> bool:
     """이 날짜의 silver가 더 채워질 가능성이 없는지 판정한다.
 
@@ -614,6 +624,9 @@ def compact_date(
             "completeness": authority.completed_windows / expected,
             "backfill_window_closed": _backfill_window_closed(config, day, today),
             "rows": table.num_rows,
+            "selected_silver_keys": [
+                item.object.key for item in authority.selected
+            ],
             "compacted_at": datetime.now(tz=_KST).isoformat(),
         },
     )

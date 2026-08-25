@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from airflow import DAG
 from airflow.providers.standard.operators.bash import BashOperator
 from airflow.task.trigger_rule import TriggerRule
-
 from config.schedules import DB_LOADER_EXECUTION_TIMEOUT
+
+from airflow import DAG
 from orchestration.task_builder import REPO_ROOT, build_module_task
 from orchestration.templates import KST_WINDOW_START
 
@@ -21,7 +21,7 @@ _SOURCE_PUBLICATIONS = frozenset(
 
 
 def build_gold_publisher_task(dag: DAG, publication: str) -> BashOperator:
-    """허용된 원천 Gold publication을 fail-closed 태스크로 만든다."""
+    """행사 authority를 게시하고 검증된 PARTIAL이면 기존 Gold를 유지한다."""
     if publication not in _SOURCE_PUBLICATIONS:
         raise ValueError(f"지원하지 않는 원천 Gold publication입니다: {publication}")
 

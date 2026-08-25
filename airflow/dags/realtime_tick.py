@@ -22,9 +22,11 @@ from __future__ import annotations
 from datetime import timedelta
 
 import pendulum
+from airflow import DAG
 from airflow.providers.standard.operators.empty import EmptyOperator
 from airflow.task.trigger_rule import TriggerRule
 from airflow.timetables.trigger import CronTriggerTimetable
+
 from callbacks.task_callbacks import on_failure_callback, on_success_callback
 from config.schedules import (
     CATCHUP,
@@ -35,25 +37,25 @@ from config.schedules import (
 from config.sources import (
     REALTIME_5MIN_SOURCES,
     RENTAL_HISTORY_LOOKBACK_HOURS,
-    WEATHER_10MIN_SOURCE,
     WEATHER_3H_SOURCE,
+    WEATHER_10MIN_SOURCE,
     WEATHER_ULTRA_SHORT_FORECAST_SOURCE,
 )
 from orchestration.collector_task import (
     build_collector_replay_task,
     build_collector_task,
+    build_population_collector_task,
     build_weather_freshness_gate_task,
 )
 from orchestration.inference_task import build_inference_task
 from orchestration.normalizer_task import build_normalizer_task
+from orchestration.poi_master_task import build_poi_master_resolve_task
 from orchestration.routes_task import build_routes_task
 from orchestration.serving_task import (
     build_finalize_serving_task,
     build_prepare_serving_task,
 )
 from orchestration.urgency_task import build_urgency_task
-
-from airflow import DAG
 
 # 초단기(실황+예보)는 10분, 단기예보는 3시간 — 기상청이 그보다 자주 새 값을 내지
 # 않으므로, 마지막 성공 수집이 이보다 최근이면 이번 tick은 건너뛴다.
@@ -94,11 +96,21 @@ def _build_realtime_tick_dag() -> DAG:
         max_active_runs=MAX_ACTIVE_RUNS,
         tags=["realtime"],
     ) as dag:
+        resolve_poi_master = build_poi_master_resolve_task(dag)
         collector_tasks = {
             source_id: build_collector_task(dag, source_id)
             for source_id in REALTIME_5MIN_SOURCES
+            if source_id != "population_realtime"
         }
-        run_normalizer = build_normalizer_task(dag)
+        collector_tasks["population_realtime"] = build_population_collector_task(
+            dag,
+            poi_master_task_id=resolve_poi_master.task_id,
+        )
+        run_normalizer = build_normalizer_task(
+            dag,
+            poi_master_task_id=resolve_poi_master.task_id,
+        )
+        resolve_poi_master >> collector_tasks["population_realtime"]
         collector_tasks["population_realtime"] >> run_normalizer
 
         weather_collect_tasks = []

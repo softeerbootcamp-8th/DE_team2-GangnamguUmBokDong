@@ -1,7 +1,7 @@
 # Gold 원천–목표 매핑
 
 > 상태: 현재 계약<br>
-> 코드 확인일: 2026-08-24
+> 코드 확인일: 2026-08-25
 
 이 문서는 Collector source, 기준정보 seed, 모델 추론과 재배치 산출물이 어떤 Gold publication과 API로 이어지는지 추적한다. 물리 column은 `data-dictionary.md`, table 관계는 `target-erd.md`, exact manifest 계약은 `publication-contract-v1.md`를 따른다.
 
@@ -169,6 +169,10 @@ Source 기반 publisher는 다음을 검증한다.
 - dependency publication state가 준비 이후 바뀌지 않음
 
 `PARTIAL`, `FAILED`, 임의의 legacy Silver key 또는 수정된 manifest bytes는 Gold publication 근거가 될 수 없다.
+문화·공연행사 CLI는 completed PARTIAL diagnostic을 새 Gold 입력으로 쓰지 않는다. 기존
+`publication_state`와 그 content-addressed publication manifest가 일치하는지 확인해
+Gold 행과 state를 변경하지 않을지를 결정하는 근거로만 사용한다. 이 경로에서 event
+output artifact 전체나 현재 DB 행을 다시 물질화해 검증하지는 않는다.
 
 ## Gold에 의도적으로 두지 않는 데이터
 

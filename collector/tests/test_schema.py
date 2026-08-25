@@ -3,6 +3,8 @@
 from datetime import timedelta
 
 import pytest
+from pydantic import ValidationError
+
 from config.schema import (
     Backfill,
     ColumnSpec,
@@ -15,7 +17,6 @@ from config.schema import (
     Storage,
     _parse_duration,
 )
-from pydantic import ValidationError
 
 
 class TestParseDuration:
@@ -146,7 +147,6 @@ class TestFetch:
 
     def test_budget_parses(self):
         assert Fetch(budget="2m30s").budget == timedelta(minutes=2, seconds=30)
-
 
 class TestBackfill:
     def test_disabled_without_max_age_ok(self):

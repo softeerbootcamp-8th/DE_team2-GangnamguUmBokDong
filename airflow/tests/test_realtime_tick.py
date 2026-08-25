@@ -9,6 +9,7 @@ from airflow.providers.standard.operators.empty import EmptyOperator
 from airflow.providers.standard.operators.python import ShortCircuitOperator
 from airflow.task.trigger_rule import TriggerRule
 from airflow.timetables.trigger import CronTriggerTimetable
+
 from config.schedules import REALTIME_TICK_CRON, TIMEZONE
 from config.sources import REALTIME_5MIN_SOURCES, RENTAL_HISTORY_LOOKBACK_HOURS
 from dags.realtime_tick import dag
@@ -34,6 +35,7 @@ def _core_task_ids() -> set[str]:
         {f"collect_{source}" for source in REALTIME_5MIN_SOURCES}
         | {
             "run_normalizer",
+            "resolve_poi_master",
             "prepare_serving_plan",
             "run_inference",
             "finalize_serving_release",
@@ -99,6 +101,49 @@ def test_inference_waits_for_plan_normalizer_and_rental_input() -> None:
         "collect_population_realtime"
     }
     assert inference.trigger_rule == TriggerRule.ALL_SUCCESS
+
+
+def test_population_and_normalizer_share_one_pinned_poi_master() -> None:
+    """실시간 인구 수집과 공간 보정이 같은 resolver XCom만 사용한다."""
+    resolver = dag.get_task("resolve_poi_master")
+    population = dag.get_task("collect_population_realtime")
+    normalizer = dag.get_task("run_normalizer")
+
+    assert population.upstream_task_ids == {resolver.task_id}
+    assert normalizer.upstream_task_ids == {population.task_id}
+    assert population.env == normalizer.env == {
+        "POI_MASTER_MODE": (
+            "{{ ti.xcom_pull(task_ids='resolve_poi_master')['mode'] }}"
+        ),
+        "POI_MASTER_MANIFEST_URI": (
+            "{{ ti.xcom_pull(task_ids='resolve_poi_master')"
+            ".get('manifest_uri') or '' }}"
+        ),
+        "POI_MASTER_MANIFEST_SHA256": (
+            "{{ ti.xcom_pull(task_ids='resolve_poi_master')"
+            ".get('manifest_sha256') or '' }}"
+        ),
+    }
+    for task in (population, normalizer):
+        assert '--poi-master-mode "$POI_MASTER_MODE"' in task.bash_command
+        assert (
+            '--poi-master-manifest-uri "$POI_MASTER_MANIFEST_URI"'
+            in task.bash_command
+        )
+        assert (
+            '--poi-master-manifest-sha256 "$POI_MASTER_MANIFEST_SHA256"'
+            in task.bash_command
+        )
+
+
+def test_other_collectors_do_not_receive_poi_master_arguments() -> None:
+    """POI Master 계약이 population 외 Collector의 CLI를 바꾸지 않는다."""
+    for source_id in REALTIME_5MIN_SOURCES:
+        if source_id == "population_realtime":
+            continue
+        task = dag.get_task(f"collect_{source_id}")
+        assert "--poi-master-" not in task.bash_command
+        assert task.env is None
 
 
 def test_derived_publication_is_one_strict_chain() -> None:

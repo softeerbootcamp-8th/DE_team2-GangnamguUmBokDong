@@ -153,13 +153,21 @@ bike_rental_history → 1시간 전 replay  (serving과 독립된 side chain)
 - `cultural_event → event:cultural_event Gold 게시`
 - `performance_event → event:performance_event Gold 게시`
 
+생활인구 Collector가 `PARTIAL`이면 authority가 없으므로 actual Archive 승격은 건너뛰되,
+기존 Archive 기반 nowcast 추정 로직은 계속 실행한다. Exact authority가 비어 있는 것과
+달리 revision·manifest·Silver checksum이 손상되면 Nowcaster는 fail-closed한다. 행사
+`PARTIAL`은 새 Gold를 게시하지 않는다. 기존 `publication_state`와 content-addressed
+manifest가 일치하면 Gold 행과 state를 변경하지 않고 CLI는 `stale`로 성공하지만, 최초
+실행처럼 유지할 state가 없거나 기존 manifest가 손상됐으면 해당 행사 branch가 실패한다.
+세 branch는 독립이므로 한 행사 실패가 생활인구나 다른 행사 branch를 막지 않는다.
+
 ### 대여소 마스터
 
 `bike_station_master`를 수집한 뒤 `station_master_enriched`를 만든다. realtime plan과 inference가 이 보강 결과를 필수 입력으로 사용한다.
 
 ### 일별 compaction
 
-D-6의 대여이력 24개 시간대를 순차적으로 강제 재조회한다. 각 시간대는 `ALL_DONE`으로 다음 시간대를 계속 시도하며, 마지막에는 성공 여부와 무관하게 대여이력 compaction을 실행한다. 다른 compaction source는 이 replay chain과 독립적으로 실행된다.
+D-6의 대여이력 24개 시간대를 순차적으로 강제 재조회한다. 각 시간대는 `ALL_DONE`으로 다음 시간대를 계속 시도하며, 마지막에는 성공 여부와 무관하게 대여이력 compaction을 실행한다. 대여소 실시간·실시간 생활인구·초단기실황 compaction은 이 replay chain과 독립적으로 실행된다. Silver Archive 대상은 4개 source지만, 공통 Hot Bronze 30일 Lifecycle 전에 모든 Collector source를 D-6 날짜 단위 Cold Bronze로 장기 보존한다. D-36 날짜에서는 모든 source의 30일 지난 non-authority Silver를 정리한다. Archive 대상 4개는 Cold와 Archive를 모두 검증하고, 나머지는 Cold를 검증하며 최신 authority는 항상 유지한다.
 
 ### 월별 모델 점검
 

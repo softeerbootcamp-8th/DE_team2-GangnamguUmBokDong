@@ -18,8 +18,13 @@ Adapter가 S3 저장까지 담당하면 외부 API 규약과 저장소 책임이
 2. Pipeline은 성공 응답을 받는 즉시 요청 식별 key로 Bronze 조각을 저장한다.
 3. Adapter는 저장소를 모르며, `normalize`는 네트워크를 사용하지 않고 전체 조각을 행 목록으로 변환한다.
 4. Pipeline은 window 전체를 정규화·검증한 뒤 Silver Parquet 하나를 만든다. 품질 게이트를 통과하기 전에는 Silver를 쓰지 않는다.
-5. 일반 재수집은 기존 Bronze prefix를 비운 뒤 시작한다. 재개와 backfill은 manifest가 가리키는 조각만 읽어 이전 실행의 잔여 조각이 섞이지 않게 한다.
+5. 일반 재수집과 backfill correction은 기존 원본을 비우지 않고 새 immutable Hot
+   Bronze revision에 쓴다. 재개는 manifest가 가리키는 revision과 조각만 읽어 이전
+   실행의 잔여 조각이 섞이지 않게 한다. 같은 실행의 transient 다음 라운드는 이미
+   성공한 조각을 유지하고 누락 조각만 같은 revision에 추가한다.
 6. 현재 window 크기에서는 조각 payload와 정규화 행을 메모리에 유지한다. 규모가 커지면 Bronze 재읽기 또는 별도 처리 경계를 다시 결정한다.
+7. 검증된 날짜의 모든 Hot revision은 원본 gzip bytes를 보존하는 날짜 단위 Cold
+   Bronze로 묶고, Hot 객체만 30일 뒤 만료한다.
 
 ## 근거
 

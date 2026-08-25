@@ -73,6 +73,7 @@ class BronzeArtifacts(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
     prefix: str
     parts: tuple[str, ...] = ()
+    revision: int | None = None
 
 
 class Artifacts(BaseModel):

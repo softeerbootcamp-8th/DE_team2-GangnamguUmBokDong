@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import TYPE_CHECKING
@@ -642,6 +643,9 @@ def _fetch_probe_pages(
         page_start += page_size
 
 
+_POI_CODE_PATTERN = re.compile(r"POI[0-9]{3}\Z")
+
+
 def _population_poi_numbers(params: dict) -> tuple[int, ...]:
     """설정 범위에서 명시된 결번을 제외한 POI 번호를 반환한다."""
     poi_start = int(params.get("poi_start", 1))
@@ -667,6 +671,42 @@ def _population_poi_numbers(params: dict) -> tuple[int, ...]:
     return numbers
 
 
+def _population_poi_codes(params: dict) -> tuple[str, ...]:
+    """동적 POI Master 코드 또는 legacy YAML 범위를 검증해 코드 튜플로 반환한다.
+
+    ``poi_codes``는 CLI가 exact POI Master를 한 번 읽어 주입하는 런타임 값이다.
+    이 값이 없을 때만 기존 ``poi_start``/``poi_end``/``poi_exclude`` 설정으로
+    되돌아가므로 static 배포와 기존 테스트의 동작을 그대로 보존한다.
+
+    args:
+        params: 서울 OpenAPI adapter 파라미터
+    returns:
+        중복 없이 오름차순으로 정렬된 POI 코드 튜플
+    raises:
+        ValueError: 동적 코드가 튜플·형식·고유성·정렬·비어 있지 않음 계약을 위반할 때
+    """
+    if "poi_codes" not in params:
+        return tuple(f"POI{number:03d}" for number in _population_poi_numbers(params))
+
+    raw_codes = params["poi_codes"]
+    if type(raw_codes) is not tuple:
+        raise ValueError("citydata_ppltn의 poi_codes는 정렬된 tuple이어야 합니다")
+    if not raw_codes:
+        raise ValueError("citydata_ppltn의 POI 요청 대상이 비어 있습니다")
+    if any(
+        type(code) is not str or _POI_CODE_PATTERN.fullmatch(code) is None
+        for code in raw_codes
+    ):
+        raise ValueError(
+            "citydata_ppltn의 poi_codes는 POI와 ASCII 숫자 3자리 형식이어야 합니다"
+        )
+    if len(set(raw_codes)) != len(raw_codes):
+        raise ValueError("citydata_ppltn의 poi_codes에 중복 코드가 있습니다")
+    if raw_codes != tuple(sorted(raw_codes)):
+        raise ValueError("citydata_ppltn의 poi_codes는 오름차순이어야 합니다")
+    return raw_codes
+
+
 @adapter("seoul_openapi")
 class SeoulOpenApiAdapter:
     """서울 열린데이터광장 공용 페이지네이션 규약 어댑터."""
@@ -687,7 +727,7 @@ class SeoulOpenApiAdapter:
         if params["service"] != "citydata_ppltn":
             return None
         return frozenset(
-            f"poi-POI{i:03d}" for i in _population_poi_numbers(params)
+            f"poi-{poi_code}" for poi_code in _population_poi_codes(params)
         )
 
     @staticmethod
@@ -717,12 +757,11 @@ class SeoulOpenApiAdapter:
                 window_end=window.window_end,
                 window_last=window.window_start - timedelta(seconds=1),
             )
-        # citydata_ppltn은 페이지네이션 대신 YAML에 선언된 POI 범위를 순회한다.
-        # 장소가 늘거나 결번이 바뀔 때 공통 코드를 고치지 않고 설정만 갱신한다.
+        # citydata_ppltn은 페이지네이션 대신 이번 실행에 고정된 POI 코드를 순회한다.
+        # S3 Master를 쓰지 않는 배포에서는 같은 함수가 legacy YAML 범위를 반환한다.
         if service == "citydata_ppltn":
             pois = []
-            for i in _population_poi_numbers(params):
-                poi_id = f"POI{i:03d}"
+            for poi_id in _population_poi_codes(params):
                 key = f"poi-{poi_id}"
                 if key not in skip:
                     url = f"{_BASE_URL}/{_api_key()}/json/{service}/1/5/{poi_id}/"
