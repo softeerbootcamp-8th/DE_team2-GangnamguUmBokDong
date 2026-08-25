@@ -51,6 +51,7 @@ from orchestration.aws_infra_task import (
     EMR_S3_SCRIPTS_PREFIX,
     MOCK_OVERRIDE_FORCE_MOCK,
     MOCK_OVERRIDE_FORCE_REAL,
+    S3_BUCKET,
     TRAINING_RUNS_PREFIX,
     create_emr_cluster,
     get_core_instance_group_id,
@@ -96,7 +97,10 @@ def _result_s3_key(run_id: str, name: str) -> str:
 
 
 def _bash_step(name: str, command: str) -> tuple[str, list[str]]:
-    return name, ["bash", "-c", command]
+    # command-runner.jar이 물려주는 환경(EMR controller.gz 실측 확인, 2026-08-25)에는
+    # S3_BUCKET이 없어 core.s3/ml_core가 잘못된 기본 버킷("gangnamgu")으로 떨어진다
+    # — Airflow 쪽 aws_infra_task.S3_BUCKET과 반드시 같은 값을 명시적으로 넘긴다.
+    return name, ["bash", "-c", f"export S3_BUCKET={S3_BUCKET} && {command}"]
 
 
 def _task_id(model_name: str, name: str) -> str:
@@ -231,6 +235,12 @@ def make_task_orchestrate_retrain_loop(model_name: str) -> Any:
                             f"spark.yarn.appMasterEnv.ML_PROFILE={profile}",
                             "--conf",
                             f"spark.executorEnv.ML_PROFILE={profile}",
+                            # S3_BUCKET도 ML_PROFILE과 같은 이유로 명시해야 한다 — 없으면
+                            # ml/feature_engine/spark/config.py가 "local-dev"로 떨어진다.
+                            "--conf",
+                            f"spark.yarn.appMasterEnv.S3_BUCKET={S3_BUCKET}",
+                            "--conf",
+                            f"spark.executorEnv.S3_BUCKET={S3_BUCKET}",
                             f"{EMR_S3_SCRIPTS_PREFIX}/run_pipeline.py",
                         ],
                     ),
@@ -246,6 +256,10 @@ def make_task_orchestrate_retrain_loop(model_name: str) -> Any:
                             f"spark.yarn.appMasterEnv.ML_PROFILE={profile}",
                             "--conf",
                             f"spark.executorEnv.ML_PROFILE={profile}",
+                            "--conf",
+                            f"spark.yarn.appMasterEnv.S3_BUCKET={S3_BUCKET}",
+                            "--conf",
+                            f"spark.executorEnv.S3_BUCKET={S3_BUCKET}",
                             f"{EMR_S3_SCRIPTS_PREFIX}/build_multi_horizon_features.py",
                         ],
                     ),
