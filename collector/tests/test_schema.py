@@ -147,6 +147,15 @@ class TestFetch:
     def test_budget_parses(self):
         assert Fetch(budget="2m30s").budget == timedelta(minutes=2, seconds=30)
 
+    def test_retry_mode_defaults_to_refetch_all(self):
+        """설정 생략 시 mutable snapshot에 안전한 전체 재수집을 사용한다."""
+        assert Fetch().retry_mode == "refetch_all"
+
+    def test_retry_mode_rejects_unknown_value(self):
+        """Bronze reuse처럼 실패 단계가 결정할 값을 source fetch 정책으로 받지 않는다."""
+        with pytest.raises(ValidationError):
+            Fetch(retry_mode="reuse")
+
 
 class TestBackfill:
     def test_disabled_without_max_age_ok(self):
@@ -223,3 +232,15 @@ class TestSourceConfig:
             schedule={"interval": "10m"}, fetch={"budget": "2m30s"}
         )
         assert config.effective_fetch_budget() == timedelta(minutes=2, seconds=30)
+
+    def test_effective_fetch_retry_mode_defaults_without_fetch_config(self):
+        """fetch 블록 자체가 없는 기존 source도 전체 재수집 기본값을 얻는다."""
+        config = _minimal_source_config()
+
+        assert config.effective_fetch_retry_mode() == "refetch_all"
+
+    def test_effective_fetch_retry_mode_uses_explicit_value(self):
+        """안정적인 조각 source는 누락 재시도를 명시할 수 있다."""
+        config = _minimal_source_config(fetch={"retry_mode": "retry_missing"})
+
+        assert config.effective_fetch_retry_mode() == "retry_missing"

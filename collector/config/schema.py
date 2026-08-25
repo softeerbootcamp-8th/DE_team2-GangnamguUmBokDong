@@ -143,7 +143,7 @@ class Quality(BaseModel):
 
 
 class Fetch(BaseModel):
-    """API 호출할 때, 얼마나 오랫동안 시도할지 설정하는 모델"""
+    """API 호출 예산과 fetch 실패 뒤 재수집 방식을 설정하는 모델."""
 
     # Pydantic 모델 configuration
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -151,6 +151,11 @@ class Fetch(BaseModel):
     # API 호출에 사용할 수 있는 최대 시간
     # None으로 두어도, SourceConfig 모델에서 자동 설정됨.
     budget: Duration | None = None
+
+    # 한 실행 안의 transient round와 Airflow가 같은 window를 다시 실행할 때 적용한다.
+    # 현재값·페이지 경계가 바뀌는 API는 전체를 다시 받고, logical window로 발표본과
+    # 조각 key가 고정되는 API만 누락 조각을 이어 받는다.
+    retry_mode: Literal["refetch_all", "retry_missing"] = "refetch_all"
 
 
 class Backfill(BaseModel):
@@ -234,3 +239,8 @@ class SourceConfig(BaseModel):
         if self.fetch and self.fetch.budget:
             return self.fetch.budget
         return min(self.schedule.interval / 2, timedelta(minutes=30))
+
+    def effective_fetch_retry_mode(self) -> Literal["refetch_all", "retry_missing"]:
+        """fetch 설정이 없으면 안전한 전체 재수집 정책을 반환한다."""
+
+        return self.fetch.retry_mode if self.fetch else "refetch_all"
