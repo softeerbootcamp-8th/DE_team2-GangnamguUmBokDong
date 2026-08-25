@@ -1,15 +1,14 @@
-"""재배치 정책 v4 any-depletion의 공급원 보호 불변조건을 검증한다."""
+"""재배치 정책 v5 정원보존의 공급원 보호 불변조건을 검증한다."""
 
 import pytest
 from core.gold_publication import ContractViolation
 from gold.rebalance_policy import (
     DEFAULT_REBALANCE_POLICY,
     LEGACY_REBALANCE_POLICY,
-    PICKUP_DONOR_GUARD_ANY_DEPLETION_V1,
     PICKUP_DONOR_GUARD_NONE,
+    PICKUP_DONOR_GUARD_CAPACITY_RESERVE_V1,
     REBALANCE_POLICY_CONFIG_SCHEMA_VERSION,
-    RISK_BAND_REBALANCE_POLICY_V4,
-    pickup_fraction_token,
+    RISK_BAND_REBALANCE_POLICY_V5,
     risk_band_policy,
 )
 
@@ -20,7 +19,6 @@ def test_risk_band_default_cooldown_matches_protection_horizon() -> None:
         protection_horizon_hours=3,
         minimum_stock_ratio=0.2,
         uncertainty_z=1.645,
-        max_pickup_stock_fraction=0.02,
     )
 
     assert policy.pickup_cooldown_minutes == 180
@@ -34,51 +32,31 @@ def test_risk_band_rejects_cooldown_shorter_than_protection_horizon() -> None:
             protection_horizon_hours=2,
             minimum_stock_ratio=0.2,
             uncertainty_z=1.645,
-            max_pickup_stock_fraction=0.02,
             pickup_cooldown_minutes=119,
         )
 
 
-def test_default_risk_band_policy_is_v4_calibration_candidate() -> None:
-    """Gold 기본 정책을 donor guard 교정 후보의 exact 파라미터로 고정한다."""
-    assert DEFAULT_REBALANCE_POLICY is RISK_BAND_REBALANCE_POLICY_V4
+def test_default_risk_band_policy_is_v5_capacity_reserve_candidate() -> None:
+    """Gold 기본 정책을 정원보존 후보의 exact 파라미터로 고정한다."""
+    assert DEFAULT_REBALANCE_POLICY is RISK_BAND_REBALANCE_POLICY_V5
     assert DEFAULT_REBALANCE_POLICY.version == (
-        "rebalance-risk-band-v4-any-depletion-h2-r0.20-z1.645-"
-        "f0300bp-cooldown120-exclusive1"
+        "rebalance-risk-band-v5-capacity-reserve-h2-r0.20-z1.645-"
+        "cooldown120-exclusive1"
     )
     assert DEFAULT_REBALANCE_POLICY.protection_horizon_hours == 2
     assert DEFAULT_REBALANCE_POLICY.minimum_stock_ratio == 0.2
     assert DEFAULT_REBALANCE_POLICY.uncertainty_z == 1.645
-    assert DEFAULT_REBALANCE_POLICY.max_pickup_stock_fraction == 0.03
     assert DEFAULT_REBALANCE_POLICY.pickup_cooldown_minutes == 120
     audit = DEFAULT_REBALANCE_POLICY.audit_document()
     assert audit["schema_version"] == REBALANCE_POLICY_CONFIG_SCHEMA_VERSION
     assert audit["pickup_donor_guard"] == (
-        PICKUP_DONOR_GUARD_ANY_DEPLETION_V1
+        PICKUP_DONOR_GUARD_CAPACITY_RESERVE_V1
     )
 
 
 def test_legacy_policy_audits_no_pickup_donor_guard() -> None:
-    """Legacy 비교군은 any-depletion 동작을 적용하지 않았음을 기록한다."""
+    """Legacy 비교군은 정원보존 동작을 적용하지 않았음을 기록한다."""
     assert (
         LEGACY_REBALANCE_POLICY.audit_document()["pickup_donor_guard"]
         == PICKUP_DONOR_GUARD_NONE
     )
-
-
-def test_pickup_fraction_token_distinguishes_sub_percent_candidates() -> None:
-    """Basis-point 토큰은 1%·1.5%·2% 후보를 서로 다르게 식별한다."""
-    assert tuple(
-        pickup_fraction_token(value) for value in (0.01, 0.015, 0.02)
-    ) == ("f0100bp", "f0150bp", "f0200bp")
-
-
-def test_risk_band_rejects_fraction_below_basis_point_granularity() -> None:
-    """Fingerprint로 구분할 수 없는 basis-point 미만 fraction을 거부한다."""
-    with pytest.raises(ContractViolation, match="0.0001 단위"):
-        risk_band_policy(
-            protection_horizon_hours=2,
-            minimum_stock_ratio=0.2,
-            uncertainty_z=1.645,
-            max_pickup_stock_fraction=0.01555,
-        )

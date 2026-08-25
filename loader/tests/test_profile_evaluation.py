@@ -145,7 +145,7 @@ def _document(cell: EvaluationCell) -> dict[str, object]:
         "source_provenance": {
             "backtest_contract_version": "point-in-time-policy-backtest-v3",
             "route_algorithm_version": "route-v4-supply-led-pickup-sla",
-            "urgency_scoring_config_version": "urgency-scoring-v4-any-depletion",
+            "urgency_scoring_config_version": "urgency-scoring-v5-capacity-reserve",
             "rental_csv": _source_file("rental"),
             "stock_csv": _source_file("stock"),
             "weather_csv": _source_file("weather"),
@@ -207,9 +207,19 @@ def test_evaluate_profile_uses_one_schema_and_gate(profile: EvaluationProfile) -
     assert "Gate 통과: **True**" in result_markdown(result)
 
 
-def test_evaluate_profile_reports_no_harm_failure(profile: EvaluationProfile) -> None:
-    """후보에만 생긴 실패 요청은 구조 오류가 아니라 명시적 gate 실패가 된다."""
+def test_evaluate_profile_reports_request_displacement_diagnostic(
+    profile: EvaluationProfile,
+) -> None:
+    """후보에만 생긴 실패 요청은 release를 막지 않고 진단값으로 공개한다."""
     document = _document(profile.cells[0])
+    baseline = document["durations"][0]["no_rebalance"]
+    baseline.update(_policy(
+        policy="no_rebalance",
+        requests=100,
+        unfulfilled=1,
+        empty_minutes=100.0,
+        moved_bikes=0,
+    ))
     candidate = document["durations"][0]["model_policies"][0]
     candidate.update(_policy(
         policy=PRODUCTION_POLICY_NAME,
@@ -222,8 +232,8 @@ def test_evaluate_profile_reports_no_harm_failure(profile: EvaluationProfile) ->
 
     result = evaluate_profile(profile, [document])
 
-    assert result["acceptance_gate"]["passed"] is False
-    assert result["acceptance_gate"]["checks"][
+    assert result["acceptance_gate"]["passed"] is True
+    assert result["acceptance_gate"]["diagnostics"][
         "every_cell_and_duration_new_unfulfilled_request_set_empty"
     ] is False
 

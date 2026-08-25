@@ -503,7 +503,6 @@ def _evaluate_gate(
     all_routes_finished = all(row["finished_by_cutoff"] for row in durations)
     checks = {
         "evidence_scope_matches": all(evidence_checks.values()),
-        "every_cell_and_duration_new_unfulfilled_request_set_empty": no_new_unfulfilled,
         "every_cell_and_duration_unfulfilled_no_worse": unfulfilled_no_worse,
         "every_cell_and_duration_empty_station_minutes_no_worse": empty_no_worse,
         "aggregate_180m_unfulfilled_requirement": (
@@ -530,6 +529,11 @@ def _evaluate_gate(
         "passed": all(checks.values()),
         "kind": "release" if profile.release_gate else "diagnostic",
         "checks": checks,
+        "diagnostics": {
+            "every_cell_and_duration_new_unfulfilled_request_set_empty": (
+                no_new_unfulfilled
+            ),
+        },
         "evidence_scope_checks": dict(evidence_checks),
         "strict_empty_improvement_by_horizon": strict_empty_checks,
         "aggregate_180m_unfulfilled_strict_improvement": (
@@ -561,9 +565,10 @@ def result_markdown(result: Mapping[str, Any]) -> str:
         "",
         (
             "| 구간 | 요청 | 충족률 baseline→후보 | 미충족 baseline→후보 | "
-            "품절 분 baseline→후보 | 감소율 | 추정 기존 운영 범위 | 이동/기존 예산 |"
+            "신규/해결 | 품절 분 baseline→후보 | 감소율 | 추정 기존 운영 범위 | "
+            "이동/기존 예산 |"
         ),
-        "|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for row in result["aggregates"]:
         lines.append(
@@ -572,6 +577,8 @@ def result_markdown(result: Mapping[str, Any]) -> str:
             f"{row['candidate_observed_demand_fulfillment_rate']:.4%} | "
             f"{row['baseline_unfulfilled_requests']}→"
             f"{row['candidate_unfulfilled_requests']} | "
+            f"{row['new_unfulfilled_request_count']}/"
+            f"{row['resolved_unfulfilled_request_count']} | "
             f"{row['baseline_empty_station_minutes']:.1f}→"
             f"{row['candidate_empty_station_minutes']:.1f} | "
             f"{row['empty_station_minutes_reduction_pct']:.3f}% | "

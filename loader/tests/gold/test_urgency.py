@@ -36,7 +36,7 @@ from gold.urgency import (
     UrgencyCalculationInputs,
     UrgencyProjection,
     UrgencyRecord,
-    _bike_qty_risk_band_v4,
+    _bike_qty_risk_band_v5,
     _bike_qty_v1,
     _history_window_from_manifest,
     _recent_stock_projection_v3,
@@ -54,11 +54,9 @@ BASE = datetime(2026, 8, 20, 0, 5, tzinfo=UTC)
 BUCKET = "test-bucket"
 
 
-def test_urgency_publisher_version_matches_v4_any_depletion_contract() -> None:
-    """Any-depletion publisher의 최종 v4 식별자를 고정한다."""
-    assert URGENCY_PUBLISHER_VERSION == (
-        "gold-urgency-publisher-v4-any-depletion"
-    )
+def test_urgency_publisher_version_matches_v5_capacity_reserve_contract() -> None:
+    """정원보존 publisher의 최종 v5 식별자를 고정한다."""
+    assert URGENCY_PUBLISHER_VERSION == "gold-urgency-publisher-v5-capacity-reserve"
 
 
 def _stock_history(*quantities: int, spacing_minutes: int = 5) -> list[dict[str, Any]]:
@@ -407,7 +405,7 @@ def test_scoring_and_bike_quantity_are_equivalent_to_rebalance_v1() -> None:
 
 
 def test_risk_band_pickup_preserves_lower_stock_across_protection_horizon() -> None:
-    """평균 재고가 유지돼도 확률 하방에서 안전재고를 뺀 만큼만 수거한다."""
+    """평균 재고가 유지돼도 확률 하방에서 정원을 뺀 만큼만 수거한다."""
     points = enrich_forecast_points(
         40,
         10,
@@ -423,7 +421,7 @@ def test_risk_band_pickup_preserves_lower_stock_across_protection_horizon() -> N
     )
     assert _bike_qty_v1(40, 10, "retrieval_needed", points) == 30
     assert (
-        _bike_qty_risk_band_v4(
+        _bike_qty_risk_band_v5(
             40,
             10,
             "retrieval_needed",
@@ -432,7 +430,7 @@ def test_risk_band_pickup_preserves_lower_stock_across_protection_horizon() -> N
             BASE,
             policy,
         )
-        == 25
+        == 17
     )
 
 
@@ -449,7 +447,7 @@ def test_risk_band_dropoff_raises_lower_stock_to_minimum() -> None:
         uncertainty_z=0.0,
     )
     assert (
-        _bike_qty_risk_band_v4(
+        _bike_qty_risk_band_v5(
             0,
             10,
             "supply_needed",
@@ -462,8 +460,8 @@ def test_risk_band_dropoff_raises_lower_stock_to_minimum() -> None:
     )
 
 
-def test_risk_band_pickup_limits_single_decision_stock_fraction() -> None:
-    """한 회수 판단은 공급원 현재 재고의 설정 비율을 넘지 않는다."""
+def test_risk_band_pickup_uses_full_capacity_surplus() -> None:
+    """미래에도 정원을 지키면 임의 비율 없이 현재 정원 초과분을 회수한다."""
     points = enrich_forecast_points(
         40,
         10,
@@ -473,10 +471,9 @@ def test_risk_band_pickup_limits_single_decision_stock_fraction() -> None:
         protection_horizon_hours=1,
         minimum_stock_ratio=0.2,
         uncertainty_z=0.0,
-        max_pickup_stock_fraction=0.2,
     )
     assert (
-        _bike_qty_risk_band_v4(
+        _bike_qty_risk_band_v5(
             40,
             10,
             "retrieval_needed",
@@ -485,7 +482,7 @@ def test_risk_band_pickup_limits_single_decision_stock_fraction() -> None:
             BASE,
             policy,
         )
-        == 8
+        == 30
     )
 
 
@@ -503,7 +500,7 @@ def test_risk_band_pickup_uses_only_current_capacity_surplus() -> None:
     )
 
     assert (
-        _bike_qty_risk_band_v4(
+        _bike_qty_risk_band_v5(
             12,
             10,
             "retrieval_needed",
@@ -530,7 +527,7 @@ def test_risk_band_pickup_fails_closed_without_three_points_including_current() 
     )
 
     assert (
-        _bike_qty_risk_band_v4(
+        _bike_qty_risk_band_v5(
             20,
             10,
             "retrieval_needed",
@@ -542,7 +539,7 @@ def test_risk_band_pickup_fails_closed_without_three_points_including_current() 
         == 0
     )
     assert (
-        _bike_qty_risk_band_v4(
+        _bike_qty_risk_band_v5(
             20,
             10,
             "retrieval_needed",
@@ -580,7 +577,7 @@ def test_risk_band_pickup_applies_recent_stock_direction(
     )
 
     assert (
-        _bike_qty_risk_band_v4(
+        _bike_qty_risk_band_v5(
             20,
             10,
             "retrieval_needed",
@@ -593,8 +590,8 @@ def test_risk_band_pickup_applies_recent_stock_direction(
     )
 
 
-def test_risk_band_pickup_vetoes_when_both_depletion_signals_are_present() -> None:
-    """최근 실측과 보호 horizon 모델 평균이 모두 감소하면 pickup을 막는다."""
+def test_risk_band_pickup_reduces_quantity_for_both_depletion_signals() -> None:
+    """최근 실측과 모델이 감소하면 미래 정원을 지키도록 회수량을 줄인다."""
     points = enrich_forecast_points(
         40,
         10,
@@ -604,11 +601,10 @@ def test_risk_band_pickup_vetoes_when_both_depletion_signals_are_present() -> No
         protection_horizon_hours=1,
         minimum_stock_ratio=0.2,
         uncertainty_z=0.0,
-        max_pickup_stock_fraction=0.2,
     )
 
     assert (
-        _bike_qty_risk_band_v4(
+        _bike_qty_risk_band_v5(
             40,
             10,
             "retrieval_needed",
@@ -617,12 +613,12 @@ def test_risk_band_pickup_vetoes_when_both_depletion_signals_are_present() -> No
             BASE,
             policy,
         )
-        == 0
+        == 21
     )
 
 
-def test_risk_band_pickup_vetoes_recent_decline_when_model_rises() -> None:
-    """모델이 상승해도 최근 실측이 감소하면 pickup을 막는다."""
+def test_risk_band_pickup_uses_recent_lower_bound_when_model_rises() -> None:
+    """모델이 상승해도 최근 실측 하방을 넘지 않게 회수한다."""
     points = enrich_forecast_points(
         40,
         10,
@@ -632,11 +628,10 @@ def test_risk_band_pickup_vetoes_recent_decline_when_model_rises() -> None:
         protection_horizon_hours=1,
         minimum_stock_ratio=0.2,
         uncertainty_z=0.0,
-        max_pickup_stock_fraction=0.2,
     )
 
     assert (
-        _bike_qty_risk_band_v4(
+        _bike_qty_risk_band_v5(
             40,
             10,
             "retrieval_needed",
@@ -645,15 +640,15 @@ def test_risk_band_pickup_vetoes_recent_decline_when_model_rises() -> None:
             BASE,
             policy,
         )
-        == 0
+        == 21
     )
 
 
 @pytest.mark.parametrize("history", ((40, 40, 40), (39, 40, 40)))
-def test_risk_band_pickup_vetoes_model_decline_without_recent_decline(
+def test_risk_band_pickup_preserves_capacity_despite_model_decline(
     history: tuple[int, ...],
 ) -> None:
-    """최근 실측이 평탄·상승해도 모델 평균이 감소하면 pickup을 막는다."""
+    """모델이 감소하면 보수적 미래에도 정원을 남기는 만큼만 회수한다."""
     points = enrich_forecast_points(
         40,
         10,
@@ -663,11 +658,10 @@ def test_risk_band_pickup_vetoes_model_decline_without_recent_decline(
         protection_horizon_hours=1,
         minimum_stock_ratio=0.2,
         uncertainty_z=0.0,
-        max_pickup_stock_fraction=0.2,
     )
 
     assert (
-        _bike_qty_risk_band_v4(
+        _bike_qty_risk_band_v5(
             40,
             10,
             "retrieval_needed",
@@ -676,12 +670,12 @@ def test_risk_band_pickup_vetoes_model_decline_without_recent_decline(
             BASE,
             policy,
         )
-        == 0
+        == 29
     )
 
 
-def test_risk_band_pickup_vetoes_gaehwa_2965_regression() -> None:
-    """개화 ST-2965의 06:55 실측 하락·모델 평탄 반례를 0대로 고정한다."""
+def test_risk_band_pickup_bounds_gaehwa_2965_by_recent_projection() -> None:
+    """개화 ST-2965 반례도 최근 하방에서 정원을 지키는 수량만 허용한다."""
     points = enrich_forecast_points(
         53,
         11,
@@ -694,11 +688,10 @@ def test_risk_band_pickup_vetoes_gaehwa_2965_regression() -> None:
         protection_horizon_hours=2,
         minimum_stock_ratio=0.2,
         uncertainty_z=1.645,
-        max_pickup_stock_fraction=0.02,
     )
 
     assert (
-        _bike_qty_risk_band_v4(
+        _bike_qty_risk_band_v5(
             53,
             11,
             "retrieval_needed",
@@ -707,7 +700,7 @@ def test_risk_band_pickup_vetoes_gaehwa_2965_regression() -> None:
             BASE,
             policy,
         )
-        == 0
+        == 33
     )
 
 

@@ -79,7 +79,7 @@ _SERVING_RELEASE_KEYS = frozenset(
     {"station", "station_demand_forecast", "station_stock"}
 )
 BIKE_STATION_REALTIME_SOURCE_ID = "bike_station_realtime"
-URGENCY_PUBLISHER_VERSION = "gold-urgency-publisher-v4-any-depletion"
+URGENCY_PUBLISHER_VERSION = "gold-urgency-publisher-v5-capacity-reserve"
 _URGENCY_SCHEMA = pa.schema(
     (
         pa.field("sta_id", pa.string(), nullable=False),
@@ -475,7 +475,7 @@ def compute_urgency_projection(
                         points,
                     )
                     if policy_config.quantity_strategy == "legacy"
-                    else _bike_qty_risk_band_v4(
+                    else _bike_qty_risk_band_v5(
                         current,
                         station.hold_cnt,
                         action_type,
@@ -1535,7 +1535,7 @@ def _bike_qty_v1(
     return 0
 
 
-def _bike_qty_risk_band_v4(
+def _bike_qty_risk_band_v5(
     current: int,
     hold_cnt: int,
     action_type: str,
@@ -1544,15 +1544,15 @@ def _bike_qty_risk_band_v4(
     now: datetime,
     policy_config: RebalancePolicyConfig,
 ) -> int:
-    """현재 초과 재고만 any-depletion guard와 하방 범위 안에서 회수한다.
+    """현재와 보수적 미래 재고 모두 정원을 넘는 수량만 회수한다.
 
     대여와 반납 count를 독립 포아송 변수로 근사하면 누적 순수요의 분산은 두 count
-    합이다. 최근 최소제곱 기울기나 보호 horizon의 모델 평균 경로 중 하나라도
-    감소하면 donor 사용을 fail-closed한다. 둘 다 비감소할 때만 모델 하방과 최근
-    기울기를 보호 horizon 및 예상 출동 지연까지 외삽한 하방 중 작은 값을 사용한다. 미래
-    반납으로 생길 초과량을 현재 회수 가능량으로 빌리지 않으며, 최근 관측이 현재
-    포함 세 점 미만이어도 fail-closed한다. 배치는 평균 최저 재고를 최소 재고까지
-    올린다.
+    합이다. 모델의 불확실성 하방과 최근 기울기를 보호 horizon 및 예상 출동
+    지연까지 외삽한 재고 중 작은 값을 보수적 미래 재고로 사용한다. 현재 정원
+    초과분과 보수적 미래 재고의 정원 초과분을 모두 만족하는 만큼만 회수한다.
+    미래 반납으로 생길 초과량을 현재 회수 가능량으로 빌리지 않으며, 최근 관측이
+    현재 포함 세 점 미만이어도 fail-closed한다. 배치는 평균 최저 재고를 최소
+    재고까지 올린다.
     """
     horizon_points = points[: policy_config.protection_horizon_hours]
     minimum_stock = math.ceil(policy_config.minimum_stock_ratio * hold_cnt)
@@ -1567,17 +1567,7 @@ def _bike_qty_risk_band_v4(
         )
         if recent_projection is None:
             return 0
-        recent_slope, recent_lower = recent_projection
-        model_mean_path = _forecast_lower_stock_path(
-            current,
-            horizon_points,
-            uncertainty_z=0.0,
-        )
-        if (
-            recent_slope < 0.0
-            or min(model_mean_path[1:], default=float(current)) < current
-        ):
-            return 0
+        _recent_slope, recent_lower = recent_projection
         model_lower = min(
             _forecast_lower_stock_path(
                 current,
@@ -1586,11 +1576,8 @@ def _bike_qty_risk_band_v4(
             )
         )
         desired = max(0, current - hold_cnt)
-        safe = max(0, math.floor(min(model_lower, recent_lower) - minimum_stock))
-        concentration_limit = math.floor(
-            current * policy_config.max_pickup_stock_fraction
-        )
-        return min(current, desired, safe, concentration_limit)
+        safe = max(0, math.floor(min(model_lower, recent_lower) - hold_cnt))
+        return min(current, desired, safe)
     if action_type == "supply_needed":
         lower_path = _forecast_lower_stock_path(
             current,
@@ -1660,7 +1647,7 @@ def _urgency_score_v1(
     points: list[dict[str, Any]],
     now: datetime,
 ) -> tuple[float, int, str]:
-    """v4 any-depletion scoring이 보존하는 v1 score·남은 분·판단을 계산한다."""
+    """v5 정원보존 정책이 유지하는 v1 score·남은 분·판단을 계산한다."""
     if current <= SUPPLY_LOW_STOCK_RATIO * hold_cnt:
         time_to_critical, action_type = 0.0, "supply_needed"
     elif current >= hold_cnt:
