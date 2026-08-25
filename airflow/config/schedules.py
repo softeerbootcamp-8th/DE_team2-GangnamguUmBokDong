@@ -67,11 +67,6 @@ DEFAULT_RETRIES = 2
 DEFAULT_RETRY_DELAY = timedelta(seconds=30)
 DEFAULT_EXECUTION_TIMEOUT = timedelta(seconds=240)
 
-# living_population_grid는 과거 날짜를 다시 조회할 수 없으므로 그날 실행 안에서
-# 일시적인 API 장애를 충분히 기다렸다가 복구한다. 다른 source의 기본 retry는 유지한다.
-DAILY_POPULATION_RETRIES = 4
-DAILY_POPULATION_RETRY_DELAY = timedelta(minutes=10)
-
 # living_population_grid는 서울 전체 250m 격자 x 24시간을 페이지네이션으로 받아오므로
 # 다른 실시간 소스보다 훨씬 오래 걸린다(로컬 테스트 실측 기준).
 EXECUTION_TIMEOUT_OVERRIDES = {

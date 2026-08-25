@@ -6,8 +6,6 @@ from airflow.task.trigger_rule import TriggerRule
 from airflow.timetables.trigger import CronTriggerTimetable
 from config.schedules import (
     DAILY_CRON,
-    DAILY_POPULATION_RETRIES,
-    DAILY_POPULATION_RETRY_DELAY,
     DEFAULT_RETRIES,
     DEFAULT_RETRY_DELAY,
     EXECUTION_TIMEOUT_OVERRIDES,
@@ -84,16 +82,12 @@ def test_nowcaster_receives_same_exact_window_as_collector():
     assert "--source-window-start" in task.bash_command
 
 
-def test_living_population_grid_uses_same_day_retry_budget():
-    """과거 재조회가 불가능한 생활인구는 당일 재시도 시간을 충분히 확보한다."""
+def test_living_population_grid_keeps_default_retry_policy():
+    """생활인구 collector는 다른 일일 source와 같은 기본 재시도를 사용한다."""
     collect_population = dag.get_task("collect_living_population_grid")
 
-    assert collect_population.retries == DAILY_POPULATION_RETRIES == 4
-    assert (
-        collect_population.retry_delay
-        == DAILY_POPULATION_RETRY_DELAY
-        == timedelta(minutes=10)
-    )
+    assert collect_population.retries == DEFAULT_RETRIES
+    assert collect_population.retry_delay == DEFAULT_RETRY_DELAY
     assert "--force" not in collect_population.bash_command
     assert "--backfill" not in collect_population.bash_command
 
