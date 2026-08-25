@@ -11,15 +11,18 @@ from typing import Any
 
 import boto3
 from core.db import get_connection
-from core.gold_publication import S3ImmutableObjectStore
+from core.gold_publication import PublicationOutcome, S3ImmutableObjectStore
 from core.gold_publication.errors import ContractViolation
+from core.source_snapshot_io import read_partial_source_snapshot
+from psycopg import Connection
 
 from gold.dispatch_center import (
     load_dispatch_center_seed,
     publish_dispatch_center,
 )
 from gold.event import publish_cultural_event, publish_performance_event
-from gold.source_catalog import S3SourceSnapshotCatalog
+from gold.source_catalog import S3SourceSnapshotCatalog, SourceManifestArtifact
+from gold.state import load_publication_state, read_state_manifest
 from gold.weather_grid import load_weather_grid_seed, publish_weather_grid
 
 _ACTIVE_PUBLICATIONS = (
@@ -87,29 +90,70 @@ def run(
                 object_base_uri=object_base_uri,
             )
         elif publication == "event:cultural_event":
+            source_artifact = _event_source_or_stale(
+                connection,
+                object_store,
+                source_catalog,
+                source_id="cultural_event",
+                logical=logical,
+            )
+            if source_artifact is None:
+                return PublicationOutcome.STALE.value
             result = publish_cultural_event(
                 connection,
                 object_store,
-                source_artifact=source_catalog.exact_window(
-                    "cultural_event",
-                    logical,
-                ),
+                source_artifact=source_artifact,
                 source_catalog=source_catalog,
                 object_base_uri=object_base_uri,
             )
         else:
+            source_artifact = _event_source_or_stale(
+                connection,
+                object_store,
+                source_catalog,
+                source_id="performance_event",
+                logical=logical,
+            )
+            if source_artifact is None:
+                return PublicationOutcome.STALE.value
             result = publish_performance_event(
                 connection,
                 object_store,
-                source_artifact=source_catalog.exact_window(
-                    "performance_event",
-                    logical,
-                ),
+                source_artifact=source_artifact,
                 source_catalog=source_catalog,
                 stadium_asset_path=_ROOT / "loader/assets/stadium_coords.json",
                 object_base_uri=object_base_uri,
             )
     return result.result.outcome.value
+
+
+def _event_source_or_stale(
+    connection: Connection[Any],
+    object_store: S3ImmutableObjectStore,
+    source_catalog: S3SourceSnapshotCatalog,
+    *,
+    source_id: str,
+    logical: datetime,
+) -> SourceManifestArtifact | None:
+    """행사 exact authority를 반환하거나 검증된 PARTIAL에서 기존 Gold를 유지한다.
+
+    Authority prefix가 정확히 빈 경우에만 completed PARTIAL fallback을 검사한다.
+    기존 publication state와 그 actual immutable manifest까지 유효해야 stale no-op을
+    허용하며, state logical time이나 Gold target은 갱신하지 않는다.
+    """
+    source_artifact = source_catalog.exact_window_or_none(source_id, logical)
+    if source_artifact is not None:
+        return source_artifact
+
+    read_partial_source_snapshot(source_id, logical)
+    publication_key = f"event:{source_id}"
+    state = load_publication_state(connection, publication_key)
+    if state is None:
+        raise ContractViolation(
+            f"{publication_key} PARTIAL 이전에 유지할 Gold publication이 없습니다."
+        )
+    read_state_manifest(object_store, state)
+    return None
 
 
 def _required_env(name: str) -> str:
