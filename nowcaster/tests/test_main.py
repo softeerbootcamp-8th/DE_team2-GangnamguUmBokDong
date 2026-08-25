@@ -1,16 +1,22 @@
 """main.py: CLI 서브커맨드 및 estimate/backfill-archive 오케스트레이션."""
 
 import io
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import boto3
+import main
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
-from botocore.exceptions import ClientError
-
-import main
 import storage
+from botocore.exceptions import ClientError
+from core.gold_publication.canonical import sha256_hex
+from core.source_snapshot import (
+    SourceSnapshotCounts,
+    SourceSnapshotStatus,
+    build_source_snapshot_manifest,
+)
 from tests.conftest import TEST_BUCKET
 
 
@@ -22,6 +28,45 @@ def _put_parquet(key: str, table: pa.Table) -> None:
     buffer = io.BytesIO()
     pq.write_table(table, buffer)
     _s3().put_object(Bucket=TEST_BUCKET, Key=key, Body=buffer.getvalue())
+
+
+def _put_authoritative_grid(day: date, table: pa.Table) -> None:
+    logical = datetime.combine(day, datetime.min.time(), tzinfo=ZoneInfo("Asia/Seoul")).replace(
+        hour=3
+    )
+    buffer = io.BytesIO()
+    pq.write_table(table, buffer)
+    body = buffer.getvalue()
+    checksum = sha256_hex(body)
+    silver_key = (
+        f"silver/living_population_grid/dt={day:%Y-%m-%d}/hh=03/"
+        f"0300/sha256={checksum}.parquet"
+    )
+    manifest = build_source_snapshot_manifest(
+        source_id="living_population_grid",
+        logical_dttm=logical,
+        revision_no=0,
+        status=SourceSnapshotStatus.SUCCEEDED,
+        config_version="fixture-v1",
+        silver_uri=f"s3://{TEST_BUCKET}/{silver_key}",
+        silver_byte_sha256=checksum,
+        counts=SourceSnapshotCounts(table.num_rows, table.num_rows, table.num_rows, 0, 0),
+        planned_parts=("page=1",),
+        completed_parts=("page=1",),
+    )
+    utc = logical.astimezone(ZoneInfo("UTC"))
+    manifest_key = (
+        "source_snapshot_manifest/living_population_grid/"
+        f"dt={utc:%Y-%m-%d}/hh={utc:%H}/"
+        f"logical={utc:%Y%m%dT%H%M%S}{utc.microsecond:06d}Z/"
+        "revision=0000000000.json"
+    )
+    _s3().put_object(Bucket=TEST_BUCKET, Key=silver_key, Body=body)
+    _s3().put_object(
+        Bucket=TEST_BUCKET,
+        Key=manifest_key,
+        Body=manifest.canonical_bytes,
+    )
 
 
 def _key_exists(key: str) -> bool:
@@ -39,8 +84,8 @@ class TestRunEstimateArchivesD4Data:
         # 그 안의 YMD 컬럼 값으로만 알 수 있다(예: 오늘 실행분의 YMD가 D-4).
         biz_date = today - timedelta(days=4)  # 2026-08-16
 
-        _put_parquet(
-            f"silver/living_population_grid/dt={today:%Y-%m-%d}/hh=00/0000.parquet",
+        _put_authoritative_grid(
+            today,
             pa.table(
                 {
                     "YMD": [f"{biz_date:%Y%m%d}"],

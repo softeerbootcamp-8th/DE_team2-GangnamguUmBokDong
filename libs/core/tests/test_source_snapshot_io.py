@@ -243,3 +243,14 @@ def test_available_uses_past_complete_after_current_is_missing() -> None:
     assert selected.status is SourceDataStatus.SUCCESS
     assert selected.freshness is SourceFreshness.STALE
     assert selected.logical_dttm == prior.astimezone(UTC)
+
+
+def test_available_fails_when_current_and_bounded_past_are_unavailable() -> None:
+    """현재 및 허용 lookback 안의 과거 성공이 없으면 명시적으로 실패한다."""
+    logical = datetime(2026, 8, 20, 13, 50, tzinfo=KST)
+    _put_snapshot(logical - timedelta(hours=2), [{"value": 1}])
+
+    with pytest.raises(SourceSnapshotNotFoundError):
+        read_available_source_snapshot(
+            "population_realtime", logical, lookback=timedelta(hours=1)
+        )

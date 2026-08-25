@@ -12,7 +12,8 @@ silver 경로 컨벤션(`silver/{source_id}/dt=.../hh=.../HHMM.parquet`)은 아�
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, time, timedelta
+from zoneinfo import ZoneInfo
 
 # pyrefly: ignore [missing-import]
 import pandas as pd
@@ -34,10 +35,15 @@ from core.s3 import (
     write_json,
     write_parquet,
 )
+from core.source_snapshot_io import (
+    SourceSnapshotNotFoundError,
+    read_latest_source_snapshot,
+)
 
 GRID_SOURCE_ID = "living_population_grid"
 _NOWCAST_FILENAME = "nowcast.parquet"
 _HISTORICAL_CACHE_PREFIX = f"derived/{GRID_SOURCE_ID}/historical_avg_cache"
+_KST = ZoneInfo("Asia/Seoul")
 
 
 def _grid_date_prefix(target_date: date) -> str:
@@ -51,20 +57,25 @@ def _nowcast_key(target_date: date) -> str:
 
 
 def read_real_grid_silver(target_date: date) -> pa.Table | None:
-    """해당 날짜의 실측 실버 parquet 파일들을 모두 읽어 단일 테이블로 병합한다.
+    """해당 수집일의 최신 authoritative 실측 Silver만 읽는다.
 
-    추정치 파일(nowcast.parquet)은 제외하며, 실측 파일이 없으면 None을 반환합니다.
+    Collector는 PARTIAL에도 immutable Silver를 쓸 수 있으므로 Silver prefix를 직접
+    나열하면 아직 게시되지 않은 부분 성공이 nowcast baseline으로 승격될 수 있다.
+    Source snapshot manifest가 연 ``SUCCEEDED`` authority만 읽고, 해당 KST 날짜에
+    성공 authority가 없으면 None을 반환한다. 계약 위반은 숨기지 않고 전파한다.
     """
-    prefix = _grid_date_prefix(target_date)
-    keys = [key for key in list_keys(prefix) if key.endswith(".parquet") and not key.endswith(_NOWCAST_FILENAME)]
-    if not keys:
+    cutoff = datetime.combine(target_date, time.max, tzinfo=_KST)
+    try:
+        snapshot = read_latest_source_snapshot(
+            GRID_SOURCE_ID,
+            cutoff,
+            lookback=timedelta(days=1),
+        )
+    except SourceSnapshotNotFoundError:
         return None
-    tables = []
-    for key in sorted(keys):
-        t = read_parquet(key, as_pandas=False)
-        if t is not None:
-            tables.append(t)
-    return pa.concat_tables(tables) if tables else None
+    if snapshot.manifest.logical_dttm.astimezone(_KST).date() != target_date:
+        return None
+    return snapshot.table
 
 
 def write_archive(target_date: date, table: pa.Table) -> str:
@@ -147,4 +158,3 @@ def write_historical_cache(
     write_parquet(sum_df.reset_index(), _historical_cache_key(pattern, "sum.parquet"))
     write_parquet(count_df.reset_index(), _historical_cache_key(pattern, "count.parquet"))
     write_json(_historical_cache_key(pattern, "dates.json"), {"dates": included_dates})
-

@@ -95,6 +95,7 @@ bronze·config로 재시도해도 결과가 같아 config를 고쳐야 하고, `
 from __future__ import annotations
 
 import logging
+import math
 import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -637,7 +638,13 @@ def execute_window(
         )
         missing = _build_missing(missing_keys, expected_total, fetched_rows)
 
-    if ratio > config.quality.max_missing_ratio:
+    exceeds_missing_gate = ratio > config.quality.max_missing_ratio and not math.isclose(
+        ratio,
+        config.quality.max_missing_ratio,
+        rel_tol=0.0,
+        abs_tol=1e-12,
+    )
+    if exceeds_missing_gate:
         # 완결도 게이트 초과 — silver를 쓰지 않고 fetch_error로 끝낸다. stage는
         # BRONZE_WRITTEN 그대로라 재실행(또는 백필)하면 분기 2/4로 들어간다.
         logger.error(

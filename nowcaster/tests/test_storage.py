@@ -1,14 +1,22 @@
 """storage.py의 S3 I/O를 moto로 검증한다."""
 
 import io
-from datetime import date
+from datetime import date, datetime
+from zoneinfo import ZoneInfo
 
 import boto3
 import pyarrow as pa
 import pyarrow.parquet as pq
-
 import storage
+from core.gold_publication.canonical import sha256_hex
+from core.source_snapshot import (
+    SourceSnapshotCounts,
+    SourceSnapshotStatus,
+    build_source_snapshot_manifest,
+)
 from tests.conftest import TEST_BUCKET
+
+KST = ZoneInfo("Asia/Seoul")
 
 
 def _s3():
@@ -21,30 +29,81 @@ def _put_parquet(key: str, table: pa.Table) -> None:
     _s3().put_object(Bucket=TEST_BUCKET, Key=key, Body=buffer.getvalue())
 
 
+def _put_authoritative_grid(day: date, table: pa.Table) -> str:
+    logical = datetime.combine(day, datetime.min.time(), tzinfo=KST).replace(hour=3)
+    buffer = io.BytesIO()
+    pq.write_table(table, buffer)
+    body = buffer.getvalue()
+    checksum = sha256_hex(body)
+    silver_key = (
+        f"silver/living_population_grid/dt={day:%Y-%m-%d}/hh=03/"
+        f"0300/sha256={checksum}.parquet"
+    )
+    manifest = build_source_snapshot_manifest(
+        source_id="living_population_grid",
+        logical_dttm=logical,
+        revision_no=0,
+        status=SourceSnapshotStatus.SUCCEEDED,
+        config_version="fixture-v1",
+        silver_uri=f"s3://{TEST_BUCKET}/{silver_key}",
+        silver_byte_sha256=checksum,
+        counts=SourceSnapshotCounts(
+            expected=table.num_rows,
+            fetched=table.num_rows,
+            kept=table.num_rows,
+            repaired=0,
+            dropped=0,
+        ),
+        planned_parts=("page=1",),
+        completed_parts=("page=1",),
+    )
+    utc = logical.astimezone(ZoneInfo("UTC"))
+    manifest_key = (
+        "source_snapshot_manifest/living_population_grid/"
+        f"dt={utc:%Y-%m-%d}/hh={utc:%H}/"
+        f"logical={utc:%Y%m%dT%H%M%S}{utc.microsecond:06d}Z/"
+        "revision=0000000000.json"
+    )
+    _s3().put_object(Bucket=TEST_BUCKET, Key=silver_key, Body=body)
+    _s3().put_object(
+        Bucket=TEST_BUCKET,
+        Key=manifest_key,
+        Body=manifest.canonical_bytes,
+    )
+    return silver_key
+
+
 class TestReadRealGridSilver:
-    def test_reads_and_concats_real_files_under_date_prefix(self):
-        table_a = pa.table({"CELL_ID": ["가가00000000"], "SPOP": [10.0]})
-        table_b = pa.table({"CELL_ID": ["가가00000001"], "SPOP": [20.0]})
-        _put_parquet("silver/living_population_grid/dt=2026-08-11/hh=00/0000.parquet", table_a)
-        _put_parquet("silver/living_population_grid/dt=2026-08-11/hh=01/0100.parquet", table_b)
+    def test_reads_latest_authoritative_file_for_collection_date(self):
+        table = pa.table(
+            {"CELL_ID": ["가가00000000", "가가00000001"], "SPOP": [10.0, 20.0]}
+        )
+        _put_authoritative_grid(date(2026, 8, 11), table)
 
         result = storage.read_real_grid_silver(date(2026, 8, 11))
 
         assert sorted(result.column("CELL_ID").to_pylist()) == ["가가00000000", "가가00000001"]
 
-    def test_excludes_nowcast_file_from_same_prefix(self):
+    def test_ignores_nowcast_file_because_only_authority_is_selected(self):
         real = pa.table({"CELL_ID": ["가가00000000"], "SPOP": [10.0]})
         estimated = pa.table({"CELL_ID": ["가가00000001"], "SPOP": [99.0]})
-        _put_parquet("silver/living_population_grid/dt=2026-08-11/hh=00/0000.parquet", real)
-        _put_parquet("silver/living_population_grid/dt=2026-08-11/hh=00/nowcast.parquet", estimated)
+        _put_authoritative_grid(date(2026, 8, 11), real)
+        _put_parquet(
+            "silver/living_population_grid/dt=2026-08-11/hh=00/nowcast.parquet",
+            estimated,
+        )
 
         result = storage.read_real_grid_silver(date(2026, 8, 11))
 
         assert result.column("CELL_ID").to_pylist() == ["가가00000000"]
 
-    def test_returns_none_when_only_nowcast_file_present(self):
-        estimated = pa.table({"CELL_ID": ["가가00000001"], "SPOP": [99.0]})
-        _put_parquet("silver/living_population_grid/dt=2026-08-11/hh=00/nowcast.parquet", estimated)
+    def test_rejects_unpublished_partial_silver(self):
+        partial = pa.table({"CELL_ID": ["가가00000001"], "SPOP": [99.0]})
+        _put_parquet(
+            "silver/living_population_grid/dt=2026-08-11/hh=03/"
+            f"0300/sha256={'a' * 64}.parquet",
+            partial,
+        )
 
         assert storage.read_real_grid_silver(date(2026, 8, 11)) is None
 
