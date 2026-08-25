@@ -17,7 +17,7 @@ storage:
 
 quality:
   max_drop_ratio: 0.05
-  max_missing_ratio: 0.0
+  max_missing_ratio: 0.1
   allow_empty: true # 행사가 없는 날도 있다
 
 policies:

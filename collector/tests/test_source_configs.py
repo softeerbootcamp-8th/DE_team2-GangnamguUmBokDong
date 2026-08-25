@@ -101,14 +101,20 @@ class TestAllSourcesLoad:
         assert config.backfill is None
 
     @pytest.mark.parametrize(
-        "source_id",
-        ("living_population_grid", "cultural_event", "performance_event"),
+        ("source_id", "expected_ratio"),
+        (
+            ("living_population_grid", 0.1),
+            ("cultural_event", 0.1),
+            ("performance_event", 0.1),
+        ),
     )
-    def test_daily_full_snapshots_reject_any_missing_part(self, source_id):
-        """과거 시점을 다시 받을 수 없는 일일 snapshot은 누락을 성공으로 인정하지 않는다."""
+    def test_daily_sources_keep_agreed_partial_tolerance(
+        self, source_id, expected_ratio
+    ):
+        """일일 source는 합의된 누락 허용치 안에서 PARTIAL 처리를 유지한다."""
         config = config_loader.load(source_id, base_dir=SOURCES_DIR)
 
-        assert config.quality.max_missing_ratio == 0.0
+        assert config.quality.max_missing_ratio == expected_ratio
 
     @pytest.mark.parametrize(
         "source_id",
@@ -451,11 +457,11 @@ class TestOptionalKeysOmittable:
 
         assert config.backfill is None
 
-    def test_cultural_event_explicitly_rejects_missing_rows(self):
-        """문화행사는 전체 catalog 일부가 빠진 결과를 성공으로 취급하지 않는다."""
+    def test_cultural_event_keeps_explicit_partial_tolerance(self):
+        """문화행사는 합의된 범위의 catalog 누락을 PARTIAL로 처리한다."""
         config = config_loader.load("cultural_event", base_dir=SOURCES_DIR)
 
-        assert config.quality.max_missing_ratio == 0.0
+        assert config.quality.max_missing_ratio == 0.1
 
     def test_max_missing_ratio_truly_omitted_defaults_to_zero(self, tmp_path):
         # 3개 키를 아예 안 쓴 최소 YAML로 기본값 자체를 확인한다.

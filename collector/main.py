@@ -19,9 +19,8 @@ Airflow는 소스별 태스크에서 논리 시각을 KST로 변환해 `--window
 | `--backfill` | 완결된 window의 누락 조각만 채움 | 기존 조각 유지, 빠진 것만 호출 |
 
 종료 코드는 `SUCCEEDED`·`PARTIAL`·`EMPTY`·`SKIPPED`가 0, `FAILED`가 non-zero다.
-누락이 있어도 게이트를 통과했으면 `PARTIAL`(0)이다. 완전한 일일 snapshot이 필요한
-운영 소스는 `max_missing_ratio=0`으로 두어 누락을 `FAILED`로 만들고 Airflow retry를
-실행한다.
+누락이 있어도 source별 허용 게이트를 통과했으면 `PARTIAL`(0)로 downstream을
+계속 실행한다. 허용치를 초과한 `FAILED/fetch_error`만 Airflow retry 대상이다.
 
 주의:
 - 스택 트레이스를 그대로 뱉지 않는다. 실패는 manifest에 남기고 정리된 메시지와

@@ -73,8 +73,9 @@ Column은 다음 순서로 판정한다.
 행이 0개일 때 `allow_empty=true`인 문화·공연행사만 정상 `EMPTY`가 될 수 있다. 나머지는 `quality_gate` 실패다.
 
 품질 gate를 통과했지만 일부 part나 row가 빠지면 진단 Silver와 `PARTIAL` manifest를
-남길 수 있지만 authoritative source snapshot으로 게시하지 않는다. 생활인구와 두 행사
-source는 `max_missing_ratio=0`이라 part 누락을 `PARTIAL`로 허용하지 않는다.
+남길 수 있지만 authoritative source snapshot으로 게시하지 않는다. 기존 운영 합의에
+따라 생활인구·문화행사·공연행사는 모두 10% 이내 누락을 `PARTIAL`로 처리해 downstream
+실행을 계속한다. 허용치를 초과한 경우에만 `FAILED/fetch_error`가 된다.
 
 ## 서울 열린데이터광장 Adapter
 

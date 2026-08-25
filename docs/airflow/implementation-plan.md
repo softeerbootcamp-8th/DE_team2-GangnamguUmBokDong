@@ -7,9 +7,10 @@
 >
 > 현행 책임과 구현 상태는 다음과 같다.
 >
-> - 범용 Backfill DAG는 없다. 일일 전체 snapshot의 `fetch_error`는 당일 task retry에서
->   Collector가 기존 부분 Bronze를 비우고 전체를 다시 수집한다. 저장·품질 실패는
->   기존 Bronze를 재사용한다.
+> - 범용 Backfill DAG는 없다. 일일 source의 누락이 합의된 허용치를 넘어서
+>   `fetch_error`가 되면 당일 task retry에서 Collector가 기존 부분 Bronze를 비우고
+>   전체를 다시 수집한다. 허용치 이내 누락은 기존처럼 `PARTIAL`로 진행하고,
+>   저장·품질 실패는 기존 Bronze를 재사용한다.
 > - 대여이력은 일반 백필이 아니라 `+1시간`과 `D-6`의 `--force` correction으로
 >   늦은 반납 기록을 보강한다.
 > - `daily_compaction`은 대여이력 D-6 correction 뒤 Silver를 날짜별 Archive로 묶는다.

@@ -92,8 +92,8 @@ legacy 백필 호환: 예전 설정처럼 `backfill.enabled`이면 `_retry_queue
 - `attempt`는 mutable 진단 실행 횟수다. `revision`은 authoritative source content의
   correction ordinal이며 최초 성공은 0, exact replay는 유지, changed content만 증가한다.
 - 각 단계 경계에서 로그 한 줄씩만 남긴다. 조각마다, 라운드마다 남기지 않는다.
-- 부분 성공의 종료 코드는 0이다. 완전한 일일 snapshot이 필요한 운영 소스는 누락
-  허용치를 0으로 두어 누락을 `FAILED/fetch_error`로 만들고 같은 날 즉시 재시도한다.
+- 부분 성공의 종료 코드는 0이다. source별 누락 허용치 이내면 기존 합의대로
+  `PARTIAL`로 downstream을 계속 실행하고, 초과한 `FAILED/fetch_error`만 재시도한다.
 """
 
 from __future__ import annotations

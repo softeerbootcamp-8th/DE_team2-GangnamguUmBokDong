@@ -17,7 +17,7 @@ storage:
 
 quality:
   max_drop_ratio: 0.1
-  max_missing_ratio: 0.0
+  max_missing_ratio: 0.1
   allow_empty: true
 
 policies:
