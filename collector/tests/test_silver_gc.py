@@ -91,3 +91,43 @@ def test_refuses_deletion_when_archive_signature_is_stale():
     assert result.reason == "archive_authority_stale"
     assert get_object_bytes(first.key) is not None
     assert get_object_bytes(latest.key) is not None
+
+
+def test_deletes_non_authority_without_archive_when_cold_is_verified():
+    """Archive 비대상 source는 검증된 Cold만으로 30일 지난 revision을 정리한다."""
+    config = _config()
+    first = _publish_succeeded(5, [1])
+    latest = _publish_succeeded(5, [2])
+    _prepare_cold()
+
+    result = silver_gc.collect_date(
+        config,
+        DAY,
+        now=datetime.now(UTC) + timedelta(days=31),
+        require_archive=False,
+    )
+
+    assert result.status == "completed"
+    assert get_object_bytes(first.key) is None
+    assert get_object_bytes(latest.key) is not None
+    manifest = read_json("_silver_gc_manifest/t_source/dt=2026-08-12.json")
+    assert manifest["archive_required"] is False
+    assert manifest["archive_key"] is None
+
+
+def test_archive_free_gc_still_requires_verified_cold():
+    """Archive 비대상이어도 Cold가 없으면 non-authority를 삭제하지 않는다."""
+    config = _config()
+    first = _publish_succeeded(5, [1])
+    latest = _publish_succeeded(5, [2])
+
+    result = silver_gc.collect_date(
+        config,
+        DAY,
+        now=datetime.now(UTC) + timedelta(days=31),
+        require_archive=False,
+    )
+
+    assert result.reason == "cold_unverified"
+    assert get_object_bytes(first.key) is not None
+    assert get_object_bytes(latest.key) is not None

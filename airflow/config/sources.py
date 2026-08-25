@@ -33,6 +33,7 @@ COLD_BRONZE_SOURCES = (
 COMPACTION_SOURCES = (
     "bike_rental_history",
     "bike_station_realtime",
+    "population_realtime",
     "weather_ultra_short_live",
 )
 

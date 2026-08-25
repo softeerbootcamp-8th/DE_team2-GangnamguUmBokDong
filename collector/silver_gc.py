@@ -1,9 +1,9 @@
 """검증된 날짜에서 최신 authority가 아닌 Silver object를 정리한다.
 
-삭제는 Cold Bronze와 일 단위 Archive가 모두 현재 authority에 맞게 검증된 뒤에만
-허용한다. 과거 Source Snapshot manifest는 immutable 감사 기록으로 남지만 삭제된
-Silver URI는 더 이상 직접 읽을 수 있으므로, 삭제 목록과 복구 근거를 GC manifest에
-기록한다.
+삭제는 모든 source에서 Cold Bronze가 검증된 뒤에만 허용하고, 일 단위 Archive
+대상 source는 Archive가 현재 authority와 일치하는지도 추가로 검증한다. 과거 Source
+Snapshot manifest는 immutable 감사 기록으로 남지만 삭제된 Silver URI는 더 이상
+직접 읽을 수 있으므로, 삭제 목록과 복구 근거를 GC manifest에 기록한다.
 """
 
 from __future__ import annotations
@@ -48,29 +48,32 @@ def collect_date(
     day: date,
     *,
     now: datetime | None = None,
+    require_archive: bool = True,
 ) -> SilverGcResult:
-    """최신 authority와 생성 후 30일이 지나지 않은 Silver를 보존한다."""
+    """Cold와 선택적인 Archive 검증 뒤 30일 지난 non-authority를 삭제한다."""
     objects = storage.list_silver_objects(config.source_id, day)
     if not objects:
         return SilverGcResult("skipped", deleted=0, retained=0, reason="no_silver")
 
-    archive_manifest = storage.read_archive_manifest(config.source_id, day)
-    if not archive_manifest:
-        return SilverGcResult(
-            "skipped", 0, len(objects), "archive_manifest_missing"
-        )
-    archive_key = archive_manifest.get("archive_key")
-    if not isinstance(archive_key, str) or not object_exists(archive_key):
-        return SilverGcResult("skipped", 0, len(objects), "archive_missing")
     cold_manifest = _cold_manifest(config.source_id, day)
     if cold_manifest is None:
         return SilverGcResult("skipped", 0, len(objects), "cold_unverified")
 
     authority, signature = compaction.resolve_date_authority(config, day)
-    if archive_manifest.get("silver_signature") != signature:
-        return SilverGcResult(
-            "skipped", 0, len(objects), "archive_authority_stale"
-        )
+    archive_key = None
+    if require_archive:
+        archive_manifest = storage.read_archive_manifest(config.source_id, day)
+        if not archive_manifest:
+            return SilverGcResult(
+                "skipped", 0, len(objects), "archive_manifest_missing"
+            )
+        archive_key = archive_manifest.get("archive_key")
+        if not isinstance(archive_key, str) or not object_exists(archive_key):
+            return SilverGcResult("skipped", 0, len(objects), "archive_missing")
+        if archive_manifest.get("silver_signature") != signature:
+            return SilverGcResult(
+                "skipped", 0, len(objects), "archive_authority_stale"
+            )
     authority_keys = {item.object.key for item in authority.selected}
     cutoff = (now or datetime.now(_KST)) - timedelta(
         days=NON_AUTHORITY_RETENTION_DAYS
@@ -89,7 +92,8 @@ def collect_date(
         "source_id": config.source_id,
         "date": day.isoformat(),
         "archive_key": archive_key,
-        "archive_silver_signature": signature,
+        "archive_required": require_archive,
+        "archive_silver_signature": signature if require_archive else None,
         "cold_key": cold_manifest["cold_key"],
         "retained_authority_keys": sorted(authority_keys),
         "retained_keys": sorted(retained_keys),

@@ -16,13 +16,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="silver_gc_cli.py")
     parser.add_argument("--source", required=True)
     parser.add_argument("--date", required=True, type=date.fromisoformat)
+    parser.add_argument("--require-archive", action="store_true")
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     """안전 조건을 만족하는 non-authority Silver를 정리한다."""
     args = parse_args(argv)
-    result = silver_gc.collect_date(config_loader.load(args.source), args.date)
+    result = silver_gc.collect_date(
+        config_loader.load(args.source),
+        args.date,
+        require_archive=args.require_archive,
+    )
     print(json.dumps({"status": result.status, "deleted": result.deleted, "retained": result.retained, "reason": result.reason}))
     return 0
 
