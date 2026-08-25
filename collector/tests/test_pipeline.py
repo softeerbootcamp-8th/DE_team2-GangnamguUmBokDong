@@ -126,7 +126,12 @@ class TestFreshFetchSuccess:
 
         saved = manifest_module.load(config.source_id, WINDOW_START)
         assert saved.status == RunStatus.SUCCEEDED
-        assert storage.read_bronze(config.source_id, WINDOW_START, ["a", "b"]) == [
+        assert storage.read_bronze(
+            config.source_id,
+            WINDOW_START,
+            ["a", "b"],
+            result.artifacts.bronze.revision,
+        ) == [
             _chunk("a"),
             _chunk("b"),
         ]
@@ -227,7 +232,7 @@ class TestSkipBranch:
 
 
 class TestForceBranch:
-    """분기 3 강제: --force는 완결 여부와 무관하게 clear_bronze 후 재수집한다."""
+    """분기 3 강제: --force는 완결 여부와 무관하게 새 revision을 수집한다."""
 
     def test_force_refetches_even_when_completed(self, scripted_adapter, client):
         scripted_adapter.results = [
@@ -243,14 +248,22 @@ class TestForceBranch:
             ],
         ]
         config = _config()
-        pipeline.execute_window(config, WINDOW_START, client=client)
+        first = pipeline.execute_window(config, WINDOW_START, client=client)
 
         result = pipeline.execute_window(
             config, WINDOW_START, client=client, force=True
         )
 
         assert scripted_adapter.fetch_calls == 2
-        assert set(result.artifacts.bronze.parts) == {"z"}  # 이전 조각(a)은 지워졌다
+        assert set(result.artifacts.bronze.parts) == {"z"}
+        assert first.artifacts.bronze.revision == 0
+        assert result.artifacts.bronze.revision == 1
+        assert storage.read_bronze(
+            config.source_id, WINDOW_START, ["a"], revision=0
+        ) == [_chunk("a")]
+        assert storage.read_bronze(
+            config.source_id, WINDOW_START, ["z"], revision=1
+        ) == [_chunk("z")]
 
 
 class TestForceAndBackfillRejected:

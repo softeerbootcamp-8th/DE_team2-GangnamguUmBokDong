@@ -34,3 +34,47 @@ def build_compaction_task(
         execution_timeout=COMPACTION_EXECUTION_TIMEOUT,
         trigger_rule=trigger_rule,
     )
+
+
+def build_cold_bronze_compaction_task(
+    dag,
+    source_id: str,
+    target_date: str,
+    *,
+    trigger_rule: str = TriggerRule.ALL_SUCCESS,
+):
+    """검증이 끝난 날짜의 모든 Hot Bronze revision을 Cold 파일로 묶는다."""
+    cmd = (
+        f"uv run --frozen python cold_compact.py --source {source_id} "
+        f"--date {target_date}"
+    )
+    return build_module_task(
+        dag,
+        f"cold_compact_{source_id}",
+        COLLECTOR_DIR,
+        cmd,
+        execution_timeout=COMPACTION_EXECUTION_TIMEOUT,
+        trigger_rule=trigger_rule,
+    )
+
+
+def build_silver_gc_task(
+    dag,
+    source_id: str,
+    target_date: str,
+    *,
+    trigger_rule: str = TriggerRule.ALL_SUCCESS,
+):
+    """Cold와 Archive가 검증되고 보존기간이 지난 non-authority Silver를 정리한다."""
+    cmd = (
+        f"uv run --frozen python silver_gc_cli.py --source {source_id} "
+        f"--date {target_date}"
+    )
+    return build_module_task(
+        dag,
+        f"gc_silver_{source_id}",
+        COLLECTOR_DIR,
+        cmd,
+        execution_timeout=COMPACTION_EXECUTION_TIMEOUT,
+        trigger_rule=trigger_rule,
+    )

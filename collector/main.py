@@ -15,7 +15,7 @@ Airflow는 소스별 태스크에서 `data_interval_start`를 KST로 변환해 `
 
 | 플래그 | 의미 | bronze |
 | --- | --- | --- |
-| `--force` | 재개 분기를 무시하고 처음부터 다시 | `clear_bronze` 후 전체 재수집 |
+| `--force` | 재개 분기를 무시하고 처음부터 다시 | 새 Hot Bronze revision에 전체 재수집 |
 | `--backfill` | 완결된 window의 누락 조각만 채움 | 기존 조각 유지, 빠진 것만 호출 |
 
 종료 코드는 `SUCCEEDED`·`PARTIAL`·`EMPTY`·`SKIPPED`가 0, `FAILED`가 non-zero다.
@@ -71,7 +71,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="main.py")
     parser.add_argument("--source", required=True, help="소스 id (sources/{source_id}.yaml)")
     parser.add_argument("--window-start", help="ISO8601, KST 오프셋(+09:00) 포함")
-    parser.add_argument("--force", action="store_true", help="재개 분기를 무시하고 clear_bronze 후 전체 재수집")
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="재개 분기를 무시하고 새 Hot Bronze revision에 전체 재수집",
+    )
     parser.add_argument("--backfill", action="store_true", help="완결된 window의 누락 조각만 채운다")
     parser.add_argument("--list-backfill-targets", action="store_true", help="백필 대상을 JSON으로 출력하고 종료")
     parser.add_argument(

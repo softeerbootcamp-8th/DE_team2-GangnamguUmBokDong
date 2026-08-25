@@ -91,5 +91,19 @@ class TestDag:
             assert task.upstream_task_ids == set()
             assert task.trigger_rule == TriggerRule.ALL_SUCCESS
 
+    def test_cold_bronze_runs_after_each_silver_compaction(self):
+        for source in COMPACTION_SOURCES:
+            task = dag.get_task(f"cold_compact_{source}")
+            assert task.upstream_task_ids == {f"compact_{source}"}
+            assert "cold_compact.py" in task.bash_command
+            assert "macros.timedelta(days=6)" in task.bash_command
+
+    def test_non_authority_silver_gc_runs_after_thirty_day_retention(self):
+        for source in COMPACTION_SOURCES:
+            task = dag.get_task(f"gc_silver_{source}")
+            assert task.upstream_task_ids == {f"cold_compact_{source}"}
+            assert "silver_gc_cli.py" in task.bash_command
+            assert "macros.timedelta(days=36)" in task.bash_command
+
     def test_expected_task_count(self):
-        assert len(dag.task_ids) == 24 + len(COMPACTION_SOURCES)
+        assert len(dag.task_ids) == 24 + 3 * len(COMPACTION_SOURCES)

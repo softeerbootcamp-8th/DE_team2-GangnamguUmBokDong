@@ -55,44 +55,109 @@ _SOURCE_SNAPSHOT_MANIFEST_KEY = re.compile(
 )
 
 
-def _bronze_prefix(source_id: str, window_start: datetime) -> str:
-    """bronze 조각들이 모이는 공통 prefix를 만든다."""
-    return (
-        f"bronze/{source_id}/dt={window_start:%Y-%m-%d}/hh={window_start:%H}/"
+def _bronze_prefix(
+    source_id: str, window_start: datetime, revision: int | None = None
+) -> str:
+    """Bronze 조각들이 모이는 legacy 또는 immutable Hot prefix를 만든다."""
+    window = (
+        f"{source_id}/dt={window_start:%Y-%m-%d}/hh={window_start:%H}/"
         f"{window_start:%H%M}/"
+    )
+    if revision is None:
+        return f"bronze/{window}"
+    if revision < 0:
+        raise ValueError(f"Bronze revision은 0 이상이어야 한다: {revision}")
+    return f"bronze/hot/{window}revision={revision:010d}/"
+
+
+def bronze_prefix(
+    source_id: str, window_start: datetime, revision: int | None = None
+) -> str:
+    """Manifest에 기록할 canonical Bronze prefix를 반환한다."""
+    return _bronze_prefix(source_id, window_start, revision)
+
+
+def next_bronze_revision(source_id: str, window_start: datetime) -> int:
+    """Manifest 저장 전 중단된 orphan까지 피해 다음 immutable revision을 고른다."""
+    window_prefix = (
+        f"bronze/hot/{source_id}/dt={window_start:%Y-%m-%d}/"
+        f"hh={window_start:%H}/{window_start:%H%M}/"
+    )
+    revisions = []
+    for key in list_keys(window_prefix):
+        matched = re.match(rf"{re.escape(window_prefix)}revision=(\d{{10}})/", key)
+        if matched is not None:
+            revisions.append(int(matched.group(1)))
+    return 0 if not revisions else max(revisions) + 1
+
+
+def _bronze_part_key(
+    source_id: str,
+    window_start: datetime,
+    chunk_key: str,
+    revision: int | None = None,
+) -> str:
+    """bronze 조각 하나의 전체 키를 만든다."""
+    return (
+        f"{_bronze_prefix(source_id, window_start, revision)}"
+        f"part={chunk_key}.json.gz"
     )
 
 
-def _bronze_part_key(source_id: str, window_start: datetime, chunk_key: str) -> str:
-    """bronze 조각 하나의 전체 키를 만든다."""
-    return f"{_bronze_prefix(source_id, window_start)}part={chunk_key}.json.gz"
-
-
 def write_bronze_part(
-    source_id: str, window_start: datetime, chunk_key: str, chunk: bytes
+    source_id: str,
+    window_start: datetime,
+    chunk_key: str,
+    chunk: bytes,
+    revision: int | None = None,
 ) -> None:
-    """bronze 조각을 gzip으로 압축해 저장한다."""
-    key = _bronze_part_key(source_id, window_start, chunk_key)
-    put_object_bytes(key, gzip.compress(chunk))
+    """API 응답 조각을 legacy 또는 immutable Hot Bronze에 gzip으로 저장한다."""
+    key = _bronze_part_key(source_id, window_start, chunk_key, revision)
+    payload = gzip.compress(chunk, mtime=0)
+    if revision is None:
+        put_object_bytes(key, payload)
+        return
+    existing = get_object_bytes(key)
+    if existing is not None and existing != payload:
+        raise RuntimeError(f"immutable Hot Bronze key 충돌: {key}")
+    if existing is None:
+        put_object_bytes(key, payload)
 
 
 def read_bronze(
-    source_id: str, window_start: datetime, parts: Sequence[str]
+    source_id: str,
+    window_start: datetime,
+    parts: Sequence[str],
+    revision: int | None = None,
 ) -> list[bytes]:
     """지정된 bronze 조각들을 읽어 압축을 해제한 뒤 순서대로 반환한다."""
-    result = []
+    restored: dict[str, bytes] = {}
     for chunk_key in parts:
-        key = _bronze_part_key(source_id, window_start, chunk_key)
+        key = _bronze_part_key(source_id, window_start, chunk_key, revision)
         body = get_object_bytes(key)
         if body:
-            result.append(gzip.decompress(body))
-    return result
+            restored[chunk_key] = gzip.decompress(body)
+    missing = tuple(part for part in parts if part not in restored)
+    if missing:
+        import cold_bronze
+
+        restored.update(
+            cold_bronze.read_revision(
+                source_id,
+                window_start,
+                -1 if revision is None else revision,
+                missing,
+            )
+        )
+    return [restored[part] for part in parts if part in restored]
 
 
-def clear_bronze(source_id: str, window_start: datetime) -> None:
+def clear_bronze(
+    source_id: str, window_start: datetime, revision: int | None = None
+) -> None:
     """해당 윈도우의 bronze 조각을 모두 삭제한다.
     수집 파이프라인이 에러로 뻗었을 때, 쓰레기 데이터가 남지 않도록 임시 조각들을 지워주는 역할."""
-    prefix = _bronze_prefix(source_id, window_start)
+    prefix = _bronze_prefix(source_id, window_start, revision)
     keys = list_keys(prefix)
     delete_objects(keys)
 
@@ -202,6 +267,14 @@ def list_silver_objects(source_id: str, day: date) -> list[S3Object]:
         for o in list_objects(_silver_date_prefix(source_id, day))
         if o.key.endswith(".parquet")
     ]
+
+
+def delete_silver_objects(keys: list[str]) -> None:
+    """검증된 exact Silver parquet key만 일괄 삭제한다."""
+    for key in keys:
+        if not key.startswith("silver/") or not key.endswith(".parquet"):
+            raise ValueError(f"Silver GC 삭제 key가 안전 범위를 벗어났다: {key}")
+    delete_objects(keys)
 
 
 def write_archive(source_id: str, day: date, table: pq.Table) -> str:

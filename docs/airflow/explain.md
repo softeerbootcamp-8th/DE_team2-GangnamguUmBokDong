@@ -159,7 +159,7 @@ bike_rental_history → 1시간 전 replay  (serving과 독립된 side chain)
 
 ### 일별 compaction
 
-D-6의 대여이력 24개 시간대를 순차적으로 강제 재조회한다. 각 시간대는 `ALL_DONE`으로 다음 시간대를 계속 시도하며, 마지막에는 성공 여부와 무관하게 대여이력 compaction을 실행한다. 다른 compaction source는 이 replay chain과 독립적으로 실행된다.
+D-6의 대여이력 24개 시간대를 순차적으로 강제 재조회한다. 각 시간대는 `ALL_DONE`으로 다음 시간대를 계속 시도하며, 마지막에는 성공 여부와 무관하게 대여이력 compaction을 실행한다. 다른 compaction source는 이 replay chain과 독립적으로 실행된다. 검증된 Cold Bronze와 Archive가 있는 D-36 날짜에서는 객체 생성 후 30일이 지난 non-authority Silver만 정리하며 최신 authority는 항상 유지한다.
 
 ### 월별 모델 점검
 

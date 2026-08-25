@@ -15,9 +15,16 @@ from airflow.timetables.trigger import CronTriggerTimetable
 from config.schedules import CATCHUP, COMPACTION_CRON, MAX_ACTIVE_RUNS, TIMEZONE
 from config.sources import COMPACTION_SOURCES, DAILY_ARCHIVE_DELAY_DAYS
 from orchestration.collector_task import build_daily_history_replay_task
-from orchestration.compaction_task import build_compaction_task
+from orchestration.compaction_task import (
+    build_cold_bronze_compaction_task,
+    build_compaction_task,
+    build_silver_gc_task,
+)
+from orchestration.templates import kst_date_days_ago
 
 from airflow import DAG
+
+SILVER_GC_RETENTION_DAYS = 30
 
 with DAG(
     dag_id="daily_compaction",
@@ -43,4 +50,16 @@ with DAG(
             )
             replay_chain >> compact
         else:
-            build_compaction_task(dag, source_id)
+            compact = build_compaction_task(dag, source_id)
+        target_date = kst_date_days_ago(DAILY_ARCHIVE_DELAY_DAYS)
+        cold = build_cold_bronze_compaction_task(
+            dag,
+            source_id,
+            target_date,
+        )
+        gc_target_date = kst_date_days_ago(
+            DAILY_ARCHIVE_DELAY_DAYS + SILVER_GC_RETENTION_DAYS
+        )
+        gc = build_silver_gc_task(dag, source_id, gc_target_date)
+        compact >> cold
+        cold >> gc
