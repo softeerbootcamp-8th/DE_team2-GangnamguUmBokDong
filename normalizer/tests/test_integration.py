@@ -8,7 +8,7 @@
 
 import io
 import json
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 
 import boto3
 import grid
@@ -228,6 +228,8 @@ class TestEndToEndRun:
         body = json.loads(_s3().get_object(Bucket=TEST_BUCKET, Key=key)["Body"].read())
 
         assert body["baseline_dates"] == ["2026-08-15", "2026-08-16"]
+        assert body["availability_tier"] == "complete"
+        assert body["source_observed_at"] == WINDOW_START.astimezone(UTC).isoformat()
         assert body["cell_count"] == 2
         assert body["poi_matched_count"] == 1
         assert body["poi_forecast_count"] == 1

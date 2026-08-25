@@ -8,6 +8,7 @@ import os
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from enum import StrEnum
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
@@ -40,6 +41,83 @@ class SourceSnapshotData:
 
     manifest: SourceSnapshotManifest
     table: pa.Table | None
+
+
+class SourceAvailabilityTier(StrEnum):
+    """Serving 소비자가 선택한 source snapshot의 가용성 단계다."""
+
+    COMPLETE = "complete"
+    PARTIAL = "partial"
+    STALE = "stale"
+
+
+@dataclass(frozen=True, slots=True)
+class AvailableSourceSnapshot:
+    """완전·부분·과거 성공 순서로 선택한 serving 입력을 표현한다."""
+
+    tier: SourceAvailabilityTier
+    logical_dttm: datetime
+    table: pa.Table
+    manifest: SourceSnapshotManifest | None
+
+
+def read_available_source_snapshot(
+    source_id: str,
+    logical_dttm: datetime,
+    *,
+    lookback: timedelta,
+    columns: list[str] | None = None,
+) -> AvailableSourceSnapshot:
+    """현재 완전 → 현재 부분 → bounded 과거 성공 순서로 snapshot을 선택한다.
+
+    PARTIAL 허용 비율은 이 reader가 다시 해석하지 않는다. Collector가 source별
+    ``max_missing_ratio`` 품질 게이트를 통과시켜 completed/partial로 확정한 결과만
+    ``read_partial_source_snapshot``이 열 수 있으므로 그 계약을 단일 기준으로 쓴다.
+    보정과 실패는 source 의미를 아는 호출자가 이 함수 다음 단계에서 결정한다.
+    """
+    if type(lookback) is not timedelta or lookback <= timedelta(0):
+        raise ValueError("lookback은 양수 timedelta여야 합니다.")
+    logical = _aware_utc(logical_dttm)
+    try:
+        exact = read_exact_source_snapshot(source_id, logical, columns=columns)
+    except SourceSnapshotNotFoundError:
+        exact = None
+    if exact is not None and exact.table is not None:
+        return AvailableSourceSnapshot(
+            SourceAvailabilityTier.COMPLETE,
+            exact.manifest.logical_dttm,
+            exact.table,
+            exact.manifest,
+        )
+
+    try:
+        partial = read_partial_source_snapshot(source_id, logical, columns=columns)
+    except SourceSnapshotNotFoundError:
+        partial = None
+    if partial is not None:
+        return AvailableSourceSnapshot(
+            SourceAvailabilityTier.PARTIAL,
+            logical,
+            partial,
+            None,
+        )
+
+    stale = read_latest_source_snapshot(
+        source_id,
+        logical - timedelta(microseconds=1),
+        lookback=lookback,
+        columns=columns,
+    )
+    if stale.table is None:  # read_latest는 non-empty만 반환하지만 계약을 방어한다.
+        raise SourceSnapshotNotFoundError(
+            f"{source_id} 사용 가능한 과거 성공 snapshot이 없습니다."
+        )
+    return AvailableSourceSnapshot(
+        SourceAvailabilityTier.STALE,
+        stale.manifest.logical_dttm,
+        stale.table,
+        stale.manifest,
+    )
 
 
 def read_exact_source_snapshot(

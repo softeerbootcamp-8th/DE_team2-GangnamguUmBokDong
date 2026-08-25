@@ -50,6 +50,22 @@ Backfill은 기존 Bronze를 유지하고 누락 key만 요청한 뒤 window 전
 
 Snapshot source처럼 과거 시각을 재조회할 수 없는 데이터는 불완전 상태가 최종값으로 남을 수 있다. 이는 다른 시점의 데이터를 섞는 것보다 안전한 선택이다.
 
+### Serving 가용성 선택 계약
+
+실시간 serving 소비자는 source별 `max_missing_ratio`를 통과한 결과에 대해 아래 순서를
+공통으로 적용한다.
+
+1. 현재 window의 완전 성공 authority
+2. 현재 window의 completed PARTIAL
+3. source별 freshness 한도 안의 과거 완전 성공 authority
+4. source 의미에 맞는 baseline·profile 등 보정
+5. 보정할 수 없을 때 명시적 실패
+
+PARTIAL의 허용 비율은 소비자마다 복제하지 않고 Collector source config를 단일 기준으로
+삼는다. 현재 인구·날씨 source의 `max_missing_ratio`는 0.15다. 파생 산출물은 선택한
+가용성 단계와 실제 source 관측 시각을 manifest에 전파해 PARTIAL이나 과거 성공이
+현재 완전 성공처럼 보이지 않게 한다.
+
 ## 관련 자료
 
 - `collector/adapters/base.py`

@@ -104,6 +104,7 @@ from core.source_snapshot_io import (
     SourceSnapshotNotFoundError,
     SourceSnapshotReadError,
     read_exact_source_snapshot,
+    read_partial_source_snapshot,
 )
 from ml_core import scoring as scoring_io
 from ml_core import silver_schema
@@ -355,7 +356,30 @@ def _read_authoritative_collector_many(
     if not logical_keys:
         return []
     with ThreadPoolExecutor(max_workers=min(16, len(logical_keys))) as pool:
-        return list(pool.map(_read, logical_keys))
+        snapshots = list(pool.map(_read, logical_keys))
+
+    # 공통 5단계 중 현재 PARTIAL은 현재 logical tick에만 허용한다. 과거 tick은
+    # COMPLETE authority만 후보가 되어 PARTIAL → 과거 성공의 순서가 뒤집히지 않는다.
+    if snapshots[-1] is None:
+        match = _COLLECTOR_LOGICAL_KEY.fullmatch(logical_keys[-1])
+        assert match is not None  # 각 key는 위의 _read에서 이미 검증됐다.
+        logical = pd.Timestamp(
+            f"{match.group('date')} {match.group('minute')[:2]}:{match.group('minute')[2:]}"
+        ).tz_localize("Asia/Seoul")
+        try:
+            partial = read_partial_source_snapshot(
+                match.group("source"), logical.to_pydatetime(), columns=columns
+            )
+        except SourceSnapshotNotFoundError:
+            pass
+        except SourceSnapshotReadError as exc:
+            raise ValueError(
+                "Collector partial source snapshot 계약 위반: "
+                f"logical_key={logical_keys[-1]}, error={exc}"
+            ) from exc
+        else:
+            snapshots[-1] = partial.to_pandas()
+    return snapshots
 
 
 def _fetch_recent_rental_trips(

@@ -1,6 +1,7 @@
 """main.py: CLI 인자 파싱과 예측 시각 해석 테스트."""
 
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 
 import main
 import poi
@@ -258,7 +259,15 @@ class TestFilterGridRowsForHour:
 def test_run_rejects_empty_current_window_cells(monkeypatch):
     """현재 target이 비면 미래와 달리 성공 manifest를 남기지 않고 실패한다."""
     window_start = datetime(2026, 8, 12, 14, 5, tzinfo=KST)
-    monkeypatch.setattr(main.storage, "read_realtime_silver", lambda _window: pa.table({}))
+    monkeypatch.setattr(
+        main.storage,
+        "read_realtime_snapshot",
+        lambda _window: SimpleNamespace(
+            table=pa.table({}),
+            tier=SimpleNamespace(value="complete"),
+            logical_dttm=_window,
+        ),
+    )
     monkeypatch.setattr(main.poi, "load_poi_areas", lambda _path: ())
     monkeypatch.setattr(main, "_baseline_cells", lambda _cache, _target: {})
 

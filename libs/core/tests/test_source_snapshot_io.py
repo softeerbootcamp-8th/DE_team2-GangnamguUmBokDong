@@ -16,8 +16,10 @@ from core.source_snapshot import (
     build_source_snapshot_manifest,
 )
 from core.source_snapshot_io import (
+    SourceAvailabilityTier,
     SourceSnapshotNotFoundError,
     SourceSnapshotReadError,
+    read_available_source_snapshot,
     read_exact_source_snapshot,
     read_latest_source_snapshot,
     read_partial_source_snapshot,
@@ -161,3 +163,55 @@ def test_partial_window_uses_kst_path_and_validates_content_address() -> None:
     client.put_object(Bucket=TEST_BUCKET, Key=silver_key, Body=b"mutated")
     with pytest.raises(SourceSnapshotReadError, match="checksum"):
         read_partial_source_snapshot("population_realtime", logical)
+
+
+def test_available_prefers_current_partial_to_past_complete() -> None:
+    """현재 완전이 없으면 현재 PARTIAL을 과거 완전 성공보다 먼저 선택한다."""
+    logical = datetime(2026, 8, 20, 13, 50, tzinfo=KST)
+    _put_snapshot(logical - timedelta(minutes=5), [{"value": 1}])
+    buffer = io.BytesIO()
+    pq.write_table(pa.Table.from_pylist([{"value": 2}]), buffer)
+    body = buffer.getvalue()
+    checksum = sha256_hex(body)
+    silver_key = (
+        "silver/population_realtime/dt=2026-08-20/hh=13/"
+        f"1350/sha256={checksum}.parquet"
+    )
+    client = boto3.client("s3", region_name="us-east-1")
+    client.put_object(Bucket=TEST_BUCKET, Key=silver_key, Body=body)
+    client.put_object(
+        Bucket=TEST_BUCKET,
+        Key="_manifest/population_realtime/dt=2026-08-20/hh=13/1350.json",
+        Body=json.dumps(
+            {
+                "source_id": "population_realtime",
+                "window_start": logical.isoformat(),
+                "status": "partial",
+                "stage": "completed",
+                "failure_reason": None,
+                "artifacts": {"silver": silver_key},
+                "counts": {"kept": 1},
+            }
+        ).encode(),
+    )
+
+    selected = read_available_source_snapshot(
+        "population_realtime", logical, lookback=timedelta(hours=1)
+    )
+
+    assert selected.tier is SourceAvailabilityTier.PARTIAL
+    assert selected.table.column("value").to_pylist() == [2]
+
+
+def test_available_uses_past_complete_after_current_is_missing() -> None:
+    """현재 완전·부분이 모두 없으면 freshness 안의 과거 성공을 선택한다."""
+    logical = datetime(2026, 8, 20, 13, 50, tzinfo=KST)
+    prior = logical - timedelta(minutes=5)
+    _put_snapshot(prior, [{"value": 1}])
+
+    selected = read_available_source_snapshot(
+        "population_realtime", logical, lookback=timedelta(hours=1)
+    )
+
+    assert selected.tier is SourceAvailabilityTier.STALE
+    assert selected.logical_dttm == prior.astimezone(UTC)

@@ -13,14 +13,14 @@ import sys
 from collections.abc import Callable
 from datetime import date, datetime, timedelta, tzinfo
 
-# pyrefly: ignore [missing-import]
-import pyarrow as pa
-from core.forecast import POPULATION_FORECAST_SLOT_COUNT
-
 import grid
 import merge
 import poi
+
+# pyrefly: ignore [missing-import]
+import pyarrow as pa
 import storage
+from core.forecast import POPULATION_FORECAST_SLOT_COUNT
 
 # 실시간 도시데이터의 예측 시각 포맷(실측: "2026-08-19 22:00", KST 정시).
 _FORECAST_TIME_FORMAT = "%Y-%m-%d %H:%M"
@@ -307,7 +307,8 @@ def run(window_start: datetime) -> int:
     returns:
         종료 코드 (성공 시 0)
     """
-    realtime_table = storage.read_realtime_silver(window_start)
+    realtime_snapshot = storage.read_realtime_snapshot(window_start)
+    realtime_table = realtime_snapshot.table
     poi_areas = poi.load_poi_areas(poi.DEFAULT_POI_SHP_PATH)
 
     forecasts_by_code = _collect_forecasts(realtime_table, window_start)
@@ -381,6 +382,8 @@ def run(window_start: datetime) -> int:
     storage.write_manifest(
         window_start,
         {
+            "availability_tier": realtime_snapshot.tier.value,
+            "source_observed_at": realtime_snapshot.logical_dttm.isoformat(),
             "baseline_dates": sorted(d.isoformat() for d in baseline_cache),
             "cell_count": len(union_cells),
             "poi_matched_count": len(observed_snapshots),
