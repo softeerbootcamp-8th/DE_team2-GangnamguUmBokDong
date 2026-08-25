@@ -168,6 +168,13 @@ def _feature_mart_spark_steps(profile: str) -> tuple[tuple[str, list[str]], tupl
         "spark.yarn.am.waitTime=1800s",
         "--conf",
         "spark.sql.shuffle.partitions=24",
+        # emr-7.13.0(Hadoop 3.4.2)에서 AM 컨테이너가 시작 직후 "fs.s3a.buffer.dir"
+        # 관련 오류로 exitCode 13으로 즉시 죽었다(실제 EMR 실행에서 확인,
+        # 2026-08-25 — emr-7.2.0/Hadoop 3.3.6에서는 없던 문제). 컨테이너 로컬
+        # 작업 디렉터리(YARN이 항상 보장하는 경로)를 명시해 기본값 해석 문제를
+        # 피한다.
+        "--conf",
+        "spark.hadoop.fs.s3a.buffer.dir=/mnt/tmp",
     ]
     return (
         (
