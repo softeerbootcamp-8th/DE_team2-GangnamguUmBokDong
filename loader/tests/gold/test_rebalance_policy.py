@@ -7,6 +7,7 @@ from gold.rebalance_policy import (
     LEGACY_REBALANCE_POLICY,
     PICKUP_DONOR_GUARD_CAPACITY_RESERVE_V1,
     PICKUP_DONOR_GUARD_NONE,
+    PICKUP_SAFETY_STRATEGY_POISSON_MEAN,
     REBALANCE_POLICY_CONFIG_SCHEMA_VERSION,
     RISK_BAND_REBALANCE_POLICY_V5,
     risk_band_policy,
@@ -46,12 +47,17 @@ def test_default_risk_band_policy_is_v5_capacity_reserve_candidate() -> None:
     assert DEFAULT_REBALANCE_POLICY.protection_horizon_hours == 2
     assert DEFAULT_REBALANCE_POLICY.minimum_stock_ratio == 0.2
     assert DEFAULT_REBALANCE_POLICY.uncertainty_z == 1.645
+    assert (
+        DEFAULT_REBALANCE_POLICY.pickup_safety_strategy
+        == PICKUP_SAFETY_STRATEGY_POISSON_MEAN
+    )
     assert DEFAULT_REBALANCE_POLICY.pickup_cooldown_minutes == 120
     audit = DEFAULT_REBALANCE_POLICY.audit_document()
     assert audit["schema_version"] == REBALANCE_POLICY_CONFIG_SCHEMA_VERSION
     assert audit["pickup_donor_guard"] == (
         PICKUP_DONOR_GUARD_CAPACITY_RESERVE_V1
     )
+    assert audit["pickup_safety_strategy"] == PICKUP_SAFETY_STRATEGY_POISSON_MEAN
 
 
 def test_legacy_policy_audits_no_pickup_donor_guard() -> None:

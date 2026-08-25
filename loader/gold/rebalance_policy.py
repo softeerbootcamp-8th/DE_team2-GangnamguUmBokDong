@@ -10,7 +10,12 @@ from typing import Any
 from core.gold_publication import ContractViolation
 
 _QUANTITY_STRATEGIES = frozenset({"legacy", "risk_band"})
-REBALANCE_POLICY_CONFIG_SCHEMA_VERSION = "rebalance-policy-config-v5"
+PICKUP_SAFETY_STRATEGY_POISSON_MEAN = "poisson-mean"
+PICKUP_SAFETY_STRATEGY_QUANTILE_ADVERSE = "quantile-adverse"
+_PICKUP_SAFETY_STRATEGIES = frozenset(
+    {PICKUP_SAFETY_STRATEGY_POISSON_MEAN, PICKUP_SAFETY_STRATEGY_QUANTILE_ADVERSE}
+)
+REBALANCE_POLICY_CONFIG_SCHEMA_VERSION = "rebalance-policy-config-v6-strategy"
 PICKUP_DONOR_GUARD_NONE = "none"
 PICKUP_DONOR_GUARD_CAPACITY_RESERVE_V1 = "capacity-reserve-v1"
 
@@ -24,6 +29,7 @@ class RebalancePolicyConfig:
     protection_horizon_hours: int
     minimum_stock_ratio: float
     uncertainty_z: float
+    pickup_safety_strategy: str
     exclusive_pickup_station: bool
     pickup_cooldown_minutes: int
 
@@ -33,6 +39,8 @@ class RebalancePolicyConfig:
             raise ContractViolation("rebalance policy version은 nonblank여야 합니다.")
         if self.quantity_strategy not in _QUANTITY_STRATEGIES:
             raise ContractViolation("rebalance quantity strategy가 지원 범위 밖입니다.")
+        if self.pickup_safety_strategy not in _PICKUP_SAFETY_STRATEGIES:
+            raise ContractViolation("pickup safety strategy가 지원 범위 밖입니다.")
         if (
             type(self.protection_horizon_hours) is not int
             or not 1 <= self.protection_horizon_hours <= 12
@@ -61,6 +69,7 @@ class RebalancePolicyConfig:
             self.protection_horizon_hours != 12
             or self.minimum_stock_ratio != 0.0
             or self.uncertainty_z != 0.0
+            or self.pickup_safety_strategy != PICKUP_SAFETY_STRATEGY_POISSON_MEAN
             or self.exclusive_pickup_station
             or self.pickup_cooldown_minutes != 0
         ):
@@ -85,6 +94,7 @@ class RebalancePolicyConfig:
             "minimum_stock_ratio": self.minimum_stock_ratio,
             "uncertainty_z": self.uncertainty_z,
             "uncertainty_scope": "pickup_only",
+            "pickup_safety_strategy": self.pickup_safety_strategy,
             "pickup_donor_guard": (
                 PICKUP_DONOR_GUARD_NONE
                 if self.quantity_strategy == "legacy"
@@ -111,6 +121,7 @@ LEGACY_REBALANCE_POLICY = RebalancePolicyConfig(
     protection_horizon_hours=12,
     minimum_stock_ratio=0.0,
     uncertainty_z=0.0,
+    pickup_safety_strategy=PICKUP_SAFETY_STRATEGY_POISSON_MEAN,
     exclusive_pickup_station=False,
     pickup_cooldown_minutes=0,
 )
@@ -122,6 +133,7 @@ def risk_band_policy(
     protection_horizon_hours: int,
     minimum_stock_ratio: float,
     uncertainty_z: float,
+    pickup_safety_strategy: str = PICKUP_SAFETY_STRATEGY_POISSON_MEAN,
     pickup_cooldown_minutes: int | None = None,
     exclusive_pickup_station: bool = True,
 ) -> RebalancePolicyConfig:
@@ -139,12 +151,15 @@ def risk_band_policy(
         f"cooldown{resolved_cooldown}-"
         f"exclusive{int(exclusive_pickup_station)}"
     )
+    if pickup_safety_strategy != PICKUP_SAFETY_STRATEGY_POISSON_MEAN:
+        version = f"{version}-safety-{pickup_safety_strategy}"
     return RebalancePolicyConfig(
         version=version,
         quantity_strategy="risk_band",
         protection_horizon_hours=protection_horizon_hours,
         minimum_stock_ratio=float(minimum_stock_ratio),
         uncertainty_z=float(uncertainty_z),
+        pickup_safety_strategy=pickup_safety_strategy,
         exclusive_pickup_station=exclusive_pickup_station,
         pickup_cooldown_minutes=resolved_cooldown,
     )

@@ -23,6 +23,7 @@ rebalance_policy_version=rebalance-risk-band-v5-capacity-reserve-h2-r0.20-z1.645
 - 수량 전략: `risk_band`
 - 예측 보호 구간: 2시간
 - 최소 재고: 정원의 20%
+- 회수 안전재고 전략: `poisson-mean`(production 기본값)
 - 불확실성 계수: `z=1.645`, donor 회수량에만 적용(`pickup_only`)
 - donor 보호: 현재와 보수적 미래 재고가 모두 정원을 넘는 수량만 회수하는
   `capacity-reserve-v1`
@@ -34,6 +35,13 @@ rebalance_policy_version=rebalance-risk-band-v5-capacity-reserve-h2-r0.20-z1.645
 계획 시 계산한 양수 수량이 production 작업 지시다. 시뮬레이터에만 존재하는 도착
 시점 안전재고 clamp로 결과를 좋게 만들지 않으며, 실행 단계에서는 실제 재고·거치
 공간·트럭 적재량이라는 물리 한계만 적용한다.
+
+Immutable inference는 모델이 계산한 q10/q50/q90을 추가 보정 없이 보존한다. 대체
+전략 `quantile-adverse`는 horizon별 `return q10 - rental q90`을 적용한
+componentwise adverse stock scenario를 제공하지만 현재 production에서는
+비활성이다. 이는 누적 quantile로 해석하지 않으며, crossing·음수 보정이나 fallback도
+정책에 두지 않는다. 모델 quantile 품질 계약이 확보된 뒤 정책 fingerprint의 전략만
+전환한다.
 
 ## 무엇을 평가하는가
 

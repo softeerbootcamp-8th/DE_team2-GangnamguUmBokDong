@@ -24,7 +24,10 @@ from core.source_snapshot import (
 )
 from gold.common import parquet_bytes
 from gold.demand import DemandForecastRecord
-from gold.rebalance_policy import risk_band_policy
+from gold.rebalance_policy import (
+    PICKUP_SAFETY_STRATEGY_QUANTILE_ADVERSE,
+    risk_band_policy,
+)
 from gold.source_catalog import S3SourceSnapshotCatalog
 from gold.station_stock import StationStockRecord
 from gold.urgency import (
@@ -38,6 +41,7 @@ from gold.urgency import (
     _bike_qty_risk_band_v5,
     _bike_qty_v1,
     _history_window_from_manifest,
+    _pickup_model_lower_stock_path,
     _recent_stock_projection_v3,
     _serving_release_manifest_refs,
     _stock_history_input_artifacts,
@@ -430,6 +434,42 @@ def test_risk_band_pickup_preserves_lower_stock_across_protection_horizon() -> N
             policy,
         )
         == 17
+    )
+
+
+def test_pickup_safety_strategies_share_stock_path_interface() -> None:
+    """정상 synthetic 입력에서 두 strategy가 같은 stock-path 계약을 제공한다."""
+    points = [
+        {
+            "predicted_rent_cnt": 2,
+            "predicted_return_cnt": 1,
+            "rental_pred_p90": 4.0,
+            "return_pred_p10": 1.0,
+        },
+        {
+            "predicted_rent_cnt": 2,
+            "predicted_return_cnt": 1,
+            "rental_pred_p90": 3.0,
+            "return_pred_p10": 2.0,
+        },
+    ]
+    poisson = risk_band_policy(
+        protection_horizon_hours=2,
+        minimum_stock_ratio=0.2,
+        uncertainty_z=0.0,
+    )
+    quantile = risk_band_policy(
+        protection_horizon_hours=2,
+        minimum_stock_ratio=0.2,
+        uncertainty_z=0.0,
+        pickup_safety_strategy=PICKUP_SAFETY_STRATEGY_QUANTILE_ADVERSE,
+    )
+
+    assert _pickup_model_lower_stock_path(20, points, poisson) == (20.0, 19.0, 18.0)
+    assert _pickup_model_lower_stock_path(20, points, quantile) == (
+        20.0,
+        17.0,
+        16.0,
     )
 
 
