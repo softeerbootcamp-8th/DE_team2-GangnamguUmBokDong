@@ -22,6 +22,13 @@ from core.gold_publication import (
     parse_publication_manifest,
 )
 from core.inference_catalog import S3InferenceRevisionCatalog
+from core.source_snapshot_io import (
+    PartialConsumptionPolicy,
+    SourceDataStatus,
+    SourceFreshness,
+    SourceResolution,
+    SourceSelectionMetadata,
+)
 from gold.rebalance_route import publish_rebalance_route
 from gold.serving_plan import (
     SourceLookbacks,
@@ -84,26 +91,33 @@ def prepare(
             f"count={len(excluded)} preview=[{preview}]",
             file=sys.stderr,
         )
+    master_artifact = source_catalog.latest_at_or_before(
+        "bike_station_master", logical, lookback=lookbacks.master
+    )
+    realtime_candidate = source_catalog.exact_window(
+        "bike_station_realtime", logical
+    )
+    short_term_artifact = source_catalog.latest_at_or_before(
+        "weather_short_term_forecast", logical, lookback=lookbacks.short_term
+    )
+    ultra_short_artifact = source_catalog.latest_at_or_before(
+        "weather_ultra_short_forecast", logical, lookback=lookbacks.ultra_short
+    )
+    for source_id, source_artifact in (
+        ("bike_station_master", master_artifact),
+        ("bike_station_realtime", realtime_candidate),
+        ("weather_short_term_forecast", short_term_artifact),
+        ("weather_ultra_short_forecast", ultra_short_artifact),
+    ):
+        _emit_source_selection_metadata(source_id, logical, source_artifact)
     with get_connection() as connection:
         artifact = prepare_serving_plan(
             connection,
             object_store,
-            master_artifact=source_catalog.latest_at_or_before(
-                "bike_station_master", logical, lookback=lookbacks.master
-            ),
-            realtime_candidate=source_catalog.exact_window(
-                "bike_station_realtime", logical
-            ),
-            short_term_artifact=source_catalog.latest_at_or_before(
-                "weather_short_term_forecast",
-                logical,
-                lookback=lookbacks.short_term,
-            ),
-            ultra_short_artifact=source_catalog.latest_at_or_before(
-                "weather_ultra_short_forecast",
-                logical,
-                lookback=lookbacks.ultra_short,
-            ),
+            master_artifact=master_artifact,
+            realtime_candidate=realtime_candidate,
+            short_term_artifact=short_term_artifact,
+            ultra_short_artifact=ultra_short_artifact,
             rental_support_sta_ids=(
                 pinned.rental_model.support_sta_ids
             ),
@@ -117,6 +131,31 @@ def prepare(
             relocation_approval_payload=relocation_payload,
         )
     return {"plan": _ref(artifact.uri, artifact.byte_sha256)}
+
+
+def _emit_source_selection_metadata(
+    source_id: str, requested: datetime, artifact: Any
+) -> None:
+    """이미 선택된 Gold source artifact를 공통 metadata 구조로 기록한다."""
+    selected = artifact.manifest.logical_dttm
+    metadata = SourceSelectionMetadata(
+        source_id=source_id,
+        status=SourceDataStatus.SUCCESS,
+        freshness=(
+            SourceFreshness.CURRENT
+            if selected == requested
+            else SourceFreshness.STALE
+        ),
+        partial_policy=PartialConsumptionPolicy.REJECT,
+        resolution=SourceResolution.OBSERVED,
+        requested_dttm=requested,
+        selected_dttm=selected,
+    )
+    print(
+        "Source selection metadata: "
+        + json.dumps(metadata.as_dict(), ensure_ascii=False, sort_keys=True),
+        file=sys.stderr,
+    )
 
 
 def _stock_history_refs(

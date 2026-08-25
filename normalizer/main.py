@@ -14,15 +14,15 @@ import sys
 from collections.abc import Callable
 from datetime import date, datetime, timedelta, tzinfo
 
-# pyrefly: ignore [missing-import]
-import pyarrow as pa
-from core.forecast import POPULATION_FORECAST_SLOT_COUNT
-from core.poi_master import PoiMasterError, PoiMasterRef
-
 import grid
 import merge
 import poi
+
+# pyrefly: ignore [missing-import]
+import pyarrow as pa
 import storage
+from core.forecast import POPULATION_FORECAST_SLOT_COUNT
+from core.poi_master import PoiMasterError, PoiMasterRef
 
 # 실시간 도시데이터의 예측 시각 포맷(실측: "2026-08-19 22:00", KST 정시).
 _FORECAST_TIME_FORMAT = "%Y-%m-%d %H:%M"
@@ -383,7 +383,13 @@ def run(
     returns:
         종료 코드 (성공 시 0)
     """
-    realtime_table = storage.read_realtime_silver(window_start)
+    realtime_snapshot = storage.read_realtime_snapshot(window_start)
+    realtime_table = realtime_snapshot.table
+    source_selection = realtime_snapshot.selection_metadata(
+        storage.REALTIME_SOURCE_ID,
+        window_start,
+        partial_policy=storage.PARTIAL_POLICY,
+    )
     selected_ref = poi_master_ref or PoiMasterRef(mode="static")
     poi_areas = poi.load_poi_master_areas(selected_ref)
     _validate_realtime_poi_contract(realtime_table, poi_areas)
@@ -459,6 +465,16 @@ def run(
     storage.write_manifest(
         window_start,
         {
+            "input_status": realtime_snapshot.status.value,
+            "input_freshness": realtime_snapshot.freshness.value,
+            "partial_policy": "repair",
+            "resolution": (
+                "repaired"
+                if realtime_snapshot.status.value == "partial"
+                else "observed"
+            ),
+            "source_selection": source_selection.as_dict(),
+            "source_observed_at": realtime_snapshot.logical_dttm.isoformat(),
             "baseline_dates": sorted(d.isoformat() for d in baseline_cache),
             "cell_count": len(union_cells),
             "poi_matched_count": len(observed_snapshots),
