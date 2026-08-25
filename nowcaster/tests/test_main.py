@@ -4,13 +4,12 @@ import io
 from datetime import date, datetime, timedelta
 
 import boto3
+import main
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
-from botocore.exceptions import ClientError
-
-import main
 import storage
+from botocore.exceptions import ClientError
 from tests.conftest import KST, TEST_BUCKET
 
 
@@ -249,6 +248,28 @@ class TestCliDispatch:
                     "2026-08-12T03:00:00",
                 ]
             )
+
+    def test_estimate_without_source_window_warns_about_skipped_actual(
+        self,
+        monkeypatch,
+        capsys,
+    ):
+        """하위호환 수동 실행이 actual 미승격을 조용히 숨기지 않는다."""
+        observed = {}
+
+        def fake_run(today, *, source_window_start):
+            """Nowcast-only dispatch 인자를 기록한다."""
+            observed.update(today=today, source_window_start=source_window_start)
+            return 0
+
+        monkeypatch.setattr(main, "run_estimate", fake_run)
+
+        assert main.main(["estimate", "--target-date", "2026-08-12"]) == 0
+        assert observed == {
+            "today": date(2026, 8, 12),
+            "source_window_start": None,
+        }
+        assert "actual Archive 승격을 생략" in capsys.readouterr().err
 
     def test_backfill_archive_command_calls_run_backfill_archive_with_csv_dir(self, monkeypatch):
         captured = {}

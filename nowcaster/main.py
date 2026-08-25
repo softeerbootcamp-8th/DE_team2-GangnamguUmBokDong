@@ -8,8 +8,8 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-
 import pandas as pd
+
 # pyrefly: ignore [missing-import]
 import pyarrow as pa
 
@@ -259,6 +259,11 @@ def main(argv: list[str] | None = None) -> int:
             or source_window_start.utcoffset() is None
         ):
             raise ValueError("--source-window-start는 timezone offset이 필요하다")
+    else:
+        print(
+            "--source-window-start가 없어 actual Archive 승격을 생략합니다.",
+            file=sys.stderr,
+        )
     return run_estimate(today, source_window_start=source_window_start)
 
 
