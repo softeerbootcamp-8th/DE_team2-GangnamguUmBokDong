@@ -84,9 +84,13 @@ _EXPLICIT_TRAIN_WINDOW_ENV = ("TRAIN_WINDOW_START", "TRAIN_WINDOW_END")
 # LGB_NUM_MACHINES>1을 EMR 스텝에만 준다) 하드코딩해도 된다.
 _EMR_PYTHONPATH = "/opt/gng"
 _EMR_PYTHON = "python3.11"
-YARN_DISTRIBUTED_SHELL_JAR = os.environ.get(
-    "YARN_DISTRIBUTED_SHELL_JAR", "/usr/lib/hadoop-yarn/hadoop-yarn-applications-distributedshell.jar"
-)
+# 비워두면(기본값) `_resolve_distributed_shell_jar()`가 실제 노드에서 find로
+# 찾는다 — 이 프로젝트는 아직 실제 EMR을 한 번도 켜본 적이 없어(2026-08) EMR
+# 7.2.0의 정확한 jar 경로(버전 접미사 등 릴리스마다 달라질 수 있음)를 미리
+# 확인할 방법이 없었다. 확실한 경로를 알게 되면 이 환경변수로 고정해 매번
+# find를 도는 비용을 없앨 수 있다.
+YARN_DISTRIBUTED_SHELL_JAR = os.environ.get("YARN_DISTRIBUTED_SHELL_JAR", "")
+_YARN_DISTRIBUTED_SHELL_JAR_SEARCH_ROOTS = ("/usr/lib/hadoop-yarn", "/usr/lib/hadoop", "/opt/hadoop")
 # m4.large(8GB) 노드 1대에 컨테이너 1개만 배치되게 노드 용량에 가깝게 잡는다 —
 # 여러 개가 배치되면 같은 LGB_LOCAL_LISTEN_PORT를 두고 충돌한다
 # (`yarn_worker_bootstrap._resolve_rank_and_machines()` 중복 host 가드 참고).
@@ -293,6 +297,35 @@ def _validate_candidate_serving_contract(profile_name: str, env_overrides: dict[
     )
 
 
+def _resolve_distributed_shell_jar() -> str:
+    """distributed-shell 예제 jar의 실제 경로를 찾는다.
+
+    `YARN_DISTRIBUTED_SHELL_JAR` 환경변수가 있으면 그대로 쓰고, 없으면 알려진
+    설치 위치 후보를 `find`로 뒤져 실제 존재하는 파일을 찾는다 — EMR 릴리스마다
+    정확한 파일명(버전 접미사 등)이 다를 수 있어 경로 하나만 고정해서 믿지
+    않는다.
+
+    raises:
+        RuntimeError: 어느 후보 경로에서도 jar를 못 찾음
+    """
+    if YARN_DISTRIBUTED_SHELL_JAR:
+        return YARN_DISTRIBUTED_SHELL_JAR
+    for root in _YARN_DISTRIBUTED_SHELL_JAR_SEARCH_ROOTS:
+        result = subprocess.run(
+            ["find", root, "-iname", "*distributedshell*.jar"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        candidates = [line for line in result.stdout.splitlines() if line.strip()]
+        if candidates:
+            return candidates[0]
+    raise RuntimeError(
+        f"distributed-shell jar를 찾을 수 없습니다({_YARN_DISTRIBUTED_SHELL_JAR_SEARCH_ROOTS} 아래 탐색) "
+        "— YARN_DISTRIBUTED_SHELL_JAR 환경변수로 정확한 경로를 지정하세요"
+    )
+
+
 def _run_distributed_training_via_yarn(model_name: str, env: dict[str, str]) -> None:
     """LGB_NUM_MACHINES(>1)개 컨테이너로 YARN distributed-shell 학습 앱을 제출하고
     끝날 때까지 대기한다(ADR-0007).
@@ -329,7 +362,7 @@ def _run_distributed_training_via_yarn(model_name: str, env: dict[str, str]) -> 
         "yarn",
         "org.apache.hadoop.yarn.applications.distributedshell.Client",
         "-jar",
-        YARN_DISTRIBUTED_SHELL_JAR,
+        _resolve_distributed_shell_jar(),
         "-shell_command",
         shell_command,
         "-num_containers",

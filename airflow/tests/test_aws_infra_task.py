@@ -90,13 +90,17 @@ def test_create_emr_cluster_sets_keep_alive_and_managed_policy_tag(monkeypatch):
     assert captured["Instances"]["KeepJobFlowAliveWhenNoSteps"] is True
     assert {"Key": "for-use-with-amazon-emr-managed-policies", "Value": "true"} in captured["Tags"]
     assert captured["Instances"]["InstanceGroups"][1]["InstanceCount"] == 3
-    assert "BootstrapActions" not in captured
+    # 기본값(AWS_EMR_BOOTSTRAP_SCRIPT_S3_URI 미설정)에서도 BootstrapActions가
+    # 실려야 한다 — 예전엔 빈 문자열이 기본값이라 아무도 안 채우면 training
+    # 패키지가 안 깔린 클러스터가 뜨고 첫 스텝이 ImportError로 조용히
+    # 실패했다(2026-08 리뷰에서 발견). S3_BUCKET 기본값에서 유도한 경로가 온다.
+    bootstrap_action = captured["BootstrapActions"][0]["ScriptBootstrapAction"]
+    assert bootstrap_action["Path"] == f"s3://{infra.S3_BUCKET}/emr/bootstrap.sh"
+    assert bootstrap_action["Args"] == [infra.S3_BUCKET]
 
 
 def test_create_emr_cluster_adds_bootstrap_action_when_configured(monkeypatch):
-    """AWS_EMR_BOOTSTRAP_SCRIPT_S3_URI가 설정되면 training 패키지를 까는
-    bootstrap.sh가 BootstrapActions로 실려 가야 한다(evaluation/YARN
-    distributed-shell 학습이 노드에서 직접 실행되므로)."""
+    """AWS_EMR_BOOTSTRAP_SCRIPT_S3_URI를 override하면 그 값을 그대로 쓴다."""
     monkeypatch.setattr(infra, "EMR_BOOTSTRAP_SCRIPT_S3_URI", "s3://my-bucket/emr/bootstrap.sh")
     monkeypatch.setattr(infra, "EMR_PYFILES_S3_BUCKET", "my-bucket")
     captured = {}
@@ -119,6 +123,30 @@ def test_create_emr_cluster_adds_bootstrap_action_when_configured(monkeypatch):
     bootstrap_action = captured["BootstrapActions"][0]["ScriptBootstrapAction"]
     assert bootstrap_action["Path"] == "s3://my-bucket/emr/bootstrap.sh"
     assert bootstrap_action["Args"] == ["my-bucket"]
+
+
+def test_create_emr_cluster_skips_bootstrap_action_when_explicitly_disabled(monkeypatch):
+    """AWS_EMR_BOOTSTRAP_SCRIPT_S3_URI를 빈 문자열로 명시적으로 비우면(로컬/모의
+    환경 등 training 패키지가 굳이 안 깔려도 되는 경우) BootstrapActions 없이 뜬다."""
+    monkeypatch.setattr(infra, "EMR_BOOTSTRAP_SCRIPT_S3_URI", "")
+    captured = {}
+    client = boto3.client("emr", region_name="ap-northeast-2")
+
+    def _capture_run_job_flow(**kwargs):
+        captured.update(kwargs)
+        return {"JobFlowId": "j-created", "ResponseMetadata": {}}
+
+    monkeypatch.setattr(client, "run_job_flow", _capture_run_job_flow)
+    monkeypatch.setattr(
+        client,
+        "describe_cluster",
+        lambda **kwargs: {"Cluster": {"Status": {"State": "WAITING"}}},
+    )
+    monkeypatch.setattr(infra, "_get_boto3_client", lambda service_name, region_name=None: client)
+
+    infra.create_emr_cluster(core_instance_count=3, mock_override=infra.MOCK_OVERRIDE_FORCE_REAL)
+
+    assert "BootstrapActions" not in captured
 
 
 def test_create_emr_cluster_raises_on_early_termination(monkeypatch):

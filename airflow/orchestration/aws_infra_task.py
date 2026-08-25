@@ -24,17 +24,17 @@ EMR_RELEASE_LABEL = os.environ.get("AWS_EMR_RELEASE_LABEL", "emr-7.2.0")
 EMR_MASTER_INSTANCE_TYPE = os.environ.get("AWS_EMR_MASTER_INSTANCE_TYPE", "m4.large")
 EMR_CORE_INSTANCE_TYPE = os.environ.get("AWS_EMR_CORE_INSTANCE_TYPE", "m4.large")
 EMR_CORE_INSTANCE_COUNT = int(os.environ.get("AWS_EMR_CORE_INSTANCE_COUNT", "2"))
-EMR_SERVICE_ROLE = os.environ.get("AWS_EMR_SERVICE_ROLE", "EMR_DefaultRole")
-EMR_JOB_FLOW_ROLE = os.environ.get("AWS_EMR_JOB_FLOW_ROLE", "EMR_EC2_DefaultRole")
+# 기본값은 AWS CLI가 관례적으로 쓰는 이름(EMR_DefaultRole 등)이 아니라 이
+# 프로젝트의 terraform(`terraform/emr.tf`)이 실제로 만드는 역할 이름
+# (`${var.project}-emr-service`/`${var.project}-emr-ec2`, `variables.tf`의
+# `project` 기본값 "gng-ubd" 기준)이다 — 이 계정은 공용 부트캠프 계정이라
+# `aws emr create-default-roles`로 만드는 범용 기본 역할이 존재할 가능성이
+# 낮고, 애초에 이 역할들을 쓰라고 terraform이 따로 만들어둔 것이기 때문이다.
+# `var.project`를 다른 값으로 배포했다면 `terraform output -raw
+# emr_service_role`/`emr_instance_profile` 값으로 이 두 환경변수를 override할 것.
+EMR_SERVICE_ROLE = os.environ.get("AWS_EMR_SERVICE_ROLE", "gng-ubd-emr-service")
+EMR_JOB_FLOW_ROLE = os.environ.get("AWS_EMR_JOB_FLOW_ROLE", "gng-ubd-emr-ec2")
 EMR_S3_SCRIPTS_PREFIX = os.environ.get("AWS_EMR_S3_SCRIPTS_PREFIX", "s3://local-dev/scripts")
-# `make emr-package`가 올리는 위치(core/ml_core/feature_engine/training 번들 +
-# bootstrap.sh)와 반드시 같은 값이어야 한다 — `create_emr_cluster()`의
-# BootstrapActions가 이 스크립트를 실행해 상시 클러스터 노드에 `training` 패키지를
-# 깐다(월간 재학습 evaluation·YARN distributed-shell 학습이 이 노드에서 직접
-# 돌아야 하므로). 비워두면(기본값) BootstrapActions 없이 뜬다 — 로컬/모의 환경 등
-# 코드가 굳이 EMR에 안 깔려도 되는 경우를 위함.
-EMR_BOOTSTRAP_SCRIPT_S3_URI = os.environ.get("AWS_EMR_BOOTSTRAP_SCRIPT_S3_URI", "")
-EMR_PYFILES_S3_BUCKET = os.environ.get("AWS_EMR_PYFILES_S3_BUCKET", "")
 
 # `libs/ml_core/paths.py`의 MODELS_PREFIX/TRAINING_RUNS_PREFIX를 그대로 미러링한다.
 # airflow venv는 lightgbm 등 무거운 의존성을 끌고 오는 ml_core/core를 설치하지
@@ -44,6 +44,18 @@ EMR_PYFILES_S3_BUCKET = os.environ.get("AWS_EMR_PYFILES_S3_BUCKET", "")
 S3_BUCKET = os.environ.get("S3_BUCKET", "gangnamgu")
 _MODELS_PREFIX = os.environ.get("MODELS_PREFIX", "models")
 TRAINING_RUNS_PREFIX = os.environ.get("TRAINING_RUNS_PREFIX", f"{_MODELS_PREFIX}/training-runs")
+
+# `make emr-package`가 올리는 위치(core/ml_core/feature_engine/training 번들 +
+# bootstrap.sh)와 반드시 같은 값이어야 한다 — `create_emr_cluster()`의
+# BootstrapActions가 이 스크립트를 실행해 상시 클러스터 노드에 `training` 패키지를
+# 깐다(월간 재학습 evaluation·YARN distributed-shell 학습이 이 노드에서 직접
+# 돌아야 하므로). 기본값은 `Makefile`의 `emr-package` 타겟이 실제로 업로드하는
+# 경로(`s3://$BUCKET/emr/bootstrap.sh`, `s3://$BUCKET/emr/pyfiles.tar.gz`)와
+# 똑같이 `S3_BUCKET`에서 유도한다 — 예전엔 빈 문자열이 기본값이라 아무도 이
+# 두 환경변수를 안 채우면 BootstrapActions 없이 클러스터가 뜨고, 그러면 첫
+# training 스텝이 "No module named 'training'"으로 조용히 실패했을 것이다.
+EMR_BOOTSTRAP_SCRIPT_S3_URI = os.environ.get("AWS_EMR_BOOTSTRAP_SCRIPT_S3_URI", f"s3://{S3_BUCKET}/emr/bootstrap.sh")
+EMR_PYFILES_S3_BUCKET = os.environ.get("AWS_EMR_PYFILES_S3_BUCKET", S3_BUCKET)
 
 # `create_emr_cluster()`가 짓는 이름(`ml-monthly-retrain-{model_name}`)의 공통
 # prefix — `list_active_emr_clusters()`가 이 값으로 "월간 재학습용" 클러스터만
