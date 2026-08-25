@@ -175,6 +175,15 @@ def _feature_mart_spark_steps(profile: str) -> tuple[tuple[str, list[str]], tupl
         # 피한다.
         "--conf",
         "spark.hadoop.fs.s3a.buffer.dir=/mnt/tmp",
+        # emr-7.13.0(Hadoop 3.4.2)에서는 s3:// 스킴도 EMRFS 전용 구현이 아니라
+        # 표준 S3A 커넥터를 타는데(emr-7.2.0/Hadoop 3.3.6과 다른 점), S3A의 기본
+        # 자격증명 provider 체인이 "The AWS Access Key Id you provided does not
+        # exist in our records"로 즉시 실패했다(실제 EMR 실행에서 확인,
+        # 2026-08-25 — s3a://에서 s3://로 바꾼 이전 수정은 emr-7.13에서는 더 이상
+        # 스킴을 구분하지 않아 무의미해졌다). EC2 인스턴스 프로필만 쓰는 provider로
+        # 명시하면 정상 동작한다(같은 디버그 클러스터에서 재현 검증).
+        "--conf",
+        "spark.hadoop.fs.s3a.aws.credentials.provider=org.apache.hadoop.fs.s3a.auth.IAMInstanceCredentialsProvider",
     ]
     return (
         (
