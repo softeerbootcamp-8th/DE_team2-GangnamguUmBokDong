@@ -2,7 +2,7 @@
 
 > **문서 상태:** 현재 평가 계약은 `point-in-time-policy-backtest-v3`, 운영 경로
 > 알고리즘은 `route-v4-supply-led-pickup-sla`, 긴급도 계산 설정은
-> `urgency-scoring-v4-any-depletion`이다. Calibration·confirmatory·production은
+> `urgency-scoring-v5-capacity-reserve`다. Calibration·confirmatory·production은
 > `evaluation.run_policy_evaluation` 하나와 `point-in-time-policy-evaluation-v1`
 > 결과 스키마 하나를 사용하며 대상 셀과 gate만 profile 데이터로 다르다. 원천 CSV,
 > 모델 bundle, MinIO station master와 생성 결과는 Git에 포함하지 않는다.
@@ -14,8 +14,8 @@
 ```text
 policy=production_route_v4
 route_algorithm_version=route-v4-supply-led-pickup-sla
-urgency_scoring_config_version=urgency-scoring-v4-any-depletion
-rebalance_policy_version=rebalance-risk-band-v4-any-depletion-h2-r0.20-z1.645-f0300bp-cooldown120-exclusive1
+urgency_scoring_config_version=urgency-scoring-v5-capacity-reserve
+rebalance_policy_version=rebalance-risk-band-v5-capacity-reserve-h2-r0.20-z1.645-cooldown120-exclusive1
 ```
 
 정책 설정의 exact 의미는 다음과 같다.
@@ -24,9 +24,8 @@ rebalance_policy_version=rebalance-risk-band-v4-any-depletion-h2-r0.20-z1.645-f0
 - 예측 보호 구간: 2시간
 - 최소 재고: 정원의 20%
 - 불확실성 계수: `z=1.645`, donor 회수량에만 적용(`pickup_only`)
-- 한 판단의 회수 상한: 현재 재고의 3%(`f0300bp`)
-- donor 보호: 최근 실측이나 모델 평균 중 하나라도 감소하면 회수하지 않는
-  `any-depletion-v1`
+- donor 보호: 현재와 보수적 미래 재고가 모두 정원을 넘는 수량만 회수하는
+  `capacity-reserve-v1`
 - 같은 donor를 진행 중인 여러 경로가 함께 회수하지 않는 exclusive pickup
 - 배차한 donor의 재회수 cooldown: 120분
 - 한 경로의 최대 방문 대여소: 5곳
@@ -58,8 +57,9 @@ observed_demand_fulfillment_rate
 
 보조 지표인 `empty_station_minutes`는 평가 창에서 재고가 0인 대여소-분의 합이다.
 충족률 변화가 몇 건 단위라 작아 보여도, 품절 상태를 얼마나 오래 줄였는지를 함께
-확인한다. 요청 단위 no-harm을 확인하기 위해 baseline에서는 성공했는데 후보에서 새로
-실패한 event 집합도 별도로 비교한다.
+확인한다. Baseline에서는 성공했는데 후보에서 새로 실패한 event 집합도 별도로
+계산한다. 이 값은 이용자 간 성공 요청이 바뀐 정도를 드러내는 diagnostic이며, 각
+셀·구간의 총 미충족과 품절 시간이 악화되지 않는지를 release no-harm으로 판정한다.
 
 기존 운영자의 station별 순개입은 각 정시 구간에서 다음 잔차로 추정할 수 있다.
 
@@ -106,29 +106,27 @@ ordinal과 첫 dropoff를 소유하는 supply-led 구조다. 따라서 회수 sc
 minimum_stock = ceil(capacity * 0.20)
 ```
 
-### Pickup: donor 보호가 먼저다
+### Pickup: 현재와 미래에 정원을 남긴다
 
-2시간 모델 평균 경로의 어느 시점이라도 현재보다 감소하거나 최근 실측 회귀 기울기가
-음수이면 해당 donor의 pickup 수량은 0이다. 최근 실측은 현재 anchor를 포함해 서로
-다른 시각이 최소 3개 있어야 하며, 부족하면 fail-closed한다. 통과한 donor만 독립
-포아송 대여·반납 근사의 누적 분산에 `z=1.645`를 적용한 모델 하방과 최근 실측을
-2시간+출동 30분까지 외삽한 하방 중 더 보수적인 값을 쓴다.
+최근 실측은 현재 anchor를 포함해 서로 다른 시각이 최소 3개 있어야 하며, 부족하면
+fail-closed한다. 독립 포아송 대여·반납 근사의 누적 분산에 `z=1.645`를 적용한 모델
+하방과 최근 실측을 2시간+출동 30분까지 외삽한 하방 중 더 작은 값을 보수적 미래
+재고로 사용한다.
 
 ```text
 current_surplus = max(0, current - capacity)
-safe_surplus = max(
+future_surplus = max(
     0,
-    floor(min(model_uncertainty_lower, recent_projection_lower) - minimum_stock),
+    floor(min(model_uncertainty_lower, recent_projection_lower) - capacity),
 )
-concentration_limit = floor(current * 0.03)
 
-pickup_qty = min(current, current_surplus, safe_surplus, concentration_limit)
+pickup_qty = min(current, current_surplus, future_surplus)
 ```
 
 핵심은 미래 반납으로 생길 초과량을 지금 빌려 회수하지 않는다는 점이다. **현재 정원을
-초과한 자전거만** donor가 될 수 있고, 그중에서도 최근·예측 어느 쪽에도 고갈 신호가
-없으며 회수 후 20% 안전재고를 지키는 3% 이하만 가져간다. `z=1.645`는 이 donor
-하방에만 적용된다.
+초과한 자전거만** donor가 될 수 있고, 보수적으로 본 미래에도 정원을 채우고 남는
+수량만 가져간다. 감소 신호 하나가 있으면 전량 0으로 만드는 veto나 현재 재고 비율
+상한은 없다. `z=1.645`는 이 donor 하방에만 적용된다.
 
 ### Dropoff: 평균 경로를 최소 재고까지 보충한다
 
@@ -205,9 +203,10 @@ donor 보호 SLA다. 평가 종료 전에 모든 stop과 센터 복귀가 끝날
 crosswalk SHA-256, 모델 SHA-256, 정책·경로·scoring·backtest semantic version을
 함께 기록한다.
 
-## 최신 develop 기반 12셀 calibration 결과
+## v4 역사적 12셀 calibration 결과
 
-후보를 고르는 과정에서 열람한 권역과 시간대 12셀을 current route-v4로 다시 실행했다.
+이 절의 수치는 v5 이전 any-depletion 정책을 고르는 과정에서 열람한 역사적 근거다.
+권역과 시간대 12셀을 당시 route-v4·urgency-v4로 실행했다.
 raw 위치는 실행 중인 scheduler container의
 `/tmp/rebalance-v4-route-sla-calibration-latest-develop-20260825-r1`이며, Git
 산출물이 아니다.
@@ -237,9 +236,8 @@ policy·model provenance도 exact하게 일치했다.
 품절 시간이 악화되지 않았고 180분 품절 시간이 7.773% 줄었다는 것은 확인했지만,
 독립 confirmatory 결과로 부르거나 production gate 통과를 주장하지 않는다.
 
-이전 회수 상한 후보 비교 결과는 현행 any-depletion·pickup SLA 정책보다 앞선
-superseded calibration이다. 현재 정책의 근거나 현재 production 설정으로 재사용하지
-않으며 필요하면 Git history에서만 확인한다.
+이 결과와 이전 회수 상한 후보 비교는 현행 v5보다 앞선 superseded calibration이다.
+현재 정책의 release 근거로 재사용하지 않으며 필요하면 Git history에서만 확인한다.
 
 ## 일원화된 평가 profile
 
@@ -268,11 +266,12 @@ Confirmatory profile의 12셀과 기존 acceptance 수치는 유지한다.
 | cheonwang | 2025-10-17 | 2025-03-17 | 2025-06-17 |
 | cheonho | 2025-11-17 | 2025-05-17 | 2025-09-17 |
 
-Confirmatory release gate는 모든 셀·구간 no-harm, 180분 미충족 엄격 개선, 180분
+Confirmatory release gate는 모든 셀·구간 총량 no-harm, 180분 미충족 엄격 개선, 180분
 품절 시간 5% 이상 감소, 개선 셀 8개 이상, pickup 지연 30분 이하, 계획=실행,
 cutoff 완료를 요구한다. Production release gate는 고정 10셀 input provenance와 모든
-구간 no-harm, 180분 미충족 엄격 개선, 각 horizon의 aggregate 품절 시간 엄격 개선을
-요구한다.
+구간 총량 no-harm, 180분 미충족 엄격 개선, 각 horizon의 aggregate 품절 시간 엄격
+개선을 요구한다. 신규 미충족 event 집합은 두 profile 모두 결과에 남기되 hard gate가
+아닌 diagnostic으로 판정한다.
 
 실행 명령은 profile 이름만 바뀐다.
 
@@ -293,19 +292,49 @@ python -m evaluation.run_policy_evaluation \
 
 기존 raw를 이관 검증할 때도 같은 명령에 `--input-results <raw...>`만 추가한다. 과거
 confirmatory envelope는 내부 `result`를 읽되 lock·claim·Git ref 계층은 사용하지
-않는다. 이전 confirmatory 12셀 실행은 구 validator의 자정 경계 생활인구 날짜 오류로
-최종 결과가 생성되지 않았으며, 이 리팩터링 자체는 그 raw를 새 confirmatory 판정으로
-재해석하지 않는다. Production 10셀 raw는 새 공통 실행기로 재집계해 기존과 같은 gate
-통과와 60·120·180분 KPI를 재현했다.
+않는다.
+
+개발 중에는 수량식 단위 테스트와 기존 `run_policy_backtest()`의 단일 셀 실행으로
+빠르게 실패를 찾고, 정식 release 판정에서만 profile의 exact 셀 전체를 실행한다. 정식
+profile을 별도 smoke profile로 쪼개지 않는다. 3개 셀 병렬 실행도 측정했지만 production
+10셀이 `566초` 걸려 순차 실행 대비 이득이 없었으므로 실행기에는 병렬 분기를 남기지
+않았다.
+
+## v5 고정 release 결과
+
+Production 10셀은 다른 모든 hard gate를 통과했다. 180분 신규 미충족 2건은 서로 다른
+날짜·대여소에서 1건씩 발생했지만, 해당 셀의 총 미충족은 각각 `12→10`, `12→12`였고
+전체에서는 신규 2건보다 해결 14건이 많았다.
+
+| Profile·구간 | 요청 | 충족률 baseline→v5 | 미충족 baseline→v5 | 품절 분 baseline→v5 | 감소율 | 이동/기존 예산 |
+|---|---:|---:|---:|---:|---:|---:|
+| production 60분 | 2,252 | 100.0000%→100.0000% | 0→0 | 15,556.6→15,330.0 | 1.457% | 39/50 |
+| production 120분 | 6,630 | 99.9849%→99.9849% | 1→1 | 33,159.3→30,973.5 | 6.592% | 188/224 |
+| production 180분 | 13,369 | 99.5587%→99.6484% | 59→47 | 52,593.8→45,671.3 | 13.162% | 399/644 |
+
+같은 production 180분에서 v4는 81개 경로로 176대를 옮겨 경로당 평균 이동량이
+`2.17대`였고, v5는 79개 경로로 399대를 옮겨 `5.05대`였다. 20대 트럭 기준 평균
+완결 이동량 비율은 약 `10.9%→25.3%`로 늘었다. 이는 실제 순간 적재율·근무 시간
+측정치는 아니지만, 더 적은 경로로 2배 이상 많은 완결 이동을 실행했다는 운영 효율
+proxy다. 최대 pickup 배차 지연도 `29.69분→19.86분`으로 줄었다.
+
+독립 confirmatory 12셀도 통과했다. 180분 12개 셀 모두 품절 시간이 개선됐고 신규
+미충족 event는 0건이었다.
+
+| Profile·구간 | 요청 | 충족률 baseline→v5 | 미충족 baseline→v5 | 품절 분 baseline→v5 | 감소율 | 이동/기존 예산 |
+|---|---:|---:|---:|---:|---:|---:|
+| confirmatory 60분 | 7,246 | 99.9862%→99.9862% | 1→1 | 16,597.0→16,194.4 | 2.426% | 135/198 |
+| confirmatory 120분 | 14,286 | 99.6150%→99.6850% | 55→45 | 33,771.6→30,490.5 | 9.715% | 412/875 |
+| confirmatory 180분 | 19,740 | 99.3364%→99.4580% | 131→107 | 50,116.3→43,572.0 | 13.058% | 621/1,513 |
 
 ## 해석 가능한 주장과 한계
 
-현재 calibration으로 직접 말할 수 있는 것은 다음이다.
+현재 고정 replay로 직접 말할 수 있는 것은 다음이다.
 
-> 고정된 관측 성공 수요와 명시한 모의 트럭 자원 아래에서 current route-v4 후보는
-> 12개 calibration 셀의 60·120·180분 모두 신규 미충족 event를 만들지 않았고,
-> 미충족 요청과 품절 시간을 악화시키지 않으면서 180분 aggregate 품절 시간을
-> 7.773% 줄였다.
+> 고정된 관측 성공 수요와 명시한 모의 트럭 자원 아래에서 route-v4와 v5 정원보존
+> 정책은 production·confirmatory의 모든 셀·구간에서 총 미충족 요청과 품절 시간을
+> 악화시키지 않았다. 180분 aggregate 품절 시간은 각각 13.162%, 13.058% 줄었고,
+> 미충족 요청은 각각 59→47, 131→107로 줄었다.
 
 아직 다음 주장은 할 수 없다.
 
@@ -319,8 +348,8 @@ confirmatory envelope는 내부 `result`를 읽되 lock·claim·Git ref 계층�
    모델이 아니다.
 4. 공통 이동 대수 상한은 적용하지만 실제 기존 운영과 차량 대수·차량 시간이 같았는지
    증명할 수 없다.
-5. 독립 12셀 confirmatory는 과거 validator 오류로 공식 최종 판정이 없으며, production
-   통과만으로 그 독립성 근거를 대신할 수 없다.
+5. 독립 12셀 confirmatory도 고정 replay 근거이며 실제 배포 환경의 온라인 효과를
+   대신하지 않는다.
 
 결과의 `EvidenceGate`는 이 한계 때문에
 `causal_superiority_vs_legacy_allowed=false`,
