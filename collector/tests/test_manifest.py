@@ -3,9 +3,8 @@
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+import manifest as manifest_module
 import pytest
-from pydantic import BaseModel, ValidationError
-
 from manifest import (
     Artifacts,
     ColumnIssueCount,
@@ -23,6 +22,7 @@ from manifest import (
     save,
     save_retry_marker,
 )
+from pydantic import BaseModel, ValidationError
 
 pytestmark = pytest.mark.usefixtures("_bucket")
 
@@ -159,6 +159,50 @@ class TestLoadSave:
 
     def test_load_missing_returns_none(self):
         assert load("never_saved", WINDOW_START) is None
+
+    def test_load_keeps_bronze_revision_separate_from_default_authority_revision(
+        self, monkeypatch
+    ):
+        """이전 manifest도 Bronze revision을 보존하고 authority는 기본값을 쓴다."""
+        data = _minimal_manifest(revision=3).model_dump(mode="json")
+        data.pop("revision")
+        data["artifacts"]["bronze"] = {
+            "prefix": "bronze/test_source/dt=2026-08-12/hh=14/1410/",
+            "parts": ["page-1"],
+            "revision": 3,
+        }
+        original = data.copy()
+        monkeypatch.setattr(
+            manifest_module.storage, "read_manifest", lambda *_args: data
+        )
+
+        loaded = load("test_source", WINDOW_START)
+
+        assert loaded is not None
+        assert loaded.revision == 0
+        assert loaded.artifacts.bronze is not None
+        assert loaded.artifacts.bronze.revision == 3
+        assert loaded.artifacts.bronze.parts == ("page-1",)
+        assert data == original
+
+    def test_load_accepts_independent_authority_and_bronze_revisions(self, monkeypatch):
+        """authority correction과 Hot Bronze revision은 서로 다른 ordinal이다."""
+        data = _minimal_manifest(revision=2).model_dump(mode="json")
+        data["artifacts"]["bronze"] = {
+            "prefix": "bronze/test_source/dt=2026-08-12/hh=14/1410/",
+            "parts": [],
+            "revision": 3,
+        }
+        monkeypatch.setattr(
+            manifest_module.storage, "read_manifest", lambda *_args: data
+        )
+
+        loaded = load("test_source", WINDOW_START)
+
+        assert loaded is not None
+        assert loaded.revision == 2
+        assert loaded.artifacts.bronze is not None
+        assert loaded.artifacts.bronze.revision == 3
 
 
 class TestRetryMarker:

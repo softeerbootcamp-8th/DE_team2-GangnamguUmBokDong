@@ -20,8 +20,11 @@ from core.s3 import (
     write_parquet,
 )
 from core.source_snapshot_io import (
+    AvailableSourceSnapshot,
+    PartialConsumptionPolicy,
     SourceSnapshotNotFoundError,
     SourceSnapshotReadError,
+    read_available_source_snapshot,
     read_exact_source_snapshot,
     read_latest_source_snapshot,
     read_partial_source_snapshot,
@@ -30,6 +33,7 @@ from core.source_snapshot_io import (
 GRID_SOURCE_ID = "living_population_grid"
 REALTIME_SOURCE_ID = "population_realtime"
 NORMALIZED_SOURCE_ID = "living_population_normalized"
+PARTIAL_POLICY = PartialConsumptionPolicy.REPAIR
 STATION_MASTER_SOURCE_ID = "bike_station_master"
 BIKE_REALTIME_SOURCE_ID = "bike_station_realtime"
 ENRICHED_STATION_MASTER_SOURCE_ID = "station_master_enriched"
@@ -123,8 +127,21 @@ def read_latest_nowcast_grid(target_date: date) -> tuple[date, pa.Table]:
     return snapshot_date, pq.read_table(io.BytesIO(body))
 
 
+def read_realtime_snapshot(window_start: datetime) -> AvailableSourceSnapshot:
+    """완전·부분·최근 성공 순서로 실시간 POI 인구를 선택한다."""
+    try:
+        return read_available_source_snapshot(
+            REALTIME_SOURCE_ID,
+            window_start,
+            lookback=timedelta(hours=1),
+            partial_policy=PARTIAL_POLICY,
+        )
+    except SourceSnapshotReadError as exc:
+        raise PartitionNotFoundError(str(exc)) from exc
+
+
 def read_realtime_silver(window_start: datetime) -> pa.Table:
-    """해당 윈도우 시각의 실시간 POI 인구 Parquet 파일을 읽어 반환한다.
+    """5단계 정책에서 선택된 실시간 POI 인구 Parquet을 반환한다.
 
     args:
         window_start: 수집 기준 시각
@@ -133,11 +150,7 @@ def read_realtime_silver(window_start: datetime) -> pa.Table:
     raises:
         PartitionNotFoundError: 해당 시각의 파일이 없을 때
     """
-    return _read_exact_collector_snapshot(
-        REALTIME_SOURCE_ID,
-        window_start,
-        allow_partial=True,
-    )
+    return read_realtime_snapshot(window_start).table
 
 
 def read_station_master_silver(window_start: datetime) -> pa.Table:

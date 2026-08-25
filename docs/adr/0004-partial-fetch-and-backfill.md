@@ -74,6 +74,32 @@ timeout을 함께 관리해야 한다.
 
 Snapshot source처럼 과거 시각을 재조회할 수 없는 데이터는 불완전 상태가 최종값으로 남을 수 있다. 이는 다른 시점의 데이터를 섞는 것보다 안전한 선택이다.
 
+### 데이터 상태와 소비 정책
+
+Producer가 기록하는 데이터 상태와 Consumer의 처리 결정을 분리한다. 데이터 상태는
+`SUCCESS`, `PARTIAL`, `FAILED`이며, 과거 데이터 사용이나 profile fallback은 데이터
+상태가 아니라 Consumer의 선택 결과다.
+
+Consumer의 PARTIAL 정책은 다음 두 값만 허용한다.
+
+- `REJECT`: PARTIAL을 사용하지 않고 freshness 한도 안의 과거 SUCCESS를 찾는다.
+- `REPAIR`: 현재 PARTIAL의 성공분을 사용하되 source별 보정기로 누락분을 채운다.
+
+PARTIAL을 보정 없이 그대로 사용하는 공통 정책은 두지 않는다. `REJECT`가 기본값이며,
+현재는 생활인구 Normalizer만 `REPAIR`를 명시한다. Normalizer는 수집된 POI만 실시간
+값으로 반영하고 누락 POI 영역은 nowcast baseline을 유지한다. Inference의 날씨·재고,
+Gold publication과 Archive compaction은 PARTIAL을 거부한다.
+
+PARTIAL 허용 비율은 Consumer마다 복제하지 않고 Collector source config를 단일 기준으로
+삼는다. 현재 인구·날씨 source의 `max_missing_ratio`는 0.15다. `REPAIR` 산출물은 입력
+상태, freshness, 정책과 실제 처리 결과를 manifest에 기록한다.
+
+공통 선택 metadata는 `source_id`, `status`, `freshness`, `partial_policy`,
+`resolution`, `requested_dttm`, `selected_dttm`을 가진다. Normalizer는 실행 manifest에
+이를 저장하고, Inference와 Gold prepare는 이미 읽거나 선택한 artifact만으로 같은 JSON
+구조를 task 로그에 기록한다. 이를 위해 source LIST/GET이나 DB query를 추가하지 않는다.
+기존 inference·Gold immutable manifest v1과 대시보드 API 응답 schema도 변경하지 않는다.
+
 ## 관련 자료
 
 - `collector/adapters/base.py`
