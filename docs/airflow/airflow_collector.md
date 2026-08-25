@@ -1,5 +1,7 @@
 # Airflow ↔ Collector 구성 및 스케줄링 설계
 
+> **보관 문서:** EC2 분리 구성과 SSH/SSM을 검토하던 초기 설계 기록이다. 현재 운영 구조는 [Airflow 운영 구조와 데이터 흐름](./explain.md)을 따른다. 현재 구현 여부는 `airflow/dags/`, `airflow/orchestration/`, `ops/compose/`에서 확인한다.
+
 ## 1. 목적
 
 이 문서는 우리 시스템에서 **Airflow가 Collector를 어떻게 스케줄링하고 실행하는지**, 그리고 AWS EC2를 **4대로 분리하는 경우와 3대로 통합하는 경우의 차이**를 정리한다.

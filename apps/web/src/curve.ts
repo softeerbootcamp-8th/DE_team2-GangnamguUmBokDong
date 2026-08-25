@@ -7,10 +7,18 @@
  * 보이는 등). 접선을 조화평균(harmonic mean)으로 잡는 방식(Fritsch-Carlson류)은
  * 이 오버슈트가 구조적으로 나지 않는다.
  */
-export function monotonePath(xs: number[], ys: number[]): string {
+interface CubicSegment {
+  cp1x: number;
+  cp1y: number;
+  cp2x: number;
+  cp2y: number;
+  x: number;
+  y: number;
+}
+
+function monotoneSegments(xs: number[], ys: number[]): CubicSegment[] {
   const n = xs.length;
-  if (n === 0) return "";
-  if (n === 1) return `M ${xs[0]} ${ys[0]}`;
+  if (n < 2) return [];
 
   const dx: number[] = [];
   const slope: number[] = [];
@@ -30,13 +38,86 @@ export function monotonePath(xs: number[], ys: number[]): string {
     tangent[i] = s0 * s1 <= 0 ? 0 : (2 * s0 * s1) / (s0 + s1);
   }
 
-  let path = `M ${xs[0]} ${ys[0]}`;
+  const segments: CubicSegment[] = [];
   for (let i = 0; i < n - 1; i++) {
     const cp1x = xs[i] + dx[i] / 3;
     const cp1y = ys[i] + (tangent[i] * dx[i]) / 3;
     const cp2x = xs[i + 1] - dx[i] / 3;
     const cp2y = ys[i + 1] - (tangent[i + 1] * dx[i]) / 3;
-    path += ` C ${cp1x} ${cp1y}, ${cp2x} ${cp2y}, ${xs[i + 1]} ${ys[i + 1]}`;
+    segments.push({ cp1x, cp1y, cp2x, cp2y, x: xs[i + 1], y: ys[i + 1] });
   }
+  return segments;
+}
+
+function serializePath(startX: number, startY: number, segments: CubicSegment[]): string {
+  return segments.reduce(
+    (path, segment) => `${path} C ${segment.cp1x} ${segment.cp1y}, ${segment.cp2x} ${segment.cp2y}, ${segment.x} ${segment.y}`,
+    `M ${startX} ${startY}`,
+  );
+}
+
+export function monotonePath(xs: number[], ys: number[]): string {
+  const n = xs.length;
+  if (n === 0) return "";
+  if (n === 1) return `M ${xs[0]} ${ys[0]}`;
+
+  const path = serializePath(xs[0], ys[0], monotoneSegments(xs, ys));
   return path;
+}
+
+/** 같은 순서를 유지하는 두 곡선이 점 사이에서도 최소 간격을 갖도록 그린다. */
+export function pairedMonotonePaths(
+  xs: number[],
+  firstYs: number[],
+  secondYs: number[],
+  minimumDistance: number,
+): [string, string] {
+  if (xs.length === 0) return ["", ""];
+  if (xs.length === 1) {
+    return [`M ${xs[0]} ${firstYs[0]}`, `M ${xs[0]} ${secondYs[0]}`];
+  }
+
+  const firstSegments = monotoneSegments(xs, firstYs);
+  const secondSegments = monotoneSegments(xs, secondYs);
+
+  const separateControlPair = (
+    firstValue: number,
+    secondValue: number,
+    firstIsAbove: boolean,
+  ): [number, number] => {
+    if (Math.abs(firstValue - secondValue) >= minimumDistance) {
+      return [firstValue, secondValue];
+    }
+    const midpoint = (firstValue + secondValue) / 2;
+    const halfDistance = minimumDistance / 2;
+    return firstIsAbove
+      ? [midpoint - halfDistance, midpoint + halfDistance]
+      : [midpoint + halfDistance, midpoint - halfDistance];
+  };
+
+  firstSegments.forEach((firstSegment, index) => {
+    const secondSegment = secondSegments[index];
+    const startDifference = firstYs[index] - secondYs[index];
+    const endDifference = firstYs[index + 1] - secondYs[index + 1];
+
+    // 양 끝의 상하관계가 같을 때만 제어점도 같은 간격으로 제한한다. 관계가
+    // 뒤집히는 구간은 실제 교차이므로 원래 곡선을 유지한다.
+    if (startDifference * endDifference <= 0) return;
+    const firstIsAbove = startDifference < 0;
+    [firstSegment.cp1y, secondSegment.cp1y] = separateControlPair(
+      firstSegment.cp1y,
+      secondSegment.cp1y,
+      firstIsAbove,
+    );
+    [firstSegment.cp2y, secondSegment.cp2y] = separateControlPair(
+      firstSegment.cp2y,
+      secondSegment.cp2y,
+      firstIsAbove,
+    );
+  });
+
+  return [
+    serializePath(xs[0], firstYs[0], firstSegments),
+    serializePath(xs[0], secondYs[0], secondSegments),
+  ];
 }

@@ -1,5 +1,25 @@
 # 2025 전체 모델 실행·AWS 자원 보고서
 
+> **보관 실행 보고서:** 2026-08-21 `develop@44b4bff`의 full-year 준비·축소 smoke·
+> 자원 측정 결과다. 아래 AWS instance 요청안과 남은 작업은 당시 판단이며 현재 인프라
+> 사양 또는 배포 상태를 나타내지 않는다. 학습 memory 등급은 후속
+> [FULL_YEAR_MEMORY_PROBE_2026-08-22.md](FULL_YEAR_MEMORY_PROBE_2026-08-22.md), 현재 실행
+> 절차는 [FULL_YEAR_TRAINING_GUIDE.md](FULL_YEAR_TRAINING_GUIDE.md)를 우선한다.
+
+## 보고서 해석
+
+| 이 보고서가 남기는 증거 | 현재 상태로 재사용할 수 없는 주장 |
+| --- | --- |
+| 당시 Archive·feature mart 준비와 행 수 | 현재 S3 partition의 완전성·행 수 |
+| 32GiB 환경의 safety guard 중단 지점 | 현재 코드의 full-year peak와 최소 RAM |
+| 축소 pair의 게시·전체 station 추론 성공 | 축소 pair가 현재 champion이라는 주장 |
+| 당시 x86 local 자원과 Arm64 CI 호환성 | 현재 AWS 가격·가용 instance·실행 성능 |
+| Resource manifest에 기록한 당시 phase 결과 | 현재 MLflow run 또는 serving pointer 상태 |
+
+`d8/h1`, 월별 12일 표본, 5-round calibration 같은 축소 모델은 연결·자원 검증용이며
+운영 품질 후보가 아니다. 당시 bucket·volume·manifest가 현재도 존재한다고 가정하지
+않는다.
+
 ## 한눈에 보는 진행 상태
 
 2026-08-21 기준 `develop@44b4bff`에서 실행했다. 결론은 두 가지다.
@@ -180,7 +200,7 @@ master를 받아 canonical crosswalk를 만들고 pair release를 원자 게시�
 결측인 station으로, 운영 serving plan도 active·유효 master·두 model support의
 교집합을 써야 한다.
 
-## AWS 요청안
+## 당시 AWS 요청안
 
 ### 상시 EC2
 
@@ -267,7 +287,7 @@ AWS 공식 사양:
 
 원격 `develop`을 다시 fetch한 결과 작업 기준과 `origin/develop`은 모두
 `44b4bff42a4db93cb176f704a18f450fade92469`이며 ahead/behind는 `0/0`이었다.
-현재 변경에 대해 다음 검증이 통과했다.
+당시 변경에 대해 다음 검증이 통과했다.
 
 | 범위 | 결과 |
 |---|---:|
@@ -283,7 +303,7 @@ AWS 공식 사양:
 `issue163-full-year` MinIO/Postgres/MLflow 컨테이너만 중지했으며 볼륨과 원천,
 feature, profile, 모델 smoke archive, resource manifest는 삭제하지 않았다.
 
-## 64GiB 실행 판정 기준
+## 당시 64GiB 실행 판정 기준
 
 첫 Arm64 Graviton 64GiB 실행은 아래 조건을 동시에 만족해야 완료로 인정한다.
 
@@ -307,7 +327,7 @@ grid/window/horizon/날짜를 줄이지 않는다. `LGB_DEFER_VALID_DATASET=true
 valid 상주가 다시 병목일 때만 별도 프로필로 사용하고, 이 경우 early stopping 없이
 요청한 800 rounds를 고정 실행했다는 사실을 metrics와 manifest에 남긴다.
 
-## 남은 작업
+## 당시 남은 작업
 
 1. 승인된 64GiB Arm64 EC2에서 `d1/h12`, 기본 800 rounds로 rental/return을
    순차 완주하고 metrics/resource manifest를 보존한다.

@@ -1,8 +1,8 @@
-# 7. LightGBM 분산 학습 워커를 YARN Distributed Shell로 기동
+# 8. LightGBM 분산 학습 워커를 YARN Distributed Shell로 기동
 
 ## Status
 
-Accepted
+Accepted — supersedes [ADR-0007](0007-single-machine-lightgbm-training.md)
 
 ## Context
 
@@ -13,6 +13,11 @@ IP/포트, 클러스터)가 아직 없다"는 전제로 `train_common.py`가
 `LGB_NUM_MACHINES>1`이면 곧바로 `NotImplementedError`를 던지게 막아뒀다
 (station_no 샤딩이 `lazy_train_dataset.py`의 날짜별 지연 로딩과 아직 연동되지
 않았기 때문).
+
+이 상태를 [ADR-0007](0007-single-machine-lightgbm-training.md)(2026-08-24)이
+"학습은 단일 EC2에서 lazy LightGBM으로 실행한다"로 재확인하며 `LGB_NUM_MACHINES>1`
+차단을 그대로 채택했다. 이 ADR은 그 결정을 대체한다 — 아래 결정으로 막혀있던
+워커 인프라 문제가 실제로 풀렸기 때문이다.
 
 학습용 EC2를 더 이상 못 쓰게 되고 EMR도 m4.large(2vCPU/8GB)만 허용되는
 제약이 생기면서, 이제 그 "워커 인프라"를 실제로 만들어야 하는 시점이 됐다.

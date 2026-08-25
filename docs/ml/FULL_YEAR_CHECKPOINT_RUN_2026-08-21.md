@@ -1,5 +1,22 @@
 # 2025 전체 모델 checkpoint 학습 실행 결과 (2026-08-21)
 
+> **보관 실행 기록:** 2026-08-21의 32GiB WSL2 자원 한계 실험을 기록한다. 현재 학습
+> 성공 여부나 권장 instance를 단독으로 판단하는 문서가 아니다. 현재 실행 방법은
+> [FULL_YEAR_TRAINING_GUIDE.md](FULL_YEAR_TRAINING_GUIDE.md), 후속 메모리 판정은
+> [FULL_YEAR_MEMORY_PROBE_2026-08-22.md](FULL_YEAR_MEMORY_PROBE_2026-08-22.md)를 우선한다.
+
+## 기록 범위
+
+| 항목 | 이 문서가 증명하는 것 | 증명하지 않는 것 |
+| --- | --- | --- |
+| Dataset | 당시 고정 계약의 rental dataset 구성 완료 | 현재 feature mart의 행 수 |
+| 자원 한계 | 당시 세 실행 모두 첫 boosting round 전 guard 도달 | 모든 32GiB 환경에서 항상 실패 |
+| Checkpoint | 구현·강제 중단 재개 test와 smoke 통과 | 이 full-year 실행에서 round checkpoint 생성 |
+| Artifact | 운영 후보와 serving pointer 미생성·미변경 | 현재 serving release 상태 |
+
+아래 bucket, local path, commit과 측정치는 당시 실행 환경의 식별자다. 객체가 현재도
+존재한다는 보장은 없으며, 현재 결과로 인용하려면 resource manifest를 다시 읽어야 한다.
+
 ## 결론
 
 최신 `develop`의 adaptive anchor/horizon 최적화를 적용하면 2025년 rental train은
@@ -49,12 +66,14 @@ fingerprint일 때 마지막 정상 round부터 재개하며 early-stopping 상�
 Booster·metrics·conformal·profile 또는 checkpoint state는 없다. Dataset 구성 단계
 자체는 재개 대상이 아니므로 다음 머신에서는 데이터를 다시 구성해야 한다.
 
-## 다음 실행 조건
+## 당시 도출한 다음 실행 조건
 
 데이터 일수나 horizon을 줄이면 1년 운영 모델 계약을 바꾸므로 이번 목표의 성공으로
-간주하지 않는다. 동일 계약을 완주하려면 최소 64GiB RAM 머신에서 rental/return을
-순차 실행하거나, 현재 미구현인 분산/out-of-core boosting 경로가 필요하다. 64GiB에서도
-동일 3GiB guard, resource manifest, 고정 archive ID와 checkpoint를 유지해야 한다.
+간주하지 않았다. 당시에는 동일 계약 완주를 위해 최소 64GiB RAM 머신에서
+rental/return을 순차 실행하거나 분산/out-of-core boosting 경로가 필요하다고 판단했다.
+이는 8월 21일 실행에서 나온 판단이며 현재 권장 instance 계약은 후속 memory probe와
+training guide를 따른다. 재실행 시에도 3GiB guard, resource manifest, 고정 archive ID와
+checkpoint를 유지해야 한다.
 
 후속 swap/cgroup 실측에서 동일 데이터 계약의 학습 logical footprint는 rental
 34.843GiB, return 34.144GiB, 현재 Docker stack을 포함한 WSL 전체는 최대

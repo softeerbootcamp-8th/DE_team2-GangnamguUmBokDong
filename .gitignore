@@ -75,3 +75,6 @@ seoul-pop-nowcasting/data/
 ops/scripts/logs/
 
 raw-data/
+
+# 모델 아티팩트 (S3/MLflow에서 관리, Git 추적 제외)
+*.tar.gz

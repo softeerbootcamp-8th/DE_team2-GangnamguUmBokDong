@@ -14,23 +14,18 @@ const HEIGHT = 220;
 const MARGIN = { top: 16, right: 16, bottom: 24, left: 32 };
 const PLOT_WIDTH = WIDTH - MARGIN.left - MARGIN.right;
 const PLOT_HEIGHT = HEIGHT - MARGIN.top - MARGIN.bottom;
-const X_TICK_COUNT = 5;
+const X_TICK_INTERVAL_MS = 3 * 60 * 60 * 1000;
 
 function formatTime(iso: string): string {
   return formatIsoTime(iso, { hour: "2-digit", minute: "2-digit" });
 }
 
-function tickIndices(length: number): number[] {
-  if (length <= 1) return [0];
-
-  const tickCount = Math.min(X_TICK_COUNT, length);
-  return Array.from(
-    new Set(
-      Array.from({ length: tickCount }, (_, index) =>
-        Math.round((index / (tickCount - 1)) * (length - 1)),
-      ),
-    ),
-  );
+function tickTimes(startMs: number, endMs: number): number[] {
+  const ticks: number[] = [];
+  for (let timestamp = startMs; timestamp <= endMs; timestamp += X_TICK_INTERVAL_MS) {
+    ticks.push(timestamp);
+  }
+  return ticks;
 }
 
 export function StockChart({ station, baseDttm, points }: Props) {
@@ -46,21 +41,35 @@ export function StockChart({ station, baseDttm, points }: Props) {
   // 잘리지 않도록, 정원과 실제 최대값 중 큰 쪽을 기준으로 y축을 잡는다.
   const maxObserved = Math.max(...series.map((p) => p.bikes));
   const maxY = Math.max(station.hold_cnt, maxObserved) * 1.1;
-  const xAt = (i: number) => MARGIN.left + (i / (series.length - 1)) * PLOT_WIDTH;
+  const startMs = Date.parse(baseDttm);
+  const endMs = Date.parse(series[series.length - 1].time);
+  const timeRangeMs = Math.max(1, endMs - startMs);
+  const xAtTime = (time: string | number) => {
+    const timestamp = typeof time === "number" ? time : Date.parse(time);
+    return MARGIN.left + ((timestamp - startMs) / timeRangeMs) * PLOT_WIDTH;
+  };
+  const xAt = (i: number) => xAtTime(series[i].time);
   const yAt = (v: number) => MARGIN.top + (1 - v / maxY) * PLOT_HEIGHT;
   const yTicks = [0, Math.round(station.hold_cnt / 2), station.hold_cnt];
-  const xTicks = tickIndices(series.length);
-  const last = series[series.length - 1];
-
+  const xTicks = tickTimes(startMs, endMs);
   function handlePointerMove(event: React.PointerEvent<SVGRectElement>) {
     const rect = event.currentTarget.getBoundingClientRect();
     const relativeX = ((event.clientX - rect.left) / rect.width) * WIDTH;
-    const index = Math.round(((relativeX - MARGIN.left) / PLOT_WIDTH) * (series.length - 1));
-    setHoverIndex(Math.min(Math.max(index, 0), series.length - 1));
+    const fraction = Math.min(Math.max((relativeX - MARGIN.left) / PLOT_WIDTH, 0), 1);
+    const hoverTimestamp = startMs + fraction * timeRangeMs;
+    const index = series.reduce((nearest, point, candidate) => (
+      Math.abs(Date.parse(point.time) - hoverTimestamp)
+        < Math.abs(Date.parse(series[nearest].time) - hoverTimestamp)
+        ? candidate
+        : nearest
+    ), 0);
+    setHoverIndex(index);
   }
 
   const hovered = hoverIndex !== null ? series[hoverIndex] : null;
-  const hoverFraction = hoverIndex !== null ? hoverIndex / (series.length - 1) : 0;
+  const hoverFraction = hoverIndex !== null
+    ? (xAt(hoverIndex) - MARGIN.left) / PLOT_WIDTH
+    : 0;
   const tooltipTransform = hoverFraction < 0.15 ? "translateX(0)" : hoverFraction > 0.85 ? "translateX(-100%)" : "translateX(-50%)";
 
   const path = monotonePath(series.map((_, i) => xAt(i)), series.map((p) => yAt(p.bikes)));
@@ -99,16 +108,16 @@ export function StockChart({ station, baseDttm, points }: Props) {
             </g>
           ))}
 
-          {xTicks.map((index, tickIndex) => (
+          {xTicks.map((timestamp, tickIndex) => (
             <text
-              key={series[index].time}
-              x={xAt(index)}
+              key={timestamp}
+              x={xAtTime(timestamp)}
               y={HEIGHT - 5}
               textAnchor={tickIndex === 0 ? "start" : tickIndex === xTicks.length - 1 ? "end" : "middle"}
               fontSize={11}
               fill="var(--text-muted)"
             >
-              {formatTime(series[index].time)}
+              {formatTime(new Date(timestamp).toISOString())}
             </text>
           ))}
 
@@ -123,18 +132,6 @@ export function StockChart({ station, baseDttm, points }: Props) {
           />
 
           <path d={path} fill="none" stroke="var(--series-stock)" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" />
-          <circle cx={xAt(series.length - 1)} cy={yAt(last.bikes)} r={4} fill="var(--series-stock)" stroke="var(--surface-1)" strokeWidth={2} />
-          <text
-            x={xAt(series.length - 1) - 6}
-            y={yAt(last.bikes) - 10}
-            textAnchor="end"
-            fontSize={11}
-            fontWeight={700}
-            fill="var(--text-primary)"
-          >
-            {last.bikes}
-          </text>
-
           {hoverIndex !== null && hovered && (
             <>
               <line

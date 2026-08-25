@@ -1,5 +1,24 @@
 # 2025 전체 모델 메모리 실측 (2026-08-22)
 
+> **보관 측정 기록:** commit `8bd7e3a` 기반 worktree와 당시 WSL2·Docker 구성에서 얻은
+> calibration 결과다. 현재 모델의 실제 peak나 현재 infrastructure instance 요구량을
+> 자동으로 갱신하는 문서가 아니다. 재실행 절차는
+> [FULL_YEAR_TRAINING_GUIDE.md](FULL_YEAR_TRAINING_GUIDE.md), 현재 task resource 설정은
+> [Airflow resource profile](../airflow/TASK_RESOURCE_PROFILES.md)을 우선한다.
+
+## 판정 범위
+
+| 이 기록으로 판단한 것 | 이 기록만으로 판단할 수 없는 것 |
+| --- | --- |
+| 당시 full-year 계약의 첫-round 중심 memory 등급 | 현재 코드·feature row 수의 exact peak |
+| 32GiB+swap 대비 64GiB RAM의 안전 여유 | 800-round 전체 wall time과 절대 최대 byte |
+| Peak-hour 축소가 memory를 줄인 정도 | 축소 profile의 예측 품질과 운영 채택 여부 |
+| Calibration archive가 serving pointer를 바꾸지 않음 | 현재 serving pointer가 가리키는 release |
+
+아래 local `data/...` 증거 경로와 MinIO bucket은 당시 환경의 식별자다. 현재도 객체가
+존재한다고 가정하지 않으며, 수치를 다시 인용하려면 원본 resource manifest의 status,
+sampling interval과 OOM counter를 함께 확인한다.
+
 ## 결론
 
 2025 전체 운영 데이터 계약을 유지한 LightGBM 학습의 최대 동시 logical footprint는

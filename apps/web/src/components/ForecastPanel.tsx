@@ -34,7 +34,7 @@ export function ForecastPanel({ station, forecast, error }: Props) {
           예측 조회에 실패해 마지막 결과를 표시합니다.
         </p>
       )}
-      <ForecastChart points={forecast.points} />
+      <ForecastChart baseDttm={forecast.base_dttm} points={forecast.points} />
     </div>
   );
 }

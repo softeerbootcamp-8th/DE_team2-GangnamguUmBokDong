@@ -1,35 +1,33 @@
-# training — 설계 문서
+# Training 설계
 
-실행 방법은 [README.md](../../../ml/training/README.md), 결정의 배경/시행착오는 [history.md](../history.md)를
-참고. 이 문서는 "지금 코드가 왜 이렇게 짜여 있는지"에 집중한다.
+> 현재 상태: **운영 코드와 일치**
+>
+> 기준 구현: `ml/training/`
+>
+> 실행 방법: [training README](../../../ml/training/README.md)
 
-현재 시간 해상도 기본 계약은 **g20/r20/a20 학습 + 5분 서빙**이다. g/r은
-`{5, 10, 15, 20, 30, 60}`분 중 같은 값을 쓰고, formal
-`TRAIN_ANCHOR_TICK_MINUTES`(a)는 생략 시 g와 같으며 명시 시 g 이상인
-배수이면서 1시간과 1일을 나눠야 한다. 모델 grid/anchor는 학습 데이터의
-해상도이고 `SERVING_TICK_MINUTES=5`는 별도 고정 계약이다.
+Training은 Feature Engine의 대여·반납 multi-horizon mart를 읽어 서로 독립된
+LightGBM 모델을 학습한다. 모든 결과는 새 immutable archive에 challenger로 저장하며,
+학습 완료만으로 운영 serving release를 변경하지 않는다.
 
-해상도 비교는 A=g20/r20/a20, B=g5/r5/a20, C=g5/r5/a5 세 arm으로 한다.
-A와 B의 공통 20분 anchor는 feature/label parity를 확인하고, 정확도는 세 모델
-모두 같은 독립 5분 test mart에서 평가한다. 각 arm의 자체 test split 지표는
-행 집합이 다르므로 서로 직접 비교하지 않는다.
+## 1. 학습 단위와 모델
 
-## 1. 왜 학습은 Spark가 아니라 로컬 LightGBM인가
+| 모델 | 라벨 | 평균 모델 | 구간 모델 | 추가 처리 |
+|---|---|---|---|---|
+| 대여 | `rental_count` | Poisson | Quantile P10/P50/P90 | `rental_exposure` offset |
+| 반납 | `return_count` | Poisson | Quantile P10/P50/P90 | 없음 |
 
-`feature_engine`은 Spark로 분산 처리하지만(EMR, 데이터 규모가 히스토리 길이에
-비례해 계속 커짐), 운영 재학습은 **최근 N개월만 잘라서** 단일 머신 LightGBM으로
-돌린다 — 학습 데이터량이 히스토리 길이와 무관하게 고정되므로 확장성 문제가
-없다. 단, 최초 챔피언은 `TRAIN_WINDOW_START=2025-01-01`과
-`TRAIN_WINDOW_END=2025-12-31`을 feature_engine/training 양쪽에 함께 주어 2025년
-전체를 exact window로 사용한다. 두 변수가 없을 때만 최근 N개월 rolling 규칙을
-적용하며, 한쪽만 있거나 오형식·역전이면 fail-closed한다. 처음엔 이 이유로
-LightGBM 자체 분산 학습(Socket/MPI)이나
-SynapseML(LightGBM-on-Spark)도 검토했지만 채택하지 않았었다(history.md 5번
-항목) — EMR 클러스터를 쓴다고 학습이 자동으로 분산되는 게 아니라 별도
-인프라/구현 부담이 컸기 때문. 이후 여러 해치 데이터로 확장 계획이 서면서
-분산 학습 자체는 다시 쓰기로 했다(history.md 17번 항목) — 다만 여전히 "학습은
-최근 N개월만 자른다"는 원칙은 유지하고, 그 잘린 데이터를 여러 머신에 나눠
-학습 속도/메모리를 더 아끼는 용도로 쓴다.
+`horizon`이 feature에 포함되므로 모델별 booster 하나가 horizon 1..12를 함께 학습한다.
+대여와 반납은 feature mart, lag, booster, category, metrics, conformal correction을
+공유하지 않는다.
+
+대여 Poisson 학습은 `init_score=log(exposure)`를 사용한다. LightGBM 모델 파일에는
+이 offset이 저장되지 않으므로 채점 시 `exposure × booster.predict(X)`로 복원해야
+한다. 이 규칙은 `libs/ml_core/scoring.py`가 학습 평가와 추론에 공통 적용한다.
+
+Quantile booster에는 exposure offset을 적용하지 않는다. validation의 conformity
+score로 split-conformal correction을 계산하고 P10/P90 구간을 보정한다. 목표
+coverage 기본값은 `CONFORMAL_TARGET_COVERAGE=0.80`이다.
 
 ## 1-1. LightGBM 분산 학습(Socket) — YARN Distributed Shell로 워커 기동
 
@@ -41,7 +39,7 @@ SynapseML(LightGBM-on-Spark)도 검토했지만 채택하지 않았었다(histor
 
 - **왜 SynapseML이 아니라 LightGBM 자체 분산인가**: SynapseML은 `VectorAssembler`로
   피처를 재조립해야 하고, 이 프로젝트 핵심인 exposure offset(`init_score`,
-  §2 참고) 우회 구현이 필요해 리스크가 컸다. LightGBM 자체 분산은 지금
+  바로 위 문단 참고) 우회 구현이 필요해 리스크가 컸다. LightGBM 자체 분산은 지금
   `train_common.py`의 `lgb.Dataset`/`lgb.train` 호출에 파라미터만 얹으면 되고
   offset 로직을 그대로 재사용할 수 있다.
 - **워커를 어떻게 띄우는가(YARN Distributed Shell)**: 학습용 EC2가 없어지고
@@ -54,7 +52,7 @@ SynapseML(LightGBM-on-Spark)도 검토했지만 채택하지 않았었다(histor
   `LGB_MACHINE_RANK`와 전체 `LGB_MACHINES` 문자열을 계산해 실제 학습 스크립트를
   실행한다(YARN은 컨테이너 배치만 해줄 뿐 서로의 주소를 알려주는 기능은 없어
   이 등록/barrier는 직접 구현했다). 배경과 대안 비교는
-  [ADR-0007](../../adr/0007-yarn-distributed-shell-workers.md) 참고.
+  [ADR-0008](../../adr/0008-yarn-distributed-shell-workers.md) 참고.
 - **데이터 분배(data-parallel)**: LightGBM 소켓 분산은 전체 데이터를 자동으로
   나눠주지 않는다 — 각 머신이 미리 자기 몫만 들고 `lgb.train()`을 호출해야
   한다. `lazy_train_dataset._shard_for_this_machine()`이 `station_no`를
@@ -72,7 +70,7 @@ SynapseML(LightGBM-on-Spark)도 검토했지만 채택하지 않았었다(histor
   `LGB_MACHINE_RANK == 0`으로 막고, 학습 호출 자체는 항상 전 머신이 진행한다 —
   boosting이 끝나면 모든 머신의 booster가 동일(매 라운드 gradient를 네트워크로
   동기화)하므로 대표 머신 하나만 저장/평가하면 충분하다.
-- **알려진 근사(추후 개선 여지)**: split-conformal correction(§3)은 검증셋
+- **알려진 근사(추후 개선 여지)**: split-conformal correction(바로 위 문단 참고)은 검증셋
   전체가 아니라 대표 머신(rank 0)의 station 샤드만으로 계산된다 — 여러 머신의
   conformity score를 모아 합치려면 LightGBM 소켓 프로토콜 밖의 별도 집계 단계가
   필요해 지금은 범위 밖으로 남겨뒀다.
@@ -82,210 +80,171 @@ SynapseML(LightGBM-on-Spark)도 검토했지만 채택하지 않았었다(histor
   안에서 한 번 8로 늘리면 그 사이클이 끝날 때까지 유지한다(피처마트 단계에서
   유휴 노드 비용은 감수).
 
-## 2. Poisson + exposure offset
+## 2. 시간 해상도 계약
 
-대여 모델은 품절(stockout) 시간대 censoring을 `init_score=log(exposure)`
-offset으로 보정한다. 반납은 거치대 상태와 무관하게 항상 성공하므로
-`exposure_col=None`(순수 Poisson)으로 학습한다.
+내장 프로필은 **g20/r20/a20 학습 + 5분 서빙**이다.
 
-**LightGBM은 `init_score`를 모델 파일에 저장하지 않는다.** 학습 시
-`eta = init_score + tree(x)`로 적합되지만 `predict()`는 `tree(x)`의 objective
-역변환(Poisson이면 `exp(tree(x))`)만 반환한다 — 그래서 실제 예측값은 항상
-`exposure * booster.predict(X)`로 직접 복원해야 한다(`ml_core/scoring.py`가
-이 규칙을 지킴).
+- `GRID_TICK_MINUTES`와 `ROLLING_TICK_MINUTES`는 같아야 한다.
+- 지원 grid는 `{5, 10, 15, 20, 30, 60}`분이다.
+- `TRAIN_ANCHOR_TICK_MINUTES`는 base grid 이상의 배수이며 한 시간과 하루를 나눈다.
+- `SERVING_TICK_MINUTES=5`는 학습 grid와 별도의 고정 운영 계약이다.
+- feature mart를 만든 effective profile과 학습 profile이 달라지면 경로 또는 계약
+  검증에서 실패해야 한다.
 
-## 3. Quantile(P10/50/90) + split-conformal 보정
+해상도 실험의 자체 test 지표는 anchor 표본이 다르므로 직접 비교하지 않는다.
+g20/a20, g5/a20, g5/a5는 동일한 독립 5분 test mart에서 비교해야 한다.
 
-`objective='quantile'` 3개(alpha=0.1/0.5/0.9)를 별도로 학습한다(exposure offset은
-적용 안 함 — quantile loss와 offset의 결합이 표준적이지 않음). 검증셋에서
-conformity score(구간 밖으로 벗어난 정도)의 분위수를 correction으로 구해
-`[p10-correction, p90+correction]`을 적용한다(`train_common._conformal_correction()`,
-Romano et al. CQR) — 테스트셋 P10~P90 커버리지가 이론값(기본 0.80)에 더 가까워짐.
+## 3. 학습 기간과 split
 
-## 4. station_no 카테고리 — 학습/서빙이 반드시 같은 코드를 써야 함
+`TRAIN_WINDOW_START`와 `TRAIN_WINDOW_END`를 모두 지정하면 inclusive 고정 기간을
+사용한다. 둘 다 없으면 `TRAIN_LOOKBACK_MONTHS`와
+`TRAINING_SAFETY_MARGIN_DAYS`로 rolling window를 계산한다. 한쪽만 지정하거나 날짜가
+잘못되면 실행 전에 실패한다.
 
-모델 feature는 station_id(텍스트, "ST-2565")가 아니라 station_no(정수
-일련번호)다 — Parquet dictionary encoding이 `to_pandas()`에서 안 살아남아
-매 학습 읽기마다 object dtype 문자열 배열을 통째로 만드는 비용이 있었는데,
-station_no는 처음부터 정수라 그 비용 자체가 없다(station_id는 출력/CLI 식별
-용도로만 계속 쓰임). `train_target()`이 전체 데이터 기준 station_no
-`CategoricalDtype`을 한 번만 고정하고 `{model_name}_station_categories.json`에
-저장한다. split(train/valid/test)마다 따로 `astype("category")`하면 LightGBM
-카테고리 코드(정수)가 어긋나 조용히 오염되는 흔한 실수라 명시적으로 피한다.
-`inference`는 `ml_core/model_contract.py`의 `load_station_dtype()`으로 이
-파일을 그대로 읽어 인코딩을 재현한다 — 이 계약이 깨지면(둘이 다른 카테고리
-순서를 쓰면) 모델이 station_no를 조용히 잘못 해석한다.
+train/valid/test는 `date=YYYY-MM-DD` partition 이름으로 결정한다. 같은 anchor의
+서로 다른 horizon이 날짜 경계를 넘어갈 수 있으므로 평가일 주변 train 날짜를
+`SPLIT_EMBARGO_DAYS`만큼 purge한다. valid와 test가 이 거리 안에 있어 같은 anchor를
+공유할 수 있는 설정도 거부한다.
 
-## 5. `ml_core/`으로 뺀 것과 이 폴더에 남은 것
+기본값은 모든 안전한 train 날짜와 모든 horizon을 사용한다. 자원 부족 시에만 다음
+dial을 사용한다.
 
-학습(`train_target()`, split, conformal correction)과 서빙(`predict()`)이
-정확히 같은 **모델 계약**(feature 목록, station_id 인코딩, 평가 지표 정의)을
-써야 한다 — 그래서 `FEATURE_COLUMNS`/`station_categories_path`/`load_station_dtype`은
-`ml_core/model_contract.py`로, `poisson_deviance`/`pinball_loss`는 `ml_core/metrics.py`로,
-채점 로직(`predict()`)은 `ml_core/scoring.py`로 뺐다. 이 폴더에는 학습에만
-필요한 것(`_dates_for_split`, `_conformal_correction`, `train_target()` 자체,
-`lazy_train_dataset.py`의 S3 지연 로딩, LightGBM 파라미터 튜닝)만 남는다.
+| 설정 | 동작 | 품질 비용 |
+|---|---|---|
+| `LGB_DEFER_VALID_DATASET=true` | valid Dataset을 학습 후 streaming 평가 | early stopping 없음 |
+| `TRAIN_DAY_DIVISOR>1` | 결정적으로 일부 train 날짜만 사용 | 계절·요일 표본 감소 |
+| `MAX_TRAIN_HORIZON<N` | 먼 horizon을 읽지 않음 | N 이후 품질 미검증 |
 
-`monitor_performance.py`/`scripts/compare_baselines.py`가 `ml_core/scoring.py`의
-`predict()`를 가져다 쓰는 이유도 같다 — "저장된 모델로 채점"하는 로직은
-서빙 전용이 아니라 평가/모니터링에서도 똑같이 필요하다.
+과거 `TRAIN_SAMPLE_FRAC`, `VALID_SAMPLE_FRAC`, `TEST_SAMPLE_FRAC`는 실제 I/O에
+연결되지 않았으므로 제거됐으며 설정하면 실패한다.
 
-## 6. 월별 성능 모니터링 — 고정 baseline이 아니라
+## 4. 메모리 제한 학습
 
-`monitor_performance.py`는 "절대 수치"가 아니라 baseline(마지막 학습 시점 테스트
-성능) 대비 **상대 악화율**로 재학습 여부를 판단한다. 절대 임계값을 안 쓰는 이유:
-Poisson deviance가 계절성에 강하게 비례한다는 걸 실측으로 확인했다(1월 0.890 vs
-6월 1.259, +42%) — 고정 baseline 대비로 여름철을 평가하면 모델이 멀쩡해도
-"재학습 필요"로 오탐이 난다. 임계값(deviance 10%, 커버리지 15%p)의 근거는
-실측 노이즈 바닥(재학습 run-to-run 편차 0.3~0.5%, embargo 스윕 편차 0.6%)보다
-한참 위로 잡은 것 — `ml_core/common_config.py` 주석 참고.
+multi-horizon mart 전체를 pandas DataFrame 하나로 합치지 않는다.
+`lazy_train_dataset.py`는 날짜 partition을 `lgb.Sequence`로 감싸 LightGBM이 요청할
+때만 읽고, 작은 LRU cache에서 오래된 날짜를 비운다.
 
-**아직 미구현**: 고정 baseline 대신 최근 N개월 이동평균(rolling baseline) 대비로
-바꾸는 개선(history.md 9번 항목 마지막 문단) — 계절이 서서히 바뀌는 건 흡수하고
-급격한 이탈만 잡도록.
+- feature: 날짜별 Arrow/Pandas chunk를 필요할 때만 로드한다.
+- label·exposure·init score: 로컬 scratch memmap에 순차 기록한다.
+- test: 날짜별로 예측하고 작은 label/prediction 배열만 합친다.
+- valid: conformal 계산 시에도 날짜별 streaming prediction을 사용한다.
 
-## 7. 실험 격리 원칙 — S3 아카이브 + MLflow (2026-08 갱신)
+따라서 전체 feature 행렬의 RAM 상주는 피하지만 scratch disk와 S3 재조회 비용은
+필요하다. 진행 상황과 peak RSS는 `TRAIN_PROGRESS_LOG_PATH`에 기록한다.
 
-예전엔 `scripts/run_embargo_sweep.py`/`build_embargo_candidate.py` 같은 별도
-스윕 스크립트와 `experiment_log.py`가 만드는 `manifest.jsonl`로 실험을
-격리·기록했다 — 지금은 둘 다 삭제됐고, 격리/기록 방식이 다음 두 가지로
-정리됐다:
+LightGBM socket 분산 설정은 코드에 존재하지만 기본값은 `serial`이다. 실제 다중
+worker 네트워크·동시 기동·전체 conformity score 집계는 운영 검증이 완료된 경로가
+아니므로 현재 표준 운영 방식으로 간주하지 않는다.
 
-- **격리**: 모든 학습은 `train_target()` 호출 한 번마다 S3 아카이브
-  (`libs/ml_core/paths.archive_models_prefix(date, profile_name)`)에만 쓴다 —
-  챔피언 자리에는 절대 직접 안 쓴다(§8 참고). 실험이 몇 번을 실패하거나
-  중간에 멈춰도 챔피언 아티팩트는 그 자체로 안전하다.
-- **기록**: (run_id, params, metrics, artifacts)를 이제 정식
-  experiment tracker인 [MLflow](../MLFLOW_SETUP.md)가 기록한다 — 예전
-  `manifest.jsonl`이 하던 일을 그대로 대체하되, 파일을 직접 열어 파싱하는
-  대신 웹 UI에서 여러 시도(예: `TRAIN_DAY_DIVISOR`/`MAX_TRAIN_HORIZON` 조합)를
-  나란히 비교할 수 있게 됐다. 자세한 설정/기록 내용은
-  [MLFLOW_SETUP.md](../MLFLOW_SETUP.md).
+## 5. Checkpoint와 재개
 
-## 8. 챔피언/챌린저 승격 — 파일 복사가 아니라 포인터 전환 (2026-08 신규)
+`TRAIN_CHECKPOINT_INTERVAL_ROUNDS`가 양수이면 Poisson, Q10, Q50, Q90 phase별
+Booster와 state를 archive의 `_checkpoints/` 아래에 저장한다. Booster 업로드 후
+state를 갱신하므로 중간 업로드를 정상 checkpoint로 오인하지 않는다.
 
-학습(`train_rental_model`/`train_return_model`)은 항상 S3 아카이브에만 쓰고,
-"지금 서빙 중인 모델"(챔피언)은 별도 포인터 객체
-(`champion/{model_name}.json`, `ml_core.paths.write_champion_pointer()`/
-`read_champion_prefix()`)가 어느 archive_prefix를 가리키는지로 정해진다.
+`TRAIN_RESUME_FROM_CHECKPOINT=true`일 때 다음 fingerprint가 모두 같아야 재개한다.
 
-최초 챔피언은 각 학습 CLI의 명시적 `--promote-if-no-champion`으로만 만든다.
-학습 성공 후에도 `promotion.bootstrap_challenger()`가 일반 승격과 같은 effective
-profile 계약 검증을 거치며, 같은 모델 포인터가 이미 있으면 오류로 중단해 기존
-챔피언을 덮지 않는다. 대여/반납을 독립적으로 부트스트랩하므로 첫 모델 성공 뒤
-둘째 모델만 실패해도 실패한 명령만 안전하게 재실행할 수 있다.
+- 입력 데이터 경로와 split 날짜
+- feature 목록과 effective profile
+- LightGBM 파라미터
+- 관련 핵심 코드 bytes
 
-**왜 파일 복사가 아니라 포인터인가**: 예전엔 승격할 때 archive의 파일 8개
-(booster 4개 + station_categories/conformal_correction/metrics/profile)를
-챔피언 prefix로 하나씩 복사했다 — S3는 여러 키에 걸친 트랜잭션을 지원하지
-않으므로, 복사가 절반쯤 끝난 순간 inference가 실행되면 booster는 새 버전인데
-station_categories는 옛 버전인 식으로 섞인 모델을 읽을 수 있었다(station_no
-카테고리 코드가 학습 시점의 정렬 순서에 의존해서, 섞이면 성능 저하가 아니라
-엉뚱한 정류소에 대한 예측이 조용히 나감). archive 자체는 immutable이므로
-포인터 하나만 원자적으로 바꾸면 파일을 복사할 필요가 아예 없다.
+validation을 사용하는 phase는 best score, best iteration, patience도 복원한다.
+완료 phase는 최종 Booster를 다시 읽어 건너뛰지만 최종 평가·conformal·metrics는
+현재 실행에서 다시 계산한다. checkpoint는 serving release가 아니며 운영 추론에
+노출되지 않는다.
 
-`training.promotion.should_promote(challenger_metrics, champion_metrics)`이
-판정한다 — 챔피언이 없으면 무조건 승격(부트스트랩). 있으면 **둘 다** 만족해야
-승격: `poisson_deviance_test`가 챔피언보다 나쁘지 않고(작거나 같고),
-`p10_p90_coverage_calibrated_test`가 목표 커버리지(§6와 같은
-`common_config.CONFORMAL_TARGET_COVERAGE`) ± 허용 드리프트
-(`COVERAGE_DRIFT_THRESHOLD`) 범위 안 — 승격 전용 새 절대 임계값을 따로 만들지
-않고 §6이 이미 근거를 댄 상대 임계값을 재사용한다. `promote_challenger()`는
-포인터를 쓴 뒤 `read_champion_prefix()`/`load_boosters()`/
-`load_conformal_correction()` 세 캐시를 전부 비운다 — 재학습해봤더니 구려서
-같은 프로세스 안에서 재학습→재승격을 반복하는 코드가 있다면, 재승격 직후
-다음 채점부터 셋이 전부 새 archive로 일관되게 나오게 하기 위함이다(하나만
-비우면 셋 중 일부만 새 값을 보는 더 나쁜 불일치가 생긴다 — 실측 확인됨,
-`libs/ml_core/paths.py`의 `read_champion_prefix()` docstring 참고).
+## 6. Feature와 station category 계약
 
-`scripts/monthly_retrain_check.py`가 `monitor_performance.check_all_models()`로
-재학습 필요 여부를 판정한 뒤, 필요하면 후보 프로필들을 순서대로 재학습
-(별도 subprocess)해보고 `should_promote()`/`promote_challenger()`로 이어간다 —
-어느 프로필도 기준을 못 넘으면 챔피언은 그대로 두고 조용히 종료한다.
+feature 순서와 dtype의 단일 기준은 `libs/ml_core/model_contract.py`다.
+`station_no`는 전체 학습 데이터에서 한 번 정렬한 `CategoricalDtype`으로 고정한다.
+split마다 category를 다시 만들면 같은 코드가 다른 정류소를 뜻할 수 있으므로
+금지한다.
 
-## 9. 학습 테이블이 로컬 RAM보다 커질 때 — 날짜 파티션 단위 지연 로딩 (2026-08 전면 개편)
+고정된 category 순서는 `{model_name}_station_categories.json`에 저장되고 model
+snapshot에 포함된다. Inference는 snapshot의 exact bytes로 dtype을 복원한다.
 
-multi-horizon 테이블은 원본 tick 테이블의 최대 `HORIZON_COUNT`배 행 수라
-("horizon을 feature로" 설계, [feature_engine/DESIGN.md](../feature_engine/DESIGN.md) §7 참고),
-과거 20분 base/anchor·full horizon·2025년 전체 기준으로도 실측 8억 행대까지 커졌다 — 통째로 하나의
-pandas DataFrame(float64/int64 컬럼 13개)으로 읽으면 원본만 수십GB라 로컬(RAM 18GB)
-에서 반복적으로 OOM이 났다. 기본은 20분 anchor이며 필요하면 formal 설정으로
-5분 base/anchor도 선택할 수 있다. 어느 해상도든 날짜·계절·기상 다양성과
-`HORIZON_COUNT` 전체를 우선 보존하므로 `TRAIN_DAY_DIVISOR`로 날짜를
-솎아내는 방식은 기본값에서 뺐다. 대신 `train_common.py`가 데이터를 한 번에 로드하지 않고,
-**`lazy_train_dataset.py`가 날짜 파티션(`date=YYYY-MM-DD/`) 단위로 S3를 지연
-조회**한다.
+## 7. Archive와 실험 추적
 
-핵심 아이디어는 LightGBM `lgb.Sequence` API가 `Dataset.construct()` 중에 각
-Sequence를 필요할 때만(그것도 두 단계 — 표본 추출용 개별 인덱스, 그 다음 실제
-적재용 연속 슬라이스 — 로) 접근한다는 점을 이용하는 것이다: 날짜 하나를
-`_DatePartitionSequence`로 표현해 `__getitem__`이 호출될 때만 그 날짜의 S3
-파일을 읽고, 공유 LRU 캐시(`ChunkCache`, 기본 최대 2개)로 오래된 날짜를
-비워서 항상 최대 1~2개 날짜분만 메모리에 남긴다(캐시에서 밀려난 날짜가 나중에
-다시 필요해지면 재조회 — 메모리 대신 네트워크 I/O를 쓰는 트레이드오프).
+각 학습 실행은 충돌하지 않는
+`{MODELS_ARCHIVE_PREFIX}/dt={MODEL_ARCHIVE_DATE}/{ML_PROFILE}/` prefix에 기록한다.
+`MODEL_ARCHIVE_DATE`를 지정하지 않으면 같은 날 재실행도 겹치지 않는 unique ID를
+생성한다.
 
-- **train/valid**: `build_lazy_dataset()`이 이 방식으로 Sequence 기반 `lgb.Dataset`을
-  만든다. 라벨(+exposure)은 날짜 하나씩 읽어 삭제 예약된 로컬 scratch memmap에
-  순서대로 기록한다. `lgb.Dataset(label=...)`은 전체 길이의 1차원 배열을 구성
-  시점에 요구하지만, disk-backed ndarray로 같은 인터페이스를 제공해 전체 기간의
-  pandas/Arrow 합본과 numpy 재복사를 피한다. 대여 init-score도 별도 memmap에서
-  계산한다.
-- **test**: 학습에 안 쓰이고 `predict()`/지표 계산에만 쓰이므로 `Dataset`으로
-  만들지 않는다 — `predict_over_dates()`가 날짜별로 그 청크만 읽어 즉시
-  predict한 뒤, 큰 feature 행렬은 버리고 작은(1D) 예측값/라벨 배열만
-  이어붙인다. valid도 학습 후 conformal correction 계산에 같은 함수를 다시
-  쓴다(학습용 Sequence 적재와는 별개 시점이라 청크를 한 번 더 읽음).
+모델별 필수 archive는 다음과 같다.
 
-단일 머신에서 native train/valid Dataset을 동시에 유지하는 것만으로 메모리
-보호선을 넘으면 `LGB_DEFER_VALID_DATASET=true`를 쓸 수 있다. 이 모드는 train
-전체로 요청한 boosting round를 고정 실행한 뒤 Dataset을 해제하고, valid 전체를
-날짜별 streaming predict해서 지표와 conformal correction을 계산한다. 날짜나
-horizon을 줄이는 샘플링은 아니지만 학습 중 valid Dataset이 없으므로 early
-stopping은 사용하지 않는다. 기본값은 false여서 기존 학습·조기 종료 계약은
-그대로 유지된다.
+| artifact | 내용 |
+|---|---|
+| `*_poisson.txt` | 평균 예측 booster |
+| `*_q10.txt`, `*_q50.txt`, `*_q90.txt` | quantile booster |
+| `*_station_categories.json` | station category 순서 |
+| `*_conformal_correction.json` | 구간 보정값 |
+| `*_metrics.json` | 평가·모니터링 baseline |
+| `*_profile.json` | 실제 적용된 effective profile |
 
-날짜(train/valid/test 소속)는 여전히 `TRAIN_DAY_DIVISOR`/`VALID_DAYS_OF_MONTH`/
-`TEST_DAYS_OF_MONTH`로 정해지지만, `_dates_for_split()`가 Spark의 `date=` 파티션
-이름 자체(day-of-month를 문자열에서 바로 뽑음)만으로 계산한다 — 데이터를 전혀
-읽지 않는 순수 캘린더 연산이라 예전 `_split()`(로드된 df의 `day` 컬럼을
-역산)보다 더 이르게, 더 싸게 구간을 확정한다. `TRAIN_DAY_DIVISOR`는 기본값
-1(=날짜 다운샘플링 없음, 1년 전체)이고, 로컬 RAM이 급하게 부족한 특수 상황에서만
-2, 3, 5로 올리는 비상 dial로 남아있다. `horizon`은 여전히 같은 날짜 파티션 안에
-1..`HORIZON_COUNT`가 섞여 있어 `filters=[("horizon", "<=", MAX_TRAIN_HORIZON)]`
-(pyarrow row-group 필터)로 따로 거른다.
+동일한 params·metrics·artifact 사본을 MLflow에도 기록한다. MLflow는 비교와 관찰을
+위한 experiment tracker이며 S3 archive나 serving authority를 대체하지 않는다.
 
-`TRAIN_SAMPLE_FRAC`/`VALID_SAMPLE_FRAC`/`TEST_SAMPLE_FRAC`는 실제 로더에 연결되지
-않은 채 설정만 존재했던 가짜 dial이라 제거했다. 설정 시 명시적으로 실패하며,
-OOM 폴백은 실제 I/O를 줄이는 위 두 옵션만 지원한다. 날짜를 줄이면 계절·요일
-표본이 감소하고 horizon을 줄이면 먼 구간을 아예 학습하지 않는 품질 tradeoff가 있다.
+## 8. Challenger 판정과 serving release
 
-같은 anchor의 horizon 행이 자정을 넘어 서로 다른 target `date`에 저장될 수 있으므로,
-평가일 전후 `SPLIT_EMBARGO_DAYS`(현재 horizon/target 기준 최소 1일)는 train에서
-purge한다. valid/test가 서로 이 거리 안에 있으면 두 평가셋도 같은 anchor를 공유할
-수 있어 설정 오류로 실패한다. 이 embargo 없이 day-of-month만 인터리브하면 early
-stopping과 conformal correction이 같은 anchor 정보를 간접 공유해 낙관적으로 보인다.
+일반 학습은 champion 위치에 쓰지 않는다. `should_promote()`는 다음 두 조건을 모두
+확인한다.
 
-로드가 실제로 진행 중인지 확인하려면 `TRAIN_PROGRESS_LOG_PATH`(기본
-`training_progress.log`)를 tail — 날짜 청크 하나가 로드될 때마다(및 사전 스캔
-파일 완료마다) 그 시점 peak RSS를 남긴다(표준출력과 별개 채널).
+1. challenger의 `poisson_deviance_test`가 champion보다 나쁘지 않다.
+2. calibrated P10–P90 coverage가 목표 coverage ± 허용 drift 범위 안이다.
 
-### 장시간 boosting checkpoint
+legacy model별 champion pointer 전환은 같은 serving feature 계약 안에서만 허용된다.
+서로 다른 rolling·embargo·grid·horizon 계약으로 한 모델만 바꾸는 것은 거부한다.
 
-`TRAIN_CHECKPOINT_INTERVAL_ROUNDS=N`과 `TRAIN_RESUME_FROM_CHECKPOINT=true`를
-사용하면 Poisson/Q10/Q50/Q90 phase마다 N round 간격의 Booster와 작은 state
-pointer를 immutable model archive 아래에 남긴다. state는 Booster 업로드가 끝난
-뒤에만 갱신되어 중간 업로드를 재개 대상으로 선택하지 않는다. 학습 데이터·split·
-effective profile·LightGBM 파라미터·핵심 코드 fingerprint가 기존 state와 모두
-같을 때만 재개한다.
+현재 운영 inference authority는 개별 champion pointer가 아니라
+`models/serving-release/current.json`이 가리키는 rental/return pair다.
+`publish_serving_release.py`는 다음을 모두 검증한 뒤 마지막에 단일 pointer CAS를
+수행한다.
 
-재개 시 Dataset은 다시 구성해야 하지만 완료된 boosting round는 반복하지 않는다.
-validation을 사용하는 경로는 최고 점수, 최고 iteration, patience 상태도 함께
-복원한다. 완전히 끝난 phase는 최종 Booster를 다시 로드해 건너뛰고 평가와 metrics는
-현재 프로세스에서 다시 계산한다. 부분 checkpoint는 serving release가 참조하지
-않으므로 중단된 실행이 현재 서빙 모델을 바꾸지 않는다.
+- rental/return archive의 필수 artifact와 model snapshot
+- 두 모델의 effective serving contract 일치
+- station profile의 grid와 category coverage
+- station master의 `station_id ↔ station_no` 1:1 crosswalk
+- 입력 object의 실제 bytes와 checksum
+
+계약이 바뀌는 migration은 수동 `--allow-contract-change`가 필요하며 월별 자동
+재학습 경로에는 연결하지 않는다. pointer 게시 전까지 archive와 snapshot은
+challenger일 뿐 운영 모델이 아니다.
 
 **분산 학습과의 연동**: `LGB_NUM_MACHINES>1`이면 `_DatePartitionSequence`가 날짜
 파티션을 읽은 직후 `_shard_for_this_machine()`으로 이 머신 몫만 남기고 반환한다
 (라벨/exposure memmap도 같은 필터를 통과한 행 기준). station_no
 `CategoricalDtype`을 고정하는 `station_categories_for_dates()`는 이 필터와
 무관하게 항상 전체 station 목록을 스캔한다 — 1-1번 항목 참고.
+
+## 9. 월별 모니터링과 재학습
+
+`monitor_performance.py`는 현재 모델의 저장된 test baseline과 최근 완결 월의 지표를
+비교한다. Poisson deviance의 상대 악화와 coverage drift가 임계값을 넘으면 재학습
+후보가 된다.
+
+`monthly_retrain_check.py --execute`는 호환되는 후보 profile만 순서대로 시도한다.
+각 후보는 별도 subprocess에서 Feature Engine과 학습을 실행하고, 기준을 통과하지
+못하면 기존 포인터를 유지한다. feature 의미가 다른 profile은 무거운 Spark 작업을
+시작하기 전에 제외한다.
+
+자동 재학습의 model별 legacy pointer 승격과 pair serving release 게시는 같은 의미가
+아니다. 운영 pair 교체에는 두 모델과 station dependency를 함께 검수한 release 게시가
+필요하다.
+
+## 10. 검증 기준
+
+```bash
+cd ml
+./training/.venv/bin/python -m pytest training/tests/ ../libs/ml_core/tests -q
+```
+
+변경 시 다음 불변조건을 유지한다.
+
+1. split purge 후 train/valid/test가 같은 anchor를 공유하지 않는다.
+2. lazy loader 결과가 eager reference와 같다.
+3. 대여 exposure offset이 학습·평가·추론에서 같은 의미다.
+4. checkpoint는 fingerprint가 다르면 재사용되지 않는다.
+5. archive 저장이 기존 champion/release pointer를 변경하지 않는다.
+6. 불완전하거나 cross-contract인 model pair는 serving release가 되지 않는다.
+7. serving release pointer CAS 실패 시 기존 release가 유지된다.

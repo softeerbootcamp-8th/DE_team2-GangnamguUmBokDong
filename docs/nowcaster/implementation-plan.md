@@ -1,54 +1,157 @@
-# Seoul-pop-nowcasting
+# 생활인구 Nowcaster 구현
 
-## 개요
+> **현재 구현:** `nowcaster/`와 Airflow `daily_population_and_events` DAG가 사용하는
+> 생활인구 추정·아카이브 경로다. 코드 확인일: 2026-08-24.
 
-- 서울 생활인구 (250m): https://data.seoul.go.kr/dataList/OA-22784/S/1/datasetView.do
+## 해결하는 문제
 
-현재 서울 생활인구는 collector 모듈을 통해서 `living_population_grid`로 수집됨.
-서울 생활인구는 일 1회 수집되는데, 데이터 특성상 기준일로부터 4일 전 데이터만 제공됨. 그래서 이전 기록을 토대로 호출 시점 기준 `-3일 ~ +3일`의 기간을 채워넣는 것이 필요함.
+**250m 생활인구 실측은 약 4일 늦게 공개되므로 오늘과 가까운 미래의 ML feature가 비게 된다.**
 
-collector가 `living_population_grid`(내국인, 250m 격자, 시간대별)를 일 1회 적재한 뒤 실행되는 후처리 모듈. 원천 API는 기준일 D의 4일 전(D-4)까지만 제공하므로, 비어 있는 최근 구간을 과거 패턴으로 채워 넣고 같은 파케이 위치에 갱신한다.
+Nowcaster는 실측 archive의 동일 요일·휴일 패턴으로 KST 기준 `D-3..D+3` 생활인구를
+추정한다. 나중에 해당 날짜 실측이 들어오면 이를 archive로 승격하고 임시 nowcast를
+삭제한다.
 
----
+## 실행 흐름
 
-## 1. 데이터 수집의 한계 및 해결책
+```text
+Collector의 당일 living_population_grid
+                    │
+                    ▼
+실제 YMD별 archive 승격 ──→ 같은 날짜 nowcast 삭제
+                    │
+                    ▼
+D-3..D+3 중 archive 없는 날짜 추정
+                    │
+                    ▼
+silver/.../nowcast.parquet
+```
 
-- **API 제공 한계**: 데이터 용량 문제로 OpenAPI는 딱 4일 전(내국인) 당일 데이터만 제공함.
-- **과거 데이터 확보**: 서울 열린데이터광장 홈페이지에서 CSV 파일을 직접 다운로드하여 과거 데이터를 전량 수집해서 파케이 파일로 아카이빙 해놓아야 함.
-  - (실제 파일을 확인하면서 중간에 제공되지 않는 기간의 파일이 있는지, 스키마 변경이 없었는지 검증 필요하고 있다면 맞춰서 저장해두어야 함)
-  - 추가적으로 API 호출로 얻은 실측 4일 전 값은 아카이빙 파케이에 어펜드하면서 기록해야 함 (나중에 여기서 꺼내서 계산할 수 있도록)
+Collector의 `dt=`는 수집일이고 데이터 내부 `YMD`가 실제 발생일이다. Archive key는 반드시
+`YMD`에서 얻은 business date를 사용한다.
 
----
+## CLI
 
-## 2. 최근 데이터(3일 전 ~ 3일 후) 추정 전략
+| 명령 | 용도 | 정기 실행 여부 |
+| --- | --- | --- |
+| `estimate` | 실측 승격과 `D-3..D+3` 추정 | Airflow 일일 실행 |
+| `bootstrap-lookback` | 현재 추정에 필요한 과거 CSV 날짜만 초기 적재 | 운영 초기 1회 |
+| `backfill-archive` | 디렉터리의 공식 과거 CSV 전체 적재 | 수동 backfill |
 
-- **기본 접근법**: 확보한 과거 4주 치의 '동일 요일, 동일 시간대' 데이터를 활용해 알 수 없는 최근 데이터를 추정한다.
-- **채택된 모델 (점진적 감소형 가중 평균)**: 최근 상권 흐름을 가장 잘 반영하도록 가까운 과거에 높은 가중치를 부여.
-  - 1주 전: 40%
-  - 2주 전: 30%
-  - 3주 전: 20%
-  - 4주 전: 10%
+Airflow는 Collector의 일일 `living_population_grid` 성공 뒤 다음 명령을 실행한다.
 
----
+```bash
+uv run --frozen python main.py estimate --target-date <KST YYYY-MM-DD>
+```
 
-## 3. 이상치 및 결측치 대응 로직 (가중치 재조정)
+## 추정 grain과 값
 
-- **문제 상황**: 특정 일자가 악천후(이상치)이거나, 서버 오류로 데이터가 누락(결측치)된 경우.
-- **해결 원칙**: 5주 전 과거 데이터를 끌어오지 않고(데이터 분포 변화 방지), 해당 일자를 제외한 뒤 남은 데이터들로만 가중치를 재조정함.
+한 추정 행의 key는 `(H_DNG_CD, CELL_ID, TT)`다. 값은 `SPOP`과 남녀 각 14개 연령대
+컬럼(`M00..M70`, `F00..F70`)이다. 실측 승격과 후보 로딩 시 같은 key의 중복은 제거한다.
 
-### 상황별 대응 시나리오
+출력에는 다음 provenance를 추가한다.
 
-- **1~2개 누락 시**: 남은 데이터의 가중치 합으로 기존 가중치를 나누어 100% 비율로 재분배.
-  - (예: 2주 전 누락 시, 남은 가중치 합인 70%를 기준으로 1주 전은 40/70, 3주 전은 20/70, 4주 전은 10/70 비중으로 재조정)
-- **3개 누락 시**: 정상적인 데이터가 1개만 남았다면, 남은 1개의 과거 데이터를 100% 그대로 차용.
-- **전체 누락 시 (Worst Case)**의 대응 방안도 필요
-- **공휴일 처리**에 대한 방안 필요
-- **이상치 탐지 기준**에 대한 방안 필요 (극단적인 경우만 반영)
-- **추정값/실측값 구분 컬럼** 필수
+| 컬럼 | 값 |
+| --- | --- |
+| `is_estimated` | 실측 `false`, nowcast `true` |
+| `estimation_method` | `actual` 또는 아래 fallback 코드 |
 
----
+## 추정 우선순위
 
-## 실행 조건
+```text
+1~4주 전 후보 가중평균
+    ↓ 해당 CELL·시간이 모두 없음
+5~8주 전 후보 중 가장 가까운 값
+    ↓ 없음
+동일 평일/특수일 pattern의 archive 전체 평균
+    ↓ 없음
+0.0
+```
 
-- 해당 모듈은 collector의 `living_population_grid`가 수집 완료된 이후 실행 (일 1회)
-- 수집한 파케이 파일을 읽어서 `3일 전 ~ 3일 후`의 데이터를 채워넣고 같은 장소에 추가
+### 1~4주 가중치
+
+| 거리 | 가중치 |
+| ---: | ---: |
+| 1주 | 0.4 |
+| 2주 | 0.3 |
+| 3주 | 0.2 |
+| 4주 | 0.1 |
+
+- 4개가 모두 있으면 `weighted_avg`다.
+- 2~3개만 있으면 존재하는 값의 가중치를 다시 정규화하고 `reweighted_avg`다.
+- 1개만 있으면 그대로 사용하고 `single_week_fallback`이다.
+- 최근 후보가 모두 없고 5~8주 값이 있으면 `extended_lookback_fallback`이다.
+- 확장 후보도 없고 전체 평균이 있으면 `grid_historical_avg`다.
+- 끝까지 값이 없으면 수치는 `0.0`, method는 `no_data`다.
+
+## 요일·공휴일 정책
+
+`holiday.py`는 일요일 또는 대한민국 공휴일을 `special`, 나머지를 `weekday`로 분류한다.
+
+- 평일 후보: 정확히 1~4주 전 같은 요일
+- 특수일 후보: 과거로 탐색한 가장 가까운 special day 4개, 최대 60일
+- 가중 후보는 target과 pattern이 같은 경우에만 사용
+- 5~8주 fallback은 같은 요일 날짜를 사용
+- 전체 평균 cache도 `weekday`, `special`로 분리
+
+## Historical average cache
+
+Archive 전체 평균을 매 실행마다 다시 읽지 않는다. `estimate_day.py`는 pattern별 누적
+합·count와 이미 반영한 날짜 목록을 S3에 저장하고, 다음 실행에서는 새 archive 날짜만
+추가한다. 따라서 archive가 증가해도 정상 일일 실행의 읽기량이 계속 선형 증가하지 않는다.
+
+## S3 구조
+
+```text
+archive/living_population_grid/dt=YYYY-MM-DD.parquet
+silver/living_population_grid/dt=YYYY-MM-DD/hh=00/nowcast.parquet
+```
+
+- Archive: 실제 발생일 기준 실측, `is_estimated=false`
+- Nowcast: 추정 대상일 기준 임시 파일, `is_estimated=true`
+- 같은 날짜 archive가 존재하면 estimate를 건너뛴다.
+- 새 실측을 archive에 쓴 뒤 같은 날짜 nowcast 삭제는 idempotent하다.
+- Collector Silver를 읽을 때 `nowcast.parquet`은 실측 후보에서 제외한다.
+
+## 초기 적재
+
+생활인구 API는 임의 과거 날짜를 요청할 수 없으므로 초기 lookback은 공식 과거 CSV가
+필요하다.
+
+```bash
+cd nowcaster
+
+uv run --frozen python main.py bootstrap-lookback \
+  --csv-dir /path/to/csv \
+  --target-date 2026-08-24
+```
+
+기본 `horizon-days=3`은 `D-3..D+3` 각각의 1~4주 후보 날짜를 계산한다. CSV와 기존
+archive 어디에도 없는 필수 날짜가 하나라도 있으면 non-zero로 실패한다. `--force`를
+지정하지 않으면 기존 archive는 유지한다.
+
+전체 CSV backfill은 다음 명령을 사용한다.
+
+```bash
+uv run --frozen python main.py backfill-archive --csv-dir /path/to/csv
+```
+
+## 구현 위치
+
+| 파일 | 책임 |
+| --- | --- |
+| `main.py` | CLI, 실측 승격, 7일 추정 orchestration |
+| `backfill.py` | CSV schema 정규화, YMD별 분할, 실측 metadata |
+| `holiday.py` | 평일·special 분류와 후보 날짜 |
+| `estimate_day.py` | Vectorized weighted/fallback 추정과 cache |
+| `estimator.py` | 단일 값 추정 규칙 |
+| `storage.py` | Archive, nowcast, historical cache S3 I/O |
+
+## 검증
+
+```bash
+UV_CACHE_DIR=/private/tmp/codex-uv-cache \
+uv run --project nowcaster --frozen pytest nowcaster/tests -q
+```
+
+테스트는 CSV backfill, actual 승격, nowcast 삭제, 후보 재가중, 5~8주 fallback, historical
+average cache, holiday pattern과 S3 key를 검증한다.

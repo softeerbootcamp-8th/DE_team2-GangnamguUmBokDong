@@ -1,5 +1,7 @@
 # Unified Airflow Data Pipeline Implementation Plan
 
+> **보관 문서:** 통합 파이프라인 구현 전 작성한 계획이다. loader를 포함한 주요 기능이 이미 구현되었고 DAG 구성도 변경되었으므로 현재 상태 설명으로 사용하지 않는다. 현재 구조는 [Airflow 운영 구조와 데이터 흐름](./explain.md)을 참고한다.
+
 ## Goal
 현재 개별적으로 동작하는 `collector`, `nowcasting`, `normalizer`, `ml/inference`, `loader` 모듈들을 연결하여 Airflow 기반의 통합 데이터 파이프라인을 구축합니다. 원천 데이터 수집부터 결측치 보간(nowcasting), 정규화(normalization), 모델 추론(inference) 및 최종 RDB 적재까지 자동화하는 것을 목표로 합니다.
 

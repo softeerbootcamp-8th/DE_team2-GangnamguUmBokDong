@@ -1,144 +1,63 @@
-# 조각 실패는 즉시 중단하지 않고 라운드로 재시도한다
+# ADR-0004: 누락 조각은 분류해 재시도하고 허용 범위 안에서 부분 처리한다
+
+- 상태: 채택
+- 결정일: 2026-08-13
+- 작성자: Data Engineering 2팀
+- 대체 대상: ADR-0003의 순번 key와 첫 실패 즉시 중단 결정
+- 대체한 ADR: 없음
 
 ## 배경
-조각 하나가 재시도를 소진하면 그 자리에서 fetch가 끝나 이미 받은 조각을 전부 버렸고([ADR 0003](./0003-bronze-streaming-and-scaling-boundaries.md)), 앞쪽 조각에서 실패할수록 API를 적게 부르고 포기하는 불공평도 있었다.
+
+여러 조각 중 하나가 일시적으로 실패했을 때 window 전체를 즉시 중단하면 이미 받은 실시간 원본까지 활용하지 못한다. 반면 받은 조각만 조용히 성공으로 처리하면 데이터 누락을 감지할 수 없고, 과거 시점을 조회할 수 없는 snapshot source에 나중 데이터를 채우면 서로 다른 시점이 섞인다.
+
+누락은 재호출로 회복할 수 있지만 검증에서 폐기된 행은 정책이나 원천 품질의 문제다. 두 손실을 같은 기준으로 판정하면 재시도 가능한 실패와 설정을 수정해야 하는 실패를 구분할 수 없다.
 
 ## 결정
-실패한 조각을 옆으로 치워두고 나머지를 끝까지 받은 뒤, 실패분만 모아 최대 3라운드까지 재시도한다.
+
+### 1. 실패 종류에 따라 최대 3라운드로 수집한다
+
+- `TRANSIENT`: timeout, HTTP 429와 5xx는 15초·30초 간격으로 다음 라운드에서 재시도한다.
+- `PERMANENT`: HTTP 400과 404는 해당 조각만 누락으로 확정한다.
+- `FATAL`: HTTP 401과 403 같은 인증 오류는 남은 호출과 라운드를 즉시 중단한다.
+
+각 window의 전체 fetch에는 명시한 `fetch.budget`을 적용하고, 없으면 수집 주기의 절반과 30분 중 작은 값을 사용한다. Adapter가 전체 요청 목록을 아는 경우 `planned_parts`를 제공해 budget 전에 시작하지 못한 요청도 누락으로 기록한다.
+
+### 2. 수집 누락과 검증 폐기를 독립적으로 판정한다
+
+`max_missing_ratio`는 fetch 단계의 누락을, `max_drop_ratio`는 validation 단계의 폐기를 판정한다. 누락 비율이 허용 범위 안이면 성공 조각을 정규화·검증해 Silver를 만들고 `PARTIAL`로 기록하며, 초과하면 Silver 없이 `FAILED/fetch_error`로 끝낸다.
+
+검증 폐기 비율의 분모는 실제 수집 행 수다. 폐기 비율이 임계치를 넘으면 Quarantine은 남기되 Silver는 쓰지 않고 `FAILED/quality_gate`로 끝낸다. 최종 `completeness`와 누락 key는 진단 manifest에 기록한다.
+
+### 3. backfill은 시간 일관성을 지킬 수 있는 source에서만 수행한다
+
+source config의 `backfill.enabled`와 `max_age`로 허용 여부와 기간을 제한한다. 불완전한 실행은 `_retry_queue/{source_id}/{window_start}.json` marker로 찾되, 실제 대상 여부는 manifest를 다시 확인한다.
+
+Backfill은 기존 Bronze를 유지하고 누락 key만 요청한 뒤 window 전체를 다시 처리한다. Silver는 checksum을 포함한 새로운 immutable object로 기록하며, 완전한 `SUCCEEDED` 또는 확인된 `EMPTY` 결과만 source authority manifest의 다음 revision으로 게시한다. 동일 내용 재실행은 기존 authority revision을 재사용한다.
+
+`max_age`가 지나면 marker를 제거하고 진단 manifest의 `backfill_status`를 `expired`로 남긴다. 현재 시점만 반환하는 snapshot source는 backfill을 활성화하지 않는다.
+
+## 근거
+
+- 라운드 재시도는 일시적인 API 장애를 회복하면서 확정 오류의 불필요한 재호출을 막는다.
+- 두 품질 게이트를 분리하면 운영자가 API 재시도와 validation 정책 수정을 구분할 수 있다.
+- 요청 parameter 기반 key는 특정 조각만 안전하게 보완하고 병렬 호출에도 동일한 identity를 유지한다.
+- marker는 실패한 window만 빠르게 찾게 하고 manifest를 진실 공급원으로 유지한다.
+- immutable Silver와 authority revision은 backfill correction이 기존에 게시된 정상 결과를 제자리 덮어쓰지 않게 한다.
 
 ## 결과
-호출 단위 백오프(수 초)로는 풀리지 않는 429·순간 5xx가 라운드 간 대기(15s → 30s)로 회복된다. 대신 실패 시 실행 시간이 길어지므로 시간 예산이 함께 필요하다.
 
-**[ADR 0003](./0003-bronze-streaming-and-scaling-boundaries.md)의 "조각 하나가 실패하면 fetch 전체를 실패로 올린다"를 대체한다.**
+허용된 일부 누락은 명시적인 `PARTIAL` 결과로 보존되지만 authority로 게시되지 않으며, 완전한 correction이 만들어질 때만 하류의 기준이 바뀐다. API 장애 시 실행 시간이 늘 수 있으므로 fetch budget과 Airflow execution timeout을 함께 관리해야 한다.
 
----
+Snapshot source처럼 과거 시각을 재조회할 수 없는 데이터는 불완전 상태가 최종값으로 남을 수 있다. 이는 다른 시점의 데이터를 섞는 것보다 안전한 선택이다.
 
-# 재시도 판단을 위해 실패를 세 범주로 나눈다
+## 관련 자료
 
-## 배경
-라운드가 생기면서 "재시도할 것인가"만으로는 부족해졌다 — 확정된 실패를 세 라운드 반복하는 낭비와, 모든 조각이 같은 인증키를 쓰는데도 조각 수만큼 헛되이 호출하는 문제가 생긴다.
-
-## 결정
-`TRANSIENT`(타임아웃·429·5xx)는 라운드에 재투입하고, `PERMANENT`(400·404)는 그 조각만 포기하며, `FATAL`(401·403·인증키 오류)은 fetch 전체를 즉시 중단한다.
-
-## 결과
-인증키가 틀렸을 때 나머지 조각을 헛되이 부르지 않고 즉시 죽는다. 서울 API의 `INFO-200`(데이터 없음)은 실패가 아니라 빈 결과로 처리해 완결도 왜곡을 막는다.
-
----
-
-# fetch에 window 단위 시간 예산을 둔다
-
-## 배경
-라운드 재시도는 실패 시 실행 시간을 늘리므로 5분 주기 소스에서 다음 window를 잠식할 수 있고, 서비스가 죽으면 480페이지짜리 소스가 수천 번을 헛되이 호출한다.
-
-## 결정
-`fetch_budget`(기본 `min(interval × 0.5, 30m)`)을 window 하나의 fetch 전체에 건다.
-
-## 결과
-조각 수가 실행마다 변해도 전체 시간이 통제된다. 예산 초과 시 진행 중인 호출만 마무리하고 새 호출을 시작하지 않으며, 그 시점 성공분으로 완결도 게이트를 탄다.
-
----
-
-# 부분 수집 결과도 silver로 보내되 완결도를 기록한다
-
-## 배경
-받은 조각을 버리면 실시간 소스는 그 window를 영영 잃는데, 그렇다고 부분 성공을 그냥 성공으로 기록하면 [ADR 0003](./0003-bronze-streaming-and-scaling-boundaries.md)이 막으려던 침묵한 손실이 된다.
-
-## 결정
-`max_missing_ratio` 게이트를 통과하면 성공분으로 silver를 쓰되, manifest에 `counts.expected` · `missing` · `completeness`를 남겨 무엇이 빠졌는지 항상 드러낸다.
-
-## 결과
-손실이 기록되므로 침묵하지 않는다. 기본값을 `0.0`으로 두어 명시적으로 열지 않은 소스는 기존과 동일하게 조각 하나만 빠져도 실패한다.
-
----
-
-# 수집 게이트와 폐기 게이트를 독립으로 둔다
-
-## 배경
-손실 지점이 fetch(누락)와 validate(폐기) 두 곳이 됐는데, 두 실패는 원인도 대응도 다르다 — 누락은 재시도·백필로 회복되고 폐기 초과는 config를 고쳐야 한다.
-
-## 결정
-`max_missing_ratio`와 `max_drop_ratio`를 각각 자기 단계에만 걸고, `drop_ratio`의 분모는 `fetched`로 유지한다.
-
-## 결과
-게이트가 곧 `failure_reason`(`fetch_error` / `quality_gate`)을 결정해 "재시도가 의미 있는 실패인가" 구분이 유지된다. 분모를 `expected`로 바꾸지 않는 이유는 그럴 경우 평상시에는 동일하고 장애 때만 폐기율이 튀는 지표가 되기 때문이다.
-
----
-
-# 두 게이트를 통과한 뒤의 최종 완결도는 게이트가 아니라 정보로 남긴다
-
-## 배경
-게이트 두 개를 각각 통과해도 손실이 곱해져 최종 68%가 되는 경우를 어느 게이트도 잡지 못한다.
-
-## 결정
-`completeness = kept / expected`를 manifest에 기록하되 임계치를 강제하지 않고, 하류가 스스로 판단하게 한다.
-
-## 결과
-게이트를 셋으로 늘리지 않고도 누적 손실이 드러난다. `expected`를 알 수 없는 기상청은 조각 기준으로 계산하고 `basis` 필드로 구분한다.
-
----
-
-# 조각 이름에 요청을 식별하는 키를 넣는다
-
-## 배경
-`part={NNN}` 순번은 호출 순서라 실행 간에 안정적이지 않다 — `list_total_count`가 변하면 같은 번호가 다른 페이지 범위를 가리켜 백필이 조각을 지목할 수 없다.
-
-## 결정
-파일명을 요청 파라미터에서 파생한 키(`part=page-00001-01000` · `part=grid-060x127`)로 바꾸고, 읽는 순서는 manifest의 `artifacts.bronze.parts` 목록이 단독으로 정한다.
-
-## 결과
-백필이 특정 조각만 지목해 같은 자리에 채워 넣을 수 있다. 순번이 맡던 순서 보장은 이미 manifest가 하고 있었으므로 잃는 것이 없다.
-
-**[ADR 0003](./0003-bronze-streaming-and-scaling-boundaries.md)의 "조각 이름에 호출 순서를 넣는다"를 대체한다.**
-
----
-
-# 백필 가능 여부를 소스별 스위치로 둔다
-
-## 배경
-따릉이 실시간·서울 실시간 인구는 시간 파라미터가 없어 나중에 호출하면 그때 시점 데이터가 온다. 채워 넣으면 백필이 아니라 시점이 섞인 오염이다.
-
-## 결정
-`backfill.enabled`를 소스별로 두고, 스냅샷 소스는 `false`로 두어 부분 성공을 허용하되 그 window를 불완전 확정으로 남긴다.
-
-## 결과
-5분 주기 소스는 다음 window가 곧 오므로 회복 가능한 손실로 처리된다. 시점이 섞인 행이 하류로 조용히 흘러가는 경로가 생기지 않는다.
-
----
-
-# 백필 대상은 마커로 인덱싱하고 manifest로 확인한다
-
-## 배경
-불완전한 window를 찾으려고 manifest를 전수 스캔하면 대상 소스 5종 기준 하루 442개, 보관 기간 7일이면 3,094개를 매 실행마다 훑게 된다.
-
-## 결정
-불완전 종료 시 `_retry_queue/{source_id}/{window_start}.json` 마커를 남겨 인덱스로 쓰고, 백필 잡은 후보마다 manifest를 읽어 실제 상태를 확인한다.
-
-## 결과
-스캔 비용이 실패 건수에 비례하고 평상시에는 LIST 한 번에 빈 결과다. manifest가 진실이므로 마커가 잔존하거나 유실돼도 오동작이 아니라 스킵 또는 백필 누락으로만 이어진다.
-
----
-
-# 백필은 나이 기준으로 만료한다
-
-## 배경
-실패 조각을 언제까지 물고 갈지 정해야 하는데, 실제 제약은 API가 그 시점 데이터를 아직 주는가이고 그것은 시간의 함수다.
-
-## 결정
-`backfill.max_age`로 만료를 판정하고 시도 횟수는 마커에 기록만 한다.
-
-## 결과
-잡 주기를 바꿔도 만료 기준이 흔들리지 않는다. 만료 시 마커를 지우고 manifest에 `backfill_status: expired`를 남겨 완결도를 최종값으로 굳힌다.
-
----
-
-# 백필은 silver를 같은 경로에 덮어쓰고 revision을 올린다
-
-## 배경
-채워 넣은 조각을 반영하려면 silver를 갱신해야 하는데, 별도 파일로 추가하면 "window 하나 = Parquet 하나"가 깨지고 하류가 디렉토리 스캔과 dedup을 떠안는다.
-
-## 결정
-bronze 조각을 보완한 뒤 그 window를 처음부터 재처리해 같은 경로에 덮어쓰고 manifest의 `revision`을 올린다.
-
-## 결과
-경로 규칙·멱등 키가 유지되고 백필이 재개 분기의 케이스 하나로 구현된다. 대신 silver가 불변이 아니게 되므로, 하류는 `revision`을 보고 window 단위로 멱등 재처리한다는 것이 계약이 된다.
+- `collector/adapters/base.py`
+- `collector/config/schema.py`
+- `collector/pipeline.py`
+- `collector/manifest.py`
+- `collector/storage.py`
+- `collector/tests/test_adapters_base.py`
+- `collector/tests/test_pipeline.py`
+- `collector/tests/test_manifest.py`
+- [ADR-0003](0003-bronze-streaming-and-scaling-boundaries.md)

@@ -1,5 +1,7 @@
 # ML → collector 확인/요청 사항
 
+> **보관 문서:** 2026-08-15~16 ML 연동 과정에서 작성한 질문·조사 기록이다. 해결 표시가 없는 항목도 현재 결함을 뜻하지 않는다. 현재 Silver 소비 계약은 `libs/ml_core/silver_schema.py`, Collector 생산 계약은 `collector/sources/*.yaml`과 source manifest 코드를 기준으로 한다.
+
 이번 S3/MinIO 데이터 파이프라인 전환(`feature_engine`/`training`/`inference`가
 로컬 `ml/data/processed_v2/*.parquet` 대신 collector가 Silver로 쌓는 S3 데이터를
 직접 읽도록 바꾸는 작업)을 진행하며 `collector` 쪽 확정이 필요한 사항을 정리한다.

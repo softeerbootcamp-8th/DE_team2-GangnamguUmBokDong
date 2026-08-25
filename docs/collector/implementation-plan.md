@@ -1,5 +1,7 @@
 # collector 모듈 구현 계획
 
+> **보관 문서:** Collector 구현 전 작성한 상세 계획이다. 현재 API·manifest·품질 gate 계약은 `collector/` 코드와 `collector/sources/*.yaml`을 기준으로 한다.
+
 > 설계 결정의 배경과 근거는 [ADR 0001](../adr/0001-collector-module-design.md)을 참고한다. 이 문서는 그 결정을 어떻게 구현할지를 다룬다.
 
 ## 목차

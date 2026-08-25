@@ -1,8 +1,14 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import type { DispatchCenter, ServingHealthResponse, ServingHealthState } from "../api";
 import { formatClock, formatIsoTime } from "../format";
 import { RegionTabs } from "./RegionTabs";
 import logo from "../../assets/ubd_logo.png";
+
+const TOOLTIP_GAP_PX = 7;
+const TOOLTIP_GUTTER_PX = 8;
+const TOOLTIP_FALLBACK_WIDTH_PX = 250;
+const HEALTH_TOOLTIP_FALLBACK_WIDTH_PX = 360;
 
 interface Props {
   regions: DispatchCenter[];
@@ -22,22 +28,82 @@ interface HeaderTimeProps {
 }
 
 function HeaderTime({ id, label, value, description, error = false }: HeaderTimeProps) {
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const tooltipRef = useRef<HTMLSpanElement>(null);
+  const [tooltipOpen, setTooltipOpen] = useState(false);
+  const [tooltipPosition, setTooltipPosition] = useState({ left: 0, top: 0 });
+
+  const updateTooltipPosition = useCallback(() => {
+    const trigger = triggerRef.current;
+    const tooltip = tooltipRef.current;
+    if (!trigger || !tooltip) return;
+
+    const triggerRect = trigger.getBoundingClientRect();
+    const tooltipRect = tooltip.getBoundingClientRect();
+    const availableWidth = Math.max(0, window.innerWidth - TOOLTIP_GUTTER_PX * 2);
+    const tooltipWidth = Math.min(
+      tooltipRect.width || TOOLTIP_FALLBACK_WIDTH_PX,
+      availableWidth,
+    );
+    const maxLeft = Math.max(
+      TOOLTIP_GUTTER_PX,
+      window.innerWidth - tooltipWidth - TOOLTIP_GUTTER_PX,
+    );
+    const left = Math.min(
+      Math.max(TOOLTIP_GUTTER_PX, triggerRect.right - tooltipWidth),
+      maxLeft,
+    );
+    const tooltipHeight = tooltipRect.height;
+    const preferredTop = triggerRect.bottom + TOOLTIP_GAP_PX;
+    const top = preferredTop + tooltipHeight <= window.innerHeight - TOOLTIP_GUTTER_PX
+      ? preferredTop
+      : Math.max(TOOLTIP_GUTTER_PX, triggerRect.top - tooltipHeight - TOOLTIP_GAP_PX);
+
+    setTooltipPosition({ left, top });
+  }, []);
+
+  useLayoutEffect(() => {
+    if (!tooltipOpen) return;
+    updateTooltipPosition();
+    window.addEventListener("resize", updateTooltipPosition);
+    window.addEventListener("scroll", updateTooltipPosition, true);
+    return () => {
+      window.removeEventListener("resize", updateTooltipPosition);
+      window.removeEventListener("scroll", updateTooltipPosition, true);
+    };
+  }, [tooltipOpen, updateTooltipPosition]);
+
+  const tooltip = (
+    <span
+      ref={tooltipRef}
+      id={`${id}-tooltip`}
+      className={`header-time-tooltip${tooltipOpen ? " is-visible" : ""}`}
+      role="tooltip"
+      style={{ left: tooltipPosition.left, top: tooltipPosition.top }}
+    >
+      {description}
+    </span>
+  );
+
   return (
     <span className={`header-time${error ? " status-error" : ""}`}>
       <span>{label} {value}</span>
       <span className="header-time-help">
         <button
+          ref={triggerRef}
           type="button"
           className="header-time-info"
           aria-label={`${label} 설명`}
           aria-describedby={`${id}-tooltip`}
+          onMouseEnter={() => setTooltipOpen(true)}
+          onMouseLeave={() => setTooltipOpen(false)}
+          onFocus={() => setTooltipOpen(true)}
+          onBlur={() => setTooltipOpen(false)}
         >
           i
         </button>
-        <span id={`${id}-tooltip`} className="header-time-tooltip" role="tooltip">
-          {description}
-        </span>
       </span>
+      {typeof document === "undefined" ? tooltip : createPortal(tooltip, document.body)}
     </span>
   );
 }
@@ -81,6 +147,51 @@ function ServingHealthTime({
   health: ServingHealthResponse | null;
   error: boolean;
 }) {
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const tooltipRef = useRef<HTMLSpanElement>(null);
+  const [tooltipOpen, setTooltipOpen] = useState(false);
+  const [tooltipPosition, setTooltipPosition] = useState({ left: 0, top: 0 });
+
+  const updateTooltipPosition = useCallback(() => {
+    const trigger = triggerRef.current;
+    const tooltip = tooltipRef.current;
+    if (!trigger || !tooltip) return;
+
+    const triggerRect = trigger.getBoundingClientRect();
+    const tooltipRect = tooltip.getBoundingClientRect();
+    const availableWidth = Math.max(0, window.innerWidth - TOOLTIP_GUTTER_PX * 2);
+    const tooltipWidth = Math.min(
+      tooltipRect.width || HEALTH_TOOLTIP_FALLBACK_WIDTH_PX,
+      availableWidth,
+    );
+    const maxLeft = Math.max(
+      TOOLTIP_GUTTER_PX,
+      window.innerWidth - tooltipWidth - TOOLTIP_GUTTER_PX,
+    );
+    const left = Math.min(
+      Math.max(TOOLTIP_GUTTER_PX, triggerRect.right - tooltipWidth),
+      maxLeft,
+    );
+    const tooltipHeight = tooltipRect.height;
+    const preferredTop = triggerRect.bottom + TOOLTIP_GAP_PX;
+    const top = preferredTop + tooltipHeight <= window.innerHeight - TOOLTIP_GUTTER_PX
+      ? preferredTop
+      : Math.max(TOOLTIP_GUTTER_PX, triggerRect.top - tooltipHeight - TOOLTIP_GAP_PX);
+
+    setTooltipPosition({ left, top });
+  }, []);
+
+  useLayoutEffect(() => {
+    if (!tooltipOpen) return;
+    updateTooltipPosition();
+    window.addEventListener("resize", updateTooltipPosition);
+    window.addEventListener("scroll", updateTooltipPosition, true);
+    return () => {
+      window.removeEventListener("resize", updateTooltipPosition);
+      window.removeEventListener("scroll", updateTooltipPosition, true);
+    };
+  }, [tooltipOpen, updateTooltipPosition]);
+
   const overall = error ? "unavailable" : health?.overall ?? "loading";
   const overallLabel = overall === "healthy"
     ? "정상"
@@ -93,61 +204,71 @@ function ServingHealthTime({
     ? formatIsoTime(health.operational_base_dttm, { hour: "2-digit", minute: "2-digit" })
     : "-";
 
+  const tooltip = (
+    <span
+      ref={tooltipRef}
+      id="serving-health-tooltip"
+      className={`serving-health-popover${tooltipOpen ? " is-visible" : ""}`}
+      role="tooltip"
+      aria-label="데이터 상태 상세"
+      style={{ left: tooltipPosition.left, top: tooltipPosition.top }}
+    >
+      <span className="serving-health-popover-header">
+        <strong>데이터 상태</strong>
+      </span>
+      <span className="serving-health-list">
+        {HEALTH_COMPONENTS.map(([key, label]) => {
+          const component = health?.components[key];
+          const state = component?.state;
+          return (
+            <span key={key} className="serving-health-row">
+              <span className={`serving-health-dot ${state ?? "loading"}`} aria-hidden="true" />
+              <span className="serving-health-label">{label}</span>
+              <span className={`serving-health-state ${state ?? "loading"}`}>
+                {componentStateLabel(key, state, component?.reason)}
+              </span>
+              <time>
+                <span>
+                  {component?.source_dttm ? "게시 " : ""}
+                  {componentTime(component?.data_dttm ?? null)}
+                </span>
+                {component?.source_dttm && (
+                  <small>원본 {componentTime(component.source_dttm)}</small>
+                )}
+              </time>
+            </span>
+          );
+        })}
+      </span>
+      <span className="serving-health-footer">
+        {error
+          ? "상태 조회 실패 · 마지막 정상 화면을 유지합니다."
+          : health
+            ? `마지막 확인 ${componentTime(health.checked_at)}`
+            : "데이터 상태를 확인하고 있습니다."}
+      </span>
+    </span>
+  );
+
   return (
     <span className="header-time serving-health-time">
       <span>기준 시각 {baseTime}</span>
       <span className="header-time-help serving-health-help">
         <button
+          ref={triggerRef}
           type="button"
           className="header-time-info"
           aria-label="기준 시각 및 데이터 상태 설명"
           aria-describedby="serving-health-tooltip"
+          onMouseEnter={() => setTooltipOpen(true)}
+          onMouseLeave={() => setTooltipOpen(false)}
+          onFocus={() => setTooltipOpen(true)}
+          onBlur={() => setTooltipOpen(false)}
         >
           i
         </button>
-        <span
-          id="serving-health-tooltip"
-          className="serving-health-popover"
-          role="tooltip"
-          aria-label="데이터 상태 상세"
-        >
-          <span className="serving-health-popover-header">
-            <strong>데이터 상태</strong>
-            <span className={`serving-health-overall ${overall}`}>{overallLabel}</span>
-          </span>
-          <span className="serving-health-list">
-            {HEALTH_COMPONENTS.map(([key, label]) => {
-              const component = health?.components[key];
-              const state = component?.state;
-              return (
-                <span key={key} className="serving-health-row">
-                  <span className={`serving-health-dot ${state ?? "loading"}`} aria-hidden="true" />
-                  <span className="serving-health-label">{label}</span>
-                  <span className={`serving-health-state ${state ?? "loading"}`}>
-                    {componentStateLabel(key, state, component?.reason)}
-                  </span>
-                  <time>
-                    <span>
-                      {component?.source_dttm ? "게시 " : ""}
-                      {componentTime(component?.data_dttm ?? null)}
-                    </span>
-                    {component?.source_dttm && (
-                      <small>원본 {componentTime(component.source_dttm)}</small>
-                    )}
-                  </time>
-                </span>
-              );
-            })}
-          </span>
-          <span className="serving-health-footer">
-            {error
-              ? "상태 조회 실패 · 마지막 정상 화면을 유지합니다."
-              : health
-                ? `마지막 확인 ${componentTime(health.checked_at)}`
-                : "데이터 상태를 확인하고 있습니다."}
-          </span>
-        </span>
       </span>
+      {typeof document === "undefined" ? tooltip : createPortal(tooltip, document.body)}
       <span className={`serving-health-badge ${overall}`}>{overallLabel}</span>
     </span>
   );
