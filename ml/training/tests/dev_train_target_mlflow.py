@@ -124,6 +124,28 @@ def test_deferred_valid_dataset_keeps_full_streaming_validation(monkeypatch):
     assert run.data.params["lgb_defer_valid_dataset"] == "True"
 
 
+def test_train_target_logs_missing_dates_to_mlflow(monkeypatch):
+    """TRAIN_WINDOW가 1년 전체라 valid/test도 매달(day-of-month 3/19, 10/26) 날짜가
+    잡히지만(`VALID_DAYS_OF_MONTH`/`TEST_DAYS_OF_MONTH` 기본값), `_seed_return_table()`은
+    각 split당 하루(1/1, 1/3, 1/10)만 심는다 — 나머지는 전부 결측이다. 학습은
+    실패하면 안 되고(사용자 요구사항), 그 결측이 MLflow metric(개수)과
+    artifact(실제 날짜 목록)로 보여야 한다."""
+    _seed_return_table()
+
+    metrics = train_target("return_count", "return", models_prefix="models/test/missing-dates")
+
+    assert metrics["missing_train_dates_count"] > 300  # 1년 - valid/test 날짜 - 1일(seed) 근처
+    assert metrics["missing_valid_dates_count"] == 23  # 매달 2일(3/19) x 12 - seed된 1/3
+    assert metrics["missing_test_dates_count"] == 23  # 매달 2일(10/26) x 12 - seed된 1/10
+
+    run = _latest_run(config.MLFLOW_EXPERIMENT_NAME)
+    assert run.info.status == "FINISHED"
+    assert run.data.metrics["missing_train_dates_count"] > 300
+    client = mlflow.tracking.MlflowClient()
+    artifact_paths = {a.path for a in client.list_artifacts(run.info.run_id)}
+    assert "missing_dates.json" in artifact_paths
+
+
 def test_train_target_ends_run_as_failed_on_exception(monkeypatch):
     _seed_return_table()
     monkeypatch.setattr(

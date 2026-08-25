@@ -491,10 +491,6 @@ def train_target(
         dict: poisson_deviance_test, rmse_test, best_iteration, pinball_test_q{10,50,90},
             p10_p90_coverage_raw_test, conformal_correction, p10_p90_coverage_calibrated_test
     raises:
-        NotImplementedError: LGB_NUM_MACHINES>1(분산 학습) — lazy_train_dataset은
-            아직 station_no 샤딩과 연동되지 않았다(2026-08 스트리밍 전환 시 범위 밖으로
-            남김 — 필요해지면 `_DatePartitionSequence`가 청크를 읽은 직후 이 머신
-            몫만 남기게 확장하면 된다, 구조상 막혀있지 않음).
         ValueError: train/valid/test 구간에 날짜 또는 데이터가 하나도 없을 때
     """
     started_at = time.monotonic()
@@ -504,12 +500,6 @@ def train_target(
         f"train_horizons={list(config.TRAIN_HORIZONS)}, adaptive_anchors={config.ADAPTIVE_TRAIN_ANCHORS}, "
         f"peak_rss={_peak_rss_mb():.0f}MB"
     )
-    if config.LGB_NUM_MACHINES > 1:
-        raise NotImplementedError(
-            "lazy_train_dataset(날짜 파티션 단위 지연 로딩)은 아직 분산 학습"
-            "(LGB_NUM_MACHINES>1)과 연동되지 않았다 — station_no 샤딩을 날짜별 로더 "
-            "안에서 다시 구현해야 한다. 지금은 LGB_TREE_LEARNER=serial(단일 머신)만 지원."
-        )
     is_primary = config.LGB_MACHINE_RANK == 0
 
     feature_columns = _FEATURE_COLUMNS_BY_MODEL[model_name]
@@ -537,10 +527,38 @@ def train_target(
     # 타입을 직렬화하지 못해 죽는다(lazy_train_dataset.station_categories_for_dates()가
     # 이미 int()로 변환해 반환).
     all_dates = sorted({*train_dates, *valid_dates, *test_dates})
+
+    # 날짜 일부가 없어도(대여이력/재고/날씨/인구 Archive 결측, feature mart 생성
+    # 실패 등) 학습을 실패시키지 않고 그 날짜만 빼고 계속한다(lazy_train_dataset.py
+    # 참고) — 다만 조용히 넘기면 "사실 일부 날짜만으로 학습했다"는 걸 아무도
+    # 모르게 되므로, 결측 날짜를 split별로 모아뒀다가 아래 mlflow.log_metrics()
+    # 근처에서 MLflow run에 남긴다(콘솔 로그를 뒤지지 않아도 MLflow에서 바로 보이게).
+    missing_dates: dict[str, set[str]] = {"train": set(), "valid": set(), "test": set()}
+    _dates_by_split = {"train": set(train_dates), "valid": set(valid_dates), "test": set(test_dates)}
+
+    def _record_missing_date(date_str: str) -> None:
+        for split, dates_in_split in _dates_by_split.items():
+            if date_str in dates_in_split:
+                missing_dates[split].add(date_str)
+
     station_categories = lazy_train_dataset.station_categories_for_dates(
-        table_path, all_dates, filters, on_complete=_progress_on_complete(f"{model_name}-station-categories")
+        table_path,
+        all_dates,
+        filters,
+        on_complete=_progress_on_complete(f"{model_name}-station-categories"),
+        on_missing_date=_record_missing_date,
     )
     station_dtype = pd.CategoricalDtype(categories=station_categories)
+
+    # 분산 학습(LGB_NUM_MACHINES>1)에서만 실제 학습 행을 이 머신 몫으로 좁힌다 —
+    # 위 station_categories/station_dtype은 이 샤딩과 무관하게 항상 전체 station
+    # 목록 기준으로 고정된 것이다(그래야 머신마다 카테고리 코드가 같음,
+    # `lazy_train_dataset._shard_for_this_machine()` docstring 참고).
+    station_shard = (
+        lazy_train_dataset._shard_for_this_machine(station_categories, config.LGB_NUM_MACHINES, config.LGB_MACHINE_RANK)
+        if config.LGB_NUM_MACHINES > 1
+        else None
+    )
 
     if is_primary:
         mlflow_tracking.configure(config.MLFLOW_EXPERIMENT_NAME)
@@ -608,6 +626,8 @@ def train_target(
             keep_raw_data=config.TRAIN_CHECKPOINT_ENABLED,
             on_chunk_loaded=_chunk_progress(model_name, "train"),
             on_prepass_complete=_progress_on_complete(f"{model_name}-train-label-prepass"),
+            station_shard=station_shard,
+            on_missing_date=_record_missing_date,
         )
         train_row_count = len(y_train)
         # train label/exposure는 native Dataset에 이미 복사됐고 이후 Python 계산에
@@ -631,6 +651,8 @@ def train_target(
                 keep_raw_data=config.TRAIN_CHECKPOINT_ENABLED,
                 reference=train_set, on_chunk_loaded=_chunk_progress(model_name, "valid"),
                 on_prepass_complete=_progress_on_complete(f"{model_name}-valid-label-prepass"),
+                station_shard=station_shard,
+                on_missing_date=_record_missing_date,
             )
             valid_row_count = len(y_valid)
             _append_progress_log(
@@ -700,6 +722,8 @@ def train_target(
                 keep_raw_data=config.TRAIN_CHECKPOINT_ENABLED,
                 on_chunk_loaded=_chunk_progress(model_name, "train-quantile"),
                 on_prepass_complete=_progress_on_complete(f"{model_name}-train-quantile-label-prepass"),
+                station_shard=station_shard,
+                on_missing_date=_record_missing_date,
             )
             if config.LGB_DEFER_VALID_DATASET:
                 valid_set_q = None
@@ -710,6 +734,8 @@ def train_target(
                     keep_raw_data=config.TRAIN_CHECKPOINT_ENABLED,
                     reference=train_set_q, on_chunk_loaded=_chunk_progress(model_name, "valid-quantile"),
                     on_prepass_complete=_progress_on_complete(f"{model_name}-valid-quantile-label-prepass"),
+                    station_shard=station_shard,
+                    on_missing_date=_record_missing_date,
                 )
 
         quantile_boosters: dict[float, lgb.Booster] = {}
@@ -762,10 +788,14 @@ def train_target(
         valid_q = lazy_train_dataset.predict_over_dates(
             table_path, valid_dates, feature_columns, station_dtype, filters, target_col, exposure_col,
             prediction_models, on_chunk_loaded=_chunk_progress(model_name, "valid-predict"),
+            station_shard=station_shard,
+            on_missing_date=_record_missing_date,
         )
         test_q = lazy_train_dataset.predict_over_dates(
             table_path, test_dates, feature_columns, station_dtype, filters, target_col, exposure_col,
             prediction_models, on_chunk_loaded=_chunk_progress(model_name, "test-predict"),
+            station_shard=station_shard,
+            on_missing_date=_record_missing_date,
         )
         y_valid = valid_q["y"]
         y_test = test_q["y"]
@@ -820,6 +850,19 @@ def train_target(
         metrics["early_stopping_used"] = not config.LGB_DEFER_VALID_DATASET
         metrics["training_wall_time_seconds"] = time.monotonic() - started_at
         metrics["peak_rss_mb"] = _peak_rss_mb()
+        # 결측 날짜 개수 — 실제 값(리스트)은 별도로 metrics.json이 아니라 mlflow
+        # artifact(missing_dates.json)에만 남긴다(개수만 metrics에 넣어야
+        # mlflow.log_metrics(숫자만 허용)에 자동으로 실린다, 아래 참고).
+        metrics["missing_train_dates_count"] = len(missing_dates["train"])
+        metrics["missing_valid_dates_count"] = len(missing_dates["valid"])
+        metrics["missing_test_dates_count"] = len(missing_dates["test"])
+        if any(missing_dates.values()):
+            print(
+                f"[{model_name}] 경고: 일부 날짜가 결측으로 학습에서 빠짐 — "
+                f"train={sorted(missing_dates['train'])}, valid={sorted(missing_dates['valid'])}, "
+                f"test={sorted(missing_dates['test'])}",
+                flush=True,
+            )
         print(f"  [calibration] correction={correction:.4f} 적용 후 커버리지 = {calibrated_coverage:.3f}")
 
         # monitor_performance.py가 "이 모델이 학습/검수 시점에 어느 정도였는지"를 알아야
@@ -840,6 +883,15 @@ def train_target(
             mlflow.log_dict(profile_payload, "profile.json")
             # metrics의 "model_name"은 문자열이라 mlflow.log_metrics(숫자만 허용)에서 뺀다.
             mlflow.log_metrics({k: v for k, v in metrics.items() if isinstance(v, int | float)})
+            # 결측 날짜 "개수"는 위 metrics로 이미 남았다 — 어느 날짜가 결측이었는지
+            # 실제 목록은 MLflow UI의 Artifacts 탭에서 바로 볼 수 있게 별도 JSON으로
+            # 남긴다(사용자 요구사항: "MLflow에서 일부 데이터만으로 학습했다는 게
+            # 보이나" — 개수만으론 어느 날인지 알 수 없어서 목록도 남김).
+            if any(missing_dates.values()):
+                mlflow.log_dict(
+                    {split: sorted(dates) for split, dates in missing_dates.items()},
+                    "missing_dates.json",
+                )
             try:
                 mlflow.set_tag("training_stage", f"[{model_name}] Completed")
             except Exception:

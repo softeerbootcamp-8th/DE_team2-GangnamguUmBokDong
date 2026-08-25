@@ -1,9 +1,11 @@
 """확정 Archive fact와 최신 Silver dimension에서 학습용 1차 정제 산출물을 만든다.
 
 대여·재고·날씨·생활인구는 날짜별 flat parquet인
-`archive/{source_id}/dt=YYYY-MM-DD.parquet`를 정확한 날짜 목록으로 읽는다. 요청 범위의
-날짜 하나라도 없으면 조용히 일부 기간만 학습하지 않고 실패한다. 정류소 마스터만
-과거 snapshot이 보장되지 않는 current dimension이라 최신
+`archive/{source_id}/dt=YYYY-MM-DD.parquet`를 정확한 날짜 목록으로 읽는다. 요청 범위
+중 일부 날짜만 없으면(수집 공백 등) 그 날짜만 건너뛰고 표준출력에 경고를 남긴
+채 계속한다 — 월간 재학습이 하루치 결측 때문에 통째로 실패하면 안 되기
+때문이다(2026-08). 요청 범위 **전체**가 다 없을 때만 실제로 실패한다. 정류소
+마스터만 과거 snapshot이 보장되지 않는 current dimension이라 최신
 `silver/station_master_enriched`를 유지한다.
 
 컬럼명 매핑(`RENT_DT`->`start_dt` 등)은 `libs/ml_core/silver_schema.py`의
@@ -145,20 +147,39 @@ def _read_archive_daily(
     since: str | None,
     until: str | None,
 ) -> tuple[DataFrame, str, str]:
-    """정확한 일별 Archive 경로만 읽고 누락·스키마 불일치를 fail-closed한다."""
+    """정확한 일별 Archive 경로를 읽는다 — 일부 날짜가 없으면 경고만 남기고
+    건너뛰며, 요청 범위 전체가 다 없을 때만 실패한다(fail-closed에서 완화,
+    모듈 docstring 참고).
+
+    **주의**: 대여/반납처럼 결측 날짜가 그대로 "수요 0"으로 학습에 들어갈 수
+    있는 소스도 포함된다 — "그날 데이터가 없었다"와 "그날 수요가 0이었다"를
+    구분하지 못한다는 트레이드오프를 감수하고, 학습이 절대 실패하지 않는 쪽을
+    우선한 결정이다(2026-08).
+    """
     days, since_bound, until_bound = _archive_dates(since, until)
     paths = [_archive_path(source_id, day) for day in days]
-    missing = [day.isoformat() for day, path in zip(days, paths, strict=True) if not _path_exists(spark, path)]
-    if missing:
-        raise FileNotFoundError(
-            f"Archive 일별 partition이 누락됐습니다: source={source_id}, dates={missing}"
+    exists_flags = [_path_exists(spark, path) for path in paths]
+    missing_days = [day.isoformat() for day, exists in zip(days, exists_flags, strict=True) if not exists]
+    existing_paths = [path for path, exists in zip(paths, exists_flags, strict=True) if exists]
+
+    if missing_days:
+        print(
+            f"[archive] 경고: source={source_id} 일부 날짜 partition이 없어 건너뜀: {missing_days}",
+            flush=True,
         )
+    if not existing_paths:
+        raise FileNotFoundError(
+            f"Archive에 요청 범위 전체가 없습니다: source={source_id}, "
+            f"dates={[day.isoformat() for day in days]}"
+        )
+
     print(
-        f"[archive] source={source_id} exact daily partitions "
-        f"{days[0]:%Y-%m-%d}..{days[-1]:%Y-%m-%d} ({len(days)} files)"
+        f"[archive] source={source_id} daily partitions {len(existing_paths)}/{len(days)}개 사용 "
+        f"({days[0]:%Y-%m-%d}..{days[-1]:%Y-%m-%d} 범위)",
+        flush=True,
     )
-    _validate_archive_schema(spark, source_id, paths)
-    df = spark.read.option("mergeSchema", "true").parquet(*paths)
+    _validate_archive_schema(spark, source_id, existing_paths)
+    df = spark.read.option("mergeSchema", "true").parquet(*existing_paths)
     archive_day = F.regexp_extract(F.input_file_name(), r"dt=(\d{4}-\d{2}-\d{2})\.parquet$", 1)
     return df.withColumn("_archive_dt", F.to_date(archive_day)), since_bound, until_bound
 

@@ -36,8 +36,9 @@ stopping)까지 포함해 eager 버전과 예측값이 byte-identical함을 직�
 
 import os
 import tempfile
+import zlib
 from collections import OrderedDict
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from datetime import date
 
 import lightgbm as lgb
@@ -224,6 +225,7 @@ def _read_date_chunk(
     columns: list[str],
     filters: list[tuple] | None,
     adaptive_anchors: bool | None = None,
+    station_shard: frozenset[int] | None = None,
 ) -> pd.DataFrame:
     """날짜 하나(`date=YYYY-MM-DD/` 파티션)만 읽어 pandas DataFrame으로 반환한다.
 
@@ -233,6 +235,12 @@ def _read_date_chunk(
 
     `adaptive_anchors`가 True(기본값 config.ADAPTIVE_TRAIN_ANCHORS)이면 피크(20분)/
     평시(60분)/심야(3일 1회 60분) 가변 앵커링 필터를 적용한다.
+
+    `station_shard`가 주어지면(분산 학습, `LGB_NUM_MACHINES>1`) 이 머신이 담당하는
+    station_no만 남긴다(`_shard_for_this_machine()` 참고) — 라벨 prepass
+    (`_stream_prepass_arrays()`)와 feature 청크(`_DatePartitionSequence`)가 이
+    함수를 통해 **같은 필터를 같은 행 순서로** 적용받으므로, 서로 다른 시점에
+    독립적으로 다시 읽어도 행이 어긋나지 않는다.
     """
     part_keys = _list_date_part_keys(table_path, date_str)
     if not part_keys:
@@ -241,6 +249,7 @@ def _read_date_chunk(
     use_adaptive = config.ADAPTIVE_TRAIN_ANCHORS if adaptive_anchors is None else adaptive_anchors
     read_columns = list(columns)
     temp_minute_added = False
+    temp_station_no_added = False
     if use_adaptive and "minute" not in read_columns:
         first_bytes = s3_io.get_object_bytes(part_keys[0])
         if first_bytes is not None:
@@ -254,6 +263,9 @@ def _read_date_chunk(
                     temp_minute_added = True
             except Exception:
                 pass
+    if station_shard is not None and "station_no" not in read_columns:
+        read_columns.append("station_no")
+        temp_station_no_added = True
 
     tables = [
         t for t in s3_io.read_parquet_many(part_keys, columns=read_columns, as_pandas=False, filters=filters) if t is not None
@@ -268,11 +280,41 @@ def _read_date_chunk(
     if use_adaptive and "minute" in df.columns:
         df = _apply_adaptive_anchor_filter(df, date_str)
         if temp_minute_added:
+            df = df[[c for c in columns if c in df.columns] + (["station_no"] if temp_station_no_added else [])]
+
+    if station_shard is not None and "station_no" in df.columns:
+        df = df[df["station_no"].isin(station_shard)]
+        if temp_station_no_added:
             df = df[[c for c in columns if c in df.columns]]
 
     if df.empty:
-        raise FileNotFoundError(f"S3에 이 날짜 파티션에 데이터가 없음(filters/adaptive anchors 이후 0행): {table_path}/date={date_str}/")
+        raise FileNotFoundError(
+            f"S3에 이 날짜 파티션에 데이터가 없음(filters/adaptive anchors/station shard 이후 0행): "
+            f"{table_path}/date={date_str}/"
+        )
     return df
+
+
+def _warn_missing_date_chunk(
+    table_path: str,
+    date_str: str,
+    exc: FileNotFoundError,
+    on_missing_date: Callable[[str], None] | None = None,
+) -> None:
+    """날짜 파티션 하나가 없거나(전날 feature mart 생성 실패 등) 필터 이후 0행이면
+    호출부는 그 날짜를 0행으로 취급하고 건너뛴다 — 한 달 학습이 하루치 결측 때문에
+    통째로 실패하면 안 되기 때문이다. 다만 조용히 넘기면 결측을 아무도 모르게 되므로
+    표준출력에 경고를 남긴다(이 파일/`train_common.py`가 공통으로 쓰는 print 기반 로그
+    관례). 전체 날짜가 다 비었을 때만(호출부의 총 행 수 0 체크) 실제로 실패한다.
+
+    `on_missing_date`가 주어지면 이 날짜 문자열로 한 번 더 호출한다 — 이 파일은
+    mlflow를 모르므로(관심사 분리), `train_common.py`가 이 콜백으로 결측 날짜를
+    모아서 MLflow run에 기록한다(그래야 "일부 날짜만으로 학습했다"는 사실이 학습
+    로그를 뒤지지 않아도 MLflow에서 바로 보인다).
+    """
+    print(f"[lazy_train_dataset] 경고: {table_path} date={date_str} 건너뜀 — {exc}", flush=True)
+    if on_missing_date is not None:
+        on_missing_date(date_str)
 
 
 class _DatePartitionSequence(lgb.Sequence):
@@ -294,6 +336,7 @@ class _DatePartitionSequence(lgb.Sequence):
         cache: ChunkCache,
         batch_size: int = 200_000,
         on_chunk_loaded: Callable[[str, int], None] | None = None,
+        station_shard: frozenset[int] | None = None,
     ):
         self._table_path = table_path
         self._date_str = date_str
@@ -304,6 +347,7 @@ class _DatePartitionSequence(lgb.Sequence):
         self._cache = cache
         self.batch_size = batch_size  # lgb.Sequence가 적재 단계에서 읽는 슬라이스 크기
         self._on_chunk_loaded = on_chunk_loaded
+        self._station_shard = station_shard
 
     def __len__(self) -> int:
         return self._row_count
@@ -312,7 +356,10 @@ class _DatePartitionSequence(lgb.Sequence):
         return self._cache.get_or_fetch(self._date_str, self._load)[idx]
 
     def _load(self) -> np.ndarray:
-        df = _read_date_chunk(self._table_path, self._date_str, self._feature_columns, self._filters)
+        df = _read_date_chunk(
+            self._table_path, self._date_str, self._feature_columns, self._filters,
+            station_shard=self._station_shard,
+        )
         arr = _feature_frame_to_float64(df, self._feature_columns, self._station_dtype)
         del df
         if self._on_chunk_loaded is not None:
@@ -325,6 +372,7 @@ def station_categories_for_dates(
     dates: list[str],
     filters: list[tuple] | None,
     on_complete: Callable[[int, int], None] | None = None,
+    on_missing_date: Callable[[str], None] | None = None,
 ) -> list[int]:
     """날짜별로 station_no를 읽고 즉시 set에 합쳐 전역 카테고리를 반환한다.
 
@@ -333,6 +381,10 @@ def station_categories_for_dates(
     전체에서 같은 매핑을 써야 LightGBM이 같은 station을 같은 코드로 본다(기존
     `train_common._prepare_xy()`와 같은 이유). 전체 기간의 station_no 열을 하나의
     pandas DataFrame으로 합치지 않아 행 수가 늘어도 peak memory는 하루치로 제한된다.
+
+    args:
+        on_missing_date: `_warn_missing_date_chunk()` 참고 — 결측 날짜를 MLflow에
+            남기고 싶은 호출부(`train_common.py`)가 넘긴다.
     """
     categories: set[int] = set()
     for done, date_str in enumerate(dates, start=1):
@@ -343,7 +395,8 @@ def station_categories_for_dates(
                 ["station_no"],
                 filters,
             )
-        except FileNotFoundError:
+        except FileNotFoundError as exc:
+            _warn_missing_date_chunk(table_path, date_str, exc, on_missing_date)
             df = None
         if df is not None:
             categories.update(int(value) for value in df["station_no"].unique())
@@ -353,6 +406,38 @@ def station_categories_for_dates(
     if not categories:
         raise FileNotFoundError(f"S3에 없음: {table_path} (dates 예: {dates[:3]})")
     return sorted(categories)
+
+
+def _shard_for_this_machine(
+    station_categories: Iterable[int], num_machines: int, machine_rank: int
+) -> frozenset[int]:
+    """전체 station_no 목록을 `num_machines`개 머신에 나눠 이 머신(`machine_rank`) 몫만 반환한다.
+
+    LightGBM 소켓 분산(`tree_learner="data"`)은 전체 데이터를 자동으로 나눠주지
+    않는다 — 각 머신이 미리 자기 몫만 들고 `lgb.train()`을 호출해야 한다
+    (ADR-0005/0007 참고). `hash()` 내장 함수 대신 `zlib.crc32`를 쓰는 이유는
+    `PYTHONHASHSEED`가 프로세스마다 랜덤이라 `hash()`를 쓰면 같은 station_no가
+    머신마다 다른 값으로 해시돼 배정이 어긋날 수 있기 때문이다 — `zlib.crc32`는
+    입력 바이트에 대해 항상 결정적이다.
+
+    **호출 시점 주의**: 이 함수는 실제 학습 행을 읽을 때만 써야 한다 —
+    `station_categories_for_dates()`(station_no `CategoricalDtype`을 고정하는
+    전역 스캔)에는 절대 적용하면 안 된다. 머신마다 다른 station 부분집합만 보고
+    카테고리를 고정하면 머신 간 카테고리 코드가 어긋나서, 승격된 모델을 읽는
+    inference가 station_no를 조용히 잘못 해석하게 된다.
+
+    args:
+        station_categories: 전체 station_no 목록(보통 `station_categories_for_dates()`의 반환값)
+        num_machines: 전체 분산 학습 머신 수(`LGB_NUM_MACHINES`)
+        machine_rank: 이 프로세스의 0-based 순번(`LGB_MACHINE_RANK`)
+    returns:
+        frozenset[int]: 이 머신이 담당할 station_no 집합
+    """
+    return frozenset(
+        station_no
+        for station_no in station_categories
+        if zlib.crc32(str(int(station_no)).encode()) % num_machines == machine_rank
+    )
 
 
 def _open_unlinked_memmap(file_obj, row_count: int) -> np.memmap:
@@ -494,6 +579,8 @@ def _stream_prepass_arrays(
     label_col: str,
     exposure_col: str | None,
     on_complete: Callable[[int, int], None] | None,
+    station_shard: frozenset[int] | None = None,
+    on_missing_date: Callable[[str], None] | None = None,
 ) -> tuple[list[int], np.memmap, np.memmap | None]:
     """label/exposure를 날짜별로 읽어 삭제 예약된 disk-backed 배열에 이어 쓴다.
 
@@ -503,6 +590,8 @@ def _stream_prepass_arrays(
     ``np.memmap``이라 LightGBM에 같은 1차원 numpy 계약을 제공하면서 peak RAM은
     하루치로 제한된다.
 
+    args:
+        on_missing_date: `_warn_missing_date_chunk()` 참고.
     returns:
         날짜별 행 수, label memmap, 선택적 exposure memmap.
     raises:
@@ -520,8 +609,9 @@ def _stream_prepass_arrays(
         columns = [label_col] + ([exposure_col] if exposure_col else [])
         for done, date_str in enumerate(dates, start=1):
             try:
-                df = _read_date_chunk(table_path, date_str, columns, filters)
-            except FileNotFoundError:
+                df = _read_date_chunk(table_path, date_str, columns, filters, station_shard=station_shard)
+            except FileNotFoundError as exc:
+                _warn_missing_date_chunk(table_path, date_str, exc, on_missing_date)
                 df = None
             row_count = 0 if df is None else len(df)
             row_counts.append(row_count)
@@ -596,6 +686,8 @@ def build_lazy_dataset(
     on_prepass_complete: Callable[[int, int], None] | None = None,
     dataset_params: dict | None = None,
     keep_raw_data: bool = False,
+    station_shard: frozenset[int] | None = None,
+    on_missing_date: Callable[[str], None] | None = None,
 ) -> tuple[lgb.Dataset, np.ndarray, np.ndarray | None]:
     """train 또는 valid 하나를 Sequence 기반 `lgb.Dataset`으로 만든다.
 
@@ -614,6 +706,11 @@ def build_lazy_dataset(
             거부되거나 다른 binning을 쓰지 않도록 학습 파라미터를 함께 넘긴다.
         keep_raw_data: checkpoint Booster를 `init_model`로 이어 학습할 때 LightGBM이
             원본 Sequence에 predictor를 연결할 수 있도록 보존할지 여부.
+        station_shard: 분산 학습(`LGB_NUM_MACHINES>1`)에서 이 머신이 담당하는
+            station_no 집합(`_shard_for_this_machine()`). None(기본값)이면 샤딩
+            없이 전체를 읽는다(기존 단일 머신 동작과 동일).
+        on_missing_date: `_warn_missing_date_chunk()` 참고 — 결측 날짜를 MLflow에
+            남기고 싶은 호출부(`train_common.py`)가 넘긴다.
     returns:
         tuple[lgb.Dataset, np.ndarray, np.ndarray | None]: (construct()까지 끝난 Dataset, y, exposure)
     raises:
@@ -628,11 +725,14 @@ def build_lazy_dataset(
         label_col,
         exposure_col,
         on_prepass_complete,
+        station_shard=station_shard,
+        on_missing_date=on_missing_date,
     )
 
     sequences = [
         _DatePartitionSequence(
-            table_path, d, feature_columns, station_dtype, filters, rc, cache, on_chunk_loaded=on_chunk_loaded
+            table_path, d, feature_columns, station_dtype, filters, rc, cache, on_chunk_loaded=on_chunk_loaded,
+            station_shard=station_shard,
         )
         for d, rc in zip(dates, row_counts, strict=True)
         if rc > 0
@@ -675,6 +775,8 @@ def predict_over_dates(
     exposure_col: str | None,
     boosters: dict[str, lgb.Booster],
     on_chunk_loaded: Callable[[str, int], None] | None = None,
+    station_shard: frozenset[int] | None = None,
+    on_missing_date: Callable[[str], None] | None = None,
 ) -> dict:
     """test 전체, 또는 valid의 학습후 예측(conformal correction용)에 쓴다 — `lgb.Dataset`이 아니다.
 
@@ -687,6 +789,14 @@ def predict_over_dates(
     args:
         boosters: {이름: booster} — 이름은 반환 dict의 키로 그대로 쓰인다(예:
             {"poisson": booster} 또는 {"q10": ..., "q50": ..., "q90": ...})
+        station_shard: 분산 학습에서 이 머신이 담당하는 station_no 집합. 주어지면
+            이 머신 몫만 평가한다 — 분산 학습에서는 각 머신이 자기 shard로 학습한
+            booster를 자기 shard의 valid/test로만 평가하는 것이 일관적이다(전체
+            valid/test는 어느 한 머신에도 없음). rank 0의 결과만 저장되므로
+            conformal correction/최종 metrics는 rank 0 shard 기준 근사치가
+            된다(ADR-0005/0007에 문서화된 기존 한계).
+        on_missing_date: `_warn_missing_date_chunk()` 참고 — 결측 날짜를 MLflow에
+            남기고 싶은 호출부(`train_common.py`)가 넘긴다.
     returns:
         dict: {"y": ndarray, "exposure": ndarray | None, **{name: ndarray for name in boosters}}
     raises:
@@ -699,9 +809,10 @@ def predict_over_dates(
 
     for date_str in dates:
         try:
-            chunk_df = _read_date_chunk(table_path, date_str, read_columns, filters)
-        except FileNotFoundError:
-            continue  # 이 날짜 파티션이 아예 없거나 filters 이후 0행 — 다음 날짜로
+            chunk_df = _read_date_chunk(table_path, date_str, read_columns, filters, station_shard=station_shard)
+        except FileNotFoundError as exc:
+            _warn_missing_date_chunk(table_path, date_str, exc, on_missing_date)
+            continue  # 이 날짜 파티션이 아예 없거나 filters/station shard 이후 0행 — 다음 날짜로
 
         y_parts.append(chunk_df[label_col].to_numpy(dtype=np.float64))
         if exposure_col:
