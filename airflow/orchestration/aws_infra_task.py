@@ -19,7 +19,10 @@ logger = logging.getLogger(__name__)
 # 기본 환경변수
 DEFAULT_REGION = os.environ.get("AWS_REGION", "ap-northeast-2")
 EC2_TRAINING_INSTANCE_ID = os.environ.get("AWS_EC2_TRAINING_INSTANCE_ID", "")
-EMR_RELEASE_LABEL = os.environ.get("AWS_EMR_RELEASE_LABEL", "emr-7.2.0")
+# emr-7.2.0은 2026-08-31에 AWS 표준 지원이 끝난다(콘솔 경고, 2026-08-25) — 이
+# 리전(ap-northeast-2)에서 현재 받을 수 있는 최신 릴리스(emr-7.13.0, Spark 3.5.6/
+# Hadoop 3.4.2, `aws emr list-release-labels`로 확인)로 올린다.
+EMR_RELEASE_LABEL = os.environ.get("AWS_EMR_RELEASE_LABEL", "emr-7.13.0")
 # 이 AWS 계정은 EMR에 m4.large 외 인스턴스 타입을 허용하지 않는다.
 EMR_MASTER_INSTANCE_TYPE = os.environ.get("AWS_EMR_MASTER_INSTANCE_TYPE", "m4.large")
 EMR_CORE_INSTANCE_TYPE = os.environ.get("AWS_EMR_CORE_INSTANCE_TYPE", "m4.large")
