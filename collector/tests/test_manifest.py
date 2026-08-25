@@ -160,8 +160,10 @@ class TestLoadSave:
     def test_load_missing_returns_none(self):
         assert load("never_saved", WINDOW_START) is None
 
-    def test_load_upgrades_legacy_nested_bronze_revision(self, monkeypatch):
-        """기존 S3 manifest의 bronze revision을 top-level로 무손실 승격한다."""
+    def test_load_keeps_bronze_revision_separate_from_default_authority_revision(
+        self, monkeypatch
+    ):
+        """이전 manifest도 Bronze revision을 보존하고 authority는 기본값을 쓴다."""
         data = _minimal_manifest(revision=3).model_dump(mode="json")
         data.pop("revision")
         data["artifacts"]["bronze"] = {
@@ -177,13 +179,14 @@ class TestLoadSave:
         loaded = load("test_source", WINDOW_START)
 
         assert loaded is not None
-        assert loaded.revision == 3
+        assert loaded.revision == 0
         assert loaded.artifacts.bronze is not None
+        assert loaded.artifacts.bronze.revision == 3
         assert loaded.artifacts.bronze.parts == ("page-1",)
         assert data == original
 
-    def test_load_rejects_conflicting_legacy_revision(self, monkeypatch):
-        """중첩·최상위 revision이 다르면 임의 선택하지 않고 손상으로 거부한다."""
+    def test_load_accepts_independent_authority_and_bronze_revisions(self, monkeypatch):
+        """authority correction과 Hot Bronze revision은 서로 다른 ordinal이다."""
         data = _minimal_manifest(revision=2).model_dump(mode="json")
         data["artifacts"]["bronze"] = {
             "prefix": "bronze/test_source/dt=2026-08-12/hh=14/1410/",
@@ -194,8 +197,12 @@ class TestLoadSave:
             manifest_module.storage, "read_manifest", lambda *_args: data
         )
 
-        with pytest.raises(ValueError, match="top-level revision"):
-            load("test_source", WINDOW_START)
+        loaded = load("test_source", WINDOW_START)
+
+        assert loaded is not None
+        assert loaded.revision == 2
+        assert loaded.artifacts.bronze is not None
+        assert loaded.artifacts.bronze.revision == 3
 
 
 class TestRetryMarker:
