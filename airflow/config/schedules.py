@@ -102,6 +102,12 @@ ROUTES_EXECUTION_TIMEOUT = timedelta(seconds=180)
 # 독립적으로 RM/NM이 관리) 백그라운드에 orphan으로 남는다 — 정상적으로 오래
 # 걸리는 학습을 죽이지 않는 쪽을 우선해 넉넉하게 잡는다.
 MONTHLY_EVALUATION_TIMEOUT = timedelta(minutes=30)
+# create_emr_cluster()의 내부 WAITING 대기(기본 1200초=20분, 그 안에 못 뜨면
+# 자기 종료)보다 살짝 여유 있게 잡은 Airflow 레벨 백스톱 — 클러스터 생성만
+# 별도 태스크로 분리해 teardown의 setup 성공 조건이 "평가 성공 여부"에 오염되지
+# 않게 한다(2026-08, PR 리뷰 지적: 평가가 멈추면 클러스터 생성이 성공했어도
+# teardown이 스킵되던 문제).
+MONTHLY_CLUSTER_CREATE_TIMEOUT = timedelta(minutes=25)
 EMR_FEATURE_MART_TIMEOUT = timedelta(minutes=90)
 MONTHLY_TRAINING_TIMEOUT = timedelta(hours=120)
 # 모델 하나(대여 또는 반납)의 재학습 루프 태스크 자체에 거는 Airflow execution_timeout.

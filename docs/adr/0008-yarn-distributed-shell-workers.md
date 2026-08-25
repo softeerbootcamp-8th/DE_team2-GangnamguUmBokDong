@@ -146,8 +146,8 @@ LightGBM 분산 학습 워커를 **YARN Distributed Shell**로 기동한다. 구
   처리하면 `_set_dag_run_terminal_state()`가 아직 실행 안 된 일반 태스크를
   trigger_rule 평가 없이 그냥 SKIPPED로 강제 전환해버려 이 안전망이 무력화됐다
   — `is_teardown=True`인 태스크만 이 강제 skip에서 예외라, setup/teardown
-  API(`terminate_cluster.as_teardown(setups=create_cluster_and_evaluate)`)로
-  바꿔야 했다. (2) 그래도 Airflow 스케줄러 자체가 죽는 등 더 근본적인 장애는
+  API(`terminate_cluster.as_teardown(setups=create_cluster)`)로 바꿔야 했다.
+  (2) 그래도 Airflow 스케줄러 자체가 죽는 등 더 근본적인 장애는
   어떤 DAG 태스크도 못 구하므로, 그 실행 그래프와 완전히 독립적으로 실제 AWS
   상태를 직접 확인해 정리하는 `emr_orphan_reaper.py`(15분마다 점검)를 별도
   안전망으로 추가했다. 이 reaper가 "재학습이 실제로 돌고 있는지"를 판단할 때
@@ -200,7 +200,23 @@ LightGBM 분산 학습 워커를 **YARN Distributed Shell**로 기동한다. 구
   경합할 이유가 없으므로, `monthly_retrain.py` 하나 안에서 대여 사이클(평가→
   재학습→클러스터 종료)이 완전히 끝난 뒤에만 반납 사이클이 시작하도록
   `build_model_task_chain()`으로 태스크를 모델별로 만들고
-  `terminate_cluster_rental >> create_cluster_and_evaluate_return` 의존관계로
-  순서를 강제했다. DAG 전체의 `dagrun_timeout`은 두 모델 몫을 합쳐
+  `terminate_cluster_rental >> create_cluster_return` 의존관계로 순서를
+  강제했다. DAG 전체의 `dagrun_timeout`은 두 모델 몫을 합쳐
   **240시간**(`MONTHLY_RETRAIN_TOTAL_TIMEOUT`)으로 잡았다 — 반납이 대여 완료를
   기다리는 시간까지 포함해도 여유가 있어야 하기 때문이다.
+
+  **클러스터 생성과 평가를 별도 태스크로 분리(2026-08, PR 리뷰 지적)**: 원래는
+  `create_cluster_and_evaluate` 하나의 태스크가 클러스터 생성과 평가 스텝
+  제출·대기를 모두 했다. 이러면 클러스터 생성 자체는 성공했는데 그 뒤 평가
+  스텝만 EMR 쪽에서 멈추거나(RUNNING에서 안 끝남) 실패해도 태스크 전체가
+  FAILED로 기록되고, teardown의 setup 성공 조건(`ALL_DONE_SETUP_SUCCESS`)을
+  못 만족해 `terminate_cluster`가 스킵됐다 — 게다가 평가 스텝이 AWS 쪽에서
+  여전히 RUNNING으로 남아있으면 `emr_orphan_reaper`도 "활성 스텝 있음"으로
+  보고 절대 건드리지 않아, 클러스터가 영원히 안 죽는 경로가 있었다.
+  `submit_emr_step()`도 타임아웃 시 `TimeoutError`만 던질 뿐 실제 EMR 스텝을
+  취소하지 않으므로(Airflow가 "기다리길 포기"하는 것과 "AWS 쪽 스텝이 멈추는
+  것"은 별개), 이 조합이 실제로 비용이 새는 경로였다. `create_cluster`(순수
+  생성)와 `evaluate`(스텝 제출·대기)를 별도 태스크로 나누고 teardown의
+  `setups`를 `create_cluster` 하나로만 지정해 — 평가 이후 무슨 일이 있어도
+  "클러스터 생성 자체는 성공했다"는 사실만으로 teardown 조건이 충족되고
+  `terminate_cluster`가 반드시 실행되게 고쳤다.

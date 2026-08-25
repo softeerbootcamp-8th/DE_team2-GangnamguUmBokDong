@@ -38,6 +38,7 @@ from airflow.timetables.trigger import CronTriggerTimetable
 from config.schedules import (
     CATCHUP,
     MAX_ACTIVE_RUNS,
+    MONTHLY_CLUSTER_CREATE_TIMEOUT,
     MONTHLY_EVALUATION_TIMEOUT,
     MONTHLY_RETRAIN_CRON,
     MONTHLY_RETRAIN_ORCHESTRATION_TIMEOUT,
@@ -104,15 +105,21 @@ def _task_id(model_name: str, name: str) -> str:
     return f"{name}_{model_name}"
 
 
-def make_task_create_cluster_and_evaluate(model_name: str) -> Any:
-    """월간 사이클용 상시 EMR 클러스터를 생성하고 그 위에서 챔피언 성능 점검
-    스텝을 실행하는 callable을 반환한다."""
+def make_task_create_cluster(model_name: str) -> Any:
+    """월간 사이클용 상시 EMR 클러스터만 생성하는 callable을 반환한다.
 
-    def task_create_cluster_and_evaluate(**context: Any) -> dict[str, Any]:
+    평가(evaluate)와 반드시 별도 태스크여야 한다 — 평가 스텝이 멈추거나
+    실패해도 "클러스터 생성 자체는 성공했다"는 사실이 `terminate_cluster`의
+    teardown 조건(setup 성공)에서 오염되면 안 되기 때문이다(2026-08, PR 리뷰
+    지적: 원래 한 태스크였을 때는 평가가 타임아웃되면 태스크 전체가 FAILED로
+    기록돼 teardown이 스킵되고, 클러스터가 계속 떠 있는데도 EMR 스텝이 여전히
+    RUNNING으로 보여 orphan reaper도 건드리지 않는 — 클러스터가 영원히
+    안 죽는 경로가 있었다)."""
+
+    def task_create_cluster(**context: Any) -> str:
         ti = context["ti"]
         params = context.get("params", {})
         mock_override = _mock_override_from_params(params)
-        run_id = context["run_id"]
 
         logger.info("[%s 월별 재학습] 1단계: 상시 EMR 클러스터 생성(피처마트용 %d노드)", model_name, FEATURE_MART_CORE_INSTANCE_COUNT)
         cluster_id = create_emr_cluster(
@@ -122,6 +129,22 @@ def make_task_create_cluster_and_evaluate(model_name: str) -> Any:
             mock_override=mock_override,
         )
         ti.xcom_push(key="cluster_id", value=cluster_id)
+        return cluster_id
+
+    return task_create_cluster
+
+
+def make_task_evaluate(model_name: str) -> Any:
+    """이미 떠 있는 상시 EMR 클러스터 위에서 챔피언 성능 점검 스텝을 실행하는
+    callable을 반환한다 — `make_task_create_cluster()`와 분리된 이유는 그
+    docstring 참고."""
+
+    def task_evaluate(**context: Any) -> dict[str, Any]:
+        ti = context["ti"]
+        params = context.get("params", {})
+        mock_override = _mock_override_from_params(params)
+        run_id = context["run_id"]
+        cluster_id = ti.xcom_pull(task_ids=_task_id(model_name, "create_cluster"), key="cluster_id")
 
         logger.info("[%s 월별 재학습] 2단계: EMR 스텝으로 %s 챔피언 성능 점검 (--check-only)", model_name, model_name)
         result_key = _result_s3_key(run_id, f"eval-{model_name}")
@@ -147,7 +170,7 @@ def make_task_create_cluster_and_evaluate(model_name: str) -> Any:
         )
         return summary
 
-    return task_create_cluster_and_evaluate
+    return task_evaluate
 
 
 def make_task_check_retrain_branch(model_name: str) -> Any:
@@ -156,7 +179,7 @@ def make_task_check_retrain_branch(model_name: str) -> Any:
     def task_check_retrain_branch(**context: Any) -> str:
         ti = context["ti"]
         needs_retrain = ti.xcom_pull(
-            task_ids=_task_id(model_name, "create_cluster_and_evaluate"), key="needs_retrain"
+            task_ids=_task_id(model_name, "evaluate"), key="needs_retrain"
         )
         if needs_retrain:
             logger.info("[%s 월별 재학습] 기준 미달 발견 — 재학습 오케스트레이션으로 분기", model_name)
@@ -176,9 +199,9 @@ def make_task_orchestrate_retrain_loop(model_name: str) -> Any:
         params = context.get("params", {})
         mock_override = _mock_override_from_params(params)
         run_id = context["run_id"]
-        cluster_id = ti.xcom_pull(task_ids=_task_id(model_name, "create_cluster_and_evaluate"), key="cluster_id")
+        cluster_id = ti.xcom_pull(task_ids=_task_id(model_name, "create_cluster"), key="cluster_id")
         candidate_profiles = (
-            ti.xcom_pull(task_ids=_task_id(model_name, "create_cluster_and_evaluate"), key="candidate_profiles")
+            ti.xcom_pull(task_ids=_task_id(model_name, "evaluate"), key="candidate_profiles")
             or ["builtin-default"]
         )
 
@@ -291,7 +314,7 @@ def make_task_terminate_emr_cluster(model_name: str) -> Any:
     def task_terminate_emr_cluster(**context: Any) -> None:
         ti = context["ti"]
         mock_override = _mock_override_from_params(context.get("params", {}))
-        cluster_id = ti.xcom_pull(task_ids=_task_id(model_name, "create_cluster_and_evaluate"), key="cluster_id")
+        cluster_id = ti.xcom_pull(task_ids=_task_id(model_name, "create_cluster"), key="cluster_id")
         if not cluster_id:
             logger.warning("[%s 월별 재학습] 4단계: cluster_id 없음(생성 자체가 실패) — 종료할 대상 없음", model_name)
             return
@@ -302,18 +325,24 @@ def make_task_terminate_emr_cluster(model_name: str) -> Any:
 
 
 def build_model_task_chain(model_name: str) -> dict[str, Any]:
-    """모델 하나(대여 또는 반납)의 평가→재학습→클러스터 종료 태스크 체인을
+    """모델 하나(대여 또는 반납)의 생성→평가→재학습→클러스터 종료 태스크 체인을
     만들어 반환한다 — `build_monthly_retrain_dag()`가 두 모델을 순서대로
     이어붙이는 데 쓴다.
 
     returns:
-        dict[str, Any]: 이 체인의 첫 태스크("create_cluster_and_evaluate")와
-            마지막 태스크("terminate_cluster") — 다른 모델의 체인과 이어붙일 때
-            이 두 개만 있으면 된다.
+        dict[str, Any]: 이 체인의 첫 태스크("create_cluster")와 마지막
+            태스크("terminate_cluster") — 다른 모델의 체인과 이어붙일 때 이 두
+            개만 있으면 된다.
     """
-    create_cluster_and_evaluate = PythonOperator(
-        task_id=_task_id(model_name, "create_cluster_and_evaluate"),
-        python_callable=make_task_create_cluster_and_evaluate(model_name),
+    create_cluster = PythonOperator(
+        task_id=_task_id(model_name, "create_cluster"),
+        python_callable=make_task_create_cluster(model_name),
+        execution_timeout=MONTHLY_CLUSTER_CREATE_TIMEOUT,
+    )
+
+    evaluate = PythonOperator(
+        task_id=_task_id(model_name, "evaluate"),
+        python_callable=make_task_evaluate(model_name),
         execution_timeout=MONTHLY_EVALUATION_TIMEOUT,
     )
 
@@ -338,7 +367,7 @@ def build_model_task_chain(model_name: str) -> dict[str, Any]:
     )
 
     # 태스크 흐름 정의 (비순환 단방향 그래프)
-    create_cluster_and_evaluate >> check_retrain_branch
+    create_cluster >> evaluate >> check_retrain_branch
     check_retrain_branch >> [orchestrate_retrain_loop, skip_monthly_retrain]
     orchestrate_retrain_loop >> terminate_cluster
     skip_monthly_retrain >> terminate_cluster
@@ -348,13 +377,22 @@ def build_model_task_chain(model_name: str) -> dict[str, Any]:
     # (Airflow 3.3.1 `_set_dag_run_terminal_state()` 실측 확인, 2026-08).
     # `is_teardown=True`인 태스크만 이 강제 skip에서 예외로 남아 실제로 실행될
     # 기회를 얻는다 — 그래서 trigger_rule 대신 setup/teardown API로 이 태스크를
-    # 표시한다. `create_cluster_and_evaluate`를 setup으로 지정하면 "그 setup이
-    # 성공했을 때만(=클러스터가 실제로 떴을 때만) teardown이 실행된다"는 semantics
-    # (TriggerRule.ALL_DONE_SETUP_SUCCESS)가 자동으로 적용된다.
-    terminate_cluster.as_teardown(setups=create_cluster_and_evaluate)
+    # 표시한다.
+    #
+    # setup은 반드시 `create_cluster` 하나여야 하고 `evaluate`를 같이 넣으면 안
+    # 된다(PR 리뷰 지적, 2026-08) — ALL_DONE_SETUP_SUCCESS는 "지정된 setup이
+    # 전부 성공했을 때만" teardown을 실행한다. evaluate 스텝이 EMR 쪽에서 멈추거나
+    # (RUNNING 상태로 안 끝남) 실패하면 evaluate 태스크 자체가 FAILED로 끝나는데,
+    # 만약 evaluate도 setup에 포함돼 있었다면 teardown이 스킵되고, 클러스터는
+    # 이미 떠 있는데도 EMR 스텝이 여전히 RUNNING으로 보여 emr_orphan_reaper의
+    # "활성 스텝 있으면 절대 안 건드림" 보호까지 겹쳐 클러스터가 영원히 안 죽는
+    # 경로가 생긴다. create_cluster만 setup으로 지정하면 evaluate 이후 무슨 일이
+    # 있어도(성공/실패/타임아웃) "클러스터 생성 자체는 성공했다"는 사실만으로
+    # teardown 조건이 충족돼 terminate_cluster가 반드시 실행된다.
+    terminate_cluster.as_teardown(setups=create_cluster)
 
     return {
-        "create_cluster_and_evaluate": create_cluster_and_evaluate,
+        "create_cluster": create_cluster,
         "terminate_cluster": terminate_cluster,
     }
 
@@ -412,7 +450,7 @@ def build_monthly_retrain_dag(cron_schedule: str) -> DAG:
     ) as dag:
         chains = {model_name: build_model_task_chain(model_name) for model_name in MODEL_EXECUTION_ORDER}
         for upstream_model, downstream_model in pairwise(MODEL_EXECUTION_ORDER):
-            chains[upstream_model]["terminate_cluster"] >> chains[downstream_model]["create_cluster_and_evaluate"]
+            chains[upstream_model]["terminate_cluster"] >> chains[downstream_model]["create_cluster"]
 
     return dag
 

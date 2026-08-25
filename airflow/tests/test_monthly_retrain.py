@@ -19,7 +19,8 @@ def test_monthly_retrain_is_a_single_combined_dag() -> None:
         f"{name}_{model}"
         for model in ("rental", "return")
         for name in (
-            "create_cluster_and_evaluate",
+            "create_cluster",
+            "evaluate",
             "check_retrain_branch",
             "orchestrate_retrain_loop",
             "skip_monthly_retrain",
@@ -34,11 +35,11 @@ def test_monthly_retrain_runs_rental_fully_before_return_starts() -> None:
     한다 — 두 EMR 클러스터가 동시에 뜨지 않게 하는 핵심 보장."""
     assert monthly_dag.MODEL_EXECUTION_ORDER == ("rental", "return")
     rental_terminate = _DAG.get_task("terminate_cluster_rental")
-    return_create = _DAG.get_task("create_cluster_and_evaluate_return")
+    return_create = _DAG.get_task("create_cluster_return")
     assert return_create.upstream_task_ids == {"terminate_cluster_rental"}
-    assert "create_cluster_and_evaluate_return" in rental_terminate.downstream_task_ids
+    assert "create_cluster_return" in rental_terminate.downstream_task_ids
     # 반납 쪽이 대여 쪽으로 역방향 의존을 만들지는 않는지도 확인.
-    assert _DAG.get_task("create_cluster_and_evaluate_rental").upstream_task_ids == set()
+    assert _DAG.get_task("create_cluster_rental").upstream_task_ids == set()
 
 
 def test_monthly_retrain_total_timeout_covers_both_models_sequentially() -> None:
@@ -58,11 +59,23 @@ def test_monthly_retrain_terminate_cluster_is_a_real_teardown() -> None:
     기회를 얻으므로, setup/teardown API로 표시돼 있는지까지 확인해야 한다."""
     for model_name in ("rental", "return"):
         terminate_cluster = _DAG.get_task(f"terminate_cluster_{model_name}")
-        create_cluster_and_evaluate = _DAG.get_task(f"create_cluster_and_evaluate_{model_name}")
+        create_cluster = _DAG.get_task(f"create_cluster_{model_name}")
         assert terminate_cluster.is_teardown is True
         assert terminate_cluster.trigger_rule == TriggerRule.ALL_DONE_SETUP_SUCCESS
-        assert create_cluster_and_evaluate.is_setup is True
-        assert f"create_cluster_and_evaluate_{model_name}" in terminate_cluster.upstream_task_ids
+        assert create_cluster.is_setup is True
+        assert f"create_cluster_{model_name}" in terminate_cluster.upstream_task_ids
+
+
+def test_monthly_retrain_evaluate_is_not_a_setup() -> None:
+    """`evaluate`가 teardown의 setup에 같이 들어가면 안 된다 — 평가 스텝이
+    EMR 쪽에서 멈추거나 실패해도(RUNNING에서 안 끝남 등) "클러스터 생성은
+    성공했다"는 사실만으로 `terminate_cluster`가 반드시 실행돼야 한다(PR 리뷰
+    지적, 2026-08). evaluate까지 setup에 포함되면 evaluate가 실패하는 순간
+    teardown 조건(ALL_DONE_SETUP_SUCCESS)을 못 만족해 클러스터가 orphan으로
+    남는다."""
+    for model_name in ("rental", "return"):
+        evaluate = _DAG.get_task(f"evaluate_{model_name}")
+        assert evaluate.is_setup is False
 
 
 def test_check_retrain_branch_decisions() -> None:
@@ -81,11 +94,24 @@ def test_check_retrain_branch_decisions() -> None:
     assert branch == "skip_monthly_retrain_rental"
 
 
-def test_create_cluster_and_evaluate_pushes_cluster_id_and_needs_retrain(monkeypatch) -> None:
-    """클러스터 생성 후 평가 스텝 결과(S3 JSON)를 읽어 needs_retrain/candidate_profiles를
-    xcom에 남긴다."""
+def test_create_cluster_pushes_cluster_id(monkeypatch) -> None:
+    """클러스터를 생성하고 cluster_id만 xcom에 남긴다 — 평가는 별도 태스크(evaluate)다."""
     mock_ti = MagicMock()
     monkeypatch.setattr(monthly_dag, "create_emr_cluster", lambda **kwargs: "j-created")
+
+    task_fn = monthly_dag.make_task_create_cluster("rental")
+    result = task_fn(ti=mock_ti, params={})
+
+    assert result == "j-created"
+    pushed = {call.kwargs["key"]: call.kwargs["value"] for call in mock_ti.xcom_push.call_args_list}
+    assert pushed["cluster_id"] == "j-created"
+
+
+def test_evaluate_pushes_needs_retrain(monkeypatch) -> None:
+    """create_cluster가 xcom에 남긴 cluster_id로 평가 스텝을 제출하고, 결과(S3 JSON)를
+    읽어 needs_retrain/candidate_profiles를 xcom에 남긴다."""
+    mock_ti = MagicMock()
+    mock_ti.xcom_pull.return_value = "j-created"
     monkeypatch.setattr(monthly_dag, "submit_emr_step", lambda *args, **kwargs: {"StepId": "s-1", "State": "COMPLETED"})
     monkeypatch.setattr(
         monthly_dag,
@@ -93,25 +119,24 @@ def test_create_cluster_and_evaluate_pushes_cluster_id_and_needs_retrain(monkeyp
         lambda key: {"needs_retrain": True, "candidate_profiles": ["rental-profile-1"]},
     )
 
-    task_fn = monthly_dag.make_task_create_cluster_and_evaluate("rental")
+    task_fn = monthly_dag.make_task_evaluate("rental")
     result = task_fn(ti=mock_ti, params={}, run_id="run-1")
 
     assert result["needs_retrain"] is True
     pushed = {call.kwargs["key"]: call.kwargs["value"] for call in mock_ti.xcom_push.call_args_list}
-    assert pushed["cluster_id"] == "j-created"
     assert pushed["needs_retrain"] is True
     assert pushed["candidate_profiles"] == ["rental-profile-1"]
 
 
-def test_create_cluster_and_evaluate_defaults_to_needs_retrain_when_no_result(monkeypatch) -> None:
+def test_evaluate_defaults_to_needs_retrain_when_no_result(monkeypatch) -> None:
     """스텝이 결과를 못 남겼을 때(주로 mock 모드) 재학습 루프 구조가 계속 검증되도록
     needs_retrain=True로 기본값을 잡는다."""
     mock_ti = MagicMock()
-    monkeypatch.setattr(monthly_dag, "create_emr_cluster", lambda **kwargs: "mock-j-1")
+    mock_ti.xcom_pull.return_value = "mock-j-1"
     monkeypatch.setattr(monthly_dag, "submit_emr_step", lambda *args, **kwargs: {"StepId": "mock-s-1", "State": "COMPLETED"})
     monkeypatch.setattr(monthly_dag, "read_s3_json", lambda key: None)
 
-    task_fn = monthly_dag.make_task_create_cluster_and_evaluate("rental")
+    task_fn = monthly_dag.make_task_evaluate("rental")
     result = task_fn(ti=mock_ti, params={}, run_id="run-1")
 
     assert result["needs_retrain"] is True
