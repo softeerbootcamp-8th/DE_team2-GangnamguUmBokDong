@@ -31,11 +31,11 @@ def test_reads_from_normalized_source_id_not_raw(monkeypatch):
     가리켜야 한다 — 원본(living_population_grid) 키가 아님."""
     requested_keys = []
 
-    def _fake_read_many(keys, columns=None):
-        requested_keys.extend(keys)
-        return [None] * len(keys)
+    def _fake_read(key, columns=None):
+        requested_keys.append(key)
+        return None
 
-    monkeypatch.setattr(ps.s3_io, "read_parquet_many", _fake_read_many)
+    monkeypatch.setattr(ps.s3_io, "read_parquet", _fake_read)
 
     ps._get_recent_population(pd.Timestamp("2026-08-17 10:00:00"))
 
@@ -47,12 +47,15 @@ def test_reads_from_normalized_source_id_not_raw(monkeypatch):
 def test_returns_target_tick_value_when_present(monkeypatch):
     target_ts = pd.Timestamp("2026-08-17 10:00:00")
 
-    def _fake_read_many(keys, columns=None):
-        # 마지막 키(=target_ts 정확히 그 tick)에만 값을 채워둔다.
-        assert keys[-1] == silver_schema.silver_key(silver_schema.POPULATION_NORMALIZED_SOURCE_ID, target_ts)
-        return [None] * (len(keys) - 1) + [_normalized_row("다사00000000", 1234.0)]
+    exact_key = silver_schema.silver_key(
+        silver_schema.POPULATION_NORMALIZED_SOURCE_ID, target_ts
+    )
 
-    monkeypatch.setattr(ps.s3_io, "read_parquet_many", _fake_read_many)
+    def _fake_read(key, columns=None):
+        assert key == exact_key
+        return _normalized_row("다사00000000", 1234.0)
+
+    monkeypatch.setattr(ps.s3_io, "read_parquet", _fake_read)
 
     result = ps._get_recent_population(target_ts)
 
@@ -64,21 +67,24 @@ def test_falls_back_to_earlier_tick_when_exact_tick_missing(monkeypatch):
     """직접 호출·미래 예보 누락이면 제한된 lookback 안의 최근 값을 대신 쓴다."""
     target_ts = pd.Timestamp("2026-08-17 10:00:00")
 
-    def _fake_read_many(keys, columns=None):
-        # 마지막(target_ts) 키만 비어있고, 그 바로 전 tick(09:55)에만 값이 있다.
-        values = [None] * len(keys)
-        values[-2] = _normalized_row("다사00000000", 500.0)
-        return values
+    requested_keys = []
 
-    monkeypatch.setattr(ps.s3_io, "read_parquet_many", _fake_read_many)
+    def _fake_read(key, columns=None):
+        requested_keys.append(key)
+        if key.endswith("/0955.parquet"):
+            return _normalized_row("다사00000000", 500.0)
+        return None
+
+    monkeypatch.setattr(ps.s3_io, "read_parquet", _fake_read)
 
     result = ps._get_recent_population(target_ts)
 
     assert result.loc["다사00000000", "pop_total"] == 500.0
+    assert len(requested_keys) == 2
 
 
 def test_returns_empty_dataframe_when_nothing_in_lookback_window(monkeypatch):
-    monkeypatch.setattr(ps.s3_io, "read_parquet_many", lambda keys, columns=None: [None] * len(keys))
+    monkeypatch.setattr(ps.s3_io, "read_parquet", lambda key, columns=None: None)
 
     result = ps._get_recent_population(pd.Timestamp("2026-08-17 10:00:00"))
 
@@ -89,12 +95,12 @@ def test_returns_empty_dataframe_when_nothing_in_lookback_window(monkeypatch):
 def test_caches_result_per_target_ts(monkeypatch):
     call_count = 0
 
-    def _fake_read_many(keys, columns=None):
+    def _fake_read(key, columns=None):
         nonlocal call_count
         call_count += 1
-        return [None] * (len(keys) - 1) + [_normalized_row("다사00000000", 1.0)]
+        return _normalized_row("다사00000000", 1.0)
 
-    monkeypatch.setattr(ps.s3_io, "read_parquet_many", _fake_read_many)
+    monkeypatch.setattr(ps.s3_io, "read_parquet", _fake_read)
 
     target_ts = pd.Timestamp("2026-08-17 10:00:00")
     ps._get_recent_population(target_ts)
