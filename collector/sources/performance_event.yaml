@@ -17,12 +17,8 @@ storage:
 
 quality:
   max_drop_ratio: 0.1
-  max_missing_ratio: 0.1
+  max_missing_ratio: 0.0
   allow_empty: true
-
-backfill:
-  enabled: true
-  max_age: 7d
 
 policies:
   required_missing: drop_row

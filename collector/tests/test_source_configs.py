@@ -93,6 +93,57 @@ class TestAllSourcesLoad:
         assert config.adapter in ("seoul_openapi", "kma_apihub")
         assert config.config_version.startswith("sha256:")
 
+    @pytest.mark.parametrize("source_id", SOURCE_IDS)
+    def test_no_source_uses_delayed_backfill(self, source_id):
+        """운영 소스는 소비 DAG가 없는 지연 backfill 큐를 만들지 않는다."""
+        config = config_loader.load(source_id, base_dir=SOURCES_DIR)
+
+        assert config.backfill is None
+
+    @pytest.mark.parametrize(
+        "source_id",
+        ("living_population_grid", "cultural_event", "performance_event"),
+    )
+    def test_daily_full_snapshots_reject_any_missing_part(self, source_id):
+        """과거 시점을 다시 받을 수 없는 일일 snapshot은 누락을 성공으로 인정하지 않는다."""
+        config = config_loader.load(source_id, base_dir=SOURCES_DIR)
+
+        assert config.quality.max_missing_ratio == 0.0
+
+    @pytest.mark.parametrize(
+        "source_id",
+        (
+            "weather_ultra_short_live",
+            "weather_ultra_short_forecast",
+            "weather_short_term_forecast",
+        ),
+    )
+    def test_weather_retries_only_missing_grids(self, source_id):
+        """기상 격자는 같은 발표 시각을 재조회해 성공한 Bronze를 재사용한다."""
+        config = config_loader.load(source_id, base_dir=SOURCES_DIR)
+
+        assert config.fetch is not None
+        assert config.fetch.retry_mode == "retry_missing"
+        assert config.effective_fetch_retry_mode() == "retry_missing"
+
+    @pytest.mark.parametrize(
+        "source_id",
+        (
+            "bike_rental_history",
+            "bike_station_master",
+            "bike_station_realtime",
+            "cultural_event",
+            "living_population_grid",
+            "performance_event",
+            "population_realtime",
+        ),
+    )
+    def test_non_weather_sources_default_to_full_refetch(self, source_id):
+        """기상 외 소스는 fetch 실패 후 서로 다른 snapshot 조각을 섞지 않는다."""
+        config = config_loader.load(source_id, base_dir=SOURCES_DIR)
+
+        assert config.effective_fetch_retry_mode() == "refetch_all"
+
     def test_no_source_declares_response_pagination_meta(self):
         """`RNUM`·`START_INDEX`·`END_INDEX`는 데이터가 아니라 요청/응답 메타다.
 
@@ -400,10 +451,11 @@ class TestOptionalKeysOmittable:
 
         assert config.backfill is None
 
-    def test_max_missing_ratio_omitted_defaults_to_zero(self):
+    def test_cultural_event_explicitly_rejects_missing_rows(self):
+        """문화행사는 전체 catalog 일부가 빠진 결과를 성공으로 취급하지 않는다."""
         config = config_loader.load("cultural_event", base_dir=SOURCES_DIR)
 
-        assert config.quality.max_missing_ratio == 0.05  # 명시한 값
+        assert config.quality.max_missing_ratio == 0.0
 
     def test_max_missing_ratio_truly_omitted_defaults_to_zero(self, tmp_path):
         # 3개 키를 아예 안 쓴 최소 YAML로 기본값 자체를 확인한다.

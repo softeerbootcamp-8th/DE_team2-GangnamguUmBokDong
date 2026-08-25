@@ -23,19 +23,20 @@
 
 ## 조각 키
 파일명이 되는 값이므로 어댑터가 요청 파라미터에서 만든다. 같은 요청이면 실행 간에 항상
-같은 키가 나와야 백필이 조각을 지목할 수 있다. 예: 서울 `page-00001-01000`(페이지 인덱스
-범위, 제로 패딩), 기상청 `grid-060x127`(격자 좌표).
+같은 키가 나와야 `retry_missing` 복구가 조각을 지목할 수 있다. 예: 서울
+`page-00001-01000`(페이지 인덱스 범위, 제로 패딩), 기상청
+`grid-060x127`(격자 좌표).
 
 ## expected_total
 알 수 있는 소스만 채운다. 일반 서울 API는 첫 페이지의 `list_total_count`, 기상청은
 `None`이다. `pagination: probe_until_empty`인 서울 API는 빈 종료 페이지를 확인한 뒤
 실제 row 위치로 계산한다. 종료 응답도 Bronze part로 보존해 source snapshot이 완결성
-증거를 가지며, pipeline은 해당 값을 다음 라운드와 백필에 되돌려준다.
+증거를 가지며, pipeline은 해당 값을 다음 라운드와 같은-window 복구에 되돌려준다.
 
 ## planned_parts
 요청 전에 전체 조각 키를 아는 어댑터만 제공한다. row 수와 별개인 요청 계획이며,
 fetch budget으로 iterator가 조기 종료돼 아직 yield하지 못한 키도 누락으로 기록하고
-백필할 수 있게 한다.
+재시도할 수 있게 한다.
 """
 
 from __future__ import annotations
@@ -47,11 +48,10 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
-from typing import TYPE_CHECKING, Protocol, TypeVar
+from typing import TYPE_CHECKING, Literal, Protocol, TypeVar
 
 if TYPE_CHECKING:
     import httpx
-
     from config.schema import SourceConfig
 
 
@@ -262,6 +262,7 @@ def fetch_with_rounds(
     now_fn=time.monotonic,
     on_chunk=None,
     planned_parts: frozenset[str] | None = None,
+    round_retry_mode: Literal["refetch_all", "retry_missing"] = "retry_missing",
 ):
     """실패분을 모아 재순회하는 공통 라운드 루프이다.
 
@@ -281,12 +282,15 @@ def fetch_with_rounds(
         on_chunk: 조각 수집 성공 시 즉시 실행할 콜백 함수 (보통 S3 스트리밍 저장용)
         planned_parts: 어댑터가 요청 전에 알 수 있는 전체 조각 키. 조기 budget
             종료로 iterator가 도달하지 못한 키도 누락으로 기록하는 데 사용한다.
+        round_retry_mode: transient 다음 round에서 전체 snapshot을 다시 받을지,
+            이미 성공한 조각을 유지하고 누락만 받을지 정한다.
     returns:
         성공분(chunks), 누락분(missing), 전체 행 수(expected_total)를 담은 FetchRoundResult 객체
     """
     collected: dict[str, bytes] = {}
     permanent: dict[str, FetchErrorKind] = {}
     transient: dict[str, FetchErrorKind] = {}
+    initial_expected_total = expected_total
 
     # (1) 마감 시한 방어
     # fetch_budget: window 하나의 fetch 전체에 걸리는 시간 제한
@@ -299,6 +303,13 @@ def fetch_with_rounds(
         # 이미 시작된 라운드는 끝까지 진행한다.
         if now_fn() >= deadline:
             break
+
+        if round_index > 0 and round_retry_mode == "refetch_all":
+            # mutable pagination은 성공 page를 유지한 채 나머지만 다시 받으면 page
+            # 경계가 이동한 두 snapshot이 섞인다. 새 round를 하나의 전체본으로 삼는다.
+            collected.clear()
+            permanent.clear()
+            expected_total = initial_expected_total
 
         # (2) 재시도 타겟팅
         # skip: 저번 배치에서 이미 성공했던 것들

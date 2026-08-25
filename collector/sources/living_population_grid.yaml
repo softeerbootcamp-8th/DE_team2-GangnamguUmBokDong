@@ -12,8 +12,7 @@ storage:
   bronze_format: json
   silver_format: parquet
   partition: [dt, hh]
-quality: {max_drop_ratio: 0.05, max_missing_ratio: 0.1, allow_empty: false}
-backfill: {enabled: true, max_age: 7d}
+quality: {max_drop_ratio: 0.05, max_missing_ratio: 0.0, allow_empty: false}
 policies: {required_missing: drop_row, required_outlier: drop_row, optional_missing: keep_null,
   optional_outlier: set_null}
 columns:

@@ -4,12 +4,12 @@
     uv run python main.py --source bike_station_realtime \
         --window-start 2026-08-12T23:10:00+09:00 [--force] [--backfill]
 
-Airflow는 소스별 태스크에서 `data_interval_start`를 KST로 변환해 `--window-start`로
-넘기고, 백필 DAG는 `_retry_queue/`에서 얻은 대상에 `--backfill`을 붙여 호출한다.
+Airflow는 소스별 태스크에서 논리 시각을 KST로 변환해 `--window-start`로 넘긴다.
+일반 fetch 실패는 같은 태스크의 retry에서 소스별 `fetch.retry_mode`로 복구한다.
+현재 범용 Backfill DAG는 없으며, `--backfill`과 대상 조회 옵션은 legacy 코드
+호환용으로만 유지한다. 운영 설정은 예전 retry marker를 발견하지 않는다.
 `window_end`는 config의 `schedule.interval`로 계산하며, collector 자체는 스케줄을
-모른다. 처리 순서는 인자 파싱 → 로깅 초기화 → config 로드 → pipeline 실행 →
-종료 코드 반환이다. 로깅 초기화가 pipeline보다 먼저여야 고정 필드가 모든 로그에
-붙는다.
+모른다.
 
 `--force`와 `--backfill`은 목적이 반대라 함께 줄 수 없다(오류로 막는다).
 
@@ -19,9 +19,9 @@ Airflow는 소스별 태스크에서 `data_interval_start`를 KST로 변환해 `
 | `--backfill` | 완결된 window의 누락 조각만 채움 | 기존 조각 유지, 빠진 것만 호출 |
 
 종료 코드는 `SUCCEEDED`·`PARTIAL`·`EMPTY`·`SKIPPED`가 0, `FAILED`가 non-zero다.
-누락이 있어도 게이트를 통과했으면 `PARTIAL`(0)이다 — 부분 성공은 재실행해도
-재개 분기가 `SKIPPED`로 빠지므로 Airflow retry가 할 일이 없고, 채워 넣는 일은
-백필 잡이 맡는다.
+누락이 있어도 게이트를 통과했으면 `PARTIAL`(0)이다. 완전한 일일 snapshot이 필요한
+운영 소스는 `max_missing_ratio=0`으로 두어 누락을 `FAILED`로 만들고 Airflow retry를
+실행한다.
 
 주의:
 - 스택 트레이스를 그대로 뱉지 않는다. 실패는 manifest에 남기고 정리된 메시지와
@@ -36,10 +36,10 @@ import argparse
 import sys
 from datetime import datetime
 
-import httpx
-
 import adapters  # noqa: F401 (어댑터 레지스트리 로드용)
 import config.loader as config_loader
+import httpx
+import manifest as manifest_module
 import pipeline
 import storage
 from logging_setup import configure_logging
@@ -55,6 +55,17 @@ _OK_STATUSES = frozenset({RunStatus.SUCCEEDED, RunStatus.PARTIAL, RunStatus.EMPT
 # read를 30초로 두는 근거는 실측 최댓값(7.2초)의 4배 여유다. connect는 짧게 둔다 —
 # 연결이 안 되는 상황은 기다려서 나아지지 않고, TRANSIENT로 라운드가 재시도한다.
 _HTTP_TIMEOUT = httpx.Timeout(connect=10.0, read=30.0, write=30.0, pool=30.0)
+
+
+def _latest_source_uses_config(
+    source_id: str, logical_dttm: datetime, config_version: str
+) -> bool:
+    """가장 최근 authority가 현재 배포 source 설정으로 수집됐는지 확인한다."""
+
+    snapshots = manifest_module.load_source_snapshots(source_id, logical_dttm)
+    return bool(
+        snapshots and snapshots[-1].manifest.config_version == config_version
+    )
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -102,7 +113,8 @@ def exit_code_for(status: RunStatus) -> int:
     """manifest의 최종 status를 프로세스 종료 코드로 바꾼다.
 
     `SUCCEEDED` · `PARTIAL` · `EMPTY` · `SKIPPED`는 0, `FAILED`는 non-zero다.
-    누락이 있어도 게이트를 통과했으면 `PARTIAL`이므로 0이다 — 부분 성공을 실패로 표시하면 Airflow retry가 할 일 없이 태스크만 실패로 뜬다.
+    누락을 허용하지 않는 소스는 pipeline 완결도 게이트에서 `FAILED`가 되므로
+    이 매핑을 바꾸지 않아도 Airflow retry가 동작한다.
 
     args:
         status: pipeline이 반환한 manifest의 최종 status.
@@ -136,13 +148,19 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.check_due_after_seconds is not None:
         import json
-
         from zoneinfo import ZoneInfo
 
+        config = config_loader.load(args.source)
         now = datetime.now(ZoneInfo("Asia/Seoul"))
         last = storage.latest_source_snapshot_logical_dttm(args.source, as_of=now)
         elapsed_seconds = None if last is None else (now - last).total_seconds()
-        due = elapsed_seconds is None or elapsed_seconds >= args.check_due_after_seconds
+        due = (
+            elapsed_seconds is None
+            or elapsed_seconds >= args.check_due_after_seconds
+            or not _latest_source_uses_config(
+                args.source, last, config.config_version
+            )
+        )
         print(json.dumps({
             "source_id": args.source,
             "due": due,
