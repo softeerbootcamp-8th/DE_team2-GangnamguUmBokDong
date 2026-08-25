@@ -39,14 +39,15 @@ def build_compaction_task(
 def build_cold_bronze_compaction_task(
     dag,
     source_id: str,
-    target_date: str,
     *,
+    today: str,
+    delay_days: int,
     trigger_rule: str = TriggerRule.ALL_SUCCESS,
 ):
-    """검증이 끝난 날짜의 모든 Hot Bronze revision을 Cold 파일로 묶는다."""
+    """기한이 된 pending Hot revision 날짜를 Cold 파일로 묶는다."""
     cmd = (
         f"uv run --frozen python cold_compact.py --source {source_id} "
-        f"--date {target_date}"
+        f"--recover-pending --today {today} --delay-days {delay_days}"
     )
     return build_module_task(
         dag,

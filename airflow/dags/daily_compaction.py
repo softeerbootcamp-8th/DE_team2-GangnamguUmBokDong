@@ -24,7 +24,7 @@ from orchestration.compaction_task import (
     build_compaction_task,
     build_silver_gc_task,
 )
-from orchestration.templates import kst_date_days_ago
+from orchestration.templates import KST_DATE, kst_date_days_ago
 
 from airflow import DAG
 
@@ -58,17 +58,22 @@ with DAG(
             compact = build_compaction_task(dag, source_id)
         compaction_tasks[source_id] = compact
 
-    target_date = kst_date_days_ago(DAILY_ARCHIVE_DELAY_DAYS)
     cold_tasks = {}
     for source_id in COLD_BRONZE_SOURCES:
         cold = build_cold_bronze_compaction_task(
             dag,
             source_id,
-            target_date,
+            today=KST_DATE,
+            delay_days=DAILY_ARCHIVE_DELAY_DAYS,
+            trigger_rule=(
+                TriggerRule.ALL_DONE
+                if source_id == "bike_rental_history"
+                else TriggerRule.ALL_SUCCESS
+            ),
         )
         cold_tasks[source_id] = cold
-        if source_id in compaction_tasks:
-            compaction_tasks[source_id] >> cold
+        if source_id == "bike_rental_history":
+            replay_chain >> cold
 
     for source_id in COLD_BRONZE_SOURCES:
         gc_target_date = kst_date_days_ago(

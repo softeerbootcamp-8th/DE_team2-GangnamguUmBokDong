@@ -13,13 +13,17 @@ import io
 import json
 import re
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+from botocore.exceptions import ClientError
 from core.s3 import (
+    delete_objects,
     get_object_bytes,
+    list_keys,
     list_objects,
+    merge_object_tags,
     object_exists,
     put_object_bytes,
     read_json,
@@ -44,6 +48,47 @@ class ColdBronzeResult:
     status: str
     objects: int
     cold_key: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class ColdRecoveryResult:
+    """pending marker에서 처리한 날짜별 Cold recovery 결과다."""
+
+    dates: int
+    objects: int
+
+
+def _pending_marker_key(source_id: str, day: date, hot_key: str) -> str:
+    """Hot object 하나에 대응하는 immutable pending marker key를 만든다."""
+    return (
+        f"_cold_pending/{source_id}/dt={day.isoformat()}/"
+        f"sha256={_sha256(hot_key.encode())}.json"
+    )
+
+
+def write_pending_marker(source_id: str, day: date, hot_key: str) -> None:
+    """Hot 저장 전에 날짜별 Cold 작업 marker를 put-once 방식으로 기록한다."""
+    key = _pending_marker_key(source_id, day, hot_key)
+    payload = {
+        "source_id": source_id,
+        "date": day.isoformat(),
+        "hot_key": hot_key,
+    }
+    previous = read_json(key)
+    if previous is not None and previous != payload:
+        raise RuntimeError(f"Cold pending marker key 충돌: {key}")
+    if previous is None:
+        write_json(key, payload)
+
+
+def _finalize_hot_objects(source_id: str, day: date, hot_keys: list[str]) -> None:
+    """검증된 Cold에 포함된 Hot을 태그하고 대응 pending marker를 제거한다."""
+    for hot_key in hot_keys:
+        if hot_key.startswith("bronze/hot/"):
+            merge_object_tags(hot_key, {"cold_compacted": "true"})
+    delete_objects(
+        [_pending_marker_key(source_id, day, hot_key) for hot_key in hot_keys]
+    )
 
 
 def _sha256(payload: bytes) -> str:
@@ -96,6 +141,7 @@ def compact_date(source_id: str, day: date) -> ColdBronzeResult:
     ):
         cold_key = previous.get("cold_key")
         if isinstance(cold_key, str) and object_exists(cold_key):
+            _finalize_hot_objects(source_id, day, [obj.key for obj in objects])
             return ColdBronzeResult("skipped", len(objects), cold_key)
 
     rows = []
@@ -166,7 +212,49 @@ def compact_date(source_id: str, day: date) -> ColdBronzeResult:
             "verified": True,
         },
     )
+    _finalize_hot_objects(source_id, day, [obj.key for obj in objects])
     return ColdBronzeResult("compacted", len(objects), cold_key)
+
+
+def recover_pending(
+    source_id: str,
+    *,
+    today: date,
+    delay_days: int = 6,
+) -> ColdRecoveryResult:
+    """보존 대기 marker 중 안정화 기간이 지난 날짜만 Cold로 묶는다."""
+    if delay_days < 0:
+        raise ValueError("Cold recovery delay_days는 0 이상이어야 한다.")
+    marker_keys = list_keys(f"_cold_pending/{source_id}/")
+    days: set[date] = set()
+    for marker_key in marker_keys:
+        marker = read_json(marker_key)
+        if not isinstance(marker, dict):
+            raise TypeError(f"Cold pending marker를 읽을 수 없다: {marker_key}")
+        if marker.get("source_id") != source_id:
+            raise RuntimeError(f"Cold pending marker source가 다르다: {marker_key}")
+        try:
+            day = date.fromisoformat(marker["date"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError(f"Cold pending marker 날짜가 잘못됐다: {marker_key}") from exc
+        hot_key = marker.get("hot_key")
+        if not isinstance(hot_key, str) or not object_exists(hot_key):
+            raise RuntimeError(f"Cold pending marker의 Hot object가 없다: {marker_key}")
+        if day + timedelta(days=delay_days) <= today:
+            days.add(day)
+
+    failures = []
+    object_count = 0
+    for day in sorted(days):
+        try:
+            result = compact_date(source_id, day)
+            object_count += result.objects
+        except (ClientError, OSError, RuntimeError, ValueError) as exc:
+            failures.append((day, exc))
+    if failures:
+        detail = ", ".join(f"{day}: {exc}" for day, exc in failures)
+        raise RuntimeError(f"Cold pending recovery 일부 날짜가 실패했다: {detail}")
+    return ColdRecoveryResult(dates=len(days), objects=object_count)
 
 
 def read_revision(

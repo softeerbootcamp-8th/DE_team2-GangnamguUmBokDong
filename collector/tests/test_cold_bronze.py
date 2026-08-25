@@ -8,7 +8,14 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 import storage
-from core.s3 import delete_objects, get_object_bytes, list_keys, read_json, write_json
+from core.s3 import (
+    delete_objects,
+    get_object_bytes,
+    get_object_tags,
+    list_keys,
+    read_json,
+    write_json,
+)
 from tests.conftest import KST
 
 pytestmark = pytest.mark.usefixtures("_bucket")
@@ -36,6 +43,9 @@ def test_compacts_every_revision_and_preserves_exact_stored_bytes():
     manifest = read_json("bronze/cold_manifest/test_source/dt=2026-08-12.json")
     assert manifest["input_objects"] == 2
     assert manifest["cold_key"] == result.cold_key
+    assert list_keys("_cold_pending/test_source/") == []
+    for key in list_keys("bronze/hot/test_source/"):
+        assert get_object_tags(key)["cold_compacted"] == "true"
 
 
 def test_unchanged_inputs_skip_rewrite():
@@ -95,3 +105,38 @@ def test_empty_date_is_explicit():
 
     assert result.status == "empty"
     assert result.cold_key is None
+
+
+def test_pending_recovery_only_processes_dates_after_delay():
+    """pending queue는 전체 날짜 sweep 없이 기한이 된 marker 날짜만 처리한다."""
+    storage.write_bronze_part("test_source", WINDOW, "page-001", b"first", 0)
+
+    before_due = cold_bronze.recover_pending(
+        "test_source", today=date(2026, 8, 17), delay_days=6
+    )
+    due = cold_bronze.recover_pending(
+        "test_source", today=date(2026, 8, 18), delay_days=6
+    )
+
+    assert before_due.dates == 0
+    assert list_keys("_cold_pending/test_source/") == []
+    assert due.dates == 1
+    assert due.objects == 1
+    assert read_json("bronze/cold_manifest/test_source/dt=2026-08-12.json")
+
+
+def test_late_revision_creates_new_pending_work_after_cold():
+    """Cold 완료 날짜의 늦은 revision은 새 marker로 다시 compaction된다."""
+    storage.write_bronze_part("test_source", WINDOW, "page-001", b"first", 0)
+    first = cold_bronze.compact_date("test_source", DAY)
+    storage.write_bronze_part("test_source", WINDOW, "page-001", b"late", 1)
+
+    recovered = cold_bronze.recover_pending(
+        "test_source", today=date(2026, 8, 18), delay_days=6
+    )
+    current = read_json("bronze/cold_manifest/test_source/dt=2026-08-12.json")
+
+    assert recovered.dates == 1
+    assert recovered.objects == 2
+    assert current["cold_key"] != first.cold_key
+    assert list_keys("_cold_pending/test_source/") == []
