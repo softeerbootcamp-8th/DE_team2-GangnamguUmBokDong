@@ -27,6 +27,7 @@ from datetime import date, datetime, timedelta
 from ml_core import silver_schema
 from pyspark.sql import Column, DataFrame, SparkSession, Window
 from pyspark.sql import functions as F
+from pyspark.sql.types import DoubleType, LongType, StringType, StructField, StructType
 
 from . import config
 
@@ -146,6 +147,7 @@ def _read_archive_daily(
     source_id: str,
     since: str | None,
     until: str | None,
+    read_schema: StructType | None = None,
 ) -> tuple[DataFrame, str, str]:
     """정확한 일별 Archive 경로를 읽는다 — 일부 날짜가 없으면 경고만 남기고
     건너뛰며, 요청 범위 전체가 다 없을 때만 실패한다(fail-closed에서 완화,
@@ -155,6 +157,13 @@ def _read_archive_daily(
     있는 소스도 포함된다 — "그날 데이터가 없었다"와 "그날 수요가 0이었다"를
     구분하지 못한다는 트레이드오프를 감수하고, 학습이 절대 실패하지 않는 쪽을
     우선한 결정이다(2026-08).
+
+    args:
+        read_schema: 지정하면 `mergeSchema=true` 대신 이 스키마로 강제 읽는다 —
+            날짜 파일마다 물리 타입이 다른 컬럼(예: 날씨 archive의 `PTY`, 실측
+            2026-08-25에서 BIGINT/DOUBLE이 섞여 있어 `CANNOT_MERGE_SCHEMAS`로
+            전체 읽기가 실패했다)이 있지만 그 컬럼을 실제로 안 쓸 때 쓴다 —
+            스키마에 없는 컬럼은 그냥 안 읽으므로 타입 충돌 자체가 생기지 않는다.
     """
     days, since_bound, until_bound = _archive_dates(since, until)
     paths = [_archive_path(source_id, day) for day in days]
@@ -179,7 +188,10 @@ def _read_archive_daily(
         flush=True,
     )
     _validate_archive_schema(spark, source_id, existing_paths)
-    df = spark.read.option("mergeSchema", "true").parquet(*existing_paths)
+    if read_schema is not None:
+        df = spark.read.schema(read_schema).parquet(*existing_paths)
+    else:
+        df = spark.read.option("mergeSchema", "true").parquet(*existing_paths)
     archive_day = F.regexp_extract(F.input_file_name(), r"dt=(\d{4}-\d{2}-\d{2})\.parquet$", 1)
     return df.withColumn("_archive_dt", F.to_date(archive_day)), since_bound, until_bound
 
@@ -398,6 +410,27 @@ def read_station_status(
     return df.select("station_id", "hour_ts", "bike_count", "stockout_flag")
 
 
+# `PTY`(강수형태 코드)가 날짜 파일마다 BIGINT/DOUBLE로 물리 타입이 갈려 있어
+# (collector 실측, 2026-08-25) `mergeSchema=true`가 CANNOT_MERGE_SCHEMAS로 전체
+# 읽기를 실패시킨다 — read_weather()가 실제로 쓰는 컬럼(PTY 제외)만 명시해서
+# 그 컬럼 자체를 안 읽게 한다. `_ARCHIVE_REQUIRED_COLUMNS[WEATHER_SOURCE_ID]`와
+# 이름은 반드시 같이 맞출 것.
+_WEATHER_READ_SCHEMA = StructType(
+    [
+        StructField("nx", LongType(), True),
+        StructField("ny", LongType(), True),
+        StructField("baseDate", StringType(), True),
+        StructField("baseTime", StringType(), True),
+        StructField("T1H", DoubleType(), True),
+        StructField("REH", DoubleType(), True),
+        StructField("WSD", DoubleType(), True),
+        StructField("RN1", DoubleType(), True),
+        StructField("_window_start", StringType(), True),
+        StructField("_source_kind", StringType(), True),
+    ]
+)
+
+
 def read_weather(
     spark: SparkSession,
     since: str | None = None,
@@ -427,6 +460,7 @@ def read_weather(
         silver_schema.WEATHER_SOURCE_ID,
         since,
         until,
+        read_schema=_WEATHER_READ_SCHEMA,
     )
     base_date = F.regexp_replace(F.col("baseDate").cast("string"), r"\D", "")
     base_time = F.lpad(F.regexp_replace(F.col("baseTime").cast("string"), r"\D", ""), 4, "0")
