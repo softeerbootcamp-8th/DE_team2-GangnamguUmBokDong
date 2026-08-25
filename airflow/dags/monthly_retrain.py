@@ -49,7 +49,6 @@ from config.schedules import (
 )
 from orchestration.aws_infra_task import (
     EMR_CORE_INSTANCE_TYPE,
-    EMR_S3_SCRIPTS_PREFIX,
     MOCK_OVERRIDE_FORCE_MOCK,
     MOCK_OVERRIDE_FORCE_REAL,
     MODELS_PREFIX,
@@ -101,7 +100,15 @@ def _result_s3_key(run_id: str, name: str) -> str:
 def _feature_mart_spark_steps(profile: str) -> tuple[tuple[str, list[str]], tuple[str, list[str]]]:
     """`profile`로 feature mart(2차 정제)를 (재)생성하는 두 Spark 스텝(name, args)을
     반환한다 — run_pipeline.py는 watermark 기반 증분이라 매번 불러도 안전하다
-    (평가 전 최신화용 `refresh_feature_mart`와 재학습 루프 양쪽에서 재사용)."""
+    (평가 전 최신화용 `refresh_feature_mart`와 재학습 루프 양쪽에서 재사용).
+
+    스크립트는 `EMR_S3_SCRIPTS_PREFIX`(S3, 기본값이 존재하지 않는 "local-dev"
+    버킷을 가리켜 실제 EMR 실행에서 AccessDenied로 실패했다 — 2026-08-25) 대신
+    bootstrap이 모든 노드에 이미 풀어놓은 로컬 경로(`_EMR_PYTHONPATH`)에서 바로
+    읽는다 — `Makefile`의 `emr-features` 타겟도 같은 이유로 로컬 경로
+    (`/opt/gng/feature_engine/spark/...`)를 쓴다. spark-submit --deploy-mode
+    cluster는 드라이버 컨테이너도 클러스터 노드 위에서 뜨므로 로컬 경로가 항상
+    유효하다."""
     common_confs = [
         "--conf",
         f"spark.yarn.appMasterEnv.ML_PROFILE={profile}",
@@ -114,16 +121,17 @@ def _feature_mart_spark_steps(profile: str) -> tuple[tuple[str, list[str]], tupl
         "--conf",
         f"spark.executorEnv.S3_BUCKET={S3_BUCKET}",
     ]
+    scripts_dir = f"{_EMR_PYTHONPATH}/feature_engine/spark"
     return (
         (
             f"Spark-RunPipeline-{profile}",
             ["spark-submit", "--deploy-mode", "cluster", "--master", "yarn", *common_confs,
-             f"{EMR_S3_SCRIPTS_PREFIX}/run_pipeline.py"],
+             f"{scripts_dir}/run_pipeline.py"],
         ),
         (
             f"Spark-BuildMultiHorizon-{profile}",
             ["spark-submit", "--deploy-mode", "cluster", "--master", "yarn", *common_confs,
-             f"{EMR_S3_SCRIPTS_PREFIX}/build_multi_horizon_features.py"],
+             f"{scripts_dir}/build_multi_horizon_features.py"],
         ),
     )
 
