@@ -283,6 +283,35 @@ def get_object_metadata(key: str) -> dict[str, str] | None:
         raise
 
 
+def get_object_tags(key: str) -> dict[str, str] | None:
+    """S3 object tag를 읽는다. 키가 없으면 None을 반환한다."""
+    try:
+        response = _client().get_object_tagging(Bucket=_bucket(), Key=key)
+        return {item["Key"]: item["Value"] for item in response.get("TagSet", [])}
+    except ClientError as exc:
+        if exc.response["Error"]["Code"] in {"404", "NoSuchKey", "NoSuchTagSet"}:
+            return None
+        raise
+
+
+def merge_object_tags(key: str, tags: dict[str, str]) -> None:
+    """기존 S3 object tag를 보존하면서 지정한 값을 병합한다."""
+    current = get_object_tags(key)
+    if current is None:
+        raise FileNotFoundError(f"tag를 기록할 S3 object가 없다: {key}")
+    merged = {**current, **tags}
+    _client().put_object_tagging(
+        Bucket=_bucket(),
+        Key=key,
+        Tagging={
+            "TagSet": [
+                {"Key": tag_key, "Value": value}
+                for tag_key, value in sorted(merged.items())
+            ]
+        },
+    )
+
+
 def _to_pandas_or_table(table: pq.Table, as_pandas: bool) -> pd.DataFrame | pq.Table:
     """`table.to_pandas()` 변환 시 순간 메모리가 2배로 뜨는 걸 줄인다.
 

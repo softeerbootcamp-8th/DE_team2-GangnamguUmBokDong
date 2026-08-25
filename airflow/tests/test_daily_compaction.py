@@ -115,11 +115,19 @@ class TestDag:
         for source in COLD_BRONZE_SOURCES:
             task = dag.get_task(f"cold_compact_{source}")
             assert "cold_compact.py" in task.bash_command
-            assert "macros.timedelta(days=6)" in task.bash_command
+            assert "--recover-pending" in task.bash_command
+            assert "--delay-days 6" in task.bash_command
             expected_upstream = (
-                {f"compact_{source}"} if source in COMPACTION_SOURCES else set()
+                {"replay_bike_rental_history_23h"}
+                if source == "bike_rental_history"
+                else set()
             )
             assert task.upstream_task_ids == expected_upstream
+
+    def test_rental_cold_recovery_is_not_blocked_by_replay_failure(self):
+        task = dag.get_task("cold_compact_bike_rental_history")
+
+        assert task.trigger_rule == TriggerRule.ALL_DONE
 
     def test_non_authority_silver_gc_runs_after_thirty_day_retention(self):
         for source in COLD_BRONZE_SOURCES:
