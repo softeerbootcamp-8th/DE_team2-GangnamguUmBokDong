@@ -109,6 +109,9 @@ def test_create_emr_cluster_sets_keep_alive_and_managed_policy_tag(monkeypatch):
     # (2026-08-25, 두 번째 실제 실행에서 실측).
     assert captured["Instances"]["EmrManagedMasterSecurityGroup"] == infra.EMR_MASTER_SG_ID
     assert captured["Instances"]["EmrManagedSlaveSecurityGroup"] == infra.EMR_CORE_SG_ID
+    # LogUri가 없으면 스텝이 실패해도 "Unknown Error"만 뜨고 실제 stdout/stderr을
+    # 볼 방법이 없다(2026-08-25, evaluate_rental 첫 실패에서 실측 확인).
+    assert captured["LogUri"] == f"s3://{infra.S3_BUCKET}/emr-logs/"
     # 기본값(AWS_EMR_BOOTSTRAP_SCRIPT_S3_URI 미설정)에서도 BootstrapActions가
     # 실려야 한다 — 예전엔 빈 문자열이 기본값이라 아무도 안 채우면 training
     # 패키지가 안 깔린 클러스터가 뜨고 첫 스텝이 ImportError로 조용히

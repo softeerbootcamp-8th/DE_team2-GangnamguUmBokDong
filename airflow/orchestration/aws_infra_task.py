@@ -502,6 +502,7 @@ def run_emr_feature_mart_job(
         "Steps": steps,
         "JobFlowRole": EMR_JOB_FLOW_ROLE,
         "ServiceRole": EMR_SERVICE_ROLE,
+        "LogUri": f"s3://{S3_BUCKET}/emr-logs/",
         "Tags": [{"Key": "for-use-with-amazon-emr-managed-policies", "Value": "true"}],
     }
 
@@ -737,6 +738,11 @@ def create_emr_cluster(
         },
         "JobFlowRole": EMR_JOB_FLOW_ROLE,
         "ServiceRole": EMR_SERVICE_ROLE,
+        # LogUri가 없으면 스텝이 실패해도 원인이 "Unknown Error"로만 나오고
+        # "Step log files on S3 are only available for clusters which have
+        # logging enabled"라고만 뜬다 — 실제 stdout/stderr을 볼 방법이 아예
+        # 없다(2026-08-25, evaluate_rental 첫 실패에서 실측 확인).
+        "LogUri": f"s3://{S3_BUCKET}/emr-logs/",
         "Tags": [{"Key": "for-use-with-amazon-emr-managed-policies", "Value": "true"}],
     }
     if EMR_BOOTSTRAP_SCRIPT_S3_URI:
