@@ -55,6 +55,11 @@ DEFAULT_RETRIES = 2
 DEFAULT_RETRY_DELAY = timedelta(seconds=30)
 DEFAULT_EXECUTION_TIMEOUT = timedelta(seconds=240)
 
+# living_population_grid는 과거 날짜를 다시 조회할 수 없으므로 그날 실행 안에서
+# 일시적인 API 장애를 충분히 기다렸다가 복구한다. 다른 source의 기본 retry는 유지한다.
+DAILY_POPULATION_RETRIES = 4
+DAILY_POPULATION_RETRY_DELAY = timedelta(minutes=10)
+
 # living_population_grid는 서울 전체 250m 격자 x 24시간을 페이지네이션으로 받아오므로
 # 다른 실시간 소스보다 훨씬 오래 걸린다(로컬 테스트 실측 기준).
 EXECUTION_TIMEOUT_OVERRIDES = {
@@ -67,8 +72,9 @@ NOWCASTING_EXECUTION_TIMEOUT = timedelta(seconds=600)
 # (2026-08-19 21:40 tick, 격자 8,564개 x 13시각, baseline 2개 날짜 = nowcast 27MB):
 # 10.7초. 5분 tick에 여유가 크지만 baseline 크기가 늘 수 있어 상한은 300초로 둔다.
 NORMALIZER_EXECUTION_TIMEOUT = timedelta(seconds=300)
-# 변경이 없는 날짜는 LIST 한 번으로 끝나지만, 백필이 들어온 날은 하루치 parquet을
-# 전부 다시 읽는다. bike_rental_history 기준 288개가 상한이다.
+# 변경이 없는 날짜는 LIST 한 번으로 끝나지만, 대여이력 D-6 correction 등으로 Silver
+# 입력이 바뀐 날은 하루치 parquet을 전부 다시 읽는다. bike_rental_history 기준
+# 288개가 상한이다.
 COMPACTION_EXECUTION_TIMEOUT = timedelta(seconds=900)
 # 실측 데이터 없음(placeholder) — 로컬에서 --all-stations 1회 실행 시간을 재본 뒤 조정.
 INFERENCE_EXECUTION_TIMEOUT = timedelta(seconds=300)

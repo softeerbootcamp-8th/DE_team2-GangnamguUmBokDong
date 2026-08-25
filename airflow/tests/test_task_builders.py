@@ -9,8 +9,7 @@ import pytest
 from airflow.sdk.execution_time import macros
 from airflow.task.trigger_rule import TriggerRule
 from callbacks.task_callbacks import on_failure_callback, on_success_callback
-
-import orchestration.collector_task as collector_task
+from orchestration import collector_task
 from orchestration.collector_task import (
     COLLECTOR_DIR,
     build_collector_replay_task,
@@ -76,6 +75,19 @@ def test_collector_task_uses_kst_window_and_own_project_environment(dag) -> None
     assert "astimezone" in task.bash_command
     assert "// 5" in task.bash_command
     assert task.cwd == COLLECTOR_DIR
+
+
+def test_collector_task_forwards_source_retry_policy(dag) -> None:
+    """Collector wrapper가 source별 retry 횟수와 간격을 Operator에 전달한다."""
+    task = build_collector_task(
+        dag,
+        "living_population_grid",
+        retries=4,
+        retry_delay=timedelta(minutes=10),
+    )
+
+    assert task.retries == 4
+    assert task.retry_delay == timedelta(minutes=10)
 
 
 def test_weather_freshness_gate_only_skips_direct_downstream(dag) -> None:

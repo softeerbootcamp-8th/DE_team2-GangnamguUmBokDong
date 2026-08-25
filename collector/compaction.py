@@ -55,9 +55,10 @@ logger = logging.getLogger(__name__)
 _KST = ZoneInfo("Asia/Seoul")
 
 # 배치가 안 돈 날을 되채우는 하한. airflow가 CATCHUP=False로 돌아서 놓친 스케줄은
-# 다시 실행되지 않으므로, 검사 범위가 그걸 복구하는 유일한 수단이다. 백필 설정과는
-# 목적이 다르므로 값을 따로 둔다.
-RECOVERY_DAYS = 7
+# 다시 실행되지 않으므로, 검사 범위가 그걸 복구하는 유일한 수단이다. D-6 대여이력
+# correction 뒤 compaction만 실패해도 다음 날 D-7에서 한 번 더 복구할 수 있도록
+# 오늘을 포함한 8일을 본다. 지연 fetch backfill 설정과는 목적이 다르다.
+RECOVERY_DAYS = 8
 
 # yaml의 types는 선언 순서대로 시도해 첫 성공을 채택하므로(validation/engine.py:42)
 # types[0]이 곧 실효 타입이다. `[str, int]`는 str()이 거의 실패하지 않아 항상 str이 된다.

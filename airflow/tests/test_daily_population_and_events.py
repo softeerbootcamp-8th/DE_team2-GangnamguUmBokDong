@@ -5,6 +5,10 @@ from datetime import timedelta
 from airflow.timetables.trigger import CronTriggerTimetable
 from config.schedules import (
     DAILY_CRON,
+    DAILY_POPULATION_RETRIES,
+    DAILY_POPULATION_RETRY_DELAY,
+    DEFAULT_RETRIES,
+    DEFAULT_RETRY_DELAY,
     EXECUTION_TIMEOUT_OVERRIDES,
     NOWCASTING_EXECUTION_TIMEOUT,
 )
@@ -66,3 +70,28 @@ def test_living_population_grid_uses_long_timeout():
         == EXECUTION_TIMEOUT_OVERRIDES["living_population_grid"]
     )
     assert collect_population.execution_timeout == timedelta(seconds=1200)
+
+
+def test_living_population_grid_uses_same_day_retry_budget():
+    """과거 재조회가 불가능한 생활인구는 당일 재시도 시간을 충분히 확보한다."""
+    collect_population = dag.get_task("collect_living_population_grid")
+
+    assert collect_population.retries == DAILY_POPULATION_RETRIES == 4
+    assert (
+        collect_population.retry_delay
+        == DAILY_POPULATION_RETRY_DELAY
+        == timedelta(minutes=10)
+    )
+    assert "--force" not in collect_population.bash_command
+    assert "--backfill" not in collect_population.bash_command
+
+
+def test_event_collectors_keep_default_retry_policy():
+    """행사 collector는 공용 retry와 기존 일반 수집 명령을 유지한다."""
+    for source_id in ("cultural_event", "performance_event"):
+        task = dag.get_task(f"collect_{source_id}")
+
+        assert task.retries == DEFAULT_RETRIES
+        assert task.retry_delay == DEFAULT_RETRY_DELAY
+        assert "--force" not in task.bash_command
+        assert "--backfill" not in task.bash_command
