@@ -4,8 +4,17 @@ from datetime import date
 
 import pytest
 from evaluation.backtest_contract import (
+    PRIMARY_METRIC,
     EvaluationContract,
     validate_sensitivity_contracts,
+)
+from evaluation.production_policy_contract import (
+    PRODUCTION_SERVICE_MINUTES_PER_STOP,
+    PRODUCTION_SPEED_KMH,
+)
+from gold.rebalance_route import (
+    PICKUP_DISPATCH_ASSUMED_SPEED_KMH,
+    PICKUP_DISPATCH_SERVICE_MINUTES_PER_STOP,
 )
 
 
@@ -16,7 +25,19 @@ def test_contract_matches_realtime_operating_cadence() -> None:
     assert contract.evaluation_minutes == 120
     assert contract.tick_minutes == 5
     assert contract.truck_capacity == 20
+    assert contract.speed_kmh == PICKUP_DISPATCH_ASSUMED_SPEED_KMH
+    assert (
+        contract.service_minutes_per_stop
+        == PICKUP_DISPATCH_SERVICE_MINUTES_PER_STOP
+    )
+    assert PRODUCTION_SPEED_KMH == PICKUP_DISPATCH_ASSUMED_SPEED_KMH
+    assert (
+        PRODUCTION_SERVICE_MINUTES_PER_STOP
+        == PICKUP_DISPATCH_SERVICE_MINUTES_PER_STOP
+    )
     assert audit["evidence_grade"] == "retrospective_heldout_replay"
+    assert audit["primary_metric"] == PRIMARY_METRIC
+    assert PRIMARY_METRIC == "observed_demand_fulfillment_rate"
     assert "인과적으로 주장할 수 없다" in audit["forbidden_claim"]
 
 

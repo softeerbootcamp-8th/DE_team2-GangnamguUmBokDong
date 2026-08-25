@@ -12,11 +12,20 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from core.scoring_config import URGENCY_SCORING_CONFIG_VERSION
 from gold.demand import DemandForecastRecord
-from gold.rebalance_policy import LEGACY_REBALANCE_POLICY, RebalancePolicyConfig
-from gold.rebalance_route import DispatchCenterTopology
+from gold.rebalance_policy import (
+    DEFAULT_REBALANCE_POLICY,
+    RebalancePolicyConfig,
+)
+from gold.rebalance_route import (
+    MAX_STOPS_PER_ROUTE,
+    ROUTE_ALGORITHM_VERSION,
+    DispatchCenterTopology,
+)
 
 from .backtest_contract import (
+    BACKTEST_CONTRACT_VERSION,
     EVIDENCE_GRADE,
     EvaluationContract,
     validate_sensitivity_contracts,
@@ -40,6 +49,7 @@ from .legacy_baseline import (
     replay_legacy_timing,
 )
 from .policy_simulator import SimulationMetrics, simulate_no_rebalance, simulate_policy
+from .production_policy_contract import PRODUCTION_POLICY_NAME
 from .rebalance_backtest import (
     RentalTrip,
     StockObservation,
@@ -103,6 +113,27 @@ class PolicyVariant:
             raise ValueError("policy variant config 타입이 잘못됐습니다.")
 
 
+def default_policy_variants(
+    max_stops_variants: tuple[int, ...],
+) -> tuple[PolicyVariant, ...]:
+    """직접 실행의 기본 후보를 production 정책과 명시적 작업 상한으로 만든다."""
+    return tuple(
+        PolicyVariant(
+            name=(
+                PRODUCTION_POLICY_NAME
+                if max_stops == MAX_STOPS_PER_ROUTE
+                else (
+                    f"experimental_{ROUTE_ALGORITHM_VERSION.replace('-', '_')}_"
+                    f"max_stops_{max_stops}"
+                )
+            ),
+            max_stops_per_route=max_stops,
+            policy_config=DEFAULT_REBALANCE_POLICY,
+        )
+        for max_stops in max_stops_variants
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class PolicyBacktestResult:
     """사전 계약·근거 gate·민감도 결과를 한 문서로 묶는다."""
@@ -145,6 +176,7 @@ class SourceProvenance:
     population_excluded_grid_ids: tuple[str, ...]
     backtest_contract_version: str
     route_algorithm_version: str
+    urgency_scoring_config_version: str
 
 
 def run_policy_backtest(
@@ -180,14 +212,7 @@ def run_policy_backtest(
     if evaluation_minutes == (60, 120, 180):
         validate_sensitivity_contracts(contracts)
     variants = (
-        tuple(
-            PolicyVariant(
-                name=f"model_route_v2_max_stops_{max_stops}",
-                max_stops_per_route=max_stops,
-                policy_config=LEGACY_REBALANCE_POLICY,
-            )
-            for max_stops in max_stops_variants
-        )
+        default_policy_variants(max_stops_variants)
         if policy_variants is None
         else policy_variants
     )
@@ -288,8 +313,9 @@ def run_policy_backtest(
         station_crosswalk_sha256=_station_crosswalk_sha256(station_crosswalk),
         population_excluded_station_count=population_excluded_station_count,
         population_excluded_grid_ids=population_excluded_grid_ids,
-        backtest_contract_version="point-in-time-policy-backtest-v2",
-        route_algorithm_version="route-v2",
+        backtest_contract_version=BACKTEST_CONTRACT_VERSION,
+        route_algorithm_version=ROUTE_ALGORITHM_VERSION,
+        urgency_scoring_config_version=URGENCY_SCORING_CONFIG_VERSION,
     )
 
     def provider(
@@ -715,7 +741,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--evaluation-minutes", nargs="+", type=int, default=[60, 120, 180]
     )
     parser.add_argument("--fleet-size", type=int, default=3)
-    parser.add_argument("--max-stops", nargs="+", type=int, default=[5, 8])
+    parser.add_argument(
+        "--max-stops",
+        nargs="+",
+        type=int,
+        default=[MAX_STOPS_PER_ROUTE],
+    )
     parser.add_argument("--rental-csv", required=True, type=Path)
     parser.add_argument("--stock-csv", required=True, type=Path)
     parser.add_argument(

@@ -18,6 +18,7 @@ from gold.rebalance_policy import (
     RebalancePolicyConfig,
 )
 from gold.rebalance_route import (
+    MAX_STOPS_PER_ROUTE,
     DispatchCenterTopology,
     ExistingRoute,
     ExistingRouteStop,
@@ -55,7 +56,6 @@ class ScheduledStop:
     station_id: str
     action: str
     planned_quantity: int
-    minimum_station_stock: int
     visit_no: int
 
 
@@ -108,7 +108,6 @@ class StopAudit:
     action: str
     executed_at: str
     planned_quantity: int
-    minimum_station_stock: int
     actual_quantity: int | None
 
 
@@ -299,17 +298,7 @@ def simulate_policy(
             route_id, stop = event.payload
             job = active_jobs[route_id]
             if stop.action == "pickup":
-                available = max(
-                    0,
-                    stock[stop.station_no] - stop.minimum_station_stock,
-                )
-                available = min(
-                    available,
-                    math.floor(
-                        stock[stop.station_no] * policy_config.max_pickup_stock_fraction
-                    ),
-                )
-                actual = min(stop.planned_quantity, available)
+                actual = min(stop.planned_quantity, stock[stop.station_no])
                 stock[stop.station_no] -= actual
                 job.truck_load += actual
             else:
@@ -465,19 +454,19 @@ def simulate_policy(
                 stations=selected,
                 speed_kmh=contract.speed_kmh,
                 service_minutes=contract.service_minutes_per_stop,
-                transfer_limit=remaining_budget,
-                policy_config=policy_config,
             )
             if job is None:
-                continue
-            if job.return_at > end:
                 continue
             transfer = sum(
                 stop.planned_quantity for stop in job.stops if stop.action == "dropoff"
             )
+            if remaining_budget is not None and transfer > remaining_budget:
+                continue
+            if job.return_at > end:
+                continue
             active_jobs[job.route_id] = job
             if policy_config.pickup_cooldown_minutes > 0:
-                cooldown_until = occurred_at + timedelta(
+                cooldown_until = job.stops[-1].executed_at + timedelta(
                     minutes=policy_config.pickup_cooldown_minutes
                 )
                 for stop in job.stops:
@@ -539,7 +528,6 @@ def simulate_policy(
                     action=stop.action,
                     executed_at=stop.executed_at.isoformat(),
                     planned_quantity=stop.planned_quantity,
-                    minimum_station_stock=stop.minimum_station_stock,
                     actual_quantity=job.executed_quantities.get(stop.visit_no),
                 )
                 for stop in job.stops
@@ -549,7 +537,10 @@ def simulate_policy(
     )
     return SimulationMetrics(
         policy=policy,
-        policy_configuration=policy_config.audit_document(),
+        policy_configuration={
+            **policy_config.audit_document(),
+            "max_stops_per_route": max_stops_per_route,
+        },
         window_start=start.isoformat(),
         window_end=end.isoformat(),
         observed_requests=observed_requests,
@@ -593,7 +584,7 @@ def simulate_no_rebalance(
         initial_stock=initial_stock,
         trips=trips,
         forecast_provider=None,
-        max_stops_per_route=8,
+        max_stops_per_route=MAX_STOPS_PER_ROUTE,
         movement_budget=0,
         policy_config=LEGACY_REBALANCE_POLICY,
     )
@@ -609,41 +600,28 @@ def _schedule_job(
     stations: Mapping[int, HistoricalStation],
     speed_kmh: float,
     service_minutes: float,
-    transfer_limit: int | None,
-    policy_config: RebalancePolicyConfig,
 ) -> ActiveJob | None:
-    """planner 경로를 예산에 맞춰 완결 수량으로 자르고 센터 복귀까지 예약한다."""
+    """Production planner의 완결 경로 수량 그대로 센터 복귀까지 예약한다."""
     by_id = {station.station_id: station for station in stations.values()}
     raw_stops = sorted(
         (stop for stop in plan.route_stops if stop.route_id == route_id),
         key=lambda row: row.visit_no,
     )
-    planned_transfer = sum(
+    pickup_transfer = sum(
+        stop.bike_cnt for stop in raw_stops if stop.route_action_type_cd == "pickup"
+    )
+    dropoff_transfer = sum(
         stop.bike_cnt for stop in raw_stops if stop.route_action_type_cd == "dropoff"
     )
-    transfer = (
-        planned_transfer
-        if transfer_limit is None
-        else min(planned_transfer, transfer_limit)
-    )
-    if transfer <= 0:
+    if dropoff_transfer <= 0:
         return None
-    remaining_by_action = {"pickup": transfer, "dropoff": transfer}
-    chosen = []
-    for stop in raw_stops:
-        action = stop.route_action_type_cd
-        quantity = min(stop.bike_cnt, remaining_by_action[action])
-        if quantity <= 0:
-            continue
-        chosen.append((stop, quantity))
-        remaining_by_action[action] -= quantity
-    if any(remaining_by_action.values()):
-        raise RuntimeError("예산 절단 뒤 pickup/dropoff 완결 수량이 맞지 않습니다.")
+    if pickup_transfer != dropoff_transfer:
+        raise RuntimeError("Production route의 pickup/dropoff 완결 수량이 맞지 않습니다.")
     current_latitude = center.latitude
     current_longitude = center.longitude
     elapsed = 0.0
     scheduled = []
-    for visit_no, (stop, quantity) in enumerate(chosen, start=1):
+    for stop in raw_stops:
         station = by_id[stop.sta_id]
         elapsed += (
             _haversine_km(
@@ -662,13 +640,8 @@ def _schedule_job(
                 station_no=station.station_no,
                 station_id=station.station_id,
                 action=stop.route_action_type_cd,
-                planned_quantity=quantity,
-                minimum_station_stock=(
-                    math.ceil(station.capacity * policy_config.execution_reserve_ratio)
-                    if stop.route_action_type_cd == "pickup"
-                    else 0
-                ),
-                visit_no=visit_no,
+                planned_quantity=stop.bike_cnt,
+                visit_no=stop.visit_no,
             )
         )
         current_latitude = station.latitude

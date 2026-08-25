@@ -76,8 +76,8 @@ dependency, role, parameter는 허용하지 않으며, 별도 표시가 없는 r
 | `weather_forecast` | `station`, `weather_grid` | `short_term_manifest`, `ultra_short_manifest` | `forecast_hour_count`, `resolver_version` |
 | `event:cultural_event` | 없음 | `cultural_event_manifest` | `event_identity_version`, `event_policy_version` |
 | `event:performance_event` | 없음 | `performance_event_manifest`, `stadium_coordinate_seed` | `event_policy_version`, `stadium_coordinate_version` |
-| `station_urgency` | `station`, `station_demand_forecast`, `station_stock` | `demand_publication_manifest`, `stock_publication_manifest`, 선택적 `stock_history_manifest_m05`~`m25`, `urgency_output` | `expected_sta_id_sha256`, `scoring_config_version`, `stock_history_offsets`, `stock_window_count` |
-| `rebalance_route` | `dispatch_center`, `station`, `station_demand_forecast`, `station_stock`, `station_urgency` | `route_coverage`, `urgency_publication_manifest` | `max_routes_per_center`, `max_stops_per_route`, `route_algorithm_version`, `route_coverage_sha256`, `route_work_unit_config_version`, `truck_capacity`, `truck_capacity_config_version` |
+| `station_urgency` | `station`, `station_demand_forecast`, `station_stock` | `demand_publication_manifest`, `stock_publication_manifest`, 선택적 `stock_history_manifest_m05`~`m25`, `urgency_output` | `expected_sta_id_sha256`, `rebalance_policy_config`, `scoring_config_version`, `stock_history_offsets`, `stock_window_count` |
+| `rebalance_route` | `dispatch_center`, `station`, `station_demand_forecast`, `station_stock`, `station_urgency` | `pickup_cooldown_station_ids`, `route_coverage`, `urgency_publication_manifest` | `max_routes_per_center`, `max_stops_per_route`, `rebalance_policy_config`, `route_algorithm_version`, `route_coverage_sha256`, `route_work_unit_config_version`, `truck_capacity`, `truck_capacity_config_version` |
 
 ### 조건부 입력
 
@@ -86,6 +86,9 @@ dependency, role, parameter는 허용하지 않으며, 별도 표시가 없는 r
 - `stock_history_manifest_m05`~`m25`: 각 offset별 0개 또는 1개다. 현재 stock을 포함해
   urgency 계산에 필요한 최소 window 수는 publisher가 검증한다.
 - `stock_history_offsets`는 사용한 과거 offset을 oldest-first로 기록한다.
+- `pickup_cooldown_station_ids`는 비어 있어도 생략하지 않는 canonical
+  `gold-id-set-v1` artifact다. 최근 pickup 때문에 이번 route 후보에서 제외한 station ID를
+  기록한다.
 - `station_stock`은 dependency 없이 `station`과 같은 release의 realtime manifest를
   사용한다. 해당 manifest는 station window set의 첫 candidate와 같아야 한다.
 
@@ -98,7 +101,11 @@ dependency, role, parameter는 허용하지 않으며, 별도 표시가 없는 r
 각 input manifest의 URI, 실제 byte hash, publication key, logical time, revision,
 artifact-set hash와 input-fingerprint hash가 dependency와 모두 같아야 한다. Route는 urgency
 fingerprint 내부의 `station`, demand, stock dependency도 자신의 dependency와 다시
-비교한다.
+비교한다. 또한 두 fingerprint의 `rebalance_policy_config`가 byte-for-byte 같아야 한다.
+`route-v3-supply-led`는 현행 `scoring_config_version`과 기본 재배치 정책의 canonical
+config만 소비하며, 구버전 점수 또는 다른 정책 fingerprint는 fail-closed로 거부한다.
+가장 긴급한 supply가 경로 ordinal과 첫 dropoff를 소유하고, pickup 후보는
+`center→pickup→supply` 총거리 순으로 고른다.
 
 ## Station 보조 문서
 

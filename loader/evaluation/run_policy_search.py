@@ -10,7 +10,11 @@ from datetime import date
 from itertools import product
 from pathlib import Path
 
-from gold.rebalance_policy import LEGACY_REBALANCE_POLICY, risk_band_policy
+from gold.rebalance_policy import (
+    LEGACY_REBALANCE_POLICY,
+    pickup_fraction_token,
+    risk_band_policy,
+)
 
 from .aggregate_policy_results import aggregate_results, write_aggregate
 from .run_policy_backtest import PolicyVariant, run_policy_backtest, write_result
@@ -22,7 +26,7 @@ def build_policy_variants(
     minimum_stock_ratios: tuple[float, ...],
     uncertainty_values: tuple[float, ...],
     max_pickup_stock_fractions: tuple[float, ...],
-    pickup_cooldown_minutes: tuple[int, ...],
+    pickup_cooldown_minutes: tuple[int | None, ...],
     max_stops: tuple[int, ...],
     include_legacy: bool,
 ) -> tuple[PolicyVariant, ...]:
@@ -52,13 +56,14 @@ def build_policy_variants(
             max_pickup_stock_fraction=fraction,
             pickup_cooldown_minutes=cooldown,
         )
+        resolved_cooldown = config.pickup_cooldown_minutes
         variants.append(
             PolicyVariant(
                 name=(
                     f"risk_h{horizon}_r{round(ratio * 100):02d}_"
                     f"z{round(uncertainty * 1000):04d}_"
-                    f"f{round(fraction * 100):03d}_"
-                    f"cd{cooldown:03d}_s{stop_limit}"
+                    f"{pickup_fraction_token(fraction)}_"
+                    f"cd{resolved_cooldown:03d}_s{stop_limit}"
                 ),
                 max_stops_per_route=stop_limit,
                 policy_config=config,
@@ -104,7 +109,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--pickup-cooldown-minutes",
         nargs="+",
         type=int,
-        default=[0],
+        default=None,
     )
     parser.add_argument("--include-legacy", action="store_true")
     parser.add_argument(
@@ -168,7 +173,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         max_pickup_stock_fractions=tuple(
             dict.fromkeys(args.max_pickup_stock_fractions)
         ),
-        pickup_cooldown_minutes=tuple(dict.fromkeys(args.pickup_cooldown_minutes)),
+        pickup_cooldown_minutes=(
+            (None,)
+            if args.pickup_cooldown_minutes is None
+            else tuple(dict.fromkeys(args.pickup_cooldown_minutes))
+        ),
         max_stops=tuple(dict.fromkeys(args.max_stops)),
         include_legacy=args.include_legacy,
     )
@@ -212,6 +221,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     print(f"Search JSON: {json_path}")
     print(f"Search Markdown: {markdown_path}")
+    print("Production acceptance: NOT PASSED (search-only)")
+    candidate = aggregate["candidate_gate"]
+    if not candidate["passed"]:
+        print("Candidate diagnostics: FAILED")
+    else:
+        print(
+            "Candidate diagnostics: PASSED "
+            f"({', '.join(candidate['passing_policies'])})"
+        )
     return 0
 
 

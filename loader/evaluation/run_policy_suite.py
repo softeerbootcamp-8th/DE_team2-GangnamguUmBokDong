@@ -9,20 +9,37 @@ from collections.abc import Sequence
 from datetime import date
 from pathlib import Path
 
-from .aggregate_policy_results import aggregate_results, write_aggregate
-from .run_policy_backtest import run_policy_backtest, write_result
+from gold.rebalance_policy import DEFAULT_REBALANCE_POLICY
+from gold.rebalance_route import MAX_STOPS_PER_ROUTE
 
-DEFAULT_DATES = tuple(date(2025, month, 17) for month in range(3, 13))
+from .aggregate_policy_results import aggregate_results, write_aggregate
+from .production_policy_contract import (
+    PRODUCTION_CENTER_ID,
+    PRODUCTION_EVALUATION_MINUTES,
+    PRODUCTION_FLEET_SIZE,
+    PRODUCTION_POLICY_NAME,
+    PRODUCTION_START_HOUR,
+    PRODUCTION_TARGET_DATES,
+)
+from .run_policy_backtest import PolicyVariant, run_policy_backtest, write_result
+
+DEFAULT_DATES = PRODUCTION_TARGET_DATES
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     """held-out 날짜 묶음과 공통 운영 조건을 파싱한다."""
     parser = argparse.ArgumentParser(description="2025 held-out 재배치 정책 suite")
     parser.add_argument("--dates", nargs="+", type=date.fromisoformat, default=DEFAULT_DATES)
-    parser.add_argument("--center", default="hangnyeoul")
-    parser.add_argument("--start-hour", type=int, default=6)
-    parser.add_argument("--fleet-size", type=int, default=3)
-    parser.add_argument("--max-stops", nargs="+", type=int, default=[5, 8])
+    parser.add_argument("--center", default=PRODUCTION_CENTER_ID)
+    parser.add_argument("--start-hour", type=int, default=PRODUCTION_START_HOUR)
+    parser.add_argument("--fleet-size", type=int, default=PRODUCTION_FLEET_SIZE)
+    parser.add_argument(
+        "--max-stops",
+        nargs="+",
+        type=int,
+        default=[MAX_STOPS_PER_ROUTE],
+        help="production release 계약상 5만 허용한다.",
+    )
     parser.add_argument(
         "--bootstrap-dir",
         type=Path,
@@ -54,10 +71,23 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--secret-key", default=os.environ.get("AWS_SECRET_ACCESS_KEY", "minioadmin"))
     parser.add_argument("--output-dir", type=Path, default=Path("../data/backtest-results"))
     args = parser.parse_args(argv)
-    if any(target.year != 2025 or target.day != 17 for target in args.dates):
-        parser.error("모든 --dates는 고정 모델의 2025년 held-out 17일이어야 합니다.")
-    if len(args.dates) != len(set(args.dates)):
-        parser.error("--dates에 중복 날짜가 있습니다.")
+    if tuple(args.dates) != PRODUCTION_TARGET_DATES:
+        parser.error("production suite의 --dates는 2025-03..12 각 17일이어야 합니다.")
+    if args.center != PRODUCTION_CENTER_ID:
+        parser.error(f"production suite의 --center는 {PRODUCTION_CENTER_ID}여야 합니다.")
+    if args.start_hour != PRODUCTION_START_HOUR:
+        parser.error(
+            f"production suite의 --start-hour는 {PRODUCTION_START_HOUR}여야 합니다."
+        )
+    if args.fleet_size != PRODUCTION_FLEET_SIZE:
+        parser.error(
+            f"production suite의 --fleet-size는 {PRODUCTION_FLEET_SIZE}이어야 합니다."
+        )
+    if args.max_stops != [MAX_STOPS_PER_ROUTE]:
+        parser.error(
+            "production suite의 --max-stops는 정확히 "
+            f"{MAX_STOPS_PER_ROUTE} 하나여야 합니다."
+        )
     return args
 
 
@@ -72,9 +102,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             target_date=target,
             center_id=args.center,
             start_hour=args.start_hour,
-            evaluation_minutes=(60, 120, 180),
+            evaluation_minutes=PRODUCTION_EVALUATION_MINUTES,
             fleet_size=args.fleet_size,
-            max_stops_variants=tuple(dict.fromkeys(args.max_stops)),
+            max_stops_variants=(MAX_STOPS_PER_ROUTE,),
             rental_csv=args.bootstrap_dir
             / f"서울특별시 공공자전거 대여이력 정보_{month}.csv",
             stock_csv=args.bootstrap_dir
@@ -87,6 +117,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             bucket=args.s3_bucket,
             access_key=args.access_key,
             secret_key=args.secret_key,
+            policy_variants=(
+                PolicyVariant(
+                    name=PRODUCTION_POLICY_NAME,
+                    max_stops_per_route=MAX_STOPS_PER_ROUTE,
+                    policy_config=DEFAULT_REBALANCE_POLICY,
+                ),
+            ),
         )
         json_path, _ = write_result(result, args.output_dir)
         documents.append(json.loads(json_path.read_text(encoding="utf-8")))
@@ -105,6 +142,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     print(f"Suite JSON: {json_path}")
     print(f"Suite Markdown: {markdown_path}")
+    if not aggregate["acceptance_gate"]["passed"]:
+        print("Acceptance gate: FAILED")
+        return 1
+    print(
+        "Acceptance gate: PASSED "
+        f"({', '.join(aggregate['acceptance_gate']['passing_policies'])})"
+    )
     return 0
 
 

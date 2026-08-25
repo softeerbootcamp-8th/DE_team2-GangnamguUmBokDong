@@ -10,6 +10,23 @@ from typing import Any
 from core.gold_publication import ContractViolation
 
 _QUANTITY_STRATEGIES = frozenset({"legacy", "risk_band"})
+REBALANCE_POLICY_CONFIG_SCHEMA_VERSION = "rebalance-policy-config-v4"
+PICKUP_FRACTION_BASIS_POINT_SCALE = 10_000
+PICKUP_DONOR_GUARD_NONE = "none"
+PICKUP_DONOR_GUARD_ANY_DEPLETION_V1 = "any-depletion-v1"
+
+
+def pickup_fraction_token(value: float) -> str:
+    """Pickup fraction을 충돌 없는 basis-point 정책 토큰으로 변환한다."""
+    if type(value) is not float or not math.isfinite(value):
+        raise ContractViolation("max_pickup_stock_fraction은 finite float여야 합니다.")
+    scaled = value * PICKUP_FRACTION_BASIS_POINT_SCALE
+    basis_points = round(scaled)
+    if not math.isclose(scaled, basis_points, rel_tol=0.0, abs_tol=1e-9):
+        raise ContractViolation(
+            "max_pickup_stock_fraction은 0.0001 단위여야 합니다."
+        )
+    return f"f{basis_points:04d}bp"
 
 
 @dataclass(frozen=True, slots=True)
@@ -24,7 +41,6 @@ class RebalancePolicyConfig:
     max_pickup_stock_fraction: float
     exclusive_pickup_station: bool
     pickup_cooldown_minutes: int
-    execution_reserve_ratio: float
 
     def __post_init__(self) -> None:
         """정책 식별자와 각 물리 파라미터 범위를 검증한다."""
@@ -50,7 +66,6 @@ class RebalancePolicyConfig:
                 "max_pickup_stock_fraction",
                 1.0,
             ),
-            (self.execution_reserve_ratio, "execution_reserve_ratio", 0.5),
         ):
             if (
                 type(value) is not float
@@ -60,6 +75,7 @@ class RebalancePolicyConfig:
                 raise ContractViolation(
                     f"{name}은 0..{maximum} finite float여야 합니다."
                 )
+        pickup_fraction_token(self.max_pickup_stock_fraction)
         if type(self.exclusive_pickup_station) is not bool:
             raise ContractViolation("exclusive_pickup_station은 bool이어야 합니다.")
         if self.quantity_strategy == "legacy" and (
@@ -69,22 +85,22 @@ class RebalancePolicyConfig:
             or self.max_pickup_stock_fraction != 1.0
             or self.exclusive_pickup_station
             or self.pickup_cooldown_minutes != 0
-            or self.execution_reserve_ratio != 0.0
         ):
             raise ContractViolation(
                 "legacy 정책은 기존 동작과 exact한 중립값이어야 합니다."
             )
         if (
             self.quantity_strategy == "risk_band"
-            and self.execution_reserve_ratio < self.minimum_stock_ratio
+            and self.pickup_cooldown_minutes < self.protection_horizon_hours * 60
         ):
             raise ContractViolation(
-                "실행 reserve는 계획 minimum stock보다 작을 수 없습니다."
+                "risk-band pickup cooldown은 protection horizon 이상이어야 합니다."
             )
 
     def audit_document(self) -> dict[str, Any]:
         """결과와 publication fingerprint에 기록할 canonical 정책 값을 반환한다."""
         return {
+            "schema_version": REBALANCE_POLICY_CONFIG_SCHEMA_VERSION,
             "version": self.version,
             "quantity_strategy": self.quantity_strategy,
             "protection_horizon_hours": self.protection_horizon_hours,
@@ -92,9 +108,13 @@ class RebalancePolicyConfig:
             "uncertainty_z": self.uncertainty_z,
             "uncertainty_scope": "pickup_only",
             "max_pickup_stock_fraction": self.max_pickup_stock_fraction,
+            "pickup_donor_guard": (
+                PICKUP_DONOR_GUARD_NONE
+                if self.quantity_strategy == "legacy"
+                else PICKUP_DONOR_GUARD_ANY_DEPLETION_V1
+            ),
             "exclusive_pickup_station": self.exclusive_pickup_station,
             "pickup_cooldown_minutes": self.pickup_cooldown_minutes,
-            "execution_reserve_ratio": self.execution_reserve_ratio,
         }
 
     @property
@@ -117,9 +137,8 @@ LEGACY_REBALANCE_POLICY = RebalancePolicyConfig(
     max_pickup_stock_fraction=1.0,
     exclusive_pickup_station=False,
     pickup_cooldown_minutes=0,
-    execution_reserve_ratio=0.0,
 )
-"""현행 urgency-v1·route-v2와 byte 의미가 같은 비교 기준 정책이다."""
+"""구 urgency-v1·route-v2 동작과 같은 비교 기준 정책이다."""
 
 
 def risk_band_policy(
@@ -128,17 +147,22 @@ def risk_band_policy(
     minimum_stock_ratio: float,
     uncertainty_z: float,
     max_pickup_stock_fraction: float = 1.0,
-    pickup_cooldown_minutes: int = 0,
+    pickup_cooldown_minutes: int | None = None,
     exclusive_pickup_station: bool = True,
 ) -> RebalancePolicyConfig:
-    """실험값을 식별자에 포함한 위험 구간 재고 정책을 만든다."""
+    """실험값을 식별자에 포함한 v4 any-depletion 정책을 만든다."""
+    resolved_cooldown = (
+        protection_horizon_hours * 60
+        if pickup_cooldown_minutes is None
+        else pickup_cooldown_minutes
+    )
     version = (
-        "rebalance-risk-band-"
+        "rebalance-risk-band-v4-any-depletion-"
         f"h{protection_horizon_hours}-"
         f"r{minimum_stock_ratio:.2f}-"
         f"z{uncertainty_z:.3f}-"
-        f"f{max_pickup_stock_fraction:.2f}-"
-        f"cooldown{pickup_cooldown_minutes}-"
+        f"{pickup_fraction_token(float(max_pickup_stock_fraction))}-"
+        f"cooldown{resolved_cooldown}-"
         f"exclusive{int(exclusive_pickup_station)}"
     )
     return RebalancePolicyConfig(
@@ -149,20 +173,19 @@ def risk_band_policy(
         uncertainty_z=float(uncertainty_z),
         max_pickup_stock_fraction=float(max_pickup_stock_fraction),
         exclusive_pickup_station=exclusive_pickup_station,
-        pickup_cooldown_minutes=pickup_cooldown_minutes,
-        execution_reserve_ratio=float(minimum_stock_ratio),
+        pickup_cooldown_minutes=resolved_cooldown,
     )
 
 
-RISK_BAND_REBALANCE_POLICY_V2 = risk_band_policy(
+RISK_BAND_REBALANCE_POLICY_V4 = risk_band_policy(
     protection_horizon_hours=2,
     minimum_stock_ratio=0.2,
-    uncertainty_z=0.0,
-    max_pickup_stock_fraction=0.15,
-    pickup_cooldown_minutes=60,
+    uncertainty_z=1.645,
+    max_pickup_stock_fraction=0.03,
+    pickup_cooldown_minutes=120,
 )
-"""2025년 교정 2일·독립 검증 8일을 통과한 보수적 production 정책이다."""
+"""실측·예측 중 한쪽이라도 하락하는 donor를 보호하는 v4 production 후보다."""
 
 
-DEFAULT_REBALANCE_POLICY = RISK_BAND_REBALANCE_POLICY_V2
+DEFAULT_REBALANCE_POLICY = RISK_BAND_REBALANCE_POLICY_V4
 """Gold urgency·route가 명시적으로 fingerprint하는 기본 재배치 정책이다."""

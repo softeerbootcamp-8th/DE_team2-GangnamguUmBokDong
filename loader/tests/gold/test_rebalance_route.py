@@ -1,7 +1,9 @@
-"""Gold rebalance route-v2 planner·coverage·Parquet 계약을 검증한다."""
+"""Gold rebalance route-v4 planner·coverage·Parquet 계약을 검증한다."""
 
 from __future__ import annotations
 
+import json
+import math
 from collections import Counter
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -9,7 +11,10 @@ from types import SimpleNamespace
 import pyarrow as pa
 import pytest
 from core.gold_publication import (
+    INPUT_FINGERPRINT_SCHEMA_VERSION,
     ContractViolation,
+    InputFingerprint,
+    Parameter,
     RouteCoverageStop,
     build_route_coverage,
     build_route_coverage_route,
@@ -20,7 +25,9 @@ from core.gold_publication import (
 from gold import rebalance_route as route_module
 from gold.common import parquet_bytes, read_parquet_bytes
 from gold.rebalance_policy import (
+    DEFAULT_REBALANCE_POLICY,
     LEGACY_REBALANCE_POLICY,
+    REBALANCE_POLICY_CONFIG_SCHEMA_VERSION,
     RebalancePolicyConfig,
     risk_band_policy,
 )
@@ -28,7 +35,12 @@ from gold.rebalance_route import (
     INITIAL_TRUCK_LOAD,
     MAX_ROUTES_PER_CENTER,
     MAX_STOPS_PER_ROUTE,
+    PICKUP_DISPATCH_ASSUMED_SPEED_KMH,
+    PICKUP_DISPATCH_MAX_LAG_MINUTES,
+    PICKUP_DISPATCH_SERVICE_MINUTES_PER_STOP,
+    PICKUP_DISPATCH_SLA_CONFIG_VERSION,
     ROUTE_ALGORITHM_VERSION,
+    ROUTE_PUBLISHER_VERSION,
     ROUTE_WORK_UNIT_CONFIG_VERSION,
     TRUCK_CAPACITY,
     TRUCK_CAPACITY_CONFIG_VERSION,
@@ -152,14 +164,19 @@ def _plan(
 
 
 def test_route_constants_match_publication_contract() -> None:
-    """route fingerprint에 들어가는 v3 작업 단위 상수를 SSOT 값으로 고정한다."""
-    assert ROUTE_ALGORITHM_VERSION == "route-v3-risk-band"
+    """route fingerprint에 들어가는 v4 작업·SLA 상수를 SSOT 값으로 고정한다."""
+    assert ROUTE_ALGORITHM_VERSION == "route-v4-supply-led-pickup-sla"
+    assert ROUTE_PUBLISHER_VERSION == "gold-route-publisher-v3-pickup-sla"
     assert TRUCK_CAPACITY == 20
     assert TRUCK_CAPACITY_CONFIG_VERSION == "truck-capacity-v1"
     assert INITIAL_TRUCK_LOAD == 0
     assert MAX_STOPS_PER_ROUTE == 5
     assert MAX_ROUTES_PER_CENTER == 3
-    assert ROUTE_WORK_UNIT_CONFIG_VERSION == "route-work-unit-v2"
+    assert ROUTE_WORK_UNIT_CONFIG_VERSION == "route-work-unit-v3-pickup-sla"
+    assert PICKUP_DISPATCH_SLA_CONFIG_VERSION == "pickup-dispatch-sla-v1"
+    assert PICKUP_DISPATCH_ASSUMED_SPEED_KMH == 20.0
+    assert PICKUP_DISPATCH_SERVICE_MINUTES_PER_STOP == 3.0
+    assert PICKUP_DISPATCH_MAX_LAG_MINUTES == 30.0
 
 
 def test_planner_can_override_stop_limit_for_offline_evaluation() -> None:
@@ -428,13 +445,13 @@ def test_planner_revalidates_canonical_coverage_prefix_load() -> None:
 
 def test_current_station_center_fk_controls_grouping_and_center_order() -> None:
     """Point 최근접 재계산 없이 current station FK를 쓰고 center ID 순으로 생성한다."""
-    center_a = _center("center_a", longitude=126.90)
-    center_b = _center("center_b", longitude=127.10)
+    center_a = _center("center_a", longitude=126.99)
+    center_b = _center("center_b", longitude=127.01)
     stations = (
-        _station("ST-1", center_id="center_b", longitude=126.9001),
-        _station("ST-2", center_id="center_a", longitude=127.0999),
-        _station("ST-3", center_id="center_b", longitude=126.9002),
-        _station("ST-4", center_id="center_a", longitude=127.0998),
+        _station("ST-1", center_id="center_b", longitude=126.9901),
+        _station("ST-2", center_id="center_a", longitude=127.0099),
+        _station("ST-3", center_id="center_b", longitude=126.9902),
+        _station("ST-4", center_id="center_a", longitude=127.0098),
     )
 
     plan = _plan(
@@ -490,7 +507,7 @@ def test_candidate_and_nearest_ties_break_by_station_id() -> None:
 
 
 def test_additional_stop_combines_urgency_with_anchor_distance() -> None:
-    """첫 긴급 pickup은 보존하고 추가 stop은 가까운 작업 효율을 반영한다."""
+    """Supply anchor 주변의 safe pickup은 전체 경로 효율을 반영한다."""
     plan = _plan(
         stations=(
             _station("ST-1", longitude=127.0),
@@ -510,8 +527,54 @@ def test_additional_stop_combines_urgency_with_anchor_distance() -> None:
     assert selected_ids == {"ST-1", "ST-3", "ST-4"}
 
 
-def test_pickups_precede_dropoffs_and_dropoff_continues_from_last_pickup() -> None:
-    """route-v2는 마지막 pickup 위치에서 가까운 dropoff로 동선을 이어간다."""
+def test_highest_supply_urgency_owns_first_route_and_first_dropoff() -> None:
+    """가까운 score 0 공급보다 먼 positive 공급이 route와 첫 dropoff를 소유한다."""
+    plan = _plan(
+        stations=(
+            _station("ST-1", longitude=127.0),
+            _station("ST-2", longitude=127.001),
+            _station("ST-3", longitude=127.06),
+        ),
+        urgency=(
+            _urgency("ST-1", "retrieval_needed", 25, score=100),
+            _urgency("ST-2", "supply_needed", 20, score=0),
+            _urgency("ST-3", "supply_needed", 1, score=2),
+        ),
+    )
+
+    first_dropoffs = [
+        next(
+            stop
+            for stop in plan.route_stops
+            if stop.route_id == route.route_id
+            and stop.route_action_type_cd == "dropoff"
+        ).sta_id
+        for route in plan.routes
+    ]
+    assert first_dropoffs == ["ST-3", "ST-2"]
+
+
+def test_supply_anchor_pickup_uses_center_to_donor_to_supply_total_distance() -> None:
+    """Anchor만 가까운 먼 donor보다 센터 포함 총경로가 짧은 donor를 고른다."""
+    plan = _plan(
+        stations=(
+            _station("ST-1", longitude=127.0),
+            _station("ST-2", longitude=127.11),
+            _station("ST-3", longitude=127.10),
+        ),
+        urgency=(
+            _urgency("ST-1", "retrieval_needed", 10, score=1),
+            _urgency("ST-2", "retrieval_needed", 10, score=100),
+            _urgency("ST-3", "supply_needed", 10, score=100),
+        ),
+        max_stops_per_route=2,
+    )
+
+    assert [stop.sta_id for stop in plan.route_stops] == ["ST-1", "ST-3"]
+
+
+def test_pickups_precede_supply_anchor_and_keep_running_load_valid() -> None:
+    """모든 pickup 뒤 최우선 supply를 먼저 방문하며 적재량은 항상 0..20이다."""
     stations = (
         _station("ST-1", longitude=127.01),
         _station("ST-2", longitude=127.011),
@@ -531,8 +594,8 @@ def test_pickups_precede_dropoffs_and_dropoff_continues_from_last_pickup() -> No
     assert [stop.sta_id for stop in plan.route_stops] == [
         "ST-1",
         "ST-2",
-        "ST-4",
         "ST-3",
+        "ST-4",
     ]
     assert [stop.route_action_type_cd for stop in plan.route_stops] == [
         "pickup",
@@ -540,6 +603,150 @@ def test_pickups_precede_dropoffs_and_dropoff_continues_from_last_pickup() -> No
         "dropoff",
         "dropoff",
     ]
+    running_load = 0
+    for stop in plan.route_stops:
+        running_load += (
+            stop.bike_cnt if stop.route_action_type_cd == "pickup" else -stop.bike_cnt
+        )
+        assert 0 <= running_load <= TRUCK_CAPACITY
+    assert running_load == 0
+
+
+def test_pickup_dispatch_sla_splits_large_work_into_complete_routes() -> None:
+    """각 donor는 30분 내지만 다중 donor가 초과하면 한 대씩 분리한다."""
+    stations = (
+        _station("ST-1", longitude=127.09),
+        _station("ST-2", longitude=126.91),
+        _station("ST-3", latitude=37.572),
+        _station("ST-4"),
+    )
+    plan = _plan(
+        stations=stations,
+        urgency=(
+            _urgency("ST-1", "retrieval_needed", 1, score=100),
+            _urgency("ST-2", "retrieval_needed", 1, score=90),
+            _urgency("ST-3", "retrieval_needed", 1, score=80),
+            _urgency("ST-4", "supply_needed", 3, score=100),
+        ),
+    )
+
+    assert len(plan.routes) == MAX_ROUTES_PER_CENTER == 3
+    station_by_id = {station.sta_id: station for station in stations}
+    selected_pickups: set[str] = set()
+    for route in plan.routes:
+        stops = [stop for stop in plan.route_stops if stop.route_id == route.route_id]
+        pickup_stops = [
+            stop for stop in stops if stop.route_action_type_cd == "pickup"
+        ]
+        dropoff_stops = [
+            stop for stop in stops if stop.route_action_type_cd == "dropoff"
+        ]
+        assert len(pickup_stops) == len(dropoff_stops) == 1
+        assert sum(stop.bike_cnt for stop in pickup_stops) == sum(
+            stop.bike_cnt for stop in dropoff_stops
+        )
+        selected_pickups.add(pickup_stops[0].sta_id)
+        pickup = station_by_id[pickup_stops[0].sta_id]
+        dispatch_lag = (
+            route_module._haversine_km(
+                _CENTER_LONGITUDE,
+                _CENTER_LATITUDE,
+                pickup.longitude,
+                pickup.latitude,
+            )
+            / PICKUP_DISPATCH_ASSUMED_SPEED_KMH
+            * 60.0
+            + PICKUP_DISPATCH_SERVICE_MINUTES_PER_STOP
+        )
+        assert dispatch_lag <= PICKUP_DISPATCH_MAX_LAG_MINUTES
+    assert selected_pickups == {"ST-1", "ST-2", "ST-3"}
+
+
+def test_pickup_sla_skips_incompatible_prefix_without_losing_later_donor() -> None:
+    """먼 중간 donor를 건너뛰어 같은 방향 donor를 한 route로 묶는다."""
+    stations = (
+        _station("ST-1", longitude=127.080),
+        _station("ST-2", longitude=126.919),
+        _station("ST-3", longitude=127.082),
+        _station("ST-4"),
+    )
+    urgency = (
+        _urgency("ST-1", "retrieval_needed", 1, score=100),
+        _urgency("ST-2", "retrieval_needed", 1, score=90),
+        _urgency("ST-3", "retrieval_needed", 1, score=80),
+        _urgency("ST-4", "supply_needed", 3, score=100),
+    )
+    plan = _plan(
+        stations=stations,
+        urgency=urgency,
+    )
+
+    assert len(plan.routes) == 2
+    first_route_pickups = [
+        stop.sta_id
+        for stop in plan.route_stops
+        if stop.route_id == plan.routes[0].route_id
+        and stop.route_action_type_cd == "pickup"
+    ]
+    second_route_pickups = [
+        stop.sta_id
+        for stop in plan.route_stops
+        if stop.route_id == plan.routes[1].route_id
+        and stop.route_action_type_cd == "pickup"
+    ]
+    assert first_route_pickups == ["ST-1", "ST-3"]
+    assert second_route_pickups == ["ST-2"]
+    assert _plan(
+        stations=tuple(reversed(stations)),
+        urgency=tuple(reversed(urgency)),
+    ) == plan
+
+
+def test_pickup_dispatch_sla_includes_exact_boundary_and_rejects_above(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pickup lag 30.0분은 포함하고 최소 초과값은 거부한다."""
+    pickup = route_module._Candidate("ST-1", "pickup", 100.0, 1, 127.0, 37.5)
+    dropoff = route_module._Candidate("ST-2", "dropoff", 100.0, 1, 127.0, 37.5)
+
+    monkeypatch.setattr(route_module, "_haversine_km", lambda *_: 9.0)
+    assert route_module._choose_balanced_stop_split(
+        [pickup],
+        [dropoff],
+        start=(_CENTER_LONGITUDE, _CENTER_LATITUDE),
+        max_stops_per_route=2,
+    ) == (1, 1, 1)
+
+    monkeypatch.setattr(
+        route_module,
+        "_haversine_km",
+        lambda *_: math.nextafter(9.0, math.inf),
+    )
+    assert (
+        route_module._choose_balanced_stop_split(
+            [pickup],
+            [dropoff],
+            start=(_CENTER_LONGITUDE, _CENTER_LATITUDE),
+            max_stops_per_route=2,
+        )
+        is None
+    )
+
+
+def test_pickup_outside_dispatch_sla_is_excluded() -> None:
+    """단독 접근만으로도 30분을 넘는 donor는 제안하지 않는다."""
+    plan = _plan(
+        stations=(
+            _station("ST-1", longitude=127.11),
+            _station("ST-2"),
+        ),
+        urgency=(
+            _urgency("ST-1", "retrieval_needed", 1, score=100),
+            _urgency("ST-2", "supply_needed", 1, score=100),
+        ),
+    )
+
+    assert plan == RebalanceRoutePlan((), ())
 
 
 def test_capacity_rollover_uses_one_based_ordinal_and_ssot_uuid() -> None:
@@ -603,8 +810,8 @@ def test_unpaired_action_does_not_create_incomplete_route() -> None:
     assert dropoff_only == RebalanceRoutePlan((), ())
 
 
-def test_work_unit_has_at_most_eight_stops_and_center_route_cap() -> None:
-    """작업은 2~8개 대여소로 완결되고 센터별 상위 3개까지만 제안한다."""
+def test_work_unit_has_at_most_five_stops_and_center_route_cap() -> None:
+    """작업은 2~5개 대여소로 완결되고 센터별 상위 3개까지만 제안한다."""
     pickup_stations = tuple(_station(f"ST-{100 + index}") for index in range(1, 13))
     dropoff_stations = tuple(_station(f"ST-{200 + index}") for index in range(1, 13))
     plan = _plan(
@@ -710,6 +917,104 @@ def test_pickup_cooldown_station_is_excluded_from_new_routes() -> None:
     assert plan == RebalanceRoutePlan((), ())
 
 
+@pytest.mark.parametrize(
+    ("centers", "stations", "message"),
+    (
+        ((_center(),), (), "current active topology"),
+        (
+            (_center(),),
+            (_station("ST-1", is_active=False),),
+            "current active topology",
+        ),
+        (
+            (_center(is_active=False),),
+            (_station("ST-1"),),
+            "current center",
+        ),
+    ),
+)
+def test_pickup_cooldown_does_not_bypass_actionable_topology_validation(
+    centers: tuple[DispatchCenterTopology, ...],
+    stations: tuple[StationRouteTopology, ...],
+    message: str,
+) -> None:
+    """Cooldown pickup도 stale station·inactive topology를 먼저 fail-closed한다."""
+    with pytest.raises(ContractViolation, match=message):
+        _plan(
+            centers=centers,
+            stations=stations,
+            urgency=(_urgency("ST-1", "retrieval_needed", 20),),
+            pickup_cooldown_sta_ids=frozenset({"ST-1"}),
+        )
+
+
+def test_route_v4_accepts_current_urgency_scoring_and_policy() -> None:
+    """Route-v4는 현재 scoring과 기본 재배치 정책 fingerprint를 소비한다."""
+    fingerprint = _supported_urgency_fingerprint()
+
+    route_module._validate_supported_urgency_fingerprint(fingerprint)
+
+
+def test_policy_audit_documents_declare_explicit_schema_version() -> None:
+    """Legacy와 risk-band 정책 JSON은 동작 version과 별도 schema를 선언한다."""
+    for policy in (LEGACY_REBALANCE_POLICY, DEFAULT_REBALANCE_POLICY):
+        assert (
+            policy.audit_document()["schema_version"]
+            == REBALANCE_POLICY_CONFIG_SCHEMA_VERSION
+        )
+        assert json.loads(policy.canonical_json) == policy.audit_document()
+
+
+@pytest.mark.parametrize(
+    "contamination",
+    ("missing_schema", "old_schema", "removed_legacy_key"),
+)
+def test_route_v4_rejects_stale_or_contaminated_policy_schema(
+    contamination: str,
+) -> None:
+    """Route-v4는 정책 JSON schema 누락·구버전·제거 키를 fail-closed한다."""
+    document = DEFAULT_REBALANCE_POLICY.audit_document()
+    if contamination == "missing_schema":
+        del document["schema_version"]
+    elif contamination == "old_schema":
+        document["schema_version"] = "rebalance-policy-config-v1"
+    else:
+        document["execution_reserve_ratio"] = 0.2
+    contaminated = json.dumps(
+        document,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+    with pytest.raises(ContractViolation, match="rebalance_policy_config"):
+        route_module._validate_supported_urgency_fingerprint(
+            _supported_urgency_fingerprint(
+                rebalance_policy_config=contaminated,
+            )
+        )
+
+
+def test_route_v4_rejects_stale_urgency_scoring_version() -> None:
+    """Route-v4는 구버전 urgency 점수 fingerprint를 fail-closed로 거부한다."""
+    fingerprint = _supported_urgency_fingerprint(
+        scoring_config_version="urgency-scoring-v1"
+    )
+
+    with pytest.raises(ContractViolation, match="scoring_config_version"):
+        route_module._validate_supported_urgency_fingerprint(fingerprint)
+
+
+def test_route_v4_rejects_different_rebalance_policy() -> None:
+    """Route-v4는 현재 기본값과 다른 urgency 정책 fingerprint를 거부한다."""
+    fingerprint = _supported_urgency_fingerprint(
+        rebalance_policy_config="different-policy-config"
+    )
+
+    with pytest.raises(ContractViolation, match="rebalance_policy_config"):
+        route_module._validate_supported_urgency_fingerprint(fingerprint)
+
+
 def test_revision_is_explicit_route_identity_input() -> None:
     """같은 계산 입력도 명시 revision이 다르면 UUID만 새 identity로 고정된다."""
     arguments = {
@@ -727,6 +1032,23 @@ def test_revision_is_explicit_route_identity_input() -> None:
     assert revision_zero.routes[0].route_id != revision_one.routes[0].route_id
     assert revision_one.routes[0].route_id == str(
         route_uuid_v5("center_a", _UTC_1600, 1, 1)
+    )
+
+
+def _supported_urgency_fingerprint(
+    *,
+    scoring_config_version: str = route_module.URGENCY_SCORING_CONFIG_VERSION,
+    rebalance_policy_config: str = DEFAULT_REBALANCE_POLICY.canonical_json,
+) -> InputFingerprint:
+    """Route-v4 지원 버전 검증에 쓸 typed urgency fingerprint를 만든다."""
+    return InputFingerprint(
+        schema_version=INPUT_FINGERPRINT_SCHEMA_VERSION,
+        dependencies=(),
+        input_artifacts=(),
+        parameters=(
+            Parameter("rebalance_policy_config", rebalance_policy_config),
+            Parameter("scoring_config_version", scoring_config_version),
+        ),
     )
 
 

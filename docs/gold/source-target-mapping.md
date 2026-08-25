@@ -140,7 +140,7 @@ dispatch_center + station topology + 진행 중 route
 
 ### `rebalance_route`
 
-Route publisher는 `station_urgency` publication manifest와 현재 Gold topology를 입력으로 사용한다. 센터별 pickup·dropoff station을 묶어 결정적 UUID와 stop 순서를 만들고 proposed route와 stop을 원자 게시한다.
+Route publisher는 `station_urgency` publication manifest와 현재 Gold topology를 입력으로 사용한다. 센터별 최고 supply urgency가 경로 순서를 소유하고 `center→pickup→supply` 총거리로 안전한 pickup을 고른다. 모든 pickup 뒤 최고 supply를 첫 dropoff로 두어 결정적 UUID와 stop 순서를 만들고 proposed route와 stop을 원자 게시한다.
 
 이미 dispatched·completed·cancelled인 route와 해당 stop은 새 제안 publication이 삭제하지 않는다.
 

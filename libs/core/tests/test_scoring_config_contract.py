@@ -12,9 +12,9 @@ from core.scoring_config import (
 )
 
 
-def test_urgency_scoring_v1_exact_values() -> None:
-    """v1 점수 의미를 바꾸는 모든 상수 값을 고정한다."""
-    assert URGENCY_SCORING_CONFIG_VERSION == "urgency-scoring-v1"
+def test_urgency_scoring_v4_any_depletion_exact_values() -> None:
+    """v4 any-depletion 의미를 바꾸는 모든 점수 상수 값을 고정한다."""
+    assert URGENCY_SCORING_CONFIG_VERSION == "urgency-scoring-v4-any-depletion"
     assert RESPONSE_LAG_MIN == 30
     assert HALF_LIFE_MIN == 60
     assert FIRST_FORECAST_MIN == 60

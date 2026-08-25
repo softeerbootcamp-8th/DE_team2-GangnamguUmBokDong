@@ -79,7 +79,7 @@ _SERVING_RELEASE_KEYS = frozenset(
     {"station", "station_demand_forecast", "station_stock"}
 )
 BIKE_STATION_REALTIME_SOURCE_ID = "bike_station_realtime"
-URGENCY_PUBLISHER_VERSION = "gold-urgency-publisher-v1"
+URGENCY_PUBLISHER_VERSION = "gold-urgency-publisher-v4-any-depletion"
 _URGENCY_SCHEMA = pa.schema(
     (
         pa.field("sta_id", pa.string(), nullable=False),
@@ -475,11 +475,13 @@ def compute_urgency_projection(
                         points,
                     )
                     if policy_config.quantity_strategy == "legacy"
-                    else _bike_qty_risk_band_v2(
+                    else _bike_qty_risk_band_v4(
                         current,
                         station.hold_cnt,
                         action_type,
                         points,
+                        history,
+                        inputs.base_dttm,
                         policy_config,
                     )
                 ),
@@ -1533,30 +1535,58 @@ def _bike_qty_v1(
     return 0
 
 
-def _bike_qty_risk_band_v2(
+def _bike_qty_risk_band_v4(
     current: int,
     hold_cnt: int,
     action_type: str,
     points: list[dict[str, Any]],
+    stock_history: list[dict[str, Any]],
+    now: datetime,
     policy_config: RebalancePolicyConfig,
 ) -> int:
-    """보호 horizon의 하방 신뢰 재고가 안전 구간을 지키는 이동량을 계산한다.
+    """현재 초과 재고만 any-depletion guard와 하방 범위 안에서 회수한다.
 
     대여와 반납 count를 독립 포아송 변수로 근사하면 누적 순수요의 분산은 두 count
-    합이다. 수거는 각 시점의 ``평균 재고 - z * sqrt(누적 count)``를 보수 재고로
-    두고 모든 시점이 최소 재고 이상인 범위만 허용한다. 배치는 불확실성 때문에
-    이동 예산을 과소비하지 않도록 평균 최저 재고를 최소 재고까지 올린다.
+    합이다. 최근 최소제곱 기울기나 보호 horizon의 모델 평균 경로 중 하나라도
+    감소하면 donor 사용을 fail-closed한다. 둘 다 비감소할 때만 모델 하방과 최근
+    기울기를 보호 horizon 및 예상 출동 지연까지 외삽한 하방 중 작은 값을 사용한다. 미래
+    반납으로 생길 초과량을 현재 회수 가능량으로 빌리지 않으며, 최근 관측이 현재
+    포함 세 점 미만이어도 fail-closed한다. 배치는 평균 최저 재고를 최소 재고까지
+    올린다.
     """
     horizon_points = points[: policy_config.protection_horizon_hours]
     minimum_stock = math.ceil(policy_config.minimum_stock_ratio * hold_cnt)
     if action_type == "retrieval_needed":
-        lower_path = _forecast_lower_stock_path(
+        recent_projection = _recent_stock_projection_v3(
+            current,
+            stock_history,
+            now,
+            protection_minutes=(
+                policy_config.protection_horizon_hours * 60 + RESPONSE_LAG_MIN
+            ),
+        )
+        if recent_projection is None:
+            return 0
+        recent_slope, recent_lower = recent_projection
+        model_mean_path = _forecast_lower_stock_path(
             current,
             horizon_points,
-            uncertainty_z=policy_config.uncertainty_z,
+            uncertainty_z=0.0,
         )
-        desired = max(0, math.floor(max(lower_path) - hold_cnt))
-        safe = max(0, math.floor(min(lower_path) - minimum_stock))
+        if (
+            recent_slope < 0.0
+            or min(model_mean_path[1:], default=float(current)) < current
+        ):
+            return 0
+        model_lower = min(
+            _forecast_lower_stock_path(
+                current,
+                horizon_points,
+                uncertainty_z=policy_config.uncertainty_z,
+            )
+        )
+        desired = max(0, current - hold_cnt)
+        safe = max(0, math.floor(min(model_lower, recent_lower) - minimum_stock))
         concentration_limit = math.floor(
             current * policy_config.max_pickup_stock_fraction
         )
@@ -1570,6 +1600,38 @@ def _bike_qty_risk_band_v2(
         needed = max(0, math.ceil(minimum_stock - min(lower_path)))
         return min(needed, max(0, hold_cnt - current))
     return 0
+
+
+def _recent_stock_projection_v3(
+    current: int,
+    stock_history: list[dict[str, Any]],
+    now: datetime,
+    *,
+    protection_minutes: int,
+) -> tuple[float, float] | None:
+    """최근 최소제곱 기울기와 보호 구간 하방 재고를 함께 반환한다."""
+    recent = sorted(
+        (
+            row
+            for row in stock_history
+            if row["observed_at"] <= now
+        ),
+        key=lambda row: row["observed_at"],
+    )
+    if (
+        type(protection_minutes) is not int
+        or protection_minutes <= 0
+        or len({row["observed_at"] for row in recent}) < 3
+        or not recent
+        or recent[-1]["observed_at"] != now
+        or recent[-1]["parking_bike_tot_cnt"] != current
+    ):
+        return None
+    xs = [(row["observed_at"] - now).total_seconds() / 60.0 for row in recent]
+    ys = [row["parking_bike_tot_cnt"] for row in recent]
+    slope = _regression_slope_v1(xs, ys)
+    lower = current + min(0.0, slope) * protection_minutes
+    return slope, lower
 
 
 def _forecast_lower_stock_path(
@@ -1598,7 +1660,7 @@ def _urgency_score_v1(
     points: list[dict[str, Any]],
     now: datetime,
 ) -> tuple[float, int, str]:
-    """현행 urgency-scoring-v1의 score·남은 분·판단 코드를 계산한다."""
+    """v4 any-depletion scoring이 보존하는 v1 score·남은 분·판단을 계산한다."""
     if current <= SUPPLY_LOW_STOCK_RATIO * hold_cnt:
         time_to_critical, action_type = 0.0, "supply_needed"
     elif current >= hold_cnt:
