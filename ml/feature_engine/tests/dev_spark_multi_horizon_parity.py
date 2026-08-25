@@ -34,12 +34,17 @@ _DAY_INDEX_EPOCH = pd.Timestamp("2000-01-01")
 
 
 def test_multi_horizon_output_paths_match_shared_contract():
-    """Spark writer와 training reader가 같은 anchor별 S3 키를 가리켜야 한다."""
-    assert fe_config.RENTAL_MULTI_HORIZON_FEATURES_TABLE_PARQUET == (
-        f"s3a://{fe_config.S3_BUCKET}/{core_paths.RENTAL_MULTI_HORIZON_FEATURES_TABLE_PARQUET}"
+    """Spark writer와 training reader가 같은 anchor별 S3 키를 가리켜야 한다.
+
+    스킴(s3a:// 로컬 MinIO vs s3:// 실제 AWS/EMR)은 `fe_config._s3a()`가 환경에
+    따라 고르므로(2026-08-25, EMR에서 s3a://가 403으로 실패해 조건부로 바꿨다),
+    여기서는 스킴을 하드코딩하지 않고 그 함수로 기대값을 만든다 — 검증 대상은
+    "키(경로)가 두 패키지에서 일치하는지"이지 스킴이 아니다."""
+    assert fe_config.RENTAL_MULTI_HORIZON_FEATURES_TABLE_PARQUET == fe_config._s3a(
+        core_paths.RENTAL_MULTI_HORIZON_FEATURES_TABLE_PARQUET
     )
-    assert fe_config.RETURN_MULTI_HORIZON_FEATURES_TABLE_PARQUET == (
-        f"s3a://{fe_config.S3_BUCKET}/{core_paths.RETURN_MULTI_HORIZON_FEATURES_TABLE_PARQUET}"
+    assert fe_config.RETURN_MULTI_HORIZON_FEATURES_TABLE_PARQUET == fe_config._s3a(
+        core_paths.RETURN_MULTI_HORIZON_FEATURES_TABLE_PARQUET
     )
 
 
