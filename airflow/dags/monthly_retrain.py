@@ -208,6 +208,22 @@ def _bash_step(name: str, command: str) -> tuple[str, list[str]]:
     return name, ["bash", "-c", f"{exports} && {command}"]
 
 
+def _wait_for_yarn_nodes_step(count: int) -> tuple[str, list[str]]:
+    """`count`개 이상 YARN 노드가 RUNNING으로 보일 때까지 대기하는 스텝을 만든다.
+
+    EMR 클러스터가 WAITING 상태가 됐다고 보고된 시점과 YARN
+    ResourceManager/NodeManager가 실제로 AM 등록을 받을 준비가 된 시점 사이에
+    간극이 있다 — 그 간극에서 바로 spark-submit을 돌리면 AM이 RM에 영원히
+    등록되지 못하고 "Futures timed out"/"ApplicationMaster ... timed out"으로
+    죽는다(실제 EMR 실행에서 재현 확인, 2026-08-25 — 서로 다른 두 클러스터에서
+    똑같은 방식으로, 리사이즈 뒤에는 이미 Wait-YARN-Nodes가 있어 안 겪던 문제).
+    클러스터 생성 직후에도 같은 대기를 걸어야 한다."""
+    return _bash_step(
+        "Wait-YARN-Nodes",
+        f"until [ $(yarn node -list -all 2>/dev/null | grep -c RUNNING) -ge {count} ]; do sleep 15; done",
+    )
+
+
 def _task_id(model_name: str, name: str) -> str:
     """모델별 태스크 체인의 task_id — 한 DAG 안에 대여/반납 두 체인이 공존하므로
     겹치지 않게 전부 모델 접미사를 붙인다."""
@@ -263,6 +279,12 @@ def make_task_refresh_feature_mart(model_name: str) -> Any:
         params = context.get("params", {})
         mock_override = _mock_override_from_params(params)
         cluster_id = ti.xcom_pull(task_ids=_task_id(model_name, "create_cluster"), key="cluster_id")
+
+        # 클러스터가 막 WAITING이 된 직후라 YARN이 실제로 AM 등록을 받을 준비가
+        # 안 됐을 수 있다 — _wait_for_yarn_nodes_step() docstring 참고. 여기서
+        # 기다려야 첫 Spark 스텝의 AM이 등록 타임아웃으로 죽지 않는다.
+        params_core_count = params.get("emr_core_instance_count") or FEATURE_MART_CORE_INSTANCE_COUNT
+        submit_emr_step(cluster_id, *_wait_for_yarn_nodes_step(params_core_count), mock_override=mock_override)
 
         profile = _champion_profile_name(model_name) or "builtin-default"
         logger.info(
@@ -377,12 +399,7 @@ def make_task_orchestrate_retrain_loop(model_name: str) -> Any:
                         target_core_count=TRAINING_CORE_INSTANCE_COUNT,
                         mock_override=mock_override,
                     )
-                    wait_name, wait_command = _bash_step(
-                        "Wait-YARN-Nodes",
-                        f"until [ $(yarn node -list -all 2>/dev/null | grep -c RUNNING) "
-                        f"-ge {TRAINING_CORE_INSTANCE_COUNT} ]; do sleep 15; done",
-                    )
-                    submit_emr_step(cluster_id, wait_name, wait_command, mock_override=mock_override)
+                    submit_emr_step(cluster_id, *_wait_for_yarn_nodes_step(TRAINING_CORE_INSTANCE_COUNT), mock_override=mock_override)
                     resized_to_training = True
 
                 logger.info("=== [%s 프로필: %s] YARN distributed-shell 학습 스텝 제출 ===", model_name, profile)

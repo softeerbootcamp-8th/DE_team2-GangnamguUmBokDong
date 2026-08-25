@@ -166,6 +166,37 @@ def test_refresh_feature_mart_submits_feature_mart_steps_for_champion_profile(mo
     assert pushed["profile"] == "leaves127"
 
 
+def test_refresh_feature_mart_waits_for_yarn_nodes_before_spark_steps(monkeypatch) -> None:
+    """클러스터가 막 WAITING이 된 직후 YARN이 AM 등록을 받을 준비가 안 됐을 수
+    있어(실제 EMR 실행에서 재현, 2026-08-25 — 서로 다른 두 클러스터에서 첫
+    스텝의 AM이 등록 타임아웃으로 죽었다), 첫 Spark 스텝 전에 반드시
+    Wait-YARN-Nodes로 대기해야 한다."""
+    mock_ti = MagicMock()
+    mock_ti.xcom_pull.return_value = "j-created"
+    monkeypatch.setattr(monthly_dag, "_champion_profile_name", lambda model_name: "leaves127")
+
+    submitted_names = []
+    monkeypatch.setattr(
+        monthly_dag,
+        "submit_emr_step",
+        lambda cluster_id, name, command, **kwargs: submitted_names.append(name),
+    )
+
+    task_fn = monthly_dag.make_task_refresh_feature_mart("rental")
+    task_fn(ti=mock_ti, params={})
+
+    assert submitted_names[0] == "Wait-YARN-Nodes"
+    assert submitted_names.index("Wait-YARN-Nodes") < submitted_names.index("Spark-RunPipeline-leaves127")
+
+
+def test_wait_for_yarn_nodes_step_checks_running_count() -> None:
+    name, command = monthly_dag._wait_for_yarn_nodes_step(3)
+    assert name == "Wait-YARN-Nodes"
+    assert command[:2] == ["bash", "-c"]
+    assert "yarn node -list -all" in command[2]
+    assert "-ge 3" in command[2]
+
+
 def test_refresh_feature_mart_falls_back_to_builtin_default_when_no_champion(monkeypatch) -> None:
     mock_ti = MagicMock()
     mock_ti.xcom_pull.return_value = "j-created"
