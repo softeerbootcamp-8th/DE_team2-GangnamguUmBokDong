@@ -49,6 +49,7 @@ from config.schedules import (
 )
 from orchestration.aws_infra_task import (
     EMR_CORE_INSTANCE_TYPE,
+    EMR_MLFLOW_TRACKING_URI,
     MOCK_OVERRIDE_FORCE_MOCK,
     MOCK_OVERRIDE_FORCE_REAL,
     MODELS_PREFIX,
@@ -97,18 +98,34 @@ def _result_s3_key(run_id: str, name: str) -> str:
     return f"{TRAINING_RUNS_PREFIX}/{run_id}/{name}.json"
 
 
+def _spark_module_launcher_command(module: str, extra_args: list[str]) -> list[str]:
+    """`module`(예: "feature_engine.spark.run_pipeline")을 spark-submit으로 돌리는
+    bash 스텝 인자를 만든다.
+
+    `run_pipeline.py`/`build_multi_horizon_features.py`는 패키지 내부 상대
+    import(`from . import config`)를 쓴다 — spark-submit에 그 파일 경로를
+    그대로 넘기면 Python이 `__main__`으로 실행해 패키지 컨텍스트를 잃고
+    "ImportError: attempted relative import with no known parent package"로
+    즉시 죽는다(실제 EMR 실행에서 확인, 2026-08-25). `python -m package.module`
+    방식만 정상 동작하는데 spark-submit은 파일 경로만 받으므로, `runpy.run_module()`로
+    감싼 launcher 스크립트를 실행 시점에 만들어 그걸 대신 제출한다."""
+    launcher = (
+        f"cat > /tmp/_spark_entry_{module.rsplit('.', 1)[-1]}.py <<'PYEOF'\n"
+        "import runpy\n"
+        f'runpy.run_module("{module}", run_name="__main__")\n'
+        "PYEOF\n"
+    )
+    entry_path = f"/tmp/_spark_entry_{module.rsplit('.', 1)[-1]}.py"
+    spark_submit = " ".join(
+        ["spark-submit", "--deploy-mode", "cluster", "--master", "yarn", *extra_args, entry_path]
+    )
+    return ["bash", "-c", launcher + spark_submit]
+
+
 def _feature_mart_spark_steps(profile: str) -> tuple[tuple[str, list[str]], tuple[str, list[str]]]:
     """`profile`로 feature mart(2차 정제)를 (재)생성하는 두 Spark 스텝(name, args)을
     반환한다 — run_pipeline.py는 watermark 기반 증분이라 매번 불러도 안전하다
-    (평가 전 최신화용 `refresh_feature_mart`와 재학습 루프 양쪽에서 재사용).
-
-    스크립트는 `EMR_S3_SCRIPTS_PREFIX`(S3, 기본값이 존재하지 않는 "local-dev"
-    버킷을 가리켜 실제 EMR 실행에서 AccessDenied로 실패했다 — 2026-08-25) 대신
-    bootstrap이 모든 노드에 이미 풀어놓은 로컬 경로(`_EMR_PYTHONPATH`)에서 바로
-    읽는다 — `Makefile`의 `emr-features` 타겟도 같은 이유로 로컬 경로
-    (`/opt/gng/feature_engine/spark/...`)를 쓴다. spark-submit --deploy-mode
-    cluster는 드라이버 컨테이너도 클러스터 노드 위에서 뜨므로 로컬 경로가 항상
-    유효하다."""
+    (평가 전 최신화용 `refresh_feature_mart`와 재학습 루프 양쪽에서 재사용)."""
     common_confs = [
         "--conf",
         f"spark.yarn.appMasterEnv.ML_PROFILE={profile}",
@@ -131,18 +148,35 @@ def _feature_mart_spark_steps(profile: str) -> tuple[tuple[str, list[str]], tupl
         "spark.pyspark.python=/usr/bin/python3.11",
         "--conf",
         "spark.pyspark.driver.python=/usr/bin/python3.11",
+        # m4.large 노드당 YARN이 실제로 내주는 건 ~6GB뿐이다(EMR 자체 로그의
+        # "6144 MB per container" 상한, 물리 8GB에서 OS/데몬 몫을 뺀 값). 기본
+        # 드라이버/AM 힙(2g)로는 워터마크 없는 최초 실행(수개월치 전체 재생성)이
+        # py4j 연결 끊김(OOM성 컨테이너 킬)으로 죽었다 — 4g로 넉넉히 올리고,
+        # num-executors를 노드 수(3)보다 적게(2) 잡아 AM/executor가 노드마다
+        # 하나씩만 배치되게 한다(실제 EMR 실행으로 검증, 2026-08-25).
+        "--driver-memory",
+        "4g",
+        "--executor-memory",
+        "4g",
+        "--num-executors",
+        "2",
+        # SparkContext 초기화 대기 기본값(100s, ApplicationMaster.scala의
+        # AM_MAX_WAIT_TIME)이 이 작은 클러스터에서 컨테이너 배치가 늦어질 때
+        # 너무 타이트해서 "Futures timed out after [100000 milliseconds]"로
+        # 죽었다 — 30분으로 넉넉히 늘린다.
+        "--conf",
+        "spark.yarn.am.waitTime=1800s",
+        "--conf",
+        "spark.sql.shuffle.partitions=24",
     ]
-    scripts_dir = f"{_EMR_PYTHONPATH}/feature_engine/spark"
     return (
         (
             f"Spark-RunPipeline-{profile}",
-            ["spark-submit", "--deploy-mode", "cluster", "--master", "yarn", *common_confs,
-             f"{scripts_dir}/run_pipeline.py"],
+            _spark_module_launcher_command("feature_engine.spark.run_pipeline", common_confs),
         ),
         (
             f"Spark-BuildMultiHorizon-{profile}",
-            ["spark-submit", "--deploy-mode", "cluster", "--master", "yarn", *common_confs,
-             f"{scripts_dir}/build_multi_horizon_features.py"],
+            _spark_module_launcher_command("feature_engine.spark.build_multi_horizon_features", common_confs),
         ),
     )
 
@@ -165,7 +199,13 @@ def _bash_step(name: str, command: str) -> tuple[str, list[str]]:
     # command-runner.jar이 물려주는 환경(EMR controller.gz 실측 확인, 2026-08-25)에는
     # S3_BUCKET이 없어 core.s3/ml_core가 잘못된 기본 버킷("gangnamgu")으로 떨어진다
     # — Airflow 쪽 aws_infra_task.S3_BUCKET과 반드시 같은 값을 명시적으로 넘긴다.
-    return name, ["bash", "-c", f"export S3_BUCKET={S3_BUCKET} && {command}"]
+    exports = f"export S3_BUCKET={S3_BUCKET}"
+    if EMR_MLFLOW_TRACKING_URI:
+        # 기본값("http://mlflow:5000/mlflow")은 docker 네트워크 이름이라 EMR
+        # 노드에서 안 풀린다 — 학습 스텝(train_common.py의 mlflow.start_run())이
+        # 여기 못 붙으면 예외 없이 바로 실패한다(PR 리뷰 지적, 2026-08).
+        exports += f" && export MLFLOW_TRACKING_URI={EMR_MLFLOW_TRACKING_URI}"
+    return name, ["bash", "-c", f"{exports} && {command}"]
 
 
 def _task_id(model_name: str, name: str) -> str:

@@ -38,6 +38,11 @@ EMR_SUBNET_ID = os.environ.get("AWS_EMR_SUBNET_ID", "")
 # emr_core)를 명시적으로 넘겨서 이 문제 자체를 피한다(2026-08-25, 실측 확인).
 EMR_MASTER_SG_ID = os.environ.get("AWS_EMR_MASTER_SG_ID", "")
 EMR_CORE_SG_ID = os.environ.get("AWS_EMR_CORE_SG_ID", "")
+# EMR 노드에서는 docker 네트워크 이름("mlflow")이 안 풀려서 MLFLOW_TRACKING_URI
+# 기본값("http://mlflow:5000/mlflow")을 그대로 쓰면 학습 스텝이 MLflow에 못 붙는다
+# (PR 리뷰 지적, 2026-08) — terraform이 상시 EC2 사설 IP로 채운 이 값을 학습 스텝
+# 커맨드에 명시적으로 주입한다. 비어 있으면(로컬/미배포) 주입을 건너뛴다.
+EMR_MLFLOW_TRACKING_URI = os.environ.get("AWS_EMR_MLFLOW_TRACKING_URI", "")
 # 기본값은 AWS CLI가 관례적으로 쓰는 이름(EMR_DefaultRole 등)이 아니라 이
 # 프로젝트의 terraform(`terraform/emr.tf`)이 실제로 만드는 역할 이름
 # (`${var.project}-emr-service`/`${var.project}-emr-ec2`, `variables.tf`의

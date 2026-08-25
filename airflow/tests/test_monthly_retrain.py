@@ -291,3 +291,46 @@ def test_terminate_cluster_task_no_ops_when_cluster_id_missing(monkeypatch) -> N
     task_fn(ti=mock_ti, params={})
 
     assert terminated == []
+
+
+def test_feature_mart_spark_steps_use_runpy_launcher_not_raw_script_path() -> None:
+    """run_pipeline.py/build_multi_horizon_features.py는 패키지 내부 상대 import를
+    쓴다 — spark-submit에 파일 경로를 그대로 넘기면 `__main__`으로 실행돼
+    "attempted relative import with no known parent package"로 즉시 죽는다(PR
+    리뷰 지적, 2026-08 — 최초 구현은 디버그 클러스터에서만 이 fix를 검증하고 실제
+    코드에는 반영하지 않는 실수를 했다). `python -m`과 동등한 `runpy.run_module()`
+    launcher를 통해서만 제출해야 한다."""
+    run_pipeline_step, multi_horizon_step = monthly_dag._feature_mart_spark_steps("some-profile")
+
+    for _name, command in (run_pipeline_step, multi_horizon_step):
+        assert command[:2] == ["bash", "-c"]
+        script = command[2]
+        # spark-submit의 마지막 인자(primary python file)는 launcher(/tmp/_spark_entry*.py)여야
+        # 한다 — feature_engine 안의 실제 스크립트 경로를 직접 넘기면 안 된다.
+        primary_file = script.strip().splitlines()[-1].split()[-1]
+        assert primary_file.startswith("/tmp/_spark_entry")
+        assert "feature_engine/spark/run_pipeline.py" not in script
+        assert "feature_engine/spark/build_multi_horizon_features.py" not in script
+
+    assert 'runpy.run_module("feature_engine.spark.run_pipeline"' in run_pipeline_step[1][2]
+    assert 'runpy.run_module("feature_engine.spark.build_multi_horizon_features"' in multi_horizon_step[1][2]
+
+
+def test_bash_step_exports_s3_bucket_always() -> None:
+    _name, command = monthly_dag._bash_step("Test", "echo hi")
+    assert "export S3_BUCKET=" in command[2]
+
+
+def test_bash_step_exports_mlflow_uri_when_configured(monkeypatch) -> None:
+    """학습 스텝(train_common.py의 mlflow.start_run())이 EMR에서 docker 네트워크
+    이름("mlflow")을 못 풀어 죽는 걸 막기 위해, terraform이 채운 상시 EC2 사설 IP
+    기반 URI를 명시적으로 주입해야 한다(PR 리뷰 지적, 2026-08)."""
+    monkeypatch.setattr(monthly_dag, "EMR_MLFLOW_TRACKING_URI", "http://10.0.0.5:5000/mlflow")
+    _name, command = monthly_dag._bash_step("Test", "echo hi")
+    assert "export MLFLOW_TRACKING_URI=http://10.0.0.5:5000/mlflow" in command[2]
+
+
+def test_bash_step_skips_mlflow_uri_when_not_configured(monkeypatch) -> None:
+    monkeypatch.setattr(monthly_dag, "EMR_MLFLOW_TRACKING_URI", "")
+    _name, command = monthly_dag._bash_step("Test", "echo hi")
+    assert "MLFLOW_TRACKING_URI" not in command[2]
