@@ -9,6 +9,8 @@ import boto3
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+from botocore.exceptions import EndpointConnectionError
+
 from core.gold_publication.canonical import sha256_hex
 from core.source_snapshot import (
     SourceSnapshotCounts,
@@ -19,6 +21,7 @@ from core.source_snapshot_io import (
     SourceSnapshotNotFoundError,
     SourceSnapshotReadError,
     read_exact_source_snapshot,
+    read_exact_source_snapshot_manifest,
     read_latest_source_snapshot,
     read_partial_source_snapshot,
 )
@@ -33,7 +36,8 @@ def _put_snapshot(
     *,
     revision: int = 0,
     source_id: str = "population_realtime",
-) -> None:
+    manifest_rows: int | None = None,
+) -> tuple[str, str, str]:
     """테스트용 content-addressed Parquet과 authority manifest를 쓴다."""
     buffer = io.BytesIO()
     pq.write_table(pa.Table.from_pylist(rows), buffer)
@@ -43,6 +47,7 @@ def _put_snapshot(
         f"silver/{source_id}/dt={logical:%Y-%m-%d}/hh={logical:%H}/"
         f"{logical:%H%M}/sha256={checksum}.parquet"
     )
+    reported_rows = len(rows) if manifest_rows is None else manifest_rows
     manifest = build_source_snapshot_manifest(
         source_id=source_id,
         logical_dttm=logical,
@@ -51,7 +56,13 @@ def _put_snapshot(
         config_version="fixture-v1",
         silver_uri=f"s3://{TEST_BUCKET}/{silver_key}",
         silver_byte_sha256=checksum,
-        counts=SourceSnapshotCounts(len(rows), len(rows), len(rows), 0, 0),
+        counts=SourceSnapshotCounts(
+            reported_rows,
+            reported_rows,
+            reported_rows,
+            0,
+            0,
+        ),
         planned_parts=("page=1",),
         completed_parts=("page=1",),
     )
@@ -66,6 +77,7 @@ def _put_snapshot(
     client.put_object(
         Bucket=TEST_BUCKET, Key=manifest_key, Body=manifest.canonical_bytes
     )
+    return f"s3://{TEST_BUCKET}/{manifest_key}", manifest.sha256, silver_key
 
 
 def test_exact_window_selects_latest_contiguous_correction() -> None:
@@ -78,6 +90,120 @@ def test_exact_window_selects_latest_contiguous_correction() -> None:
     assert result.manifest.revision_no == 1
     assert result.table is not None
     assert result.table.column("value").to_pylist() == [2]
+
+
+def test_exact_manifest_ref_stays_on_old_revision_after_correction() -> None:
+    """고정된 URI+SHA는 같은 logical window의 후속 correction을 따라가지 않는다."""
+    logical = datetime(2026, 8, 20, 13, 50, tzinfo=KST)
+    manifest_uri, manifest_sha256, _silver_key = _put_snapshot(
+        logical,
+        [{"value": 1}],
+        revision=0,
+    )
+    _put_snapshot(logical, [{"value": 2}], revision=1)
+
+    pinned = read_exact_source_snapshot_manifest(
+        manifest_uri,
+        manifest_sha256,
+    )
+
+    assert pinned.manifest.revision_no == 0
+    assert pinned.table is not None
+    assert pinned.table.column("value").to_pylist() == [1]
+    assert read_exact_source_snapshot(
+        "population_realtime", logical
+    ).manifest.revision_no == 1
+
+
+def test_exact_manifest_ref_rejects_wrong_manifest_sha256() -> None:
+    logical = datetime(2026, 8, 20, 13, 50, tzinfo=KST)
+    manifest_uri, _manifest_sha256, _silver_key = _put_snapshot(
+        logical,
+        [{"value": 1}],
+    )
+
+    with pytest.raises(SourceSnapshotReadError, match="manifest"):
+        read_exact_source_snapshot_manifest(manifest_uri, "0" * 64)
+
+
+def test_exact_manifest_ref_requires_canonical_authority_uri() -> None:
+    logical = datetime(2026, 8, 20, 13, 50, tzinfo=KST)
+    manifest_uri, manifest_sha256, _silver_key = _put_snapshot(
+        logical,
+        [{"value": 1}],
+    )
+    noncanonical_uri = manifest_uri.replace("revision=0000000000", "revision=0")
+
+    with pytest.raises(ValueError, match="canonical"):
+        read_exact_source_snapshot_manifest(noncanonical_uri, manifest_sha256)
+
+
+def test_exact_manifest_ref_rejects_key_body_source_mismatch() -> None:
+    logical = datetime(2026, 8, 20, 13, 50, tzinfo=KST)
+    manifest_uri, manifest_sha256, _silver_key = _put_snapshot(
+        logical,
+        [{"value": 1}],
+    )
+    source_key = manifest_uri.removeprefix(f"s3://{TEST_BUCKET}/")
+    target_key = source_key.replace(
+        "/population_realtime/",
+        "/poi_master/",
+    )
+    client = boto3.client("s3", region_name="us-east-1")
+    body = client.get_object(Bucket=TEST_BUCKET, Key=source_key)["Body"].read()
+    client.put_object(Bucket=TEST_BUCKET, Key=target_key, Body=body)
+
+    with pytest.raises(SourceSnapshotReadError, match="identity"):
+        read_exact_source_snapshot_manifest(
+            f"s3://{TEST_BUCKET}/{target_key}",
+            manifest_sha256,
+        )
+
+
+def test_exact_manifest_ref_validates_linked_silver_checksum_and_row_count() -> None:
+    logical = datetime(2026, 8, 20, 13, 50, tzinfo=KST)
+    checksum_uri, checksum_manifest_sha256, silver_key = _put_snapshot(
+        logical,
+        [{"value": 1}],
+    )
+    client = boto3.client("s3", region_name="us-east-1")
+    client.put_object(Bucket=TEST_BUCKET, Key=silver_key, Body=b"mutated")
+
+    with pytest.raises(SourceSnapshotReadError, match="checksum"):
+        read_exact_source_snapshot_manifest(
+            checksum_uri,
+            checksum_manifest_sha256,
+        )
+
+    row_logical = logical + timedelta(minutes=1)
+    row_uri, row_manifest_sha256, _row_silver_key = _put_snapshot(
+        row_logical,
+        [{"value": 1}],
+        manifest_rows=2,
+    )
+    with pytest.raises(SourceSnapshotReadError, match="행 수"):
+        read_exact_source_snapshot_manifest(row_uri, row_manifest_sha256)
+
+
+def test_exact_manifest_ref_wraps_linked_silver_access_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """연결된 Silver GET의 botocore 오류를 source read 도메인 예외로 변환한다."""
+    logical = datetime(2026, 8, 20, 13, 50, tzinfo=KST)
+    manifest_uri, manifest_sha256, _silver_key = _put_snapshot(
+        logical,
+        [{"value": 1}],
+    )
+
+    def fail_get(_key: str) -> bytes | None:
+        """Silver artifact transport 실패를 발생시킨다."""
+        raise EndpointConnectionError(endpoint_url="https://s3.invalid")
+
+    monkeypatch.setattr("core.source_snapshot_io.get_object_bytes", fail_get)
+
+    with pytest.raises(SourceSnapshotReadError, match="Silver") as caught:
+        read_exact_source_snapshot_manifest(manifest_uri, manifest_sha256)
+    assert isinstance(caught.value.__cause__, EndpointConnectionError)
 
 
 def test_exact_window_fails_when_content_bytes_change() -> None:

@@ -19,13 +19,14 @@ UV_PROJECT_ENVIRONMENT="$AIRFLOW_UV_ENVIRONMENT" uv sync --frozen
 case "${1:-api-server}" in
     init)
         UV_PROJECT_ENVIRONMENT="$AIRFLOW_UV_ENVIRONMENT" uv run airflow db migrate
-        # 6개 모듈은 Airflow와 별개의 uv 프로젝트다 — BashOperator가 처음 스케줄될 때
+        # 7개 모듈은 Airflow와 별개의 uv 프로젝트다 — BashOperator가 처음 스케줄될 때
         # 콜드 네트워크 sync로 타임아웃을 먹지 않도록 컨테이너 기동 시 한 번 예열한다.
         # 호스트 .venv를 bind mount 안에서 다시 쓰면 macOS/Linux 환경이 서로 깨지므로,
         # Compose named volume 아래의 프로젝트별 경로만 사용한다.
-        for proj in collector normalizer nowcaster ml/inference loader rebalance; do
+        for proj in collector poi_master normalizer nowcaster ml/inference loader rebalance; do
             echo "[airflow-init] prewarming $proj"
             env_name="${proj//\//-}"
+            env_name="${env_name//_/-}"
             (
                 cd "/workspace/$proj"
                 UV_PROJECT_ENVIRONMENT="/opt/venvs/modules/$env_name" uv sync --frozen

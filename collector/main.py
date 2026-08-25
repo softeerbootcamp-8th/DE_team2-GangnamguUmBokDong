@@ -34,19 +34,29 @@ non-zero로 Airflow retry 대상이다.
 from __future__ import annotations
 
 import argparse
+import hashlib
+import re
 import sys
 from datetime import datetime
 
+import httpx
+
+# pyrefly: ignore [missing-import]
+import pyarrow as pa
+from core.poi_master import PoiMasterRef, read_poi_master
+
 import adapters  # noqa: F401 (어댑터 레지스트리 로드용)
 import config.loader as config_loader
-import httpx
 import manifest as manifest_module
 import pipeline
 import storage
+from config.schema import SourceConfig
 from logging_setup import configure_logging
 from manifest import RunStatus
 
 _OK_STATUSES = frozenset({RunStatus.SUCCEEDED, RunStatus.PARTIAL, RunStatus.EMPTY, RunStatus.SKIPPED})
+_POPULATION_SOURCE_ID = "population_realtime"
+_POI_CODE_PATTERN = re.compile(r"POI[0-9]{3}\Z")
 
 # httpx 기본값은 모든 단계에 5초다. 서울 열린데이터광장의 1000행 페이지 응답 시간을
 # 실측하면 시점에 따라 0.6~7.2초로 흔들려서, 기본값이면 느린 시점에 페이지마다
@@ -71,12 +81,13 @@ def _latest_source_uses_config(
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """CLI 인자를 파싱한다.
+
     `--force`와 `--backfill`은 목적이 반대라 함께 주면 `argparse`가 사용법 메시지를 찍고 `SystemExit`을 일으키게 막는다.
 
     args:
         argv: 파싱할 인자 목록. 생략하면 `sys.argv`를 그대로 쓴다.
     returns:
-        `source` · `window_start` · `force` · `backfill` · `list_backfill_targets` 필드를 담은 네임스페이스.
+        실행 window와 선택한 POI Master ref 필드를 담은 네임스페이스.
     raises:
         SystemExit: 필수 인자가 없거나 `--force`와 `--backfill`을 함께 줬을 때.
     """
@@ -87,12 +98,34 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--backfill", action="store_true", help="완결된 window의 누락 조각만 채운다")
     parser.add_argument("--list-backfill-targets", action="store_true", help="백필 대상을 JSON으로 출력하고 종료")
     parser.add_argument(
+        "--poi-master-mode",
+        choices=("static", "s3"),
+        default="static",
+        help="population_realtime 호출 대상을 기존 YAML(static) 또는 exact S3 POI Master에서 읽는다",
+    )
+    parser.add_argument(
+        "--poi-master-manifest-uri",
+        help="s3 모드에서 사용할 immutable POI Master manifest의 exact URI",
+    )
+    parser.add_argument(
+        "--poi-master-manifest-sha256",
+        help="s3 모드에서 사용할 POI Master manifest bytes의 SHA-256",
+    )
+    parser.add_argument(
         "--check-due-after-seconds",
         type=int,
         default=None,
         help="마지막 성공 수집 이후 이 초만큼 안 지났으면 수집을 건너뛰어도 되는지 JSON으로 출력하고 종료",
     )
     args = parser.parse_args(argv)
+
+    # Airflow는 static/S3를 같은 command shape으로 호출하고 static ref 필드는 빈
+    # 환경변수로 넘긴다. 빈 문자열을 "ref가 지정됨"으로 오인하지 않도록 여기서
+    # 생략값과 같은 None으로 정규화한다.
+    for field in ("poi_master_manifest_uri", "poi_master_manifest_sha256"):
+        value = getattr(args, field)
+        if value is not None and not value.strip():
+            setattr(args, field, None)
 
     if (
         not args.list_backfill_targets
@@ -107,7 +140,89 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if args.force and args.backfill:
         parser.error("--force와 --backfill은 함께 줄 수 없다")
 
+    has_manifest_ref = (
+        args.poi_master_manifest_uri is not None
+        or args.poi_master_manifest_sha256 is not None
+    )
+    if args.source != _POPULATION_SOURCE_ID and (
+        args.poi_master_mode != "static" or has_manifest_ref
+    ):
+        parser.error("POI Master 인자는 population_realtime 소스에만 사용할 수 있다")
+    if args.poi_master_mode == "static" and has_manifest_ref:
+        parser.error("static 모드에는 POI Master manifest ref를 지정할 수 없다")
+    if args.poi_master_mode == "s3" and (
+        args.poi_master_manifest_uri is None
+        or args.poi_master_manifest_sha256 is None
+    ):
+        parser.error("s3 모드에는 POI Master manifest URI와 SHA-256이 모두 필요하다")
+
     return args
+
+
+def _validated_master_poi_codes(table: pa.Table) -> tuple[str, ...]:
+    """POI Master의 AREA_CD를 검증하고 코드 오름차순의 불변 튜플로 반환한다.
+
+    args:
+        table: exact POI Master manifest가 가리키는 Parquet 테이블
+    returns:
+        중복 없이 정렬된 POI 코드 튜플
+    raises:
+        ValueError: 테이블 타입·컬럼·코드 형식·중복 또는 빈 목록이 잘못됐을 때
+    """
+    if type(table) is not pa.Table:
+        raise ValueError("POI Master reader는 pyarrow.Table을 반환해야 합니다")
+    if table.column_names != ["AREA_CD"]:
+        raise ValueError(
+            "POI Master 코드 조회 결과는 AREA_CD 컬럼 하나여야 합니다: "
+            f"columns={table.column_names}"
+        )
+
+    raw_codes = table.column("AREA_CD").to_pylist()
+    if not raw_codes:
+        raise ValueError("POI Master의 AREA_CD 목록이 비어 있습니다")
+    if any(
+        type(code) is not str or _POI_CODE_PATTERN.fullmatch(code) is None
+        for code in raw_codes
+    ):
+        raise ValueError("POI Master AREA_CD는 POI와 ASCII 숫자 3자리 형식이어야 합니다")
+    if len(set(raw_codes)) != len(raw_codes):
+        raise ValueError("POI Master AREA_CD에 중복 코드가 있습니다")
+    return tuple(sorted(raw_codes))
+
+
+def _config_with_poi_master(
+    config: SourceConfig,
+    ref: PoiMasterRef,
+) -> SourceConfig:
+    """Exact S3 POI Master를 한 번 읽어 Collector 실행 설정에 고정한다.
+
+    Master manifest SHA를 YAML 설정 hash와 함께 다시 hash하여 source snapshot의
+    ``config_version``에도 호출 목록의 외부 의존성이 반영되게 한다.
+
+    args:
+        config: YAML에서 읽은 frozen SourceConfig
+        ref: Airflow가 이번 tick에 고정한 exact S3 POI Master 참조
+    returns:
+        정렬된 ``poi_codes``와 합성 config version이 주입된 새 SourceConfig
+    """
+    table = read_poi_master(ref, columns=["AREA_CD"])
+    poi_codes = _validated_master_poi_codes(table)
+    manifest_sha256 = ref.manifest_sha256
+    if manifest_sha256 is None:
+        raise ValueError("s3 POI Master ref에는 manifest SHA-256이 필요합니다")
+
+    version_material = (
+        f"collector_config={config.config_version}\n"
+        f"poi_master_manifest_sha256={manifest_sha256}\n"
+    ).encode("ascii")
+    config_version = f"sha256:{hashlib.sha256(version_material).hexdigest()}"
+    adapter_params = {**config.adapter_params, "poi_codes": poi_codes}
+    return config.model_copy(
+        update={
+            "adapter_params": adapter_params,
+            "config_version": config_version,
+        }
+    )
 
 
 def exit_code_for(status: RunStatus) -> int:
@@ -174,6 +289,13 @@ def main(argv: list[str] | None = None) -> int:
 
     configure_logging(args.source, window_start, attempt=1)
     config = config_loader.load(args.source)
+    if args.poi_master_mode == "s3":
+        ref = PoiMasterRef(
+            mode="s3",
+            manifest_uri=args.poi_master_manifest_uri,
+            manifest_sha256=args.poi_master_manifest_sha256,
+        )
+        config = _config_with_poi_master(config, ref)
 
     # httpx.Client를 여기서 만들어 실행 하나에 재사용한다
     # 어댑터는 연결을 모르고 `client` 인자로 주입받기만 한다

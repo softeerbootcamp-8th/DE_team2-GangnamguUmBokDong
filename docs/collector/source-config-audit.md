@@ -14,7 +14,7 @@ YAML의 `schedule.interval`은 source 자체의 기대 주기를 설명하는 me
 | --- | --- | --- | --- |
 | `bike_rental_history` | 서울 `tbCycleRentData` | 5분 | 해당 시간대 누적 대여·반납 이력, 1시간 replay와 D-6 보강 |
 | `bike_station_realtime` | 서울 `bikeList` | 5분 | 빈 페이지까지 탐색, `stationId` 자연키 중복 검증 |
-| `population_realtime` | 서울 `citydata_ppltn` | 5분 | POI001~121 병렬 조회, 중첩 예측 12개를 scalar column으로 flatten |
+| `population_realtime` | 서울 `citydata_ppltn` | 5분 | 중앙 POI Master의 `AREA_CD`를 병렬 조회, 중첩 예측 12개를 scalar column으로 flatten |
 | `weather_ultra_short_live` | 기상청 `getUltraSrtNcst` | 10분 경계 | 34개 격자 병렬 조회, category pivot |
 | `weather_ultra_short_forecast` | 기상청 `getUltraSrtFcst` | 10분 경계 | 34개 격자 병렬 조회, category pivot, 강수 범주 변환 |
 | `weather_short_term_forecast` | 기상청 `getVilageFcst` | 3시간 경계 | 격자별 다중 page 수집, category pivot, 강수 범주 변환 |
@@ -110,7 +110,7 @@ API key가 URL path에 들어가므로 예외와 로그에서는 `***`로 가린
 
 - `bikeList`의 `list_total_count`는 전체 건수가 아니므로 `probe_until_empty`로 빈 page까지 조회한다. 최대 10 page를 넘기면 조용히 truncate하지 않고 실패한다.
 - `tbCycleRentData`는 날짜와 시간을 path에 함께 줘야 한다. 5분 tick이 속한 시간의 누적 결과를 받아 Archive compaction에서 중복을 제거한다.
-- `citydata_ppltn`은 단일 paged table이 아니라 POI별 endpoint다. POI001~121을 조회하고 `FCST_PPLTN`을 예측시각 순서로 최대 12개 slot에 펼친다.
+- `citydata_ppltn`은 단일 paged table이 아니라 POI별 endpoint다. 정상 경로는 Airflow가 고정한 exact POI Master manifest URI·SHA에서 `AREA_CD` 목록을 읽는다. activation이 아직 없는 `static` fallback에서만 source YAML의 `poi_start`, `poi_end`, `poi_exclude`로 기존 범위와 제외 목록을 만든다. `FCST_PPLTN`은 예측시각 순서로 최대 12개 slot에 펼친다.
 - 병렬 조회는 source YAML에 `concurrency`가 선언된 source만 사용한다.
 
 ## 기상청 Adapter

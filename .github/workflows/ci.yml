@@ -96,7 +96,7 @@ jobs:
       - name: Sync Graviton runtime dependencies
         run: |
           for project in \
-            airflow collector apps/api ml/inference ml/training ml/feature_engine \
+            airflow collector poi_master apps/api ml/inference ml/training ml/feature_engine \
             libs/core libs/ml_core normalizer nowcaster loader rebalance; do
             echo "==> ${project}"
             (cd "${project}" && uv sync --frozen)
@@ -106,6 +106,7 @@ jobs:
         run: |
           (cd airflow && uv run pytest -q)
           (cd collector && uv run pytest -q)
+          (cd poi_master && uv run pytest -q)
           (cd ml/inference && uv run pytest -q)
           (cd ml/training && uv run pytest -q)
           (cd libs/ml_core && uv run pytest -q)

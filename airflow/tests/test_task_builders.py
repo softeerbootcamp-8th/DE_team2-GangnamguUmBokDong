@@ -8,6 +8,7 @@ import jinja2
 import pytest
 from airflow.sdk.execution_time import macros
 from airflow.task.trigger_rule import TriggerRule
+
 from callbacks.task_callbacks import on_failure_callback, on_success_callback
 from orchestration import collector_task
 from orchestration.collector_task import (
@@ -15,6 +16,7 @@ from orchestration.collector_task import (
     build_collector_replay_task,
     build_collector_task,
     build_daily_history_replay_task,
+    build_population_collector_task,
     build_weather_freshness_gate_task,
 )
 from orchestration.gold_publisher_task import (
@@ -28,6 +30,11 @@ from orchestration.normalizer_task import (
     build_station_master_enrichment_task,
 )
 from orchestration.nowcasting_task import NOWCASTING_DIR, build_nowcasting_task
+from orchestration.poi_master_task import (
+    POI_MASTER_DIR,
+    build_poi_master_refresh_task,
+    build_poi_master_resolve_task,
+)
 from orchestration.routes_task import build_routes_task
 from orchestration.serving_task import (
     LOADER_DIR,
@@ -47,6 +54,7 @@ from orchestration.urgency_task import build_urgency_task
 def test_repo_root_resolves_to_repository_root() -> None:
     """Task cwd 기준 저장소 루트를 실제 module directory와 결합한다."""
     assert (REPO_ROOT / "collector").is_dir()
+    assert (REPO_ROOT / "poi_master").is_dir()
     assert (REPO_ROOT / "loader").is_dir()
     assert (REPO_ROOT / "ml" / "inference").is_dir()
 
@@ -200,12 +208,59 @@ def test_module_task_rejects_resource_probe_delimiter(dag) -> None:
 
 def test_normalizer_task_contract(dag) -> None:
     """Population normalizer는 기존 frozen project와 all-success 계약을 유지한다."""
-    task = build_normalizer_task(dag)
+    task = build_normalizer_task(dag, poi_master_task_id="resolve_x")
     assert task.task_id == "run_normalizer"
     assert task.cwd == NORMALIZER_DIR
     assert "python main.py --window-start" in task.bash_command
+    assert '--poi-master-mode "$POI_MASTER_MODE"' in task.bash_command
+    assert task.env is not None
+    assert "resolve_x" in task.env["POI_MASTER_MODE"]
     assert "--baseline-date-mode" not in task.bash_command
     assert task.trigger_rule == TriggerRule.ALL_SUCCESS
+
+
+def test_population_collector_consumes_exact_poi_master_ref(dag) -> None:
+    """Population 전용 builder만 resolver의 mode·manifest exact ref를 전달한다."""
+    task = build_population_collector_task(dag, poi_master_task_id="resolve_x")
+
+    assert task.task_id == "collect_population_realtime"
+    assert task.cwd == COLLECTOR_DIR
+    assert "--source population_realtime" in task.bash_command
+    assert '--poi-master-mode "$POI_MASTER_MODE"' in task.bash_command
+    assert '--poi-master-manifest-uri "$POI_MASTER_MANIFEST_URI"' in task.bash_command
+    assert (
+        '--poi-master-manifest-sha256 "$POI_MASTER_MANIFEST_SHA256"'
+        in task.bash_command
+    )
+    assert task.env == {
+        "POI_MASTER_MODE": "{{ ti.xcom_pull(task_ids='resolve_x')['mode'] }}",
+        "POI_MASTER_MANIFEST_URI": (
+            "{{ ti.xcom_pull(task_ids='resolve_x').get('manifest_uri') or '' }}"
+        ),
+        "POI_MASTER_MANIFEST_SHA256": (
+            "{{ ti.xcom_pull(task_ids='resolve_x').get('manifest_sha256') or '' }}"
+        ),
+    }
+
+
+def test_poi_master_refresh_and_resolve_builder_contracts(dag) -> None:
+    """POI Master 앱의 refresh·resolve CLI와 JSON XCom 계약을 고정한다."""
+    refresh = build_poi_master_refresh_task(dag)
+    resolve = build_poi_master_resolve_task(dag)
+
+    assert refresh.cwd == resolve.cwd == POI_MASTER_DIR
+    for task in (refresh, resolve):
+        assert task.bash_command.startswith(
+            "env -u VIRTUAL_ENV UV_PROJECT_ENVIRONMENT=/opt/venvs/modules/poi-master "
+        )
+    assert "python main.py refresh" in refresh.bash_command
+    assert "python main.py resolve" in resolve.bash_command
+    assert '--as-of "$POI_MASTER_AS_OF"' in resolve.bash_command
+    assert resolve.env == {"POI_MASTER_AS_OF": KST_WINDOW_START}
+    assert refresh.output_processor('{"status":"unchanged"}') == {
+        "status": "unchanged"
+    }
+    assert resolve.output_processor('{"mode":"static"}') == {"mode": "static"}
 
 
 def test_station_master_enrichment_builder_contract(dag) -> None:
@@ -381,7 +436,11 @@ def test_module_wrappers_attach_success_and_failure_callbacks(dag) -> None:
 def test_plan_and_source_tasks_share_same_five_minute_template(dag) -> None:
     """Plan logical time과 source task가 동일한 5분 KST floor를 사용한다."""
     collector = build_collector_task(dag, "bike_station_realtime")
-    normalizer = build_normalizer_task(dag, "normalize_for_template")
+    normalizer = build_normalizer_task(
+        dag,
+        "normalize_for_template",
+        poi_master_task_id="resolve_for_template",
+    )
     prepare = build_prepare_serving_task(dag)
 
     for task in (collector, normalizer):
