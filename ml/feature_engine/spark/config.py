@@ -2,10 +2,12 @@
 
 이 패키지는 EMR에 그대로 올라가는 걸 전제로 하므로, `src/`(로컬 pandas 파이프라인,
 "1차 정제"와 검증용)에 의존하지 않고 독립적으로 동작한다. 로컬 개발도 항상
-S3(MinIO)를 거친다 — 로컬 파일시스템 폴백은 없다. 경로는 전부 `s3a://{버킷}/{키}`
-형태의 단일 URI 문자열이다(Spark의 Hadoop-S3A 필요 형식). 경로 조합에
-`pathlib.Path`나 `"/".join(...)`을 쓰지 않고 f-string으로 그때그때 만든다
-(`collector/storage.py`와 통일된 컨벤션).
+S3(MinIO)를 거친다 — 로컬 파일시스템 폴백은 없다. 경로는 전부 `{버킷}/{키}` 형태의
+단일 URI 문자열이다 — 스킴은 `_s3a()`가 환경에 따라 고른다(로컬 MinIO는
+Hadoop-S3A가 필요해 `s3a://`, 실제 AWS/EMR은 EMRFS가 IAM 인스턴스 프로필을 제대로
+타는 `s3://` — `s3a://`를 EMR에서 쓰면 403(InvalidAccessKeyId)로 실패한다,
+2026-08-25 실측). 경로 조합에 `pathlib.Path`나 `"/".join(...)`을 쓰지 않고
+f-string으로 그때그때 만든다(`collector/storage.py`와 통일된 컨벤션).
 
 **입력**: 과거·월별 학습 fact는 collector/nowcaster가 확정한 일별
 `ARCHIVE_ROOT/{source_id}/dt=YYYY-MM-DD.parquet`만 읽는다. 최신
@@ -49,8 +51,16 @@ S3_BUCKET = os.environ.get("S3_BUCKET", "local-dev")
 
 
 def _s3a(key: str) -> str:
-    """S3 키를 Spark Hadoop-S3A용 단일 URI 문자열로 만든다."""
-    return f"s3a://{S3_BUCKET}/{key}"
+    """S3 키를 Spark용 단일 URI 문자열로 만든다.
+
+    로컬 MinIO(`S3_ENDPOINT_URL` 설정됨)는 반드시 Hadoop-S3A 커넥터가 필요해
+    `s3a://`를 쓴다. 실제 AWS(EMR)에서는 `s3a://`가 EMR의 IAM 인스턴스 프로필
+    자격증명을 안 타고(EMRFS는 `s3://`에만 연결돼 있다) 존재하지 않는 access key로
+    S3에 요청을 보내 403(InvalidAccessKeyId)로 즉시 실패한다(실제 EMR 실행에서
+    확인, 2026-08-25) — EMR에서는 EMRFS가 처리하는 `s3://`를 쓴다.
+    """
+    scheme = "s3a" if os.environ.get("S3_ENDPOINT_URL") else "s3"
+    return f"{scheme}://{S3_BUCKET}/{key}"
 
 
 # collector Archive 계층의 루트 — 과거·월별 학습 fact reader가 이 아래에서 날짜별
