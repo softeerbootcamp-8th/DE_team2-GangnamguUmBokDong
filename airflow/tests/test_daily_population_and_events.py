@@ -72,6 +72,14 @@ def test_living_population_grid_uses_long_timeout():
     assert collect_population.execution_timeout == timedelta(seconds=1200)
 
 
+def test_nowcaster_receives_same_exact_window_as_collector():
+    """생활인구 actual 승격은 날짜 prefix가 아니라 같은 logical window를 사용한다."""
+    task = dag.get_task("run_nowcasting_estimate")
+
+    assert "--target-date" in task.bash_command
+    assert "--source-window-start" in task.bash_command
+
+
 def test_living_population_grid_uses_same_day_retry_budget():
     """과거 재조회가 불가능한 생활인구는 당일 재시도 시간을 충분히 확보한다."""
     collect_population = dag.get_task("collect_living_population_grid")

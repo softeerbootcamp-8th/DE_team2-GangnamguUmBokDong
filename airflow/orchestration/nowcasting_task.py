@@ -8,13 +8,17 @@ from __future__ import annotations
 
 from config.schedules import NOWCASTING_EXECUTION_TIMEOUT
 from orchestration.task_builder import REPO_ROOT, build_module_task
-from orchestration.templates import KST_DATE
+from orchestration.templates import KST_DATE, KST_WINDOW_START
 
 NOWCASTING_DIR = str(REPO_ROOT / "nowcaster")
 
 
 def build_nowcasting_task(dag):
-    cmd = f"uv run --frozen python main.py estimate --target-date {KST_DATE}"
+    """Collector와 같은 logical window를 넘겨 authoritative 실측만 승격한다."""
+    cmd = (
+        "uv run --frozen python main.py estimate "
+        f"--target-date {KST_DATE} --source-window-start {KST_WINDOW_START}"
+    )
     return build_module_task(
         dag,
         "run_nowcasting_estimate",

@@ -29,15 +29,34 @@ def _read_archive_as_frame(target_date: date) -> pd.DataFrame | None:
     return None
 
 
-def run_estimate(today: date) -> int:
-    """수집된 실측 데이터를 아카이브에 반영하고, D-3부터 D+3까지의 생활인구를 추정한다.
-    
-    collector의 dt= 파티션은 수집 실행일이지 데이터가 가리키는 실제 날짜가 아니다
-    (예: dt=2026-08-15 안의 YMD가 20260811). 
-    오늘자 파티션을 읽고 그 안의 YMD로 실제 대상 날짜(biz)를 알아내 그 날짜로 archive에 적재한다.
+def run_estimate(
+    today: date,
+    *,
+    source_window_start: datetime | None = None,
+) -> int:
+    """권위가 확인된 실측을 반영하고 D-3부터 D+3까지 생활인구를 추정한다.
+
+    Collector의 dt= 파티션은 수집 실행일이지 데이터가 가리키는 실제 날짜가 아니다
+    (예: dt=2026-08-15 안의 YMD가 20260811). Collector와 같은 exact logical
+    window가 주어진 경우에만 authority를 따라 Silver를 읽고, 그 안의 YMD로 실제
+    대상 날짜를 알아내 Archive에 적재한다. PARTIAL처럼 authority가 없거나 exact
+    window가 생략되면 실측 승격만 건너뛰고 나우캐스팅은 계속한다.
     """
-    # 1. 오늘 수집된 실측 데이터(Silver)를 아카이브로 승격 및 기존 임시 추정치 정리
-    real = storage.read_real_grid_silver(today)
+    if source_window_start is not None:
+        if (
+            source_window_start.tzinfo is None
+            or source_window_start.utcoffset() is None
+        ):
+            raise ValueError("source_window_start는 timezone-aware여야 한다")
+        if source_window_start.astimezone(_KST).date() != today:
+            raise ValueError("source_window_start의 KST 날짜가 target date와 다르다")
+
+    # 1. 오늘 수집된 authoritative 실측 Silver를 Archive로 승격하고 임시 추정치 정리
+    real = (
+        storage.read_real_grid_silver(source_window_start)
+        if source_window_start is not None
+        else None
+    )
     if real is not None:
         # 수집 파일 내 실제 발생 일자(biz_date)별로 분리
         for biz_date, day_table in backfill.group_rows_by_date(real).items():
@@ -206,6 +225,10 @@ def main(argv: list[str] | None = None) -> int:
     # 1-2. estimate 커맨드: 실측 데이터 승격 및 D-3~D+3 나우캐스팅 추정 실행
     estimate_parser = subparsers.add_parser("estimate")
     estimate_parser.add_argument("--target-date")
+    estimate_parser.add_argument(
+        "--source-window-start",
+        help="Collector와 동일한 ISO 8601 logical window (timezone offset 필수)",
+    )
 
     args = parser.parse_args(argv)
 
@@ -228,7 +251,15 @@ def main(argv: list[str] | None = None) -> int:
 
     # estimate 커맨드: target-date가 주어지면 해당 날짜, 없으면 KST 기준 오늘을 기준으로 실행
     today = date.fromisoformat(args.target_date) if args.target_date else datetime.now(tz=_KST).date()
-    return run_estimate(today)
+    source_window_start = None
+    if args.source_window_start:
+        source_window_start = datetime.fromisoformat(args.source_window_start)
+        if (
+            source_window_start.tzinfo is None
+            or source_window_start.utcoffset() is None
+        ):
+            raise ValueError("--source-window-start는 timezone offset이 필요하다")
+    return run_estimate(today, source_window_start=source_window_start)
 
 
 if __name__ == "__main__":

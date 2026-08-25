@@ -218,12 +218,14 @@ def test_station_master_enrichment_builder_contract(dag) -> None:
     assert "astimezone" in task.bash_command
 
 
-def test_nowcasting_task_uses_date_not_window_start(dag) -> None:
-    """Nowcasting 독립 task는 기존 target-date 계약을 유지한다."""
+def test_nowcasting_task_uses_date_and_exact_source_window(dag) -> None:
+    """Nowcasting은 추정 기준일과 Collector의 exact logical time을 함께 받는다."""
     task = build_nowcasting_task(dag)
 
     assert task.cwd == NOWCASTING_DIR
     assert "main.py estimate --target-date" in task.bash_command
+    assert "--source-window-start" in task.bash_command
+    assert KST_WINDOW_START in task.bash_command
     assert "strftime" in task.bash_command
 
 
