@@ -8,7 +8,7 @@ from evaluation.backtest_contract import (
     EvaluationContract,
     validate_sensitivity_contracts,
 )
-from evaluation.production_policy_contract import (
+from evaluation.evaluation_profiles import (
     PRODUCTION_SERVICE_MINUTES_PER_STOP,
     PRODUCTION_SPEED_KMH,
 )

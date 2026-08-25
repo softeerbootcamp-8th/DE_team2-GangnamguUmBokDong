@@ -2,10 +2,10 @@
 
 > **문서 상태:** 현재 평가 계약은 `point-in-time-policy-backtest-v3`, 운영 경로
 > 알고리즘은 `route-v4-supply-led-pickup-sla`, 긴급도 계산 설정은
-> `urgency-scoring-v4-any-depletion`이다. 이 문서의 12셀 수치는 후보 교정
-> (calibration) 결과이며, 별도로 사전 등록한 confirmatory matrix는 아직 실행하지
-> 않았다. 원천 CSV, 모델 bundle, MinIO station master와 생성 결과는 Git에 포함하지
-> 않는다.
+> `urgency-scoring-v4-any-depletion`이다. Calibration·confirmatory·production은
+> `evaluation.run_policy_evaluation` 하나와 `point-in-time-policy-evaluation-v1`
+> 결과 스키마 하나를 사용하며 대상 셀과 gate만 profile 데이터로 다르다. 원천 CSV,
+> 모델 bundle, MinIO station master와 생성 결과는 Git에 포함하지 않는다.
 
 ## 현재 production 후보
 
@@ -241,22 +241,25 @@ policy·model provenance도 exact하게 일치했다.
 superseded calibration이다. 현재 정책의 근거나 현재 production 설정으로 재사용하지
 않으며 필요하면 Git history에서만 확인한다.
 
-## 사전 등록 confirmatory matrix v3
+## 일원화된 평가 profile
 
-`confirmatory-matrix-v3.json`은 v2에서 고정한 selection, 12셀, 60·120·180분 평가 계약,
-acceptance gate를 바꾸지 않고 최신 develop base ancestry와 후보 semantic version을
-추가로 잠근 manifest다.
+평가 목적은 세 가지지만 실행·집계·결과 schema는 하나다.
 
-- Manifest SHA-256:
-  `3d31517d57e3a460f1c9d0acc9637f5a91beaffcb6936514c61026263386ca15`
-- 등록 branch: `feature/rebalance-policy-v3`
-- 등록 develop base:
-  `3f6c7977550efaa3e03f9bd847480517e04f690b`
-- calibration에서 제외한 독립 권역: `sangam`, `jungnang`, `cheonwang`, `cheonho`
-- calibration 사용으로 confirmatory에서 제외한 권역: `gaehwa`, `hangnyeoul`, `isu`,
-  `yeongnam`
+| Profile | 대상 | 역할 | Gate 종류 |
+|---|---|---|---|
+| `calibration` | 후보 선택에 사용한 12셀 | 후보 안전성 재현 | diagnostic |
+| `confirmatory` | 미열람 4권역 12셀 | 독립 일반화 확인 | release |
+| `production` | 학여울 2025-03..12 17일 10셀 | 고정 배포 범위 확인 | release |
 
-고정한 12셀은 다음과 같다.
+세 profile은 모두 `run_policy_backtest()`로 셀을 계산하고, 공통 집계기가 다음을 한
+문서에서 계산한다.
+
+- `no_rebalance` 대비 관측 수요 충족률·미충족 event·품절 대여소-분
+- 시간별 재고 잔차로 추정한 기존 운영의 품절 대여소-분 범위와 이동 예산
+- 계획·실행 이동량, route cutoff 완료, pickup dispatch 지연
+- 모델·원천·station surface provenance
+
+Confirmatory profile의 12셀과 기존 acceptance 수치는 유지한다.
 
 | 센터 | 07:00 | 13:00 | 18:00 |
 |---|---|---|---|
@@ -265,54 +268,20 @@ acceptance gate를 바꾸지 않고 최신 develop base ancestry와 후보 seman
 | cheonwang | 2025-10-17 | 2025-03-17 | 2025-06-17 |
 | cheonho | 2025-11-17 | 2025-05-17 | 2025-09-17 |
 
-단 한 번의 confirmatory 실행이 통과하려면 다음을 모두 만족해야 한다.
+Confirmatory release gate는 모든 셀·구간 no-harm, 180분 미충족 엄격 개선, 180분
+품절 시간 5% 이상 감소, 개선 셀 8개 이상, pickup 지연 30분 이하, 계획=실행,
+cutoff 완료를 요구한다. Production release gate는 고정 10셀 input provenance와 모든
+구간 no-harm, 180분 미충족 엄격 개선, 각 horizon의 aggregate 품절 시간 엄격 개선을
+요구한다.
 
-1. exact 12셀×3구간이며 모든 셀·구간의 신규 미충족 event가 0건이다.
-2. 모든 셀·구간에서 미충족 요청 수와 품절 대여소-분이 각각 `no_rebalance`보다
-   나빠지지 않는다.
-3. 180분 aggregate 미충족 요청 수가 엄격히 감소한다.
-4. 180분 aggregate 품절 대여소-분이 5% 이상 감소한다.
-5. 180분 품절 시간이 엄격히 개선된 셀이 12개 중 8개 이상이다.
-6. 모든 셀·구간의 pickup dispatch lag가 30분 이하다.
-7. 모든 셀·구간에서 계획 이동량과 실행 이동량이 같고, 모든 경로가 cutoff 안에
-   완료된다.
-
-> **현재 상태:** manifest와 sidecar만 등록했다. Candidate lock 이후의 single-run
-> claim과 12셀 실행은 아직 하지 않았으므로 confirmatory 통과·실패를 예단하지 않는다.
-
-### Lock과 실행 계약
-
-현 CLI는 `--repo-root`를 필수로 받고, resolve한 값이
-`git rev-parse --show-toplevel`의 실제 repository root와 exact하게 같은지 검증한다.
-재현 명령에서는 이를 절대경로로 넘긴다. worktree는 등록 branch의 clean commit이어야
-하고, candidate HEAD와 등록 develop base가 모두 존재하며 base가 candidate의
-ancestor여야 한다. Candidate lock에는 policy configuration뿐 아니라 route·urgency
-scoring·backtest semantic version이 함께 들어간다.
-
-Candidate lock과 결과 디렉터리는 resolve했을 때 repository 밖이어야 하며, 재현
-명령에서는 명시적인 절대경로를 쓴다. CLI는 실제 import된 `evaluation`·`gold`·`core`·
-`ml_core`와 center seed가 해당 candidate worktree의 파일인지 확인하고 12셀 뒤 Git
-HEAD·clean 상태와 import binding을 다시 검증한다. `run`은 원천을 읽기 전에 exact
-holdout 셀 집합 ID에 대응하는 private Git ref를 old-zero CAS로 만들고 claim JSON
-blob을 고정한다. Raw 파일은 holdout·candidate·claim authority envelope에 결속하며,
-검증이 끝난 exact 12개 raw SHA와 결과 digest는 별도 completion Git ref에 봉인한다.
-따라서 lock이나 output 경로를 바꾸거나 같은 셀에 새 후보를 붙인 official CLI 재실행은
-거부한다. 이 장치는 같은 repository 안의 우발적·CLI 재실행을 막는 로컬 guard이며,
-권한 보유자의 ref 삭제나 별도 clone까지 막는 외부 append-only authority는 아니다.
-다음은 경로 형태를 보여 주는 명령이며, 최종 clean candidate commit을 고정하기 전에는
-실행하지 않는다.
+실행 명령은 profile 이름만 바뀐다.
 
 ```bash
 cd /absolute/path/to/rebalance-policy-v3/loader
 
-python -m evaluation.run_confirmatory_matrix lock \
-  --repo-root /absolute/path/to/rebalance-policy-v3 \
-  --candidate-lock /tmp/rebalance-confirmatory-v3/candidate-lock.json
-
-python -m evaluation.run_confirmatory_matrix run \
-  --repo-root /absolute/path/to/rebalance-policy-v3 \
-  --candidate-lock /tmp/rebalance-confirmatory-v3/candidate-lock.json \
-  --output-dir /tmp/rebalance-confirmatory-v3/result \
+python -m evaluation.run_policy_evaluation \
+  --profile production \
+  --output-dir /tmp/rebalance-evaluation/production \
   --bootstrap-dir /absolute/path/to/data/issue163-full-year/bootstrap \
   --weather-csv /absolute/path/to/data/issue163-full-year/bootstrap/weather_realtime_2025.csv \
   --population-dir /absolute/path/to/data/issue163-full-year/population \
@@ -321,6 +290,13 @@ python -m evaluation.run_confirmatory_matrix run \
   --s3-endpoint http://localhost:9000 \
   --s3-bucket issue163-full-year
 ```
+
+기존 raw를 이관 검증할 때도 같은 명령에 `--input-results <raw...>`만 추가한다. 과거
+confirmatory envelope는 내부 `result`를 읽되 lock·claim·Git ref 계층은 사용하지
+않는다. 이전 confirmatory 12셀 실행은 구 validator의 자정 경계 생활인구 날짜 오류로
+최종 결과가 생성되지 않았으며, 이 리팩터링 자체는 그 raw를 새 confirmatory 판정으로
+재해석하지 않는다. Production 10셀 raw는 새 공통 실행기로 재집계해 기존과 같은 gate
+통과와 60·120·180분 KPI를 재현했다.
 
 ## 해석 가능한 주장과 한계
 
@@ -343,8 +319,8 @@ python -m evaluation.run_confirmatory_matrix run \
    모델이 아니다.
 4. 공통 이동 대수 상한은 적용하지만 실제 기존 운영과 차량 대수·차량 시간이 같았는지
    증명할 수 없다.
-5. 현재 수치는 후보 선택에 사용한 calibration이며 독립 12셀 confirmatory는 아직
-   실행하지 않았다.
+5. 독립 12셀 confirmatory는 과거 validator 오류로 공식 최종 판정이 없으며, production
+   통과만으로 그 독립성 근거를 대신할 수 없다.
 
 결과의 `EvidenceGate`는 이 한계 때문에
 `causal_superiority_vs_legacy_allowed=false`,

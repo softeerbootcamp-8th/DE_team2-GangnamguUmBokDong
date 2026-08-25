@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import argparse
 import csv
 import heapq
 import json
@@ -1064,63 +1063,3 @@ def _haversine_km(
         + math.cos(phi_a) * math.cos(phi_b) * math.sin(delta_lambda / 2.0) ** 2
     )
     return 2.0 * radius_km * math.asin(math.sqrt(value))
-
-
-def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    """백테스트 CLI 인자를 파싱한다."""
-    parser = argparse.ArgumentParser(
-        description="실제 수요 기반 재배치 소규모 백테스트"
-    )
-    parser.add_argument("--date", required=True, type=date.fromisoformat)
-    parser.add_argument("--center", required=True)
-    parser.add_argument("--start-hour", type=int, default=6)
-    parser.add_argument("--duration-hours", type=int, default=6)
-    parser.add_argument("--max-stops", type=int, nargs="+", default=[5, 8])
-    parser.add_argument("--rental-csv", required=True, type=Path)
-    parser.add_argument("--stock-csv", required=True, type=Path)
-    parser.add_argument(
-        "--station-json",
-        type=Path,
-        default=Path("../apps/api/seed_data/stations_seoul.json"),
-    )
-    parser.add_argument(
-        "--center-seed",
-        type=Path,
-        default=Path("../docs/gold/dispatch-center-seed.yaml"),
-    )
-    parser.add_argument(
-        "--output-dir", type=Path, default=Path("../data/backtest-results")
-    )
-    args = parser.parse_args(argv)
-    if not 0 <= args.start_hour <= 23:
-        parser.error("--start-hour는 0..23이어야 합니다.")
-    if not 1 <= args.duration_hours <= 24 - args.start_hour:
-        parser.error("평가 구간은 목표일 안의 1시간 이상이어야 합니다.")
-    if any(not 2 <= value <= 32767 for value in args.max_stops):
-        parser.error("--max-stops는 각각 2..32767이어야 합니다.")
-    return args
-
-
-def main(argv: Sequence[str] | None = None) -> int:
-    """CLI 입력으로 백테스트를 실행하고 결과 파일 위치를 출력한다."""
-    args = parse_args(argv)
-    result = run_backtest(
-        target_date=args.date,
-        center_id=args.center,
-        start_hour=args.start_hour,
-        duration_hours=args.duration_hours,
-        rental_csv=args.rental_csv,
-        stock_csv=args.stock_csv,
-        station_json=args.station_json,
-        center_seed=args.center_seed,
-        max_stops_variants=tuple(args.max_stops),
-    )
-    json_path, markdown_path = write_result(result, args.output_dir)
-    print(result_markdown(result))
-    print(f"JSON: {json_path}")
-    print(f"Markdown: {markdown_path}")
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
