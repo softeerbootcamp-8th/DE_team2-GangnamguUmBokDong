@@ -19,6 +19,9 @@ TIMEZONE = "Asia/Seoul"
 # 3시간짜리 수집이 실패해도 다음 5분 tick에서 바로 재시도되어, cron 경계에 걸려
 # 최대 3시간을 기다리던 예전보다 복구가 훨씬 빠르다.
 REALTIME_TICK_CRON = "*/5 * * * *"
+# 서울시 POI 목록·영역 파일의 변경 여부를 매일 확인한다. 5분 realtime tick의
+# 정각 경계와 03:00 일별 배치를 피해 가벼운 기준정보 갱신을 독립 실행한다.
+POI_MASTER_REFRESH_CRON = "4 2 * * *"
 # living_population_grid는 그날 데이터를 하루 1개 파일로 발행한다 — 실제 발행 시각을
 # 확인해 필요하면 조정한다.
 DAILY_CRON = "0 3 * * *"
@@ -81,6 +84,10 @@ NOWCASTING_EXECUTION_TIMEOUT = timedelta(seconds=600)
 # (2026-08-19 21:40 tick, 격자 8,564개 x 13시각, baseline 2개 날짜 = nowcast 27MB):
 # 10.7초. 5분 tick에 여유가 크지만 baseline 크기가 늘 수 있어 상한은 300초로 둔다.
 NORMALIZER_EXECUTION_TIMEOUT = timedelta(seconds=300)
+# POI master refresh는 외부 파일 2개를 내려받아 geometry까지 검증한다. resolver는
+# 이미 게시된 작은 manifest 하나를 선택하는 작업이라 짧게 실패시킨다.
+POI_MASTER_REFRESH_EXECUTION_TIMEOUT = timedelta(seconds=300)
+POI_MASTER_RESOLVE_EXECUTION_TIMEOUT = timedelta(seconds=30)
 # 변경이 없는 날짜는 LIST 한 번으로 끝나지만, 대여이력 D-6 correction 등으로 Silver
 # 입력이 바뀐 날은 하루치 parquet을 전부 다시 읽는다. bike_rental_history 기준
 # 288개가 상한이다.

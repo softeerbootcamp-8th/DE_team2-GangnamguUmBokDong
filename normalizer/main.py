@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 from collections.abc import Callable
 from datetime import date, datetime, timedelta, tzinfo
@@ -16,6 +17,7 @@ from datetime import date, datetime, timedelta, tzinfo
 # pyrefly: ignore [missing-import]
 import pyarrow as pa
 from core.forecast import POPULATION_FORECAST_SLOT_COUNT
+from core.poi_master import PoiMasterError, PoiMasterRef
 
 import grid
 import merge
@@ -26,6 +28,11 @@ import storage
 _FORECAST_TIME_FORMAT = "%Y-%m-%d %H:%M"
 # 이보다 먼 예측은 쓰지 않는다. API가 간격을 바꿔도 미래로 무한히 번지지 않게 하는 상한.
 _MAX_HORIZON = timedelta(hours=12)
+_POI_CODE_PATTERN = re.compile(r"POI[0-9]{3}\Z")
+
+
+class RealtimePoiContractError(ValueError):
+    """실시간 생활인구의 POI 식별자 계약이 선택된 Master와 맞지 않는다."""
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -38,6 +45,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """
     parser = argparse.ArgumentParser(prog="main.py")
     parser.add_argument("--window-start", required=True, help="ISO8601, KST 오프셋(+09:00) 포함")
+    parser.add_argument(
+        "--poi-master-mode",
+        choices=("static", "s3"),
+        default="static",
+        help="Airflow가 중앙에서 고정한 POI Master 소비 모드",
+    )
+    parser.add_argument("--poi-master-manifest-uri")
+    parser.add_argument("--poi-master-manifest-sha256")
     return parser.parse_args(argv)
 
 
@@ -161,6 +176,64 @@ def _build_poi_snapshots(
             )
         )
     return snapshots
+
+
+def _validate_realtime_poi_contract(
+    realtime_table: pa.Table,
+    poi_areas: tuple[poi.PoiArea, ...],
+) -> frozenset[str]:
+    """실시간 AREA_CD가 유효하고 선택된 POI Master의 부분집합인지 검증한다.
+
+    API의 부분 실패로 Master 일부 코드가 실시간 snapshot에 없는 것은 허용한다. 반대로
+    실시간 snapshot에만 있는 코드는 Collector와 Normalizer가 서로 다른 Master를 썼거나
+    입력 authority가 손상됐다는 뜻이므로 출력 전에 실패시킨다.
+
+    args:
+        realtime_table: Collector가 게시한 실시간 POI 인구 테이블
+        poi_areas: 이번 실행에 고정된 POI Master 영역
+    returns:
+        검증된 실시간 AREA_CD 집합
+    raises:
+        RealtimePoiContractError: AREA_CD 컬럼·값·고유성 또는 Master 부분집합 계약이 깨질 때
+    """
+    if type(realtime_table) is not pa.Table:
+        raise RealtimePoiContractError(
+            "population_realtime 입력은 pyarrow.Table이어야 합니다."
+        )
+    if "AREA_CD" not in realtime_table.column_names:
+        raise RealtimePoiContractError(
+            "population_realtime 입력에 AREA_CD 컬럼이 없습니다."
+        )
+
+    raw_codes = realtime_table.column("AREA_CD").to_pylist()
+    invalid_codes = [
+        code
+        for code in raw_codes
+        if type(code) is not str or _POI_CODE_PATTERN.fullmatch(code) is None
+    ]
+    if invalid_codes:
+        raise RealtimePoiContractError(
+            "population_realtime AREA_CD는 POI와 ASCII 숫자 3자리 형식이어야 합니다: "
+            f"invalid={invalid_codes!r}"
+        )
+    if len(raw_codes) != len(set(raw_codes)):
+        duplicates = sorted(
+            code for code in set(raw_codes) if raw_codes.count(code) > 1
+        )
+        raise RealtimePoiContractError(
+            "population_realtime AREA_CD에 중복 코드가 있습니다: "
+            f"duplicates={duplicates}"
+        )
+
+    realtime_codes = frozenset(raw_codes)
+    master_codes = frozenset(area.area_cd for area in poi_areas)
+    unknown_codes = sorted(realtime_codes - master_codes)
+    if unknown_codes:
+        raise RealtimePoiContractError(
+            "population_realtime에 선택된 POI Master에 없는 AREA_CD가 있습니다: "
+            f"unknown={unknown_codes}"
+        )
+    return realtime_codes
 
 
 def _parse_forecast_time(raw: object, tzinfo: tzinfo | None) -> datetime | None:
@@ -295,7 +368,10 @@ def _write_normalized(
     )
 
 
-def run(window_start: datetime) -> int:
+def run(
+    window_start: datetime,
+    poi_master_ref: PoiMasterRef | None = None,
+) -> int:
     """현재 시각과 향후 12시간 예측 시각을 각각 보정해 그 시각의 Silver tick에 쓴다.
 
     현재 시각은 실측 POI 인구와 성비로 성·연령까지 재분배하고(`merge.merge_cell`), 미래
@@ -308,7 +384,9 @@ def run(window_start: datetime) -> int:
         종료 코드 (성공 시 0)
     """
     realtime_table = storage.read_realtime_silver(window_start)
-    poi_areas = poi.load_poi_areas(poi.DEFAULT_POI_SHP_PATH)
+    selected_ref = poi_master_ref or PoiMasterRef(mode="static")
+    poi_areas = poi.load_poi_master_areas(selected_ref)
+    _validate_realtime_poi_contract(realtime_table, poi_areas)
 
     forecasts_by_code = _collect_forecasts(realtime_table, window_start)
     targets = _forecast_targets(forecasts_by_code)
@@ -385,6 +463,8 @@ def run(window_start: datetime) -> int:
             "cell_count": len(union_cells),
             "poi_matched_count": len(observed_snapshots),
             "poi_forecast_count": len(forecasts_by_code),
+            "poi_master": selected_ref.as_dict(),
+            "poi_master_row_count": len(poi_areas),
             "forecast_horizons": len(targets),
             "written_keys": written,
             "skipped_targets": skipped,
@@ -399,8 +479,13 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     window_start = datetime.fromisoformat(args.window_start)
     try:
-        return run(window_start)
-    except (storage.PartitionNotFoundError, ValueError) as exc:
+        ref = PoiMasterRef(
+            mode=args.poi_master_mode,
+            manifest_uri=args.poi_master_manifest_uri or None,
+            manifest_sha256=args.poi_master_manifest_sha256 or None,
+        )
+        return run(window_start, ref)
+    except (PoiMasterError, storage.PartitionNotFoundError, ValueError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
 

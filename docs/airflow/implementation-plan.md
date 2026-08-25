@@ -234,6 +234,43 @@ Collector 문서에는 `data_interval_start`를 `--window-start`로 넘긴다고
 
 ---
 
+## 4.1 POI Master 자동 갱신과 실행 고정
+
+`poi_master_refresh` DAG는 매일 `02:04 KST`에 서울 열린데이터광장 자료 페이지를 확인한다. 첨부 이름에서 `서울시 주요 <N>장소 목록.xlsx`와 `서울시 주요 <N>장소 영역.zip`을 찾아 내려받고, 내용이 바뀌어 검증을 통과한 경우에만 새 POI Master를 게시한다. 두 파일명이 선언한 `<N>`, XLSX·Shape의 고유 `AREA_CD` 수, 최종 Master 행 수는 모두 같아야 하며 파일 bytes가 같더라도 이 선언이 바뀌면 다시 검증한다. 운영 환경의 전역 `dags_are_paused_at_creation=true`와 무관하게 이 무인 유지관리 DAG만 `is_paused_upon_creation=False`로 최초 배포부터 자동 활성화한다.
+
+```bash
+cd /workspace/poi_master && uv run --frozen python main.py refresh
+```
+
+S3에는 원본과 통합 Parquet을 content hash 주소로 불변 저장한다. 원본은 일반
+Collector Bronze의 30일 만료 정책과 분리된 `source_snapshot_raw/`에 영구 보존한다.
+
+```text
+source_snapshot_raw/poi_master/list/sha256=<xlsx-byte-sha256>.xlsx
+source_snapshot_raw/poi_master/areas/sha256=<zip-byte-sha256>.zip
+silver/poi_master/sha256=<parquet-byte-sha256>.parquet
+source_snapshot_manifest/poi_master/dt=YYYY-MM-DD/hh=HH/logical=<UTC timestamp>/revision=0000000000.json
+source_snapshot_pointer/poi_master/activated=<UTC timestamp>.json
+```
+
+게시 순서는 `source raw → Silver → source manifest → activation`이며 activation을 마지막에 append-only로 추가한다. 변경 가능한 `current.json`은 두지 않는다. activation key는 시각당 하나뿐이고 조건부 PUT으로 생성하므로 동시 실행에서도 한 manifest만 그 시각의 승자가 된다. 같은 내용이면 새 활성본을 만들지 않고, 페이지 조회·다운로드·검증·게시 중 실패하면 새 activation 없이 이전 활성본을 계속 사용한다. 기존 대비 POI가 과도하게 줄면 `--max-drop-ratio` 게이트가 게시를 막으며 기본값은 `0.2`다. 최초 activation도 repository의 legacy POI Shapefile 행 수를 기존 기준으로 사용한다.
+
+변경 없음 판단에는 두 원천 checksum뿐 아니라 `poi_master_schema_version`도 포함한다. 따라서 변환 계약을 올리면 원천 파일이 같아도 새 artifact를 게시하며, consumer는 지원하지 않는 schema version을 거부한다. Schema 전환은 새 version을 writer에 지정하면서 같은 물리 schema의 직전 version을 `POI_MASTER_READABLE_SCHEMA_VERSIONS`에 유지하고, refresh activation을 확인한 다음 별도 배포에서 제거하는 2단계로 수행한다. 실행 역할에는 위 네 POI Master namespace의 `DeleteObject`를 명시적으로 거부해 append-only history가 정리 작업으로 삭제되지 않게 한다.
+
+각 `realtime_tick`은 수집 전에 해당 KST window 기준 활성본 하나를 고정한다.
+
+```text
+resolve_poi_master
+  → collect_population_realtime
+  → run_normalizer
+```
+
+`resolve_poi_master`는 `python main.py resolve --as-of <KST-window>` 결과인 `POI_MASTER_MODE`, `POI_MASTER_MANIFEST_URI`, `POI_MASTER_MANIFEST_SHA256`을 두 downstream Task에 동일하게 전달한다. 따라서 두 Task 사이에 refresh가 실행돼도 한 run 안에서 POI 목록과 geometry 버전이 섞이지 않는다.
+
+activation이 아직 하나도 없으면 `mode=static`으로 기존 Collector YAML과 repository Shapefile을 사용한다. 반면 한 번 고정된 exact S3 manifest나 artifact가 손상됐으면 다른 버전이나 static으로 조용히 전환하지 않고 해당 run을 실패시킨다.
+
+---
+
 ## 5. 실시간 수집 DAG
 
 파일:

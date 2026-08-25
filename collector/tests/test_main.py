@@ -2,16 +2,25 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import datetime
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
-import main
+import pyarrow as pa
 import pytest
+
+import main
 from manifest import RunStatus
 
 KST = ZoneInfo("Asia/Seoul")
+POI_MASTER_URI = (
+    "s3://test-bucket/source_snapshot_manifest/poi_master/"
+    "dt=2026-08-25/hh=00/logical=20260825T000000000000Z/"
+    "revision=0000000000.json"
+)
+POI_MASTER_SHA256 = "a" * 64
 
 
 class TestParseArgs:
@@ -50,6 +59,165 @@ class TestParseArgs:
 
         assert args.check_due_after_seconds == 600
         assert args.window_start is None
+
+    def test_poi_master_defaults_to_static_without_refs(self):
+        args = main.parse_args(
+            [
+                "--source",
+                "population_realtime",
+                "--window-start",
+                "2026-08-12T14:10:00+09:00",
+            ]
+        )
+
+        assert args.poi_master_mode == "static"
+        assert args.poi_master_manifest_uri is None
+        assert args.poi_master_manifest_sha256 is None
+
+    def test_static_mode_normalizes_airflow_empty_ref_values(self):
+        """Airflow의 고정 command shape에서 빈 ref 환경변수는 미지정으로 취급한다."""
+        args = main.parse_args(
+            [
+                "--source",
+                "population_realtime",
+                "--window-start",
+                "2026-08-12T14:10:00+09:00",
+                "--poi-master-mode",
+                "static",
+                "--poi-master-manifest-uri",
+                "",
+                "--poi-master-manifest-sha256",
+                "   ",
+            ]
+        )
+
+        assert args.poi_master_manifest_uri is None
+        assert args.poi_master_manifest_sha256 is None
+
+    def test_s3_poi_master_requires_both_exact_ref_fields(self):
+        with pytest.raises(SystemExit):
+            main.parse_args(
+                [
+                    "--source",
+                    "population_realtime",
+                    "--window-start",
+                    "2026-08-12T14:10:00+09:00",
+                    "--poi-master-mode",
+                    "s3",
+                    "--poi-master-manifest-uri",
+                    POI_MASTER_URI,
+                ]
+            )
+
+    @pytest.mark.parametrize(
+        "ref_args",
+        [
+            ["--poi-master-manifest-uri", POI_MASTER_URI],
+            ["--poi-master-manifest-sha256", POI_MASTER_SHA256],
+            [
+                "--poi-master-manifest-uri",
+                POI_MASTER_URI,
+                "--poi-master-manifest-sha256",
+                POI_MASTER_SHA256,
+            ],
+        ],
+    )
+    def test_static_poi_master_rejects_manifest_refs(self, ref_args):
+        with pytest.raises(SystemExit):
+            main.parse_args(
+                [
+                    "--source",
+                    "population_realtime",
+                    "--window-start",
+                    "2026-08-12T14:10:00+09:00",
+                    *ref_args,
+                ]
+            )
+
+    def test_non_population_source_rejects_poi_master_ref(self):
+        with pytest.raises(SystemExit):
+            main.parse_args(
+                [
+                    "--source",
+                    "bike_station_realtime",
+                    "--window-start",
+                    "2026-08-12T14:10:00+09:00",
+                    "--poi-master-mode",
+                    "s3",
+                    "--poi-master-manifest-uri",
+                    POI_MASTER_URI,
+                    "--poi-master-manifest-sha256",
+                    POI_MASTER_SHA256,
+                ]
+            )
+
+
+class TestPoiMasterConfig:
+    """S3 POI Master를 한 번 읽어 frozen Collector 설정에 고정하는 계약을 검증한다."""
+
+    def test_codes_are_validated_sorted_and_injected_without_mutating_yaml_config(
+        self, monkeypatch
+    ):
+        config = main.config_loader.load("population_realtime")
+        original_params = dict(config.adapter_params)
+        calls = []
+        table = pa.table({"AREA_CD": ["POI132", "POI001"]})
+
+        def fake_read(ref, columns=None):
+            calls.append((ref, columns))
+            return table
+
+        monkeypatch.setattr(main, "read_poi_master", fake_read)
+        ref = main.PoiMasterRef(
+            mode="s3",
+            manifest_uri=POI_MASTER_URI,
+            manifest_sha256=POI_MASTER_SHA256,
+        )
+
+        result = main._config_with_poi_master(config, ref)
+
+        assert len(calls) == 1
+        assert calls[0] == (ref, ["AREA_CD"])
+        assert result.adapter_params["poi_codes"] == ("POI001", "POI132")
+        assert config.adapter_params == original_params
+        assert "poi_codes" not in config.adapter_params
+
+    def test_config_version_combines_yaml_hash_and_manifest_hash(self, monkeypatch):
+        config = main.config_loader.load("population_realtime")
+        monkeypatch.setattr(
+            main,
+            "read_poi_master",
+            lambda *_args, **_kwargs: pa.table({"AREA_CD": ["POI001"]}),
+        )
+        ref = main.PoiMasterRef(
+            mode="s3",
+            manifest_uri=POI_MASTER_URI,
+            manifest_sha256=POI_MASTER_SHA256,
+        )
+
+        result = main._config_with_poi_master(config, ref)
+
+        material = (
+            f"collector_config={config.config_version}\n"
+            f"poi_master_manifest_sha256={POI_MASTER_SHA256}\n"
+        ).encode("ascii")
+        assert result.config_version == f"sha256:{hashlib.sha256(material).hexdigest()}"
+        assert result.config_version != config.config_version
+
+    @pytest.mark.parametrize(
+        "table",
+        [
+            pa.table({"AREA_CD": pa.array([], type=pa.string())}),
+            pa.table({"AREA_CD": ["POI001", "POI001"]}),
+            pa.table({"AREA_CD": ["POI1"]}),
+            pa.table({"AREA_CD": ["POI１２３"]}),
+            pa.table({"AREA_CD": [None]}),
+            pa.table({"AREA_CD": ["POI001"], "AREA_NM": ["장소"]}),
+        ],
+    )
+    def test_rejects_invalid_master_code_tables(self, table):
+        with pytest.raises(ValueError, match="POI Master"):
+            main._validated_master_poi_codes(table)
 
 
 class TestExitCodeFor:
@@ -258,6 +426,77 @@ class TestMain:
 
         assert captured["force"] is False
         assert captured["backfill"] is True
+
+    def test_s3_mode_reads_master_once_before_pipeline(self, monkeypatch):
+        config = main.config_loader.load("population_realtime")
+        captured = {"read_count": 0}
+
+        monkeypatch.setattr(main.config_loader, "load", lambda _source_id: config)
+
+        def fake_read(ref, columns=None):
+            captured["read_count"] += 1
+            captured["ref"] = ref
+            captured["columns"] = columns
+            return pa.table({"AREA_CD": ["POI132", "POI001"]})
+
+        def fake_execute_window(config, *_args, **_kwargs):
+            captured["config"] = config
+            return SimpleNamespace(status=RunStatus.SUCCEEDED)
+
+        monkeypatch.setattr(main, "read_poi_master", fake_read)
+        monkeypatch.setattr(main.pipeline, "execute_window", fake_execute_window)
+
+        code = main.main(
+            [
+                "--source",
+                "population_realtime",
+                "--window-start",
+                "2026-08-12T14:10:00+09:00",
+                "--poi-master-mode",
+                "s3",
+                "--poi-master-manifest-uri",
+                POI_MASTER_URI,
+                "--poi-master-manifest-sha256",
+                POI_MASTER_SHA256,
+            ]
+        )
+
+        assert code == 0
+        assert captured["read_count"] == 1
+        assert captured["ref"].manifest_uri == POI_MASTER_URI
+        assert captured["ref"].manifest_sha256 == POI_MASTER_SHA256
+        assert captured["columns"] == ["AREA_CD"]
+        assert captured["config"].adapter_params["poi_codes"] == (
+            "POI001",
+            "POI132",
+        )
+
+    def test_s3_mode_rejects_invalid_manifest_ref_before_reading_master(
+        self, monkeypatch
+    ):
+        config = main.config_loader.load("population_realtime")
+        monkeypatch.setattr(main.config_loader, "load", lambda _source_id: config)
+        monkeypatch.setattr(
+            main,
+            "read_poi_master",
+            lambda *_args, **_kwargs: pytest.fail("invalid ref를 읽으려 해서는 안 됨"),
+        )
+
+        with pytest.raises(ValueError):
+            main.main(
+                [
+                    "--source",
+                    "population_realtime",
+                    "--window-start",
+                    "2026-08-12T14:10:00+09:00",
+                    "--poi-master-mode",
+                    "s3",
+                    "--poi-master-manifest-uri",
+                    POI_MASTER_URI,
+                    "--poi-master-manifest-sha256",
+                    "NOT-A-SHA256",
+                ]
+            )
 
 
 class TestHttpTimeout:

@@ -2,12 +2,12 @@
 
 from datetime import datetime, timedelta
 
-import main
-import poi
 import pyarrow as pa
 import pytest
 from shapely.geometry import box
 
+import main
+import poi
 from tests.conftest import KST
 
 
@@ -21,7 +21,24 @@ class TestParseArgs:
         args = main.parse_args(["--window-start", "2026-08-12T14:05:00+09:00"])
 
         assert args.window_start == "2026-08-12T14:05:00+09:00"
+        assert args.poi_master_mode == "static"
         assert not hasattr(args, "baseline_date_mode")
+
+    def test_takes_exact_s3_poi_master_ref(self):
+        """Airflow가 고정한 S3 manifest URI와 SHA를 그대로 파싱한다."""
+        args = main.parse_args([
+            "--window-start", "2026-08-12T14:05:00+09:00",
+            "--poi-master-mode", "s3",
+            "--poi-master-manifest-uri",
+            (
+                "s3://bucket/source_snapshot_manifest/poi_master/dt=2026-08-12/"
+                "hh=05/logical=20260812T050500000000Z/revision=0000000000.json"
+            ),
+            "--poi-master-manifest-sha256", "a" * 64,
+        ])
+
+        assert args.poi_master_mode == "s3"
+        assert args.poi_master_manifest_sha256 == "a" * 64
 
     def test_rejects_removed_baseline_mode_flag(self):
         with pytest.raises(SystemExit):
@@ -125,6 +142,88 @@ class TestBuildForecastSnapshots:
         assert set(snapshots) == {"POI001"}
         assert snapshots["POI001"].pop_estimate == pytest.approx((100.0 + 600.0) / 2)
         assert snapshots["POI001"].male_rate == 0.0
+
+
+def _poi_area(area_cd: str) -> poi.PoiArea:
+    """POI 입력 계약 테스트용 유효 영역을 만든다."""
+    geometry = box(0, 0, 100, 100)
+    return poi.PoiArea(
+        area_cd=area_cd,
+        area_nm=f"장소 {area_cd}",
+        geometry=geometry,
+        area_m2=geometry.area,
+    )
+
+
+class TestRealtimePoiContract:
+    """실시간 POI 코드가 한 실행에 고정된 Master와 일치하는지 검증한다."""
+
+    @pytest.mark.parametrize(
+        "raw_code",
+        [None, "", " POI001", "POI1", "POI１２３", 1, True],
+    )
+    def test_rejects_null_or_invalid_area_codes(self, raw_code):
+        table = pa.table({"AREA_CD": [raw_code]})
+
+        with pytest.raises(main.RealtimePoiContractError, match="ASCII 숫자 3자리"):
+            main._validate_realtime_poi_contract(table, (_poi_area("POI001"),))
+
+    def test_rejects_missing_area_code_column(self):
+        with pytest.raises(main.RealtimePoiContractError, match="AREA_CD 컬럼"):
+            main._validate_realtime_poi_contract(
+                pa.table({"AREA_NM": ["장소"]}),
+                (_poi_area("POI001"),),
+            )
+
+    def test_rejects_duplicate_area_codes(self):
+        table = pa.table({"AREA_CD": ["POI001", "POI001"]})
+
+        with pytest.raises(main.RealtimePoiContractError, match="중복"):
+            main._validate_realtime_poi_contract(table, (_poi_area("POI001"),))
+
+    def test_rejects_codes_absent_from_selected_master(self):
+        table = pa.table({"AREA_CD": ["POI001", "POI132"]})
+
+        with pytest.raises(main.RealtimePoiContractError, match="POI132"):
+            main._validate_realtime_poi_contract(table, (_poi_area("POI001"),))
+
+    def test_allows_realtime_to_omit_master_codes(self):
+        table = pa.table({"AREA_CD": ["POI001"]})
+        areas = (_poi_area("POI001"), _poi_area("POI002"))
+
+        assert main._validate_realtime_poi_contract(table, areas) == frozenset(
+            {"POI001"}
+        )
+
+    def test_run_rejects_unknown_code_before_baseline_or_output(self, monkeypatch):
+        """Master 불일치를 baseline 계산이나 Silver 쓰기 전에 차단한다."""
+        window_start = datetime(2026, 8, 12, 14, 5, tzinfo=KST)
+        realtime = pa.Table.from_pylist(
+            [_forecast_row("POI132", first_hour=15, slots=1)]
+        )
+        monkeypatch.setattr(
+            main.storage,
+            "read_realtime_silver",
+            lambda _window: realtime,
+        )
+        monkeypatch.setattr(
+            main.poi,
+            "load_poi_master_areas",
+            lambda _ref: (_poi_area("POI001"),),
+        )
+        monkeypatch.setattr(
+            main,
+            "_baseline_cells",
+            lambda *_args: pytest.fail("Master 불일치 뒤 baseline을 읽으면 안 됩니다."),
+        )
+        monkeypatch.setattr(
+            main.storage,
+            "write_normalized_silver",
+            lambda *_args, **_kwargs: pytest.fail("잘못된 입력으로 출력하면 안 됩니다."),
+        )
+
+        with pytest.raises(main.RealtimePoiContractError, match="POI132"):
+            main.run(window_start)
 
 
 class TestFilterGridRowsForHour:
@@ -258,8 +357,13 @@ class TestFilterGridRowsForHour:
 def test_run_rejects_empty_current_window_cells(monkeypatch):
     """현재 target이 비면 미래와 달리 성공 manifest를 남기지 않고 실패한다."""
     window_start = datetime(2026, 8, 12, 14, 5, tzinfo=KST)
-    monkeypatch.setattr(main.storage, "read_realtime_silver", lambda _window: pa.table({}))
-    monkeypatch.setattr(main.poi, "load_poi_areas", lambda _path: ())
+    empty_realtime = pa.table({"AREA_CD": pa.array([], type=pa.string())})
+    monkeypatch.setattr(
+        main.storage,
+        "read_realtime_silver",
+        lambda _window: empty_realtime,
+    )
+    monkeypatch.setattr(main.poi, "load_poi_master_areas", lambda _ref: ())
     monkeypatch.setattr(main, "_baseline_cells", lambda _cache, _target: {})
 
     with pytest.raises(ValueError, match="현재 window"):

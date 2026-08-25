@@ -1,7 +1,10 @@
 """poi.py: POI shapefile 로딩, 위상 오류 복구, 캐싱 테스트."""
 
+import pyarrow as pa
 import pytest
-from shapely.geometry import GeometryCollection, LineString, Point
+import shapely
+from core.poi_master import PoiMasterRef
+from shapely.geometry import GeometryCollection, LineString, Point, box
 
 import poi
 
@@ -67,3 +70,84 @@ def test_select_largest_polygon_picks_biggest_piece_from_multipolygon():
     multi = MultiPolygon([small, big])
     result = poi._select_largest_polygon(multi, area_cd="POI999")
     assert result.equals(big)
+
+
+def _master_table(rows: list[dict]) -> pa.Table:
+    """S3 POI Master의 exact schema로 테스트 table을 만든다."""
+    schema = pa.schema(
+        [
+            ("AREA_CD", pa.string()),
+            ("AREA_NM", pa.string()),
+            ("CATEGORY", pa.string()),
+            ("ENG_NM", pa.string()),
+            ("SOURCE_NO", pa.int64()),
+            ("GEOMETRY_WKB", pa.binary()),
+            ("AREA_M2", pa.float64()),
+        ]
+    )
+    return pa.Table.from_pylist(rows, schema=schema)
+
+
+def _master_row(area_cd: str, geometry=None) -> dict:
+    """유효한 EPSG:5179 POI Master 행 하나를 만든다."""
+    selected = geometry or box(950_000, 1_940_000, 950_100, 1_940_100)
+    return {
+        "AREA_CD": area_cd,
+        "AREA_NM": f"장소 {area_cd}",
+        "CATEGORY": "공원",
+        "ENG_NM": f"Place {area_cd}",
+        "SOURCE_NO": int(area_cd[-3:]),
+        "GEOMETRY_WKB": shapely.to_wkb(selected),
+        "AREA_M2": selected.area,
+    }
+
+
+def test_load_poi_master_areas_decodes_one_exact_ref_once(monkeypatch):
+    """Normalizer가 중앙 ref의 WKB를 읽고 cache하며 latest를 별도 조회하지 않는다."""
+    ref = PoiMasterRef(
+        mode="s3",
+        manifest_uri=(
+            "s3://test/source_snapshot_manifest/poi_master/dt=2026-08-25/hh=01/"
+            "logical=20260825T010000000000Z/revision=0000000000.json"
+        ),
+        manifest_sha256="a" * 64,
+    )
+    calls = []
+    table = _master_table([_master_row("POI001"), _master_row("POI132")])
+
+    def fake_read(selected_ref):
+        """고정 ref 호출을 기록하고 fixture table을 반환한다."""
+        calls.append(selected_ref)
+        return table
+
+    poi.load_poi_master_areas.cache_clear()
+    monkeypatch.setattr(poi, "read_poi_master", fake_read)
+
+    first = poi.load_poi_master_areas(ref)
+    second = poi.load_poi_master_areas(ref)
+
+    assert calls == [ref]
+    assert first is second
+    assert [area.area_cd for area in first] == ["POI001", "POI132"]
+    assert all(area.geometry.is_valid and area.area_m2 > 0 for area in first)
+
+
+def test_load_poi_master_areas_rejects_duplicate_or_unsorted_codes(monkeypatch):
+    """손상된 registry 순서를 조용히 정렬하거나 중복 제거하지 않는다."""
+    ref = PoiMasterRef(
+        mode="s3",
+        manifest_uri=(
+            "s3://test/source_snapshot_manifest/poi_master/dt=2026-08-25/hh=01/"
+            "logical=20260825T010000000000Z/revision=0000000000.json"
+        ),
+        manifest_sha256="b" * 64,
+    )
+    poi.load_poi_master_areas.cache_clear()
+    monkeypatch.setattr(
+        poi,
+        "read_poi_master",
+        lambda _ref: _master_table([_master_row("POI132"), _master_row("POI001")]),
+    )
+
+    with pytest.raises(ValueError, match="고유 오름차순"):
+        poi.load_poi_master_areas(ref)
