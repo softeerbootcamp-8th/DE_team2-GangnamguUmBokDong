@@ -108,6 +108,27 @@ def test_exact_window_returns_highest_contiguous_correction() -> None:
     assert artifact.byte_sha256 == sha256_hex(artifact.payload)
 
 
+def test_optional_exact_window_returns_none_only_for_empty_prefix() -> None:
+    """선택 API는 exact authority prefix가 실제로 비었을 때만 None을 반환한다."""
+    assert _catalog({}).exact_window_or_none("cultural_event", LOGICAL) is None
+
+
+def test_optional_exact_window_does_not_hide_revision_gap() -> None:
+    """비어 있지 않은 손상 authority를 PARTIAL fallback 대상으로 축소하지 않는다."""
+    source = "cultural_event"
+    objects = {
+        _key(source, LOGICAL, revision): _manifest(
+            LOGICAL,
+            revision,
+            source_id=source,
+        )
+        for revision in (0, 2)
+    }
+
+    with pytest.raises(ContractViolation, match="빈틈없이"):
+        _catalog(objects).exact_window_or_none(source, LOGICAL)
+
+
 def test_latest_at_or_before_selects_latest_logical_then_revision() -> None:
     """기준 이전 최신 logical·correction을 두 단계로 선택한다."""
     source = "bike_station_realtime"

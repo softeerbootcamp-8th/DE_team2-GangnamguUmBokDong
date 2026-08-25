@@ -7,12 +7,13 @@ from typing import ClassVar
 from zoneinfo import ZoneInfo
 
 import httpx
+import pytest
+
 import manifest as manifest_module
 import pipeline
-import pytest
 import storage
 from adapters.base import FetchErrorKind, FetchResult, adapter
-from config.schema import Backfill, Policies, Quality, Schedule, SourceConfig
+from config.schema import Backfill, Fetch, Policies, Quality, Schedule, SourceConfig
 from config.schema import Storage as StorageConfig
 from manifest import FailureReason, RunStatus, Stage
 
@@ -183,6 +184,88 @@ class TestFreshFetchSuccess:
         assert result.missing.basis == "parts"
         assert result.completeness == 1.0
 
+    def test_refetch_all_replaces_successes_from_prior_transient_round(
+        self, scripted_adapter, client
+    ):
+        """mutable source의 round retry는 서로 다른 snapshot page를 섞지 않는다."""
+        scripted_adapter.results = [
+            [
+                FetchResult(
+                    key="a", payload=_chunk("old-a"), error=None, expected_total=2
+                ),
+                FetchResult(
+                    key="b",
+                    payload=None,
+                    error=FetchErrorKind.TRANSIENT,
+                    expected_total=None,
+                ),
+            ],
+            [
+                FetchResult(
+                    key="a", payload=_chunk("new-a"), error=None, expected_total=2
+                ),
+                FetchResult(
+                    key="b", payload=_chunk("new-b"), error=None, expected_total=None
+                ),
+            ],
+        ]
+
+        result = pipeline.execute_window(
+            _config(), WINDOW_START, client=client, sleep_fn=lambda seconds: None
+        )
+
+        assert result.status is RunStatus.SUCCEEDED
+        assert result.artifacts.bronze.revision == 1
+        assert storage.read_bronze(
+            "t_source", WINDOW_START, ["a"], revision=0
+        ) == [_chunk("old-a")]
+        assert storage.read_bronze(
+            "t_source", WINDOW_START, ["a", "b"], revision=1
+        ) == [
+            _chunk("new-a"),
+            _chunk("new-b"),
+        ]
+
+    def test_retry_missing_preserves_successes_from_prior_transient_round(
+        self, scripted_adapter, client
+    ):
+        """고정 격자 source의 round retry는 이미 성공한 조각을 유지한다."""
+        scripted_adapter.results = [
+            [
+                FetchResult(
+                    key="a", payload=_chunk("old-a"), error=None, expected_total=2
+                ),
+                FetchResult(
+                    key="b",
+                    payload=None,
+                    error=FetchErrorKind.TRANSIENT,
+                    expected_total=None,
+                ),
+            ],
+            [
+                FetchResult(
+                    key="a", payload=_chunk("new-a"), error=None, expected_total=2
+                ),
+                FetchResult(
+                    key="b", payload=_chunk("new-b"), error=None, expected_total=None
+                ),
+            ],
+        ]
+        config = _config(fetch=Fetch(retry_mode="retry_missing"))
+
+        result = pipeline.execute_window(
+            config, WINDOW_START, client=client, sleep_fn=lambda seconds: None
+        )
+
+        assert result.status is RunStatus.SUCCEEDED
+        assert result.artifacts.bronze.revision == 0
+        assert storage.read_bronze(
+            "t_source", WINDOW_START, ["a", "b"], revision=0
+        ) == [
+            _chunk("old-a"),
+            _chunk("new-b"),
+        ]
+
     def test_unvisited_planned_part_fails_zero_missing_ratio_gate(
         self, scripted_adapter, client
     ):
@@ -229,6 +312,36 @@ class TestSkipBranch:
 
         assert result.status == RunStatus.SKIPPED
         assert scripted_adapter.fetch_calls == 1  # 다시 호출되지 않았다
+
+    def test_completed_partial_keeps_existing_skip_contract(
+        self, scripted_adapter, client
+    ):
+        """누락을 허용한 PARTIAL은 전역 의미를 바꾸지 않고 일반 재실행을 건너뛴다."""
+        scripted_adapter.results = [
+            [
+                FetchResult(
+                    key="a", payload=_chunk("a"), error=None, expected_total=2
+                ),
+                FetchResult(
+                    key="b",
+                    payload=None,
+                    error=FetchErrorKind.PERMANENT,
+                    expected_total=None,
+                ),
+            ]
+        ]
+        config = _config(
+            quality=Quality(
+                max_drop_ratio=1.0, max_missing_ratio=0.6, allow_empty=True
+            )
+        )
+        partial = pipeline.execute_window(config, WINDOW_START, client=client)
+        assert partial.status is RunStatus.PARTIAL
+
+        skipped = pipeline.execute_window(config, WINDOW_START, client=client)
+
+        assert skipped.status is RunStatus.SKIPPED
+        assert scripted_adapter.fetch_calls == 1
 
 
 class TestForceBranch:
@@ -509,6 +622,224 @@ class TestBronzeReuseBranch:
         )  # 두 번째 실행에서 다시 fetch하지 않았다
         assert result.status == RunStatus.SUCCEEDED
         assert result.stage == Stage.COMPLETED
+        assert result.artifacts.bronze.revision == first.artifacts.bronze.revision
+
+
+class TestFetchErrorRecovery:
+    """fetch_error 재실행은 소스 정책에 맞게 Bronze를 다시 확보한다."""
+
+    def test_refetch_all_creates_new_revision_and_preserves_prior(
+        self, scripted_adapter, client
+    ):
+        """전체 재수집은 새 revision을 발표하고 이전 원본도 보존한다."""
+        scripted_adapter.results = [
+            [
+                FetchResult(
+                    key="a", payload=_chunk("old-a"), error=None, expected_total=2
+                ),
+                FetchResult(
+                    key="b",
+                    payload=None,
+                    error=FetchErrorKind.PERMANENT,
+                    expected_total=None,
+                ),
+            ]
+        ]
+        config = _config()
+        failed = pipeline.execute_window(
+            config, WINDOW_START, client=client, sleep_fn=lambda seconds: None
+        )
+        assert failed.failure_reason is FailureReason.FETCH_ERROR
+
+        scripted_adapter.results = [
+            [
+                FetchResult(
+                    key="a", payload=_chunk("new-a"), error=None, expected_total=2
+                ),
+                FetchResult(
+                    key="b", payload=_chunk("new-b"), error=None, expected_total=None
+                ),
+            ]
+        ]
+        recovered = pipeline.execute_window(config, WINDOW_START, client=client)
+
+        assert recovered.status is RunStatus.SUCCEEDED
+        assert scripted_adapter.fetch_calls == 2
+        assert failed.artifacts.bronze.revision == 0
+        assert recovered.artifacts.bronze.revision == 1
+        assert storage.read_bronze(
+            config.source_id, WINDOW_START, ["a"], revision=0
+        ) == [_chunk("old-a")]
+        assert storage.read_bronze(
+            config.source_id, WINDOW_START, ["a", "b"], revision=1
+        ) == [
+            _chunk("new-a"),
+            _chunk("new-b"),
+        ]
+
+    def test_retry_missing_preserves_successful_parts(
+        self, scripted_adapter, client
+    ):
+        """안정적인 조각 소스는 기존 성공분을 유지하고 누락분만 다시 받는다."""
+        scripted_adapter.results = [
+            [
+                FetchResult(
+                    key="a", payload=_chunk("old-a"), error=None, expected_total=2
+                ),
+                FetchResult(
+                    key="b",
+                    payload=None,
+                    error=FetchErrorKind.PERMANENT,
+                    expected_total=None,
+                ),
+            ]
+        ]
+        config = _config(fetch=Fetch(retry_mode="retry_missing"))
+        failed = pipeline.execute_window(
+            config, WINDOW_START, client=client, sleep_fn=lambda seconds: None
+        )
+        assert failed.failure_reason is FailureReason.FETCH_ERROR
+
+        scripted_adapter.results = [
+            [
+                FetchResult(
+                    key="a", payload=_chunk("new-a"), error=None, expected_total=2
+                ),
+                FetchResult(
+                    key="b", payload=_chunk("new-b"), error=None, expected_total=None
+                ),
+            ]
+        ]
+        recovered = pipeline.execute_window(config, WINDOW_START, client=client)
+
+        assert recovered.status is RunStatus.SUCCEEDED
+        assert scripted_adapter.fetch_calls == 2
+        assert failed.artifacts.bronze.revision == 0
+        assert recovered.artifacts.bronze.revision == 1
+        assert storage.read_bronze(
+            config.source_id, WINDOW_START, ["a"], revision=0
+        ) == [_chunk("old-a")]
+        assert storage.read_bronze(
+            config.source_id, WINDOW_START, ["a", "b"], revision=1
+        ) == [
+            _chunk("old-a"),
+            _chunk("new-b"),
+        ]
+
+    def test_retry_missing_without_known_missing_falls_back_to_full_refetch(
+        self, scripted_adapter, client
+    ):
+        """누락 key가 없는 fetch_error는 타겟 재시도가 불가능해 전체 재조회한다."""
+        scripted_adapter.results = [
+            [
+                FetchResult(
+                    key="old", payload=_chunk("old"), error=None, expected_total=0
+                )
+            ]
+        ]
+        config = _config(fetch=Fetch(retry_mode="retry_missing"))
+        failed = pipeline.execute_window(config, WINDOW_START, client=client)
+        assert failed.failure_reason is FailureReason.FETCH_ERROR
+        assert failed.missing.parts == ()
+
+        scripted_adapter.results = [
+            [
+                FetchResult(
+                    key="new", payload=_chunk("new"), error=None, expected_total=1
+                )
+            ]
+        ]
+        recovered = pipeline.execute_window(config, WINDOW_START, client=client)
+
+        assert recovered.status is RunStatus.SUCCEEDED
+        assert recovered.artifacts.bronze.parts == ("new",)
+        assert failed.artifacts.bronze.revision == 0
+        assert recovered.artifacts.bronze.revision == 1
+        assert storage.read_bronze(
+            config.source_id, WINDOW_START, ["old"], revision=0
+        ) == [_chunk("old")]
+        assert storage.read_bronze(
+            config.source_id, WINDOW_START, ["new"], revision=1
+        ) == [_chunk("new")]
+
+    def test_stale_daily_window_does_not_refetch_current_snapshot(
+        self, scripted_adapter, client, monkeypatch
+    ):
+        """다음 날 과거 일일 task를 재실행해도 현재 응답을 옛 날짜에 쓰지 않는다."""
+        monkeypatch.setattr(pipeline, "_now", lambda: WINDOW_START.replace(hour=15))
+        scripted_adapter.results = [
+            [
+                FetchResult(
+                    key="a", payload=_chunk("a"), error=None, expected_total=2
+                ),
+                FetchResult(
+                    key="b",
+                    payload=None,
+                    error=FetchErrorKind.PERMANENT,
+                    expected_total=None,
+                ),
+            ]
+        ]
+        config = _config(schedule=Schedule(interval="1d"))
+        failed = pipeline.execute_window(config, WINDOW_START, client=client)
+        assert failed.failure_reason is FailureReason.FETCH_ERROR
+
+        monkeypatch.setattr(
+            pipeline, "_now", lambda: WINDOW_START.replace(day=13, hour=3)
+        )
+        scripted_adapter.results = [
+            [
+                FetchResult(
+                    key="a", payload=_chunk("new-a"), error=None, expected_total=2
+                ),
+                FetchResult(
+                    key="b", payload=_chunk("new-b"), error=None, expected_total=None
+                ),
+            ]
+        ]
+        blocked = pipeline.execute_window(config, WINDOW_START, client=client)
+
+        assert blocked.status is RunStatus.FAILED
+        assert blocked.failure_reason is FailureReason.FETCH_ERROR
+        assert scripted_adapter.fetch_calls == 1
+        assert blocked.artifacts.bronze.revision == failed.artifacts.bronze.revision
+
+    def test_daily_window_refetches_within_same_kst_day(
+        self, scripted_adapter, client, monkeypatch
+    ):
+        """정상적인 당일 Airflow retry는 일일 전체본을 다시 수집한다."""
+        now = WINDOW_START.replace(hour=15)
+        monkeypatch.setattr(pipeline, "_now", lambda: now)
+        scripted_adapter.results = [
+            [
+                FetchResult(
+                    key="a", payload=_chunk("old-a"), error=None, expected_total=2
+                ),
+                FetchResult(
+                    key="b",
+                    payload=None,
+                    error=FetchErrorKind.PERMANENT,
+                    expected_total=None,
+                ),
+            ]
+        ]
+        config = _config(schedule=Schedule(interval="1d"))
+        pipeline.execute_window(config, WINDOW_START, client=client)
+
+        scripted_adapter.results = [
+            [
+                FetchResult(
+                    key="a", payload=_chunk("new-a"), error=None, expected_total=2
+                ),
+                FetchResult(
+                    key="b", payload=_chunk("new-b"), error=None, expected_total=None
+                ),
+            ]
+        ]
+        recovered = pipeline.execute_window(config, WINDOW_START, client=client)
+
+        assert recovered.status is RunStatus.SUCCEEDED
+        assert scripted_adapter.fetch_calls == 2
 
 
 class TestBackfillBranch:
@@ -547,6 +878,14 @@ class TestBackfillBranch:
         assert result.missing.parts == ()
         assert result.revision == 0
         assert set(result.artifacts.bronze.parts) == {"a", "b"}
+        assert first.artifacts.bronze.revision == 0
+        assert result.artifacts.bronze.revision == 1
+        assert storage.read_bronze(
+            config.source_id, WINDOW_START, ["a"], revision=0
+        ) == [_chunk("a")]
+        assert storage.read_bronze(
+            config.source_id, WINDOW_START, ["a", "b"], revision=1
+        ) == [_chunk("a"), _chunk("b")]
 
     def test_backfill_fetches_missing_even_if_stage_is_bronze_written(
         self, scripted_adapter, client
@@ -619,6 +958,27 @@ class TestDropRatioGate:
         assert result.status == RunStatus.FAILED
         assert result.failure_reason == FailureReason.QUALITY_GATE
         assert result.artifacts.silver is None
+
+    def test_quality_gate_retry_reuses_bronze(self, scripted_adapter, client):
+        """fetch 정책은 deterministic 품질 실패에서 외부 API를 다시 호출하지 않는다."""
+        scripted_adapter.results = [
+            [FetchResult(key="a", payload=_chunk("a"), error=None, expected_total=None)]
+        ]
+        scripted_adapter.rows_by_key = {"a": {"col": None}}
+        config = _config(
+            quality=Quality(
+                max_drop_ratio=0.0, max_missing_ratio=0.0, allow_empty=False
+            ),
+            columns={"col": pipeline_make_required_str_spec()},
+        )
+        first = pipeline.execute_window(config, WINDOW_START, client=client)
+        assert first.failure_reason is FailureReason.QUALITY_GATE
+
+        second = pipeline.execute_window(config, WINDOW_START, client=client)
+
+        assert second.failure_reason is FailureReason.QUALITY_GATE
+        assert scripted_adapter.fetch_calls == 1
+        assert second.artifacts.bronze.revision == first.artifacts.bronze.revision
 
 
 def pipeline_make_required_str_spec():
@@ -1112,7 +1472,7 @@ class TestSourceSnapshotAuthority:
 
 
 class TestRetryMarkerSync:
-    """#11 백필 DAG가 읽을 `_retry_queue` 마커를 pipeline이 실제로 쓰는지 확인한다."""
+    """legacy 백필 호환용 `_retry_queue` 마커 동작을 검증한다."""
 
     def _backfill_config(self, **overrides):
         return _config(backfill=Backfill(enabled=True, max_age="1d"), **overrides)

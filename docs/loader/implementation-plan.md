@@ -1,7 +1,7 @@
 # Loader와 Gold publication 구조
 
 > **현재 구현:** `loader/gold/`, `gold_cli.py`, `serving_cli.py`와 Airflow
-> `realtime_tick`이 사용하는 적재 경로를 설명한다. 코드 확인일: 2026-08-24.
+> `realtime_tick`이 사용하는 적재 경로를 설명한다. 코드 확인일: 2026-08-25.
 
 ## 역할
 
@@ -48,6 +48,12 @@ Gold schema가 아니다. 현재 target은 단수형 `station`, 통합 `event`, 
 | `seed:weather_grid` | `weather_grid` | 단기·초단기 forecast source YAML의 동일한 34개 grid |
 | `event:cultural_event` | `event:cultural_event` | Exact cultural source snapshot |
 | `event:performance_event` | `event:performance_event` | Exact performance snapshot와 stadium coordinate asset |
+
+행사 exact source authority가 없더라도 같은 window의 diagnostic이 검증 가능한 completed
+`PARTIAL`이고 기존 `publication_state`와 actual publication manifest가 유효하면 새
+Gold를 만들지 않고 기존 publication을 유지한다. 이때 CLI outcome만 `stale`이며 state의
+logical time을 전진시키지 않으므로 API freshness는 기존 publication 시각을 그대로 본다.
+단순 authority 누락, 손상된 authority, 최초 PARTIAL 또는 손상된 기존 state는 실패한다.
 
 `station-master-correction`, `station-release`, `weather-forecast` 값은 parser 호환을 위해
 남아 있지만 실행 시 실패한다. 이 standalone authority는 retired됐으며 coordinated serving

@@ -20,10 +20,6 @@ quality:
   max_missing_ratio: 0.1
   allow_empty: true
 
-backfill:
-  enabled: true
-  max_age: 7d
-
 policies:
   required_missing: drop_row
   required_outlier: drop_row

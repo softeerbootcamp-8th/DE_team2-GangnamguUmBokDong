@@ -1,7 +1,7 @@
 # Collector 데이터 계약
 
 > 상태: 현재 코드 기준<br>
-> 코드 확인일: 2026-08-24
+> 코드 확인일: 2026-08-25
 
 이 문서는 Collector가 외부 API 응답을 어떤 schema와 저장 계층으로 생산하는지 설명한다. Column별 type, required, range, enum과 정책의 최종 기준은 `collector/sources/*.yaml`이다. Gold/PostGIS schema는 `docs/gold/`에서 별도로 관리한다.
 
@@ -32,8 +32,11 @@ bronze/hot/<source_id>/dt=YYYY-MM-DD/hh=HH/HHMM/revision=NNNNNNNNNN/part=<part_k
 - API page, 기상 격자 또는 POI 같은 fetch part별 gzip JSON이다.
 - 응답 원문에 가깝게 보존하며 validation 이전의 재개 지점이다.
 - part가 도착할 때마다 즉시 쓴다.
-- 일반 재시도는 manifest가 가리키는 Hot Bronze revision을 재사용한다.
-- `--force`와 backfill correction은 기존 원본을 지우지 않고 새 immutable revision을 만든다.
+- 저장·품질 실패와 과거 일일 window 재시도는 manifest가 가리키는 Hot Bronze
+  revision을 재사용한다.
+- 최초 수집·`refetch_all`·`--force`·backfill correction은 기존 원본을 지우지 않고
+  새 immutable revision을 만든다. `retry_missing` correction은 기존 성공 조각과
+  새 누락 조각을 새 revision에 합친다.
 - Hot object를 쓰기 전에 `_cold_pending/<source_id>/dt=YYYY-MM-DD/` 아래 immutable
   marker를 만든다. Cold worker는 전체 날짜를 훑지 않고 안정화 기간 6일이 지난 pending
   날짜만 처리한다.

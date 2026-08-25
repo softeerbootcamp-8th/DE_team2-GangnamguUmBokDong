@@ -1,6 +1,28 @@
 # Airflow 구현 계획
 
-> **보관 문서:** 구현 당시의 상세 계획을 보존한 자료다. 현재 DAG 이름, 주기와 인프라 구성은 이 문서가 아니라 [Airflow 운영 구조와 데이터 흐름](./explain.md) 및 실제 코드를 기준으로 판단한다.
+> **보관 문서:** 구현 당시의 상세 계획을 보존한 자료다. 아래 본문에 남은
+> Backfill·Bronze Compaction 설계는 현재 운영 계약이 아니다. 현행 DAG 이름, 주기와
+> 인프라 구성은 실제 `airflow/dags/`, `airflow/orchestration/` 및 Collector 코드를
+> 기준으로 판단한다.
+>
+> 현행 책임과 구현 상태는 다음과 같다.
+>
+> - 범용 Backfill DAG는 없다. 일일 source의 누락이 합의된 허용치를 넘어서
+>   `fetch_error`가 되면 당일 task retry에서 Collector가 기존 부분 Bronze를 비우고
+>   전체를 다시 수집한다. 허용치 이내 누락은 `PARTIAL`(exit 0)이어서 downstream
+>   task가 스케줄되지만 데이터 사용 여부는 소비자별 정책이 결정한다. 생활인구는
+>   actual 승격을 건너뛰고 추정을 계속하며, 행사는 기존 state·manifest가 일치할 때만
+>   Gold 행과 state를 변경하지 않는다. Bronze 확보 후 실패 manifest가 남은 품질·후속
+>   저장 실패는 기존 Bronze를 재사용한다.
+> - 대여이력은 일반 백필이 아니라 `+1시간`과 `D-6`의 `--force` correction으로
+>   늦은 반납 기록을 보강한다.
+> - `daily_compaction`은 대여이력 D-6 correction 뒤 Silver를 날짜별 Archive로 묶는다.
+>   대여소 실시간·기상 실황 Archive는 이 replay와 독립적으로 처리한다. Bronze를
+>   압축하는 작업이 아니다.
+> - 영구 원본용 Cold Bronze archive/compaction은 아직 구현하지 않았다.
+> - `--backfill`, retry marker와 manifest의 backfill 필드는 기존 코드·manifest 파싱
+>   호환을 위해 유지한다. 운영 설정은 marker를 만들거나 발견하지 않으며, 기존
+>   `_retry_queue` 객체는 비활성 상태로 별도 정리할 대상이다.
 
 ## 1. 목적
 
@@ -161,7 +183,11 @@ Airflow는 Collector 내부 품질 게이트를 다시 판정하지 않고 **프
 | `SKIPPED` | `0` | `SUCCESS` |
 | `FAILED` | non-zero | Task 실패 → Airflow retry |
 
-`PARTIAL`은 일부 quarantine 또는 일부 조각 누락이 존재하더라도 Collector의 `max_missing_ratio`·`max_drop_ratio` 게이트를 통과하고 `stage=completed`까지 간 상태다. Airflow는 이를 다시 실패로 재판정하지 않는다.
+`PARTIAL`은 일부 quarantine 또는 일부 조각 누락이 존재하더라도 Collector의
+`max_missing_ratio`·`max_drop_ratio` 게이트를 통과하고 `stage=completed`까지 간
+상태다. Airflow는 Collector task를 다시 실패로 재판정하지 않지만, 이는 PARTIAL
+Silver가 모든 downstream 입력으로 허용된다는 뜻이 아니다. 각 소비자가 authority,
+명시적 PARTIAL 보정 또는 기존 publication 유지 중 자기 source 정책을 적용한다.
 
 Collector 세부 결과의 최종 근거는 S3 `_manifest/{source_id}/.../{HHMM}.json`이다. manifest에는 `status`, `stage`, `failure_reason`, `attempt`, `revision`, `counts`, `missing`, `drop_ratio`, `completeness`, `artifacts`, `backfill_status` 등이 기록될 수 있다.
 

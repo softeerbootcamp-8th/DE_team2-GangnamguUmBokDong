@@ -5,6 +5,7 @@ S3를 타는 통합 경로는 test_compaction_run.py에서 따로 본다. 여기
 """
 
 from datetime import datetime
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pyarrow as pa
@@ -17,6 +18,7 @@ from compaction import (
     silver_signature,
     window_start_from_key,
 )
+from config import loader as config_loader
 from config.schema import (
     Backfill,
     ColumnSpec,
@@ -29,6 +31,7 @@ from config.schema import Storage as StorageConfig
 from core.s3 import S3Object
 
 KST = ZoneInfo("Asia/Seoul")
+SOURCES_DIR = Path(__file__).resolve().parents[1] / "sources"
 
 
 def _config(**overrides):
@@ -258,8 +261,17 @@ class TestLookbackDays:
 
         assert lookback_days(config) == RECOVERY_DAYS
 
-    def test_recovery_floor_is_at_least_a_week(self):
-        assert RECOVERY_DAYS >= 7
+    def test_recovery_floor_keeps_d6_correction_for_next_day_retry(self):
+        """D-6 correction 당일 압축이 실패해도 다음 날 D-7에서 다시 검사한다."""
+
+        assert RECOVERY_DAYS == 8
+
+    def test_rental_production_config_keeps_d7_in_recovery_sweep(self):
+        """운영 대여이력에서 지연 backfill을 꺼도 Archive 복구 범위는 줄지 않는다."""
+        config = config_loader.load("bike_rental_history", base_dir=SOURCES_DIR)
+
+        assert config.backfill is None
+        assert lookback_days(config) == 8
 
     def test_sub_day_max_age_rounds_up_and_adds_boundary_day(self):
         config = _config(backfill=Backfill(enabled=True, max_age="30h"))

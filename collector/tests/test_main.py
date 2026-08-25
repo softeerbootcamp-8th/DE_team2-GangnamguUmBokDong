@@ -7,9 +7,8 @@ from datetime import datetime
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
-import pytest
-
 import main
+import pytest
 from manifest import RunStatus
 
 KST = ZoneInfo("Asia/Seoul")
@@ -67,6 +66,23 @@ class TestExitCodeFor:
 class TestCheckDueAfterSeconds:
     """Airflow freshness gate가 파싱하는 --check-due-after-seconds JSON 출력을 검증한다."""
 
+    def test_latest_source_config_version_uses_final_revision(self, monkeypatch):
+        """Freshness 판정은 최신 authority revision의 config version을 비교한다."""
+        logical = datetime(2026, 8, 24, 10, 10, tzinfo=KST)
+        snapshots = (
+            SimpleNamespace(manifest=SimpleNamespace(config_version="old")),
+            SimpleNamespace(manifest=SimpleNamespace(config_version="current")),
+        )
+        monkeypatch.setattr(
+            main.manifest_module,
+            "load_source_snapshots",
+            lambda source_id, logical_dttm: snapshots,
+        )
+
+        assert main._latest_source_uses_config(
+            "weather_ultra_short_live", logical, "current"
+        )
+
     def test_due_true_when_never_collected(self, monkeypatch, capsys):
         monkeypatch.setattr(
             main.storage, "latest_source_snapshot_logical_dttm", lambda *a, **k: None
@@ -86,6 +102,7 @@ class TestCheckDueAfterSeconds:
         }
 
     def test_due_false_when_within_threshold(self, monkeypatch, capsys):
+        """현재 config authority가 아직 신선하면 수집을 건너뛴다."""
         now = datetime(2026, 8, 24, 10, 15, tzinfo=KST)
         last = datetime(2026, 8, 24, 10, 12, tzinfo=KST)
 
@@ -98,6 +115,7 @@ class TestCheckDueAfterSeconds:
         monkeypatch.setattr(
             main.storage, "latest_source_snapshot_logical_dttm", lambda *a, **k: last
         )
+        monkeypatch.setattr(main, "_latest_source_uses_config", lambda *a, **k: True)
 
         code = main.main(
             ["--source", "weather_ultra_short_live", "--check-due-after-seconds", "600"]
@@ -110,6 +128,7 @@ class TestCheckDueAfterSeconds:
         assert payload["last_logical_dttm"] == last.isoformat()
 
     def test_due_true_once_threshold_elapsed(self, monkeypatch, capsys):
+        """현재 config authority도 freshness 시간이 지나면 다시 수집한다."""
         now = datetime(2026, 8, 24, 10, 25, tzinfo=KST)
         last = datetime(2026, 8, 24, 10, 12, tzinfo=KST)
 
@@ -130,6 +149,37 @@ class TestCheckDueAfterSeconds:
         assert code == 0
         payload = json.loads(capsys.readouterr().out)
         assert payload["due"] is True
+
+    def test_due_true_when_latest_authority_uses_old_config(
+        self, monkeypatch, capsys
+    ):
+        """YAML 배포 직후에는 신선한 옛 authority라도 새 설정으로 다시 수집한다."""
+        now = datetime(2026, 8, 24, 10, 15, tzinfo=KST)
+        last = datetime(2026, 8, 24, 10, 12, tzinfo=KST)
+
+        class _FixedDatetime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                """고정된 KST 현재 시각을 반환한다."""
+                return now
+
+        monkeypatch.setattr(main, "datetime", _FixedDatetime)
+        monkeypatch.setattr(
+            main.storage, "latest_source_snapshot_logical_dttm", lambda *a, **k: last
+        )
+        monkeypatch.setattr(main, "_latest_source_uses_config", lambda *a, **k: False)
+
+        code = main.main(
+            [
+                "--source",
+                "weather_ultra_short_live",
+                "--check-due-after-seconds",
+                "600",
+            ]
+        )
+
+        assert code == 0
+        assert json.loads(capsys.readouterr().out)["due"] is True
 
 
 class TestMain:

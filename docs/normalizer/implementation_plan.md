@@ -37,7 +37,7 @@ latest successful nowcast ┘
 - Station master 보강은 정적인 CELL geometry만 필요하므로 미래 파일을 제외한 최신 성공
   nowcast를 사용할 수 있다.
 - Collector 입력은 source snapshot authority가 가리키는 Parquet을 읽는다. EMPTY는
-  실패하며, 허용된 source만 PARTIAL fallback을 사용할 수 있다.
+  실패하며, 현재 `population_realtime`만 검증된 exact PARTIAL fallback을 사용할 수 있다.
 
 ## 공간 계약
 

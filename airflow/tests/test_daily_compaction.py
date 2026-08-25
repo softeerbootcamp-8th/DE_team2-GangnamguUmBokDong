@@ -16,7 +16,7 @@ class TestCompactionTask:
         assert "uv run --frozen python compact.py --source bike_station_realtime" in task.bash_command
 
     def test_passes_no_date_so_collector_derives_its_own_range(self, dag):
-        """검사 범위는 소스 설정에서 유도한다 — Airflow가 백필 창을 알 필요가 없다."""
+        """검사 범위는 Collector가 유도한다 — Airflow가 recovery 범위를 알 필요가 없다."""
         task = build_compaction_task(dag, "bike_rental_history")
 
         assert "--date" not in task.bash_command
