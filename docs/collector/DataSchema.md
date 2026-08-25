@@ -37,9 +37,15 @@ bronze/hot/<source_id>/dt=YYYY-MM-DD/hh=HH/HHMM/revision=NNNNNNNNNN/part=<part_k
 - 최초 수집·`--force`·backfill correction은 기존 원본을 지우지 않고 새 immutable
   revision을 만든다. backfill correction은 기존 성공 조각과 새 누락 조각을 새
   revision에 합친다.
+- Hot object를 쓰기 전에 `_cold_pending/<source_id>/dt=YYYY-MM-DD/` 아래 immutable
+  marker를 만든다. Cold worker는 전체 날짜를 훑지 않고 안정화 기간 6일이 지난 pending
+  날짜만 처리한다.
 - Silver Archive 대상 여부와 관계없이 모든 Collector source의 검증된 날짜 revision은
   `bronze/cold/<source_id>/dt=YYYY-MM-DD/sha256=...parquet`에 원본 gzip bytes 그대로
   장기 보관한다.
+- Cold object의 checksum·row count readback이 끝나면 포함된 Hot object에
+  `cold_compacted=true` 태그를 붙인 뒤 marker를 제거한다. Hot 30일 Lifecycle은 이
+  태그가 있는 object에만 적용되므로 Cold 실패 원본은 삭제되지 않는다.
 - 모든 source에서 Cold Bronze가 검증되면 최신 authority가 아닌 Silver를 객체 생성 후
   30일간 보존한 다음 삭제한다. 일 단위 Archive 대상 source는 Archive와 현재 authority
   signature 일치도 추가로 검증하고
