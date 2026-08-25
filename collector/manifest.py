@@ -68,7 +68,7 @@ class FailureReason(str, Enum):
 
 
 class BronzeArtifacts(BaseModel):
-    """bronze 계층에 쓰인 조각들의 위치 정보."""
+    """bronze 계층에 쓰인 조각들의 위치와 Hot Bronze revision 정보."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
     prefix: str

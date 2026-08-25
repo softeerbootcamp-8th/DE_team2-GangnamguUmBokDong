@@ -144,6 +144,9 @@ def test_prepare_pins_support_refs_with_same_client_and_bucket(monkeypatch) -> N
     )
     monkeypatch.setattr(serving_cli, "prepare_serving_plan", prepare_plan)
     monkeypatch.setattr(
+        serving_cli, "_emit_source_selection_metadata", lambda *_args: None
+    )
+    monkeypatch.setattr(
         serving_cli,
         "get_connection",
         lambda: nullcontext("connection"),
@@ -160,6 +163,12 @@ def test_prepare_pins_support_refs_with_same_client_and_bucket(monkeypatch) -> N
     assert captured["rental_support_sta_ids"] is rental_ref
     assert captured["return_support_sta_ids"] is return_ref
     assert captured["inference_eligible_sta_ids"] == ("ST-1",)
+    assert source_catalog.calls == [
+        ("latest", "bike_station_master"),
+        ("exact", "bike_station_realtime"),
+        ("latest", "weather_short_term_forecast"),
+        ("latest", "weather_ultra_short_forecast"),
+    ]
 
 
 def test_finalize_returns_only_four_exact_refs(monkeypatch) -> None:
