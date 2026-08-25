@@ -65,6 +65,25 @@ resource "aws_iam_role_policy" "emr_service_extra_describe" {
           "ec2:DescribeInstanceCreditSpecifications",
         ]
         Resource = "*"
+      },
+      {
+        # AmazonEMRServicePolicy_v2의 PassRoleForEC2 statement는 iam:PassRole을
+        # 하드코딩된 기본 이름 "EMR_EC2_DefaultRole"에만 허용한다 — 우리 EC2
+        # instance profile role 이름은 gng-ubd-emr-ec2라 이 조건에 안 걸려서,
+        # EMR 서비스가 노드를 띄울 때 이 role을 인스턴스에 붙일 권한이 아예
+        # 없었다. RunInstances가 인스턴스 프로필을 못 붙여 그대로 실패하고
+        # "insufficient EC2 permissions"로만 뭉뚱그려져서 원인 특정이 어려웠다
+        # (2026-08-25, 인스턴스가 0개 생성된 것으로 실측 확인 — AWS 공식
+        # AmazonEMRServicePolicy_v2 원문과 대조해 발견).
+        Sid      = "PassCustomEmrEc2RoleToLaunchedInstances"
+        Effect   = "Allow"
+        Action   = "iam:PassRole"
+        Resource = aws_iam_role.emr_ec2.arn
+        Condition = {
+          StringLike = {
+            "iam:PassedToService" = "ec2.amazonaws.com*"
+          }
+        }
       }
     ]
   })
