@@ -30,6 +30,14 @@ EMR_CORE_INSTANCE_COUNT = int(os.environ.get("AWS_EMR_CORE_INSTANCE_COUNT", "2")
 # 합리적인 기본값이 없으므로, terraform이 `config/prod.env`에 자동으로 채워주는
 # 값(`aws_subnet.public[0].id`, `terraform/data.tf`)을 그대로 읽는다.
 EMR_SUBNET_ID = os.environ.get("AWS_EMR_SUBNET_ID", "")
+# Instances.EmrManagedMasterSecurityGroup/EmrManagedSlaveSecurityGroup을 안 넘기면
+# EMR이 기본 보안그룹을 스스로 만들려고 하는데, 그러려면 ec2:CreateSecurityGroup을
+# 호출할 VPC 자체에 `for-use-with-amazon-emr-managed-policies` 태그가 있어야 한다
+# (AmazonEMRServicePolicy_v2의 조건부 권한) — 그 태그를 VPC 전체에 붙이는 대신,
+# 미리 만들어 태그해둔 보안그룹 2개(terraform/emr.tf의 aws_security_group.emr_master/
+# emr_core)를 명시적으로 넘겨서 이 문제 자체를 피한다(2026-08-25, 실측 확인).
+EMR_MASTER_SG_ID = os.environ.get("AWS_EMR_MASTER_SG_ID", "")
+EMR_CORE_SG_ID = os.environ.get("AWS_EMR_CORE_SG_ID", "")
 # 기본값은 AWS CLI가 관례적으로 쓰는 이름(EMR_DefaultRole 등)이 아니라 이
 # 프로젝트의 terraform(`terraform/emr.tf`)이 실제로 만드는 역할 이름
 # (`${var.project}-emr-service`/`${var.project}-emr-ec2`, `variables.tf`의
@@ -408,6 +416,12 @@ def run_emr_feature_mart_job(
             "AWS_EMR_SUBNET_ID가 비어 있습니다 — m4.large는 VPC 서브넷 지정 없이 못 뜹니다. "
             "terraform output -raw subnet_id 값을 config/prod.env(AWS_EMR_SUBNET_ID)에 채우세요."
         )
+    if not EMR_MASTER_SG_ID or not EMR_CORE_SG_ID:
+        raise RuntimeError(
+            "AWS_EMR_MASTER_SG_ID/AWS_EMR_CORE_SG_ID가 비어 있습니다 — 이게 없으면 EMR이 기본 "
+            "보안그룹을 스스로 만들려다 VPC 태그 조건에 막혀 실패합니다. terraform이 만든 "
+            "aws_security_group.emr_master/emr_core의 ID를 config/prod.env에 채우세요."
+        )
 
     master_type = master_instance_type or EMR_MASTER_INSTANCE_TYPE
     core_type = core_instance_type or EMR_CORE_INSTANCE_TYPE
@@ -480,6 +494,8 @@ def run_emr_feature_mart_job(
                 },
             ],
             "Ec2SubnetId": EMR_SUBNET_ID,
+            "EmrManagedMasterSecurityGroup": EMR_MASTER_SG_ID,
+            "EmrManagedSlaveSecurityGroup": EMR_CORE_SG_ID,
             "KeepJobFlowAliveWhenNoSteps": False,
             "TerminationProtected": False,
         },
@@ -677,6 +693,12 @@ def create_emr_cluster(
             "AWS_EMR_SUBNET_ID가 비어 있습니다 — m4.large는 VPC 서브넷 지정 없이 못 뜹니다. "
             "terraform output -raw subnet_id 값을 config/prod.env(AWS_EMR_SUBNET_ID)에 채우세요."
         )
+    if not EMR_MASTER_SG_ID or not EMR_CORE_SG_ID:
+        raise RuntimeError(
+            "AWS_EMR_MASTER_SG_ID/AWS_EMR_CORE_SG_ID가 비어 있습니다 — 이게 없으면 EMR이 기본 "
+            "보안그룹을 스스로 만들려다 VPC 태그 조건에 막혀 실패합니다. terraform이 만든 "
+            "aws_security_group.emr_master/emr_core의 ID를 config/prod.env에 채우세요."
+        )
 
     master_type = master_instance_type or EMR_MASTER_INSTANCE_TYPE
     core_type = core_instance_type or EMR_CORE_INSTANCE_TYPE
@@ -708,6 +730,8 @@ def create_emr_cluster(
                 },
             ],
             "Ec2SubnetId": EMR_SUBNET_ID,
+            "EmrManagedMasterSecurityGroup": EMR_MASTER_SG_ID,
+            "EmrManagedSlaveSecurityGroup": EMR_CORE_SG_ID,
             "KeepJobFlowAliveWhenNoSteps": True,
             "TerminationProtected": False,
         },

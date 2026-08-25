@@ -221,6 +221,11 @@ locals {
     # ID라 aws_infra_task.py에 합리적인 기본값을 둘 수 없어 여기서 채운다
     # (2026-08-25, 첫 실제 EMR 실행에서 이게 빠져 실패한 걸 발견).
     AWS_EMR_SUBNET_ID=${aws_subnet.public[0].id}
+    # EMR이 기본 보안그룹을 스스로 만들려면 VPC에 특정 태그가 있어야 하는데
+    # (AmazonEMRServicePolicy_v2의 조건부 권한), 그 대신 미리 만들어둔 보안그룹을
+    # 명시적으로 넘긴다 — emr.tf의 aws_security_group.emr_master/emr_core 참고.
+    AWS_EMR_MASTER_SG_ID=${aws_security_group.emr_master.id}
+    AWS_EMR_CORE_SG_ID=${aws_security_group.emr_core.id}
     GOLD_STATION_MASTER_LOOKBACK_HOURS=168
     GOLD_STATION_REALTIME_LOOKBACK_HOURS=24
 

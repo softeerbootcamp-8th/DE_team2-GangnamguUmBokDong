@@ -31,6 +31,8 @@ def _default_emr_subnet(monkeypatch):
     설정된 정상 상태"를 기본으로 가정하게 한다. 빈 값일 때의 동작만 검증하는
     테스트는 이 값을 다시 ""로 덮어쓴다."""
     monkeypatch.setattr(infra, "EMR_SUBNET_ID", "subnet-0123456789abcdef0")
+    monkeypatch.setattr(infra, "EMR_MASTER_SG_ID", "sg-master0123456789")
+    monkeypatch.setattr(infra, "EMR_CORE_SG_ID", "sg-core0123456789ab")
 
 
 def _stub_emr_client(monkeypatch) -> Stubber:
@@ -102,6 +104,11 @@ def test_create_emr_cluster_sets_keep_alive_and_managed_policy_tag(monkeypatch):
     # m4.large는 서브넷 없이 못 뜬다 — 첫 실제 실행에서 이게 빠져 "Subnet is
     # required" VALIDATION_ERROR로 실패했다(2026-08-25).
     assert captured["Instances"]["Ec2SubnetId"] == infra.EMR_SUBNET_ID
+    # 보안그룹을 명시하지 않으면 EMR이 스스로 만들려다 VPC 태그 조건에 막혀
+    # "insufficient EC2 permissions: ec2:CreateSecurityGroup"로 실패했다
+    # (2026-08-25, 두 번째 실제 실행에서 실측).
+    assert captured["Instances"]["EmrManagedMasterSecurityGroup"] == infra.EMR_MASTER_SG_ID
+    assert captured["Instances"]["EmrManagedSlaveSecurityGroup"] == infra.EMR_CORE_SG_ID
     # 기본값(AWS_EMR_BOOTSTRAP_SCRIPT_S3_URI 미설정)에서도 BootstrapActions가
     # 실려야 한다 — 예전엔 빈 문자열이 기본값이라 아무도 안 채우면 training
     # 패키지가 안 깔린 클러스터가 뜨고 첫 스텝이 ImportError로 조용히
@@ -203,6 +210,21 @@ def test_create_emr_cluster_raises_immediately_when_subnet_id_missing(monkeypatc
     monkeypatch.setattr(infra, "_get_boto3_client", _fail)
 
     with pytest.raises(RuntimeError, match="AWS_EMR_SUBNET_ID"):
+        infra.create_emr_cluster(core_instance_count=3, mock_override=infra.MOCK_OVERRIDE_FORCE_REAL)
+
+
+def test_create_emr_cluster_raises_immediately_when_security_groups_missing(monkeypatch):
+    """AWS_EMR_MASTER_SG_ID/AWS_EMR_CORE_SG_ID가 비어 있으면 boto3를 부르기도
+    전에 즉시 실패해야 한다 — 비워두면 EMR이 기본 보안그룹을 스스로 만들려다
+    VPC 태그 조건에 막혀 실패한다(2026-08-25, 두 번째 실제 실행에서 실측)."""
+    monkeypatch.setattr(infra, "EMR_MASTER_SG_ID", "")
+
+    def _fail(*args, **kwargs):
+        raise AssertionError("보안그룹 검증에서 걸러졌어야 하므로 boto3 클라이언트를 만들면 안 됨")
+
+    monkeypatch.setattr(infra, "_get_boto3_client", _fail)
+
+    with pytest.raises(RuntimeError, match="AWS_EMR_MASTER_SG_ID"):
         infra.create_emr_cluster(core_instance_count=3, mock_override=infra.MOCK_OVERRIDE_FORCE_REAL)
 
 

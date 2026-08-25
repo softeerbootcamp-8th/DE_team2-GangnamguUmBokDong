@@ -34,7 +34,14 @@ resource "aws_subnet" "public" {
   # EC2에 퍼블릭 IP를 자동 할당한다. 노출 통제는 SG가 한다.
   map_public_ip_on_launch = true
 
-  tags = { Name = "${var.project}-public-${var.azs[count.index]}" }
+  tags = {
+    Name = "${var.project}-public-${var.azs[count.index]}"
+    # AmazonEMRServicePolicy_v2의 ec2:RunInstances/CreateNetworkInterface
+    # 권한이 이 태그가 붙은 서브넷+보안그룹 조합에만 조건부로 허용된다
+    # (CreateInTaggedNetwork 구문, aws:ResourceTag 조건) — 없으면 EMR
+    # 클러스터가 노드를 못 띄운다(2026-08-25, 첫 실제 실행에서 실측 확인).
+    "for-use-with-amazon-emr-managed-policies" = "true"
+  }
 }
 
 resource "aws_route_table" "public" {

@@ -66,6 +66,80 @@ resource "aws_iam_instance_profile" "emr_ec2" {
   role     = aws_iam_role.emr_ec2.name
 }
 
+# --- EMR 마스터/코어 보안그룹 (EMR이 알아서 만들게 두지 않고 직접 관리) ---
+#
+# RunJobFlow에서 Instances.EmrManagedMasterSecurityGroup/EmrManagedSlaveSecurityGroup을
+# 안 넘기면 EMR이 기본 보안그룹을 스스로 만들려고 시도하는데, 그러려면
+# ec2:CreateSecurityGroup을 호출할 VPC 자체가 `for-use-with-amazon-emr-managed-policies`
+# 태그를 갖고 있어야 한다(AmazonEMRServicePolicy_v2의 조건부 권한, 2026-08-25 첫
+# 실제 실행에서 실측 확인 — "Service role ... has insufficient EC2 permissions:
+# ec2:CreateSecurityGroup"). VPC 전체에 태그를 붙이는 것보다, 필요한 보안그룹
+# 딱 2개만 미리 만들어서 명시적으로 넘기는 쪽이 범위가 좁고 terraform으로
+# diff도 볼 수 있어 더 안전하다 — AWS 공식 문서도 이 방식을 지원한다.
+resource "aws_security_group" "emr_master" {
+  name        = "${var.project}-emr-master"
+  description = "EMR primary(master) node"
+  vpc_id      = aws_vpc.main.id
+
+  tags = {
+    Name = "${var.project}-emr-master"
+    # 이 태그가 있어야 AmazonEMRServicePolicy_v2의 Authorize/RevokeSecurityGroup*
+    # 권한 조건(aws:ResourceTag)이 충족된다 — EMR이 만드는 기본 보안그룹은
+    # 스스로 이 태그를 붙이지만, 우리가 직접 만드는 건 수동으로 붙여야 한다.
+    "for-use-with-amazon-emr-managed-policies" = "true"
+  }
+}
+
+resource "aws_security_group" "emr_core" {
+  name        = "${var.project}-emr-core"
+  description = "EMR core node"
+  vpc_id      = aws_vpc.main.id
+
+  tags = {
+    Name                                       = "${var.project}-emr-core"
+    "for-use-with-amazon-emr-managed-policies" = "true"
+  }
+}
+
+# 마스터/코어 노드 간 내부 통신(HDFS/YARN 등 다수 포트)은 전부 허용한다 — EMR
+# 기본 관리형 보안그룹도 같은 방식(자기 자신 + 상대 보안그룹 전체 허용)이라
+# 포트를 개별로 나열하지 않는다.
+resource "aws_vpc_security_group_ingress_rule" "emr_master_from_master" {
+  security_group_id            = aws_security_group.emr_master.id
+  referenced_security_group_id = aws_security_group.emr_master.id
+  ip_protocol                  = "-1"
+}
+
+resource "aws_vpc_security_group_ingress_rule" "emr_master_from_core" {
+  security_group_id            = aws_security_group.emr_master.id
+  referenced_security_group_id = aws_security_group.emr_core.id
+  ip_protocol                  = "-1"
+}
+
+resource "aws_vpc_security_group_ingress_rule" "emr_core_from_master" {
+  security_group_id            = aws_security_group.emr_core.id
+  referenced_security_group_id = aws_security_group.emr_master.id
+  ip_protocol                  = "-1"
+}
+
+resource "aws_vpc_security_group_ingress_rule" "emr_core_from_core" {
+  security_group_id            = aws_security_group.emr_core.id
+  referenced_security_group_id = aws_security_group.emr_core.id
+  ip_protocol                  = "-1"
+}
+
+resource "aws_vpc_security_group_egress_rule" "emr_master_all" {
+  security_group_id = aws_security_group.emr_master.id
+  cidr_ipv4         = "0.0.0.0/0"
+  ip_protocol       = "-1"
+}
+
+resource "aws_vpc_security_group_egress_rule" "emr_core_all" {
+  security_group_id = aws_security_group.emr_core.id
+  cidr_ipv4         = "0.0.0.0/0"
+  ip_protocol       = "-1"
+}
+
 # --- 상시 EC2(Airflow)가 EC2/EMR을 직접 호출하는 데 필요한 권한 ---
 #
 # `airflow/orchestration/aws_infra_task.py`는 별도 access key 없이 상시 EC2의
