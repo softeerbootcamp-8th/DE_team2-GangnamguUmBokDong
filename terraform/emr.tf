@@ -140,6 +140,27 @@ data "aws_iam_policy_document" "airflow_infra_control" {
     actions   = ["iam:PassRole"]
     resources = [aws_iam_role.emr_service.arn, aws_iam_role.emr_ec2.arn]
   }
+
+  # EMR은 클러스터 생성/정리에 계정 전역 서비스 연결 역할(service-linked role)
+  # `AWSServiceRoleForEMRCleanup`이 필요한데, 이 계정엔 아직 없고 호출 주체에
+  # 이걸 자동 생성할 권한도 없어서 RunJobFlow가 VALIDATION_ERROR로 즉시
+  # TERMINATED_WITH_ERRORS 됐다(2026-08-25 첫 실제 실행, 실측 확인). AWS가
+  # 권장하는 최소 권한 패턴대로 이 역할 하나만, EMR 서비스가 요청할 때만
+  # 만들 수 있게 좁혀서 추가한다 — 한 번 생성되면 계정 전체에 영구히 남으므로
+  # (서비스 연결 역할은 계정당 1개, 재사용됨) 이후로는 이 권한이 다시 쓰일
+  # 일이 없다.
+  statement {
+    sid       = "EmrServiceLinkedRoleBootstrap"
+    effect    = "Allow"
+    actions   = ["iam:CreateServiceLinkedRole"]
+    resources = ["arn:aws:iam::*:role/aws-service-role/elasticmapreduce.amazonaws.com/AWSServiceRoleForEMRCleanup"]
+
+    condition {
+      test     = "StringEquals"
+      variable = "iam:AWSServiceName"
+      values   = ["elasticmapreduce.amazonaws.com"]
+    }
+  }
 }
 
 resource "aws_iam_policy" "airflow_infra_control" {
@@ -150,7 +171,7 @@ resource "aws_iam_policy" "airflow_infra_control" {
   # 확인됨(AccessDeniedException). IAM은 정책 rename API가 아예 없어서
   # name이 바뀌면 terraform이 자동으로 삭제+재생성하므로, 내용을 고칠 때마다
   # 이 접미사 숫자를 올리면 CreatePolicyVersion을 아예 안 거치게 된다.
-  name        = "${var.project}-airflow-infra-control-v2"
+  name        = "${var.project}-airflow-infra-control-v3"
   description = "Airflow 상시 EC2가 학습 EC2/EMR 클러스터를 직접 제어하는 데 필요한 권한"
   policy      = data.aws_iam_policy_document.airflow_infra_control.json
 }

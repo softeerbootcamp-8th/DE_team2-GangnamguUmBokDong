@@ -713,12 +713,20 @@ def create_emr_cluster(
 
     start_time = time.time()
     while time.time() - start_time < timeout_seconds:
-        state = emr.describe_cluster(ClusterId=cluster_id)["Cluster"]["Status"]["State"]
+        status = emr.describe_cluster(ClusterId=cluster_id)["Cluster"]["Status"]
+        state = status["State"]
         logger.info("[EMR] 클러스터 '%s' 상태: %s", cluster_id, state)
         if state == "WAITING":
             return cluster_id
         if state in ("TERMINATED", "TERMINATED_WITH_ERRORS"):
-            raise RuntimeError(f"EMR 클러스터 '{cluster_id}' 생성 중 비정상 종료: {state}")
+            # StateChangeReason(Code/Message)이 실제 원인(부트스트랩 실패, 용량 부족,
+            # 설정 오류 등)을 담고 있는데 예전엔 이걸 버리고 상태값만 남겨서, 첫 실제
+            # 실행에서 실패했을 때 콘솔을 따로 뒤져야 원인을 알 수 있었다(2026-08-25).
+            reason = status.get("StateChangeReason", {})
+            raise RuntimeError(
+                f"EMR 클러스터 '{cluster_id}' 생성 중 비정상 종료: {state} "
+                f"(code={reason.get('Code')}, message={reason.get('Message')})"
+            )
         time.sleep(30)
 
     # 타임아웃 시 강제 종료 — 안 그러면 cluster_id가 호출부(DAG)의 XCom에 한 번도
