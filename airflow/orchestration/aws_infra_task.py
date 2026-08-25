@@ -51,9 +51,16 @@ TRAINING_RUNS_PREFIX = os.environ.get("TRAINING_RUNS_PREFIX", f"{_MODELS_PREFIX}
 MONTHLY_RETRAIN_CLUSTER_NAME_PREFIX = os.environ.get(
     "AWS_MONTHLY_RETRAIN_CLUSTER_NAME_PREFIX", "ml-monthly-retrain-"
 )
-# `emr_orphan_reaper.py`가 이 나이(시간)를 넘긴 클러스터를 강제 종료한다 — 정상
-# 사이클(평가 30분 + 재학습 루프 최대 6시간)보다 충분히 여유를 둔 값.
-EMR_ORPHAN_MAX_AGE_HOURS = float(os.environ.get("AWS_EMR_ORPHAN_MAX_AGE_HOURS", "8"))
+# `emr_orphan_reaper.py`가 종료 대상을 정하는 유일한 시간 기준: 클러스터에 지금
+# 활성(PENDING/RUNNING) 스텝이 없고, 마지막 스텝이 끝난 지(스텝이 아예 없으면
+# 클러스터 생성 이후) 이 시간이 지나야만 "재학습 루프가 정말 다 끝났다"고 보고
+# 종료 대상으로 삼는다 — 스텝 사이 짧은 간격(리사이즈 대기 등)에 오검출로 죽이지
+# 않기 위한 여유. **활성 스텝이 있는 클러스터는 나이·시간 기준과 무관하게 이
+# reaper가 절대 건드리지 않는다** — 1년치 데이터를 단일 머신으로 학습하는 데
+# 실측 24시간이 걸린 이력이 있어(2026-08), "N시간 넘으면 무조건 종료" 같은
+# 시간 기반 절대 상한은 정상적으로 오래 걸리는 학습을 죽일 위험이 더 크다고
+# 판단했다.
+EMR_IDLE_GRACE_MINUTES = float(os.environ.get("AWS_EMR_IDLE_GRACE_MINUTES", "15"))
 
 # is_mock_mode()/is_emr_mock_mode()의 override 인자에 허용되는 값.
 MOCK_OVERRIDE_FORCE_MOCK = "force_mock"
@@ -556,6 +563,47 @@ def list_active_emr_clusters(
                 "created_at": cluster["Status"]["Timeline"]["CreationDateTime"],
             })
     return clusters
+
+
+def get_cluster_step_activity(
+    cluster_id: str, *, region_name: str | None = None, mock_override: str | None = None
+) -> dict[str, Any]:
+    """이 클러스터에 지금 활성 스텝이 있는지, 마지막 스텝이 언제 끝났는지 확인한다.
+
+    `emr_orphan_reaper.py`가 "재학습 DAG가 지금 이 클러스터를 실제로 쓰고
+    있는가"를 판단하는 데 쓴다 — Airflow 자체에 물어보지 않는다. Airflow 3.x
+    Task SDK는 태스크 프로세스 안에서 다른 DAG의 실행 상태를 직접(DB 조회)
+    확인하는 지원 경로가 없다(태스크는 격리된 프로세스에서 API 서버와 HTTP로만
+    통신 — 3.3.1 소스로 확인함, 2026-08). 대신 "이 EMR 클러스터에 지금 실행
+    중이거나 대기 중인 스텝이 있는가"는 "그 DAG의 재학습 루프가 지금 이
+    클러스터를 쓰고 있는가"와 사실상 같은 질문이라, EMR 쪽 실제 상태만으로
+    충분하고 오히려 더 신뢰할 수 있다(Airflow 쪽 기록이 어떻게 꼬여있든 무관).
+
+    args:
+        cluster_id: 대상 EMR 클러스터 ID
+        region_name: AWS 리전명
+        mock_override: `is_emr_mock_mode()` 참고
+    returns:
+        dict: {"has_active_step": bool, "last_step_completed_at": datetime | None}
+            스텝이 하나도 없거나 전부 아직 안 끝났으면 `last_step_completed_at`은
+            None — 호출부가 클러스터 생성 시각으로 대신 판단해야 한다.
+    """
+    if is_emr_mock_mode(mock_override):
+        return {"has_active_step": False, "last_step_completed_at": None}
+
+    emr = _get_boto3_client("emr", region_name)
+    steps = emr.list_steps(ClusterId=cluster_id)["Steps"]
+    active_states = {"PENDING", "CANCEL_PENDING", "RUNNING"}
+    has_active_step = any(step["Status"]["State"] in active_states for step in steps)
+    end_times = [
+        step["Status"]["Timeline"]["EndDateTime"]
+        for step in steps
+        if step["Status"]["Timeline"].get("EndDateTime") is not None
+    ]
+    return {
+        "has_active_step": has_active_step,
+        "last_step_completed_at": max(end_times) if end_times else None,
+    }
 
 
 def create_emr_cluster(

@@ -326,3 +326,67 @@ def test_list_active_emr_clusters_mock_mode_returns_empty_without_calling_aws(mo
     monkeypatch.setattr(infra, "_get_boto3_client", _fail)
 
     assert infra.list_active_emr_clusters(mock_override=infra.MOCK_OVERRIDE_FORCE_MOCK) == []
+
+
+# --- get_cluster_step_activity() ---
+
+
+def test_get_cluster_step_activity_detects_active_step(monkeypatch):
+    stubber = _stub_emr_client(monkeypatch)
+    stubber.add_response(
+        "list_steps",
+        {
+            "Steps": [
+                {"Id": "s-old", "Status": {"State": "COMPLETED", "Timeline": {"EndDateTime": datetime(2026, 8, 25, tzinfo=UTC)}}},
+                {"Id": "s-running", "Status": {"State": "RUNNING", "Timeline": {}}},
+            ]
+        },
+    )
+    stubber.activate()
+
+    activity = infra.get_cluster_step_activity("j-1", mock_override=infra.MOCK_OVERRIDE_FORCE_REAL)
+
+    assert activity["has_active_step"] is True
+
+
+def test_get_cluster_step_activity_returns_last_completed_time_when_idle(monkeypatch):
+    stubber = _stub_emr_client(monkeypatch)
+    earlier = datetime(2026, 8, 25, 10, 0, tzinfo=UTC)
+    later = datetime(2026, 8, 25, 11, 0, tzinfo=UTC)
+    stubber.add_response(
+        "list_steps",
+        {
+            "Steps": [
+                {"Id": "s-1", "Status": {"State": "COMPLETED", "Timeline": {"EndDateTime": earlier}}},
+                {"Id": "s-2", "Status": {"State": "FAILED", "Timeline": {"EndDateTime": later}}},
+            ]
+        },
+    )
+    stubber.activate()
+
+    activity = infra.get_cluster_step_activity("j-1", mock_override=infra.MOCK_OVERRIDE_FORCE_REAL)
+
+    assert activity["has_active_step"] is False
+    assert activity["last_step_completed_at"] == later
+
+
+def test_get_cluster_step_activity_no_steps_yet(monkeypatch):
+    stubber = _stub_emr_client(monkeypatch)
+    stubber.add_response("list_steps", {"Steps": []})
+    stubber.activate()
+
+    activity = infra.get_cluster_step_activity("j-1", mock_override=infra.MOCK_OVERRIDE_FORCE_REAL)
+
+    assert activity == {"has_active_step": False, "last_step_completed_at": None}
+
+
+def test_get_cluster_step_activity_mock_mode_returns_idle_without_calling_aws(monkeypatch):
+    def _fail(*args, **kwargs):
+        raise AssertionError("mock 모드에서는 boto3 클라이언트를 만들면 안 됨")
+
+    monkeypatch.setattr(infra, "_get_boto3_client", _fail)
+
+    assert infra.get_cluster_step_activity("j-1", mock_override=infra.MOCK_OVERRIDE_FORCE_MOCK) == {
+        "has_active_step": False,
+        "last_step_completed_at": None,
+    }

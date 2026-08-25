@@ -144,5 +144,58 @@ LightGBM 분산 학습 워커를 **YARN Distributed Shell**로 기동한다. 구
   API(`terminate_cluster.as_teardown(setups=create_cluster_and_evaluate)`)로
   바꿔야 했다. (2) 그래도 Airflow 스케줄러 자체가 죽는 등 더 근본적인 장애는
   어떤 DAG 태스크도 못 구하므로, 그 실행 그래프와 완전히 독립적으로 실제 AWS
-  상태를 직접 확인해 정리하는 `emr_orphan_reaper.py`(15분마다, 8시간 초과
-  클러스터 강제 종료)를 별도 안전망으로 추가했다.
+  상태를 직접 확인해 정리하는 `emr_orphan_reaper.py`(15분마다 점검)를 별도
+  안전망으로 추가했다. 이 reaper가 "재학습이 실제로 돌고 있는지"를 판단할 때
+  Airflow에 묻지 않는 것도 중요한 설계 결정이다 — Airflow 3.x Task SDK는
+  태스크 프로세스 안에서 다른 DAG의 실행 상태를 직접 조회하는 경로를 지원하지
+  않는다(격리된 프로세스로 API 서버와 HTTP로만 통신, 3.3.1 소스로 확인). 대신
+  "이 EMR 클러스터에 지금 활성(PENDING/RUNNING) 스텝이 있는가"가 그 질문과
+  사실상 같은 의미이자 더 신뢰할 수 있는 ground truth라, `get_cluster_step_activity()`로
+  EMR 스텝 상태만 본다: 활성 스텝이 있으면 나이와 무관하게 절대 종료하지 않고,
+  없으면 마지막 스텝이 끝난 뒤(스텝이 아예 없으면 클러스터 생성 뒤) 유예
+  시간(기본 15분, `EMR_IDLE_GRACE_MINUTES`)이 지나야 종료한다. 활성 스텝이
+  있으면 나이와 무관한 시간 기반 절대 상한("N시간 넘으면 무조건 종료" 같은
+  장치)은 **일부러 두지 않았다** — 이 프로젝트는 1년치 데이터를 48GB RAM
+  단일 머신으로 학습하는 데 실측 24시간이 걸린 이력이 있어(2026-08), 분산
+  학습으로 더 빨라지길 기대하더라도 후보 프로필을 여러 번 순차 재시도하면
+  정상적인 학습도 그보다 오래 걸릴 수 있다고 판단했다 — "활성 스텝이 있다"는
+  AWS 쪽 사실 자체보다 신뢰할 만한 시간 추측은 없다.
+
+  스텝이 진짜로 멈추는 경우(예: YARN 클라이언트가 영원히 응답 없음)를 막는
+  올바른 방법은 **`_run_distributed_training_via_yarn()`의 `subprocess.run()`에
+  타임아웃을 거는 게 아니다** — YARN distributed-shell Client는 애플리케이션을
+  제출하고 지켜보기만 하는 관찰자일 뿐, 실제 작업(ApplicationMaster + 컨테이너
+  8개)은 ResourceManager/NodeManager가 관리하는 완전히 별개의 프로세스다. 그래서
+  로컬 Client 프로세스만 타임아웃으로 죽이면 EMR 스텝은 실패로 찍히는데 실제
+  분산 학습은 클러스터에서 계속 돌아 orphan이 된다 — 데이터가 커서 정상적으로
+  오래 걸리는 상황과 구분이 안 될 뿐 아니라, 다음 후보 프로필이 같은 8노드를
+  또 요청해 자원 경합까지 생길 수 있다. 진짜로 멈춘 애플리케이션을 막으려면
+  YARN 자체의 애플리케이션 타임아웃(distributed-shell Client의 `-timeout`
+  옵션, ResourceManager가 컨테이너까지 전부 정리)을 쓰는 게 맞는데, 이번
+  범위에서는 그 대신 상위 레이어의 타임아웃을 전부 넉넉하게(120시간,
+  아래 참고) 잡아 "정상적으로 오래 걸리는 학습을 죽이지 않는" 쪽을 우선했다 —
+  진짜 무한정 멈춘 애플리케이션에 대한 별도 방어는 후속 과제로 남겨둔다.
+
+  같은 이유로 `orchestrate_retrain_loop`의 Airflow `execution_timeout`
+  (`MONTHLY_RETRAIN_ORCHESTRATION_TIMEOUT`)과 학습 스텝 하나의 폴링 타임아웃
+  (`MONTHLY_TRAINING_TIMEOUT`, `submit_emr_step()`에 그대로 전달)도 원래 각각
+  6시간/3시간이었던 것을 **120시간**으로 넉넉하게 올렸다(2026-08) — 이 타임아웃이
+  발동하면 (a) 오케스트레이션 타임아웃은 teardown을 거쳐 클러스터를 통째로
+  종료시키고, (b) 학습 스텝 타임아웃은 앞서 설명한 것과 똑같이 로컬 폴링만
+  포기할 뿐 실제 YARN 앱은 안 죽는데도 `orchestrate_retrain_loop`는 "이 프로필
+  실패"로 보고 다음 후보로 넘어가버린다 — 둘 다 정상적으로 오래 걸리는 학습을
+  잘못 건드리는 방향의 실패이므로, 짧게 잡아서 얻는 이득보다 잃는 게 크다고
+  판단했다.
+
+  **대여/반납 DAG 재통합(2026-08)**: 원래 `monthly_retrain_rental`/
+  `monthly_retrain_return` 두 DAG로 나눠 각자 다른 시각(03:00/06:00)에
+  스케줄했다. 타임아웃을 120시간으로 늘리기 전에는 3시간 간격 스태거링으로
+  충분했지만, 이제는 재시도나 지연으로 두 스케줄이 겹치면 8노드 EMR 클러스터
+  2개가 동시에 뜰 수 있다 — 이 계정은 EMR에 m4.large만 허용되고 두 모델이
+  경합할 이유가 없으므로, `monthly_retrain.py` 하나 안에서 대여 사이클(평가→
+  재학습→클러스터 종료)이 완전히 끝난 뒤에만 반납 사이클이 시작하도록
+  `build_model_task_chain()`으로 태스크를 모델별로 만들고
+  `terminate_cluster_rental >> create_cluster_and_evaluate_return` 의존관계로
+  순서를 강제했다. DAG 전체의 `dagrun_timeout`은 두 모델 몫을 합쳐
+  **240시간**(`MONTHLY_RETRAIN_TOTAL_TIMEOUT`)으로 잡았다 — 반납이 대여 완료를
+  기다리는 시간까지 포함해도 여유가 있어야 하기 때문이다.

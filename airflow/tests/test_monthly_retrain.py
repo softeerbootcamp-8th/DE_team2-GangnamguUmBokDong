@@ -1,31 +1,52 @@
 """monthly_retrain DAG 구조, 스케줄 및 단일 EMR 클러스터 생애주기 오케스트레이션을
-검증한다(2026-08 재설계 — ADR-0007, EC2/SSM 경로를 EMR 스텝으로 통합)."""
+검증한다(2026-08 재설계 — ADR-0007, EC2/SSM 경로를 EMR 스텝으로 통합. 이후
+대여/반납 동시 실행을 막기 위해 한 DAG 안에서 순차 실행하도록 재통합)."""
 
+from datetime import timedelta
 from unittest.mock import MagicMock
 
 import dags.monthly_retrain as monthly_dag
-import dags.monthly_retrain_rental as monthly_rental_dag
-import dags.monthly_retrain_return as monthly_return_dag
 from airflow.task.trigger_rule import TriggerRule
 
+_DAG = monthly_dag.dag
 
-def test_monthly_retrain_dags_structure() -> None:
-    """대여 및 반납 monthly_retrain DAG의 ID, 태스크 목록 및 의존성 구조를 검증한다."""
-    rental_dag = monthly_rental_dag.dag
-    assert rental_dag.dag_id == "monthly_retrain_rental"
 
-    return_dag = monthly_return_dag.dag
-    assert return_dag.dag_id == "monthly_retrain_return"
-
+def test_monthly_retrain_is_a_single_combined_dag() -> None:
+    """대여/반납이 각자 최대 8노드 EMR 클러스터를 띄우므로, 동시에 두 개가 뜨는
+    걸 막기 위해 하나의 DAG 안에 두 모델 체인이 모두 있어야 한다."""
+    assert _DAG.dag_id == "monthly_retrain"
     expected_tasks = {
-        "create_cluster_and_evaluate",
-        "check_retrain_branch",
-        "orchestrate_retrain_loop",
-        "skip_monthly_retrain",
-        "terminate_cluster",
+        f"{name}_{model}"
+        for model in ("rental", "return")
+        for name in (
+            "create_cluster_and_evaluate",
+            "check_retrain_branch",
+            "orchestrate_retrain_loop",
+            "skip_monthly_retrain",
+            "terminate_cluster",
+        )
     }
-    assert set(rental_dag.task_ids) == expected_tasks
-    assert set(return_dag.task_ids) == expected_tasks
+    assert set(_DAG.task_ids) == expected_tasks
+
+
+def test_monthly_retrain_runs_rental_fully_before_return_starts() -> None:
+    """대여 사이클이 클러스터 종료까지 완전히 끝난 뒤에만 반납 사이클이 시작돼야
+    한다 — 두 EMR 클러스터가 동시에 뜨지 않게 하는 핵심 보장."""
+    assert monthly_dag.MODEL_EXECUTION_ORDER == ("rental", "return")
+    rental_terminate = _DAG.get_task("terminate_cluster_rental")
+    return_create = _DAG.get_task("create_cluster_and_evaluate_return")
+    assert return_create.upstream_task_ids == {"terminate_cluster_rental"}
+    assert "create_cluster_and_evaluate_return" in rental_terminate.downstream_task_ids
+    # 반납 쪽이 대여 쪽으로 역방향 의존을 만들지는 않는지도 확인.
+    assert _DAG.get_task("create_cluster_and_evaluate_rental").upstream_task_ids == set()
+
+
+def test_monthly_retrain_total_timeout_covers_both_models_sequentially() -> None:
+    """두 모델을 순차 실행하므로 전체 DAG Run 타임아웃은 모델 하나 몫(120시간)의
+    2배(240시간)로 잡아야 한다 — 반납이 대여 완료를 기다리다 총 타임아웃에
+    걸리면 안 되므로."""
+    assert _DAG.dagrun_timeout == timedelta(hours=240)
+    assert _DAG.dagrun_timeout >= 2 * monthly_dag.MONTHLY_RETRAIN_ORCHESTRATION_TIMEOUT
 
 
 def test_monthly_retrain_terminate_cluster_is_a_real_teardown() -> None:
@@ -35,29 +56,29 @@ def test_monthly_retrain_terminate_cluster_is_a_real_teardown() -> None:
     끝내버린다(Airflow 3.3.1 `_set_dag_run_terminal_state()` 실측 확인). 오직
     `is_teardown=True`인 태스크만 이 강제 skip에서 예외로 남아 실제로 실행될
     기회를 얻으므로, setup/teardown API로 표시돼 있는지까지 확인해야 한다."""
-    for dag in (monthly_rental_dag.dag, monthly_return_dag.dag):
-        terminate_cluster = dag.get_task("terminate_cluster")
-        create_cluster_and_evaluate = dag.get_task("create_cluster_and_evaluate")
+    for model_name in ("rental", "return"):
+        terminate_cluster = _DAG.get_task(f"terminate_cluster_{model_name}")
+        create_cluster_and_evaluate = _DAG.get_task(f"create_cluster_and_evaluate_{model_name}")
         assert terminate_cluster.is_teardown is True
         assert terminate_cluster.trigger_rule == TriggerRule.ALL_DONE_SETUP_SUCCESS
         assert create_cluster_and_evaluate.is_setup is True
-        assert "create_cluster_and_evaluate" in terminate_cluster.upstream_task_ids
+        assert f"create_cluster_and_evaluate_{model_name}" in terminate_cluster.upstream_task_ids
 
 
 def test_check_retrain_branch_decisions() -> None:
-    """needs_retrain 값에 따라 올바른 다운스트림 태스크로 분기한다."""
+    """needs_retrain 값에 따라 올바른(모델 접미사가 붙은) 다운스트림 태스크로 분기한다."""
     mock_ti = MagicMock()
     branch_fn = monthly_dag.make_task_check_retrain_branch("rental")
 
-    # Case 1: 재학습 필요 시 orchestrate_retrain_loop로 분기
+    # Case 1: 재학습 필요 시 orchestrate_retrain_loop_rental로 분기
     mock_ti.xcom_pull.return_value = True
     branch = branch_fn(ti=mock_ti)
-    assert branch == "orchestrate_retrain_loop"
+    assert branch == "orchestrate_retrain_loop_rental"
 
-    # Case 2: 재학습 불필요 시 skip_monthly_retrain으로 분기
+    # Case 2: 재학습 불필요 시 skip_monthly_retrain_rental로 분기
     mock_ti.xcom_pull.return_value = False
     branch = branch_fn(ti=mock_ti)
-    assert branch == "skip_monthly_retrain"
+    assert branch == "skip_monthly_retrain_rental"
 
 
 def test_create_cluster_and_evaluate_pushes_cluster_id_and_needs_retrain(monkeypatch) -> None:
