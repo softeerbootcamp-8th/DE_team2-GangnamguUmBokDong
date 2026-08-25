@@ -361,6 +361,72 @@ def test_batch_capable_distance_callback_replaces_per_pair_calls() -> None:
     )
 
 
+def test_batch_capable_distance_callback_batches_whole_projection() -> None:
+    """여러 station의 relocation·center 거리를 projection당 두 번에 계산한다."""
+    centers = (
+        DispatchCenterReference("CENTER-B", 127.06, 37.53, True),
+        DispatchCenterReference("CENTER-A", 127.03, 37.50, True),
+    )
+    batch_calls: list[tuple[tuple[tuple[float, float], tuple[float, float]], ...]] = []
+
+    def distance(*_: float) -> float:
+        """global batch 경로에서 스칼라 호출은 허용하지 않는다."""
+        raise AssertionError("scalar distance must not be called")
+
+    def batch(
+        pairs: tuple[tuple[tuple[float, float], tuple[float, float]], ...],
+    ) -> tuple[float, ...]:
+        """입력 순서를 기록하고 모든 거리를 같은 값으로 반환한다."""
+        batch_calls.append(pairs)
+        return (1.0,) * len(pairs)
+
+    distance.batch = batch  # type: ignore[attr-defined]
+    second_lon = LON + 0.0001
+    master_rows = (
+        _master_row(),
+        _master_row(RNTLS_ID="ST-2", LOT=second_lon),
+    )
+    realtime_rows = (
+        _realtime_row(),
+        _realtime_row(
+            stationId="ST-2",
+            stationName="두 번째 대여소",
+            stationLongitude=second_lon,
+        ),
+    )
+    previous = (
+        _previous(),
+        _previous(
+            sta_id="ST-2",
+            sta_nm="두 번째 기존 대여소",
+            longitude=second_lon,
+        ),
+    )
+
+    projection = _build(
+        master_rows=master_rows,
+        windows=(_window(CANDIDATE_TIME, *realtime_rows),),
+        previous=previous,
+        centers=centers,
+        distance_meters=distance,
+    )
+
+    assert tuple(record.sta_id for record in projection.records) == ("ST-1", "ST-2")
+    assert len(batch_calls) == 2
+    assert batch_calls[0] == (
+        ((LON, LAT), (LON, LAT)),
+        ((LON, LAT), (LON, LAT)),
+        ((second_lon, LAT), (second_lon, LAT)),
+        ((second_lon, LAT), (second_lon, LAT)),
+    )
+    assert batch_calls[1] == (
+        ((LON, LAT), (127.06, 37.53)),
+        ((LON, LAT), (127.03, 37.50)),
+        ((second_lon, LAT), (127.06, 37.53)),
+        ((second_lon, LAT), (127.03, 37.50)),
+    )
+
+
 def test_batch_distance_result_count_mismatch_is_rejected() -> None:
     """batch가 입력보다 적게 돌려주면 조용히 넘기지 않는다."""
     centers = (

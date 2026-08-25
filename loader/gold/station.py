@@ -163,6 +163,35 @@ class StationProjection:
             )
 
 
+@dataclass(frozen=True, slots=True)
+class _StationCandidate:
+    """projection 전 station별 master·realtime·prior 입력을 고정한다."""
+
+    station_id: str
+    previous: StationRecord | None
+    realtime_row: Mapping[str, Any] | None
+    realtime_values: tuple[str, int] | None
+    master_values: tuple[str | None, tuple[float, float] | None]
+
+
+@dataclass(frozen=True, slots=True)
+class _ResolvedStation:
+    """거리 기반 center 배정 직전의 station 전체 필드를 보관한다."""
+
+    sta_id: str
+    sta_nm: str
+    sta_addr: str
+    hold_cnt: int
+    longitude: float
+    latitude: float
+    sta_point_source_cd: str
+    weather_grid_id: str
+    master_base_dttm: datetime
+    last_seen_dttm: datetime
+    is_active: bool
+    lkg_retained: int
+
+
 def build_station_projection(
     *,
     master_snapshot: MasterSnapshot,
@@ -196,95 +225,42 @@ def build_station_projection(
         raise ContractViolation("distance_meters는 callable이어야 합니다.")
     approvals = _approval_lookup(relocation_approval)
     used_approvals: set[tuple[str, str]] = set()
-    lkg_retained = 0
-    records: list[StationRecord] = []
     candidate_by_id = window_maps[0]
-    candidate_ids = set(candidate_by_id)
-    for station_id in sorted(
-        set(previous_by_id) | candidate_ids,
-        key=lambda value: value.encode("utf-8"),
-    ):
-        previous = previous_by_id.get(station_id)
-        realtime_row = candidate_by_id.get(station_id)
-        realtime_values = _serving_realtime_values(realtime_row)
-        if previous is None and realtime_values is None:
-            continue
-        master_row = master_by_id.get(station_id)
-        master_values = _master_values(master_row)
-        point_choice = _choose_master_values_and_point(
-            station_id=station_id,
-            master_values=master_values,
+    candidates = _station_candidates(
+        candidate_by_id=candidate_by_id,
+        master_by_id=master_by_id,
+        previous_by_id=previous_by_id,
+    )
+    if getattr(distance, "batch", None) is None:
+        resolved, center_distances = _resolve_station_ordered(
+            candidates,
+            distance_meters=distance,
             master_base_dttm=master_snapshot.logical_dttm,
-            realtime_row=realtime_row,
-            previous=previous,
+            candidate_logical_dttm=candidate.logical_dttm,
+            window_maps=window_maps,
+            grid_ids=grid_ids,
+            centers=centers,
+            activation_ready=activation_ready,
             approvals=approvals,
             used_approvals=used_approvals,
+        )
+    else:
+        resolved, center_distances = _resolve_station_globally_batched(
+            candidates,
             distance_meters=distance,
+            master_base_dttm=master_snapshot.logical_dttm,
+            candidate_logical_dttm=candidate.logical_dttm,
+            window_maps=window_maps,
+            grid_ids=grid_ids,
+            centers=centers,
+            activation_ready=activation_ready,
+            approvals=approvals,
+            used_approvals=used_approvals,
         )
-        if point_choice is None:
-            if previous is None:
-                continue
-            address = previous.sta_addr
-            longitude = previous.longitude
-            latitude = previous.latitude
-            point_source = previous.sta_point_source_cd
-            master_base = previous.master_base_dttm
-            lkg_retained += 1
-        else:
-            (
-                address,
-                longitude,
-                latitude,
-                point_source,
-                master_base,
-                used_lkg,
-            ) = point_choice
-            lkg_retained += int(used_lkg)
-        if realtime_values is not None:
-            station_name, hold_count = realtime_values
-            last_seen = candidate.logical_dttm
-        else:
-            assert previous is not None
-            station_name = previous.sta_nm
-            hold_count = previous.hold_cnt
-            last_seen = (
-                candidate.logical_dttm
-                if realtime_row is not None
-                else previous.last_seen_dttm
-            )
-        weather_nx, weather_ny = latlon_to_grid(latitude, longitude)
-        weather_grid_id = f"{weather_nx}_{weather_ny}"
-        if weather_grid_id not in grid_ids:
-            raise ContractViolation(
-                f"station이 weather_grid seed 밖 격자를 참조합니다: "
-                f"{station_id} -> {weather_grid_id}"
-            )
-        center_id = _nearest_active_center(longitude, latitude, centers, distance)
-        invalid_streak = _leading_invalid_window_count(station_id, window_maps)
-        if realtime_values is not None:
-            is_active = bool(
-                (previous is not None and previous.is_active)
-                or station_id in activation_ready
-            )
-        else:
-            assert previous is not None
-            is_active = previous.is_active and invalid_streak < 3
-        records.append(
-            StationRecord(
-                sta_id=station_id,
-                sta_nm=station_name,
-                sta_addr=address,
-                hold_cnt=hold_count,
-                longitude=longitude,
-                latitude=latitude,
-                sta_point_source_cd=point_source,
-                weather_grid_id=weather_grid_id,
-                dispatch_center_id=center_id,
-                master_base_dttm=master_base,
-                last_seen_dttm=last_seen,
-                is_active=is_active,
-            )
-        )
+    records = tuple(
+        _station_record_with_center(item, centers, meters)
+        for item, meters in zip(resolved, center_distances, strict=True)
+    )
     expected_approvals = set(approvals)
     if used_approvals != expected_approvals:
         extras = sorted(expected_approvals - used_approvals)
@@ -292,7 +268,246 @@ def build_station_projection(
             "station relocation approval에 실제 반영하지 않은 여분이 있습니다: "
             f"{extras}"
         )
-    return StationProjection(tuple(records), bool(used_approvals), lkg_retained)
+    return StationProjection(
+        records,
+        bool(used_approvals),
+        sum(item.lkg_retained for item in resolved),
+    )
+
+
+def _station_candidates(
+    *,
+    candidate_by_id: Mapping[str, Mapping[str, Any]],
+    master_by_id: Mapping[str, Mapping[str, Any]],
+    previous_by_id: Mapping[str, StationRecord],
+) -> tuple[_StationCandidate, ...]:
+    """기존 UTF-8 station 순서로 projection 후보를 만든다."""
+    candidates: list[_StationCandidate] = []
+    for station_id in sorted(
+        set(previous_by_id) | set(candidate_by_id),
+        key=lambda value: value.encode("utf-8"),
+    ):
+        previous = previous_by_id.get(station_id)
+        realtime_row = candidate_by_id.get(station_id)
+        realtime_values = _serving_realtime_values(realtime_row)
+        if previous is None and realtime_values is None:
+            continue
+        candidates.append(
+            _StationCandidate(
+                station_id=station_id,
+                previous=previous,
+                realtime_row=realtime_row,
+                realtime_values=realtime_values,
+                master_values=_master_values(master_by_id.get(station_id)),
+            )
+        )
+    return tuple(candidates)
+
+
+def _resolve_station_ordered(
+    candidates: tuple[_StationCandidate, ...],
+    *,
+    distance_meters: Callable[[float, float, float, float], float],
+    master_base_dttm: datetime,
+    candidate_logical_dttm: datetime,
+    window_maps: tuple[dict[str, Mapping[str, Any]], ...],
+    grid_ids: set[str],
+    centers: tuple[DispatchCenterReference, ...],
+    activation_ready: set[str],
+    approvals: Mapping[tuple[str, str], Any],
+    used_approvals: set[tuple[str, str]],
+) -> tuple[tuple[_ResolvedStation, ...], tuple[tuple[float, ...], ...]]:
+    """batch 미지원 callback의 기존 station별 거리 평가 순서를 유지한다."""
+    resolved: list[_ResolvedStation] = []
+    center_distances: list[tuple[float, ...]] = []
+    for candidate in candidates:
+        comparisons = _master_point_comparisons(candidate)
+        comparison_meters = _checked_distances(
+            distance_meters,
+            _comparison_pairs(comparisons),
+        )
+        item = _resolve_station(
+            candidate,
+            comparisons=comparisons,
+            comparison_meters=comparison_meters,
+            master_base_dttm=master_base_dttm,
+            candidate_logical_dttm=candidate_logical_dttm,
+            window_maps=window_maps,
+            grid_ids=grid_ids,
+            activation_ready=activation_ready,
+            approvals=approvals,
+            used_approvals=used_approvals,
+        )
+        if item is None:
+            continue
+        resolved.append(item)
+        center_distances.append(
+            _checked_distances(distance_meters, _center_pairs(item, centers))
+        )
+    return tuple(resolved), tuple(center_distances)
+
+
+def _resolve_station_globally_batched(
+    candidates: tuple[_StationCandidate, ...],
+    *,
+    distance_meters: Callable[[float, float, float, float], float],
+    master_base_dttm: datetime,
+    candidate_logical_dttm: datetime,
+    window_maps: tuple[dict[str, Mapping[str, Any]], ...],
+    grid_ids: set[str],
+    centers: tuple[DispatchCenterReference, ...],
+    activation_ready: set[str],
+    approvals: Mapping[tuple[str, str], Any],
+    used_approvals: set[tuple[str, str]],
+) -> tuple[tuple[_ResolvedStation, ...], tuple[tuple[float, ...], ...]]:
+    """projection 전체 relocation과 center 거리를 각각 한 번에 계산한다."""
+    comparisons = tuple(_master_point_comparisons(item) for item in candidates)
+    comparison_distances = _checked_distance_groups(
+        distance_meters,
+        tuple(_comparison_pairs(group) for group in comparisons),
+    )
+    resolved = tuple(
+        item
+        for item in (
+            _resolve_station(
+                candidate,
+                comparisons=group,
+                comparison_meters=meters,
+                master_base_dttm=master_base_dttm,
+                candidate_logical_dttm=candidate_logical_dttm,
+                window_maps=window_maps,
+                grid_ids=grid_ids,
+                activation_ready=activation_ready,
+                approvals=approvals,
+                used_approvals=used_approvals,
+            )
+            for candidate, group, meters in zip(
+                candidates,
+                comparisons,
+                comparison_distances,
+                strict=True,
+            )
+        )
+        if item is not None
+    )
+    center_distances = _checked_distance_groups(
+        distance_meters,
+        tuple(_center_pairs(item, centers) for item in resolved),
+    )
+    return resolved, center_distances
+
+
+def _resolve_station(
+    candidate: _StationCandidate,
+    *,
+    comparisons: tuple[tuple[str, tuple[float, float], tuple[float, float]], ...],
+    comparison_meters: tuple[float, ...],
+    master_base_dttm: datetime,
+    candidate_logical_dttm: datetime,
+    window_maps: tuple[dict[str, Mapping[str, Any]], ...],
+    grid_ids: set[str],
+    activation_ready: set[str],
+    approvals: Mapping[tuple[str, str], Any],
+    used_approvals: set[tuple[str, str]],
+) -> _ResolvedStation | None:
+    """검증된 relocation 거리로 center 배정 전 station을 확정한다."""
+    point_choice = _choose_master_values_and_point(
+        station_id=candidate.station_id,
+        master_values=candidate.master_values,
+        master_base_dttm=master_base_dttm,
+        realtime_row=candidate.realtime_row,
+        previous=candidate.previous,
+        approvals=approvals,
+        used_approvals=used_approvals,
+        comparisons=comparisons,
+        comparison_meters=comparison_meters,
+    )
+    if point_choice is None:
+        if candidate.previous is None:
+            return None
+        address = candidate.previous.sta_addr
+        longitude = candidate.previous.longitude
+        latitude = candidate.previous.latitude
+        point_source = candidate.previous.sta_point_source_cd
+        master_base = candidate.previous.master_base_dttm
+        lkg_retained = 1
+    else:
+        (
+            address,
+            longitude,
+            latitude,
+            point_source,
+            master_base,
+            used_lkg,
+        ) = point_choice
+        lkg_retained = int(used_lkg)
+    if candidate.realtime_values is not None:
+        station_name, hold_count = candidate.realtime_values
+        last_seen = candidate_logical_dttm
+    else:
+        assert candidate.previous is not None
+        station_name = candidate.previous.sta_nm
+        hold_count = candidate.previous.hold_cnt
+        last_seen = (
+            candidate_logical_dttm
+            if candidate.realtime_row is not None
+            else candidate.previous.last_seen_dttm
+        )
+    weather_nx, weather_ny = latlon_to_grid(latitude, longitude)
+    weather_grid_id = f"{weather_nx}_{weather_ny}"
+    if weather_grid_id not in grid_ids:
+        raise ContractViolation(
+            "station이 weather_grid seed 밖 격자를 참조합니다: "
+            f"{candidate.station_id} -> {weather_grid_id}"
+        )
+    invalid_streak = _leading_invalid_window_count(
+        candidate.station_id,
+        window_maps,
+    )
+    if candidate.realtime_values is not None:
+        is_active = bool(
+            (candidate.previous is not None and candidate.previous.is_active)
+            or candidate.station_id in activation_ready
+        )
+    else:
+        assert candidate.previous is not None
+        is_active = candidate.previous.is_active and invalid_streak < 3
+    return _ResolvedStation(
+        sta_id=candidate.station_id,
+        sta_nm=station_name,
+        sta_addr=address,
+        hold_cnt=hold_count,
+        longitude=longitude,
+        latitude=latitude,
+        sta_point_source_cd=point_source,
+        weather_grid_id=weather_grid_id,
+        master_base_dttm=master_base,
+        last_seen_dttm=last_seen,
+        is_active=is_active,
+        lkg_retained=lkg_retained,
+    )
+
+
+def _station_record_with_center(
+    station: _ResolvedStation,
+    centers: tuple[DispatchCenterReference, ...],
+    meters: tuple[float, ...],
+) -> StationRecord:
+    """center 거리 결과를 기존 tie-break로 station record에 결합한다."""
+    return StationRecord(
+        sta_id=station.sta_id,
+        sta_nm=station.sta_nm,
+        sta_addr=station.sta_addr,
+        hold_cnt=station.hold_cnt,
+        longitude=station.longitude,
+        latitude=station.latitude,
+        sta_point_source_cd=station.sta_point_source_cd,
+        weather_grid_id=station.weather_grid_id,
+        dispatch_center_id=_nearest_active_center_from_meters(centers, meters),
+        master_base_dttm=station.master_base_dttm,
+        last_seen_dttm=station.last_seen_dttm,
+        is_active=station.is_active,
+    )
 
 
 def _validate_and_index_windows(
@@ -428,9 +643,10 @@ def _choose_master_values_and_point(
     previous: StationRecord | None,
     approvals: Mapping[tuple[str, str], Any],
     used_approvals: set[tuple[str, str]],
-    distance_meters: Callable[[float, float, float, float], float],
+    comparisons: tuple[tuple[str, tuple[float, float], tuple[float, float]], ...],
+    comparison_meters: tuple[float, ...],
 ) -> tuple[str, float, float, str, datetime, bool] | None:
-    """master LKG·fallback·>100m 승인으로 주소와 Point를 선택한다."""
+    """검증된 거리로 master LKG·fallback·>100m Point를 선택한다."""
     address, master_point = master_values
     realtime_point = (
         _optional_point(
@@ -457,33 +673,9 @@ def _choose_master_values_and_point(
             False,
         )
     master_lon, master_lat = master_point
-    comparisons: list[tuple[str, tuple[float, float], tuple[float, float]]] = []
-    if previous is not None:
-        comparisons.append(
-            (
-                "gold_vs_master",
-                (master_lon, master_lat),
-                (previous.longitude, previous.latitude),
-            )
-        )
-    if realtime_point is not None:
-        comparisons.append(
-            (
-                "master_vs_realtime",
-                (master_lon, master_lat),
-                realtime_point,
-            )
-        )
+    if len(comparison_meters) != len(comparisons):
+        raise ContractViolation("station relocation 거리 결과 수가 입력과 다릅니다.")
     approved_keys: list[tuple[str, str]] = []
-    # 비교 쌍은 최대 2개이고 승인 판정에 앞서 전부 필요하지 않을 수도 있지만,
-    # 쌍마다 RDS를 왕복하지 않도록 한 번에 계산한다 — 값은 스칼라 경로와 같다.
-    comparison_meters = _checked_distances(
-        distance_meters,
-        tuple(
-            (candidate_point, reference_point)
-            for _, candidate_point, reference_point in comparisons
-        ),
-    )
     for meters, (comparison_cd, candidate_point, reference_point) in zip(
         comparison_meters, comparisons, strict=True
     ):
@@ -508,6 +700,45 @@ def _choose_master_values_and_point(
         "bike_station_master",
         master_base_dttm,
         False,
+    )
+
+
+def _master_point_comparisons(
+    candidate: _StationCandidate,
+) -> tuple[tuple[str, tuple[float, float], tuple[float, float]], ...]:
+    """기존 순서로 station의 relocation 비교 좌표를 만든다."""
+    address, master_point = candidate.master_values
+    if address is None or master_point is None:
+        return ()
+    realtime_point = (
+        _optional_point(
+            candidate.realtime_row.get("stationLongitude"),
+            candidate.realtime_row.get("stationLatitude"),
+        )
+        if candidate.realtime_row is not None
+        else None
+    )
+    comparisons: list[tuple[str, tuple[float, float], tuple[float, float]]] = []
+    if candidate.previous is not None:
+        comparisons.append(
+            (
+                "gold_vs_master",
+                master_point,
+                (candidate.previous.longitude, candidate.previous.latitude),
+            )
+        )
+    if realtime_point is not None:
+        comparisons.append(("master_vs_realtime", master_point, realtime_point))
+    return tuple(comparisons)
+
+
+def _comparison_pairs(
+    comparisons: tuple[tuple[str, tuple[float, float], tuple[float, float]], ...],
+) -> tuple[tuple[tuple[float, float], tuple[float, float]], ...]:
+    """relocation 비교에서 PostGIS가 소비할 좌표 쌍만 반환한다."""
+    return tuple(
+        (candidate_point, reference_point)
+        for _, candidate_point, reference_point in comparisons
     )
 
 
@@ -559,20 +790,27 @@ def _leading_invalid_window_count(
     return count
 
 
-def _nearest_active_center(
-    longitude: float,
-    latitude: float,
+def _center_pairs(
+    station: _ResolvedStation,
     centers: tuple[DispatchCenterReference, ...],
-    distance_meters: Callable[[float, float, float, float], float],
-) -> str:
-    """geography 거리 최소 center를, 동률이면 ID UTF-8 순으로 선택한다."""
-    meters = _checked_distances(
-        distance_meters,
-        tuple(
-            ((longitude, latitude), (center.longitude, center.latitude))
-            for center in centers
-        ),
+) -> tuple[tuple[tuple[float, float], tuple[float, float]], ...]:
+    """station과 active center의 기존 순서 좌표 쌍을 반환한다."""
+    return tuple(
+        (
+            (station.longitude, station.latitude),
+            (center.longitude, center.latitude),
+        )
+        for center in centers
     )
+
+
+def _nearest_active_center_from_meters(
+    centers: tuple[DispatchCenterReference, ...],
+    meters: tuple[float, ...],
+) -> str:
+    """검증된 거리의 기존 meter·UTF-8 tie-break로 center를 선택한다."""
+    if len(meters) != len(centers):
+        raise ContractViolation("dispatch center 거리 결과 수가 입력과 다릅니다.")
     ranked = [
         (
             value,
@@ -582,6 +820,24 @@ def _nearest_active_center(
         for value, center in zip(meters, centers, strict=True)
     ]
     return min(ranked)[2]
+
+
+def _checked_distance_groups(
+    distance_meters: Callable[[float, float, float, float], float],
+    groups: tuple[tuple[tuple[tuple[float, float], tuple[float, float]], ...], ...],
+) -> tuple[tuple[float, ...], ...]:
+    """station별 좌표 쌍을 한 batch로 계산한 뒤 원래 경계로 복원한다."""
+    flattened = tuple(pair for group in groups for pair in group)
+    values = _checked_distances(distance_meters, flattened)
+    resolved: list[tuple[float, ...]] = []
+    offset = 0
+    for group in groups:
+        next_offset = offset + len(group)
+        resolved.append(values[offset:next_offset])
+        offset = next_offset
+    if offset != len(values):
+        raise ContractViolation("global batch 거리 결과 경계가 입력과 다릅니다.")
+    return tuple(resolved)
 
 
 def _checked_distances(
