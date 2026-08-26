@@ -19,11 +19,33 @@ logger = logging.getLogger(__name__)
 # 기본 환경변수
 DEFAULT_REGION = os.environ.get("AWS_REGION", "ap-northeast-2")
 EC2_TRAINING_INSTANCE_ID = os.environ.get("AWS_EC2_TRAINING_INSTANCE_ID", "")
-EMR_RELEASE_LABEL = os.environ.get("AWS_EMR_RELEASE_LABEL", "emr-7.2.0")
+# emr-7.2.0은 2026-08-31에 AWS 표준 지원이 끝난다(콘솔 경고, 2026-08-25) — 이
+# 리전(ap-northeast-2)에서 현재 받을 수 있는 최신 릴리스(emr-7.13.0, Spark 3.5.6/
+# Hadoop 3.4.2, `aws emr list-release-labels`로 확인)로 올린다.
+EMR_RELEASE_LABEL = os.environ.get("AWS_EMR_RELEASE_LABEL", "emr-7.13.0")
 # 이 AWS 계정은 EMR에 m4.large 외 인스턴스 타입을 허용하지 않는다.
 EMR_MASTER_INSTANCE_TYPE = os.environ.get("AWS_EMR_MASTER_INSTANCE_TYPE", "m4.large")
 EMR_CORE_INSTANCE_TYPE = os.environ.get("AWS_EMR_CORE_INSTANCE_TYPE", "m4.large")
 EMR_CORE_INSTANCE_COUNT = int(os.environ.get("AWS_EMR_CORE_INSTANCE_COUNT", "2"))
+# m4.large는 EC2-Classic을 지원하지 않아 반드시 VPC 서브넷을 명시해야 한다 — 이게
+# 없어서 첫 실제 실행에서 RunJobFlow가 "Subnet is required" VALIDATION_ERROR로
+# 즉시 실패했다(2026-08-25, 실측). 계정/리전마다 값이 다른 실제 리소스 ID라
+# 합리적인 기본값이 없으므로, terraform이 `config/prod.env`에 자동으로 채워주는
+# 값(`aws_subnet.public[0].id`, `terraform/data.tf`)을 그대로 읽는다.
+EMR_SUBNET_ID = os.environ.get("AWS_EMR_SUBNET_ID", "")
+# Instances.EmrManagedMasterSecurityGroup/EmrManagedSlaveSecurityGroup을 안 넘기면
+# EMR이 기본 보안그룹을 스스로 만들려고 하는데, 그러려면 ec2:CreateSecurityGroup을
+# 호출할 VPC 자체에 `for-use-with-amazon-emr-managed-policies` 태그가 있어야 한다
+# (AmazonEMRServicePolicy_v2의 조건부 권한) — 그 태그를 VPC 전체에 붙이는 대신,
+# 미리 만들어 태그해둔 보안그룹 2개(terraform/emr.tf의 aws_security_group.emr_master/
+# emr_core)를 명시적으로 넘겨서 이 문제 자체를 피한다(2026-08-25, 실측 확인).
+EMR_MASTER_SG_ID = os.environ.get("AWS_EMR_MASTER_SG_ID", "")
+EMR_CORE_SG_ID = os.environ.get("AWS_EMR_CORE_SG_ID", "")
+# EMR 노드에서는 docker 네트워크 이름("mlflow")이 안 풀려서 MLFLOW_TRACKING_URI
+# 기본값("http://mlflow:5000/mlflow")을 그대로 쓰면 학습 스텝이 MLflow에 못 붙는다
+# (PR 리뷰 지적, 2026-08) — terraform이 상시 EC2 사설 IP로 채운 이 값을 학습 스텝
+# 커맨드에 명시적으로 주입한다. 비어 있으면(로컬/미배포) 주입을 건너뛴다.
+EMR_MLFLOW_TRACKING_URI = os.environ.get("AWS_EMR_MLFLOW_TRACKING_URI", "")
 # 기본값은 AWS CLI가 관례적으로 쓰는 이름(EMR_DefaultRole 등)이 아니라 이
 # 프로젝트의 terraform(`terraform/emr.tf`)이 실제로 만드는 역할 이름
 # (`${var.project}-emr-service`/`${var.project}-emr-ec2`, `variables.tf`의
@@ -42,8 +64,8 @@ EMR_S3_SCRIPTS_PREFIX = os.environ.get("AWS_EMR_S3_SCRIPTS_PREFIX", "s3://local-
 # 독립적으로 다시 정의하는 것과 동일한 패턴), boto3만으로 직접 읽는다. 값이 서로
 # 어긋나면 안 되므로 한쪽을 고치면 반드시 다른 쪽도 같이 고칠 것.
 S3_BUCKET = os.environ.get("S3_BUCKET", "gangnamgu")
-_MODELS_PREFIX = os.environ.get("MODELS_PREFIX", "models")
-TRAINING_RUNS_PREFIX = os.environ.get("TRAINING_RUNS_PREFIX", f"{_MODELS_PREFIX}/training-runs")
+MODELS_PREFIX = os.environ.get("MODELS_PREFIX", "models")
+TRAINING_RUNS_PREFIX = os.environ.get("TRAINING_RUNS_PREFIX", f"{MODELS_PREFIX}/training-runs")
 
 # `make emr-package`가 올리는 위치(core/ml_core/feature_engine/training 번들 +
 # bootstrap.sh)와 반드시 같은 값이어야 한다 — `create_emr_cluster()`의
@@ -397,6 +419,18 @@ def run_emr_feature_mart_job(
         logger.info("[Mock EMR] 프로필 '%s' 피처마트 생성 EMR 클러스터 실행 및 완료 (Mock: %s)", profile_name, mock_job_id)
         return mock_job_id
 
+    if not EMR_SUBNET_ID:
+        raise RuntimeError(
+            "AWS_EMR_SUBNET_ID가 비어 있습니다 — m4.large는 VPC 서브넷 지정 없이 못 뜹니다. "
+            "terraform output -raw subnet_id 값을 config/prod.env(AWS_EMR_SUBNET_ID)에 채우세요."
+        )
+    if not EMR_MASTER_SG_ID or not EMR_CORE_SG_ID:
+        raise RuntimeError(
+            "AWS_EMR_MASTER_SG_ID/AWS_EMR_CORE_SG_ID가 비어 있습니다 — 이게 없으면 EMR이 기본 "
+            "보안그룹을 스스로 만들려다 VPC 태그 조건에 막혀 실패합니다. terraform이 만든 "
+            "aws_security_group.emr_master/emr_core의 ID를 config/prod.env에 채우세요."
+        )
+
     master_type = master_instance_type or EMR_MASTER_INSTANCE_TYPE
     core_type = core_instance_type or EMR_CORE_INSTANCE_TYPE
     core_count = core_instance_count or EMR_CORE_INSTANCE_COUNT
@@ -467,12 +501,16 @@ def run_emr_feature_mart_job(
                     "InstanceCount": core_count,
                 },
             ],
+            "Ec2SubnetId": EMR_SUBNET_ID,
+            "EmrManagedMasterSecurityGroup": EMR_MASTER_SG_ID,
+            "EmrManagedSlaveSecurityGroup": EMR_CORE_SG_ID,
             "KeepJobFlowAliveWhenNoSteps": False,
             "TerminationProtected": False,
         },
         "Steps": steps,
         "JobFlowRole": EMR_JOB_FLOW_ROLE,
         "ServiceRole": EMR_SERVICE_ROLE,
+        "LogUri": f"s3://{S3_BUCKET}/emr-logs/",
         "Tags": [{"Key": "for-use-with-amazon-emr-managed-policies", "Value": "true"}],
     }
 
@@ -659,6 +697,18 @@ def create_emr_cluster(
         logger.info("[Mock EMR] 상시 클러스터 '%s' 생성 (Mock: %s)", cluster_name or "monthly-retrain", mock_cluster_id)
         return mock_cluster_id
 
+    if not EMR_SUBNET_ID:
+        raise RuntimeError(
+            "AWS_EMR_SUBNET_ID가 비어 있습니다 — m4.large는 VPC 서브넷 지정 없이 못 뜹니다. "
+            "terraform output -raw subnet_id 값을 config/prod.env(AWS_EMR_SUBNET_ID)에 채우세요."
+        )
+    if not EMR_MASTER_SG_ID or not EMR_CORE_SG_ID:
+        raise RuntimeError(
+            "AWS_EMR_MASTER_SG_ID/AWS_EMR_CORE_SG_ID가 비어 있습니다 — 이게 없으면 EMR이 기본 "
+            "보안그룹을 스스로 만들려다 VPC 태그 조건에 막혀 실패합니다. terraform이 만든 "
+            "aws_security_group.emr_master/emr_core의 ID를 config/prod.env에 채우세요."
+        )
+
     master_type = master_instance_type or EMR_MASTER_INSTANCE_TYPE
     core_type = core_instance_type or EMR_CORE_INSTANCE_TYPE
     core_count = core_instance_count or EMR_CORE_INSTANCE_COUNT
@@ -688,11 +738,19 @@ def create_emr_cluster(
                     "InstanceCount": core_count,
                 },
             ],
+            "Ec2SubnetId": EMR_SUBNET_ID,
+            "EmrManagedMasterSecurityGroup": EMR_MASTER_SG_ID,
+            "EmrManagedSlaveSecurityGroup": EMR_CORE_SG_ID,
             "KeepJobFlowAliveWhenNoSteps": True,
             "TerminationProtected": False,
         },
         "JobFlowRole": EMR_JOB_FLOW_ROLE,
         "ServiceRole": EMR_SERVICE_ROLE,
+        # LogUri가 없으면 스텝이 실패해도 원인이 "Unknown Error"로만 나오고
+        # "Step log files on S3 are only available for clusters which have
+        # logging enabled"라고만 뜬다 — 실제 stdout/stderr을 볼 방법이 아예
+        # 없다(2026-08-25, evaluate_rental 첫 실패에서 실측 확인).
+        "LogUri": f"s3://{S3_BUCKET}/emr-logs/",
         "Tags": [{"Key": "for-use-with-amazon-emr-managed-policies", "Value": "true"}],
     }
     if EMR_BOOTSTRAP_SCRIPT_S3_URI:
@@ -713,12 +771,20 @@ def create_emr_cluster(
 
     start_time = time.time()
     while time.time() - start_time < timeout_seconds:
-        state = emr.describe_cluster(ClusterId=cluster_id)["Cluster"]["Status"]["State"]
+        status = emr.describe_cluster(ClusterId=cluster_id)["Cluster"]["Status"]
+        state = status["State"]
         logger.info("[EMR] 클러스터 '%s' 상태: %s", cluster_id, state)
         if state == "WAITING":
             return cluster_id
         if state in ("TERMINATED", "TERMINATED_WITH_ERRORS"):
-            raise RuntimeError(f"EMR 클러스터 '{cluster_id}' 생성 중 비정상 종료: {state}")
+            # StateChangeReason(Code/Message)이 실제 원인(부트스트랩 실패, 용량 부족,
+            # 설정 오류 등)을 담고 있는데 예전엔 이걸 버리고 상태값만 남겨서, 첫 실제
+            # 실행에서 실패했을 때 콘솔을 따로 뒤져야 원인을 알 수 있었다(2026-08-25).
+            reason = status.get("StateChangeReason", {})
+            raise RuntimeError(
+                f"EMR 클러스터 '{cluster_id}' 생성 중 비정상 종료: {state} "
+                f"(code={reason.get('Code')}, message={reason.get('Message')})"
+            )
         time.sleep(30)
 
     # 타임아웃 시 강제 종료 — 안 그러면 cluster_id가 호출부(DAG)의 XCom에 한 번도

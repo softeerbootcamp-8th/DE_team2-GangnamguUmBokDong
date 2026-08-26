@@ -37,7 +37,9 @@ echo "[emr-bootstrap] 서드파티 의존성 설치"
 # ImportError가 난다. boto3는 watermark.py가 Spark가 아니라 plain boto3로 워터마크
 # JSON을 읽기 때문에 필요하다. lightgbm/scikit-learn/mlflow-skinny는 training
 # 패키지(월간 재학습 evaluation·YARN distributed-shell 학습)가 이 노드에서 직접
-# 실행되면서 추가됐다.
+# 실행되면서 추가됐다. psycopg는 monthly_retrain_check가 core.gold_publication을
+# 거쳐 core.model_snapshot을 import할 때 연쇄적으로 필요해진다(2026-08-25 실측 —
+# 없으면 evaluate 스텝이 "No module named 'psycopg'"로 죽는다).
 sudo python3.11 -m pip install --quiet --upgrade pip
 sudo python3.11 -m pip install --quiet \
     pandas \
@@ -48,7 +50,8 @@ sudo python3.11 -m pip install --quiet \
     numpy \
     lightgbm \
     scikit-learn \
-    "mlflow-skinny>=2.14"
+    "mlflow-skinny>=2.14" \
+    "psycopg[binary]>=3.3.4"
 
 echo "[emr-bootstrap] 레포 패키지 내려받기: s3://${S3_BUCKET}/${PYFILES_KEY}"
 # pip 설치가 아니라 PYTHONPATH에 얹는 방식이다. libs/ml_core와 ml/feature_engine이
@@ -60,7 +63,10 @@ rm -f /tmp/pyfiles.tar.gz
 
 echo "[emr-bootstrap] 설치 확인"
 # import까지 확인해서 3.10+ 문법과 의존성 누락을 여기서 잡는다 — 잡이 시작된 뒤
-# executor에서 터지면 로그를 뒤지느라 시간이 든다.
+# executor에서 터지면 로그를 뒤지느라 시간이 든다. monthly_retrain_check를 직접
+# import해서 evaluate 스텝이 실제로 타는 import 체인(core.gold_publication →
+# psycopg 등 간접 의존성 포함)을 여기서 그대로 검증한다 — 예전엔 core/ml_core/training
+# 최상위만 확인해서 psycopg 누락을 놓쳤다(2026-08-25).
 sudo env PYTHONPATH="${TARGET_DIR}" python3.11 -c "
 import sys
 assert sys.version_info >= (3, 11), sys.version
@@ -68,6 +74,7 @@ import pandas, pyarrow, boto3, holidays, pyproj, lightgbm, sklearn, mlflow  # no
 from core import s3  # noqa: F401
 from ml_core import common_config, silver_schema  # noqa: F401
 from training import config as training_config  # noqa: F401
+from training.scripts import monthly_retrain_check  # noqa: F401
 print('[emr-bootstrap] python', sys.version.split()[0], '+ core/ml_core/training import OK')
 "
 

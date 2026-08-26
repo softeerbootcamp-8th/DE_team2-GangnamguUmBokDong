@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
@@ -296,7 +296,7 @@ class TestCheckDueAfterSeconds:
         assert payload["last_logical_dttm"] == last.isoformat()
 
     def test_due_true_once_threshold_elapsed(self, monkeypatch, capsys):
-        """현재 config authority도 freshness 시간이 지나면 다시 수집한다."""
+        """time_rule이 없는 소스는 여전히 순수 elapsed-time 임계값으로 판단한다."""
         now = datetime(2026, 8, 24, 10, 25, tzinfo=KST)
         last = datetime(2026, 8, 24, 10, 12, tzinfo=KST)
 
@@ -309,9 +309,99 @@ class TestCheckDueAfterSeconds:
         monkeypatch.setattr(
             main.storage, "latest_source_snapshot_logical_dttm", lambda *a, **k: last
         )
+        monkeypatch.setattr(main, "_latest_source_uses_config", lambda *a, **k: True)
+
+        code = main.main(
+            ["--source", "bike_station_realtime", "--check-due-after-seconds", "600"]
+        )
+
+        assert code == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["due"] is True
+
+    def test_grid_source_not_due_within_same_announcement_slot(self, monkeypatch, capsys):
+        """`time_rule`이 있는 소스(기상청)는 elapsed-time 임계값을 넘겨도 같은 발표
+        슬롯 안이면 due가 아니다 — 그렇지 않으면 같은 시간당 값을 여러 번 재수집해
+        manifest revision만 쌓인다(`weather_ultra_short_live`는 매시 정각 그리드인데
+        Airflow의 freshness 임계값은 10분이라, 순수 elapsed 비교였다면 매시 6번씩
+        중복 수집을 시도했을 것)."""
+        now = datetime(2026, 8, 24, 10, 25, tzinfo=KST)  # 그리드: 09:00
+        last = datetime(2026, 8, 24, 10, 12, tzinfo=KST)  # 그리드: 09:00(같음)
+
+        class _FixedDatetime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return now
+
+        monkeypatch.setattr(main, "datetime", _FixedDatetime)
+        monkeypatch.setattr(
+            main.storage, "latest_source_snapshot_logical_dttm", lambda *a, **k: last
+        )
+        monkeypatch.setattr(main, "_latest_source_uses_config", lambda *a, **k: True)
 
         code = main.main(
             ["--source", "weather_ultra_short_live", "--check-due-after-seconds", "600"]
+        )
+
+        assert code == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["due"] is False
+
+    def test_grid_source_due_once_slot_boundary_crossed(self, monkeypatch, capsys):
+        """`time_rule`이 있는 소스는 그리드 경계를 넘으면(elapsed-time 임계값과
+        무관하게) due가 된다."""
+        now = datetime(2026, 8, 24, 10, 5, tzinfo=KST)  # 그리드: 09:00
+        last = datetime(2026, 8, 24, 9, 35, tzinfo=KST)  # 그리드: 08:00(다름)
+
+        class _FixedDatetime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return now
+
+        monkeypatch.setattr(main, "datetime", _FixedDatetime)
+        monkeypatch.setattr(
+            main.storage, "latest_source_snapshot_logical_dttm", lambda *a, **k: last
+        )
+        monkeypatch.setattr(main, "_latest_source_uses_config", lambda *a, **k: True)
+
+        code = main.main(
+            ["--source", "weather_ultra_short_live", "--check-due-after-seconds", "600"]
+        )
+
+        assert code == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["due"] is True
+
+    def test_grid_source_delayed_success_does_not_compound_next_slot_delay(
+        self, monkeypatch, capsys
+    ):
+        """실제 운영 버그 재현(2026-08-26): 마지막 성공이 wall-clock으로 많이
+        늦어졌어도(05:00 슬롯이 07:00에야 성공) 그 지연이 다음 판단 기준에
+        누적되지 않고, 다음 실제 발표 슬롯(08:00)이 지나자마자 바로 due가 되어야
+        한다 — `last`를 그리드로 스냅하면 07:00도 어차피 "05:00 슬롯"으로
+        읽히므로, elapsed-time만 봤다면 07:00+3h=10:00까지 due가 아니었을
+        상황이다."""
+        now = datetime(2026, 8, 26, 8, 15, tzinfo=KST)  # vilage_fcst 그리드: 08:00
+        last = datetime(2026, 8, 26, 7, 0, tzinfo=KST)  # vilage_fcst 그리드: 05:00(다름)
+
+        class _FixedDatetime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return now
+
+        monkeypatch.setattr(main, "datetime", _FixedDatetime)
+        monkeypatch.setattr(
+            main.storage, "latest_source_snapshot_logical_dttm", lambda *a, **k: last
+        )
+        monkeypatch.setattr(main, "_latest_source_uses_config", lambda *a, **k: True)
+
+        code = main.main(
+            [
+                "--source",
+                "weather_short_term_forecast",
+                "--check-due-after-seconds",
+                str(int(timedelta(hours=3).total_seconds())),
+            ]
         )
 
         assert code == 0
