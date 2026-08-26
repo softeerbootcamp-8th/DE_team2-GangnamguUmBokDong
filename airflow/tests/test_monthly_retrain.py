@@ -506,6 +506,7 @@ def test_orchestrate_retrain_loop_submits_feature_mart_then_trains_without_resiz
     # docstring 참고).
     train_command = submitted_commands["Train-rental-profile-a"][2]
     assert "org.apache.hadoop.yarn.applications.distributedshell.Client" in train_command
+    assert "--performance-already-checked" in train_command
     expected_machines = monthly_dag.TRAINING_CORE_INSTANCE_COUNT - monthly_dag._WRAPPER_NODE_RESERVATION
     assert f"-shell_env LGB_NUM_MACHINES={expected_machines}" in train_command
 

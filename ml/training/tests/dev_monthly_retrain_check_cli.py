@@ -312,6 +312,38 @@ def test_main_execute_writes_promotion_result_to_s3_key(monkeypatch):
     assert written["target_models"] == ["rental"]
 
 
+def test_main_execute_skips_redundant_performance_check(monkeypatch):
+    """상위 오케스트레이터가 성능 점검을 끝냈으면 지정 모델을 바로 재학습한다."""
+    monkeypatch.setattr(
+        mrc,
+        "_check_all_models_distributed",
+        lambda *args, **kwargs: pytest.fail("성능 점검을 다시 실행하면 안 됩니다"),
+    )
+    monkeypatch.setattr(mrc, "_load_baseline_metrics", lambda model_name: None)
+    attempted = []
+    monkeypatch.setattr(
+        mrc,
+        "_attempt_promotion",
+        lambda model_name, *args, **kwargs: attempted.append(model_name) or True,
+    )
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "monthly_retrain_check",
+            "--execute",
+            "--performance-already-checked",
+            "--models",
+            "rental",
+            "--profile-name",
+            "builtin-default",
+        ],
+    )
+
+    mrc.main()
+
+    assert attempted == ["rental"]
+
+
 def test_candidate_profiles_model_specific_filtering(monkeypatch):
     """대여 모델은 rental_* 프로필을 우선하고 return_*을 제외하며, 반납 모델은 반대로 동작한다."""
     mock_profiles = [
@@ -356,4 +388,3 @@ def test_get_lgb_params_model_specific_overrides():
     assert return_params["num_leaves"] == 31
     assert return_params["learning_rate"] == 0.05
     assert return_params["min_data_in_leaf"] == 50
-
