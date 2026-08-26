@@ -1,6 +1,5 @@
 # 따릉이 재배치 우선순위 대시보드
-
-> 따릉이 대여 이력과 실시간 인구 및 날씨 데이터를 기반으로 대여소별 수요·재고를 예측하고, 재배치 우선순위와 이동 경로를 제공하는 운영 대시보드
+  > 따릉이 대여 이력과 실시간 인구 및 날씨 데이터를 기반으로 대여소별 수요·재고를 예측하고, 재배치 우선순위와 이동 경로를 제공하는 운영 대시보드
 
 **소프티어 부트캠프 8기 Data Engineering 2팀 최종 프로젝트**
 
@@ -9,30 +8,32 @@
 ## 목차
 
 1. [프로젝트 개요](#1-프로젝트-개요)
-2. [솔루션](#2-솔루션)
-3. [기대효과](#3-기대효과)
-4. [데이터 파이프라인](#4-데이터-파이프라인)
-5. [데이터셋](#5-데이터셋)
-6. [시스템 아키텍처](#6-시스템-아키텍처)
-7. [기술 스택](#7-기술-스택)
-8. [Airflow 워크플로](#8-airflow-워크플로)
-9. [로컬 실행](#9-로컬-실행)
-10. [테스트](#10-테스트)
-11. [디렉터리 구조](#11-디렉터리-구조)
-12. [문서](#12-문서)
-13. [팀원](#13-팀원)
+2. [데이터 파이프라인](#2-데이터-파이프라인)
+3. [기술적 도전과 해결](#3-기술적-도전과-해결)
+4. [데이터셋](#4-데이터셋)
+5. [시스템 아키텍처](#5-시스템-아키텍처)
+6. [기술 스택](#6-기술-스택)
+7. [Airflow 워크플로](#7-airflow-워크플로)
+8. [로컬 실행](#8-로컬-실행)
+9. [테스트](#9-테스트)
+10. [디렉터리 구조](#10-디렉터리-구조)
+11. [기타 문서](#11-기타-문서)
+12. [팀원](#12-팀원)
 
 ---
 
 ## 1. 프로젝트 개요
 
-### 배경 및 문제점
+### 배경
 
-> **어떤 대여소는 0대, 어떤 대여소는 117대—자전거는 있지만 필요한 곳에 없습니다.**
+#### 수요 쏠림에 따른 자전거 불균형
+
+> **어떤 대여소는 0대, 어떤 대여소는 117대  
+자전거는 있지만 필요한 곳에 없습니다.**
 
 따릉이는 서울 전역 2,774개 대여소로 성장했지만, 시간대와 지역에 따른 수요 쏠림으로 품절과 과다 거치가 동시에 발생합니다. 2025년에는 자전거가 한 대도 없는 대여소가 94곳으로 확인됐습니다. [[뉴시스, 2024](https://www.newsis.com/view/NISX20241108_0002951902)] [[뉴시스, 2025](https://mobile.newsis.com/view_amp.html?ar_id=NISX20250709_0003245347)]
 
-### 따릉이 재배치 현황
+#### 인력 기반 수동 재배치 방식
 
 > **배송 인력 130명이 자전거 4만 5,000대의 균형을 맞추고 있습니다.**
 
@@ -47,35 +48,26 @@
 - **제한된 자원**: 자전거는 늘었지만 배송·정비 인력은 충분히 늘지 못했습니다. [[한국경제, 2023](https://www.hankyung.com/article/2023053115641)]
 - **데이터 오차**: 비정상 반납으로 앱의 재고와 실제 위치가 다를 수 있습니다. [[뉴시스, 2024](https://www.newsis.com/view/NISX20241108_0002951902)]
 
-### 전략적 목표
+### 프로젝트 목표
 
-현재 재고를 관찰하는 데 그치지 않고 대여·반납 수요와 향후 재고를 예측하여 **사후 대응 중심의 운영을 예측 기반의 선제적 재배치로 전환**합니다. 이를 통해 담당자가 제한된 차량과 인력을 더 시급한 대여소에 먼저 투입할 수 있도록 의사결정 근거와 실행 가능한 작업 경로를 제공합니다.
+현재 재고를 표시하는 데 그치지 않고, 대여·반납 수요와 향후 재고를 예측하여 **사후 대응 중심의 운영을 예측 기반의 선제적 재배치로 전환**합니다. 이를 통해 담당자가 제한된 차량과 인력을 더 시급한 대여소에 먼저 투입할 수 있도록 의사결정 근거와 실행 가능한 작업 경로를 제공합니다.
 
 ### 대상 사용자
 
 서울시 공공자전거 따릉이의 재배치 운영·관리 담당자
 
-## 2. 솔루션
+### 솔루션
 
-우리 시스템은 실시간 재고와 도시 데이터를 수집하고, 대여·반납 수요를 예측한 뒤, 그 결과를 재배치 우선순위와 작업 경로로 변환합니다.
+실시간 따릉이 재고와 인구 및 날씨 데이터를 수집하여, 대여·반납 수요를 예측한 뒤, 그 결과를 재배치 우선순위와 작업 경로로 제공합니다.
 
-1. **실시간 운영 데이터 통합**: 따릉이 재고·대여이력과 날씨·생활인구·행사 데이터를 자동으로 수집하고 품질을 검증합니다.
-2. **대여·반납 수요 예측**: 대여소별 대여량과 반납량을 각각 예측하고 현재 재고에 반영해 시간대별 예상 재고를 계산합니다.
-3. **위험 감지와 우선순위 산정**: 현재 상태, 최근 재고 추세와 예측 결과를 결합해 품절·포화 방향, 위험까지 남은 시간과 0~100의 긴급도 점수를 산출합니다.
-4. **실행 가능한 재배치 경로 생성**: 공급·회수가 필요한 수량, 차량 적재량과 이미 배차된 작업을 고려해 방문 순서와 상차·하차 수량을 제안합니다.
-5. **하나의 운영 화면 제공**: 지도, 우선순위 목록, 수요·재고 예측 그래프와 작업 경로를 한 화면에서 확인하고 작업 상태를 관리합니다.
-6. **지속적인 모델 운영**: 데이터 파이프라인을 5분 단위로 갱신하고, 모델 성능을 추적해 월별 평가 결과에 따라 재학습합니다.
+1. **실시간 데이터 제공**: 따릉이 재고·대여이력과 날씨·생활인구·행사 데이터를 5분 단위로 수집하고, 지도에서 대여소별 현재 자전거 수와 거치 가능 수를 실시간으로 제공합니다.
+2. **대여·반납 수요 및 재고 예측**: 대여소별 대여·반납 예측 모델의 결과를 결합하여, 현재 재고를 반영한 시간대별 예상 재고 변화를 계산합니다.
+3. **위험 감지 및 긴급도 산정**: 현재 상태와 예측 결과를 결합해 품절·포화 예상 시점과 위험까지 남은 시간을 파악하고, 계산한 긴급도 점수를 기반으로 작업 우선순위를 제공합니다.
+4. **실행 가능한 재배치 경로 생성**: 공급·회수 필요 수량, 차량 적재량과 이미 배차된 작업을 고려해 방문 순서와 상차·하차 수량을 포함한 작업 경로를 제안합니다.
+5. **통합 운영 화면 및 상태 관리**: 지도, 우선순위 목록, 예측 그래프와 작업 경로를 한 화면에서 확인하고, 작업의 배차·완료·취소·복원 등 전체 운영 상태를 관리합니다.
+6. **모델 수명주기 관리 및 지속적 운영**: 자동화된 데이터 파이프라인과 MLflow를 통해 실험과 모델을 추적하고, 월별 성능 평가 결과에 따라 모델을 재학습합니다.
 
-### 제공 기능
-
-- **실시간 현황 조회**: 지도에서 대여소 위치, 현재 자전거 수와 거치 가능 수를 확인합니다.
-- **수요·재고 예측**: 대여·반납 모델의 결과를 결합해 향후 재고 변화를 제공합니다.
-- **긴급도 산정**: 품절·포화 예상 시점과 부족량으로 작업 우선순위를 계산합니다.
-- **재배치 경로 생성**: 상차·하차 수량과 방문 순서를 포함한 작업 경로를 생성합니다.
-- **운영 상태 관리**: 작업의 배차, 완료, 취소 및 복원 상태를 관리합니다.
-- **모델 수명주기 관리**: MLflow로 실험과 모델을 추적하고 월별 평가 결과에 따라 재학습합니다.
-
-## 3. 기대효과
+### 기대효과
 
 | 관점 | 기대효과 |
 | --- | --- |
@@ -85,9 +77,9 @@
 | **운영 조직** | 작업 상태와 예측 근거를 일관된 데이터로 관리하여 재배치 정책을 평가하고 개선할 기반을 마련합니다. |
 | **시스템 운영** | 자동 수집·검증·추론·모니터링을 통해 반복 업무를 줄이고 데이터와 모델의 최신성을 유지합니다. |
 
-궁극적으로는 자전거의 공간적 불균형을 완화하여 따릉이의 이용 가능성을 높이고, 같은 운영 자원으로 더 효과적인 재배치를 수행하는 것을 기대합니다.
+> **데이터 기반의 선제적 의사결정을 지원하여 실무자의 업무 부담을 줄이고, 한정된 인력과 장비로 최적의 재배치 효율을 달성하고자 합니다.**
 
-## 4. 데이터 파이프라인
+## 2. 데이터 파이프라인
 
 ### 데이터 흐름
 
@@ -100,7 +92,18 @@
 | **Archive** | 학습과 재처리에 사용할 일 단위 이력을 구성합니다. |
 | **Gold** | 대여소, 예측, 긴급도, 작업 경로 등 서비스 조회용 데이터를 PostGIS에 게시합니다. |
 
-## 5. 데이터셋
+## 3. 기술적 도전과 해결
+
+파이프라인을 만들며 마주친 문제와 그 해결 과정을 주제별로 정리했습니다.
+
+| 문서 | 다룬 문제 |
+| --- | --- |
+| [원천 데이터의 한계를 어떻게 보완할 것인가](docs/readme/01-data-imputation.md) | 대여이력은 반납 기준으로 쌓여 뒤늦게 도착하고, 생활인구는 4일 지연되며, 실시간 인구는 121개 지점에만 있습니다 |
+| [소스마다 다른 스키마를 어떻게 일관된 정책으로 수집할 것인가](docs/readme/02-source-adapter.md) | 소스마다 스키마와 결측 표기가 달라, 소스가 늘 때마다 검증 코드에 분기가 쌓입니다 |
+| [데이터 품질을 어떻게 관리할 것인가](docs/readme/03-quality-gate.md) | 누락되거나 오염된 배치가 그대로 흘러가면 하위 서비스 전체의 신뢰도가 무너집니다 |
+| [파이프라인을 어떻게 정해진 시간 내에 마칠 것인가](docs/readme/04-fetch-strategy.md) | 수집 지연이 전체 파이프라인의 5분 마감을 넘기게 만듭니다 |
+
+## 4. 데이터셋
 
 | 데이터셋 | 제공처 | 활용 |
 | --- | --- | --- |
@@ -114,42 +117,47 @@
 
 외부 API를 직접 수집하려면 서울 열린데이터광장의 `SEOUL_OPENAPI_KEY`와 기상청 API 허브의 `KMA_APIHUB_KEY`가 필요합니다.
 
-## 6. 시스템 아키텍처
+## 5. 시스템 아키텍처
 
 ![따릉이 재배치 우선순위 시스템 아키텍처](./architecture.png)
 
-Airflow가 수집, 정규화, 생활인구 보정, 추론, Gold 게시와 재배치 경로 생성을 오케스트레이션합니다. 운영 환경에서는 S3와 RDS for PostgreSQL/PostGIS를 데이터 계층으로 사용하며, 특징 생성은 일회성 EMR Classic 클러스터에서, 모델 학습은 학습용 EC2에서 수행합니다. 상시 애플리케이션 EC2는 Airflow, MLflow, FastAPI와 웹 서비스를 실행합니다.
+| 구분 | 구성 요소 | 주요 역할 |
+| --- | --- | --- |
+| **오케스트레이션** | Airflow | 데이터 파이프라인(수집, 정규화, 보정, 추론, Gold 게시, 재배치 경로 생성) 관리 |
+| **데이터 계층** | S3, RDS (PostgreSQL/PostGIS) | 데이터 레이크(S3) 및 서비스 조회용 공간 데이터베이스(RDS) |
+| **데이터 처리 및 학습** | EMR Classic, 학습용 EC2 | 대규모 특징(Feature) 생성(일회성 EMR) 및 예측 모델 학습(학습용 EC2) |
+| **애플리케이션 서빙** | 상시 운영 EC2 | Airflow(스케줄링), MLflow(모델 추적), FastAPI(백엔드) 및 웹 서비스 실행 |
 
 
-### 기술 스택
+## 6. 기술 스택
 
 | 영역 | 기술 |
 | --- | --- |
-| 오케스트레이션 | Apache Airflow 3, Docker Compose |
-| 수집·가공 | Python, PyArrow, Pandas, Pydantic |
-| 머신러닝 | LightGBM, Apache Spark, MLflow |
-| 저장소 | Amazon S3, MinIO, PostgreSQL 16, PostGIS 3.4 |
-| 백엔드 | FastAPI |
-| 프론트엔드 | React, TypeScript, Vite, Leaflet |
-| AWS 인프라 | EC2, EMR Classic, RDS, S3, IAM, VPC |
-| IaC·개발 도구 | Terraform, uv, Ruff, Pytest, Vitest |
+| **오케스트레이션** | ![Airflow](https://img.shields.io/badge/Apache_Airflow_3-017CEE?style=for-the-badge&logo=apacheairflow&logoColor=white) ![Docker](https://img.shields.io/badge/Docker_Compose-2496ED?style=for-the-badge&logo=docker&logoColor=white) |
+| **수집·가공** | ![Python](https://img.shields.io/badge/Python-3670A0?style=for-the-badge&logo=python&logoColor=ffdd54) ![PyArrow](https://img.shields.io/badge/PyArrow-1A1A1A?style=for-the-badge&logo=apachearrow&logoColor=white) ![Pandas](https://img.shields.io/badge/Pandas-150458?style=for-the-badge&logo=pandas&logoColor=white) ![Pydantic](https://img.shields.io/badge/Pydantic-E92063?style=for-the-badge&logo=pydantic&logoColor=white) |
+| **머신러닝** | ![LightGBM](https://img.shields.io/badge/LightGBM-2E8B57?style=for-the-badge) ![Spark](https://img.shields.io/badge/Apache_Spark-E25A1C?style=for-the-badge&logo=apachespark&logoColor=white) ![MLflow](https://img.shields.io/badge/MLflow-0194E2?style=for-the-badge&logo=mlflow&logoColor=white) |
+| **저장소** | ![S3](https://img.shields.io/badge/Amazon_S3-569A31?style=for-the-badge) ![MinIO](https://img.shields.io/badge/MinIO-C72E49?style=for-the-badge&logo=minio&logoColor=white) ![PostgreSQL](https://img.shields.io/badge/PostgreSQL_16-4169E1?style=for-the-badge&logo=postgresql&logoColor=white) ![PostGIS](https://img.shields.io/badge/PostGIS_3.4-336791?style=for-the-badge&logo=postgresql&logoColor=white) |
+| **백엔드** | ![FastAPI](https://img.shields.io/badge/FastAPI-009688?style=for-the-badge&logo=fastapi&logoColor=white) |
+| **프론트엔드** | ![React](https://img.shields.io/badge/React-20232A?style=for-the-badge&logo=react&logoColor=61DAFB) ![TypeScript](https://img.shields.io/badge/TypeScript-3178C6?style=for-the-badge&logo=typescript&logoColor=white) ![Vite](https://img.shields.io/badge/Vite-646CFF?style=for-the-badge&logo=vite&logoColor=FFD62E) ![Leaflet](https://img.shields.io/badge/Leaflet-199900?style=for-the-badge&logo=leaflet&logoColor=white) |
+| **AWS 인프라** | ![EC2](https://img.shields.io/badge/Amazon_EC2-FF9900?style=for-the-badge) ![EMR](https://img.shields.io/badge/Amazon_EMR-FF9900?style=for-the-badge) ![RDS](https://img.shields.io/badge/Amazon_RDS-527FFF?style=for-the-badge) ![S3](https://img.shields.io/badge/Amazon_S3-569A31?style=for-the-badge) ![IAM](https://img.shields.io/badge/AWS_IAM-DD344C?style=for-the-badge) ![VPC](https://img.shields.io/badge/Amazon_VPC-8C4FFF?style=for-the-badge) |
+| **IaC·개발 도구** | ![Terraform](https://img.shields.io/badge/Terraform-7B42BC?style=for-the-badge&logo=terraform&logoColor=white) ![uv](https://img.shields.io/badge/uv-DE5FE9?style=for-the-badge&logo=uv&logoColor=white) ![Ruff](https://img.shields.io/badge/Ruff-261230?style=for-the-badge&logo=ruff&logoColor=D7FF64) ![Pytest](https://img.shields.io/badge/Pytest-0A9EDC?style=for-the-badge&logo=pytest&logoColor=white) ![Vitest](https://img.shields.io/badge/Vitest-6E9F18?style=for-the-badge&logo=vitest&logoColor=FCC72B) |
 
-## 8. Airflow 워크플로
+## 7. Airflow 워크플로
 
 모든 스케줄은 `Asia/Seoul` 기준이며 `catchup=False`로 동작합니다.
 
 | DAG | 스케줄 | 역할 |
 | --- | --- | --- |
-| `realtime_tick` | 매 5분 | 실시간 데이터 수집 → 정규화 → 추론 → Gold 게시 → 긴급도·경로 생성 |
-| `daily_population_and_events` | 매일 03:00 | 생활인구 수집·보정 및 문화·공연 행사 게시 |
-| `station_master` | 매일 03:04 | 대여소 기준정보 수집 및 서빙용 마스터 생성 |
-| `daily_compaction` | 매일 04:30 | D-6 대여이력 재수집 및 Silver 일 단위 Archive 압축 |
-| `monthly_retrain_rental` | 매월 1일 03:00 | 대여 모델 평가 및 조건부 재학습 |
-| `monthly_retrain_return` | 매월 1일 06:00 | 반납 모델 평가 및 조건부 재학습 |
+| `realtime_tick` | 매 5분 | 실시간 수집 및 재배치 경로 생성 (End-to-End) |
+| `daily_population_and_events` | 매일 03:00 | 생활인구 및 행사 데이터 일간 갱신 |
+| `station_master` | 매일 03:04 | 대여소 마스터 정보 갱신 |
+| `daily_compaction` | 매일 04:30 | 데이터 누락 보완 및 일 단위 압축 보관 (Archive) |
+| `monthly_retrain_rental` | 매월 1일 03:00 | 대여 예측 모델 평가 및 재학습 |
+| `monthly_retrain_return` | 매월 1일 06:00 | 반납 예측 모델 평가 및 재학습 |
 
-`realtime_tick`은 단일 DAG로 5분마다 실행됩니다. 날씨 collector별 freshness gate가 마지막 성공 수집 시각을 확인해, 날씨가 필요하지 않은 tick에는 불필요한 외부 API 호출을 생략합니다.
+> 💡 **참고**: `realtime_tick`은 5분 주기로 실행되는 핵심 단일 DAG입니다. 수집 주기가 긴 외부 API(날씨 등)는 자체적인 **Freshness Gate**를 통해 이전 성공 시각을 확인하여 불필요한 중복 호출을 차단합니다.
 
-## 9. 로컬 실행
+## 8. 로컬 실행
 
 ### 사전 요구사항
 
@@ -201,7 +209,7 @@ uv sync
 uv run python main.py --help
 ```
 
-## 10. 테스트
+## 9. 테스트
 
 ```bash
 make lint       # 전체 Python 프로젝트 Ruff 검사
@@ -212,7 +220,7 @@ make e2e-smoke  # 실행 중인 로컬 스택의 실시간 E2E smoke test
 
 프론트엔드만 검증하려면 `apps/web`에서 `npm ci`, `npm test`, `npm run build`를 실행합니다.
 
-## 11. 디렉터리 구조
+## 10. 디렉터리 구조
 
 ```text
 .
@@ -238,7 +246,7 @@ make e2e-smoke  # 실행 중인 로컬 스택의 실시간 E2E smoke test
 └── .env.example        # 로컬 환경변수 예시
 ```
 
-## 12. 문서
+## 11. 기타 문서
 
 - [개발 환경 및 로컬 실행](docs/getting-started.md)
 - [Airflow 데이터 흐름](docs/airflow/explain.md)
@@ -248,7 +256,7 @@ make e2e-smoke  # 실행 중인 로컬 스택의 실시간 E2E smoke test
 - [프론트엔드 구성](apps/web/README.md)
 - [아키텍처 결정 기록](docs/adr/)
 
-## 13. 팀원
+## 12. 팀원
 
 <table>
   <tr>
