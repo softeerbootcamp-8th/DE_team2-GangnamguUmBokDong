@@ -253,6 +253,74 @@ def test_refresh_feature_mart_skips_champion_build_when_test_profile_only(monkey
     assert not any("Spark-RunPipeline" in s for s in submitted_names)
 
 
+def test_refresh_feature_mart_gives_wait_for_yarn_nodes_a_short_timeout(monkeypatch) -> None:
+    """submit_emr_step()의 기본 90분 타임아웃을 그대로 물려받으면, Wait-YARN-Nodes +
+    RunPipeline + BuildMultiHorizon 세 스텝이 각각 90분씩 써서 최악 270분이 되어
+    MONTHLY_FEATURE_REFRESH_TIMEOUT(4시간)을 넘길 수 있다(PR #248 리뷰 지적) —
+    이 대기는 원래 1분 안에 끝나야 하므로 훨씬 짧은 타임아웃을 명시해야 한다."""
+    mock_ti = MagicMock()
+    mock_ti.xcom_pull.return_value = "j-created"
+    captured_timeouts = {}
+    monkeypatch.setattr(
+        monthly_dag,
+        "submit_emr_step",
+        lambda cluster_id, name, command, **kwargs: captured_timeouts.update({name: kwargs.get("timeout_seconds")}),
+    )
+
+    task_fn = monthly_dag.make_task_refresh_feature_mart("rental")
+    task_fn(ti=mock_ti, params={"test_profile_only": True})
+
+    assert captured_timeouts["Wait-YARN-Nodes"] == 1200
+
+
+def test_evaluate_uses_same_profile_refresh_feature_mart_just_built(monkeypatch) -> None:
+    """refresh_feature_mart가 챔피언 프로필로 feature mart를 갱신해도, evaluate가
+    ML_PROFILE 없이(=기본 builtin-default 경로로) 읽으면 챔피언 프로필의 w/e/t가
+    기본값과 다를 때 방금 갱신한 데이터를 못 보거나 없는 테이블을 본다(PR #248
+    리뷰 지적) — refresh_feature_mart가 xcom에 남긴 profile을 evaluate가 그대로
+    받아써야 한다."""
+    mock_ti = MagicMock()
+    mock_ti.xcom_pull.side_effect = lambda task_ids, key: {
+        "cluster_id": "j-created",
+        "profile": "champion-profile-x",
+    }.get(key)
+    submitted = {}
+    monkeypatch.setattr(
+        monthly_dag,
+        "submit_emr_step",
+        lambda cluster_id, name, command, **kwargs: submitted.update(command=command)
+        or {"StepId": "s-1", "State": "COMPLETED"},
+    )
+    monkeypatch.setattr(monthly_dag, "read_s3_json", lambda key: {"needs_retrain": False})
+
+    task_fn = monthly_dag.make_task_evaluate("rental")
+    task_fn(ti=mock_ti, params={}, run_id="run-1")
+
+    script = submitted["command"][2]
+    assert "-shell_env ML_PROFILE=champion-profile-x" in script
+
+
+def test_evaluate_defaults_profile_to_builtin_when_refresh_pushed_nothing(monkeypatch) -> None:
+    """refresh_feature_mart가 profile을 xcom에 못 남긴 경우(예: 과거 실행 기록이
+    없는 등)에도 evaluate가 죽지 않고 builtin-default로 안전하게 fallback한다."""
+    mock_ti = MagicMock()
+    mock_ti.xcom_pull.side_effect = lambda task_ids, key: {"cluster_id": "j-created"}.get(key)
+    submitted = {}
+    monkeypatch.setattr(
+        monthly_dag,
+        "submit_emr_step",
+        lambda cluster_id, name, command, **kwargs: submitted.update(command=command)
+        or {"StepId": "s-1", "State": "COMPLETED"},
+    )
+    monkeypatch.setattr(monthly_dag, "read_s3_json", lambda key: {"needs_retrain": False})
+
+    task_fn = monthly_dag.make_task_evaluate("rental")
+    task_fn(ti=mock_ti, params={}, run_id="run-1")
+
+    script = submitted["command"][2]
+    assert "-shell_env ML_PROFILE=builtin-default" in script
+
+
 def test_evaluate_pushes_needs_retrain(monkeypatch) -> None:
     """create_cluster가 xcom에 남긴 cluster_id로 평가 스텝을 제출하고, 결과(S3 JSON)를
     읽어 needs_retrain/candidate_profiles를 xcom에 남긴다."""
@@ -278,9 +346,58 @@ def test_evaluate_pushes_needs_retrain(monkeypatch) -> None:
     pushed = {call.kwargs["key"]: call.kwargs["value"] for call in mock_ti.xcom_push.call_args_list}
     assert pushed["needs_retrain"] is True
     assert pushed["candidate_profiles"] == ["rental-profile-1"]
-    # master 노드 OOM(exitCode 137) 이후 evaluate는 core 노드의 spark-submit
-    # YARN cluster 컨테이너에서 돌아야 한다 — _yarn_python_module_step() docstring 참고.
-    assert "spark-submit --deploy-mode cluster --master yarn" in submitted["command"][2]
+    # master 노드 OOM(exitCode 137) 이후 evaluate는 core 노드의 YARN
+    # distributed-shell 컨테이너에서 돌아야 한다 — _yarn_python_module_step()
+    # docstring 참고.
+    assert "org.apache.hadoop.yarn.applications.distributedshell.Client" in submitted["command"][2]
+
+
+def test_evaluate_passes_eval_num_workers_matching_provisioned_core_count(monkeypatch) -> None:
+    """평가(predict)는 학습과 달리 워커끼리 통신할 필요가 없는 embarrassingly
+    parallel 작업이라(monitor_performance.combine_evaluation_shards() 참고),
+    create_cluster가 이미 띄워둔 core 노드 수만큼 그대로 나눠 돌릴 수 있다 —
+    실제로 띄운 노드 수(emr_core_instance_count override 포함)와 어긋나면
+    존재하지 않는 컨테이너를 기다리다 barrier가 타임아웃난다."""
+    mock_ti = MagicMock()
+    mock_ti.xcom_pull.return_value = "j-created"
+    submitted = {}
+    monkeypatch.setattr(
+        monthly_dag,
+        "submit_emr_step",
+        lambda cluster_id, name, command, **kwargs: submitted.update(command=command)
+        or {"StepId": "s-1", "State": "COMPLETED"},
+    )
+    monkeypatch.setattr(monthly_dag, "read_s3_json", lambda key: {"needs_retrain": False})
+
+    task_fn = monthly_dag.make_task_evaluate("rental")
+    task_fn(ti=mock_ti, params={}, run_id="run-1")
+
+    script = submitted["command"][2]
+    expected = monthly_dag.FEATURE_MART_CORE_INSTANCE_COUNT - monthly_dag._WRAPPER_NODE_RESERVATION
+    assert f"--eval-num-workers {expected}" in script
+
+
+def test_evaluate_eval_num_workers_respects_core_instance_count_override(monkeypatch) -> None:
+    """override(5) - _WRAPPER_NODE_RESERVATION(2) = 3 — 이 Evaluate 스텝 자신도
+    자기 자신의 YARN distributed-shell AM + 오케스트레이터가 도는 워커 컨테이너로
+    노드 2개를 먹으므로 그만큼 빼야 barrier가 존재하지 않는 컨테이너를 기다리다
+    타임아웃나지 않는다(실제 EMR 실행에서 확인, 2026-08-26)."""
+    mock_ti = MagicMock()
+    mock_ti.xcom_pull.return_value = "j-created"
+    submitted = {}
+    monkeypatch.setattr(
+        monthly_dag,
+        "submit_emr_step",
+        lambda cluster_id, name, command, **kwargs: submitted.update(command=command)
+        or {"StepId": "s-1", "State": "COMPLETED"},
+    )
+    monkeypatch.setattr(monthly_dag, "read_s3_json", lambda key: {"needs_retrain": False})
+
+    task_fn = monthly_dag.make_task_evaluate("rental")
+    task_fn(ti=mock_ti, params={"emr_core_instance_count": 5}, run_id="run-1")
+
+    script = submitted["command"][2]
+    assert "--eval-num-workers 3" in script
 
 
 def test_evaluate_defaults_to_needs_retrain_when_no_result(monkeypatch) -> None:
@@ -357,11 +474,13 @@ def test_orchestrate_retrain_loop_submits_feature_mart_then_trains_without_resiz
     assert any("Spark-RunPipeline-profile-b" in s for s in submitted_steps)
     assert any("Train-rental-profile-a" in s for s in submitted_steps)
     assert any("Train-rental-profile-b" in s for s in submitted_steps)
-    # 학습 오케스트레이터도 master가 아니라 core 노드 YARN 컨테이너에서 돌아야
-    # 한다(evaluate와 같은 이유 — _yarn_python_module_step() docstring 참고).
+    # 학습 오케스트레이터도 master가 아니라 core 노드 YARN distributed-shell
+    # 컨테이너에서 돌아야 한다(evaluate와 같은 이유 — _yarn_python_module_step()
+    # docstring 참고).
     train_command = submitted_commands["Train-rental-profile-a"][2]
-    assert "spark-submit --deploy-mode cluster --master yarn" in train_command
-    assert "spark.yarn.appMasterEnv.LGB_NUM_MACHINES=8" in train_command
+    assert "org.apache.hadoop.yarn.applications.distributedshell.Client" in train_command
+    expected_machines = monthly_dag.TRAINING_CORE_INSTANCE_COUNT - monthly_dag._WRAPPER_NODE_RESERVATION
+    assert f"-shell_env LGB_NUM_MACHINES={expected_machines}" in train_command
 
 
 def test_orchestrate_retrain_loop_passes_no_promote_when_test_profile_only(monkeypatch) -> None:
@@ -483,23 +602,27 @@ def test_feature_mart_spark_steps_use_runpy_launcher_not_raw_script_path() -> No
     assert "SparkSession.builder.getOrCreate()" not in multi_horizon_step[1][2]
 
 
-def test_yarn_python_module_step_wraps_in_spark_submit_with_small_heap_large_overhead() -> None:
+def test_feature_mart_spark_steps_num_executors_scales_with_core_count() -> None:
+    """`--num-executors`가 기본값(피처마트 단계 노드 수)에 하드코딩돼 있으면,
+    재학습 루프처럼 이미 학습용(더 많은) 노드 수로 떠 있는 클러스터 위에서
+    같은 함수를 재사용할 때 나머지 노드가 논다(PR #248 리뷰 지적) — 실제
+    돌 클러스터의 core 노드 수를 받아 그에 맞춰 병렬도를 잡아야 한다."""
+    default_step, _ = monthly_dag._feature_mart_spark_steps("some-profile")
+    scaled_step, _ = monthly_dag._feature_mart_spark_steps("some-profile", core_instance_count=8)
+
+    assert f"--num-executors {monthly_dag.FEATURE_MART_CORE_INSTANCE_COUNT - 1}" in default_step[1][2]
+    assert "--num-executors 7" in scaled_step[1][2]
+
+
+def test_yarn_python_module_step_wraps_in_distributed_shell_with_small_am_heap() -> None:
     """평가/학습 오케스트레이터(`training.scripts.monthly_retrain_check`)를 master
     노드에 bare bash 스텝으로 직접 올렸다가 master의 EMR 자체 데몬 메모리 압박으로
-    OOM(exitCode 137)이 났다. YARN distributed-shell(-num_containers 1)로
-    옮겨보니 그 예제 jar 자체가 이 EMR의 Java 17 런타임에서 "JNI error"로 죽었다
-    (둘 다 실제 EMR 실행에서 확인, 2026-08-26). spark-submit(YARN cluster 모드,
-    Java 17 대응이 이미 확인된 경로)으로 감싸되, Spark가 실제로는 아무 연산도
-    안 하므로 JVM 힙은 최소(1g)로 두고 진짜 메모리가 필요한 py4j 파이썬
-    서브프로세스 몫은 spark.driver.memoryOverhead로 크게 잡는다.
-
-    그런데 이렇게만 하면 이 대상 모듈이 SparkContext를 전혀 안 만들기 때문에,
-    YARN cluster 모드의 ApplicationMaster가 `waitForSparkContextInitialized()`
-    에서 SparkContext가 생기길 `spark.yarn.am.waitTime`(1800초)까지 기다린
-    "뒤에야" RM에 AM 등록을 시도한다 — 실제로 매 시도(기본 2회)가 ACCEPTED
-    상태로 30분씩 멈췄다가 실패했다(실제 EMR 실행에서 확인, 2026-08-26). 아무
-    일도 안 하는 `SparkSession.builder.getOrCreate()`를 launcher 맨 앞에 끼워
-    넣어야 AM이 등록을 미루지 않는다."""
+    OOM(exitCode 137)이 났다. YARN distributed-shell로 옮겨보니 처음엔 그 예제
+    jar 자체가 "JNI error"로 죽었는데, 나중에 실제 분산학습 워커로 격리 재현해보니
+    Java 17 비호환이 아니라 그냥 기본 100MB AM 힙 부족이었다(둘 다 실제 EMR
+    실행에서 확인, 2026-08-26). `-master_memory`/`-master_vcores`를 명시하면
+    정상 동작한다 — spark-submit으로 우회했던 중간 단계(더미 SparkSession, JVM
+    힙/overhead 계산, dynamic allocation 문제)는 전부 필요 없어졌다."""
     name, command = monthly_dag._yarn_python_module_step(
         "Evaluate-rental",
         "training.scripts.monthly_retrain_check",
@@ -508,21 +631,17 @@ def test_yarn_python_module_step_wraps_in_spark_submit_with_small_heap_large_ove
     assert name == "Evaluate-rental"
     assert command[:2] == ["bash", "-c"]
     script = command[2]
-    assert "spark-submit --deploy-mode cluster --master yarn" in script
-    assert "--driver-memory 1g" in script
-    assert "spark.driver.memoryOverhead=5120" in script
-    assert "--driver-cores 2" in script
-    assert 'runpy.run_module("training.scripts.monthly_retrain_check"' in script
-    # AM이 SparkContext 없이 등록을 미루지 않도록, runpy보다 먼저 더미
-    # SparkSession을 만들어야 한다.
-    assert script.index("SparkSession.builder.getOrCreate()") < script.index("import runpy")
-    # app 인자는 spark-submit이 entry 스크립트 뒤에 그대로 붙여줘야 sys.argv로 전달된다.
-    assert script.strip().endswith("--check-only --models rental --result-s3-key some/key.json")
+    assert "org.apache.hadoop.yarn.applications.distributedshell.Client" in script
+    assert "-num_containers 1" in script
+    assert f"-master_memory {monthly_dag._YARN_AM_MEMORY_MB}" in script
+    assert f"-master_vcores {monthly_dag._YARN_AM_VCORES}" in script
+    assert "-shell_command 'cd /opt/gng && PYTHONPATH=/opt/gng python3.11 -m training.scripts.monthly_retrain_check --check-only --models rental --result-s3-key some/key.json'" in script
 
 
-def test_yarn_python_module_step_passes_env_via_am_env_conf() -> None:
-    """학습 스텝의 LGB_NUM_MACHINES/LGB_TREE_LEARNER는 master 셸의 bash export가
-    아니라 spark.yarn.appMasterEnv.*로 AM 컨테이너 안까지 넘어가야 한다."""
+def test_yarn_python_module_step_passes_env_via_shell_env() -> None:
+    """학습 스텝의 LGB_NUM_MACHINES/LGB_TREE_LEARNER는 distributed-shell
+    컨테이너가 부모 프로세스 환경을 상속하지 않으므로 -shell_env로 명시해야
+    한다(training/scripts/monthly_retrain_check.py의 같은 제약과 동일)."""
     _name, command = monthly_dag._yarn_python_module_step(
         "Train-rental-profile-a",
         "training.scripts.monthly_retrain_check",
@@ -530,8 +649,10 @@ def test_yarn_python_module_step_passes_env_via_am_env_conf() -> None:
         env={"LGB_NUM_MACHINES": "8", "LGB_TREE_LEARNER": "data"},
     )
     script = command[2]
-    assert "spark.yarn.appMasterEnv.LGB_NUM_MACHINES=8" in script
-    assert "spark.yarn.appMasterEnv.LGB_TREE_LEARNER=data" in script
+    assert "-shell_env LGB_NUM_MACHINES=8" in script
+    assert "-shell_env LGB_TREE_LEARNER=data" in script
+    assert f"-shell_env S3_BUCKET={monthly_dag.S3_BUCKET}" in script
+    assert f"-shell_env PYTHONPATH={monthly_dag._EMR_PYTHONPATH}" in script
 
 
 def test_bash_step_exports_s3_bucket_always() -> None:

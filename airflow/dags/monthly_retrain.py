@@ -11,16 +11,15 @@ EC2 자체도 더 이상 쓸 수 없게 됐다. 지금은 월 1회 EMR 클러스
 → 재학습 필요 시 학습용(8노드)으로 `resize_emr_cluster()`를 태우는 2단계
 구성이었으나, 진행 중이던 스텝이 resize 중 죽거나 목표 개수까지 못 올라가는
 사례가 의심돼(2026-08-26) 지금은 resize를 아예 없앴다. LightGBM 학습은 YARN
-Distributed Shell로 `TRAINING_CORE_INSTANCE_COUNT`개 컨테이너에 나눠 띄운다
-(`training/scripts/yarn_worker_bootstrap.py` — **주의**: 이 예제 jar가 이
-계정의 Java 17 런타임에서 즉시 죽는 게 실제 EMR 실행으로 확인됐다,
-`_yarn_python_module_step()` docstring 2번 참고 — 실 학습에서도 재현되는지
-별도 검증 필요). 평가/학습 오케스트레이터(`training.scripts.monthly_retrain_check`)
-도 master 노드에 bash 스텝으로 직접 올렸다가 master의 EMR 자체 데몬 메모리
-압박으로 OOM(exitCode 137)이 나서, spark-submit(YARN cluster 모드)으로 감싸
-core 노드로 옮겼다 — 이 스크립트는 Spark 연산을 안 쓰므로 JVM 힙은 최소로
-잡고(`--driver-memory 1g`) 실제 필요한 메모리는 `spark.driver.memoryOverhead`
-로 확보한다.
+Distributed Shell로 컨테이너를 나눠 띄운다(`training/scripts/
+yarn_worker_bootstrap.py`). 평가/학습 오케스트레이터(`training.scripts.
+monthly_retrain_check`)도 master 노드에 bash 스텝으로 직접 올렸다가 master의
+EMR 자체 데몬 메모리 압박으로 OOM(exitCode 137)이 나서, 지금은 이 오케스트레이터
+자신도 YARN distributed-shell(`-num_containers 1`)로 core 노드에서 돌린다 —
+실제 학습/평가 워커와 같은 메커니즘이라 별도 JVM 힙/executor 계산이 필요 없고,
+자신이 먹는 노드도 AM 하나(1GB 남짓)뿐이다(`_yarn_python_module_step()`
+docstring 참고 — spark-submit으로 감싸던 중간 단계에서 dynamic allocation·
+executor 자원 경합 문제를 겪은 뒤 이 방식으로 정착했다).
 
 **대여/반납을 한 DAG으로 합친 이유(2026-08)**: 원래는 `monthly_retrain_rental`/
 `monthly_retrain_return` 두 DAG로 나눠 각자 다른 시각(03:00/06:00)에 스케줄했다.
@@ -92,6 +91,18 @@ MODEL_EXECUTION_ORDER = ("rental", "return")
 # 로직(또는 메모리 미해제) 쪽을 봐야 한다.
 FEATURE_MART_CORE_INSTANCE_COUNT = 8
 TRAINING_CORE_INSTANCE_COUNT = 8
+# Evaluate/Train 스텝은 `_yarn_python_module_step()`으로 자기 자신도 YARN
+# distributed-shell로 core 노드에서 돈다 — AM(`_YARN_AM_MEMORY_MB`만큼의 작은
+# 힙)과 실제 오케스트레이터 파이썬 코드가 도는 워커 컨테이너(`-container_memory
+# 6144`, 노드 전체)는 별개다. 즉 이 wrapper 자신만으로 최소 노드 2개(AM 1 +
+# 자기 워커 컨테이너 1)를 먹는다 — 1개(AM)만 빼고 계산했다가 barrier가 요청한
+# 워커 수보다 실제 가용 노드가 하나 모자라 10분 타임아웃나는 걸 실제 EMR
+# 실행에서 확인했다(2026-08-26). 그 "안"에서 다시 진짜 워커(평가/학습)용
+# distributed-shell을 core 노드 수 그대로 요청하면 안 되고, 항상 이 예약분만큼
+# 적게 잡아야 한다. (spark-submit으로 감싸던 예전 방식은 AM+정적 executor로
+# 3노드를 먹었었다 — distributed-shell로 바꾸며 3 -> 2로 줄었다,
+# `_yarn_python_module_step()` docstring 4번 참고.)
+_WRAPPER_NODE_RESERVATION = 2
 _EMR_PYTHONPATH = "/opt/gng"
 
 # `test_profile_only` DAG 파라미터가 켜졌을 때 재평가를 건너뛰고 바로 재학습
@@ -135,8 +146,6 @@ def _spark_module_launcher_command(
     module: str,
     extra_args: list[str],
     app_args: list[str] | None = None,
-    *,
-    create_dummy_spark_session: bool = False,
 ) -> list[str]:
     """`module`(예: "feature_engine.spark.run_pipeline")을 spark-submit으로 돌리는
     bash 스텝 인자를 만든다.
@@ -152,29 +161,16 @@ def _spark_module_launcher_command(
     `app_args`는 spark-submit이 entry 스크립트 뒤에 그대로 붙여 전달하는
     애플리케이션 인자다 — `runpy.run_module(..., run_name="__main__")`이 대상
     모듈의 `if __name__ == "__main__":` 블록을 실행할 때 그 블록이 보는
-    `sys.argv`는 spark-submit이 launcher 스크립트를 실행한 그 argv 그대로다
-    (`_yarn_python_module_step()`이 argparse 기반 스크립트를 이 launcher로
-    core 노드 YARN 컨테이너에 태울 때 씀).
+    `sys.argv`는 spark-submit이 launcher 스크립트를 실행한 그 argv 그대로다.
 
-    `create_dummy_spark_session=True`는 대상 모듈이 Spark를 전혀 안 쓸 때만
-    필요하다 — YARN cluster 모드에서 Spark의 ApplicationMaster는 `runDriver()`가
-    사용자 코드에서 SparkContext가 생성되기를 최대 `spark.yarn.am.waitTime`까지
-    기다린 "뒤에야" RM에 AM을 등록한다(`waitForSparkContextInitialized()`). 이
-    launcher가 감싸는 모듈이 SparkContext를 절대 안 만들면, AM은 등록 자체를
-    미룬 채 그 대기시간(우리는 1800초로 늘려둠)을 매 시도(기본 2회)마다 통째로
-    날리고 결국 실패한다 — 실제 EMR 실행에서 확인(2026-08-26, `Evaluate-rental`
-    스텝이 ACCEPTED 상태로 약 30분씩 두 번 멈췄다가 실패). 아무 일도 안 하는
-    `SparkSession.builder.getOrCreate()` 한 줄만 먼저 실행해도 AM이 즉시
-    등록된다."""
-    dummy_session = (
-        'from pyspark.sql import SparkSession\nSparkSession.builder.getOrCreate()\n'
-        if create_dummy_spark_session
-        else ""
-    )
+    이 launcher는 실제로 Spark를 쓰는 모듈(`run_pipeline`/`build_multi_horizon_features`
+    처럼 자기 코드 안에서 `get_spark()`로 SparkSession을 직접 만드는 것)에만 쓴다 —
+    Spark를 전혀 안 쓰는 순수 파이썬 오케스트레이터는 `_yarn_python_module_step()`이
+    YARN distributed-shell로 직접 띄운다(그 함수 docstring 4번 참고 — spark-submit으로
+    감싸던 예전 방식은 SparkContext가 안 생겨 AM 등록이 미뤄지는 문제가 있었다)."""
     launcher = (
         f"cat > /tmp/_spark_entry_{module.rsplit('.', 1)[-1]}.py <<'PYEOF'\n"
-        + dummy_session
-        + "import runpy\n"
+        "import runpy\n"
         f'runpy.run_module("{module}", run_name="__main__")\n'
         "PYEOF\n"
     )
@@ -185,81 +181,89 @@ def _spark_module_launcher_command(
     return ["bash", "-c", launcher + spark_submit]
 
 
+_YARN_DISTRIBUTED_SHELL_JAR_SEARCH_ROOTS = ("/usr/lib/hadoop-yarn", "/usr/lib/hadoop", "/opt/hadoop")
+# distributed-shell 자체 ApplicationMaster(워커 컨테이너와 별개)가 기본 100MB
+# 힙으로 뜨면 클래스 로딩만 하다가도 OutOfMemoryError로 즉시 죽는다 — 겉보기엔
+# "JNI error"라 Java 17 비호환처럼 보였지만 실제로는 순수 메모리 부족이었다
+# (`ml/training/scripts/monthly_retrain_check.py`의 YARN_AM_MEMORY_MB 주석과
+# 같은 근거, 실제 EMR 실행에서 -master_memory 512로 재현/해결 확인, 2026-08-26).
+_YARN_AM_MEMORY_MB = 1024
+_YARN_AM_VCORES = 1
+
+
 def _yarn_python_module_step(
     name: str, module: str, app_args: list[str], env: dict[str, str] | None = None
 ) -> tuple[str, list[str]]:
     """master 노드가 아니라 core 노드의 YARN 컨테이너 안에서 순수 파이썬 모듈
     (`training.scripts.monthly_retrain_check` 등)을 돌리는 스텝을 만든다.
 
-    **2026-08-26 실제 EMR 실행에서 세 번 시도 끝에 얻은 결론**:
+    **2026-08-26 실제 EMR 실행에서 네 번 시도 끝에 얻은 결론**:
     1) 처음엔 이 오케스트레이터를 `command-runner.jar` bash 스텝으로 master에서
        직접 돌렸다가 exitCode 137(OOM)로 죽었다 — master 노드는 이 계정
        제약상 m4.large(8GB)뿐인데, EMR 자체 데몬(ResourceManager/NameNode/
        instance-controller 등)만으로 이미 ~5.7GB를 쓰고 있어서(`free -h` 실측)
        우리 프로세스가 겨우 1.5GB(`dmesg`의 anon-rss:1544572kB)를 더 쓴 것만으로
        시스템 전체가 OOM-killer에 걸렸다.
-    2) YARN distributed-shell(`-num_containers 1`, 실제 학습 워커
-       `yarn_worker_bootstrap.py`가 쓰는 것과 같은 메커니즘)로 core 노드에
-       옮겨봤는데, 이번엔 컨테이너에 도달하기도 전에 distributed-shell 자체의
-       ApplicationMaster jar가 "WARNING: package javax.script not in
-       java.base" + "Error: A JNI error has occurred"로 즉시 죽었다 — 이
-       예제 jar(`org.apache.hadoop.yarn.applications.distributedshell`)가
-       EMR-7.13의 Java 17 런타임과 근본적으로 안 맞는 것으로 보인다(같은 jar를
-       실제 분산학습 워커에도 쓰므로, 이 계정에서 YARN distributed-shell 전체가
-       막혀 있을 가능성이 있다 — 별도로 재검증 필요).
-    3) spark-submit(YARN cluster 모드)으로 다시 돌아왔지만, 이번엔 JVM 힙
-       (`--driver-memory`)이 통째로 컨테이너 메모리 예산에서 떼어가는 걸
-       놓쳤던 첫 시도의 실수를 고쳤다 — Spark 자체는 아무 연산도 안 하므로
-       JVM 힙은 최소화(`--driver-memory 1g`)하고, 실제 메모리가 필요한 건
-       py4j로 뜨는 별도 파이썬(pandas/boto3) 서브프로세스 쪽이다. 그 서브프로세스는
-       JVM 힙이 아니라 컨테이너의 "overhead" 예산 안에서 도는데, 기본 overhead
-       (driver-memory의 10%)로는 부족했다 — `spark.driver.memoryOverhead`를
-       명시적으로 크게 잡아야 한다. 두 값의 합(컨테이너 총 요청량)은 노드당
-       YARN 상한(6144MB)을 넘지 않게 유지한다. Spark의 AM 실행 스크립트는
-       (2번과 달리) Java 17에 필요한 `--add-opens` 등을 이미 올바르게 넣어주는
-       것으로 이미 확인됐다(feature mart 스텝의 executor 등록 성공 실측)."""
-    common_confs = [
-        "--conf",
-        f"spark.yarn.appMasterEnv.S3_BUCKET={S3_BUCKET}",
-        "--conf",
-        f"spark.yarn.appMasterEnv.PYTHONPATH={_EMR_PYTHONPATH}",
-        "--conf",
-        "spark.pyspark.python=/usr/bin/python3.11",
-        "--conf",
-        "spark.pyspark.driver.python=/usr/bin/python3.11",
-        "--driver-memory",
-        "1g",
-        # 실제 메모리를 쓰는 건 JVM 힙이 아니라 py4j 서브프로세스(pandas/boto3) —
-        # 이 예산이 부족하면 컨테이너 전체가 exitCode 137로 죽는다(위 3번 참고).
-        # 4096으로도 부족해서(실제 EMR 실행에서 재확인, 2026-08-26) 이 계정
-        # 노드당 상한(6144MB)에 맞춰 최대로 올린다 — driver-memory(1g)와 합쳐
-        # 정확히 6144.
-        "--conf",
-        "spark.driver.memoryOverhead=5120",
-        "--conf",
-        "spark.yarn.am.waitTime=1800s",
-        # LightGBM predict()는 기본적으로 멀티스레드를 쓰려 하는데, --driver-cores를
-        # 안 주면 AM 컨테이너가 YARN에서 1 vCore만 받아서 스레드끼리 그 안에서
-        # 경합만 한다 — 실제 EMR 실행에서 챔피언 4개 부스터(포아송/q10/q50/q90)
-        # 예측에 부스터당 최대 ~550초씩 걸리는 것으로 확인(2026-08-26). m4.large는
-        # 물리 코어가 2개뿐이라(YARN엔 4 vCore로 과다 표시돼 있지만 물리 한계는
-        # 2) 그 이상은 의미가 없다.
-        "--driver-cores",
-        "2",
-    ]
+    2) YARN distributed-shell로 core 노드에 옮겨봤는데, 이번엔 컨테이너에
+       도달하기도 전에 distributed-shell 자체의 ApplicationMaster가 "WARNING:
+       package javax.script not in java.base" + "Error: A JNI error has
+       occurred"로 즉시 죽었다 — 처음엔 Java 17 비호환으로 오진했지만, 나중에
+       실제 분산학습 워커(`yarn_worker_bootstrap.py`)로 격리 재현해보니 그냥
+       기본 100MB AM 힙 부족이었다(`_YARN_AM_MEMORY_MB` 주석 참고).
+    3) 그래서 spark-submit(YARN cluster 모드, 더미 SparkSession)으로 우회했으나,
+       이 방식은 (a) Spark 자체가 아무 연산도 안 하는데도 EMR 기본 dynamic
+       allocation이 executor를 최대 50개까지 미리 요청해 우리 distributed-shell
+       워커와 자원을 놓고 경합하다 driver가 죽고(`spark.dynamicAllocation.
+       enabled=false`로 완화는 됐지만), (b) 그렇게 완화해도 이 spark-submit
+       자신이 AM(노드 1개) + 정적 최소 executor(스파크가 0개를 거부해서 강제로
+       뜨는 executor, 노드 1개 이상)를 항상 먹어서, 그 "안"에서 다시 8노드
+       그대로 distributed-shell을 요청하면 barrier가 나머지를 10분간 기다리다
+       타임아웃나는 문제가 있었다(전부 실제 EMR 실행에서 확인, 2026-08-26).
+    4) 결론: 2번의 "JNI error"가 사실 AM 힙 부족이었다는 걸 알게 된 뒤로는
+       distributed-shell(`-num_containers 1`, `-master_memory`/`-master_vcores`
+       명시)로 돌아오는 게 정답이다 — Spark를 아예 안 쓰므로 더미 SparkSession
+       (`_spark_module_launcher_command`)도, JVM 힙/overhead 계산도,
+       dynamicAllocation 문제도 전부 해당 사항이 없어지고, 이 오케스트레이터
+       자신이 먹는 노드도 AM 하나(그것도 1GB 남짓, 노드 전체를 안 씀)뿐이라
+       나머지 core 노드를 실제 distributed-shell 워커에 최대한 넘겨줄 수 있다.
+    """
+    shell_env = {"S3_BUCKET": S3_BUCKET, "PYTHONPATH": _EMR_PYTHONPATH, **(env or {})}
     if EMR_MLFLOW_TRACKING_URI:
-        common_confs += ["--conf", f"spark.yarn.appMasterEnv.MLFLOW_TRACKING_URI={EMR_MLFLOW_TRACKING_URI}"]
-    for key, value in (env or {}).items():
-        common_confs += ["--conf", f"spark.yarn.appMasterEnv.{key}={value}"]
-    return name, _spark_module_launcher_command(
-        module, common_confs, app_args=app_args, create_dummy_spark_session=True
+        shell_env["MLFLOW_TRACKING_URI"] = EMR_MLFLOW_TRACKING_URI
+    shell_env_args = " ".join(f"-shell_env {key}={value}" for key, value in shell_env.items())
+    module_args = " ".join(app_args)
+    # LightGBM predict()는 기본적으로 멀티스레드를 쓰려 하는데, vcores를 1만
+    # 주면 스레드끼리 그 안에서 경합만 한다 — 실제 EMR 실행에서 챔피언 4개
+    # 부스터(포아송/q10/q50/q90) 예측에 부스터당 최대 ~550초씩 걸리는 것으로
+    # 확인(2026-08-26). m4.large는 물리 코어가 2개뿐이라(YARN엔 4 vCore로
+    # 과다 표시돼 있지만 물리 한계는 2) 그 이상은 의미가 없다.
+    shell_command = f"cd {_EMR_PYTHONPATH} && PYTHONPATH={_EMR_PYTHONPATH} python3.11 -m {module} {module_args}"
+    search_roots = " ".join(_YARN_DISTRIBUTED_SHELL_JAR_SEARCH_ROOTS)
+    script = (
+        f"JAR=$(find {search_roots} -iname '*distributedshell*.jar' 2>/dev/null | head -1); "
+        'if [ -z "$JAR" ]; then echo "distributed-shell jar를 찾을 수 없습니다" >&2; exit 1; fi; '
+        "yarn org.apache.hadoop.yarn.applications.distributedshell.Client "
+        f'-jar "$JAR" -shell_command \'{shell_command}\' '
+        "-num_containers 1 -container_memory 6144 -container_vcores 2 "
+        f"-master_memory {_YARN_AM_MEMORY_MB} -master_vcores {_YARN_AM_VCORES} {shell_env_args}"
     )
+    return name, ["bash", "-c", script]
 
 
-def _feature_mart_spark_steps(profile: str) -> tuple[tuple[str, list[str]], tuple[str, list[str]]]:
+def _feature_mart_spark_steps(
+    profile: str, core_instance_count: int = FEATURE_MART_CORE_INSTANCE_COUNT
+) -> tuple[tuple[str, list[str]], tuple[str, list[str]]]:
     """`profile`로 feature mart(2차 정제)를 (재)생성하는 두 Spark 스텝(name, args)을
     반환한다 — run_pipeline.py는 watermark 기반 증분이라 매번 불러도 안전하다
-    (평가 전 최신화용 `refresh_feature_mart`와 재학습 루프 양쪽에서 재사용)."""
+    (평가 전 최신화용 `refresh_feature_mart`와 재학습 루프 양쪽에서 재사용).
+
+    args:
+        core_instance_count: 이 스텝이 실제로 돌 클러스터의 core 노드 수 —
+            `--num-executors`를 여기 맞춰 노드마다 executor 하나씩 배치한다
+            (노드 수보다 하나 적게 잡아 AM 자리를 남긴다). 하드코딩된 값을
+            그대로 두면 노드 수가 늘어나도 병렬도가 그대로라 유휴 노드가
+            생긴다(PR #248 리뷰 지적).
+    """
     common_confs = [
         # feature_engine/spark/spark_session.py의 get_spark()가 "지금 진짜 yarn
         # 클러스터 실행인지"를 판단할 유일한 신호 — pyspark SparkConf()로 spark-submit
@@ -296,14 +300,14 @@ def _feature_mart_spark_steps(profile: str) -> tuple[tuple[str, list[str]], tupl
         # "6144 MB per container" 상한, 물리 8GB에서 OS/데몬 몫을 뺀 값). 기본
         # 드라이버/AM 힙(2g)로는 워터마크 없는 최초 실행(수개월치 전체 재생성)이
         # py4j 연결 끊김(OOM성 컨테이너 킬)으로 죽었다 — 4g로 넉넉히 올리고,
-        # num-executors를 노드 수(3)보다 적게(2) 잡아 AM/executor가 노드마다
-        # 하나씩만 배치되게 한다(실제 EMR 실행으로 검증, 2026-08-25).
+        # num-executors를 노드 수보다 적게 잡아 AM/executor가 노드마다 하나씩만
+        # 배치되게 한다(실제 EMR 실행으로 검증, 2026-08-25).
         "--driver-memory",
         "4g",
         "--executor-memory",
         "4g",
         "--num-executors",
-        "2",
+        str(max(core_instance_count - 1, 1)),
         # SparkContext 초기화 대기 기본값(100s, ApplicationMaster.scala의
         # AM_MAX_WAIT_TIME)이 이 작은 클러스터에서 컨테이너 배치가 늦어질 때
         # 너무 타이트해서 "Futures timed out after [100000 milliseconds]"로
@@ -446,7 +450,17 @@ def make_task_refresh_feature_mart(model_name: str) -> Any:
         # 때도 이 대기는 그대로 해야 한다 — 뒤에 오는 orchestrate_retrain_loop의 첫
         # 스텝이 이 대기를 대신 해주지 않기 때문이다.
         params_core_count = params.get("emr_core_instance_count") or FEATURE_MART_CORE_INSTANCE_COUNT
-        submit_emr_step(cluster_id, *_wait_for_yarn_nodes_step(params_core_count), mock_override=mock_override)
+        # submit_emr_step()의 기본 timeout_seconds(5400s=90분)는 무거운 Spark
+        # 스텝 기준이다 — 이 대기는 그냥 `yarn node -list` 폴링이라 노드가
+        # 정상 등록되면 1분 안에 끝난다. 기본값을 그대로 물려받으면 이 스텝을
+        # 포함해 총 3개 스텝(대기+RunPipeline+BuildMultiHorizon)이 각각 90분
+        # 한도를 쓸 수 있어 최악 270분 > MONTHLY_FEATURE_REFRESH_TIMEOUT(4시간)
+        # 이 된다(PR #248 리뷰 지적) — 노드가 끝내 안 붙는 실패 케이스도 90분씩
+        # 기다릴 이유가 없으므로 짧게 별도로 잡는다.
+        submit_emr_step(
+            cluster_id, *_wait_for_yarn_nodes_step(params_core_count),
+            timeout_seconds=1200, mock_override=mock_override,
+        )
 
         if params.get("test_profile_only"):
             # 챔피언 프로필 feature mart는 필요 없다 — orchestrate_retrain_loop가
@@ -461,7 +475,7 @@ def make_task_refresh_feature_mart(model_name: str) -> Any:
         logger.info(
             "[%s 월별 재학습] 1.5단계: 챔피언 프로필 '%s' 기준으로 feature mart 증분 갱신", model_name, profile
         )
-        for step_name, spark_args in _feature_mart_spark_steps(profile):
+        for step_name, spark_args in _feature_mart_spark_steps(profile, params_core_count):
             submit_emr_step(cluster_id, step_name, spark_args, mock_override=mock_override)
         ti.xcom_push(key="profile", value=profile)
 
@@ -498,10 +512,33 @@ def make_task_evaluate(model_name: str) -> Any:
 
         logger.info("[%s 월별 재학습] 2단계: EMR 스텝으로 %s 챔피언 성능 점검 (--check-only)", model_name, model_name)
         result_key = _result_s3_key(run_id, f"eval-{model_name}")
+        # 이 시점엔 create_cluster가 이미 core 노드를 다 띄워둔 상태다(피처마트용/
+        # 학습용 노드 수를 더 이상 분리하지 않음 — FEATURE_MART_CORE_INSTANCE_COUNT ==
+        # TRAINING_CORE_INSTANCE_COUNT). 평가(predict)는 학습과 달리 워커끼리 통신할
+        # 필요가 없는 embarrassingly parallel 작업이라(monitor_performance.
+        # combine_evaluation_shards() 참고) 놀고 있는 core 노드 수만큼 그대로
+        # 나눠 돌릴 수 있다 — create_cluster와 같은 override 규칙을 써서 실제
+        # 띄운 노드 수와 어긋나지 않게 한다. 이 Evaluate 스텝 자신도 spark-submit
+        # 래퍼로 노드를 먹으므로 `_WRAPPER_NODE_RESERVATION`만큼 빼야 한다
+        # (위 상수 주석 참고 — 안 빼면 barrier가 10분 타임아웃난다).
+        core_count = params.get("emr_core_instance_count") or FEATURE_MART_CORE_INSTANCE_COUNT
+        eval_num_workers = max(core_count - _WRAPPER_NODE_RESERVATION, 1)
+        # refresh_feature_mart가 방금 갱신한 feature mart는 챔피언 프로필 경로
+        # (FEATURE_PARAM_COMBO_ID = w/e/t, 프로필에서 파생)에 쓰였다. 여기서
+        # ML_PROFILE을 안 넘기면 monitor_performance가 기본(builtin-default)
+        # 경로를 읽어, 챔피언 프로필의 w/e/t가 기본값과 다를 때 방금 갱신한
+        # mart를 못 보거나(구버전 데이터) 아예 없는 테이블을 봐서
+        # FileNotFoundError/ValueError로 죽는다(PR #248 리뷰 지적) — 같은
+        # xcom 값을 그대로 재사용해 두 태스크가 항상 같은 프로필을 본다.
+        profile = ti.xcom_pull(task_ids=_task_id(model_name, "refresh_feature_mart"), key="profile") or "builtin-default"
         name, command = _yarn_python_module_step(
             f"Evaluate-{model_name}",
             "training.scripts.monthly_retrain_check",
-            ["--check-only", "--models", model_name, "--result-s3-key", result_key],
+            [
+                "--check-only", "--models", model_name, "--result-s3-key", result_key,
+                "--eval-num-workers", str(eval_num_workers),
+            ],
+            env={"ML_PROFILE": profile},
         )
         submit_emr_step(cluster_id, name, command, mock_override=mock_override)
 
@@ -564,11 +601,12 @@ def make_task_orchestrate_retrain_loop(model_name: str) -> Any:
         )
 
         results_by_profile: dict[str, Any] = {}
+        core_instance_count = params.get("emr_core_instance_count") or TRAINING_CORE_INSTANCE_COUNT
 
         for profile in candidate_profiles:
             logger.info("=== [%s 프로필: %s] EMR 피처마트 스텝 제출 ===", model_name, profile)
             try:
-                for step_name, spark_args in _feature_mart_spark_steps(profile):
+                for step_name, spark_args in _feature_mart_spark_steps(profile, core_instance_count):
                     submit_emr_step(cluster_id, step_name, spark_args, mock_override=mock_override)
                 logger.info("=== [%s 프로필: %s] EMR 피처마트 완료 ===", model_name, profile)
 
@@ -590,12 +628,15 @@ def make_task_orchestrate_retrain_loop(model_name: str) -> Any:
                     # 나오면 이 플래그 없이는 진짜 models/champion/*.json이
                     # 바뀐다. 스모크 테스트 목적과 안 맞으므로 명시적으로 막는다.
                     train_args.append("--no-promote")
+                # 이 학습 스텝도 spark-submit 래퍼 "안"에서 자기 자신의 distributed-shell을
+                # core_instance_count 그대로 요청하면 barrier가 영원히 기다리다 타임아웃
+                # 난다 — Evaluate와 같은 이유(`_WRAPPER_NODE_RESERVATION` 주석 참고).
                 train_name, train_command = _yarn_python_module_step(
                     f"Train-{model_name}-{profile}",
                     "training.scripts.monthly_retrain_check",
                     train_args,
                     env={
-                        "LGB_NUM_MACHINES": str(TRAINING_CORE_INSTANCE_COUNT),
+                        "LGB_NUM_MACHINES": str(max(core_instance_count - _WRAPPER_NODE_RESERVATION, 1)),
                         "LGB_TREE_LEARNER": "data",
                     },
                 )
