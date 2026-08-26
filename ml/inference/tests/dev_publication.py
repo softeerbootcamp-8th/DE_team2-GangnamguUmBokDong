@@ -373,8 +373,18 @@ def _predictor_state() -> tuple[dict[str, object], object]:
                         "hour": target.hour,
                         "minute": target.minute,
                         "horizon": horizon,
-                        "rental": {"pred_mean": state["prediction"]},
-                        "return": {"pred_mean": state["prediction"]},
+                        "rental": {
+                            "pred_mean": state["prediction"],
+                            "pred_p10": 0.5,
+                            "pred_p50": 1.0,
+                            "pred_p90": 1.5,
+                        },
+                        "return": {
+                            "pred_mean": state["prediction"],
+                            "pred_p10": 0.25,
+                            "pred_p50": 0.75,
+                            "pred_p90": 1.25,
+                        },
                     }
                 )
         count = len(kwargs["station_ids"]) * 12
@@ -935,7 +945,8 @@ def test_authority_context_uses_pinned_profile_instead_of_legacy_global_cache():
         station_index, values = ps._get_station_profile()
 
     assert station_index == {1: 0}
-    assert values.shape[0] == 1
+    assert set(values) == {(1, 0)}
+    assert values[(1, 0)].shape[0] == 1
     assert ps._station_profile_values is None
 
 

@@ -2,7 +2,7 @@
 
 Mutable champion pointer나 ``predictions/...`` overwrite는 이 모듈의 authority가
 아니다. Serving-release pointer를 run 시작에 정확히 한 번 읽고, 계산이 실제로 읽은
-non-model S3 bytes와 7-column 결과를 content-addressed object로 고정한 뒤 immutable
+non-model S3 bytes와 13-column 결과를 content-addressed object로 고정한 뒤 immutable
 revision catalog를 claim하고 success/EMPTY manifest를 마지막에 기록한다.
 """
 
@@ -77,7 +77,7 @@ from .predict_single import (
     predict_demand_multi_hour_all_stations,
 )
 
-INFERENCE_PRODUCER_VERSION = "gold-inference-producer-v1"
+INFERENCE_PRODUCER_VERSION = "gold-inference-producer-v2-quantiles"
 """Inference manifest에 기록하는 producer implementation version이다."""
 
 InferencePublicationError = InferenceCatalogError
@@ -429,7 +429,7 @@ def _complete_output_table(
     logical_dttm: datetime,
     expected_sta_ids: IdSet,
 ) -> pa.Table:
-    """Legacy batch result를 exact complete 7-column authority table로 바꾼다."""
+    """Legacy batch result를 exact complete 13-column authority table로 바꾼다."""
     if type(outcome) is not dict:
         raise InferencePublicationError("inference predictor 결과는 dict여야 합니다.")
     failed = outcome.get("failed")
@@ -459,7 +459,13 @@ def _complete_output_table(
                     "minute": result["minute"],
                     "horizon": result["horizon"],
                     "rental_pred_mean": result["rental"]["pred_mean"],
+                    "rental_pred_p10": result["rental"]["pred_p10"],
+                    "rental_pred_p50": result["rental"]["pred_p50"],
+                    "rental_pred_p90": result["rental"]["pred_p90"],
                     "return_pred_mean": result["return"]["pred_mean"],
+                    "return_pred_p10": result["return"]["pred_p10"],
+                    "return_pred_p50": result["return"]["pred_p50"],
+                    "return_pred_p90": result["return"]["pred_p90"],
                 }
             )
     except (KeyError, TypeError) as exc:

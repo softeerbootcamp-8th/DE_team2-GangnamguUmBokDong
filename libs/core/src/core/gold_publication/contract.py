@@ -577,6 +577,7 @@ _REGISTRY = {
         ),
         parameter_names=(
             "expected_sta_id_sha256",
+            "rebalance_policy_config",
             "scoring_config_version",
             "stock_history_offsets",
             "stock_window_count",
@@ -596,12 +597,18 @@ _REGISTRY = {
             "station_urgency",
         ),
         input_roles=(
+            _role("pickup_cooldown_station_ids"),
             _role("route_coverage"),
             _role("urgency_publication_manifest"),
         ),
         parameter_names=(
             "max_routes_per_center",
             "max_stops_per_route",
+            "pickup_dispatch_assumed_speed_kmh",
+            "pickup_dispatch_max_lag_minutes",
+            "pickup_dispatch_service_minutes_per_stop",
+            "pickup_dispatch_sla_config_version",
+            "rebalance_policy_config",
             "route_algorithm_version",
             "route_coverage_sha256",
             "route_work_unit_config_version",
@@ -894,7 +901,7 @@ def validate_route_urgency_dependencies(
     route_fingerprint: InputFingerprint,
     urgency_fingerprint: InputFingerprint,
 ) -> None:
-    """route와 urgency fingerprint의 station·demand·stock tuple을 대조한다."""
+    """route와 urgency fingerprint의 upstream tuple·정책 config를 대조한다."""
     validate_input_fingerprint("rebalance_route", route_fingerprint)
     validate_input_fingerprint("station_urgency", urgency_fingerprint)
     route_dependencies = {
@@ -915,6 +922,19 @@ def validate_route_urgency_dependencies(
                 "route fingerprint와 urgency nested dependency tuple이 다릅니다: "
                 f"{dependency_key}"
             )
+    route_parameters = {
+        parameter.name: parameter.value for parameter in route_fingerprint.parameters
+    }
+    urgency_parameters = {
+        parameter.name: parameter.value for parameter in urgency_fingerprint.parameters
+    }
+    if (
+        route_parameters["rebalance_policy_config"]
+        != urgency_parameters["rebalance_policy_config"]
+    ):
+        raise ContractViolation(
+            "route fingerprint와 urgency nested rebalance_policy_config가 다릅니다."
+        )
 
 
 def validate_station_stock_release(

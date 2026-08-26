@@ -79,6 +79,14 @@ from .station_stock import (
 )
 from .versioning import PublicationCandidate, allocate_revision
 
+_POSTGIS_DISTANCE_BATCH_MAX_PAIRS = 16_384
+"""한 SQL의 좌표 array raw payload를 약 512KiB로 제한하는 pair 상한이다.
+
+Pair 하나는 네 float8 좌표라 raw 32 bytes이고, 16,384개면 512KiB다. 반환 distance
+raw 값도 128KiB 안쪽이라 statement와 ``fetchall()``을 bounded로 유지하면서 현재
+projection 규모에서도 수천 개의 station별 왕복을 한 자릿수 chunk로 줄인다.
+"""
+
 BIKE_STATION_MASTER_SOURCE_ID = "bike_station_master"
 BIKE_STATION_REALTIME_SOURCE_ID = "bike_station_realtime"
 STATION_PUBLISHER_VERSION = "gold-station-publisher-v1"
@@ -1468,7 +1476,7 @@ def _postgis_distance(cursor: Cursor[tuple[Any, ...]]) -> Any:
     def batch(
         pairs: tuple[tuple[tuple[float, float], tuple[float, float]], ...],
     ) -> tuple[float, ...]:
-        """Point 쌍 여러 개의 거리를 한 번의 round trip으로 반환한다.
+        """Point 쌍 여러 개를 bounded chunk의 round trip으로 계산해 반환한다.
 
         `distance`와 완전히 같은 geography 식을 쓰므로 값이 달라지지 않는다.
         정류소 하나당 배차센터 12개를 개별 쿼리로 재는 구조가
@@ -1478,31 +1486,35 @@ def _postgis_distance(cursor: Cursor[tuple[Any, ...]]) -> Any:
         """
         if not pairs:
             return ()
-        cursor.execute(
-            """
-            SELECT ST_Distance(
-                ST_SetSRID(ST_MakePoint(t.lon_a, t.lat_a), 4326)::geography,
-                ST_SetSRID(ST_MakePoint(t.lon_b, t.lat_b), 4326)::geography
+        values: list[float] = []
+        for offset in range(0, len(pairs), _POSTGIS_DISTANCE_BATCH_MAX_PAIRS):
+            chunk = pairs[offset : offset + _POSTGIS_DISTANCE_BATCH_MAX_PAIRS]
+            cursor.execute(
+                """
+                SELECT ST_Distance(
+                    ST_SetSRID(ST_MakePoint(t.lon_a, t.lat_a), 4326)::geography,
+                    ST_SetSRID(ST_MakePoint(t.lon_b, t.lat_b), 4326)::geography
+                )
+                FROM unnest(
+                    %s::float8[], %s::float8[], %s::float8[], %s::float8[]
+                ) WITH ORDINALITY AS t(lon_a, lat_a, lon_b, lat_b, ord)
+                ORDER BY t.ord
+                """,
+                (
+                    [candidate[0] for candidate, _ in chunk],
+                    [candidate[1] for candidate, _ in chunk],
+                    [reference[0] for _, reference in chunk],
+                    [reference[1] for _, reference in chunk],
+                ),
             )
-            FROM unnest(
-                %s::float8[], %s::float8[], %s::float8[], %s::float8[]
-            ) WITH ORDINALITY AS t(lon_a, lat_a, lon_b, lat_b, ord)
-            ORDER BY t.ord
-            """,
-            (
-                [candidate[0] for candidate, _ in pairs],
-                [candidate[1] for candidate, _ in pairs],
-                [reference[0] for _, reference in pairs],
-                [reference[1] for _, reference in pairs],
-            ),
-        )
-        rows = cursor.fetchall()
-        if len(rows) != len(pairs):
-            raise ContractViolation(
-                "PostGIS ST_Distance batch 결과 수가 입력과 다릅니다: "
-                f"expected={len(pairs)} actual={len(rows)}"
-            )
-        return tuple(float(row[0]) for row in rows)
+            rows = cursor.fetchall()
+            if len(rows) != len(chunk):
+                raise ContractViolation(
+                    "PostGIS ST_Distance batch 결과 수가 입력과 다릅니다: "
+                    f"offset={offset} expected={len(chunk)} actual={len(rows)}"
+                )
+            values.extend(float(row[0]) for row in rows)
+        return tuple(values)
 
     distance.batch = batch  # type: ignore[attr-defined]
     return distance
