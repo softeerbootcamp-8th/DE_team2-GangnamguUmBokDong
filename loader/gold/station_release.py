@@ -2399,6 +2399,8 @@ def _upsert_station(
     _validate_station_ids(tuple(record.sta_id for record in records))
     if not records:
         return
+    # 위 중복 검증이 동일 key의 statement 내 재충돌을 차단한다. C 정렬은
+    # ON CONFLICT가 기존 station row를 잠그는 순서를 locale과 무관하게 고정한다.
     cursor.execute(
         """
         INSERT INTO station (
@@ -2473,8 +2475,8 @@ def _upsert_station(
             [record.sta_nm for record in records],
             [record.sta_addr for record in records],
             [record.hold_cnt for record in records],
-            [record.longitude for record in records],
-            [record.latitude for record in records],
+            [float(record.longitude) for record in records],
+            [float(record.latitude) for record in records],
             [record.sta_point_source_cd for record in records],
             [record.weather_grid_id for record in records],
             [record.dispatch_center_id for record in records],
@@ -2492,6 +2494,8 @@ def _replace_station_stock(
     """station_stock을 단일 upsert 후 absent-key 삭제로 reconcile한다."""
     _validate_station_ids(tuple(record.sta_id for record in records))
     if records:
+        # 위 중복 검증이 동일 key의 statement 내 재충돌을 차단한다. C 정렬은
+        # ON CONFLICT가 기존 stock row를 잠그는 순서를 locale과 무관하게 고정한다.
         cursor.execute(
             """
             INSERT INTO station_stock (

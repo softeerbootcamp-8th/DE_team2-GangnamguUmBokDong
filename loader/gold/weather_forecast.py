@@ -462,6 +462,8 @@ def _upsert_weather_forecast_records(
     """incoming weather PK를 단일 SQL로 upsert하며 최초 생성 시각을 보존한다."""
     if not records:
         return
+    # Projection 계약이 grid·forecast key 중복을 차단한다. C 정렬은 ON CONFLICT가
+    # 기존 forecast row를 잠그는 순서를 locale과 무관하게 고정한다.
     cursor.execute(
         """
         INSERT INTO weather_forecast AS current_forecast (

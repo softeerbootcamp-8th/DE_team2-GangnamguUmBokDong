@@ -850,10 +850,12 @@ def _reconcile_demand_records(
             predicted_rent_cnt INTEGER NOT NULL,
             predicted_rtn_cnt INTEGER NOT NULL,
             PRIMARY KEY (sta_id, predicted_dttm)
-    ) ON COMMIT DROP
-    """
+        ) ON COMMIT DROP
+        """
     )
     if records:
+        # Projection 계약과 staging PK가 중복 key를 차단해 단일 statement가 성립한다.
+        # C 정렬은 ON CONFLICT가 기존 row를 잠그는 순서를 locale과 무관하게 고정한다.
         cursor.execute(
             """
             INSERT INTO gold_demand_staging (
