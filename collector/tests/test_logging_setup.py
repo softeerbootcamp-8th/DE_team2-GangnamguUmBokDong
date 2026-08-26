@@ -11,7 +11,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import logging_setup
-from logging_setup import configure_logging
+from logging_setup import configure_httpx_request_logging, configure_logging
 
 KST = ZoneInfo("Asia/Seoul")
 
@@ -82,6 +82,19 @@ class TestLevel:
         line = stream.getvalue()
         assert line.startswith("ERROR")
         assert "failure_reason=quality_gate" in line
+
+
+class TestHttpxRequestLogging:
+    def test_kma_suppresses_duplicate_httpx_info_log(self):
+        configure_httpx_request_logging("kma_apihub")
+
+        assert logging.getLogger("httpx").level == logging.WARNING
+
+    def test_other_adapter_restores_inherited_httpx_level(self):
+        configure_httpx_request_logging("kma_apihub")
+        configure_httpx_request_logging("seoul_openapi")
+
+        assert logging.getLogger("httpx").level == logging.NOTSET
 
 
 class TestPropagationToNamedLogger:
