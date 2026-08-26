@@ -277,20 +277,26 @@ def main(argv: list[str] | None = None) -> int:
 
         if last is None:
             time_based_due = True
-        elif time_rule:
-            # 발표 그리드가 있는 소스(기상청 단기예보/초단기실황·예보)는
-            # "마지막 성공이 wall-clock으로 언제 실행됐는지"가 아니라 "그
-            # 실행이 실제로 담당했던 발표 슬롯이 무엇인지"를 그리드에 스냅해서
-            # 비교해야 한다. `last`(=manifest key로 쓰인 원래 window_start,
-            # `orchestration.templates.KST_WINDOW_START` — DAG 트리거 시각을
-            # 5분 단위로 내림한 값)를 그대로 elapsed_seconds 임계값과 비교하면,
-            # 한 번이라도 늦게 성공할 때마다 그 지연이 다음 판단 기준에 그대로
-            # 누적돼 실제 발표 슬롯과 점점 어긋난다 — 실제 운영에서 확인
-            # (2026-08-26, weather_short_term_forecast manifest logical_dttm이
+        elif time_rule == "vilage_fcst":
+            # 단기예보(3시간 그리드)만 그리드 스냅 비교를 쓴다 — "마지막 성공이
+            # wall-clock으로 언제 실행됐는지"가 아니라 "그 실행이 실제로 담당했던
+            # 발표 슬롯이 무엇인지"로 판단해야, 한 번이라도 늦게 성공할 때마다
+            # 그 지연이 다음 판단 기준에 그대로 누적돼 실제 발표 슬롯과 점점
+            # 어긋나는 문제를 막는다 — 실제 운영에서 확인(2026-08-26,
+            # weather_short_term_forecast manifest logical_dttm이
             # 09:00→12:00→15:00→16:00→19:00→22:00→01:00→04:00→07:00(KST)처럼
             # 3시간 간격의 wall-clock 성공 시각만 계속 이어져서, 08:00 발표분이
-            # 10:00이 돼서야 잡혔다). 두 시각을 같은 그리드로 스냅해서 슬롯
-            # 자체가 넘어갔는지로 판단하면 지연이 누적되지 않는다.
+            # 10:00이 돼서야 잡혔다).
+            #
+            # 초단기실황/예보(hourly/half_hourly)에는 이 그리드 스냅을 적용하지
+            # 않는다 — 이 두 소스는 realtime_tick의 5분 tick마다 폴링돼서
+            # (min_interval 10분/30분) 지연이 누적될 만큼 폴링 간격이 벌어지지
+            # 않는다. 한때 이 둘에도 그리드 스냅을 적용했다가 실제 운영에서
+            # 확인(2026-08-26): 시간당 6번(10분 간격) 잘 수집되던 게, 이 분기가
+            # 배포되자마자 시간당 1번으로 뚝 떨어졌다 — adjust_base_time의
+            # hourly/half_hourly 규칙은 API 파라미터 계산용으로 "그 시각에 유효한
+            # 슬롯 하나"만 반환해서, 소스 자체가 시간당 여러 번 갱신되더라도
+            # due 판단을 시간당 1번으로 강제로 좁혀버린다.
             from adapters.kma_apihub import adjust_base_time
 
             time_based_due = adjust_base_time(now, time_rule) > adjust_base_time(last, time_rule)

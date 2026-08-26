@@ -319,14 +319,17 @@ class TestCheckDueAfterSeconds:
         payload = json.loads(capsys.readouterr().out)
         assert payload["due"] is True
 
-    def test_grid_source_not_due_within_same_announcement_slot(self, monkeypatch, capsys):
-        """`time_rule`이 있는 소스(기상청)는 elapsed-time 임계값을 넘겨도 같은 발표
-        슬롯 안이면 due가 아니다 — 그렇지 않으면 같은 시간당 값을 여러 번 재수집해
-        manifest revision만 쌓인다(`weather_ultra_short_live`는 매시 정각 그리드인데
-        Airflow의 freshness 임계값은 10분이라, 순수 elapsed 비교였다면 매시 6번씩
-        중복 수집을 시도했을 것)."""
+    def test_hourly_half_hourly_sources_use_elapsed_time_not_grid_snap(
+        self, monkeypatch, capsys
+    ):
+        """실제 운영 회귀 재현(2026-08-26): `hourly`/`half_hourly`(초단기실황/예보)에도
+        그리드 스냅을 적용했더니, 하루 종일 10분 간격(매시 6번)으로 잘 수집되던
+        게 배포 직후 시간당 1번으로 뚝 떨어졌다(S3 manifest로 실측 확인) — 이
+        두 소스는 realtime_tick의 5분 tick마다 폴링돼 지연이 누적될 틈이 없으므로
+        그리드 스냅이 애초에 필요 없었다. 같은 그리드(09:00) 안이라도 elapsed가
+        임계값(10분)을 넘으면 due여야 한다."""
         now = datetime(2026, 8, 24, 10, 25, tzinfo=KST)  # 그리드: 09:00
-        last = datetime(2026, 8, 24, 10, 12, tzinfo=KST)  # 그리드: 09:00(같음)
+        last = datetime(2026, 8, 24, 10, 12, tzinfo=KST)  # 그리드: 09:00(같음), elapsed=13분
 
         class _FixedDatetime(datetime):
             @classmethod
@@ -345,13 +348,16 @@ class TestCheckDueAfterSeconds:
 
         assert code == 0
         payload = json.loads(capsys.readouterr().out)
-        assert payload["due"] is False
+        assert payload["due"] is True
 
-    def test_grid_source_due_once_slot_boundary_crossed(self, monkeypatch, capsys):
-        """`time_rule`이 있는 소스는 그리드 경계를 넘으면(elapsed-time 임계값과
-        무관하게) due가 된다."""
-        now = datetime(2026, 8, 24, 10, 5, tzinfo=KST)  # 그리드: 09:00
-        last = datetime(2026, 8, 24, 9, 35, tzinfo=KST)  # 그리드: 08:00(다름)
+    def test_vilage_fcst_not_due_within_same_announcement_slot_even_past_threshold(
+        self, monkeypatch, capsys
+    ):
+        """단기예보(`vilage_fcst`)는 elapsed-time 임계값을 넘겨도 같은 발표 슬롯
+        안이면 due가 아니다 — 그렇지 않으면 같은 3시간 슬롯 값을 여러 번
+        재수집해 manifest revision만 쌓인다."""
+        now = datetime(2026, 8, 24, 10, 25, tzinfo=KST)  # 그리드: 08:00
+        last = datetime(2026, 8, 24, 8, 12, tzinfo=KST)  # 그리드: 08:00(같음), elapsed=2h13m
 
         class _FixedDatetime(datetime):
             @classmethod
@@ -365,7 +371,36 @@ class TestCheckDueAfterSeconds:
         monkeypatch.setattr(main, "_latest_source_uses_config", lambda *a, **k: True)
 
         code = main.main(
-            ["--source", "weather_ultra_short_live", "--check-due-after-seconds", "600"]
+            # 임계값(1시간)을 이미 넘겼지만(elapsed=2h13m) 그리드 스냅으로 판단하면
+            # 여전히 같은 08:00 슬롯이라 due가 아니어야 한다.
+            ["--source", "weather_short_term_forecast", "--check-due-after-seconds", "3600"]
+        )
+
+        assert code == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["due"] is False
+
+    def test_vilage_fcst_due_once_slot_boundary_crossed(self, monkeypatch, capsys):
+        """단기예보(`vilage_fcst`)는 그리드 경계를 넘으면 elapsed-time 임계값을
+        아직 못 채웠어도 due가 된다."""
+        now = datetime(2026, 8, 24, 10, 5, tzinfo=KST)  # 그리드: 08:00
+        last = datetime(2026, 8, 24, 7, 35, tzinfo=KST)  # 그리드: 05:00(다름), elapsed=2h30m
+
+        class _FixedDatetime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return now
+
+        monkeypatch.setattr(main, "datetime", _FixedDatetime)
+        monkeypatch.setattr(
+            main.storage, "latest_source_snapshot_logical_dttm", lambda *a, **k: last
+        )
+        monkeypatch.setattr(main, "_latest_source_uses_config", lambda *a, **k: True)
+
+        code = main.main(
+            # 임계값(3시간)을 아직 못 채웠지만(elapsed=2h30m) 그리드 경계(05:00->08:00)를
+            # 넘었으므로 due여야 한다.
+            ["--source", "weather_short_term_forecast", "--check-due-after-seconds", "10800"]
         )
 
         assert code == 0
