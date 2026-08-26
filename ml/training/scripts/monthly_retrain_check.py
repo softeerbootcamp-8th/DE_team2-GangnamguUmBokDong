@@ -617,20 +617,20 @@ def main() -> list[dict]:
     )
     args = parser.parse_args()
 
-    results = check_all_models(as_of=args.as_of)
-    if not args.json_output:
-        _print_report(results)
-
     requested_models = (
         [m.strip() for m in args.models.split(",") if m.strip()]
         if args.models
         else None
     )
-    relevant_results = (
-        [r for r in results if r["model_name"] in requested_models]
-        if requested_models
-        else results
-    )
+    # `check_all_models()`에 처음부터 요청받은 모델만 넘긴다 — 안 그러면
+    # `--models rental`이어도 return용 feature mart까지 통째로 읽어들여
+    # m4.large 컨테이너 메모리 예산에서 OOM(exitCode 137)이 난다(실제 EMR
+    # 실행에서 확인, 2026-08-26).
+    results = check_all_models(as_of=args.as_of, model_names=requested_models)
+    if not args.json_output:
+        _print_report(results)
+
+    relevant_results = results
     retrain_needed = [r for r in relevant_results if r["needs_retrain"]]
     target_models = [r["model_name"] for r in retrain_needed]
 

@@ -139,10 +139,16 @@ def evaluate_recent_performance(
     needed = sorted(
         set(feature_columns) | {target_col, "horizon", "date", "hour"} | ({exposure_col} if exposure_col else set())
     )
-    df = s3_io.read_parquet(table_path, columns=needed, date_range=(start, end))
+    # multi-horizon 테이블은 같은 날짜 파티션 안에 horizon마다 행이 다 섞여 있다
+    # (기본 8개: common_config.TRAIN_HORIZONS) — `filters`를 안 주면 이 구간의
+    # 8개 horizon 전부를 pandas로 읽어들인 "뒤"에 `df["horizon"]==horizon`으로
+    # 걸러서, 실제 필요한 양의 최대 8배를 메모리에 올린다(m4.large 컨테이너
+    # 메모리 상한 6144MB를 꽉 채워도 exitCode 137로 죽는 것으로 실제 EMR
+    # 실행에서 확인, 2026-08-26). pyarrow row-group 필터(`filters=`)로 애초에
+    # 이 horizon 행만 읽는다 — `core.s3.read_parquet()` docstring 참고.
+    df = s3_io.read_parquet(table_path, columns=needed, date_range=(start, end), filters=[("horizon", "==", horizon)])
     if df is None:
         raise FileNotFoundError(f"S3에 없음: {table_path}")
-    df = df[df["horizon"] == horizon].reset_index(drop=True)
     if df.empty:
         raise ValueError(
             f"{start}~{end} 구간·horizon={horizon}에 feature mart 데이터가 없음 — 최신 데이터가 반영됐는지 확인하세요"
@@ -236,17 +242,26 @@ def _log_to_mlflow(result: dict, horizon: int) -> None:
         print(f"[monitor_performance] MLflow 로깅 실패(무시하고 진행): {exc}")
 
 
-def check_all_models(as_of: date | None = None, horizon: int = 1) -> list[dict]:
-    """대여/반납 챔피언 모델을 모두 확인한다.
+def check_all_models(
+    as_of: date | None = None, horizon: int = 1, model_names: list[str] | None = None
+) -> list[dict]:
+    """대여/반납 챔피언 모델을 확인한다.
 
     args:
         as_of: 기준 날짜 (테스트용 override)
         horizon: `evaluate_recent_performance()` 참고 — 기본 1
+        model_names: None(기본)이면 대여/반납 둘 다 확인한다. 지정하면 그 모델만
+            확인한다 — `evaluate_recent_performance()` 한 번 호출마다 feature
+            mart를 한 달치 통째로 읽어들이는데(m4.large 마스터/컨테이너의 좁은
+            메모리 예산에서 실제로 exitCode 137 OOM으로 확인됨, 2026-08-26),
+            호출부가 모델 하나만 필요로 할 때 나머지 모델까지 읽어서 메모리를
+            두 배로 쓸 이유가 없다.
     returns:
-        list[dict]: decide_retrain() 결과 (rental, return 순)
+        list[dict]: decide_retrain() 결과 (요청한 모델 순서, 기본은 rental, return 순)
     """
+    specs = [spec for spec in MODEL_SPECS if spec[0] in model_names] if model_names else MODEL_SPECS
     results = []
-    for model_name, target_col, exposure_col in MODEL_SPECS:
+    for model_name, target_col, exposure_col in specs:
         evaluation = evaluate_recent_performance(model_name, target_col, exposure_col, as_of=as_of, horizon=horizon)
         result = decide_retrain(evaluation)
         _log_to_mlflow(result, horizon)

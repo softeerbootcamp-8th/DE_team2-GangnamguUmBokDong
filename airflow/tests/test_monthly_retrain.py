@@ -215,12 +215,40 @@ def test_refresh_feature_mart_falls_back_to_builtin_default_when_no_champion(mon
     assert any("builtin-default" in s for s in submitted_steps)
 
 
+def test_refresh_feature_mart_skips_champion_build_when_test_profile_only(monkeypatch) -> None:
+    """test_profile_only=True면 챔피언 feature mart는 만들 필요가 없다 —
+    orchestrate_retrain_loop가 TEST_ONLY_PROFILE_NAME으로 어차피 다시 만든다.
+    다만 Wait-YARN-Nodes는 그대로 제출해야 한다 — 뒤에 오는 retrain 루프의 첫
+    스텝이 AM 등록 타임아웃으로 죽지 않으려면 이 대기가 반드시 필요하다."""
+    mock_ti = MagicMock()
+    mock_ti.xcom_pull.return_value = "j-created"
+
+    submitted_names = []
+    monkeypatch.setattr(
+        monthly_dag,
+        "submit_emr_step",
+        lambda cluster_id, name, command, **kwargs: submitted_names.append(name),
+    )
+
+    task_fn = monthly_dag.make_task_refresh_feature_mart("rental")
+    task_fn(ti=mock_ti, params={"test_profile_only": True})
+
+    assert submitted_names == ["Wait-YARN-Nodes"]
+    assert not any("Spark-RunPipeline" in s for s in submitted_names)
+
+
 def test_evaluate_pushes_needs_retrain(monkeypatch) -> None:
     """create_cluster가 xcom에 남긴 cluster_id로 평가 스텝을 제출하고, 결과(S3 JSON)를
     읽어 needs_retrain/candidate_profiles를 xcom에 남긴다."""
     mock_ti = MagicMock()
     mock_ti.xcom_pull.return_value = "j-created"
-    monkeypatch.setattr(monthly_dag, "submit_emr_step", lambda *args, **kwargs: {"StepId": "s-1", "State": "COMPLETED"})
+    submitted = {}
+    monkeypatch.setattr(
+        monthly_dag,
+        "submit_emr_step",
+        lambda cluster_id, name, command, **kwargs: submitted.update(name=name, command=command)
+        or {"StepId": "s-1", "State": "COMPLETED"},
+    )
     monkeypatch.setattr(
         monthly_dag,
         "read_s3_json",
@@ -234,6 +262,9 @@ def test_evaluate_pushes_needs_retrain(monkeypatch) -> None:
     pushed = {call.kwargs["key"]: call.kwargs["value"] for call in mock_ti.xcom_push.call_args_list}
     assert pushed["needs_retrain"] is True
     assert pushed["candidate_profiles"] == ["rental-profile-1"]
+    # master 노드 OOM(exitCode 137) 이후 evaluate는 core 노드의 spark-submit
+    # YARN cluster 컨테이너에서 돌아야 한다 — _yarn_python_module_step() docstring 참고.
+    assert "spark-submit --deploy-mode cluster --master yarn" in submitted["command"][2]
 
 
 def test_evaluate_defaults_to_needs_retrain_when_no_result(monkeypatch) -> None:
@@ -251,6 +282,28 @@ def test_evaluate_defaults_to_needs_retrain_when_no_result(monkeypatch) -> None:
     assert result["candidate_profiles"] == ["builtin-default"]
 
 
+def test_evaluate_forces_test_profile_when_test_profile_only(monkeypatch) -> None:
+    """test_profile_only=True면 실제 EMR 성능 점검 스텝을 아예 제출하지 않고,
+    바로 TEST_ONLY_PROFILE_NAME 하나만 재학습 대상으로 xcom에 남긴다 — 재평가를
+    건너뛰고 작은 프로필로 전체 파이프라인을 빠르게 스모크 테스트하는 용도."""
+    mock_ti = MagicMock()
+    mock_ti.xcom_pull.return_value = "j-created"
+    submit_calls = []
+    monkeypatch.setattr(
+        monthly_dag, "submit_emr_step", lambda *a, **k: submit_calls.append(a) or {"StepId": "s", "State": "COMPLETED"}
+    )
+
+    task_fn = monthly_dag.make_task_evaluate("rental")
+    result = task_fn(ti=mock_ti, params={"test_profile_only": True}, run_id="run-1")
+
+    assert submit_calls == []
+    assert result["needs_retrain"] is True
+    assert result["candidate_profiles"] == [monthly_dag.TEST_ONLY_PROFILE_NAME]
+    pushed = {call.kwargs["key"]: call.kwargs["value"] for call in mock_ti.xcom_push.call_args_list}
+    assert pushed["needs_retrain"] is True
+    assert pushed["candidate_profiles"] == [monthly_dag.TEST_ONLY_PROFILE_NAME]
+
+
 def test_orchestrate_retrain_loop_submits_feature_mart_then_trains_without_resize(monkeypatch) -> None:
     """재학습 루프가 프로필마다 피처마트 스텝을 제출하고 YARN distributed-shell 학습
     스텝을 제출한다 — 클러스터가 이미 학습 단계 노드 수로 생성돼 있으므로(resize
@@ -263,13 +316,14 @@ def test_orchestrate_retrain_loop_submits_feature_mart_then_trains_without_resiz
     }.get(key)
 
     submitted_steps = []
+    submitted_commands = {}
 
-    monkeypatch.setattr(
-        monthly_dag,
-        "submit_emr_step",
-        lambda cluster_id, name, command, **kwargs: submitted_steps.append(name)
-        or {"StepId": "s", "State": "COMPLETED"},
-    )
+    def _fake_submit_emr_step(cluster_id, name, command, **kwargs):
+        submitted_steps.append(name)
+        submitted_commands[name] = command
+        return {"StepId": "s", "State": "COMPLETED"}
+
+    monkeypatch.setattr(monthly_dag, "submit_emr_step", _fake_submit_emr_step)
     # 첫 프로필은 승격 실패, 두 번째 프로필은 승격 성공 -> 루프가 거기서 멈춰야 한다.
     monkeypatch.setattr(
         monthly_dag,
@@ -287,6 +341,11 @@ def test_orchestrate_retrain_loop_submits_feature_mart_then_trains_without_resiz
     assert any("Spark-RunPipeline-profile-b" in s for s in submitted_steps)
     assert any("Train-rental-profile-a" in s for s in submitted_steps)
     assert any("Train-rental-profile-b" in s for s in submitted_steps)
+    # 학습 오케스트레이터도 master가 아니라 core 노드 YARN 컨테이너에서 돌아야
+    # 한다(evaluate와 같은 이유 — _yarn_python_module_step() docstring 참고).
+    train_command = submitted_commands["Train-rental-profile-a"][2]
+    assert "spark-submit --deploy-mode cluster --master yarn" in train_command
+    assert "spark.yarn.appMasterEnv.LGB_NUM_MACHINES=8" in train_command
 
 
 def test_terminate_cluster_task_calls_terminate_when_cluster_exists(monkeypatch) -> None:
@@ -336,6 +395,62 @@ def test_feature_mart_spark_steps_use_runpy_launcher_not_raw_script_path() -> No
 
     assert 'runpy.run_module("feature_engine.spark.run_pipeline"' in run_pipeline_step[1][2]
     assert 'runpy.run_module("feature_engine.spark.build_multi_horizon_features"' in multi_horizon_step[1][2]
+    # 이 두 모듈은 자기 코드 안에서 get_spark()로 SparkSession을 직접 만드므로,
+    # launcher가 대신 더미 SparkSession을 끼워 넣을 필요가 없다(그건
+    # _yarn_python_module_step()처럼 Spark를 전혀 안 쓰는 모듈에만 필요하다).
+    assert "SparkSession.builder.getOrCreate()" not in run_pipeline_step[1][2]
+    assert "SparkSession.builder.getOrCreate()" not in multi_horizon_step[1][2]
+
+
+def test_yarn_python_module_step_wraps_in_spark_submit_with_small_heap_large_overhead() -> None:
+    """평가/학습 오케스트레이터(`training.scripts.monthly_retrain_check`)를 master
+    노드에 bare bash 스텝으로 직접 올렸다가 master의 EMR 자체 데몬 메모리 압박으로
+    OOM(exitCode 137)이 났다. YARN distributed-shell(-num_containers 1)로
+    옮겨보니 그 예제 jar 자체가 이 EMR의 Java 17 런타임에서 "JNI error"로 죽었다
+    (둘 다 실제 EMR 실행에서 확인, 2026-08-26). spark-submit(YARN cluster 모드,
+    Java 17 대응이 이미 확인된 경로)으로 감싸되, Spark가 실제로는 아무 연산도
+    안 하므로 JVM 힙은 최소(1g)로 두고 진짜 메모리가 필요한 py4j 파이썬
+    서브프로세스 몫은 spark.driver.memoryOverhead로 크게 잡는다.
+
+    그런데 이렇게만 하면 이 대상 모듈이 SparkContext를 전혀 안 만들기 때문에,
+    YARN cluster 모드의 ApplicationMaster가 `waitForSparkContextInitialized()`
+    에서 SparkContext가 생기길 `spark.yarn.am.waitTime`(1800초)까지 기다린
+    "뒤에야" RM에 AM 등록을 시도한다 — 실제로 매 시도(기본 2회)가 ACCEPTED
+    상태로 30분씩 멈췄다가 실패했다(실제 EMR 실행에서 확인, 2026-08-26). 아무
+    일도 안 하는 `SparkSession.builder.getOrCreate()`를 launcher 맨 앞에 끼워
+    넣어야 AM이 등록을 미루지 않는다."""
+    name, command = monthly_dag._yarn_python_module_step(
+        "Evaluate-rental",
+        "training.scripts.monthly_retrain_check",
+        ["--check-only", "--models", "rental", "--result-s3-key", "some/key.json"],
+    )
+    assert name == "Evaluate-rental"
+    assert command[:2] == ["bash", "-c"]
+    script = command[2]
+    assert "spark-submit --deploy-mode cluster --master yarn" in script
+    assert "--driver-memory 1g" in script
+    assert "spark.driver.memoryOverhead=5120" in script
+    assert "--driver-cores 2" in script
+    assert 'runpy.run_module("training.scripts.monthly_retrain_check"' in script
+    # AM이 SparkContext 없이 등록을 미루지 않도록, runpy보다 먼저 더미
+    # SparkSession을 만들어야 한다.
+    assert script.index("SparkSession.builder.getOrCreate()") < script.index("import runpy")
+    # app 인자는 spark-submit이 entry 스크립트 뒤에 그대로 붙여줘야 sys.argv로 전달된다.
+    assert script.strip().endswith("--check-only --models rental --result-s3-key some/key.json")
+
+
+def test_yarn_python_module_step_passes_env_via_am_env_conf() -> None:
+    """학습 스텝의 LGB_NUM_MACHINES/LGB_TREE_LEARNER는 master 셸의 bash export가
+    아니라 spark.yarn.appMasterEnv.*로 AM 컨테이너 안까지 넘어가야 한다."""
+    _name, command = monthly_dag._yarn_python_module_step(
+        "Train-rental-profile-a",
+        "training.scripts.monthly_retrain_check",
+        ["--execute"],
+        env={"LGB_NUM_MACHINES": "8", "LGB_TREE_LEARNER": "data"},
+    )
+    script = command[2]
+    assert "spark.yarn.appMasterEnv.LGB_NUM_MACHINES=8" in script
+    assert "spark.yarn.appMasterEnv.LGB_TREE_LEARNER=data" in script
 
 
 def test_bash_step_exports_s3_bucket_always() -> None:
