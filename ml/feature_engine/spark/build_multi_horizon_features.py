@@ -227,6 +227,15 @@ def _run_cli() -> None:
     from .spark_session import get_spark
 
     spark = get_spark()
+    # run_pipeline.py는 dynamic partition overwrite를 명시하는데 이 스크립트는
+    # 빠뜨려서, 기본값(static)이 이번 실행에 실제로 등장한 날짜 파티션만 남기고
+    # 테이블 전체를 지워버렸다 — WINDOW_START(TRAIN_LOOKBACK_MONTHS 기준, 프로필마다
+    # 다름)보다 오래된 파티션이 전부 사라지는 실제 데이터 유실로 확인됐다
+    # (2026-08-26, w/e/t가 같아 경로를 공유하는 테스트 프로필로 이 스크립트를
+    # 돌렸다가 프로덕션 테이블의 365개 파티션 중 332개가 삭제됨). dynamic으로
+    # 바꾸면 "이번에 실제로 쓴 날짜 파티션"만 교체되고 그 밖의 기존 파티션은
+    # 그대로 남는다.
+    spark.conf.set("spark.sql.sources.partitionOverwriteMode", "dynamic")
     features = _features_in_training_window(
         spark.read.parquet(config.FEATURES_TABLE_PARQUET)
     )
