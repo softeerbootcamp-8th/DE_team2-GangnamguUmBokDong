@@ -319,17 +319,16 @@ class TestCheckDueAfterSeconds:
         payload = json.loads(capsys.readouterr().out)
         assert payload["due"] is True
 
-    def test_hourly_half_hourly_sources_use_elapsed_time_not_grid_snap(
+    def test_ultra_short_live_uses_dedicated_ten_minutely_freshness_grid(
         self, monkeypatch, capsys
     ):
-        """실제 운영 회귀 재현(2026-08-26): `hourly`/`half_hourly`(초단기실황/예보)에도
-        그리드 스냅을 적용했더니, 하루 종일 10분 간격(매시 6번)으로 잘 수집되던
-        게 배포 직후 시간당 1번으로 뚝 떨어졌다(S3 manifest로 실측 확인) — 이
-        두 소스는 realtime_tick의 5분 tick마다 폴링돼 지연이 누적될 틈이 없으므로
-        그리드 스냅이 애초에 필요 없었다. 같은 그리드(09:00) 안이라도 elapsed가
-        임계값(10분)을 넘으면 due여야 한다."""
-        now = datetime(2026, 8, 24, 10, 25, tzinfo=KST)  # 그리드: 09:00
-        last = datetime(2026, 8, 24, 10, 12, tzinfo=KST)  # 그리드: 09:00(같음), elapsed=13분
+        """`weather_ultra_short_live`는 fetch용 `time_rule=hourly`(시간당 1슬롯)와
+        별개로, `freshness_rule=ten_minutely` 전용 그리드로 freshness를 판단한다
+        — 실제 갱신 주기(10분)에 맞춰 매 슬롯 경계에서 지연 없이 즉시 due가
+        되어야 한다. 그리드가 다르면(10:20 vs 10:10) elapsed가 임계값을 넘지
+        않았어도 due다(vilage_fcst와 동일한 그리드-경계 우선 원칙)."""
+        now = datetime(2026, 8, 24, 10, 21, tzinfo=KST)  # 10분 그리드: 10:20
+        last = datetime(2026, 8, 24, 10, 12, tzinfo=KST)  # 10분 그리드: 10:10(다름), elapsed=9분
 
         class _FixedDatetime(datetime):
             @classmethod
@@ -343,7 +342,40 @@ class TestCheckDueAfterSeconds:
         monkeypatch.setattr(main, "_latest_source_uses_config", lambda *a, **k: True)
 
         code = main.main(
+            # 임계값(10분)을 아직 못 채웠지만(elapsed=9분) 10분 그리드 경계를
+            # 넘었으므로 due여야 한다 — 예전 elapsed-time 방식이었다면
+            # 이 케이스는 due=False였을 것(구버전 회귀 없이 즉시 반응함을 증명).
             ["--source", "weather_ultra_short_live", "--check-due-after-seconds", "600"]
+        )
+
+        assert code == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["due"] is True
+
+    def test_ultra_short_forecast_uses_dedicated_thirty_minutely_freshness_grid(
+        self, monkeypatch, capsys
+    ):
+        """`weather_ultra_short_forecast`는 fetch용 `time_rule=half_hourly`(시간당
+        1슬롯, 매시 30분)와 별개로, `freshness_rule=thirty_minutely`(시간당
+        2슬롯) 전용 그리드로 freshness를 판단한다. half_hourly 그리드로
+        판단했다면 여전히 같은 09:30 슬롯이라 due가 아니었겠지만,
+        thirty_minutely로는 10:00 슬롯이 이미 지나 due여야 한다."""
+        now = datetime(2026, 8, 24, 10, 5, tzinfo=KST)  # 30분 그리드: 10:00 / half_hourly: 09:30
+        last = datetime(2026, 8, 24, 9, 40, tzinfo=KST)  # 30분 그리드: 09:30 / half_hourly: 09:30
+
+        class _FixedDatetime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return now
+
+        monkeypatch.setattr(main, "datetime", _FixedDatetime)
+        monkeypatch.setattr(
+            main.storage, "latest_source_snapshot_logical_dttm", lambda *a, **k: last
+        )
+        monkeypatch.setattr(main, "_latest_source_uses_config", lambda *a, **k: True)
+
+        code = main.main(
+            ["--source", "weather_ultra_short_forecast", "--check-due-after-seconds", "1800"]
         )
 
         assert code == 0

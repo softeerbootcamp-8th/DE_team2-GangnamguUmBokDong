@@ -6,6 +6,12 @@ adapter_params:
   root_key: response.body.items.item
   pivot: {key: category, value: fcstValue}
   time_rule: half_hourly
+  # fetch(base_time 파라미터)는 API가 허용하는 half_hourly 그리드(시간당 1슬롯,
+  # 매시 30분)를 쓰지만, freshness 판단(Airflow의 --check-due-after-seconds)은
+  # 실제 갱신 주기(30분, 시간당 2슬롯)에 맞춘 전용 그리드를 쓴다 —
+  # adapters/kma_apihub.py 모듈 docstring 참고. 이름이 비슷해도 half_hourly와
+  # thirty_minutely는 다른 그리드다(전자는 시간당 1슬롯, 후자는 2슬롯).
+  freshness_rule: thirty_minutely
   concurrency: 8
   grids:
   - [57, 125]

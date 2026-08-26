@@ -623,6 +623,33 @@ def test_adjust_base_time_half_hourly():
     )
 
 
+def test_adjust_base_time_ten_minutely():
+    # 10분 단위로 내림만 한다(발표 지연 보정 없음) — freshness 전용
+    dt = datetime(2026, 8, 12, 14, 37, tzinfo=KST)
+    assert adjust_base_time(dt, "ten_minutely") == datetime(
+        2026, 8, 12, 14, 30, tzinfo=KST
+    )
+
+    dt = datetime(2026, 8, 12, 14, 0, tzinfo=KST)
+    assert adjust_base_time(dt, "ten_minutely") == datetime(
+        2026, 8, 12, 14, 0, tzinfo=KST
+    )
+
+
+def test_adjust_base_time_thirty_minutely():
+    # 30분 단위로 내림만 한다(시간당 2슬롯: :00, :30) — half_hourly(시간당
+    # 1슬롯, 매시 30분)와 다르다
+    dt = datetime(2026, 8, 12, 14, 5, tzinfo=KST)
+    assert adjust_base_time(dt, "thirty_minutely") == datetime(
+        2026, 8, 12, 14, 0, tzinfo=KST
+    )
+
+    dt = datetime(2026, 8, 12, 14, 37, tzinfo=KST)
+    assert adjust_base_time(dt, "thirty_minutely") == datetime(
+        2026, 8, 12, 14, 30, tzinfo=KST
+    )
+
+
 def test_adjust_base_time_vilage_fcst():
     # 02, 05, 08, 11, 14, 17, 20, 23시 + 10분 발표
     # 05:09 -> 02:00

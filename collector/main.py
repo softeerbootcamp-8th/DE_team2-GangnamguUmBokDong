@@ -274,32 +274,33 @@ def main(argv: list[str] | None = None) -> int:
         last = storage.latest_source_snapshot_logical_dttm(args.source, as_of=now)
         elapsed_seconds = None if last is None else (now - last).total_seconds()
         time_rule = config.adapter_params.get("time_rule")
+        # freshness 판단은 fetch용 time_rule(API가 허용하는 발표 그리드)이 아니라
+        # 이 소스가 실제로 갱신되는 폴링 그리드를 봐야 한다 — 단기예보(vilage_fcst,
+        # 3시간)는 둘이 같지만, 초단기실황/예보는 API 파라미터 그리드(hourly/
+        # half_hourly, 시간당 1슬롯)와 실제 갱신 주기(10분/30분)가 다르다. 이
+        # 둘을 혼동해서 hourly/half_hourly를 freshness에 그대로 썼다가 실제
+        # 운영에서 확인(2026-08-26): 시간당 6번(10분 간격) 잘 수집되던 게 시간당
+        # 1번으로 뚝 떨어졌다 — 그래서 `freshness_rule`을 별도 필드로 분리해
+        # ten_minutely/thirty_minutely 같은 순수 폴링 그리드를 쓰게 한다
+        # (`adapters.kma_apihub` 모듈 docstring 표 참고).
+        freshness_rule = config.adapter_params.get("freshness_rule") or time_rule
 
         if last is None:
             time_based_due = True
-        elif time_rule == "vilage_fcst":
-            # 단기예보(3시간 그리드)만 그리드 스냅 비교를 쓴다 — "마지막 성공이
-            # wall-clock으로 언제 실행됐는지"가 아니라 "그 실행이 실제로 담당했던
-            # 발표 슬롯이 무엇인지"로 판단해야, 한 번이라도 늦게 성공할 때마다
-            # 그 지연이 다음 판단 기준에 그대로 누적돼 실제 발표 슬롯과 점점
-            # 어긋나는 문제를 막는다 — 실제 운영에서 확인(2026-08-26,
-            # weather_short_term_forecast manifest logical_dttm이
+        elif freshness_rule:
+            # "마지막 성공이 wall-clock으로 언제 실행됐는지"가 아니라 "그 실행이
+            # 실제로 담당했던 그리드 슬롯이 무엇인지"로 판단해야, 한 번이라도
+            # 늦게 성공할 때마다 그 지연이 다음 판단 기준에 그대로 누적돼 실제
+            # 슬롯과 점점 어긋나는 문제를 막는다 — 실제 운영에서 확인
+            # (2026-08-26, weather_short_term_forecast manifest logical_dttm이
             # 09:00→12:00→15:00→16:00→19:00→22:00→01:00→04:00→07:00(KST)처럼
             # 3시간 간격의 wall-clock 성공 시각만 계속 이어져서, 08:00 발표분이
             # 10:00이 돼서야 잡혔다).
-            #
-            # 초단기실황/예보(hourly/half_hourly)에는 이 그리드 스냅을 적용하지
-            # 않는다 — 이 두 소스는 realtime_tick의 5분 tick마다 폴링돼서
-            # (min_interval 10분/30분) 지연이 누적될 만큼 폴링 간격이 벌어지지
-            # 않는다. 한때 이 둘에도 그리드 스냅을 적용했다가 실제 운영에서
-            # 확인(2026-08-26): 시간당 6번(10분 간격) 잘 수집되던 게, 이 분기가
-            # 배포되자마자 시간당 1번으로 뚝 떨어졌다 — adjust_base_time의
-            # hourly/half_hourly 규칙은 API 파라미터 계산용으로 "그 시각에 유효한
-            # 슬롯 하나"만 반환해서, 소스 자체가 시간당 여러 번 갱신되더라도
-            # due 판단을 시간당 1번으로 강제로 좁혀버린다.
             from adapters.kma_apihub import adjust_base_time
 
-            time_based_due = adjust_base_time(now, time_rule) > adjust_base_time(last, time_rule)
+            time_based_due = adjust_base_time(now, freshness_rule) > adjust_base_time(
+                last, freshness_rule
+            )
         else:
             time_based_due = elapsed_seconds >= args.check_due_after_seconds
 
