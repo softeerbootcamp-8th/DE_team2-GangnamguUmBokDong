@@ -3,7 +3,10 @@
 # bind mount한다 (docker-compose.yml 참고) — 코드 변경 시 이미지 재빌드가 필요 없다.
 FROM python:3.11-slim
 
-RUN apt-get update && apt-get install -y libgomp1 && rm -rf /var/lib/apt/lists/*
+# curl은 airflow-scheduler가 마운트된 Docker 소켓(docker-compose.prod.yml 참고)으로
+# mlflow 컨테이너를 시작/정지시키는 데 쓴다 — monthly_retrain DAG 실행 중에만
+# mlflow를 띄워 상시 EC2 리소스를 아낀다.
+RUN apt-get update && apt-get install -y libgomp1 curl && rm -rf /var/lib/apt/lists/*
 RUN pip install --no-cache-dir uv
 
 WORKDIR /workspace

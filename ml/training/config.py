@@ -216,7 +216,11 @@ if SPLIT_EMBARGO_DAYS < 0:
 # 청크를 읽을 때마다 완료 개수(또는 청크)와 그 시점까지의 peak RSS(MB)를 이 파일에
 # 이어쓴다(표준출력과 별개 — 표준출력이 다른 곳으로 리다이렉트/버퍼링돼도 이 파일만
 # tail 하면 진행 상황을 확인할 수 있다).
-TRAIN_PROGRESS_LOG_PATH = os.environ.get("TRAIN_PROGRESS_LOG_PATH", "training_progress.log")
+# 절대경로(기본 /tmp) — CWD 상대경로였을 때 YARN distributed-shell 워커가 `cd
+# /opt/gng`(배포 코드 디렉터리, yarn 사용자에게 쓰기 권한 없음) 후 학습을
+# 띄우면서 PermissionError로 즉시 죽었다(실제 EMR 실행에서 확인, 2026-08-26).
+# `/tmp`는 로컬/EC2/EMR 어떤 실행 주체·CWD에서도 항상 쓰기 가능하다.
+TRAIN_PROGRESS_LOG_PATH = os.environ.get("TRAIN_PROGRESS_LOG_PATH", "/tmp/training_progress.log")
 TRAIN_PROGRESS_LOG_INTERVAL_SECONDS = float(os.environ.get("TRAIN_PROGRESS_LOG_INTERVAL_SECONDS", "5"))
 
 

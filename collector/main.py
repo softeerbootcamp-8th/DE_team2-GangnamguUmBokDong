@@ -273,12 +273,32 @@ def main(argv: list[str] | None = None) -> int:
         now = datetime.now(ZoneInfo("Asia/Seoul"))
         last = storage.latest_source_snapshot_logical_dttm(args.source, as_of=now)
         elapsed_seconds = None if last is None else (now - last).total_seconds()
-        due = (
-            elapsed_seconds is None
-            or elapsed_seconds >= args.check_due_after_seconds
-            or not _latest_source_uses_config(
-                args.source, last, config.config_version
-            )
+        time_rule = config.adapter_params.get("time_rule")
+
+        if last is None:
+            time_based_due = True
+        elif time_rule:
+            # 발표 그리드가 있는 소스(기상청 단기예보/초단기실황·예보)는
+            # "마지막 성공이 wall-clock으로 언제 실행됐는지"가 아니라 "그
+            # 실행이 실제로 담당했던 발표 슬롯이 무엇인지"를 그리드에 스냅해서
+            # 비교해야 한다. `last`(=manifest key로 쓰인 원래 window_start,
+            # `orchestration.templates.KST_WINDOW_START` — DAG 트리거 시각을
+            # 5분 단위로 내림한 값)를 그대로 elapsed_seconds 임계값과 비교하면,
+            # 한 번이라도 늦게 성공할 때마다 그 지연이 다음 판단 기준에 그대로
+            # 누적돼 실제 발표 슬롯과 점점 어긋난다 — 실제 운영에서 확인
+            # (2026-08-26, weather_short_term_forecast manifest logical_dttm이
+            # 09:00→12:00→15:00→16:00→19:00→22:00→01:00→04:00→07:00(KST)처럼
+            # 3시간 간격의 wall-clock 성공 시각만 계속 이어져서, 08:00 발표분이
+            # 10:00이 돼서야 잡혔다). 두 시각을 같은 그리드로 스냅해서 슬롯
+            # 자체가 넘어갔는지로 판단하면 지연이 누적되지 않는다.
+            from adapters.kma_apihub import adjust_base_time
+
+            time_based_due = adjust_base_time(now, time_rule) > adjust_base_time(last, time_rule)
+        else:
+            time_based_due = elapsed_seconds >= args.check_due_after_seconds
+
+        due = time_based_due or not _latest_source_uses_config(
+            args.source, last, config.config_version
         )
         print(json.dumps({
             "source_id": args.source,

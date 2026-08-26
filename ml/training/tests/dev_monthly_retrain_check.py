@@ -158,6 +158,35 @@ def test_attempt_promotion_uses_a_unique_archive_prefix_each_call(monkeypatch):
     assert used_archive_dates[0] != used_archive_dates[1]
 
 
+def test_attempt_promotion_no_promote_skips_champion_pointer_write(monkeypatch):
+    """no_promote=True면 학습/판정은 그대로 하고 반환값도 True(승격 기준 충족)를
+    주지만, 실제 promote_challenger()는 호출하지 않는다 — 프로덕션과 feature
+    mart 경로를 공유할 수 있는 테스트 프로필로 파이프라인을 스모크 테스트할 때
+    실수로 진짜 챔피언이 바뀌는 걸 막는 안전장치(airflow test_profile_only 참고)."""
+    from training.scripts import monthly_retrain_check as mrc
+
+    monkeypatch.setattr(mrc, "_candidate_profiles", lambda model_name: [("default", {})])
+    monkeypatch.setattr(mrc, "_validate_candidate_serving_contract", lambda profile_name, env_overrides: None)
+    monkeypatch.setattr(mrc, "_trigger_feature_pipeline", lambda profile_name, env_overrides: None)
+    monkeypatch.setattr(
+        mrc,
+        "_run_training_subprocess",
+        lambda model_name, profile_name, archive_date, env_overrides: {
+            "poisson_deviance_test": 0.5,
+            "p10_p90_coverage_calibrated_test": 0.8,
+        },
+    )
+    monkeypatch.setattr(mrc, "should_promote", lambda challenger, champion: (True, ["지표 통과"]))
+
+    promote_calls = []
+    monkeypatch.setattr(mrc, "promote_challenger", lambda model_name, archive_prefix: promote_calls.append(archive_prefix))
+
+    result = mrc._attempt_promotion("rental", None, no_promote=True)
+
+    assert result is True
+    assert promote_calls == []
+
+
 def test_attempt_promotion_skips_incompatible_contract_and_tries_next_profile(monkeypatch):
     """지표를 통과해도 계약 검증이 거부한 후보에서 월별 작업 전체가 멈추지 않는다."""
     from training.scripts import monthly_retrain_check as mrc

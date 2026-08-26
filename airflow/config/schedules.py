@@ -117,6 +117,13 @@ MONTHLY_EVALUATION_TIMEOUT = timedelta(minutes=30)
 # teardown이 스킵되던 문제).
 MONTHLY_CLUSTER_CREATE_TIMEOUT = timedelta(minutes=25)
 EMR_FEATURE_MART_TIMEOUT = timedelta(minutes=90)
+# refresh_feature_mart(evaluate 직전, 챔피언 프로필로 feature mart 증분 갱신)의
+# Airflow 레벨 execution_timeout. run_pipeline.py + build_multi_horizon_features.py
+# 두 EMR 스텝을 순서대로 제출하는데, aws_infra_task.submit_emr_step()의 스텝별
+# 기본 대기 한도가 이미 90분(EMR_FEATURE_MART_TIMEOUT과 같은 값)이라 두 스텝이면
+# 최대 180분까지 걸릴 수 있다 — EMR_FEATURE_MART_TIMEOUT을 그대로 쓰면 두 번째
+# 스텝이 끝나기 전에 Airflow가 먼저 태스크를 죽인다. 180분보다 넉넉하게 잡는다.
+MONTHLY_FEATURE_REFRESH_TIMEOUT = timedelta(hours=4)
 MONTHLY_TRAINING_TIMEOUT = timedelta(hours=120)
 # 모델 하나(대여 또는 반납)의 재학습 루프 태스크 자체에 거는 Airflow execution_timeout.
 MONTHLY_RETRAIN_ORCHESTRATION_TIMEOUT = timedelta(hours=120)

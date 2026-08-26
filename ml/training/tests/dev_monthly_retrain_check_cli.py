@@ -167,7 +167,7 @@ def test_main_check_only_json_output(monkeypatch, capsys):
         },
     ]
 
-    monkeypatch.setattr(mrc, "check_all_models", lambda as_of=None: mock_results)
+    monkeypatch.setattr(mrc, "check_all_models", lambda as_of=None, model_names=None: mock_results)
     monkeypatch.setattr("sys.argv", ["monthly_retrain_check", "--check-only", "--json-output"])
 
     mrc.main()
@@ -180,8 +180,10 @@ def test_main_check_only_json_output(monkeypatch, capsys):
 
 
 def test_main_check_only_model_filtering(monkeypatch, capsys):
-    """--models로 특정 모델을 지정했을 때 해당 모델의 결과만 평가되고 요약에 포함된다."""
-    mock_results = [
+    """--models로 특정 모델을 지정했을 때 해당 모델만 평가되고(다른 모델의 feature
+    mart를 읽는 비용/메모리를 아예 안 씀 — m4.large 컨테이너에서 실제로
+    exitCode 137 OOM으로 확인됨, 2026-08-26) 요약에도 그 모델만 포함된다."""
+    all_mock_results = [
         {
             "model_name": "rental",
             "needs_retrain": True,
@@ -210,7 +212,13 @@ def test_main_check_only_model_filtering(monkeypatch, capsys):
         },
     ]
 
-    monkeypatch.setattr(mrc, "check_all_models", lambda as_of=None: mock_results)
+    monkeypatch.setattr(
+        mrc,
+        "check_all_models",
+        lambda as_of=None, model_names=None: (
+            [r for r in all_mock_results if r["model_name"] in model_names] if model_names else all_mock_results
+        ),
+    )
 
     # 1. --models return: return은 정상이므로 needs_retrain=False
     monkeypatch.setattr("sys.argv", ["monthly_retrain_check", "--check-only", "--json-output", "--models", "return"])
@@ -251,7 +259,7 @@ def test_main_check_only_writes_result_to_s3_key(monkeypatch, capsys):
             "reasons": ["deviance 16.7% 악화"],
         },
     ]
-    monkeypatch.setattr(mrc, "check_all_models", lambda as_of=None: mock_results)
+    monkeypatch.setattr(mrc, "check_all_models", lambda as_of=None, model_names=None: mock_results)
     monkeypatch.setattr(
         "sys.argv",
         ["monthly_retrain_check", "--check-only", "--result-s3-key", "models/training-runs/test/check.json"],
@@ -281,7 +289,7 @@ def test_main_execute_writes_promotion_result_to_s3_key(monkeypatch):
             "reasons": ["deviance 16.7% 악화"],
         },
     ]
-    monkeypatch.setattr(mrc, "check_all_models", lambda as_of=None: mock_results)
+    monkeypatch.setattr(mrc, "check_all_models", lambda as_of=None, model_names=None: mock_results)
     monkeypatch.setattr(mrc, "_load_baseline_metrics", lambda model_name: None)
     monkeypatch.setattr(mrc, "_attempt_promotion", lambda *args, **kwargs: True)
     monkeypatch.setattr(

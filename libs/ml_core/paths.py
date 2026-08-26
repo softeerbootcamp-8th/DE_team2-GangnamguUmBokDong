@@ -95,6 +95,26 @@ def training_run_worker_key(run_id: str, worker_id: str) -> str:
     return f"{TRAINING_RUNS_PREFIX}/{run_id}/workers/{worker_id}.json"
 
 
+def eval_shard_key(run_id: str, model_name: str, worker_id: str) -> str:
+    """분산 평가(`yarn_eval_worker.py`) 워커 하나가 자기 부분합을 쓰는 키.
+
+    학습 barrier(`training_run_worker_key()`)와 개념은 같지만(같은 `run_id`가
+    공유하는 워커들이 다 쓸 때까지 오케스트레이터가 기다렸다가 합산), 평가는
+    워커끼리 서로의 주소를 알 필요가 없어(embarrassingly parallel — 소켓 통신
+    없음) 페이로드가 host/port가 아니라 부분합(n_rows, sum_*)이다. `training-runs`
+    prefix는 공유하되 `eval-shards/{model_name}/` 아래로 분리해 학습 barrier
+    파일과 네임스페이스가 섞이지 않게 한다.
+
+    args:
+        run_id: 이 평가 시도 전체가 공유하는 식별자
+        model_name: "rental" 또는 "return"
+        worker_id: 워커(컨테이너)마다 고유한 식별자
+    returns:
+        str: "{TRAINING_RUNS_PREFIX}/{run_id}/eval-shards/{model_name}/{worker_id}.json"
+    """
+    return f"{TRAINING_RUNS_PREFIX}/{run_id}/eval-shards/{model_name}/{worker_id}.json"
+
+
 def archive_models_prefix(date: str, profile_name: str) -> str:
     """한 번의 학습 시도(날짜 + 프로필 조합)가 쓸 아카이브 prefix를 만든다.
 

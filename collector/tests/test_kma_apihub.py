@@ -13,7 +13,7 @@ import pytest
 from adapters.base import FetchErrorKind, Window, fetch_with_rounds
 from adapters.kma_apihub import (
     KmaApiHubAdapter,
-    _adjust_base_time,
+    adjust_base_time,
     _classify_result_code,
 )
 
@@ -602,23 +602,23 @@ def test_classify_result_code():
 def test_adjust_base_time_hourly():
     # 40분 전에는 이전 시각 (14:39 -> 13:00)
     dt = datetime(2026, 8, 12, 14, 39, tzinfo=KST)
-    assert _adjust_base_time(dt, "hourly") == datetime(2026, 8, 12, 13, 0, tzinfo=KST)
+    assert adjust_base_time(dt, "hourly") == datetime(2026, 8, 12, 13, 0, tzinfo=KST)
 
     # 40분 이후는 현재 시각 (14:40 -> 14:00)
     dt = datetime(2026, 8, 12, 14, 40, tzinfo=KST)
-    assert _adjust_base_time(dt, "hourly") == datetime(2026, 8, 12, 14, 0, tzinfo=KST)
+    assert adjust_base_time(dt, "hourly") == datetime(2026, 8, 12, 14, 0, tzinfo=KST)
 
 
 def test_adjust_base_time_half_hourly():
     # 30분 전에는 이전 시각 30분 (14:29 -> 13:30)
     dt = datetime(2026, 8, 12, 14, 29, tzinfo=KST)
-    assert _adjust_base_time(dt, "half_hourly") == datetime(
+    assert adjust_base_time(dt, "half_hourly") == datetime(
         2026, 8, 12, 13, 30, tzinfo=KST
     )
 
     # 30분 이후는 현재 시각 30분 (14:30 -> 14:30)
     dt = datetime(2026, 8, 12, 14, 30, tzinfo=KST)
-    assert _adjust_base_time(dt, "half_hourly") == datetime(
+    assert adjust_base_time(dt, "half_hourly") == datetime(
         2026, 8, 12, 14, 30, tzinfo=KST
     )
 
@@ -627,18 +627,18 @@ def test_adjust_base_time_vilage_fcst():
     # 02, 05, 08, 11, 14, 17, 20, 23시 + 10분 발표
     # 05:09 -> 02:00
     dt = datetime(2026, 8, 12, 5, 9, tzinfo=KST)
-    assert _adjust_base_time(dt, "vilage_fcst") == datetime(
+    assert adjust_base_time(dt, "vilage_fcst") == datetime(
         2026, 8, 12, 2, 0, tzinfo=KST
     )
 
     # 05:10 -> 05:00
     dt = datetime(2026, 8, 12, 5, 10, tzinfo=KST)
-    assert _adjust_base_time(dt, "vilage_fcst") == datetime(
+    assert adjust_base_time(dt, "vilage_fcst") == datetime(
         2026, 8, 12, 5, 0, tzinfo=KST
     )
 
     # 01:00 -> 전날 23:00
     dt = datetime(2026, 8, 12, 1, 0, tzinfo=KST)
-    assert _adjust_base_time(dt, "vilage_fcst") == datetime(
+    assert adjust_base_time(dt, "vilage_fcst") == datetime(
         2026, 8, 11, 23, 0, tzinfo=KST
     )
