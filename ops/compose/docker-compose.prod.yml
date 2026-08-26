@@ -83,6 +83,18 @@ services:
     <<: *airflow-common
     command: ["scheduler"]
     restart: unless-stopped
+    # monthly_retrain DAG가 mlflow 컨테이너를 자기 실행 구간에만 켰다 끄기 위해
+    # 호스트 Docker 데몬을 직접 호출한다(SSM이 이 계정에서 SCP로 막혀 있어 원격
+    # 실행 수단이 없다 — terraform/emr.tf 주석 참고). LocalExecutor라 태스크가 이
+    # 컨테이너 안에서 바로 도니 이 컨테이너에만 소켓을 준다(webserver/dag-processor는
+    # 필요 없음). 이 마운트는 사실상 호스트에 대한 루트급 제어권을 이 컨테이너에
+    # 준다는 뜻이니, 여기서 실행하는 명령은 mlflow 컨테이너 시작/정지로만 국한한다.
+    # `<<: *airflow-common`의 volumes 키를 여기서 다시 선언하면 YAML 병합 규칙상
+    # 완전히 대체되므로(추가가 아님), 앵커의 두 마운트를 그대로 반복해야 한다.
+    volumes:
+      - ../..:/workspace
+      - airflow-module-venvs:/opt/venvs/modules
+      - /var/run/docker.sock:/var/run/docker.sock
     depends_on:
       airflow-init:
         condition: service_completed_successfully

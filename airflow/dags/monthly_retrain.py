@@ -34,7 +34,9 @@ core 노드로 옮겼다 — 이 스크립트는 Spark 연산을 안 쓰므로 J
 
 from __future__ import annotations
 
+import json
 import logging
+import subprocess
 from itertools import pairwise
 from typing import Any
 
@@ -620,6 +622,80 @@ def make_task_terminate_emr_cluster(model_name: str) -> Any:
     return task_terminate_emr_cluster
 
 
+# 이 값과 정확히 일치하는 label(docker-compose가 서비스마다 자동으로 붙임)을
+# 가진 컨테이너를 찾는다 — 정확한 컨테이너 이름(프로젝트명 접두사 등)에 의존하면
+# compose 프로젝트 이름이 바뀔 때 조용히 깨진다.
+_MLFLOW_COMPOSE_SERVICE_LABEL = "com.docker.compose.service=mlflow"
+
+
+def _docker_mlflow_container_action(action: str) -> None:
+    """호스트 Docker 데몬(마운트된 소켓)에 직접 HTTP로 붙어 mlflow 컨테이너를
+    시작/정지한다.
+
+    이 프로젝트는 SSM(SendCommand 등)이 SCP로 전면 차단돼 있어(terraform/emr.tf
+    참고) 상시 EC2에 원격으로 명령을 실행할 방법이 이것뿐이다 — airflow-scheduler
+    컨테이너에만 호스트 docker.sock을 마운트해뒀다(docker-compose.prod.yml).
+    `docker` CLI를 이미지에 새로 설치하는 대신 Docker Engine API를 curl로 직접
+    호출한다(엔진 API와 CLI는 같은 REST 인터페이스를 공유한다).
+
+    args:
+        action: "start" 또는 "stop"
+    """
+    find_cmd = [
+        "curl", "-sf", "--unix-socket", "/var/run/docker.sock",
+        f"http://localhost/containers/json?all=1&filters=%7B%22label%22%3A%5B%22{_MLFLOW_COMPOSE_SERVICE_LABEL}%22%5D%7D",
+    ]
+    result = subprocess.run(find_cmd, capture_output=True, text=True, check=True)
+    containers = json.loads(result.stdout)
+    if not containers:
+        logger.warning("[mlflow %s] label=%s인 컨테이너를 못 찾음 — 건너뜀", action, _MLFLOW_COMPOSE_SERVICE_LABEL)
+        return
+    container_id = containers[0]["Id"]
+    subprocess.run(
+        ["curl", "-sf", "-X", "POST", "--unix-socket", "/var/run/docker.sock", f"http://localhost/containers/{container_id}/{action}"],
+        check=True,
+    )
+    logger.info("[mlflow %s] 컨테이너 %s에 적용 완료", action, container_id[:12])
+
+
+def make_task_start_mlflow() -> Any:
+    """monthly_retrain DAG 실행 구간에만 mlflow를 띄우는 callable을 반환한다 —
+    상시 켜두는 대신 이 DAG가 도는 동안만 켜서 EC2 리소스를 아낀다. mlflow가
+    안 떠도 재학습 자체의 정확성과는 무관하므로(모니터링/로깅 부가 기능,
+    `monitor_performance._log_to_mlflow()`도 실패를 삼킴) 실패해도 DAG를 막지
+    않는다."""
+
+    def task_start_mlflow(**context: Any) -> None:
+        mock_override = _mock_override_from_params(context.get("params", {}))
+        if mock_override == MOCK_OVERRIDE_FORCE_MOCK:
+            logger.info("[mlflow] force_mock — 실제로 켜지 않음")
+            return
+        try:
+            _docker_mlflow_container_action("start")
+        except Exception:
+            logger.exception("[mlflow] 시작 실패 — 재학습은 계속 진행(모니터링 부가 기능일 뿐)")
+
+    return task_start_mlflow
+
+
+def make_task_stop_mlflow() -> Any:
+    """DAG가 어떻게 끝났든(성공/실패/수동 중단) mlflow를 반드시 정지하는 callable을
+    반환한다 — `make_task_terminate_emr_cluster()`와 같은 이유로 teardown으로
+    표시해야 운영자가 DAG Run을 수동으로 실패 처리해도 실행된다."""
+
+    def task_stop_mlflow(**context: Any) -> None:
+        mock_override = _mock_override_from_params(context.get("params", {}))
+        if mock_override == MOCK_OVERRIDE_FORCE_MOCK:
+            logger.info("[mlflow] force_mock — 실제로 끄지 않음")
+            return
+        try:
+            _docker_mlflow_container_action("stop")
+        except Exception:
+            logger.exception("[mlflow] 정지 실패 — 다음 성공 실행 때 재시도되지 않으니 수동 확인 필요")
+
+    return task_stop_mlflow
+
+
 def build_model_task_chain(model_name: str) -> dict[str, Any]:
     """모델 하나(대여 또는 반납)의 생성→평가→재학습→클러스터 종료 태스크 체인을
     만들어 반환한다 — `build_monthly_retrain_dag()`가 두 모델을 순서대로
@@ -761,9 +837,24 @@ def build_monthly_retrain_dag(cron_schedule: str) -> DAG:
             ),
         },
     ) as dag:
+        start_mlflow = PythonOperator(
+            task_id="start_mlflow",
+            python_callable=make_task_start_mlflow(),
+        )
+        stop_mlflow = PythonOperator(
+            task_id="stop_mlflow",
+            python_callable=make_task_stop_mlflow(),
+        )
+        # terminate_cluster와 같은 이유로 teardown 표시 — 운영자가 DAG Run을
+        # 수동으로 실패 처리해도(Airflow 3.3.1 강제 skip 실측, 위 주석 참고) 반드시
+        # 실행돼 mlflow가 계속 켜진 채 남지 않게 한다.
+        stop_mlflow.as_teardown(setups=start_mlflow)
+
         chains = {model_name: build_model_task_chain(model_name) for model_name in MODEL_EXECUTION_ORDER}
         for upstream_model, downstream_model in pairwise(MODEL_EXECUTION_ORDER):
             chains[upstream_model]["terminate_cluster"] >> chains[downstream_model]["create_cluster"]
+        start_mlflow >> chains[MODEL_EXECUTION_ORDER[0]]["create_cluster"]
+        chains[MODEL_EXECUTION_ORDER[-1]]["terminate_cluster"] >> stop_mlflow
 
     return dag
 

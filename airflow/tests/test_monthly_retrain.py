@@ -27,7 +27,7 @@ def test_monthly_retrain_is_a_single_combined_dag() -> None:
             "skip_monthly_retrain",
             "terminate_cluster",
         )
-    }
+    } | {"start_mlflow", "stop_mlflow"}
     assert set(_DAG.task_ids) == expected_tasks
 
 
@@ -39,8 +39,24 @@ def test_monthly_retrain_runs_rental_fully_before_return_starts() -> None:
     return_create = _DAG.get_task("create_cluster_return")
     assert return_create.upstream_task_ids == {"terminate_cluster_rental"}
     assert "create_cluster_return" in rental_terminate.downstream_task_ids
-    # 반납 쪽이 대여 쪽으로 역방향 의존을 만들지는 않는지도 확인.
-    assert _DAG.get_task("create_cluster_rental").upstream_task_ids == set()
+    # 반납 쪽이 대여 쪽으로 역방향 의존을 만들지는 않는지도 확인(start_mlflow는
+    # DAG 전체를 감싸는 태스크라 예외로 허용).
+    assert _DAG.get_task("create_cluster_rental").upstream_task_ids == {"start_mlflow"}
+
+
+def test_start_stop_mlflow_wrap_the_whole_dag() -> None:
+    """mlflow는 DAG 실행 구간에만 켜져 있어야 한다 — 대여 체인 시작 전에 켜고,
+    반납 체인(마지막 모델)의 클러스터 종료 뒤에 끈다. stop_mlflow는
+    terminate_cluster와 같은 이유로 teardown이어야 운영자가 DAG Run을 수동으로
+    실패 처리해도 실행된다."""
+    start_mlflow = _DAG.get_task("start_mlflow")
+    stop_mlflow = _DAG.get_task("stop_mlflow")
+    # setup/teardown 쌍(as_teardown(setups=...))이 start_mlflow -> stop_mlflow
+    # 직접 엣지를 암묵적으로 추가하므로, create_cluster_rental과 stop_mlflow
+    # 둘 다 downstream에 있어야 한다.
+    assert start_mlflow.downstream_task_ids == {"create_cluster_rental", "stop_mlflow"}
+    assert stop_mlflow.upstream_task_ids == {"terminate_cluster_return", "start_mlflow"}
+    assert stop_mlflow.is_teardown is True
 
 
 def test_monthly_retrain_total_timeout_covers_both_models_sequentially() -> None:
@@ -372,6 +388,45 @@ def test_terminate_cluster_task_no_ops_when_cluster_id_missing(monkeypatch) -> N
     task_fn(ti=mock_ti, params={})
 
     assert terminated == []
+
+
+def test_start_mlflow_calls_docker_action(monkeypatch) -> None:
+    calls = []
+    monkeypatch.setattr(monthly_dag, "_docker_mlflow_container_action", lambda action: calls.append(action))
+
+    monthly_dag.make_task_start_mlflow()(params={})
+
+    assert calls == ["start"]
+
+
+def test_start_mlflow_skips_when_force_mock(monkeypatch) -> None:
+    calls = []
+    monkeypatch.setattr(monthly_dag, "_docker_mlflow_container_action", lambda action: calls.append(action))
+
+    monthly_dag.make_task_start_mlflow()(params={"mock_mode": "force_mock"})
+
+    assert calls == []
+
+
+def test_stop_mlflow_calls_docker_action(monkeypatch) -> None:
+    calls = []
+    monkeypatch.setattr(monthly_dag, "_docker_mlflow_container_action", lambda action: calls.append(action))
+
+    monthly_dag.make_task_stop_mlflow()(params={})
+
+    assert calls == ["stop"]
+
+
+def test_stop_mlflow_does_not_raise_when_docker_action_fails(monkeypatch) -> None:
+    """mlflow 정지 실패가 DAG teardown 체인 전체를 실패시키면 안 된다 — 부가
+    기능(모니터링)일 뿐이라 실패를 삼키고 경고만 남긴다."""
+
+    def _boom(action):
+        raise RuntimeError("docker socket 없음")
+
+    monkeypatch.setattr(monthly_dag, "_docker_mlflow_container_action", _boom)
+
+    monthly_dag.make_task_stop_mlflow()(params={})  # raise하지 않아야 한다
 
 
 def test_feature_mart_spark_steps_use_runpy_launcher_not_raw_script_path() -> None:
