@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import argparse
 import csv
 import heapq
 import json
@@ -120,7 +119,7 @@ class BacktestResult:
     existing_operation: ExistingOperationEstimate
     existing_empty_station_hours: int
     no_rebalance: ReplayMetrics
-    current_route_v2: ReplayMetrics
+    current_route_v4: ReplayMetrics
     route_variants: tuple[ReplayMetrics, ...]
     empty_station_hour_change_vs_existing_pct: float | None
     assumptions: tuple[str, ...]
@@ -434,7 +433,7 @@ def build_oracle_urgency(
     window_end: datetime,
     movement_budget: int,
 ) -> tuple[RouteUrgencyInput, ...]:
-    """실제 미래 수요로 route-v2의 탐색용 상한 urgency를 구성한다.
+    """실제 미래 수요로 route-v4의 탐색용 상한 urgency를 구성한다.
 
     이 함수는 미래 정보를 사용하므로 운영 성능 근거가 아니라 경로 구성의 잠재
     효과와 제약을 확인하는 oracle 실험에만 사용해야 한다.
@@ -516,7 +515,7 @@ def build_current_route_plan(
     urgency: tuple[RouteUrgencyInput, ...],
     max_stops_per_route: int = MAX_STOPS_PER_ROUTE,
 ) -> RebalanceRoutePlan:
-    """운영 코드의 현재 route-v2 planner로 한 센터의 작업을 계산한다."""
+    """운영 코드의 현재 route-v4 planner로 한 센터의 작업을 계산한다."""
     topology = tuple(
         StationRouteTopology(
             sta_id=station.station_id,
@@ -713,7 +712,7 @@ def run_backtest(
     center_seed: Path,
     max_stops_variants: tuple[int, ...] = (5, MAX_STOPS_PER_ROUTE),
 ) -> BacktestResult:
-    """하루·한 센터의 탐색용 route-v2 백테스트 전체 절차를 실행한다."""
+    """하루·한 센터의 탐색용 route-v4 백테스트 전체 절차를 실행한다."""
     centers = load_centers(center_seed)
     center_rows = [row for row in centers if row[0].dispatch_center_id == center_id]
     if len(center_rows) != 1:
@@ -795,7 +794,7 @@ def run_backtest(
         )
         variant_metrics.append(
             replay_policy(
-                policy=f"route_v2_max_stops_{max_stops}_oracle_need",
+                policy=f"route_v4_max_stops_{max_stops}_oracle_need",
                 trips=trips,
                 initial_stock=initial_stock,
                 station_nos=station_nos,
@@ -809,7 +808,7 @@ def run_backtest(
     current = next(
         row
         for row in variants
-        if row.policy == f"route_v2_max_stops_{MAX_STOPS_PER_ROUTE}_oracle_need"
+        if row.policy == f"route_v4_max_stops_{MAX_STOPS_PER_ROUTE}_oracle_need"
     )
     actual_empty = _actual_empty_station_hours(by_time, station_nos, checkpoints)
     change = (
@@ -840,14 +839,14 @@ def run_backtest(
         existing_operation=existing,
         existing_empty_station_hours=actual_empty,
         no_rebalance=no_rebalance,
-        current_route_v2=current,
+        current_route_v4=current,
         route_variants=variants,
         empty_station_hour_change_vs_existing_pct=change,
         assumptions=(
             "기존 운영 이동량은 시간대별 실측 재고 변화에서 시민 대여·반납을 제거한 순잔차다.",
             "운영자 이동 시각·트럭 경로는 공개 데이터로 식별할 수 없다.",
             "현재 정책의 필요량은 평가 구간의 미래 실제 수요를 사용한 oracle 상한이며 모델 성능이 아니다.",
-            "route-v2 트럭은 동시에 출발하고 직선거리 20km/h, 대여소당 3분 작업으로 근사한다.",
+            "route-v4 트럭은 동시에 출발하고 직선거리 20km/h, 대여소당 3분 작업으로 근사한다.",
             "실패해 관측되지 않은 잠재 대여 요청은 평가할 수 없다.",
         ),
     )
@@ -919,7 +918,7 @@ def result_markdown(result: BacktestResult) -> str:
     for metrics in result.route_variants:
         max_stops = metrics.policy.split("_")[4]
         lines.append(
-            f"| route-v2 최대 {max_stops}곳 (oracle need) | "
+            f"| route-v4 최대 {max_stops}곳 (oracle need) | "
             f"{metrics.empty_station_hours} | {metrics.unfulfilled_requests} | "
             f"{metrics.moved_bikes} | {metrics.route_count}/{metrics.route_stop_count} | "
             f"{metrics.estimated_vehicle_minutes:.1f} |"
@@ -927,7 +926,7 @@ def result_markdown(result: BacktestResult) -> str:
     lines.extend(
         (
             "",
-            f"실제 운영 대비 현재 route-v2 품절 대여소-시간 변화: **{change}**",
+            f"실제 운영 대비 현재 route-v4 품절 대여소-시간 변화: **{change}**",
             "",
             "## 해석 제한",
             "",
@@ -1064,63 +1063,3 @@ def _haversine_km(
         + math.cos(phi_a) * math.cos(phi_b) * math.sin(delta_lambda / 2.0) ** 2
     )
     return 2.0 * radius_km * math.asin(math.sqrt(value))
-
-
-def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    """백테스트 CLI 인자를 파싱한다."""
-    parser = argparse.ArgumentParser(
-        description="실제 수요 기반 재배치 소규모 백테스트"
-    )
-    parser.add_argument("--date", required=True, type=date.fromisoformat)
-    parser.add_argument("--center", required=True)
-    parser.add_argument("--start-hour", type=int, default=6)
-    parser.add_argument("--duration-hours", type=int, default=6)
-    parser.add_argument("--max-stops", type=int, nargs="+", default=[5, 8])
-    parser.add_argument("--rental-csv", required=True, type=Path)
-    parser.add_argument("--stock-csv", required=True, type=Path)
-    parser.add_argument(
-        "--station-json",
-        type=Path,
-        default=Path("../apps/api/seed_data/stations_seoul.json"),
-    )
-    parser.add_argument(
-        "--center-seed",
-        type=Path,
-        default=Path("../docs/gold/dispatch-center-seed.yaml"),
-    )
-    parser.add_argument(
-        "--output-dir", type=Path, default=Path("../data/backtest-results")
-    )
-    args = parser.parse_args(argv)
-    if not 0 <= args.start_hour <= 23:
-        parser.error("--start-hour는 0..23이어야 합니다.")
-    if not 1 <= args.duration_hours <= 24 - args.start_hour:
-        parser.error("평가 구간은 목표일 안의 1시간 이상이어야 합니다.")
-    if any(not 2 <= value <= 32767 for value in args.max_stops):
-        parser.error("--max-stops는 각각 2..32767이어야 합니다.")
-    return args
-
-
-def main(argv: Sequence[str] | None = None) -> int:
-    """CLI 입력으로 백테스트를 실행하고 결과 파일 위치를 출력한다."""
-    args = parse_args(argv)
-    result = run_backtest(
-        target_date=args.date,
-        center_id=args.center,
-        start_hour=args.start_hour,
-        duration_hours=args.duration_hours,
-        rental_csv=args.rental_csv,
-        stock_csv=args.stock_csv,
-        station_json=args.station_json,
-        center_seed=args.center_seed,
-        max_stops_variants=tuple(args.max_stops),
-    )
-    json_path, markdown_path = write_result(result, args.output_dir)
-    print(result_markdown(result))
-    print(f"JSON: {json_path}")
-    print(f"Markdown: {markdown_path}")
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

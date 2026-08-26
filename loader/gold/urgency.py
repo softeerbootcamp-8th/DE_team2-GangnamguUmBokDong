@@ -56,7 +56,18 @@ from .common import (
     source_snapshot_parquet,
     store_input_payload,
 )
-from .demand import DemandForecastRecord, demand_records_from_parquet
+from .demand import (
+    DemandForecastRecord,
+    DemandPredictionRecord,
+    demand_predictions_from_publication_lineage,
+    demand_records_from_parquet,
+)
+from .rebalance_policy import (
+    DEFAULT_REBALANCE_POLICY,
+    PICKUP_SAFETY_STRATEGY_POISSON_MEAN,
+    PICKUP_SAFETY_STRATEGY_QUANTILE_ADVERSE,
+    RebalancePolicyConfig,
+)
 from .source_catalog import S3SourceSnapshotCatalog
 from .state import (
     PublicationStateRecord,
@@ -75,7 +86,7 @@ _SERVING_RELEASE_KEYS = frozenset(
     {"station", "station_demand_forecast", "station_stock"}
 )
 BIKE_STATION_REALTIME_SOURCE_ID = "bike_station_realtime"
-URGENCY_PUBLISHER_VERSION = "gold-urgency-publisher-v1"
+URGENCY_PUBLISHER_VERSION = "gold-urgency-publisher-v5-capacity-reserve"
 _URGENCY_SCHEMA = pa.schema(
     (
         pa.field("sta_id", pa.string(), nullable=False),
@@ -262,6 +273,7 @@ class UrgencyCalculationInputs:
     current_stock: tuple[StationStockRecord, ...]
     demand: tuple[DemandForecastRecord, ...]
     base_dttm: datetime
+    demand_quantiles: tuple[DemandPredictionRecord, ...] = ()
 
     def __post_init__(self) -> None:
         """모든 입력의 타입·순서·window 수·anchor를 재검증한다."""
@@ -342,6 +354,14 @@ class UrgencyCalculationInputs:
             raise ContractViolation("demand는 DemandForecastRecord tuple이어야 합니다.")
         if any(item.base_dttm != base for item in self.demand):
             raise ContractViolation("demand row가 urgency anchor와 다릅니다.")
+        if type(self.demand_quantiles) is not tuple or any(
+            type(item) is not DemandPredictionRecord for item in self.demand_quantiles
+        ):
+            raise ContractViolation(
+                "demand_quantiles는 DemandPredictionRecord tuple이어야 합니다."
+            )
+        if any(item.base_dttm != base for item in self.demand_quantiles):
+            raise ContractViolation("quantile row가 urgency anchor와 다릅니다.")
 
 
 def build_urgency_projection(
@@ -395,15 +415,90 @@ def build_urgency_projection(
     return UrgencyProjection(ordered, base, expected)
 
 
-def compute_urgency_projection(inputs: UrgencyCalculationInputs) -> UrgencyProjection:
-    """검증된 Gold·immutable 입력으로 현행 urgency-v1 projection을 계산한다."""
+def _complete_quantile_index(
+    records: tuple[DemandPredictionRecord, ...],
+    expected_sta_ids: tuple[str, ...],
+) -> dict[tuple[str, int], DemandPredictionRecord]:
+    """Quantile 입력에서 expected station×12만 골라 완전성을 검증한다."""
+    expected_station_set = set(expected_sta_ids)
+    indexed: dict[tuple[str, int], DemandPredictionRecord] = {}
+    for record in records:
+        if record.station_id not in expected_station_set:
+            continue
+        if record.rental_pred_p90 is None or record.return_pred_p10 is None:
+            raise ContractViolation(
+                "quantile-adverse는 v2 quantile inference가 필요합니다."
+            )
+        key = (record.station_id, record.horizon)
+        if key in indexed:
+            raise ContractViolation("quantile 입력에 중복 station·horizon이 있습니다.")
+        indexed[key] = record
+    expected = {
+        (station_id, horizon)
+        for station_id in expected_sta_ids
+        for horizon in range(1, 13)
+    }
+    if set(indexed) != expected:
+        raise ContractViolation(
+            "quantile-adverse에는 expected station×horizon 1..12가 필요합니다."
+        )
+    return indexed
+
+
+def _demand_horizon(record: DemandForecastRecord, base: datetime) -> int:
+    """Demand target 시각을 base 이후 exact 1..12 horizon으로 변환한다."""
+    delta_seconds = (record.predicted_dttm - base).total_seconds()
+    if delta_seconds % 3600 != 0:
+        raise ContractViolation(
+            "demand predicted_dttm은 exact 시간 horizon이어야 합니다."
+        )
+    horizon = int(delta_seconds // 3600)
+    if not 1 <= horizon <= 12:
+        raise ContractViolation("demand horizon은 정확히 1..12여야 합니다.")
+    return horizon
+
+
+def _demand_forecasts_by_station(
+    records: tuple[DemandForecastRecord, ...],
+    base: datetime,
+) -> dict[str, tuple[DemandForecastRecord, ...]]:
+    """Demand 행을 station별 exact horizon 1..12 순서로 결합한다."""
+    indexed: dict[str, dict[int, DemandForecastRecord]] = {}
+    for record in records:
+        horizon = _demand_horizon(record, base)
+        station = indexed.setdefault(record.sta_id, {})
+        if horizon in station:
+            raise ContractViolation("demand에 중복 station·horizon이 있습니다.")
+        station[horizon] = record
+    expected_horizons = set(range(1, 13))
+    incomplete = sorted(
+        station_id
+        for station_id, forecasts in indexed.items()
+        if set(forecasts) != expected_horizons
+    )
+    if incomplete:
+        raise ContractViolation(
+            f"urgency demand는 station별 horizon 1..12가 필요합니다: {incomplete}"
+        )
+    return {
+        station_id: tuple(forecasts[horizon] for horizon in range(1, 13))
+        for station_id, forecasts in indexed.items()
+    }
+
+
+def compute_urgency_projection(
+    inputs: UrgencyCalculationInputs,
+    *,
+    policy_config: RebalancePolicyConfig = DEFAULT_REBALANCE_POLICY,
+) -> UrgencyProjection:
+    """검증된 Gold·immutable 입력과 재배치 정책으로 urgency projection을 계산한다."""
     if type(inputs) is not UrgencyCalculationInputs:
         raise ContractViolation("inputs는 UrgencyCalculationInputs여야 합니다.")
+    if type(policy_config) is not RebalancePolicyConfig:
+        raise ContractViolation("policy_config는 RebalancePolicyConfig여야 합니다.")
     active_by_id = {station.sta_id: station for station in inputs.active_stations}
     current_by_id = {record.sta_id: record for record in inputs.current_stock}
-    demand_by_id: dict[str, list[DemandForecastRecord]] = {}
-    for record in inputs.demand:
-        demand_by_id.setdefault(record.sta_id, []).append(record)
+    demand_by_id = _demand_forecasts_by_station(inputs.demand, inputs.base_dttm)
     demand_ids = tuple(sorted(demand_by_id, key=_utf8_key))
     expected = tuple(
         sorted(
@@ -416,19 +511,31 @@ def compute_urgency_projection(inputs: UrgencyCalculationInputs) -> UrgencyProje
         for point in window:
             if point.sta_id in expected:
                 history_by_id.setdefault(point.sta_id, []).append(point)
+    quantile_by_key: dict[tuple[str, int], DemandPredictionRecord] = {}
+    if policy_config.pickup_safety_strategy == PICKUP_SAFETY_STRATEGY_QUANTILE_ADVERSE:
+        quantile_by_key = _complete_quantile_index(inputs.demand_quantiles, expected)
 
     computed: list[UrgencyRecord] = []
     for station_id in expected:
         station = active_by_id[station_id]
         current = current_by_id[station_id].parking_bike_tot_cnt
         forecasts = demand_by_id[station_id]
-        raw_points = [
-            {
+        raw_points = []
+        for record in forecasts:
+            horizon = _demand_horizon(record, inputs.base_dttm)
+            raw = {
                 "predicted_rent_cnt": record.predicted_rent_cnt,
                 "predicted_return_cnt": record.predicted_rtn_cnt,
             }
-            for record in forecasts
-        ]
+            quantile = quantile_by_key.get((station_id, horizon))
+            if quantile is not None:
+                raw.update(
+                    {
+                        "rental_pred_p90": quantile.rental_pred_p90,
+                        "return_pred_p10": quantile.return_pred_p10,
+                    }
+                )
+            raw_points.append(raw)
         points = enrich_forecast_points(current, station.hold_cnt, raw_points)
         history = [
             {
@@ -457,11 +564,23 @@ def compute_urgency_projection(inputs: UrgencyCalculationInputs) -> UrgencyProje
                 urgency_score=score,
                 critical_remaining_min=minutes,
                 rebalance_need_type_cd=action_type,
-                bike_qty=_bike_qty_v1(
-                    current,
-                    station.hold_cnt,
-                    action_type,
-                    points,
+                bike_qty=(
+                    _bike_qty_v1(
+                        current,
+                        station.hold_cnt,
+                        action_type,
+                        points,
+                    )
+                    if policy_config.quantity_strategy == "legacy"
+                    else _bike_qty_risk_band_v5(
+                        current,
+                        station.hold_cnt,
+                        action_type,
+                        points,
+                        history,
+                        inputs.base_dttm,
+                        policy_config,
+                    )
                 ),
             )
         )
@@ -629,6 +748,10 @@ def publish_station_urgency(
         input_artifacts=(*input_artifacts, urgency_input),
         parameters=(
             Parameter("expected_sta_id_sha256", expected_ids.sha256),
+            Parameter(
+                "rebalance_policy_config",
+                DEFAULT_REBALANCE_POLICY.canonical_json,
+            ),
             Parameter("scoring_config_version", URGENCY_SCORING_CONFIG_VERSION),
             # 결측 window를 허용하므로 상수가 아니라 실제로 쓴 수와 offset을
             # 남긴다 — 같은 anchor에서 degraded 게시와 완전 게시가 같은
@@ -725,6 +848,7 @@ def publish_station_urgency(
                 current_stock=calculation.current_stock,
                 demand=calculation.demand,
                 base_dttm=calculation.base_dttm,
+                demand_quantiles=calculation.demand_quantiles,
             )
         )
         if locked_projection != projection:
@@ -751,6 +875,7 @@ def publish_station_urgency(
             current_stock=calculation.current_stock,
             demand=calculation.demand,
             base_dttm=calculation.base_dttm,
+            demand_quantiles=calculation.demand_quantiles,
         )
         empty_projection = compute_urgency_projection(locked)
         validate_id_set_parameter(
@@ -956,6 +1081,7 @@ def _calculation_inputs_from_manifests(
     stock_manifest: PublicationManifest,
     history_inputs: tuple[tuple[int, InputArtifact], ...],
     payloads: Mapping[str, bytes],
+    policy_config: RebalancePolicyConfig = DEFAULT_REBALANCE_POLICY,
 ) -> UrgencyCalculationInputs:
     """Linked publication과 history actual bytes를 typed scoring 입력으로 연다."""
     base = _utc_dttm(anchor, "urgency anchor")
@@ -966,6 +1092,12 @@ def _calculation_inputs_from_manifests(
             "demand·stock publication manifest가 urgency anchor와 다릅니다."
         )
     demand = _demand_records_from_manifest(object_store, demand_manifest)
+    demand_quantiles = (
+        demand_predictions_from_publication_lineage(object_store, demand_manifest)
+        if policy_config.pickup_safety_strategy
+        == PICKUP_SAFETY_STRATEGY_QUANTILE_ADVERSE
+        else ()
+    )
     current_stock = _stock_records_from_manifest(object_store, stock_manifest)
     history_windows = tuple(
         _history_window_from_manifest(
@@ -983,6 +1115,7 @@ def _calculation_inputs_from_manifests(
         current_stock=current_stock,
         demand=demand,
         base_dttm=base,
+        demand_quantiles=demand_quantiles,
     )
 
 
@@ -1509,6 +1642,162 @@ def _bike_qty_v1(
     return 0
 
 
+def _bike_qty_risk_band_v5(
+    current: int,
+    hold_cnt: int,
+    action_type: str,
+    points: list[dict[str, Any]],
+    stock_history: list[dict[str, Any]],
+    now: datetime,
+    policy_config: RebalancePolicyConfig,
+) -> int:
+    """현재와 보수적 미래 재고 모두 정원을 넘는 수량만 회수한다.
+
+    대여와 반납 count를 독립 포아송 변수로 근사하면 누적 순수요의 분산은 두 count
+    합이다. 모델의 불확실성 하방과 최근 기울기를 보호 horizon 및 예상 출동
+    지연까지 외삽한 재고 중 작은 값을 보수적 미래 재고로 사용한다. 현재 정원
+    초과분과 보수적 미래 재고의 정원 초과분을 모두 만족하는 만큼만 회수한다.
+    미래 반납으로 생길 초과량을 현재 회수 가능량으로 빌리지 않으며, 최근 관측이
+    현재 포함 세 점 미만이어도 fail-closed한다. 배치는 평균 최저 재고를 최소
+    재고까지 올린다.
+    """
+    horizon_points = points[: policy_config.protection_horizon_hours]
+    minimum_stock = math.ceil(policy_config.minimum_stock_ratio * hold_cnt)
+    if action_type == "retrieval_needed":
+        recent_projection = _recent_stock_projection_v3(
+            current,
+            stock_history,
+            now,
+            protection_minutes=(
+                policy_config.protection_horizon_hours * 60 + RESPONSE_LAG_MIN
+            ),
+        )
+        if recent_projection is None:
+            return 0
+        _recent_slope, recent_lower = recent_projection
+        pickup_horizon_hours = math.ceil(
+            (policy_config.protection_horizon_hours * 60 + RESPONSE_LAG_MIN) / 60
+        )
+        model_lower = min(
+            _pickup_model_lower_stock_path(
+                current,
+                points[:pickup_horizon_hours],
+                policy_config,
+            )
+        )
+        desired = max(0, current - hold_cnt)
+        safe = max(0, math.floor(min(model_lower, recent_lower) - hold_cnt))
+        return min(current, desired, safe)
+    if action_type == "supply_needed":
+        lower_path = _forecast_lower_stock_path(
+            current,
+            horizon_points,
+            uncertainty_z=0.0,
+        )
+        needed = max(0, math.ceil(minimum_stock - min(lower_path)))
+        return min(needed, max(0, hold_cnt - current))
+    return 0
+
+
+def _recent_stock_projection_v3(
+    current: int,
+    stock_history: list[dict[str, Any]],
+    now: datetime,
+    *,
+    protection_minutes: int,
+) -> tuple[float, float] | None:
+    """최근 최소제곱 기울기와 보호 구간 하방 재고를 함께 반환한다."""
+    recent = sorted(
+        (row for row in stock_history if row["observed_at"] <= now),
+        key=lambda row: row["observed_at"],
+    )
+    if (
+        type(protection_minutes) is not int
+        or protection_minutes <= 0
+        or len({row["observed_at"] for row in recent}) < 3
+        or not recent
+        or recent[-1]["observed_at"] != now
+        or recent[-1]["parking_bike_tot_cnt"] != current
+    ):
+        return None
+    xs = [(row["observed_at"] - now).total_seconds() / 60.0 for row in recent]
+    ys = [row["parking_bike_tot_cnt"] for row in recent]
+    slope = _regression_slope_v1(xs, ys)
+    lower = current + min(0.0, slope) * protection_minutes
+    return slope, lower
+
+
+def _forecast_lower_stock_path(
+    current: int,
+    points: list[dict[str, Any]],
+    *,
+    uncertainty_z: float,
+) -> tuple[float, ...]:
+    """독립 포아송 순수요 완충을 적용한 시점별 하방 재고를 반환한다."""
+    mean_stock = float(current)
+    cumulative_variance = 0.0
+    lower = [mean_stock]
+    for point in points:
+        rentals = max(0, int(point["predicted_rent_cnt"]))
+        returns = max(0, int(point["predicted_return_cnt"]))
+        mean_stock += returns - rentals
+        cumulative_variance += rentals + returns
+        lower.append(mean_stock - uncertainty_z * math.sqrt(cumulative_variance))
+    return tuple(lower)
+
+
+def _pickup_model_lower_stock_path(
+    current: int,
+    points: list[dict[str, Any]],
+    policy_config: RebalancePolicyConfig,
+) -> tuple[float, ...]:
+    """설정된 pickup safety strategy로 보수적 재고 경로를 반환한다."""
+    strategies = {
+        PICKUP_SAFETY_STRATEGY_POISSON_MEAN: _poisson_mean_pickup_stock_path,
+        PICKUP_SAFETY_STRATEGY_QUANTILE_ADVERSE: _quantile_adverse_stock_path,
+    }
+    return strategies[policy_config.pickup_safety_strategy](
+        current,
+        points,
+        policy_config,
+    )
+
+
+def _poisson_mean_pickup_stock_path(
+    current: int,
+    points: list[dict[str, Any]],
+    policy_config: RebalancePolicyConfig,
+) -> tuple[float, ...]:
+    """검증된 mean+독립 Poisson 근사로 pickup 하방 재고를 계산한다."""
+    return _forecast_lower_stock_path(
+        current,
+        points,
+        uncertainty_z=policy_config.uncertainty_z,
+    )
+
+
+def _quantile_adverse_stock_path(
+    current: int,
+    points: list[dict[str, Any]],
+    policy_config: RebalancePolicyConfig,
+) -> tuple[float, ...]:
+    """Quantile adverse와 poisson 하방 중 작은 재고 경로를 반환한다."""
+    stock = float(current)
+    quantile_path = [stock]
+    for point in points:
+        stock += float(point["return_pred_p10"]) - float(point["rental_pred_p90"])
+        quantile_path.append(stock)
+    poisson_path = _poisson_mean_pickup_stock_path(current, points, policy_config)
+    return tuple(
+        min(quantile_stock, poisson_stock)
+        for quantile_stock, poisson_stock in zip(
+            quantile_path,
+            poisson_path,
+            strict=True,
+        )
+    )
+
+
 def _urgency_score_v1(
     current: int,
     hold_cnt: int,
@@ -1516,7 +1805,7 @@ def _urgency_score_v1(
     points: list[dict[str, Any]],
     now: datetime,
 ) -> tuple[float, int, str]:
-    """현행 urgency-scoring-v1의 score·남은 분·판단 코드를 계산한다."""
+    """v5 정원보존 정책이 유지하는 v1 score·남은 분·판단을 계산한다."""
     if current <= SUPPLY_LOW_STOCK_RATIO * hold_cnt:
         time_to_critical, action_type = 0.0, "supply_needed"
     elif current >= hold_cnt:

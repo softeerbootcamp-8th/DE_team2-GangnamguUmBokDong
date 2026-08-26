@@ -29,6 +29,7 @@ from ml_core.scoring import (
     use_pinned_scoring_models,
 )
 
+from .population_contract import population_source_date_contract
 from .rebalance_backtest import RentalTrip
 
 HORIZON_COUNT = 12
@@ -253,7 +254,8 @@ def build_population_nowcast(
     source_dates_by_target: dict[date, tuple[date, ...]] = {}
     cache: dict[date, dict[tuple[int, str], float]] = {}
     for target in target_dates:
-        candidates = _population_candidate_dates(target)
+        date_contract = population_source_date_contract(target)
+        candidates = date_contract.base_dates
         used_dates = set(candidates)
         candidate_values = [
             _read_population_day(
@@ -265,7 +267,7 @@ def build_population_nowcast(
             )
             for day in candidates
         ]
-        extended_dates = tuple(target - timedelta(weeks=week) for week in range(5, 9))
+        extended_dates = date_contract.fallback_dates
         extended_values = [
             _read_population_day(population_dir, day, grid_ids, cache, required=False)
             for day in extended_dates
@@ -490,24 +492,8 @@ def _lag_counts(
 
 
 def _population_candidate_dates(target: date) -> tuple[date, date, date, date]:
-    """운영 nowcaster와 같은 평일/특수일 규칙으로 네 과거 후보일을 선택한다."""
-    holidays = korean_holidays([target.year - 1, target.year])
-
-    def special(day: date) -> bool:
-        """일요일 또는 대한민국 공휴일인지 반환한다."""
-        return day.weekday() == 6 or day.isoformat() in holidays
-
-    if not special(target):
-        return tuple(target - timedelta(weeks=week) for week in range(1, 5))  # type: ignore[return-value]
-    result = []
-    cursor = target - timedelta(days=1)
-    while len(result) < 4 and (target - cursor).days <= 60:
-        if special(cursor):
-            result.append(cursor)
-        cursor -= timedelta(days=1)
-    if len(result) != 4:
-        raise ValueError(f"특수일 인구 후보 네 날짜를 찾지 못했습니다: {target}")
-    return tuple(result)  # type: ignore[return-value]
+    """기존 호출자에 운영 nowcaster의 필수 네 생활인구 후보일을 반환한다."""
+    return population_source_date_contract(target).base_dates
 
 
 def _read_population_day(

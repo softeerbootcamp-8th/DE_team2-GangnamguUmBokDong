@@ -223,6 +223,34 @@ def test_route_rejects_urgency_with_stale_nested_dependency() -> None:
         validate_route_urgency_dependencies(stale_route, urgency)
 
 
+def test_route_rejects_urgency_with_different_rebalance_policy() -> None:
+    """같은 upstream tuple이어도 urgency와 route 정책 config가 다르면 거부한다."""
+    urgency = _fingerprint("station_urgency")
+    dependency_overrides = {
+        dependency.publication_key: dependency for dependency in urgency.dependencies
+    }
+    route = _fingerprint(
+        "rebalance_route",
+        dependency_overrides=dependency_overrides,
+    )
+    route = _replace_parameter(
+        "rebalance_route",
+        route,
+        "rebalance_policy_config",
+        _parameter_value(urgency, "rebalance_policy_config"),
+    )
+    validate_route_urgency_dependencies(route, urgency)
+
+    mismatched_route = _replace_parameter(
+        "rebalance_route",
+        route,
+        "rebalance_policy_config",
+        "different-policy-config",
+    )
+    with pytest.raises(ContractViolation, match="rebalance_policy_config"):
+        validate_route_urgency_dependencies(mismatched_route, urgency)
+
+
 def test_station_and_stock_share_window_set_candidate_manifest() -> None:
     """station window-set의 첫 manifest가 같은 release의 stock input과 같아야 한다."""
     candidate = StationRealtimeWindow(
@@ -385,4 +413,32 @@ def _replace_input_artifact(
         fingerprint.dependencies,
         artifacts,
         fingerprint.parameters,
+    )
+
+
+def _replace_parameter(
+    publication_key: str,
+    fingerprint: InputFingerprint,
+    name: str,
+    value: str,
+) -> InputFingerprint:
+    """한 parameter 값을 바꿔 registry-valid fingerprint를 다시 만든다."""
+    parameters = tuple(
+        Parameter(name, value) if parameter.name == name else parameter
+        for parameter in fingerprint.parameters
+    )
+    return build_input_fingerprint(
+        publication_key,
+        fingerprint.dependencies,
+        fingerprint.input_artifacts,
+        parameters,
+    )
+
+
+def _parameter_value(fingerprint: InputFingerprint, name: str) -> str:
+    """Fingerprint에서 이름이 정확히 일치하는 parameter 값을 반환한다."""
+    return next(
+        parameter.value
+        for parameter in fingerprint.parameters
+        if parameter.name == name
     )

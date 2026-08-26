@@ -19,6 +19,7 @@ from gold.common import parquet_bytes
 from gold.source_catalog import SourceManifestArtifact
 from gold.station import StationRecord
 from gold.station_release import (
+    _POSTGIS_DISTANCE_BATCH_MAX_PAIRS,
     _STATION_SCHEMA,
     _STATION_STOCK_SCHEMA,
     _build_window_set,
@@ -33,6 +34,7 @@ from gold.station_release import (
     _station_records_to_parquet,
     _stock_records_from_parquet,
     _stock_records_to_parquet,
+    _upsert_station,
     _validate_station_ids,
 )
 from gold.station_stock import StationStockRecord
@@ -246,6 +248,23 @@ def test_route_cleanup_sql_targets_proposed_headers_by_stop_station() -> None:
     assert parameters == (["ST-1", "ST-2"],)
 
 
+def test_station_batch_normalizes_mixed_integer_and_float_points() -> None:
+    """좌표 array에 int와 float가 섞여도 psycopg에 float만 전달한다."""
+    cursor = _RouteCleanupCursor()
+    records = (
+        _station(longitude=127, latitude=37),
+        _station(sta_id="ST-2", longitude=127.1, latitude=37.1),
+    )
+
+    _upsert_station(cursor, records)  # type: ignore[arg-type]
+
+    [(statement, parameters)] = cursor.calls
+    assert "unnest(" in statement
+    assert parameters[4] == [127.0, 127.1]
+    assert parameters[5] == [37.0, 37.1]
+    assert all(type(value) is float for value in (*parameters[4], *parameters[5]))
+
+
 def test_postgis_distance_callback_uses_geography_and_exact_boundary() -> None:
     """relocation·center 거리가 haversine 대신 PostGIS geography를 사용한다."""
     cursor = _DistanceCursor((100.0, 100.000001))
@@ -305,6 +324,25 @@ def test_postgis_distance_batch_skips_query_for_empty_input() -> None:
 
     assert distance.batch(()) == ()
     assert cursor.statements == []
+
+
+def test_postgis_distance_batch_chunks_at_safe_statement_boundary() -> None:
+    """상한을 한 쌍 넘으면 입력 순서를 유지한 두 statement로 나눈다."""
+    pair_count = _POSTGIS_DISTANCE_BATCH_MAX_PAIRS + 1
+    cursor = _DistanceCursor(tuple(float(index) for index in range(pair_count)))
+    distance = _postgis_distance(cursor)  # type: ignore[arg-type]
+    pair = ((127.0, 37.5), (127.001, 37.5))
+
+    values = distance.batch((pair,) * pair_count)
+
+    assert len(values) == pair_count
+    assert values[0] == 0.0
+    assert values[-1] == float(pair_count - 1)
+    assert len(cursor.statements) == 2
+    assert [len(parameters[0]) for parameters in cursor.parameters] == [
+        _POSTGIS_DISTANCE_BATCH_MAX_PAIRS,
+        1,
+    ]
 
 
 def test_direct_prior_payload_uses_actual_immutable_bytes() -> None:

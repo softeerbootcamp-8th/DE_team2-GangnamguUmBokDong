@@ -7,7 +7,7 @@ import re
 import unicodedata
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID
 
@@ -30,6 +30,7 @@ from core.gold_publication import (
     build_input_fingerprint,
     build_route_coverage,
     build_route_coverage_route,
+    parse_id_set,
     parse_input_fingerprint,
     parse_publication_manifest,
     parse_route_coverage,
@@ -37,6 +38,7 @@ from core.gold_publication import (
     sha256_hex,
     validate_route_urgency_dependencies,
 )
+from core.scoring_config import URGENCY_SCORING_CONFIG_VERSION
 from psycopg import Connection, Cursor
 from psycopg.pq import TransactionStatus
 from psycopg.rows import tuple_row
@@ -52,6 +54,7 @@ from .common import (
     read_parquet_bytes,
     store_input_payload,
 )
+from .rebalance_policy import DEFAULT_REBALANCE_POLICY, RebalancePolicyConfig
 from .state import (
     PublicationStateRecord,
     load_dependencies,
@@ -59,14 +62,18 @@ from .state import (
     read_state_manifest,
 )
 
-ROUTE_ALGORITHM_VERSION = "route-v2"
+ROUTE_ALGORITHM_VERSION = "route-v4-supply-led-pickup-sla"
 TRUCK_CAPACITY = 20
 TRUCK_CAPACITY_CONFIG_VERSION = "truck-capacity-v1"
 INITIAL_TRUCK_LOAD = 0
-MAX_STOPS_PER_ROUTE = 8
+MAX_STOPS_PER_ROUTE = 5
 MAX_ROUTES_PER_CENTER = 3
-ROUTE_WORK_UNIT_CONFIG_VERSION = "route-work-unit-v1"
-ROUTE_PUBLISHER_VERSION = "gold-route-publisher-v1"
+ROUTE_WORK_UNIT_CONFIG_VERSION = "route-work-unit-v3-pickup-sla"
+PICKUP_DISPATCH_SLA_CONFIG_VERSION = "pickup-dispatch-sla-v1"
+PICKUP_DISPATCH_ASSUMED_SPEED_KMH = 20.0
+PICKUP_DISPATCH_SERVICE_MINUTES_PER_STOP = 3.0
+PICKUP_DISPATCH_MAX_LAG_MINUTES = 30.0
+ROUTE_PUBLISHER_VERSION = "gold-route-publisher-v3-pickup-sla"
 _MAX_DATABASE_REVISION = 2_147_483_647
 
 _STATION_ID = re.compile(r"ST-[0-9]+\Z")
@@ -143,7 +150,7 @@ class StationRouteTopology:
 
 @dataclass(frozen=True, slots=True)
 class RouteUrgencyInput:
-    """urgency artifact에서 route-v2가 소비하는 최소 typed 필드를 표현한다."""
+    """urgency artifact에서 route-v4가 소비하는 최소 typed 필드를 표현한다."""
 
     sta_id: str
     urgency_score: float
@@ -408,6 +415,7 @@ class RouteDatabaseSnapshot:
     dispatch_centers: tuple[DispatchCenterTopology, ...]
     stations: tuple[StationRouteTopology, ...]
     route_coverage: RouteCoverageDocument
+    pickup_cooldown_sta_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         """DB snapshot의 exact tuple과 canonical coverage 타입을 검증한다."""
@@ -415,6 +423,19 @@ class RouteDatabaseSnapshot:
         _index_stations(self.stations)
         if type(self.route_coverage) is not RouteCoverageDocument:
             raise ContractViolation("route DB snapshot coverage 타입이 잘못됐습니다.")
+        cooldown_ids = tuple(
+            sorted(
+                self.pickup_cooldown_sta_ids, key=lambda value: value.encode("utf-8")
+            )
+        )
+        if (
+            self.pickup_cooldown_sta_ids != cooldown_ids
+            or len(cooldown_ids) != len(set(cooldown_ids))
+            or any(_STATION_ID.fullmatch(value) is None for value in cooldown_ids)
+        ):
+            raise ContractViolation(
+                "pickup cooldown station ID가 canonical하지 않습니다."
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -517,8 +538,10 @@ def plan_rebalance_routes(
     urgency: tuple[RouteUrgencyInput, ...],
     route_coverage: RouteCoverageDocument,
     max_stops_per_route: int = MAX_STOPS_PER_ROUTE,
+    policy_config: RebalancePolicyConfig = DEFAULT_REBALANCE_POLICY,
+    pickup_cooldown_sta_ids: frozenset[str] = frozenset(),
 ) -> RebalanceRoutePlan:
-    """route-v2 완결 작업·coverage·용량 계약으로 proposed aggregate를 계산한다.
+    """route-v4 완결 작업·pickup SLA·coverage 계약으로 proposed aggregate를 계산한다.
 
     ``normal``과 ``bike_qty<=0`` 행은 route 후보가 아니므로 이 순수 planner는
     topology 존재를 요구하지 않는다. urgency 기대 집합의 완전성은 publication
@@ -530,6 +553,14 @@ def plan_rebalance_routes(
         raise ContractViolation("max_stops_per_route는 2..32767 integer여야 합니다.")
     if type(route_coverage) is not RouteCoverageDocument:
         raise ContractViolation("route_coverage는 RouteCoverageDocument여야 합니다.")
+    if type(policy_config) is not RebalancePolicyConfig:
+        raise ContractViolation("policy_config는 RebalancePolicyConfig여야 합니다.")
+    if type(pickup_cooldown_sta_ids) is not frozenset or any(
+        type(sta_id) is not str or not sta_id for sta_id in pickup_cooldown_sta_ids
+    ):
+        raise ContractViolation(
+            "pickup cooldown station ID는 frozenset[str]여야 합니다."
+        )
     if route_coverage.stock_anchor_dttm != logical:
         raise ContractViolation(
             "route coverage stock anchor가 urgency logical_dttm과 다릅니다."
@@ -543,6 +574,8 @@ def plan_rebalance_routes(
         stations_by_id=stations_by_id,
         centers_by_id=centers_by_id,
         coverage_qty=coverage_qty,
+        exclusive_pickup_station=policy_config.exclusive_pickup_station,
+        pickup_cooldown_sta_ids=pickup_cooldown_sta_ids,
     )
     routes: list[RebalanceRoute] = []
     route_stops: list[RebalanceRouteStop] = []
@@ -558,24 +591,42 @@ def plan_rebalance_routes(
             candidate for candidate in candidates if candidate.action == "dropoff"
         ]
         ordinal = 1
-        while (
-            pickups
-            and dropoffs
-            and ordinal <= MAX_ROUTES_PER_CENTER
-        ):
-            anchor_candidate = pickups[0]
-            route_pickups = _rank_for_route(
+        while pickups and dropoffs and ordinal <= MAX_ROUTES_PER_CENTER:
+            anchor_candidate = dropoffs[0]
+            ranked_pickups = _rank_pickups_for_supply(
                 pickups,
                 anchor=anchor_candidate,
-                keep_anchor_first=True,
+                center=center,
+            )
+            route_start = (center.longitude, center.latitude)
+            route_pickups = [
+                candidate
+                for candidate in ranked_pickups
+                if _pickup_dispatch_lag_minutes(
+                    (_SelectedStop(candidate, 1),),
+                    start=route_start,
+                )
+                <= PICKUP_DISPATCH_MAX_LAG_MINUTES
+            ]
+            unreachable_pickups = [
+                candidate
+                for candidate in ranked_pickups
+                if candidate not in route_pickups
+            ]
+            route_pickups = _prioritize_pickup_sla_prefix(
+                route_pickups,
+                start=route_start,
+                max_pickup_stops=max_stops_per_route - 1,
             )
             route_dropoffs = _rank_for_route(
                 dropoffs,
                 anchor=anchor_candidate,
+                keep_anchor_first=True,
             )
             split = _choose_balanced_stop_split(
                 route_pickups,
                 route_dropoffs,
+                start=route_start,
                 max_stops_per_route=max_stops_per_route,
             )
             if split is None:
@@ -591,7 +642,19 @@ def plan_rebalance_routes(
                 transfer_qty,
                 stop_limit=dropoff_stop_limit,
             )
-            pickups = sorted(pickup_remainder, key=_candidate_priority)
+            if policy_config.exclusive_pickup_station:
+                selected_pickup_ids = {
+                    stop.candidate.sta_id for stop in selected_pickups
+                }
+                pickup_remainder = [
+                    candidate
+                    for candidate in pickup_remainder
+                    if candidate.sta_id not in selected_pickup_ids
+                ]
+            pickups = sorted(
+                [*pickup_remainder, *unreachable_pickups],
+                key=_candidate_priority,
+            )
             dropoffs = sorted(dropoff_remainder, key=_candidate_priority)
             picked_qty = sum(stop.bike_cnt for stop in selected_pickups)
             dropped_qty = sum(stop.bike_cnt for stop in selected_dropoffs)
@@ -601,7 +664,7 @@ def plan_rebalance_routes(
                 or len(selected_pickups) + len(selected_dropoffs) > max_stops_per_route
             ):
                 raise ContractViolation(
-                    "route-v2 작업 단위 선택이 완결 수량·stop 제한을 위반했습니다."
+                    "route-v4 작업 단위 선택이 완결 수량·stop 제한을 위반했습니다."
                 )
             route_id = str(route_uuid_v5(center_id, logical, revision_no, ordinal))
             routes.append(
@@ -617,7 +680,8 @@ def plan_rebalance_routes(
             ordered_stops = _nearest_stops(
                 selected_pickups,
                 selected_dropoffs,
-                start=(center.longitude, center.latitude),
+                start=route_start,
+                anchor_dropoff=anchor_candidate,
             )
             route_stops.extend(
                 RebalanceRouteStop(
@@ -783,11 +847,45 @@ def publish_rebalance_route(
             suffix="json",
         ),
     )
+    cooldown_ids = build_id_set(database_snapshot.pickup_cooldown_sta_ids)
+    cooldown_payload = cooldown_ids.canonical_bytes
+    cooldown_input = InputArtifact(
+        byte_sha256=cooldown_ids.sha256,
+        role="pickup_cooldown_station_ids",
+        uri=content_addressed_uri(
+            object_base_uri,
+            publication_key="rebalance_route",
+            category="inputs",
+            name="pickup_cooldown_station_ids",
+            payload=cooldown_payload,
+            suffix="json",
+        ),
+    )
     input_fingerprint = build_input_fingerprint(
         "rebalance_route",
         dependencies,
-        (coverage_input, urgency_snapshot.manifest_input),
+        (coverage_input, cooldown_input, urgency_snapshot.manifest_input),
         (
+            Parameter(
+                "rebalance_policy_config",
+                DEFAULT_REBALANCE_POLICY.canonical_json,
+            ),
+            Parameter(
+                "pickup_dispatch_assumed_speed_kmh",
+                str(PICKUP_DISPATCH_ASSUMED_SPEED_KMH),
+            ),
+            Parameter(
+                "pickup_dispatch_max_lag_minutes",
+                str(PICKUP_DISPATCH_MAX_LAG_MINUTES),
+            ),
+            Parameter(
+                "pickup_dispatch_service_minutes_per_stop",
+                str(PICKUP_DISPATCH_SERVICE_MINUTES_PER_STOP),
+            ),
+            Parameter(
+                "pickup_dispatch_sla_config_version",
+                PICKUP_DISPATCH_SLA_CONFIG_VERSION,
+            ),
             Parameter("route_algorithm_version", ROUTE_ALGORITHM_VERSION),
             Parameter(
                 "route_coverage_sha256",
@@ -853,12 +951,27 @@ def publish_rebalance_route(
     )
     if stored_coverage != coverage_input:
         raise ContractViolation("stored route coverage identity가 preview와 다릅니다.")
+    stored_cooldown = store_input_payload(
+        object_store,
+        base_uri=object_base_uri,
+        publication_key="rebalance_route",
+        role="pickup_cooldown_station_ids",
+        payload=cooldown_payload,
+        suffix="json",
+        require_canonical_json=True,
+    )
+    if stored_cooldown != cooldown_input:
+        raise ContractViolation("stored pickup cooldown ID 집합이 preview와 다릅니다.")
     materials = materialize_publication(
         object_store,
         base_uri=object_base_uri,
         publication_key="rebalance_route",
         dependencies=dependencies,
-        input_artifacts=(coverage_input, urgency_snapshot.manifest_input),
+        input_artifacts=(
+            coverage_input,
+            cooldown_input,
+            urgency_snapshot.manifest_input,
+        ),
         parameters=input_fingerprint.parameters,
         outputs=candidate.outputs,
     )
@@ -896,6 +1009,11 @@ def publish_rebalance_route(
         if actual_coverage != database_snapshot.route_coverage:
             raise ContractViolation(
                 "verified route coverage bytes가 준비한 DB projection과 다릅니다."
+            )
+        actual_cooldown_ids = parse_id_set(payloads[cooldown_input.uri])
+        if actual_cooldown_ids != cooldown_ids:
+            raise ContractViolation(
+                "verified pickup cooldown ID 집합이 준비한 DB projection과 다릅니다."
             )
         validate_route_urgency_dependencies(
             publication.input_fingerprint,
@@ -1047,7 +1165,7 @@ def _plan_from_snapshots(
     database_snapshot: RouteDatabaseSnapshot,
     urgency_snapshot: RouteUrgencySnapshot,
 ) -> RebalanceRoutePlan:
-    """Typed urgency와 DB snapshot을 pure route-v2 planner 입력으로 바꾼다."""
+    """Typed urgency와 DB snapshot을 pure route-v4 planner 입력으로 바꾼다."""
     return plan_rebalance_routes(
         logical_dttm=logical_dttm,
         revision_no=revision_no,
@@ -1055,6 +1173,8 @@ def _plan_from_snapshots(
         stations=database_snapshot.stations,
         urgency=urgency_snapshot.records,
         route_coverage=database_snapshot.route_coverage,
+        policy_config=DEFAULT_REBALANCE_POLICY,
+        pickup_cooldown_sta_ids=frozenset(database_snapshot.pickup_cooldown_sta_ids),
     )
 
 
@@ -1144,6 +1264,7 @@ def _build_route_urgency_snapshot(
         fingerprint_payload,
         "station_urgency",
     )
+    _validate_supported_urgency_fingerprint(fingerprint)
     parameters = {
         parameter.name: parameter.value for parameter in fingerprint.parameters
     }
@@ -1196,6 +1317,25 @@ def _build_route_urgency_snapshot(
         ),
         records=records,
     )
+
+
+def _validate_supported_urgency_fingerprint(
+    fingerprint: InputFingerprint,
+) -> None:
+    """Route-v4가 소비할 수 있는 urgency 점수·정책 버전을 강제한다."""
+    parameters = {
+        parameter.name: parameter.value for parameter in fingerprint.parameters
+    }
+    expected = {
+        "scoring_config_version": URGENCY_SCORING_CONFIG_VERSION,
+        "rebalance_policy_config": DEFAULT_REBALANCE_POLICY.canonical_json,
+    }
+    for name, expected_value in expected.items():
+        if parameters[name] != expected_value:
+            raise ContractViolation(
+                f"route-v4가 지원하지 않는 urgency {name}입니다: "
+                f"expected={expected_value}, actual={parameters[name]}"
+            )
 
 
 def _route_urgency_records_from_parquet(
@@ -1290,7 +1430,35 @@ def _route_database_snapshot_locked(
     )
     stations = tuple(StationRouteTopology(*row) for row in cursor.fetchall())
     coverage = _route_coverage_locked(cursor, logical)
-    return RouteDatabaseSnapshot(centers, stations, coverage)
+    cursor.execute(
+        """
+        SELECT DISTINCT stop.sta_id COLLATE "C" AS sta_id
+          FROM rebalance_route AS route
+          JOIN rebalance_route_stop AS stop USING (route_id)
+         WHERE (
+                   route.route_status_cd = 'dispatched'
+                   OR (
+                       route.route_status_cd = 'completed'
+                       AND route.completed_dttm > %s
+                       AND route.completed_dttm <= %s
+                   )
+               )
+           AND stop.route_action_type_cd = 'pickup'
+         ORDER BY sta_id
+        """,
+        (
+            logical
+            - timedelta(minutes=DEFAULT_REBALANCE_POLICY.pickup_cooldown_minutes),
+            logical,
+        ),
+    )
+    pickup_cooldown_sta_ids = tuple(row[0] for row in cursor.fetchall())
+    return RouteDatabaseSnapshot(
+        centers,
+        stations,
+        coverage,
+        pickup_cooldown_sta_ids,
+    )
 
 
 def _route_coverage_locked(
@@ -1627,6 +1795,8 @@ def _build_candidates(
     stations_by_id: dict[str, StationRouteTopology],
     centers_by_id: dict[str, DispatchCenterTopology],
     coverage_qty: dict[tuple[str, str], int],
+    exclusive_pickup_station: bool = False,
+    pickup_cooldown_sta_ids: frozenset[str] = frozenset(),
 ) -> dict[str, tuple[_Candidate, ...]]:
     """현재 station FK와 coverage를 적용한 센터별 결정적 후보를 만든다."""
     candidates: dict[str, list[_Candidate]] = {}
@@ -1644,7 +1814,12 @@ def _build_candidates(
             raise ContractViolation(
                 f"actionable urgency station의 current center가 active가 아닙니다: {row.sta_id}"
             )
-        remaining = row.bike_qty - coverage_qty.get((row.sta_id, action), 0)
+        if action == "pickup" and row.sta_id in pickup_cooldown_sta_ids:
+            continue
+        covered = coverage_qty.get((row.sta_id, action), 0)
+        if exclusive_pickup_station and action == "pickup" and covered > 0:
+            continue
+        remaining = row.bike_qty - covered
         if remaining <= 0:
             continue
         candidates.setdefault(station.dispatch_center_id, []).append(
@@ -1683,9 +1858,9 @@ def _rank_for_route(
     anchor: _Candidate,
     keep_anchor_first: bool = False,
 ) -> list[_Candidate]:
-    """최고 긴급 pickup 주변의 처리효율 순으로 한 작업 후보를 정렬한다.
+    """고정 anchor 주변의 거리·긴급도 처리효율 순으로 후보를 정렬한다.
 
-    첫 pickup은 전체 긴급도 순서를 유지한다. 추가 stop은 긴급도가 높고 anchor에
+    Anchor 자체를 먼저 유지할 수 있고, 추가 stop은 긴급도가 높고 anchor에
     가까울수록 앞서는 (urgency + 1) / (distance + 1) 점수를 사용한다.
     """
 
@@ -1711,6 +1886,78 @@ def _rank_for_route(
     return [anchor, *(candidate for candidate in ranked if candidate != anchor)]
 
 
+def _rank_pickups_for_supply(
+    candidates: list[_Candidate],
+    *,
+    anchor: _Candidate,
+    center: DispatchCenterTopology,
+) -> list[_Candidate]:
+    """센터에서 안전 donor를 거쳐 supply anchor로 가는 총거리 순으로 정렬한다.
+
+    Pickup 수량의 donor 안전성은 urgency가 이미 계산했다. 여기서는 supply 우선순위를
+    바꾸지 않으면서 센터에서 donor까지의 접근 거리도 빠뜨리지 않는 경로비용을 쓴다.
+    """
+
+    def pickup_path_key(
+        candidate: _Candidate,
+    ) -> tuple[float, float, float, float, bytes]:
+        """총거리 뒤 pickup 도착거리·긴급도 순의 결정적 key를 반환한다."""
+        center_distance = _haversine_km(
+            center.longitude,
+            center.latitude,
+            candidate.longitude,
+            candidate.latitude,
+        )
+        supply_distance = _haversine_km(
+            candidate.longitude,
+            candidate.latitude,
+            anchor.longitude,
+            anchor.latitude,
+        )
+        return (
+            center_distance + supply_distance,
+            center_distance,
+            -candidate.urgency_score,
+            supply_distance,
+            _utf8_key(candidate.sta_id),
+        )
+
+    return sorted(candidates, key=pickup_path_key)
+
+
+def _prioritize_pickup_sla_prefix(
+    candidates: list[_Candidate],
+    *,
+    start: tuple[float, float],
+    max_pickup_stops: int,
+) -> list[_Candidate]:
+    """SLA 가능 donor를 정렬 prefix 중 최대한 앞으로 모은다.
+
+    기본 공급 경로 순위는 유지하되, 먼 donor 하나 때문에 그 뒤의
+    가까운 donor까지 prefix 탐색에서 누락되지 않도록 순서만 안정적으로
+    재배치한다. 미선택 후보는 후속 route 탐색을 위해 모두 보존한다.
+    """
+    if type(max_pickup_stops) is not int or max_pickup_stops < 1:
+        raise ContractViolation("max_pickup_stops는 1 이상 integer여야 합니다.")
+    feasible_prefix: list[_Candidate] = []
+    deferred: list[_Candidate] = []
+    for candidate in candidates:
+        if len(feasible_prefix) >= max_pickup_stops:
+            deferred.append(candidate)
+            continue
+        proposed = tuple(
+            _SelectedStop(item, 1) for item in (*feasible_prefix, candidate)
+        )
+        if (
+            _pickup_dispatch_lag_minutes(proposed, start=start)
+            <= PICKUP_DISPATCH_MAX_LAG_MINUTES
+        ):
+            feasible_prefix.append(candidate)
+        else:
+            deferred.append(candidate)
+    return [*feasible_prefix, *deferred]
+
+
 def _take_by_priority(
     candidates: list[_Candidate],
     limit: int,
@@ -1720,9 +1967,7 @@ def _take_by_priority(
     """후보 우선순위를 보존하며 양수 limit까지 수량을 배정한다."""
     if type(limit) is not int or limit < 0:
         raise ContractViolation("route selection limit은 0 이상 integer여야 합니다.")
-    if stop_limit is not None and (
-        type(stop_limit) is not int or stop_limit < 0
-    ):
+    if stop_limit is not None and (type(stop_limit) is not int or stop_limit < 0):
         raise ContractViolation("route stop limit은 0 이상 integer여야 합니다.")
     if limit == 0 or not candidates:
         return (), list(candidates)
@@ -1730,9 +1975,7 @@ def _take_by_priority(
     remaining: list[_Candidate] = []
     available = limit
     for candidate in candidates:
-        if available == 0 or (
-            stop_limit is not None and len(selected) >= stop_limit
-        ):
+        if available == 0 or (stop_limit is not None and len(selected) >= stop_limit):
             remaining.append(candidate)
             continue
         quantity = min(candidate.remaining_qty, available)
@@ -1756,13 +1999,15 @@ def _choose_balanced_stop_split(
     pickups: list[_Candidate],
     dropoffs: list[_Candidate],
     *,
+    start: tuple[float, float],
     max_stops_per_route: int = MAX_STOPS_PER_ROUTE,
 ) -> tuple[int, int, int] | None:
-    """설정된 대여소 상한으로 가장 많은 수량을 완결할 stop 배분을 고른다.
+    """Pickup SLA와 대여소 상한 안에서 가장 많은 완결 수량을 고른다.
 
     pickup과 dropoff에 각각 한 자리를 보장하고, 처리 가능 수량이 같으면 더 적은
-    대여소와 더 높은 긴급도 합을 우선한다. 후보 목록은 이미 경로 효율 순으로
-    정렬되어 있으므로 각 action의 앞쪽 N개만 비교해도 결정적이다.
+    대여소와 더 높은 긴급도 합을 우선한다. 실제 planner와 같은 센터 기준 최근접
+    pickup 순서의 마지막 실행시각이 30분을 넘는 후보는 제외한다. 따라서 큰 작업이
+    SLA를 위반하면 같은 입력에서 더 작은 완결 작업으로 결정적으로 분리된다.
     """
     if not pickups or not dropoffs:
         return None
@@ -1786,10 +2031,20 @@ def _choose_balanced_stop_split(
             )
             if transfer_qty <= 0:
                 continue
+            selected_pickups, _ = _take_by_priority(
+                pickups,
+                transfer_qty,
+                stop_limit=pickup_stop_limit,
+            )
+            if (
+                not selected_pickups
+                or _pickup_dispatch_lag_minutes(selected_pickups, start=start)
+                > PICKUP_DISPATCH_MAX_LAG_MINUTES
+            ):
+                continue
             stop_count = pickup_stop_limit + dropoff_stop_limit
             urgency_sum = sum(
-                item.urgency_score
-                for item in (*pickup_candidates, *dropoff_candidates)
+                item.urgency_score for item in (*pickup_candidates, *dropoff_candidates)
             )
             key = (
                 transfer_qty,
@@ -1804,16 +2059,55 @@ def _choose_balanced_stop_split(
     return None if best is None else best[1]
 
 
+def _pickup_dispatch_lag_minutes(
+    pickups: tuple[_SelectedStop, ...],
+    *,
+    start: tuple[float, float],
+) -> float:
+    """센터 출발부터 마지막 pickup 실행까지의 production 가정 시간을 계산한다."""
+    ordered, _ = _nearest_order(pickups, start=start)
+    current = start
+    elapsed = 0.0
+    for stop in ordered:
+        candidate = stop.candidate
+        elapsed += (
+            _haversine_km(
+                current[0],
+                current[1],
+                candidate.longitude,
+                candidate.latitude,
+            )
+            / PICKUP_DISPATCH_ASSUMED_SPEED_KMH
+            * 60.0
+            + PICKUP_DISPATCH_SERVICE_MINUTES_PER_STOP
+        )
+        current = (candidate.longitude, candidate.latitude)
+    return elapsed
+
+
 def _nearest_stops(
     pickups: tuple[_SelectedStop, ...],
     dropoffs: tuple[_SelectedStop, ...],
     *,
     start: tuple[float, float],
+    anchor_dropoff: _Candidate,
 ) -> tuple[_SelectedStop, ...]:
-    """센터부터 pickup을 거쳐 dropoff까지 이어지는 최근접 순서를 만든다."""
-    pickup_order, pickup_end = _nearest_order(pickups, start=start)
-    dropoff_order, _ = _nearest_order(dropoffs, start=pickup_end)
-    return pickup_order + dropoff_order
+    """센터부터 pickup을 거쳐 최우선 supply와 추가 dropoff를 잇는다."""
+    pickup_order, _ = _nearest_order(pickups, start=start)
+    anchored = tuple(
+        stop for stop in dropoffs if stop.candidate.sta_id == anchor_dropoff.sta_id
+    )
+    if len(anchored) != 1:
+        raise ContractViolation(
+            "선택된 dropoff에 최우선 supply anchor가 정확히 하나여야 합니다."
+        )
+    anchor_stop = anchored[0]
+    additional = tuple(stop for stop in dropoffs if stop is not anchor_stop)
+    additional_order, _ = _nearest_order(
+        additional,
+        start=(anchor_dropoff.longitude, anchor_dropoff.latitude),
+    )
+    return pickup_order + (anchor_stop,) + additional_order
 
 
 def _nearest_order(

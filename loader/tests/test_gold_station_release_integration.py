@@ -32,6 +32,7 @@ from gold import station_release
 from gold.common import parquet_bytes
 from gold.dispatch_center import load_dispatch_center_seed, publish_dispatch_center
 from gold.source_catalog import S3SourceSnapshotCatalog, SourceManifestArtifact
+from gold.station import StationRecord
 from gold.station_release import (
     publish_station_lifecycle_correction,
     publish_station_master_correction,
@@ -511,6 +512,65 @@ def test_station_topology_changes_clear_only_affected_proposed_routes(
         gold_connection,
         lifecycle_routes,
     )
+
+
+def test_station_unnest_accepts_mixed_integer_and_float_points(
+    gold_connection: Connection[Any],
+) -> None:
+    """혼합 숫자 좌표를 float array로 정규화해 실제 PostGIS에 upsert한다."""
+    client = boto3.client("s3", region_name="us-east-1")
+    store = S3ImmutableObjectStore(client)
+    logical = datetime.now(UTC).replace(second=0, microsecond=0) - timedelta(minutes=5)
+    _publish_topology(gold_connection, store, logical)
+
+    with gold_connection.transaction(), gold_connection.cursor() as cursor:
+        cursor.execute("SELECT weather_grid_id FROM weather_grid ORDER BY 1 LIMIT 1")
+        grid_row = cursor.fetchone()
+        cursor.execute(
+            "SELECT dispatch_center_id FROM dispatch_center ORDER BY 1 LIMIT 1"
+        )
+        center_row = cursor.fetchone()
+        assert grid_row is not None
+        assert center_row is not None
+        records = (
+            StationRecord(
+                sta_id="ST-900001",
+                sta_nm="정수 좌표 대여소",
+                sta_addr="서울시 테스트로 1",
+                hold_cnt=10,
+                longitude=127,
+                latitude=37,
+                sta_point_source_cd="bike_station_master",
+                weather_grid_id=grid_row[0],
+                dispatch_center_id=center_row[0],
+                master_base_dttm=logical,
+                last_seen_dttm=logical,
+                is_active=True,
+            ),
+            StationRecord(
+                sta_id="ST-900002",
+                sta_nm="실수 좌표 대여소",
+                sta_addr="서울시 테스트로 2",
+                hold_cnt=10,
+                longitude=127.1,
+                latitude=37.1,
+                sta_point_source_cd="bike_station_master",
+                weather_grid_id=grid_row[0],
+                dispatch_center_id=center_row[0],
+                master_base_dttm=logical,
+                last_seen_dttm=logical,
+                is_active=True,
+            ),
+        )
+        station_release._upsert_station(cursor, records)
+        cursor.execute(
+            "SELECT sta_id, ST_X(sta_point), ST_Y(sta_point) "
+            "FROM station ORDER BY sta_id"
+        )
+        assert cursor.fetchall() == [
+            ("ST-900001", 127.0, 37.0),
+            ("ST-900002", 127.1, 37.1),
+        ]
 
 
 def _publish_topology(
