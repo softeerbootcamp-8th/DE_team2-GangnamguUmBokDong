@@ -187,7 +187,7 @@ def test_module_task_records_resource_profile_per_task_instance(dag) -> None:
         "try_number={{ ti.try_number }}",
         "map_index={{ ti.map_index }}",
         "parallelism=${AIRFLOW__CORE__PARALLELISM:-3}",
-        "max_active_tasks_per_dag=${AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG:-2}",
+        "max_active_tasks_per_dag=${AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG:-3}",
     ):
         assert f'--metadata "{metadata}"' in task.bash_command
     assert "--sample-seconds" in task.bash_command

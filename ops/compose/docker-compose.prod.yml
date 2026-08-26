@@ -38,10 +38,13 @@ x-airflow-common: &airflow-common
     # 데이터와 모델이 준비되기 전에 파이프라인이 돌며 실패 로그만 쌓는 것을 막는다.
     # 준비가 끝나면 UI에서 station_master → weather_3h → weather_10min → realtime_5min 순으로 unpause.
     AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
-    # t4g.large(8GB)에서 BashOperator subprocess가 pandas/pyarrow(+LightGBM)를 들고
-    # 뜬다 — 프로세스당 400MB~1.2GB다. LocalExecutor 기본 parallelism 32는 위험하다.
+    # t4g.large(2 vCPU, 8GB)에서 pandas/PyArrow/LightGBM을 쓰는 BashOperator subprocess의
+    # 무제한 병렬화는 위험하다. 다만 realtime DAG 초반의 collector/freshness task는 서로
+    # 독립적이고 상당 부분 I/O-bound라 DAG당 2개 제한은 병렬성을 과도하게 줄일 수 있다.
+    # 전체 병렬도 3 안에서 realtime DAG도 최대 3개 task를 쓰게 맞춘 운영 실측값이다.
+    # 향후 DAG wall-clock/p95, CPU, available memory, swap-in/out을 비교해 재조정한다.
     AIRFLOW__CORE__PARALLELISM: ${AIRFLOW__CORE__PARALLELISM:-3}
-    AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG: ${AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG:-2}
+    AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG: ${AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG:-3}
     AIRFLOW_RESOURCE_PROBE_SAMPLE_SECONDS: ${AIRFLOW_RESOURCE_PROBE_SAMPLE_SECONDS:-1}
     # BashOperator subprocess(collector/normalizer/nowcaster/ml/loader)가 쓰는 값.
     DATABASE_URL: ${DATABASE_URL:?RDS app DB 연결 문자열이 필요합니다}
