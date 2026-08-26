@@ -81,3 +81,26 @@ def build_silver_gc_task(
         execution_timeout=COMPACTION_EXECUTION_TIMEOUT,
         trigger_rule=trigger_rule,
     )
+
+
+def build_hot_bronze_gc_task(
+    dag,
+    source_id: str,
+    *,
+    today: str,
+    retention_days: int,
+    trigger_rule: str = TriggerRule.ALL_SUCCESS,
+):
+    """검증된 Cold inventory에 포함된 보존기한 도래 Hot을 정리한다."""
+    cmd = (
+        f"uv run --frozen python hot_bronze_gc_cli.py --source {source_id} "
+        f"--today {today} --retention-days {retention_days}"
+    )
+    return build_module_task(
+        dag,
+        f"gc_hot_bronze_{source_id}",
+        COLLECTOR_DIR,
+        cmd,
+        execution_timeout=COMPACTION_EXECUTION_TIMEOUT,
+        trigger_rule=trigger_rule,
+    )
