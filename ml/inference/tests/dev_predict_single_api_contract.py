@@ -160,7 +160,7 @@ def test_lag_rolling_features_differ_by_minute_within_same_hour():
     _set_rental_events(trips)
     _set_return_history("A", "2025-06-01 16:00:00")
     ps._station_profile_station_index = {}
-    ps._station_profile_values = np.empty((0, 0, 0, 0, 0), dtype="float32")
+    ps._station_profile_values = {}
 
     out_1700, fb_1700 = ps._lag_rolling_features(
         "A", 1, pd.Timestamp("2025-06-01 17:00:00")
@@ -184,7 +184,7 @@ def test_build_feature_record_honors_minute():
     _set_rental_events(trips)
     _set_return_history("A", "2025-06-01 16:05:00")
     ps._station_profile_station_index = {}
-    ps._station_profile_values = np.empty((0, 0, 0, 0, 0), dtype="float32")
+    ps._station_profile_values = {}
     _set_station_master(["A"])
 
     record, fallback, population_fallback = ps._build_feature_record(
@@ -232,7 +232,7 @@ def test_predict_demand_multi_hour_all_stations_reports_failed_stations(monkeypa
     _set_rental_events(trips)
     _set_return_history("A", "2025-06-01 09:00:00")
     ps._station_profile_station_index = {}
-    ps._station_profile_values = np.empty((0, 0, 0, 0, 0), dtype="float32")
+    ps._station_profile_values = {}
     ps._population_profile = {}
     _set_station_master(["A"])  # "MISSING"은 일부러 마스터에 안 넣음
     monkeypatch.setattr(ps, "predict", _fake_predict)
@@ -262,7 +262,7 @@ def test_predict_demand_multi_hour_all_stations_no_failures_when_all_known(monke
     _set_rental_events(trips)
     _set_return_history("A", "2025-06-01 09:00:00")
     ps._station_profile_station_index = {}
-    ps._station_profile_values = np.empty((0, 0, 0, 0, 0), dtype="float32")
+    ps._station_profile_values = {}
     ps._population_profile = {}
     _set_station_master(["A"])
     monkeypatch.setattr(ps, "predict", _fake_predict)
@@ -298,7 +298,7 @@ def test_predict_demand_multi_hour_all_stations_isolates_malformed_master_row(
     _set_rental_events(trips)
     _set_return_history("A", "2025-06-01 09:00:00")
     ps._station_profile_station_index = {}
-    ps._station_profile_values = np.empty((0, 0, 0, 0, 0), dtype="float32")
+    ps._station_profile_values = {}
     ps._population_profile = {}
     _set_station_master(["A", "BROKEN"])
     if column == "station_no":
@@ -330,7 +330,7 @@ def test_default_all_stations_uses_active_trained_servable_intersection(monkeypa
     _set_rental_events(trips)
     _set_return_history("A", "2025-06-01 09:00:00")
     ps._station_profile_station_index = {}
-    ps._station_profile_values = np.empty((0, 0, 0, 0, 0), dtype="float32")
+    ps._station_profile_values = {}
     ps._population_profile = {}
     _set_station_master(["A", "INACTIVE", "BROKEN", "UNTRAINED"])
     ps._station_master.loc["BROKEN", "capacity"] = np.nan
@@ -394,7 +394,7 @@ def test_all_stations_releases_rental_boosters_before_return_scoring(monkeypatch
     _set_rental_events(trips)
     _set_return_history("A", "2025-06-01 09:00:00")
     ps._station_profile_station_index = {}
-    ps._station_profile_values = np.empty((0, 0, 0, 0, 0), dtype="float32")
+    ps._station_profile_values = {}
     ps._population_profile = {}
     _set_station_master(["A"])
 
@@ -437,7 +437,7 @@ def test_multi_hour_releases_rental_boosters_before_return_scoring(monkeypatch):
     _set_rental_events(trips)
     _set_return_history("A", "2025-06-01 09:00:00")
     ps._station_profile_station_index = {}
-    ps._station_profile_values = np.empty((0, 0, 0, 0, 0), dtype="float32")
+    ps._station_profile_values = {}
     ps._population_profile = {}
     _set_station_master(["A"])
 
@@ -478,7 +478,7 @@ def test_public_single_apis_release_boosters_after_each_score(monkeypatch):
     _set_rental_events(trips)
     _set_return_history("A", "2025-06-01 09:00:00")
     ps._station_profile_station_index = {}
-    ps._station_profile_values = np.empty((0, 0, 0, 0, 0), dtype="float32")
+    ps._station_profile_values = {}
     _set_station_master(["A"])
     events = []
 
@@ -519,7 +519,7 @@ def test_single_station_cli_saves_to_s3(monkeypatch):
     _set_rental_events(trips)
     _set_return_history("ST-100", "2025-06-01 09:00:00")
     ps._station_profile_station_index = {}
-    ps._station_profile_values = np.empty((0, 0, 0, 0, 0), dtype="float32")
+    ps._station_profile_values = {}
     ps._population_profile = {}
     _set_station_master(["ST-100"])
     monkeypatch.setattr(ps, "predict", _fake_predict)
@@ -684,7 +684,7 @@ def test_single_station_multi_hour_cli_saves_to_s3(monkeypatch):
     _set_rental_events(trips)
     _set_return_history("ST-100", "2025-06-01 09:00:00")
     ps._station_profile_station_index = {}
-    ps._station_profile_values = np.empty((0, 0, 0, 0, 0), dtype="float32")
+    ps._station_profile_values = {}
     ps._population_profile = {}
     _set_station_master(["ST-100"])
     monkeypatch.setattr(ps, "predict", _fake_predict)

@@ -8,7 +8,6 @@ fixture 패턴 재사용). 각 테스트 후 전역을 리셋해 테스트 간 �
 lag_24h/168h, roll_mean/std_3h/24h 테스트는 해당 컬럼 자체가 없어져 제거했다.
 """
 
-import numpy as np
 import pandas as pd
 import pytest
 from ml_core.rolling_window_features import count_visible_in_window
@@ -79,7 +78,7 @@ def _set_profile(entries: dict) -> None:
     literal)을 유지한 채 내부적으로만 DataFrame으로 바꿔 실제 압축 함수를 그대로 태운다."""
     if not entries:
         ps._station_profile_station_index = {}
-        ps._station_profile_values = np.empty((0, 0, 0, 0, 0), dtype="float32")
+        ps._station_profile_values = {}
         return
     df = pd.DataFrame(
         [

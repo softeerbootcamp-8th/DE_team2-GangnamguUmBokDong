@@ -22,20 +22,28 @@ from core.source_snapshot import (
     SourceSnapshotStatus,
     build_source_snapshot_manifest,
 )
-
 from gold.common import parquet_bytes
-from gold.demand import DemandForecastRecord
+from gold.demand import DemandForecastRecord, DemandPredictionRecord
+from gold.rebalance_policy import (
+    PICKUP_SAFETY_STRATEGY_QUANTILE_ADVERSE,
+    risk_band_policy,
+)
 from gold.source_catalog import S3SourceSnapshotCatalog
 from gold.station_stock import StationStockRecord
 from gold.urgency import (
+    URGENCY_PUBLISHER_VERSION,
     ActiveStation,
     StationUrgencyRecord,
     StockHistoryPoint,
     UrgencyCalculationInputs,
     UrgencyProjection,
     UrgencyRecord,
+    _bike_qty_risk_band_v5,
     _bike_qty_v1,
+    _complete_quantile_index,
     _history_window_from_manifest,
+    _pickup_model_lower_stock_path,
+    _recent_stock_projection_v3,
     _serving_release_manifest_refs,
     _stock_history_input_artifacts,
     _urgency_score_v1,
@@ -48,6 +56,23 @@ from gold.urgency import (
 
 BASE = datetime(2026, 8, 20, 0, 5, tzinfo=UTC)
 BUCKET = "test-bucket"
+
+
+def test_urgency_publisher_version_matches_v5_capacity_reserve_contract() -> None:
+    """정원보존 publisher의 최종 v5 식별자를 고정한다."""
+    assert URGENCY_PUBLISHER_VERSION == "gold-urgency-publisher-v5-capacity-reserve"
+
+
+def _stock_history(*quantities: int, spacing_minutes: int = 5) -> list[dict[str, Any]]:
+    """현재를 마지막 점으로 하는 oldest-first 재고 이력을 만든다."""
+    return [
+        {
+            "observed_at": BASE
+            - timedelta(minutes=spacing_minutes * (len(quantities) - index - 1)),
+            "parking_bike_tot_cnt": quantity,
+        }
+        for index, quantity in enumerate(quantities)
+    ]
 
 
 def test_serving_release_refs_require_exact_three_key_mapping() -> None:
@@ -333,9 +358,69 @@ def test_compute_projection_allows_new_station_absent_from_old_complete_windows(
             urgency_score=53.5,
             critical_remaining_min=0,
             rebalance_need_type_cd="supply_needed",
-            bike_qty=19,
+            bike_qty=7,
         ),
     )
+
+
+def _quantile_predictions(
+    station_ids: tuple[str, ...],
+    *,
+    include_quantiles: bool = True,
+) -> tuple[DemandPredictionRecord, ...]:
+    """Quantile 결합 테스트용 station×12 prediction을 만든다."""
+    return tuple(
+        DemandPredictionRecord(
+            base_dttm=BASE,
+            station_id=station_id,
+            horizon=horizon,
+            target_dttm=BASE + timedelta(hours=horizon - 1),
+            rental_pred_mean=3.0,
+            rental_pred_p10=1.0 if include_quantiles else None,
+            rental_pred_p50=2.0 if include_quantiles else None,
+            rental_pred_p90=4.0 if include_quantiles else None,
+            return_pred_mean=1.0,
+            return_pred_p10=0.5 if include_quantiles else None,
+            return_pred_p50=1.0 if include_quantiles else None,
+            return_pred_p90=2.0 if include_quantiles else None,
+        )
+        for station_id in station_ids
+        for horizon in range(1, 13)
+    )
+
+
+def test_quantile_index_ignores_stations_outside_urgency_intersection() -> None:
+    """Stock 교집합 밖 lineage quantile은 expected 완전성을 깨지 않는다."""
+    indexed = _complete_quantile_index(
+        _quantile_predictions(("ST-1", "ST-2")),
+        ("ST-1",),
+    )
+
+    assert set(indexed) == {("ST-1", horizon) for horizon in range(1, 13)}
+
+
+def test_quantile_index_requires_v2_quantiles_for_expected_station() -> None:
+    """Mean-only v1 lineage는 quantile-adverse에서 fail-closed한다."""
+    with pytest.raises(ContractViolation, match="v2 quantile"):
+        _complete_quantile_index(
+            _quantile_predictions(("ST-1",), include_quantiles=False),
+            ("ST-1",),
+        )
+
+
+def test_compute_projection_joins_quantile_by_target_horizon() -> None:
+    """Demand tuple 순서와 무관하게 predicted_dttm horizon으로 계산한다."""
+    inputs = _calculation_inputs(history_station_ids=("ST-1",))
+    reordered = UrgencyCalculationInputs(
+        active_stations=inputs.active_stations,
+        history_offsets_minutes=inputs.history_offsets_minutes,
+        history_windows=inputs.history_windows,
+        current_stock=inputs.current_stock,
+        demand=tuple(reversed(inputs.demand)),
+        base_dttm=inputs.base_dttm,
+    )
+
+    assert compute_urgency_projection(reordered) == compute_urgency_projection(inputs)
 
 
 def test_calculation_inputs_fix_history_roles_to_oldest_first_offsets() -> None:
@@ -381,6 +466,422 @@ def test_scoring_and_bike_quantity_are_equivalent_to_rebalance_v1() -> None:
         expected[2],
         points,
     )
+
+
+def test_risk_band_pickup_preserves_lower_stock_across_protection_horizon() -> None:
+    """평균 재고가 유지돼도 확률 하방에서 정원을 뺀 만큼만 수거한다."""
+    points = enrich_forecast_points(
+        40,
+        10,
+        [
+            {"predicted_rent_cnt": 15, "predicted_return_cnt": 15},
+            {"predicted_rent_cnt": 15, "predicted_return_cnt": 15},
+        ],
+    )
+    policy = risk_band_policy(
+        protection_horizon_hours=2,
+        minimum_stock_ratio=0.2,
+        uncertainty_z=1.645,
+    )
+    assert _bike_qty_v1(40, 10, "retrieval_needed", points) == 30
+    assert (
+        _bike_qty_risk_band_v5(
+            40,
+            10,
+            "retrieval_needed",
+            points,
+            _stock_history(40, 40, 40),
+            BASE,
+            policy,
+        )
+        == 17
+    )
+
+
+def test_pickup_safety_strategies_share_stock_path_interface() -> None:
+    """정상 synthetic 입력에서 두 strategy가 같은 stock-path 계약을 제공한다."""
+    points = [
+        {
+            "predicted_rent_cnt": 2,
+            "predicted_return_cnt": 1,
+            "rental_pred_p90": 4.0,
+            "return_pred_p10": 1.0,
+        },
+        {
+            "predicted_rent_cnt": 2,
+            "predicted_return_cnt": 1,
+            "rental_pred_p90": 3.0,
+            "return_pred_p10": 2.0,
+        },
+    ]
+    poisson = risk_band_policy(
+        protection_horizon_hours=2,
+        minimum_stock_ratio=0.2,
+        uncertainty_z=0.0,
+    )
+    quantile = risk_band_policy(
+        protection_horizon_hours=2,
+        minimum_stock_ratio=0.2,
+        uncertainty_z=0.0,
+        pickup_safety_strategy=PICKUP_SAFETY_STRATEGY_QUANTILE_ADVERSE,
+    )
+
+    assert _pickup_model_lower_stock_path(20, points, poisson) == (20.0, 19.0, 18.0)
+    assert _pickup_model_lower_stock_path(20, points, quantile) == (
+        20.0,
+        17.0,
+        16.0,
+    )
+
+
+def test_quantile_adverse_is_never_looser_than_poisson_lower_path() -> None:
+    """교차 quantile도 검증된 poisson 하방보다 큰 donor pickup을 만들지 않는다."""
+    points = [
+        {
+            "predicted_rent_cnt": 5,
+            "predicted_return_cnt": 0,
+            "rental_pred_p90": 0.5,
+            "return_pred_p10": 2.0,
+        }
+        for _ in range(2)
+    ]
+    poisson = risk_band_policy(
+        protection_horizon_hours=2,
+        minimum_stock_ratio=0.2,
+        uncertainty_z=1.645,
+    )
+    quantile = risk_band_policy(
+        protection_horizon_hours=2,
+        minimum_stock_ratio=0.2,
+        uncertainty_z=1.645,
+        pickup_safety_strategy=PICKUP_SAFETY_STRATEGY_QUANTILE_ADVERSE,
+    )
+
+    assert _pickup_model_lower_stock_path(
+        40, points, quantile
+    ) == _pickup_model_lower_stock_path(40, points, poisson)
+
+
+def test_pickup_model_horizon_covers_response_lag() -> None:
+    """Donor 모델 하방은 보호 2시간 뒤 30분 출동 지연까지 보수적으로 덮는다."""
+    points = enrich_forecast_points(
+        40,
+        30,
+        [
+            {"predicted_rent_cnt": 0, "predicted_return_cnt": 0},
+            {"predicted_rent_cnt": 0, "predicted_return_cnt": 0},
+            {"predicted_rent_cnt": 20, "predicted_return_cnt": 0},
+        ],
+    )
+    policy = risk_band_policy(
+        protection_horizon_hours=2,
+        minimum_stock_ratio=0.2,
+        uncertainty_z=1.645,
+    )
+
+    assert (
+        _bike_qty_risk_band_v5(
+            40,
+            30,
+            "retrieval_needed",
+            points,
+            _stock_history(40, 40, 40),
+            BASE,
+            policy,
+        )
+        == 0
+    )
+
+
+def test_risk_band_dropoff_raises_lower_stock_to_minimum() -> None:
+    """배치량은 보호 구간의 최저 하방 재고를 최소 안전재고까지 올린다."""
+    points = enrich_forecast_points(
+        0,
+        10,
+        [{"predicted_rent_cnt": 5, "predicted_return_cnt": 0}],
+    )
+    policy = risk_band_policy(
+        protection_horizon_hours=1,
+        minimum_stock_ratio=0.2,
+        uncertainty_z=0.0,
+    )
+    assert (
+        _bike_qty_risk_band_v5(
+            0,
+            10,
+            "supply_needed",
+            points,
+            [],
+            BASE,
+            policy,
+        )
+        == 7
+    )
+
+
+def test_risk_band_pickup_uses_full_capacity_surplus() -> None:
+    """미래에도 정원을 지키면 임의 비율 없이 현재 정원 초과분을 회수한다."""
+    points = enrich_forecast_points(
+        40,
+        10,
+        [{"predicted_rent_cnt": 0, "predicted_return_cnt": 0}],
+    )
+    policy = risk_band_policy(
+        protection_horizon_hours=1,
+        minimum_stock_ratio=0.2,
+        uncertainty_z=0.0,
+    )
+    assert (
+        _bike_qty_risk_band_v5(
+            40,
+            10,
+            "retrieval_needed",
+            points,
+            _stock_history(40, 40, 40),
+            BASE,
+            policy,
+        )
+        == 30
+    )
+
+
+def test_risk_band_pickup_uses_only_current_capacity_surplus() -> None:
+    """미래 반납 초과량은 현재 실제 정원 초과분보다 많은 회수를 만들지 않는다."""
+    points = enrich_forecast_points(
+        12,
+        10,
+        [{"predicted_rent_cnt": 0, "predicted_return_cnt": 50}],
+    )
+    policy = risk_band_policy(
+        protection_horizon_hours=1,
+        minimum_stock_ratio=0.2,
+        uncertainty_z=0.0,
+    )
+
+    assert (
+        _bike_qty_risk_band_v5(
+            12,
+            10,
+            "retrieval_needed",
+            points,
+            _stock_history(12, 12, 12),
+            BASE,
+            policy,
+        )
+        == 2
+    )
+
+
+def test_risk_band_pickup_fails_closed_without_three_points_including_current() -> None:
+    """현재 포함 고유 재고 관측이 세 점 미만이면 pickup을 만들지 않는다."""
+    points = enrich_forecast_points(
+        20,
+        10,
+        [{"predicted_rent_cnt": 0, "predicted_return_cnt": 0}],
+    )
+    policy = risk_band_policy(
+        protection_horizon_hours=1,
+        minimum_stock_ratio=0.2,
+        uncertainty_z=0.0,
+    )
+
+    assert (
+        _bike_qty_risk_band_v5(
+            20,
+            10,
+            "retrieval_needed",
+            points,
+            _stock_history(20, 20),
+            BASE,
+            policy,
+        )
+        == 0
+    )
+    assert (
+        _bike_qty_risk_band_v5(
+            20,
+            10,
+            "retrieval_needed",
+            points,
+            _stock_history(20, 20, 19),
+            BASE,
+            policy,
+        )
+        == 0
+    )
+
+
+@pytest.mark.parametrize(
+    ("history", "expected"),
+    (
+        ((18, 19, 20), 10),
+        ((20, 20, 20), 10),
+        ((22, 21, 20), 0),
+    ),
+)
+def test_risk_band_pickup_applies_recent_stock_direction(
+    history: tuple[int, ...],
+    expected: int,
+) -> None:
+    """한 방향만 평탄할 때 기존 recent lower-bound 수량을 보존한다."""
+    points = enrich_forecast_points(
+        20,
+        10,
+        [{"predicted_rent_cnt": 0, "predicted_return_cnt": 0}],
+    )
+    policy = risk_band_policy(
+        protection_horizon_hours=1,
+        minimum_stock_ratio=0.2,
+        uncertainty_z=0.0,
+    )
+
+    assert (
+        _bike_qty_risk_band_v5(
+            20,
+            10,
+            "retrieval_needed",
+            points,
+            _stock_history(*history),
+            BASE,
+            policy,
+        )
+        == expected
+    )
+
+
+def test_risk_band_pickup_reduces_quantity_for_both_depletion_signals() -> None:
+    """최근 실측과 모델이 감소하면 미래 정원을 지키도록 회수량을 줄인다."""
+    points = enrich_forecast_points(
+        40,
+        10,
+        [{"predicted_rent_cnt": 1, "predicted_return_cnt": 0}],
+    )
+    policy = risk_band_policy(
+        protection_horizon_hours=1,
+        minimum_stock_ratio=0.2,
+        uncertainty_z=0.0,
+    )
+
+    assert (
+        _bike_qty_risk_band_v5(
+            40,
+            10,
+            "retrieval_needed",
+            points,
+            _stock_history(41, 40, 40),
+            BASE,
+            policy,
+        )
+        == 21
+    )
+
+
+def test_risk_band_pickup_uses_recent_lower_bound_when_model_rises() -> None:
+    """모델이 상승해도 최근 실측 하방을 넘지 않게 회수한다."""
+    points = enrich_forecast_points(
+        40,
+        10,
+        [{"predicted_rent_cnt": 0, "predicted_return_cnt": 1}],
+    )
+    policy = risk_band_policy(
+        protection_horizon_hours=1,
+        minimum_stock_ratio=0.2,
+        uncertainty_z=0.0,
+    )
+
+    assert (
+        _bike_qty_risk_band_v5(
+            40,
+            10,
+            "retrieval_needed",
+            points,
+            _stock_history(41, 40, 40),
+            BASE,
+            policy,
+        )
+        == 21
+    )
+
+
+@pytest.mark.parametrize("history", ((40, 40, 40), (39, 40, 40)))
+def test_risk_band_pickup_preserves_capacity_despite_model_decline(
+    history: tuple[int, ...],
+) -> None:
+    """모델이 감소하면 보수적 미래에도 정원을 남기는 만큼만 회수한다."""
+    points = enrich_forecast_points(
+        40,
+        10,
+        [{"predicted_rent_cnt": 1, "predicted_return_cnt": 0}],
+    )
+    policy = risk_band_policy(
+        protection_horizon_hours=1,
+        minimum_stock_ratio=0.2,
+        uncertainty_z=0.0,
+    )
+
+    assert (
+        _bike_qty_risk_band_v5(
+            40,
+            10,
+            "retrieval_needed",
+            points,
+            _stock_history(*history),
+            BASE,
+            policy,
+        )
+        == 29
+    )
+
+
+def test_risk_band_pickup_bounds_gaehwa_2965_by_recent_projection() -> None:
+    """개화 ST-2965 반례도 최근 하방에서 정원을 지키는 수량만 허용한다."""
+    points = enrich_forecast_points(
+        53,
+        11,
+        [
+            {"predicted_rent_cnt": 3, "predicted_return_cnt": 3},
+            {"predicted_rent_cnt": 3, "predicted_return_cnt": 3},
+        ],
+    )
+    policy = risk_band_policy(
+        protection_horizon_hours=2,
+        minimum_stock_ratio=0.2,
+        uncertainty_z=1.645,
+    )
+
+    assert (
+        _bike_qty_risk_band_v5(
+            53,
+            11,
+            "retrieval_needed",
+            points,
+            _stock_history(55, 53, 53, 53, 53, 53),
+            BASE,
+            policy,
+        )
+        == 33
+    )
+
+
+def test_recent_stock_projection_includes_response_lag() -> None:
+    """하락 추세 reserve는 보호 한 시간 뒤 추가 출동 지연 30분까지 지킨다."""
+    history = _stock_history(22, 21, 20)
+
+    horizon_only = _recent_stock_projection_v3(
+        20,
+        history,
+        BASE,
+        protection_minutes=60,
+    )
+    with_response_lag = _recent_stock_projection_v3(
+        20,
+        history,
+        BASE,
+        protection_minutes=90,
+    )
+
+    assert horizon_only == pytest.approx((-0.2, 8.0))
+    assert with_response_lag == pytest.approx((-0.2, 2.0))
 
 
 def test_history_null_parking_is_station_observation_absence() -> None:

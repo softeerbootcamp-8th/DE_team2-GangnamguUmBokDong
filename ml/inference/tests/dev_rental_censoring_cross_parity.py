@@ -17,7 +17,6 @@ count_visible_in_window()을 anchor마다 반복 호출하는 방식으로 구�
 
 import os
 
-import numpy as np
 import pandas as pd
 import pytest
 from ml_core.rolling_window_features import censored_rolling_counts
@@ -129,7 +128,7 @@ def test_rental_lag_1h_matches_between_batch_and_single_point(spark, trips, tmp_
     ps._rental_events_coverage = (pd.Timestamp("2025-01-01"), pd.Timestamp("2025-12-31 23:59:59"))
     ps._history_by_station = {}  # return_lag_1h는 이 테스트 대상이 아님 — 항상 profile fallback
     ps._station_profile_station_index = {}
-    ps._station_profile_values = np.empty((0, 0, 0, 0, 0), dtype="float32")
+    ps._station_profile_values = {}
 
     check_targets = pd.date_range("2025-06-01 08:00", "2025-06-01 12:00", freq="h")
     for target_ts in check_targets:
