@@ -42,11 +42,11 @@ _ROUTE_ARTIFACT_SET_BYTES = (
 _ROUTE_ARTIFACT_SET_SHA256 = (
     "576eec2c53f1be8985ce531f512f4f4014fe05879d1f53714128dd774d8abf87"
 )
-_ROUTE_INPUT_SHA256 = "0de0cd4437f089bec16b778cf927c1fef732cd349dca7533a465100b94c5454e"
+_ROUTE_INPUT_SHA256 = "047eb834d15205766513e37c85f47628c81806272daa7d32e077afd106d7fb36"
 _ID_SET_BYTES = b'{"ids":["ST-1","ST-2"],"schema_version":"gold-id-set-v1"}'
 _ID_SET_SHA256 = "a080d2f47ea7c4d0f5d27704264ed23d5a93ec525dd12544812f81b3519fa52f"
 _ROUTE_MANIFEST_SHA256 = (
-    "01b04e4af53f338184842157ac269915b1be70e45073d1f12b35184e598a49cf"
+    "e5cd4827e6cb5334b2b73f819a1603ba390d91719c8bf43d8b16ccfccd71ce2a"
 )
 
 
@@ -119,6 +119,11 @@ def _route_input_fingerprint() -> InputFingerprint:
     )
     artifacts = (
         InputArtifact(
+            "e" * 64,
+            "pickup_cooldown_station_ids",
+            "s3://fixture/pickup-cooldown-station-ids.json",
+        ),
+        InputArtifact(
             "b" * 64,
             "urgency_publication_manifest",
             "s3://fixture/urgency-publication.json",
@@ -131,15 +136,29 @@ def _route_input_fingerprint() -> InputFingerprint:
     )
     parameters = (
         Parameter("max_routes_per_center", "3"),
-        Parameter("max_stops_per_route", "8"),
+        Parameter("max_stops_per_route", "5"),
+        Parameter("pickup_dispatch_assumed_speed_kmh", "20.0"),
+        Parameter("pickup_dispatch_max_lag_minutes", "30.0"),
+        Parameter("pickup_dispatch_service_minutes_per_stop", "3.0"),
+        Parameter("pickup_dispatch_sla_config_version", "pickup-dispatch-sla-v1"),
+        Parameter(
+            "rebalance_policy_config",
+            "fixture-rebalance-policy-config",
+        ),
         Parameter("truck_capacity_config_version", "truck-capacity-v1"),
         Parameter("truck_capacity", "20"),
         Parameter(
             "route_coverage_sha256",
             "13cd1f4fe82d4b09370fd4141d1ee1a727f25c5b109de11f06bb904f9c001e8b",
         ),
-        Parameter("route_work_unit_config_version", "route-work-unit-v1"),
-        Parameter("route_algorithm_version", "route-v2"),
+        Parameter(
+            "route_work_unit_config_version",
+            "route-work-unit-v3-pickup-sla",
+        ),
+        Parameter(
+            "route_algorithm_version",
+            "route-v4-supply-led-pickup-sla",
+        ),
     )
     return build_input_fingerprint(
         "rebalance_route",
@@ -403,6 +422,7 @@ def test_registry_matches_all_ten_ssot_publication_keys() -> None:
             ),
             (
                 "expected_sta_id_sha256",
+                "rebalance_policy_config",
                 "scoring_config_version",
                 "stock_history_offsets",
                 "stock_window_count",
@@ -420,10 +440,19 @@ def test_registry_matches_all_ten_ssot_publication_keys() -> None:
                 "station_stock",
                 "station_urgency",
             ),
-            ("route_coverage", "urgency_publication_manifest"),
+            (
+                "pickup_cooldown_station_ids",
+                "route_coverage",
+                "urgency_publication_manifest",
+            ),
             (
                 "max_routes_per_center",
                 "max_stops_per_route",
+                "pickup_dispatch_assumed_speed_kmh",
+                "pickup_dispatch_max_lag_minutes",
+                "pickup_dispatch_service_minutes_per_stop",
+                "pickup_dispatch_sla_config_version",
+                "rebalance_policy_config",
                 "route_algorithm_version",
                 "route_coverage_sha256",
                 "route_work_unit_config_version",

@@ -1,6 +1,6 @@
 # Gold publication byte contract v1
 
-> **현재 계약:** `libs/core/src/core/gold_publication/`과 Gold publisher가 사용하는 canonical byte·manifest 계약이다. 코드 확인일: 2026-08-24.
+> **현재 계약:** `libs/core/src/core/gold_publication/`과 Gold publisher가 사용하는 canonical byte·manifest 계약이다. 코드 확인일: 2026-08-25.
 
 ## 왜 필요한가
 
@@ -76,8 +76,8 @@ dependency, role, parameter는 허용하지 않으며, 별도 표시가 없는 r
 | `weather_forecast` | `station`, `weather_grid` | `short_term_manifest`, `ultra_short_manifest` | `forecast_hour_count`, `resolver_version` |
 | `event:cultural_event` | 없음 | `cultural_event_manifest` | `event_identity_version`, `event_policy_version` |
 | `event:performance_event` | 없음 | `performance_event_manifest`, `stadium_coordinate_seed` | `event_policy_version`, `stadium_coordinate_version` |
-| `station_urgency` | `station`, `station_demand_forecast`, `station_stock` | `demand_publication_manifest`, `stock_publication_manifest`, 선택적 `stock_history_manifest_m05`~`m25`, `urgency_output` | `expected_sta_id_sha256`, `scoring_config_version`, `stock_history_offsets`, `stock_window_count` |
-| `rebalance_route` | `dispatch_center`, `station`, `station_demand_forecast`, `station_stock`, `station_urgency` | `route_coverage`, `urgency_publication_manifest` | `max_routes_per_center`, `max_stops_per_route`, `route_algorithm_version`, `route_coverage_sha256`, `route_work_unit_config_version`, `truck_capacity`, `truck_capacity_config_version` |
+| `station_urgency` | `station`, `station_demand_forecast`, `station_stock` | `demand_publication_manifest`, `stock_publication_manifest`, 선택적 `stock_history_manifest_m05`~`m25`, `urgency_output` | `expected_sta_id_sha256`, `rebalance_policy_config`, `scoring_config_version`, `stock_history_offsets`, `stock_window_count` |
+| `rebalance_route` | `dispatch_center`, `station`, `station_demand_forecast`, `station_stock`, `station_urgency` | `pickup_cooldown_station_ids`, `route_coverage`, `urgency_publication_manifest` | `max_routes_per_center`, `max_stops_per_route`, `pickup_dispatch_assumed_speed_kmh`, `pickup_dispatch_max_lag_minutes`, `pickup_dispatch_service_minutes_per_stop`, `pickup_dispatch_sla_config_version`, `rebalance_policy_config`, `route_algorithm_version`, `route_coverage_sha256`, `route_work_unit_config_version`, `truck_capacity`, `truck_capacity_config_version` |
 
 ### 조건부 입력
 
@@ -86,6 +86,9 @@ dependency, role, parameter는 허용하지 않으며, 별도 표시가 없는 r
 - `stock_history_manifest_m05`~`m25`: 각 offset별 0개 또는 1개다. 현재 stock을 포함해
   urgency 계산에 필요한 최소 window 수는 publisher가 검증한다.
 - `stock_history_offsets`는 사용한 과거 offset을 oldest-first로 기록한다.
+- `pickup_cooldown_station_ids`는 비어 있어도 생략하지 않는 canonical
+  `gold-id-set-v1` artifact다. 모든 dispatched route가 예약한 pickup과 정책 cooldown 안에
+  완료된 route의 pickup station ID를 기록하며 이번 route 후보에서 제외한다.
 - `station_stock`은 dependency 없이 `station`과 같은 release의 realtime manifest를
   사용한다. 해당 manifest는 station window set의 첫 candidate와 같아야 한다.
 
@@ -98,7 +101,38 @@ dependency, role, parameter는 허용하지 않으며, 별도 표시가 없는 r
 각 input manifest의 URI, 실제 byte hash, publication key, logical time, revision,
 artifact-set hash와 input-fingerprint hash가 dependency와 모두 같아야 한다. Route는 urgency
 fingerprint 내부의 `station`, demand, stock dependency도 자신의 dependency와 다시
-비교한다.
+비교한다. 또한 두 fingerprint의 `rebalance_policy_config`가 byte-for-byte 같아야 한다.
+`route-v4-supply-led-pickup-sla`는 현행 `scoring_config_version`과 기본 재배치 정책의
+canonical config만 소비하며, 구버전 점수 또는 다른 정책 fingerprint는 fail-closed로
+거부한다. `rebalance_policy_config`에는 같은 pickup station을 plan 안에서 한 경로에만 쓰는
+exclusive 설정과 완료 후 재회수 cooldown을 포함한다.
+
+### v2 inference·urgency-v5 전환 규칙
+
+- 신규 inference producer는 `ml-inference-snapshot-manifest-v2`와 quantile 포함
+  13-column output만 게시한다.
+- Gold demand는 기존 `ml-inference-snapshot-manifest-v1`의 7-column output을
+  mean-only로 dual-read한다. 이때 quantile은 없는 값으로 유지하며
+  `poisson-mean`만 사용할 수 있다. `quantile-adverse`는 v1 lineage를 fail-closed한다.
+- 정상 realtime DAG는 같은 run의 새 urgency-v5 manifest를 route-v4에 직접 넘긴다.
+  이미 urgency-v1/v4가 끝난 과거 anchor를 route-v4로 재실행할 때는 route만 단독
+  재실행하지 않고, 같은 anchor의 urgency-v5를 먼저 다시 게시한 뒤 그 manifest로
+  route를 실행한다. 서로 다른 정책 fingerprint를 compatibility 명목으로 섞지 않는다.
+
+Pickup SLA provenance는 다음 네 parameter로 고정한다.
+
+- `pickup_dispatch_sla_config_version=pickup-dispatch-sla-v1`
+- `pickup_dispatch_assumed_speed_kmh=20.0`
+- `pickup_dispatch_service_minutes_per_stop=3.0`
+- `pickup_dispatch_max_lag_minutes=30.0`
+
+가장 긴급한 supply가 경로 ordinal과 첫 dropoff를 소유하고, pickup 후보는
+`center→pickup→supply` 총거리 순으로 고른다. 실제 pickup 방문은 센터부터 최근접 순서이며
+이동시간과 stop 작업시간을 합친 마지막 pickup 실행시각이 dispatch 뒤 30분 이하여야 한다.
+큰 split이 이를 위반하면 더 작은 pickup·dropoff 완결 route를 고르고, 단일 pickup도
+30분 밖이면 그 donor를 제외한다. 이 작업 단위는
+`route_work_unit_config_version=route-work-unit-v3-pickup-sla`와
+`gold-route-publisher-v3-pickup-sla`로 식별한다.
 
 ## Station 보조 문서
 

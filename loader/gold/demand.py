@@ -17,12 +17,16 @@ from core.gold_publication import (
     InputArtifact,
     Parameter,
     PreparedPublication,
+    PublicationManifest,
     VerifiedPublicationEvidence,
     build_id_set,
     parse_id_set,
+    parse_input_fingerprint,
     validate_id_set_parameter,
+    validate_input_fingerprint,
 )
 from core.inference_snapshot import (
+    INFERENCE_SNAPSHOT_MANIFEST_SCHEMA_VERSION,
     InferenceSnapshotManifest,
     InferenceSnapshotStatus,
     ModelManifestRef,
@@ -114,14 +118,20 @@ class DemandInferenceSnapshot:
 
 @dataclass(frozen=True, slots=True)
 class DemandPredictionRecord:
-    """Gold 변환 직전의 typed inference mean 예측 행을 표현한다."""
+    """Gold 변환 직전의 typed inference mean·quantile 예측 행을 표현한다."""
 
     base_dttm: datetime
     station_id: str
     horizon: int
     target_dttm: datetime
     rental_pred_mean: float
+    rental_pred_p10: float | None
+    rental_pred_p50: float | None
+    rental_pred_p90: float | None
     return_pred_mean: float
+    return_pred_p10: float | None
+    return_pred_p50: float | None
+    return_pred_p90: float | None
 
     def __post_init__(self) -> None:
         """source의 base·horizon·구간 시작시각·float64 계약을 검증한다."""
@@ -143,6 +153,23 @@ class DemandPredictionRecord:
             )
         _prediction_mean(self.rental_pred_mean, "rental_pred_mean")
         _prediction_mean(self.return_pred_mean, "return_pred_mean")
+        quantiles = (
+            (self.rental_pred_p10, "rental_pred_p10"),
+            (self.rental_pred_p50, "rental_pred_p50"),
+            (self.rental_pred_p90, "rental_pred_p90"),
+            (self.return_pred_p10, "return_pred_p10"),
+            (self.return_pred_p50, "return_pred_p50"),
+            (self.return_pred_p90, "return_pred_p90"),
+        )
+        missing_count = sum(value is None for value, _name in quantiles)
+        if missing_count not in {0, len(quantiles)}:
+            raise ContractViolation(
+                "inference quantile은 전부 존재하거나 전부 없어야 합니다."
+            )
+        for value, name in quantiles:
+            if value is None:
+                continue
+            _prediction_quantile(value, name)
 
 
 @dataclass(frozen=True, slots=True)
@@ -521,15 +548,18 @@ def demand_predictions_from_inference_parquet(
     *,
     expected_base_dttm: datetime,
     expected_sta_ids: tuple[str, ...],
+    schema_version: str = INFERENCE_SNAPSHOT_MANIFEST_SCHEMA_VERSION,
 ) -> tuple[DemandPredictionRecord, ...]:
-    """Core exact authority Parquet을 Gold typed prediction으로 변환한다."""
+    """Core v1/v2 authority Parquet을 Gold typed prediction으로 변환한다."""
     base = _utc_dttm(expected_base_dttm, "inference expected base_dttm")
     expected = build_id_set(_station_id_set(expected_sta_ids, "inference expected"))
     table = parse_inference_output_parquet(
         payload,
         logical_dttm=base,
         expected_sta_ids=expected,
+        schema_version=schema_version,
     )
+    has_quantiles = "rental_pred_p10" in table.column_names
     return tuple(
         DemandPredictionRecord(
             base_dttm=base,
@@ -541,10 +571,51 @@ def demand_predictions_from_inference_parquet(
                 "inference target",
             ),
             rental_pred_mean=row["rental_pred_mean"],
+            rental_pred_p10=row["rental_pred_p10"] if has_quantiles else None,
+            rental_pred_p50=row["rental_pred_p50"] if has_quantiles else None,
+            rental_pred_p90=row["rental_pred_p90"] if has_quantiles else None,
             return_pred_mean=row["return_pred_mean"],
+            return_pred_p10=row["return_pred_p10"] if has_quantiles else None,
+            return_pred_p50=row["return_pred_p50"] if has_quantiles else None,
+            return_pred_p90=row["return_pred_p90"] if has_quantiles else None,
         )
         for row in table.to_pylist()
     )
+
+
+def demand_predictions_from_publication_lineage(
+    object_store: ImmutableObjectStore,
+    demand_manifest: PublicationManifest,
+) -> tuple[DemandPredictionRecord, ...]:
+    """Demand fingerprint가 pin한 immutable inference quantile 행을 읽는다."""
+    fingerprint_payload = object_store.read_bytes(
+        demand_manifest.input_fingerprint_uri,
+        demand_manifest.input_fingerprint_sha256,
+        require_canonical_json=True,
+    )
+    fingerprint = parse_input_fingerprint(
+        fingerprint_payload,
+        "station_demand_forecast",
+    )
+    validate_input_fingerprint("station_demand_forecast", fingerprint)
+    matches = tuple(
+        artifact
+        for artifact in fingerprint.input_artifacts
+        if artifact.role == "inference_output"
+    )
+    if len(matches) != 1:
+        raise ContractViolation(
+            "demand lineage에는 inference_output manifest가 정확히 하나여야 합니다."
+        )
+    inference = matches[0]
+    snapshot = _read_inference_snapshot(
+        object_store,
+        inference_manifest_uri=inference.uri,
+        inference_manifest_sha256=inference.byte_sha256,
+    )
+    if snapshot.manifest.logical_dttm != demand_manifest.logical_dttm:
+        raise ContractViolation("demand와 inference lineage anchor가 다릅니다.")
+    return snapshot.predictions
 
 
 def _read_inference_snapshot(
@@ -673,6 +744,7 @@ def _build_inference_snapshot(
             output_payload,
             expected_base_dttm=manifest.logical_dttm,
             expected_sta_ids=expected_ids,
+            schema_version=manifest.schema_version,
         )
     if len(predictions) != manifest.counts.actual_row_count:
         raise ContractViolation(
@@ -759,9 +831,7 @@ def _projection_from_snapshot(
         expected_station_ids=expected_sta_ids,
     )
     if projection.expected_sta_ids != snapshot.expected_sta_ids:
-        raise ContractViolation(
-            "inference expected ID set이 plan expected와 다릅니다."
-        )
+        raise ContractViolation("inference expected ID set이 plan expected와 다릅니다.")
     return projection
 
 
@@ -1010,6 +1080,13 @@ def _prediction_mean(value: object, name: str) -> float:
     """inference mean을 finite·비음수 Python float64로 검증한다."""
     if type(value) is not float or not math.isfinite(value) or value < 0.0:
         raise ContractViolation(f"{name}은 finite·비음수 float64여야 합니다.")
+    return value
+
+
+def _prediction_quantile(value: object, name: str) -> float:
+    """Inference quantile을 보정하지 않고 finite Python float64로 검증한다."""
+    if type(value) is not float or not math.isfinite(value):
+        raise ContractViolation(f"{name}은 finite float64여야 합니다.")
     return value
 
 
