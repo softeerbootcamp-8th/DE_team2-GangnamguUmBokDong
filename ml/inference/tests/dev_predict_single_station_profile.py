@@ -303,6 +303,23 @@ def test_build_station_profile_arrays_rejects_duplicate_logical_key(monkeypatch)
         ps._build_station_profile_arrays(df)
 
 
+@pytest.mark.parametrize("column", ["rental_mean", "return_mean"])
+def test_build_station_profile_arrays_rejects_non_numeric_stat(column):
+    """비수치 profile 통계는 NaN으로 숨기지 않고 artifact 계약 오류로 실패한다."""
+    row = {
+        "station_no": 5,
+        "minute": 0,
+        "dow": 0,
+        "month": 1,
+        "rental_mean": 1.0,
+        "return_mean": 2.0,
+    }
+    row[column] = "broken"
+
+    with pytest.raises(ValueError):
+        ps._build_station_profile_arrays(_profile_df([row]))
+
+
 def test_build_station_profile_arrays_uses_compact_dense_shape_not_per_combo_dict():
     """station 축은 실제로 등장한 station_no 개수만큼만 잡아야 한다(예: 정류소가
     2개뿐인데 station_no 값 자체는 1과 9000처럼 멀리 떨어져 있어도 배열 크기가

@@ -35,7 +35,12 @@ def test_reads_from_normalized_source_id_not_raw(monkeypatch):
         requested_keys.append(key)
         return None
 
+    def _fake_read_many(keys, columns=None):
+        requested_keys.extend(keys)
+        return [None] * len(keys)
+
     monkeypatch.setattr(ps.s3_io, "read_parquet", _fake_read)
+    monkeypatch.setattr(ps.s3_io, "read_parquet_many", _fake_read_many)
 
     ps._get_recent_population(pd.Timestamp("2026-08-17 10:00:00"))
 
@@ -55,7 +60,11 @@ def test_returns_target_tick_value_when_present(monkeypatch):
         assert key == exact_key
         return _normalized_row("다사00000000", 1234.0)
 
+    def _unexpected_read_many(keys, columns=None):
+        raise AssertionError("정확한 최신 tick이 있으면 과거 key를 읽으면 안 됨")
+
     monkeypatch.setattr(ps.s3_io, "read_parquet", _fake_read)
+    monkeypatch.setattr(ps.s3_io, "read_parquet_many", _unexpected_read_many)
 
     result = ps._get_recent_population(target_ts)
 
@@ -67,24 +76,38 @@ def test_falls_back_to_earlier_tick_when_exact_tick_missing(monkeypatch):
     """직접 호출·미래 예보 누락이면 제한된 lookback 안의 최근 값을 대신 쓴다."""
     target_ts = pd.Timestamp("2026-08-17 10:00:00")
 
-    requested_keys = []
+    requested_latest_keys = []
+    requested_fallback_keys = []
 
     def _fake_read(key, columns=None):
-        requested_keys.append(key)
-        if key.endswith("/0955.parquet"):
-            return _normalized_row("다사00000000", 500.0)
+        requested_latest_keys.append(key)
         return None
 
+    def _fake_read_many(keys, columns=None):
+        requested_fallback_keys.extend(keys)
+        values = [None] * len(keys)
+        values[-1] = _normalized_row("다사00000000", 500.0)
+        return values
+
     monkeypatch.setattr(ps.s3_io, "read_parquet", _fake_read)
+    monkeypatch.setattr(ps.s3_io, "read_parquet_many", _fake_read_many)
 
     result = ps._get_recent_population(target_ts)
 
     assert result.loc["다사00000000", "pop_total"] == 500.0
-    assert len(requested_keys) == 2
+    assert len(requested_latest_keys) == 1
+    assert requested_latest_keys[0].endswith("/1000.parquet")
+    assert len(requested_fallback_keys) == 12
+    assert requested_fallback_keys[-1].endswith("/0955.parquet")
 
 
 def test_returns_empty_dataframe_when_nothing_in_lookback_window(monkeypatch):
     monkeypatch.setattr(ps.s3_io, "read_parquet", lambda key, columns=None: None)
+    monkeypatch.setattr(
+        ps.s3_io,
+        "read_parquet_many",
+        lambda keys, columns=None: [None] * len(keys),
+    )
 
     result = ps._get_recent_population(pd.Timestamp("2026-08-17 10:00:00"))
 

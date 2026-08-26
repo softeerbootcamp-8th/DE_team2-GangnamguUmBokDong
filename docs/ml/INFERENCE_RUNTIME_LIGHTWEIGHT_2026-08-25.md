@@ -9,8 +9,9 @@ LightGBM artifact, 예측 수식, 결과 스키마, archive와 serving pointer�
 - station profile은 실제로 읽은 `(month, dow)` 조합별 배열만 만든다.
 - fallback에서 참조하지 않는 `rental_std`와 `return_std`는 Parquet에서 읽거나
   runtime 배열에 보관하지 않는다. 원본 profile artifact의 스키마와 파일은 유지한다.
-- 생활인구는 최근 1시간의 13개 5분 Parquet를 모두 읽은 뒤 하나를 고르지 않고,
-  최신 key부터 읽어 첫 유효 tick에서 멈춘다.
+- 생활인구는 최신 5분 Parquet를 먼저 확인하고, 정확한 tick이 있으면 과거 12개를
+  읽지 않는다. 최신 tick이 없으면 나머지는 병렬로 읽어 결측 구간의 직렬 S3 왕복을
+  피하면서 최근 1시간 안의 첫 유효 tick을 고른다.
 
 Q/X/Y 모델, full-year probe, policy replay 확대, 1h lag snapshot, quantile 변경,
 정적 피처, 재학습과 EMR 검증은 이 변경에 포함하지 않는다.
@@ -28,9 +29,9 @@ Q/X/Y 모델, full-year probe, policy replay 확대, 1h lag snapshot, quantile �
 ```
 
 생활인구는 기존과 같이 `[T-60분, T]`에서 가장 최근의 비어 있지 않은 normalized
-tick을 선택한다. 정확한 T가 있으면 GET은 `13회 → 1회`, 바로 전 tick만 있으면
-`13회 → 2회`, 모두 없으면 기존과 같은 최대 13회다. 캐시 key와 fallback 결과는
-바뀌지 않는다.
+tick을 선택한다. 정확한 T가 있으면 GET은 `13회 → 1회`다. T가 없으면 T를 한 번
+확인한 뒤 나머지 12개를 기존처럼 병렬 조회하므로 GET은 최대 13회지만 결측마다
+S3 왕복이 직렬로 누적되지 않는다. 캐시 key와 fallback 결과는 바뀌지 않는다.
 
 ## 격리 실측
 
@@ -41,15 +42,17 @@ station profile read·배열 구성·전체 행 lookup 검증 구간이다.
 | 항목 | 기존 `develop` | 변경 | 차이 |
 |---|---:|---:|---:|
 | 선택 Parquet 컬럼 | 8 | 6 | std 2개 제외 |
-| 선택 컬럼 compressed bytes 합 | 70,901,285B | 33,223,898B | -53.1% |
+| 선택 컬럼 decode 대상 compressed bytes 합 | 70,901,285B | 33,223,898B | -53.1% |
 | 필터 후 DataFrame 메모리 | 4,288,020B | 2,728,788B | -36.4% |
 | runtime profile 배열 | 261,950,976B | 1,559,232B | -99.4% |
 | 배열 구성 | 0.2325초 | 0.0249초 | -89.3% |
 | 검증 구간 wall | 0.3524초 | 0.0997초 | -71.7% |
 | 프로세스 peak RSS | 643.5MiB | 424.3MiB | -34.1% |
 
-Parquet compressed bytes는 실제 파일 metadata에서 선택 컬럼 chunk의 크기를 합산한
-값이다. 네트워크 요청의 HTTP framing이나 S3 SDK buffer는 포함하지 않는다. RSS는
+Parquet compressed bytes는 실제 파일 metadata에서 decoder가 선택한 컬럼 chunk의
+크기를 합산한 값이다. 현재 `core.s3.read_parquet()`은 객체 전체를 먼저 받은 뒤
+column projection을 적용하므로 S3 GET 전송량과 authority snapshot payload 크기는
+줄지 않는다. 이 수치는 decode 대상과 최종 DataFrame 메모리 감소의 근거다. RSS는
 Python import와 Parquet decode까지 포함하며, 전체 inference 동시 실행의 peak를
 뜻하지 않는다.
 

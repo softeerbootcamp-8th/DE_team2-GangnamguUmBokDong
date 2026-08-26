@@ -852,7 +852,7 @@ def _build_station_profile_arrays(
     raises:
         ValueError: profile key 차원 값이 범위를 벗어나거나 minute이 활성 모델
             grid에 맞지 않거나 logical key가 중복되어 dense 배열 한 칸을 여러
-            행이 덮어쓸 수 있을 때
+            행이 덮어쓸 수 있거나 통계값이 숫자가 아닐 때
     """
     logical_key = ["station_no", "minute", "dow", "month"]
     station_no_values = pd.to_numeric(df["station_no"], errors="coerce")
@@ -912,26 +912,37 @@ def _build_station_profile_arrays(
 
     station_idx = station_no_values.map(station_index).to_numpy()
     minute_idx = minute_values.to_numpy(dtype="int64") // config.GRID_TICK_MINUTES
-    dow_array = dow_values.to_numpy(dtype="int64")
-    month_array = month_values.to_numpy(dtype="int64")
+    dow_array = dow_values.to_numpy(dtype="int16")
+    month_array = month_values.to_numpy(dtype="int16")
     stat_arrays = {
-        col: pd.to_numeric(df[col], errors="coerce").to_numpy(dtype="float32")
+        col: pd.to_numeric(df[col], errors="raise").to_numpy(dtype="float32")
         for col in _STATION_PROFILE_STAT_COLS
     }
-    values: dict[tuple[int, int], np.ndarray] = {}
-    calendar_pairs = sorted(set(zip(month_array.tolist(), dow_array.tolist())))
-    for month, dow in calendar_pairs:
-        mask = (month_array == month) & (dow_array == dow)
-        calendar_values = np.full(
-            (len(station_nos), n_minute_buckets, len(_STATION_PROFILE_STAT_COLS)),
-            np.nan,
-            dtype="float32",
-        )
-        for stat_idx, col in enumerate(_STATION_PROFILE_STAT_COLS):
-            calendar_values[station_idx[mask], minute_idx[mask], stat_idx] = (
-                stat_arrays[col][mask]
-            )
-        values[(month, dow)] = calendar_values
+    calendar_codes = month_array * 7 + dow_array
+    unique_calendar_codes = np.unique(calendar_codes)
+    calendar_slot_by_code = np.full(91, -1, dtype="int16")
+    calendar_slot_by_code[unique_calendar_codes] = np.arange(
+        len(unique_calendar_codes), dtype="int16"
+    )
+    calendar_idx = calendar_slot_by_code[calendar_codes]
+    calendar_values = np.full(
+        (
+            len(unique_calendar_codes),
+            len(station_nos),
+            n_minute_buckets,
+            len(_STATION_PROFILE_STAT_COLS),
+        ),
+        np.nan,
+        dtype="float32",
+    )
+    for stat_idx, col in enumerate(_STATION_PROFILE_STAT_COLS):
+        calendar_values[calendar_idx, station_idx, minute_idx, stat_idx] = stat_arrays[
+            col
+        ]
+    values = {
+        (int(code) // 7, int(code) % 7): calendar_values[slot]
+        for slot, code in enumerate(unique_calendar_codes)
+    }
 
     return station_index, values
 
@@ -1251,10 +1262,10 @@ def _get_recent_population(
     정답 라벨(피처마트)은 사후 보정 없는 실측 그대로여야 학습-서빙 간 값의 의미가
     갈리지 않는다.
 
-    `weather_ultra_short_live`/`bike_station_realtime`과 같은 5분 tick 소스라
-    `_get_recent_weather()`/`_get_recent_bike_status()`와 동일한 패턴을 쓴다 —
+    `weather_ultra_short_live`/`bike_station_realtime`과 같은 5분 tick 소스와 동일하게
     target_ts를 5분 단위로 내림한 키가 있으면 그걸, 없으면(직접 호출·수동 재실행
     또는 미래 예보 일부 누락) 거슬러 올라가 최대 1시간 안의 최근 값을 대신 쓴다.
+    조회는 최신 key 하나를 먼저 확인하고, 없으면 나머지 key를 병렬로 읽는다.
     운영 DAG의 현재 tick은 normalizer 성공이 필수라 이 조회가 task 실패를 우회하지
     않는다. 원본과 달리 시각이 이미 S3 키
     경로(dt=/hh=/HHMM)에 있어 파일 내용에 YMD/TT 컬럼이 없다 — 그래서 원본처럼
@@ -1281,11 +1292,15 @@ def _get_recent_population(
 
     keys = silver_schema.population_normalized_tick_keys(target_ts, lookback_hours)
     result = pd.DataFrame(columns=["pop_total"])
-    # 정확한 tick이 정상적으로 존재하는 운영 경로에서 과거 1시간치 13개 파일을
-    # 전부 메모리에 올렸다가 12개를 버리지 않는다. 최신 key부터 하나씩 읽고 첫
-    # 성공에서 멈추면 정상 tick은 GET 1회, 결측 tick만 필요한 만큼 거슬러 간다.
-    for key in reversed(keys):
-        df = s3_io.read_parquet(key)
+    # 정상 tick은 최신 key 하나만 읽는다. 최신 key가 비었을 때는 나머지를 병렬로
+    # 읽어 결측 구간의 S3 왕복이 직렬로 누적되지 않게 하면서 가장 최근 값을 고른다.
+    latest = s3_io.read_parquet(keys[-1])
+    candidates = (
+        [latest]
+        if latest is not None and not latest.empty
+        else reversed(s3_io.read_parquet_many(keys[:-1]))
+    )
+    for df in candidates:
         if df is not None and not df.empty:
             df = df.rename(columns=silver_schema.POPULATION_COLUMN_MAP)
             result = df.set_index("grid_id")[["pop_total"]]
