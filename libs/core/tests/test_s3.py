@@ -389,13 +389,22 @@ def test_delete_objects(n):
 
 
 class _CapturingBoto3:
-    """`boto3.client()`에 실제로 넘어간 kwargs를 잡아두는 스텁."""
+    """`boto3.Session().client()`에 넘어간 설정과 생성 횟수를 잡는 스텁."""
 
     def __init__(self):
+        """Session namespace를 겸하는 빈 capture를 만든다."""
+        self.session = self
+        self.session_kwargs: dict | None = None
         self.kwargs: dict | None = None
         self.calls = 0
 
+    def Session(self, **kwargs):
+        """Session 설정을 기록하고 client factory 역할을 할 자신을 반환한다."""
+        self.session_kwargs = kwargs
+        return self
+
     def client(self, service_name, **kwargs):
+        """Client 설정과 호출 수를 기록하고 새 identity 객체를 반환한다."""
         self.calls += 1
         self.kwargs = kwargs
         return object()
@@ -427,10 +436,105 @@ def test_client_cache_separates_timeout_policy(monkeypatch):
     assert fake.calls == 2
 
 
+@pytest.mark.parametrize(
+    ("name", "first", "second"),
+    [
+        ("AWS_DEFAULT_REGION", "us-east-1", "ap-northeast-2"),
+        ("AWS_PROFILE", "first-profile", "second-profile"),
+        ("AWS_ACCESS_KEY_ID", "first-key", "second-key"),
+        ("AWS_SECRET_ACCESS_KEY", "first-secret", "second-secret"),
+        ("AWS_SESSION_TOKEN", "first-token", "second-token"),
+    ],
+)
+def test_client_cache_separates_effective_environment(
+    monkeypatch, name, first, second
+):
+    """Region/profile/credential 설정이 바뀌면 기존 client를 재사용하지 않는다."""
+    fake = _CapturingBoto3()
+    monkeypatch.setattr(s3, "boto3", fake)
+    monkeypatch.delenv("S3_ENDPOINT_URL", raising=False)
+    monkeypatch.setenv(name, first)
+
+    original = s3._client()
+    monkeypatch.setenv(name, second)
+    changed = s3._client()
+
+    assert original is not changed
+    assert fake.calls == 2
+
+
+def test_client_uses_worker_sized_connection_pool(monkeypatch):
+    """16개 read worker가 botocore 기본 pool 10개에 막히지 않게 맞춘다."""
+    fake = _CapturingBoto3()
+    monkeypatch.setattr(s3, "boto3", fake)
+    monkeypatch.delenv("S3_ENDPOINT_URL", raising=False)
+
+    s3._client()
+
+    assert fake.kwargs["config"].max_pool_connections == 16
+
+
+def test_client_applies_region_and_profile_to_session(monkeypatch):
+    """명시한 profile/region은 새 boto3 Session의 실제 설정으로 전달한다."""
+    fake = _CapturingBoto3()
+    monkeypatch.setattr(s3, "boto3", fake)
+    monkeypatch.delenv("S3_ENDPOINT_URL", raising=False)
+    monkeypatch.setenv("AWS_PROFILE", "serving-profile")
+    monkeypatch.setenv("AWS_DEFAULT_REGION", "ap-northeast-2")
+
+    s3._client()
+
+    assert fake.session_kwargs == {
+        "profile_name": "serving-profile",
+        "region_name": "ap-northeast-2",
+    }
+
+
+def test_clear_client_cache_closes_every_client(monkeypatch):
+    """Cache clear가 분리된 timeout client들의 HTTP pool을 모두 닫는다."""
+
+    class _ClosableClient:
+        """close 호출 여부만 기록하는 가짜 S3 client다."""
+
+        def __init__(self):
+            """열린 상태의 client를 만든다."""
+            self.close_calls = 0
+
+        def close(self):
+            """Connection pool close 호출을 기록한다."""
+            self.close_calls += 1
+
+    class _ClosableBoto3(_CapturingBoto3):
+        """호출마다 닫을 수 있는 client를 생성하는 capture다."""
+
+        def __init__(self):
+            """생성 client 목록을 함께 초기화한다."""
+            super().__init__()
+            self.clients = []
+
+        def client(self, service_name, **kwargs):
+            """새 closable client와 설정을 기록한다."""
+            self.calls += 1
+            self.kwargs = kwargs
+            client = _ClosableClient()
+            self.clients.append(client)
+            return client
+
+    fake = _ClosableBoto3()
+    monkeypatch.setattr(s3, "boto3", fake)
+    monkeypatch.delenv("S3_ENDPOINT_URL", raising=False)
+    s3._client()
+    s3._client(0.5)
+
+    s3._clear_client_cache()
+
+    assert [client.close_calls for client in fake.clients] == [1, 1]
+
+
 @pytest.mark.parametrize("endpoint", [None, ""])
 def test_client_without_endpoint_delegates_credentials_to_boto3_chain(monkeypatch, endpoint):
-    # 자격증명을 명시적으로 넘기면 boto3가 EC2 instance profile / EMR 실행 역할을 아예
-    # 조회하지 않는다 — 운영에서 전부 403이 되므로 인자 자체가 없어야 한다.
+    # 환경 credential이 없을 때 자격증명을 명시적으로 넘기면 boto3가 EC2 instance
+    # profile / EMR 실행 역할을 조회하지 않는다 — 운영 경로에는 인자가 없어야 한다.
     # 운영 compose는 S3_ENDPOINT_URL을 빈 문자열로 두므로 ""도 "없음"으로 취급해야 한다.
     fake = _CapturingBoto3()
     monkeypatch.setattr(s3, "boto3", fake)
@@ -438,6 +542,9 @@ def test_client_without_endpoint_delegates_credentials_to_boto3_chain(monkeypatc
         monkeypatch.delenv("S3_ENDPOINT_URL", raising=False)
     else:
         monkeypatch.setenv("S3_ENDPOINT_URL", endpoint)
+    monkeypatch.delenv("AWS_ACCESS_KEY_ID", raising=False)
+    monkeypatch.delenv("AWS_SECRET_ACCESS_KEY", raising=False)
+    monkeypatch.delenv("AWS_SESSION_TOKEN", raising=False)
 
     s3._client()
 
@@ -453,12 +560,14 @@ def test_client_with_endpoint_passes_explicit_credentials(monkeypatch):
     monkeypatch.setenv("S3_ENDPOINT_URL", "http://minio:9000")
     monkeypatch.setenv("AWS_ACCESS_KEY_ID", "local-key")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "local-secret")
+    monkeypatch.setenv("AWS_SESSION_TOKEN", "local-token")
 
     s3._client()
 
     assert fake.kwargs["endpoint_url"] == "http://minio:9000"
     assert fake.kwargs["aws_access_key_id"] == "local-key"
     assert fake.kwargs["aws_secret_access_key"] == "local-secret"
+    assert fake.kwargs["aws_session_token"] == "local-token"
 
 
 def test_client_with_endpoint_falls_back_to_minioadmin(monkeypatch):

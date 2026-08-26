@@ -80,6 +80,30 @@ _ACTIVE_READ_CAPTURE: ContextVar[S3ReadCapture | None] = ContextVar(
 )
 _CLIENT_CACHE_LOCK = threading.Lock()
 _CLIENT_CACHE: dict[tuple[object, ...], Any] = {}
+_S3_MAX_WORKERS = 16
+_CLIENT_IDENTITY_ENV_NAMES = (
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_SECURITY_TOKEN",
+    "AWS_REGION",
+    "AWS_DEFAULT_REGION",
+    "AWS_PROFILE",
+    "AWS_DEFAULT_PROFILE",
+    "AWS_SHARED_CREDENTIALS_FILE",
+    "AWS_CONFIG_FILE",
+    "AWS_ROLE_ARN",
+    "AWS_ROLE_SESSION_NAME",
+    "AWS_WEB_IDENTITY_TOKEN_FILE",
+    "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+    "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+    "AWS_EC2_METADATA_DISABLED",
+    "AWS_ENDPOINT_URL",
+    "AWS_ENDPOINT_URL_S3",
+    "AWS_CA_BUNDLE",
+    "AWS_RETRY_MODE",
+    "AWS_MAX_ATTEMPTS",
+)
 
 
 @contextmanager
@@ -205,9 +229,10 @@ def _client(timeout_seconds: float | None = None):
     """S3 호환 클라이언트를 process-local로 생성해 재사용한다.
 
     `S3_ENDPOINT_URL`이 있으면 MinIO 등 S3 호환 스토리지로 보고 환경변수의 자격증명을
-    명시적으로 넘긴다(로컬 개발 경로 — 기존 동작 그대로). 없으면 실제 AWS S3로 보고
-    자격증명을 boto3 credential chain에 맡긴다: 자격증명 인자를 명시하면 boto3가 EC2
-    instance profile이나 EMR 실행 역할을 **아예 조회하지 않아** 운영에서 전부 403이 된다.
+    명시적으로 넘긴다(로컬 개발 경로 — 기존 동작 그대로). 없으면 실제 AWS S3로 보고,
+    환경 credential이 이미 명시된 경우에만 그 exact access/secret/token을 client에
+    고정한다. 환경 credential이 없으면 boto3 credential chain에 맡겨 EC2 instance
+    profile이나 web identity 같은 refreshable provider를 그대로 사용한다.
 
     args:
         timeout_seconds: 지정하면 connect/read timeout을 이 값으로 두고 재시도를
@@ -218,50 +243,87 @@ def _client(timeout_seconds: float | None = None):
             맞아 기본값을 안 바꾼다.
     """
     endpoint_url = os.environ.get("S3_ENDPOINT_URL") or None
-    access_key = (
-        os.environ.get("AWS_ACCESS_KEY_ID", "minioadmin") if endpoint_url else None
+    access_key = os.environ.get("AWS_ACCESS_KEY_ID", "minioadmin")
+    secret_key = os.environ.get("AWS_SECRET_ACCESS_KEY", "minioadmin")
+    session_token = os.environ.get("AWS_SESSION_TOKEN") or os.environ.get(
+        "AWS_SECURITY_TOKEN"
     )
-    secret_key = (
-        os.environ.get("AWS_SECRET_ACCESS_KEY", "minioadmin") if endpoint_url else None
+    client_environment = tuple(
+        (name, os.environ.get(name)) for name in _CLIENT_IDENTITY_ENV_NAMES
     )
     cache_key = (
         os.getpid(),
-        id(boto3),
         endpoint_url,
-        access_key,
-        secret_key,
         timeout_seconds,
+        client_environment,
     )
     with _CLIENT_CACHE_LOCK:
         cached = _CLIENT_CACHE.get(cache_key)
         if cached is not None:
             return cached
 
-        config = None
+        config_kwargs: dict[str, Any] = {
+            "max_pool_connections": _S3_MAX_WORKERS,
+        }
         if timeout_seconds is not None:
-            config = BotoConfig(
+            config_kwargs.update(
                 connect_timeout=timeout_seconds,
                 read_timeout=timeout_seconds,
                 retries={"max_attempts": 1},
             )
+        config = BotoConfig(**config_kwargs)
+        profile_name = (
+            os.environ.get("AWS_PROFILE")
+            or os.environ.get("AWS_DEFAULT_PROFILE")
+            or None
+        )
+        region_name = (
+            os.environ.get("AWS_REGION")
+            or os.environ.get("AWS_DEFAULT_REGION")
+            or None
+        )
+        client_factory = boto3
+        client_kwargs: dict[str, Any] = {"config": config}
+        if profile_name is not None:
+            client_factory = boto3.session.Session(
+                profile_name=profile_name,
+                region_name=region_name,
+            )
+        elif region_name is not None:
+            client_kwargs["region_name"] = region_name
         if endpoint_url:
-            client = boto3.client(
-                "s3",
+            client_kwargs.update(
                 endpoint_url=endpoint_url,
                 aws_access_key_id=access_key,
                 aws_secret_access_key=secret_key,
-                config=config,
+                aws_session_token=session_token,
             )
-        else:
-            client = boto3.client("s3", config=config)
+        elif os.environ.get("AWS_ACCESS_KEY_ID") and os.environ.get(
+            "AWS_SECRET_ACCESS_KEY"
+        ):
+            # 명시적인 환경 credential은 client 설정에 고정해야 같은 process에서
+            # 값이 바뀌어도 boto3 default session의 옛 credential을 재사용하지 않는다.
+            # 환경 credential이 없으면 이 kwargs들을 생략해 instance role/web
+            # identity 같은 refreshable provider를 credential chain에 그대로 맡긴다.
+            client_kwargs.update(
+                aws_access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
+                aws_secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
+                aws_session_token=session_token,
+            )
+        client = client_factory.client("s3", **client_kwargs)
         _CLIENT_CACHE[cache_key] = client
         return client
 
 
 def _clear_client_cache() -> None:
-    """테스트가 격리된 mock/backend마다 새 client를 만들도록 cache를 비운다."""
+    """Cache를 비우고 분리한 client의 HTTP connection pool을 닫는다."""
     with _CLIENT_CACHE_LOCK:
+        clients = list(_CLIENT_CACHE.values())
         _CLIENT_CACHE.clear()
+    for client in clients:
+        close = getattr(client, "close", None)
+        if callable(close):
+            close()
 
 
 def _bucket() -> str:
@@ -491,7 +553,7 @@ def _read_parquet_by_dates(
     # 내려받고, 그게 끝나야 다음 날짜 LIST를 시작"하는 계단식 패턴이면 학습처럼
     # 몇 달치를 한 번에 읽을 때 그 사이 대기 시간이 그대로 쌓인다 — LIST 자체는
     # 가벼운 호출이라 read_parquet_many()와 같은 동시성으로 먼저 다 끝내둔다.
-    with ThreadPoolExecutor(max_workers=16) as pool:
+    with ThreadPoolExecutor(max_workers=_S3_MAX_WORKERS) as pool:
         keys_by_date = list(
             pool.map(
                 lambda date_str: sorted(k for k in list_keys(f"{prefix}date={date_str}/") if k.endswith(".parquet")),
@@ -547,7 +609,7 @@ def _read_parquet_by_dates(
 def read_parquet_many(
     keys: list[str],
     columns: list[str] | None = None,
-    max_workers: int = 16,
+    max_workers: int = _S3_MAX_WORKERS,
     as_pandas: bool = True,
     filters: list[tuple] | None = None,
     on_complete: Callable[[int, int], None] | None = None,
