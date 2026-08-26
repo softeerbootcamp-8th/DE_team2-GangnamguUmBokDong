@@ -16,6 +16,7 @@ import psycopg
 import pytest
 from core.gold_publication import (
     ContractViolation,
+    InputArtifact,
     PublicationOutcome,
     S3ImmutableObjectStore,
     build_id_set,
@@ -50,7 +51,7 @@ from gold import serving_plan as serving_module
 from gold.demand import HORIZON_COUNT
 from gold.serving_plan import (
     SourceLookbacks,
-    prepare_serving_plan,
+    prepare_serving_plan as _prepare_serving_plan,
     publish_serving_plan,
 )
 from gold.source_catalog import S3SourceSnapshotCatalog, SourceManifestArtifact
@@ -81,6 +82,34 @@ _LOOKBACKS = SourceLookbacks(
     ultra_short=timedelta(hours=6),
 )
 _EFFECTIVE_CONTRACT_VERSION = f"sha256:{'e' * 64}"
+_RELEASE_SHA = "a" * 64
+_ENRICHED_MASTER_SHA = "9" * 64
+
+
+def _shared_plan_identities() -> dict[str, object]:
+    """Integration plan과 inference가 공유할 exact identity fixture를 만든다."""
+    return {
+        "serving_release": ServingReleaseRef(
+            byte_sha256=_RELEASE_SHA,
+            effective_contract_version=_EFFECTIVE_CONTRACT_VERSION,
+            release_version=f"sha256:{_RELEASE_SHA}",
+            uri=_uri("serving-release", _RELEASE_SHA, "json"),
+        ),
+        "station_master_enriched": InputArtifact(
+            byte_sha256=_ENRICHED_MASTER_SHA,
+            role="station_master_enriched",
+            uri=(
+                f"s3://{_BUCKET}/silver/station_master_enriched/"
+                "dt=2026-08-20/hh=00/0005.parquet"
+            ),
+        ),
+    }
+
+
+def prepare_serving_plan(*args: Any, **kwargs: Any) -> Any:
+    """모든 integration plan writer에 v3 shared identity를 공통 주입한다."""
+    kwargs.update(_shared_plan_identities())
+    return _prepare_serving_plan(*args, **kwargs)
 
 
 class _DriftingInferenceCatalog(InMemoryInferenceRevisionCatalog):
@@ -1383,14 +1412,9 @@ def _put_inference(
 ) -> tuple[str, str]:
     """Plan dependency·expected ref를 그대로 쓰는 success/EMPTY inference를 저장한다."""
     expected_ids = parse_expected_ids(store, plan.expected_sta_ids)
-    release_bytes = b'{"release":"serving-plan-integration-v1"}'
-    release_sha = sha256_hex(release_bytes)
-    release_ref = ServingReleaseRef(
-        byte_sha256=release_sha,
-        effective_contract_version=_EFFECTIVE_CONTRACT_VERSION,
-        release_version=f"sha256:{release_sha}",
-        uri=_uri("serving-release", release_sha, "json"),
-    )
+    assert plan.plan.serving_release is not None
+    assert plan.plan.station_master_enriched is not None
+    release_ref = plan.plan.serving_release
     if expected_ids:
         output_bytes = _inference_output_bytes(
             plan.plan.logical_dttm,
@@ -1411,6 +1435,15 @@ def _put_inference(
                 byte_sha256="1" * 64,
                 role="feature_snapshot",
                 uri=_uri("inference/input", "1" * 64, "parquet"),
+            ),
+            ImmutableInputRef(
+                byte_sha256=plan.plan.station_master_enriched.byte_sha256,
+                role="station_master_enriched",
+                uri=_uri(
+                    "inference/input/station-master-enriched",
+                    plan.plan.station_master_enriched.byte_sha256,
+                    "parquet",
+                ),
             ),
         )
     else:

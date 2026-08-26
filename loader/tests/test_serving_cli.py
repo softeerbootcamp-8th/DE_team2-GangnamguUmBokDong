@@ -68,13 +68,15 @@ def test_inference_eligibility_excludes_known_master_quality_errors() -> None:
             """Fixture parquet body를 반환한다."""
             return {"Body": _Body()}
 
-    eligible, excluded = serving_cli._load_inference_eligible_station_ids(
+    eligible, excluded, reference = serving_cli._load_inference_eligible_station_ids(
         _Client(), "fixture"
     )
 
     assert eligible == ("ST-1",)
     assert excluded[0][0] == "ST-2"
     assert "grid_id 값이 유효하지 않음" in excluded[0][1]
+    assert reference.role == "station_master_enriched"
+    assert reference.byte_sha256 == serving_cli.sha256_hex(sink.getvalue())
 
 
 def test_prepare_pins_support_refs_with_same_client_and_bucket(monkeypatch) -> None:
@@ -106,7 +108,21 @@ def test_prepare_pins_support_refs_with_same_client_and_bucket(monkeypatch) -> N
     pinned = SimpleNamespace(
         rental_model=SimpleNamespace(support_sta_ids=rental_ref),
         return_model=SimpleNamespace(support_sta_ids=return_ref),
+        pointer=SimpleNamespace(
+            release_manifest_byte_sha256="a" * 64,
+            release_manifest_uri=(
+                "s3://fixture/models/serving-release/manifests/"
+                + "sha256="
+                + "a" * 64
+                + ".json"
+            ),
+        ),
+        manifest=SimpleNamespace(
+            effective_contract=SimpleNamespace(version=f"sha256:{'b' * 64}"),
+            release_version=f"sha256:{'c' * 64}",
+        ),
     )
+    enriched_ref = object()
     captured = {}
 
     def load_current(*, object_store, pointer_store):
@@ -140,7 +156,7 @@ def test_prepare_pins_support_refs_with_same_client_and_bucket(monkeypatch) -> N
     monkeypatch.setattr(
         serving_cli,
         "_load_inference_eligible_station_ids",
-        lambda _client, _bucket: (("ST-1",), ()),
+        lambda _client, _bucket: (("ST-1",), (), enriched_ref),
     )
     monkeypatch.setattr(serving_cli, "prepare_serving_plan", prepare_plan)
     monkeypatch.setattr(
@@ -163,6 +179,8 @@ def test_prepare_pins_support_refs_with_same_client_and_bucket(monkeypatch) -> N
     assert captured["rental_support_sta_ids"] is rental_ref
     assert captured["return_support_sta_ids"] is return_ref
     assert captured["inference_eligible_sta_ids"] == ("ST-1",)
+    assert captured["station_master_enriched"] is enriched_ref
+    assert captured["serving_release"].byte_sha256 == "a" * 64
     assert source_catalog.calls == [
         ("latest", "bike_station_master"),
         ("exact", "bike_station_realtime"),

@@ -100,6 +100,7 @@ from functools import wraps
 
 import numpy as np
 import pandas as pd
+import pyarrow as pa
 from core import s3 as s3_io
 from core.source_snapshot_io import (
     PartialConsumptionPolicy,
@@ -193,6 +194,10 @@ _PINNED_STATION_PROFILE: ContextVar[
         default=None,
     )
 )
+_PINNED_STATION_MASTER: ContextVar[pd.DataFrame | None] = ContextVar(
+    "inference_pinned_station_master",
+    default=None,
+)
 _PREDICTION_RUN_LOCK = threading.RLock()
 
 # 이 모듈의 실시간 캐시는 "프로세스 생애주기 동안 딱 한 번"만 채워진다(기존과 동일한
@@ -249,9 +254,10 @@ def _clear_runtime_caches() -> None:
 def authority_inference_run(
     station_profile: VerifiedStationProfile,
     *,
+    station_master_enriched_payload: bytes,
     logical_dttm: datetime | None = None,
 ) -> Iterator[None]:
-    """Pinned station profile을 쓰는 격리된 authority 계산 cache 경계를 연다.
+    """Pinned profile·station master를 쓰는 authority 계산 경계를 연다.
 
     Legacy 단일/모니터링 API는 기존 process cache를 유지한다. Publication만 이
     경계를 사용해 이전 호출의 mutable-source cache를 재사용하지 않고 release가
@@ -266,11 +272,20 @@ def authority_inference_run(
             f"pinned={station_profile.grid_tick_minutes}, "
             f"runtime={config.GRID_TICK_MINUTES}"
         )
+    if type(station_master_enriched_payload) is not bytes:
+        raise TypeError("station_master_enriched_payload는 exact bytes여야 합니다.")
+    try:
+        station_master = _station_master_from_raw(
+            pd.read_parquet(io.BytesIO(station_master_enriched_payload))
+        )
+    except (OSError, ValueError, pa.ArrowException) as exc:
+        raise ValueError("pinned station_master_enriched를 읽을 수 없습니다.") from exc
     if not _PREDICTION_RUN_LOCK.acquire(blocking=False):
         raise RuntimeError(
             "같은 process에서 다른 prediction run과 authority run을 동시에 실행할 수 없습니다."
         )
     token = None
+    station_master_token = None
     try:
         filters = None
         if logical_dttm is not None:
@@ -329,9 +344,12 @@ def authority_inference_run(
             )
         _clear_runtime_caches()
         token = _PINNED_STATION_PROFILE.set(pinned_profile)
+        station_master_token = _PINNED_STATION_MASTER.set(station_master)
         yield
     finally:
         _clear_runtime_caches()
+        if station_master_token is not None:
+            _PINNED_STATION_MASTER.reset(station_master_token)
         if token is not None:
             _PINNED_STATION_PROFILE.reset(token)
         _PREDICTION_RUN_LOCK.release()
@@ -777,7 +795,7 @@ def _rental_visible_batch_all_stations(
 
 
 def _get_station_master() -> pd.DataFrame:
-    """최신 Silver 보강 정류소 마스터를 station_id 인덱스로 캐시해 반환한다.
+    """Pinned 또는 legacy latest 보강 정류소 마스터를 캐시해 반환한다.
 
     feature_engine도 같은 보강 Silver의 최신 snapshot을 1차정제 산출물로 만들지만,
     inference는 그 중간 산출물 대신 Silver를 직접 읽어 정류소 신설/폐쇄를 즉시
@@ -787,6 +805,9 @@ def _get_station_master() -> pd.DataFrame:
         pd.DataFrame: station_id로 인덱싱된 정류소 마스터 (station_no, capacity, lat, lon, grid_id)
     """
     global _station_master
+    pinned = _PINNED_STATION_MASTER.get()
+    if pinned is not None:
+        return pinned
     if _station_master is None:
         keys = [
             key
@@ -801,23 +822,27 @@ def _get_station_master() -> pd.DataFrame:
         raw = s3_io.read_parquet(latest_key)
         if raw is None:
             raise FileNotFoundError(f"S3에 없음: {latest_key}")
-        master = raw.rename(columns=silver_schema.STATION_COLUMN_MAP)
-        if "grid_id" not in master:
-            raise ValueError("보강 station master에 grid_id 컬럼이 없음")
-        valid_grid = master["grid_id"].notna() & master["grid_id"].astype(
-            str
-        ).str.strip().ne("")
-        grid_coverage = float(valid_grid.mean())
-        if grid_coverage < 0.95:
-            raise ValueError(
-                f"보강 station master의 grid_id 매핑률이 기준 미달: {grid_coverage:.3%}"
-            )
-        master = master.set_index("station_id")
-        # 행 전체를 한 번에 astype(int)하면 깨진 station_no 하나가 전체 배치를
-        # 중단한다. 형 변환과 유효성 검사는 `_validated_station_row()`에서 station별로
-        # 수행해 정상 정류소는 계속 서빙한다.
-        _station_master = master
+        _station_master = _station_master_from_raw(raw)
     return _station_master
+
+
+def _station_master_from_raw(raw: pd.DataFrame) -> pd.DataFrame:
+    """보강 station master raw frame을 inference lookup 형태로 검증한다."""
+    master = raw.rename(columns=silver_schema.STATION_COLUMN_MAP)
+    if "grid_id" not in master:
+        raise ValueError("보강 station master에 grid_id 컬럼이 없음")
+    valid_grid = master["grid_id"].notna() & master["grid_id"].astype(
+        str
+    ).str.strip().ne("")
+    grid_coverage = float(valid_grid.mean())
+    if grid_coverage < 0.95:
+        raise ValueError(
+            f"보강 station master의 grid_id 매핑률이 기준 미달: {grid_coverage:.3%}"
+        )
+    # 행 전체를 한 번에 astype(int)하면 깨진 station_no 하나가 전체 배치를
+    # 중단한다. 형 변환과 유효성 검사는 `_validated_station_row()`에서 station별로
+    # 수행해 정상 정류소는 계속 서빙한다.
+    return master.set_index("station_id")
 
 
 def _validated_station_row(
