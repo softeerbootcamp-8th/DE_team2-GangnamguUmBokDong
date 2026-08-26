@@ -48,6 +48,7 @@ import pipeline
 # pyrefly: ignore [missing-import]
 import pyarrow as pa
 import storage
+from adapters.kma_apihub import release_base_time
 from config.schema import SourceConfig
 from core.poi_master import PoiMasterRef, read_poi_master
 from logging_setup import configure_httpx_request_logging, configure_logging
@@ -75,6 +76,25 @@ def _latest_source_uses_config(
     snapshots = manifest_module.load_source_snapshots(source_id, logical_dttm)
     return bool(
         snapshots and snapshots[-1].manifest.config_version == config_version
+    )
+
+
+def _short_term_release_advanced(
+    config: SourceConfig, last_logical_dttm: datetime, now: datetime
+) -> bool:
+    """마지막 성공 이후 새 단기예보 발표 기준시각이 열렸는지 반환한다.
+
+    단기예보는 02·05·08·11·14·17·20·23시 발표본을 사용한다. 단순히 마지막
+    성공부터 3시간을 재면 13:50에 11시 발표본을 받은 뒤 14시 발표본을 16:50까지
+    놓칠 수 있으므로, 두 실제 시각이 가리키는 발표 기준시각을 직접 비교한다.
+    """
+    if config.adapter != "kma_apihub":
+        return False
+    time_rule = config.adapter_params.get("time_rule")
+    if time_rule != "vilage_fcst":
+        return False
+    return release_base_time(now, time_rule) > release_base_time(
+        last_logical_dttm, time_rule
     )
 
 
@@ -273,9 +293,13 @@ def main(argv: list[str] | None = None) -> int:
         now = datetime.now(ZoneInfo("Asia/Seoul"))
         last = storage.latest_source_snapshot_logical_dttm(args.source, as_of=now)
         elapsed_seconds = None if last is None else (now - last).total_seconds()
+        release_advanced = (
+            False if last is None else _short_term_release_advanced(config, last, now)
+        )
         due = (
             elapsed_seconds is None
             or elapsed_seconds >= args.check_due_after_seconds
+            or release_advanced
             or not _latest_source_uses_config(
                 args.source, last, config.config_version
             )

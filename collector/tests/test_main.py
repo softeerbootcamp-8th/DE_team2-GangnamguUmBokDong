@@ -349,6 +349,82 @@ class TestCheckDueAfterSeconds:
         assert code == 0
         assert json.loads(capsys.readouterr().out)["due"] is True
 
+    @pytest.mark.parametrize(
+        ("now", "expected_due"),
+        [
+            pytest.param(
+                datetime(2026, 8, 26, 14, 9, tzinfo=KST),
+                False,
+                id="before-14-release-availability",
+            ),
+            pytest.param(
+                datetime(2026, 8, 26, 14, 10, tzinfo=KST),
+                True,
+                id="14-release-available",
+            ),
+        ],
+    )
+    def test_short_term_due_when_release_cycle_advances(
+        self, monkeypatch, capsys, now, expected_due
+    ):
+        """3시간 미만이어도 새 단기예보 발표본이 열리면 즉시 수집한다."""
+        last = datetime(2026, 8, 26, 13, 50, tzinfo=KST)
+
+        class _FixedDatetime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return now
+
+        monkeypatch.setattr(main, "datetime", _FixedDatetime)
+        monkeypatch.setattr(
+            main.storage, "latest_source_snapshot_logical_dttm", lambda *a, **k: last
+        )
+        monkeypatch.setattr(main, "_latest_source_uses_config", lambda *a, **k: True)
+
+        code = main.main(
+            [
+                "--source",
+                "weather_short_term_forecast",
+                "--check-due-after-seconds",
+                "10800",
+            ]
+        )
+
+        assert code == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["due"] is expected_due
+        assert payload["elapsed_seconds"] < 10800
+
+    def test_short_term_not_due_twice_for_same_release(
+        self, monkeypatch, capsys
+    ):
+        """14시 발표본을 받은 뒤 같은 발표 주기에서는 중복 수집하지 않는다."""
+        now = datetime(2026, 8, 26, 14, 15, tzinfo=KST)
+        last = datetime(2026, 8, 26, 14, 10, tzinfo=KST)
+
+        class _FixedDatetime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return now
+
+        monkeypatch.setattr(main, "datetime", _FixedDatetime)
+        monkeypatch.setattr(
+            main.storage, "latest_source_snapshot_logical_dttm", lambda *a, **k: last
+        )
+        monkeypatch.setattr(main, "_latest_source_uses_config", lambda *a, **k: True)
+
+        code = main.main(
+            [
+                "--source",
+                "weather_short_term_forecast",
+                "--check-due-after-seconds",
+                "10800",
+            ]
+        )
+
+        assert code == 0
+        assert json.loads(capsys.readouterr().out)["due"] is False
+
 
 class TestMain:
     @pytest.fixture

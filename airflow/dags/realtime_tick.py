@@ -58,7 +58,9 @@ from orchestration.serving_task import (
 from orchestration.urgency_task import build_urgency_task
 
 # 초단기(실황+예보)는 10분, 단기예보는 3시간 — 기상청이 그보다 자주 새 값을 내지
-# 않으므로, 마지막 성공 수집이 이보다 최근이면 이번 tick은 건너뛴다.
+# 않으므로, 마지막 성공 수집이 이보다 최근이면 이번 tick은 건너뛴다. 단, 단기예보는
+# Collector freshness check가 02·05·08·11·14·17·20·23시 발표 경계의 전진도
+# 확인하므로, 직전 수집이 발표 직전이었어도 새 발표본을 다음 tick에서 수집한다.
 _ULTRA_WEATHER_MIN_INTERVAL = timedelta(minutes=10)
 _SHORT_TERM_WEATHER_MIN_INTERVAL = timedelta(hours=3)
 _WEATHER_MIN_INTERVAL_BY_SOURCE = {

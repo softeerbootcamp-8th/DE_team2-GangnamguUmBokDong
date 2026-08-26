@@ -89,7 +89,7 @@ def _classify_result_code(code: str | None) -> FetchErrorKind | None:
     return FetchErrorKind.PERMANENT
 
 
-def _adjust_base_time(dt: datetime, rule: str | None) -> datetime:
+def release_base_time(dt: datetime, rule: str | None) -> datetime:
     """기상청 API가 허용하는 가장 최근의 base_time으로 내림한다."""
     if not rule:
         return dt
@@ -187,9 +187,12 @@ def _fetch_grid(
             response = client.get(url)
         except httpx.RequestError as exc:
             logger.info(
-                "stage=kma_http_request endpoint=%s grid=%03dx%03d page=%d "
+                "stage=kma_http_request endpoint=%s base_date=%s base_time=%s "
+                "grid=%03dx%03d page=%d "
                 "outcome=request_error error_type=%s elapsed_ms=%.1f",
                 endpoint,
+                base_date,
+                base_time,
                 nx,
                 ny,
                 page_no,
@@ -199,9 +202,12 @@ def _fetch_grid(
             return _GridOutcome(payload=None, error=FetchErrorKind.TRANSIENT)
 
         logger.info(
-            "stage=kma_http_request endpoint=%s grid=%03dx%03d page=%d "
+            "stage=kma_http_request endpoint=%s base_date=%s base_time=%s "
+            "grid=%03dx%03d page=%d "
             "outcome=response status_code=%d elapsed_ms=%.1f",
             endpoint,
+            base_date,
+            base_time,
             nx,
             ny,
             page_no,
@@ -292,7 +298,7 @@ class KmaApiHubAdapter:
         time_rule = params.get("time_rule")
 
         # time_rule 규칙에 따라 API 유효 시각으로 보정
-        adjusted_time = _adjust_base_time(window.window_start, time_rule)
+        adjusted_time = release_base_time(window.window_start, time_rule)
         base_date = adjusted_time.strftime("%Y%m%d")
         base_time = adjusted_time.strftime("%H%M")
 
