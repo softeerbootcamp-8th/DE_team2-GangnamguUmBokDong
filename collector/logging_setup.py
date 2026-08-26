@@ -128,6 +128,17 @@ def configure_logging(
     return root
 
 
+def configure_httpx_request_logging(adapter_name: str) -> None:
+    """KMA의 elapsed 로그와 중복되는 httpx 요청 로그만 끈다.
+
+    KMA 어댑터는 기존 httpx INFO 로그를 endpoint·격자·페이지·소요시간이 포함된
+    자체 로그로 일대일 대체한다. 다른 어댑터는 기존 동작을 유지하며, 한 프로세스에서
+    설정 함수를 여러 번 호출하는 테스트를 위해 NOTSET으로 원복할 수도 있게 한다.
+    """
+    level = logging.WARNING if adapter_name == "kma_apihub" else logging.NOTSET
+    logging.getLogger("httpx").setLevel(level)
+
+
 def configure_batch_logging(
     source_id: str, *, level: int = logging.INFO, stream=None
 ) -> logging.Logger:
