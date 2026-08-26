@@ -125,6 +125,8 @@ def write_bronze_part(
         raise RuntimeError(f"immutable Hot Bronze key 충돌: {key}")
     if existing is None:
         put_object_bytes(key, payload)
+    # Sweep가 pre-write marker를 본 뒤 지웠더라도 PUT 완료 상태를 다시 queue에 남긴다.
+    cold_bronze.write_pending_marker(source_id, window_start.date(), key)
 
 
 def read_bronze(

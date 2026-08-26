@@ -43,7 +43,7 @@ def test_compacts_every_revision_and_preserves_exact_stored_bytes():
     manifest = read_json("bronze/cold_manifest/test_source/dt=2026-08-12.json")
     assert manifest["input_objects"] == 2
     assert manifest["cold_key"] == result.cold_key
-    assert list_keys("_cold_pending/test_source/") == []
+    assert len(list_keys("_cold_pending/test_source/")) == 2
     for key in list_keys("bronze/hot/test_source/"):
         assert get_object_tags(key)["cold_compacted"] == "true"
 
@@ -151,6 +151,7 @@ def test_missing_hot_marker_is_ignored_until_due_and_then_cleaned():
     assert before_due.dates == 0
     assert due.dates == 1
     assert due.objects == 0
+    assert due.stale_markers == 1
     assert list_keys("_cold_pending/test_source/") == []
 
 
@@ -168,4 +169,38 @@ def test_late_revision_creates_new_pending_work_after_cold():
     assert recovered.dates == 1
     assert recovered.objects == 2
     assert current["cold_key"] != first.cold_key
+    assert list_keys("_cold_pending/test_source/") == []
+
+
+def test_hot_put_during_sweep_keeps_revision_pending(monkeypatch):
+    """시작 때 marker만 있던 revision의 sweep 중 PUT을 다음 실행이 복구한다."""
+    storage.write_bronze_part("test_source", WINDOW, "page-001", b"first", 0)
+    late_key = (
+        "bronze/hot/test_source/dt=2026-08-12/hh=14/1455/"
+        "revision=0000000001/part=page-001.json.gz"
+    )
+    cold_bronze.write_pending_marker("test_source", DAY, late_key)
+    original = cold_bronze.compact_date
+
+    def _compact_then_finish_late_put(source_id, day):
+        result = original(source_id, day)
+        storage.write_bronze_part(
+            "test_source", WINDOW, "page-001", b"late", revision=1
+        )
+        return result
+
+    monkeypatch.setattr(cold_bronze, "compact_date", _compact_then_finish_late_put)
+    with pytest.raises(RuntimeError, match="Cold 생성 중 Hot 입력이 변경됐다"):
+        cold_bronze.recover_pending(
+            "test_source", today=date(2026, 8, 18), delay_days=6
+        )
+
+    assert list_keys("_cold_pending/test_source/")
+    monkeypatch.setattr(cold_bronze, "compact_date", original)
+    recovered = cold_bronze.recover_pending(
+        "test_source", today=date(2026, 8, 18), delay_days=6
+    )
+
+    assert recovered.dates == 1
+    assert recovered.objects == 2
     assert list_keys("_cold_pending/test_source/") == []

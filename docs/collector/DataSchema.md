@@ -40,7 +40,9 @@ bronze/hot/<source_id>/dt=YYYY-MM-DD/hh=HH/HHMM/revision=NNNNNNNNNN/part=<part_k
 - Hot object를 쓰기 전에 `_cold_pending/<source_id>/dt=YYYY-MM-DD/` 아래 window
   revision별 immutable marker를 만든다. part가 많아도 같은 revision은 marker 하나를
   공유한다. Cold worker는 marker key의 날짜를 먼저 판별하고 안정화 기간 6일이 지난
-  pending 날짜만 실제 Hot 조회 대상으로 처리한다.
+  pending 날짜만 실제 Hot 조회 대상으로 처리한다. compaction 전후 Hot signature가
+  달라지면 marker를 유지·복원하고 실패해 다음 실행에서 다시 처리한다. Hot 없이 남은
+  marker는 stale 건수로 결과에 명시한 뒤 정리한다.
 - Silver Archive 대상 여부와 관계없이 모든 Collector source의 검증된 날짜 revision은
   `bronze/cold/<source_id>/dt=YYYY-MM-DD/sha256=...parquet`에 원본 gzip bytes 그대로
   장기 보관한다.

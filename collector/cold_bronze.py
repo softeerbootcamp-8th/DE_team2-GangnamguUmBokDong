@@ -60,6 +60,7 @@ class ColdRecoveryResult:
 
     dates: int
     objects: int
+    stale_markers: int
 
 
 def _pending_marker_key(source_id: str, day: date, hot_key: str) -> str:
@@ -89,14 +90,11 @@ def write_pending_marker(source_id: str, day: date, hot_key: str) -> None:
         write_json(key, payload)
 
 
-def _finalize_hot_objects(source_id: str, day: date, hot_keys: list[str]) -> None:
-    """검증된 Cold에 포함된 Hot을 태그하고 대응 pending marker를 제거한다."""
+def _tag_hot_objects(hot_keys: list[str]) -> None:
+    """검증된 Cold에 포함된 Hot에 Lifecycle 허용 태그를 붙인다."""
     for hot_key in hot_keys:
         if hot_key.startswith("bronze/hot/"):
             merge_object_tags(hot_key, {"cold_compacted": "true"})
-    delete_objects(
-        [_pending_marker_key(source_id, day, hot_key) for hot_key in hot_keys]
-    )
 
 
 def _sha256(payload: bytes) -> str:
@@ -109,6 +107,30 @@ def _input_objects(source_id: str, day: date):
     objects = list_objects(f"bronze/hot/{source_id}/dt={day.isoformat()}/")
     objects += list_objects(f"bronze/{source_id}/dt={day.isoformat()}/")
     return sorted(objects, key=lambda item: item.key.encode("utf-8"))
+
+
+def _input_signature(objects) -> str:
+    """Cold 입력 object 목록의 결정적인 signature를 만든다."""
+    rows = [[obj.key, obj.size, obj.last_modified.isoformat()] for obj in objects]
+    return _sha256(
+        json.dumps(rows, separators=(",", ":"), ensure_ascii=False).encode()
+    )
+
+
+def _marker_revision_prefix(marker_key: str, source_id: str, day: date) -> str:
+    """신·구 pending marker payload에서 Hot revision prefix를 읽는다."""
+    marker = read_json(marker_key)
+    if not isinstance(marker, dict):
+        raise TypeError(f"Cold pending marker를 읽을 수 없다: {marker_key}")
+    if marker.get("source_id") != source_id or marker.get("date") != day.isoformat():
+        raise RuntimeError(f"Cold pending marker identity가 다르다: {marker_key}")
+    prefix = marker.get("hot_revision_prefix")
+    if isinstance(prefix, str) and prefix:
+        return prefix
+    hot_key = marker.get("hot_key")
+    if isinstance(hot_key, str) and "/part=" in hot_key:
+        return hot_key.rsplit("/part=", 1)[0]
+    raise TypeError(f"Cold pending marker의 Hot revision prefix가 없다: {marker_key}")
 
 
 def _parse_key(key: str, source_id: str, day: date) -> dict:
@@ -134,12 +156,7 @@ def compact_date(source_id: str, day: date) -> ColdBronzeResult:
     if not objects:
         return ColdBronzeResult(status="empty", objects=0, cold_key=None)
 
-    signature_rows = [
-        [obj.key, obj.size, obj.last_modified.isoformat()] for obj in objects
-    ]
-    input_signature = _sha256(
-        json.dumps(signature_rows, separators=(",", ":"), ensure_ascii=False).encode()
-    )
+    input_signature = _input_signature(objects)
     manifest_key = f"bronze/cold_manifest/{source_id}/dt={day.isoformat()}.json"
     previous = read_json(manifest_key)
     if (
@@ -149,7 +166,7 @@ def compact_date(source_id: str, day: date) -> ColdBronzeResult:
     ):
         cold_key = previous.get("cold_key")
         if isinstance(cold_key, str) and object_exists(cold_key):
-            _finalize_hot_objects(source_id, day, [obj.key for obj in objects])
+            _tag_hot_objects([obj.key for obj in objects])
             return ColdBronzeResult("skipped", len(objects), cold_key)
 
     rows = []
@@ -220,7 +237,7 @@ def compact_date(source_id: str, day: date) -> ColdBronzeResult:
             "verified": True,
         },
     )
-    _finalize_hot_objects(source_id, day, [obj.key for obj in objects])
+    _tag_hot_objects([obj.key for obj in objects])
     return ColdBronzeResult("compacted", len(objects), cold_key)
 
 
@@ -237,7 +254,9 @@ def recover_pending(
     markers_by_day: dict[date, list[str]] = {}
     for marker_key in marker_keys:
         matched = _PENDING_MARKER_KEY.fullmatch(marker_key)
-        if matched is None or matched.group("source") != source_id:
+        if matched is None:
+            raise RuntimeError(f"Cold pending marker key 형식이 잘못됐다: {marker_key}")
+        if matched.group("source") != source_id:
             raise RuntimeError(f"Cold pending marker source가 다르다: {marker_key}")
         try:
             day = date.fromisoformat(matched.group("day"))
@@ -248,18 +267,57 @@ def recover_pending(
 
     failures = []
     object_count = 0
+    stale_count = 0
     for day in sorted(markers_by_day):
         try:
+            prefixes = {
+                marker_key: _marker_revision_prefix(marker_key, source_id, day)
+                for marker_key in markers_by_day[day]
+            }
             result = compact_date(source_id, day)
             object_count += result.objects
-            # 실행 시작 뒤 생긴 marker는 지우지 않아 late revision을 다음 실행이 처리한다.
-            delete_objects(markers_by_day[day])
+            current = _input_objects(source_id, day)
+            manifest = read_json(
+                f"bronze/cold_manifest/{source_id}/dt={day.isoformat()}.json"
+            )
+            current_signature = _input_signature(current)
+            if current and (
+                not isinstance(manifest, dict)
+                or manifest.get("verified") is not True
+                or manifest.get("input_signature") != current_signature
+            ):
+                raise RuntimeError(
+                    f"Cold 생성 중 Hot 입력이 변경됐다: source={source_id}, day={day}"
+                )
+
+            current_keys = {obj.key for obj in current}
+            stale = [
+                marker_key
+                for marker_key, prefix in prefixes.items()
+                if not any(key.startswith(f"{prefix}/") for key in current_keys)
+            ]
+            stale_count += len(stale)
+            # 시작 뒤 생긴 marker는 이 목록에 없으므로 late revision 작업으로 남는다.
+            delete_objects(sorted(set(markers_by_day[day])))
+
+            after_delete = _input_objects(source_id, day)
+            if _input_signature(after_delete) != current_signature:
+                for obj in after_delete:
+                    if obj.key.startswith("bronze/hot/"):
+                        write_pending_marker(source_id, day, obj.key)
+                raise RuntimeError(
+                    f"Cold marker 정리 중 Hot 입력이 변경됐다: source={source_id}, day={day}"
+                )
         except (ClientError, OSError, RuntimeError, ValueError) as exc:
             failures.append((day, exc))
     if failures:
         detail = ", ".join(f"{day}: {exc}" for day, exc in failures)
         raise RuntimeError(f"Cold pending recovery 일부 날짜가 실패했다: {detail}")
-    return ColdRecoveryResult(dates=len(markers_by_day), objects=object_count)
+    return ColdRecoveryResult(
+        dates=len(markers_by_day),
+        objects=object_count,
+        stale_markers=stale_count,
+    )
 
 
 def read_revision(
