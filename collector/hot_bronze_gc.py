@@ -40,7 +40,7 @@ def _gc_manifest_key(source_id: str, day: date) -> str:
 
 
 def _inventory(manifest_key: str, manifest: dict) -> tuple[list[str], str]:
-    """신규 manifest inventory를 읽거나 검증된 구버전 Cold Parquet에서 승격한다."""
+    """Cold Parquet inventory와 manifest proof를 exact equality로 검증한다."""
     cold_key = manifest.get("cold_key")
     cold_sha256 = manifest.get("cold_sha256")
     if not isinstance(cold_key, str) or not isinstance(cold_sha256, str):
@@ -48,25 +48,40 @@ def _inventory(manifest_key: str, manifest: dict) -> tuple[list[str], str]:
     payload = get_object_bytes(cold_key)
     if payload is None or hashlib.sha256(payload).hexdigest() != cold_sha256:
         raise RuntimeError(f"Cold object checksum 검증에 실패했다: {cold_key}")
+    table = pq.read_table(pa.BufferReader(payload), columns=["original_key"])
+    actual_inventory = table["original_key"].to_pylist()
+    if not all(isinstance(key, str) for key in actual_inventory):
+        raise TypeError(f"Cold original_key가 문자열이 아니다: {cold_key}")
+    if len(actual_inventory) != len(set(actual_inventory)):
+        raise RuntimeError(f"Cold original_key가 중복됐다: {cold_key}")
+    actual_signature = hashlib.sha256(
+        "\n".join(actual_inventory).encode()
+    ).hexdigest()
+    if len(actual_inventory) != manifest.get("input_objects"):
+        raise RuntimeError(f"Cold row 수가 manifest와 다르다: {manifest_key}")
+
     inventory = manifest.get("inventory_keys")
     if not isinstance(inventory, list) or not all(
         isinstance(key, str) for key in inventory
     ):
-        table = pq.read_table(pa.BufferReader(payload), columns=["original_key"])
-        inventory = sorted(table["original_key"].to_pylist(), key=str.encode)
-        if len(inventory) != manifest.get("input_objects"):
-            raise RuntimeError(f"구버전 Cold row 수가 manifest와 다르다: {manifest_key}")
-        signature = hashlib.sha256("\n".join(inventory).encode()).hexdigest()
+        # inventory 필드 도입 전 manifest만 검증된 Cold에서 안전하게 승격한다.
+        inventory = actual_inventory
         write_json(
             manifest_key,
             {
                 **manifest,
                 "inventory_keys": inventory,
-                "inventory_signature": signature,
+                "inventory_signature": actual_signature,
             },
         )
-    signature = hashlib.sha256("\n".join(inventory).encode()).hexdigest()
-    return inventory, signature
+        return inventory, actual_signature
+
+    if inventory != actual_inventory:
+        raise RuntimeError(f"Cold inventory가 manifest와 다르다: {manifest_key}")
+    manifest_signature = manifest.get("inventory_signature")
+    if manifest_signature != actual_signature:
+        raise RuntimeError(f"Cold inventory signature가 다르다: {manifest_key}")
+    return actual_inventory, actual_signature
 
 
 def collect_date(
