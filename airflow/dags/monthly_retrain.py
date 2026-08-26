@@ -92,17 +92,21 @@ MODEL_EXECUTION_ORDER = ("rental", "return")
 FEATURE_MART_CORE_INSTANCE_COUNT = 8
 TRAINING_CORE_INSTANCE_COUNT = 8
 # Evaluate/Train 스텝은 `_yarn_python_module_step()`으로 자기 자신도 YARN
-# distributed-shell로 core 노드에서 돈다 — AM(`_YARN_AM_MEMORY_MB`만큼의 작은
-# 힙)과 실제 오케스트레이터 파이썬 코드가 도는 워커 컨테이너(`-container_memory
-# 6144`, 노드 전체)는 별개다. 즉 이 wrapper 자신만으로 최소 노드 2개(AM 1 +
-# 자기 워커 컨테이너 1)를 먹는다 — 1개(AM)만 빼고 계산했다가 barrier가 요청한
-# 워커 수보다 실제 가용 노드가 하나 모자라 10분 타임아웃나는 걸 실제 EMR
-# 실행에서 확인했다(2026-08-26). 그 "안"에서 다시 진짜 워커(평가/학습)용
-# distributed-shell을 core 노드 수 그대로 요청하면 안 되고, 항상 이 예약분만큼
-# 적게 잡아야 한다. (spark-submit으로 감싸던 예전 방식은 AM+정적 executor로
-# 3노드를 먹었었다 — distributed-shell로 바꾸며 3 -> 2로 줄었다,
-# `_yarn_python_module_step()` docstring 4번 참고.)
-_WRAPPER_NODE_RESERVATION = 2
+# distributed-shell(이하 "outer")로 core 노드에서 돈다 — outer AM
+# (`_YARN_AM_MEMORY_MB`만큼의 작은 힙)과 실제 오케스트레이터 파이썬 코드가
+# 도는 outer 워커 컨테이너(`-container_memory 6144`, 노드 전체)는 별개다.
+# 그 "안"에서 오케스트레이터가 다시 진짜 워커(평가/학습)용 distributed-shell
+# ("inner")을 제출하는 중첩 구조라, inner도 자기 AM을 하나 더 띄운다.
+# YARN 스케줄러가 inner AM을 outer AM과 같은 노드에 co-locate해준다는 보장이
+# 없으므로(스케줄링 정책·클러스터 상태에 따라 달라짐), 최악의 경우 outer
+# AM·outer 워커·inner AM이 각자 다른 노드 3개를 차지한다고 보고 예약해야
+# 한다 — 2개(outer AM+워커)만 빼고 6워커를 요청했다가 co-locate가 안 된
+# 케이스에서 barrier가 10분 타임아웃나는 걸 실제 EMR 실행에서 재확인했다
+# (2026-08-26). (spark-submit으로 감싸던 예전 방식은 AM+정적 executor로도
+# 3노드를 먹었으니 이 값 자체는 결국 동일하다 — distributed-shell 전환의
+# 이득은 예약 노드 수가 아니라 dynamic allocation/JVM 힙 계산 문제 제거 쪽에
+# 있다, `_yarn_python_module_step()` docstring 4번 참고.)
+_WRAPPER_NODE_RESERVATION = 3
 _EMR_PYTHONPATH = "/opt/gng"
 
 # `test_profile_only` DAG 파라미터가 켜졌을 때 재평가를 건너뛰고 바로 재학습

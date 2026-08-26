@@ -378,10 +378,11 @@ def test_evaluate_passes_eval_num_workers_matching_provisioned_core_count(monkey
 
 
 def test_evaluate_eval_num_workers_respects_core_instance_count_override(monkeypatch) -> None:
-    """override(5) - _WRAPPER_NODE_RESERVATION(2) = 3 — 이 Evaluate 스텝 자신도
-    자기 자신의 YARN distributed-shell AM + 오케스트레이터가 도는 워커 컨테이너로
-    노드 2개를 먹으므로 그만큼 빼야 barrier가 존재하지 않는 컨테이너를 기다리다
-    타임아웃나지 않는다(실제 EMR 실행에서 확인, 2026-08-26)."""
+    """override(5) - _WRAPPER_NODE_RESERVATION(3) = 2 — outer AM/워커 컨테이너 +
+    inner distributed-shell 자신의 AM까지, 최악의 배치(co-locate 안 됨)를
+    가정하면 노드 3개가 필요하므로 그만큼 빼야 barrier가 존재하지 않는
+    컨테이너를 기다리다 타임아웃나지 않는다(실제 EMR 실행에서 확인,
+    2026-08-26)."""
     mock_ti = MagicMock()
     mock_ti.xcom_pull.return_value = "j-created"
     submitted = {}
@@ -397,7 +398,7 @@ def test_evaluate_eval_num_workers_respects_core_instance_count_override(monkeyp
     task_fn(ti=mock_ti, params={"emr_core_instance_count": 5}, run_id="run-1")
 
     script = submitted["command"][2]
-    assert "--eval-num-workers 3" in script
+    assert "--eval-num-workers 2" in script
 
 
 def test_evaluate_defaults_to_needs_retrain_when_no_result(monkeypatch) -> None:
