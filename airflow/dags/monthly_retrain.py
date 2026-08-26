@@ -109,6 +109,30 @@ TRAINING_CORE_INSTANCE_COUNT = 8
 _WRAPPER_NODE_RESERVATION = 3
 _EMR_PYTHONPATH = "/opt/gng"
 
+
+def _resolve_wrapper_worker_count(core_instance_count: int) -> int:
+    """`core_instance_count`에서 `_WRAPPER_NODE_RESERVATION`을 뺀 실제 inner
+    워커 요청 수를 계산한다.
+
+    `max(core_instance_count - _WRAPPER_NODE_RESERVATION, 1)`처럼 조용히
+    1로 내림 처리하면 안 된다 — `emr_core_instance_count`가 예약분 이하로
+    작을 때는 outer AM/outer 워커/inner AM 최악 배치만으로 이미 모든 노드가
+    차서 inner 워커를 하나도 띄울 빈 노드가 없는데도 "1개는 될 것"처럼
+    보이고, 실제로는 barrier가 10분 동안 존재할 수 없는 컨테이너를 기다리다
+    타임아웃나는 것으로만 뒤늦게 드러난다(PR #248 리뷰 지적, 2026-08-26) —
+    DAG Param의 `minimum`(UI 경로)과 별개로, override 등으로 Param 검증을
+    우회한 호출에도 대비해 여기서도 즉시 fail-fast한다.
+    """
+    worker_count = core_instance_count - _WRAPPER_NODE_RESERVATION
+    if worker_count < 1:
+        raise ValueError(
+            f"emr_core_instance_count={core_instance_count}는 너무 작습니다 — "
+            f"outer AM/워커 컨테이너 + inner AM 최악 배치 예약분"
+            f"({_WRAPPER_NODE_RESERVATION}개 노드)보다 커야 inner 워커를 최소 1개라도 "
+            f"띄울 수 있습니다({_WRAPPER_NODE_RESERVATION + 1} 이상 필요)."
+        )
+    return worker_count
+
 # `test_profile_only` DAG 파라미터가 켜졌을 때 재평가를 건너뛰고 바로 재학습
 # 대상으로 강제하는 프로필 — s3://{S3_BUCKET}/profiles/a-test-sparse-flat.json.
 # mock_mode(AWS 호출을 흉내낼지 여부)와는 완전히 별개 축이다: test_profile_only는
@@ -526,7 +550,7 @@ def make_task_evaluate(model_name: str) -> Any:
         # 래퍼로 노드를 먹으므로 `_WRAPPER_NODE_RESERVATION`만큼 빼야 한다
         # (위 상수 주석 참고 — 안 빼면 barrier가 10분 타임아웃난다).
         core_count = params.get("emr_core_instance_count") or FEATURE_MART_CORE_INSTANCE_COUNT
-        eval_num_workers = max(core_count - _WRAPPER_NODE_RESERVATION, 1)
+        eval_num_workers = _resolve_wrapper_worker_count(core_count)
         # refresh_feature_mart가 방금 갱신한 feature mart는 챔피언 프로필 경로
         # (FEATURE_PARAM_COMBO_ID = w/e/t, 프로필에서 파생)에 쓰였다. 여기서
         # ML_PROFILE을 안 넘기면 monitor_performance가 기본(builtin-default)
@@ -606,6 +630,11 @@ def make_task_orchestrate_retrain_loop(model_name: str) -> Any:
 
         results_by_profile: dict[str, Any] = {}
         core_instance_count = params.get("emr_core_instance_count") or TRAINING_CORE_INSTANCE_COUNT
+        # 후보 프로필마다 반복하기 전에 한 번만 검증한다 — 이 값이 너무 작은
+        # 건 프로필별 문제가 아니라 설정 자체의 문제라, per-profile try/except
+        # (아래 660행)에 걸려 "후보 하나 실패"로 조용히 넘어가면 안 되고 루프
+        # 시작 전에 곧바로 실패해야 한다.
+        _resolve_wrapper_worker_count(core_instance_count)
 
         for profile in candidate_profiles:
             logger.info("=== [%s 프로필: %s] EMR 피처마트 스텝 제출 ===", model_name, profile)
@@ -640,7 +669,7 @@ def make_task_orchestrate_retrain_loop(model_name: str) -> Any:
                     "training.scripts.monthly_retrain_check",
                     train_args,
                     env={
-                        "LGB_NUM_MACHINES": str(max(core_instance_count - _WRAPPER_NODE_RESERVATION, 1)),
+                        "LGB_NUM_MACHINES": str(_resolve_wrapper_worker_count(core_instance_count)),
                         "LGB_TREE_LEARNER": "data",
                     },
                 )
@@ -878,12 +907,15 @@ def build_monthly_retrain_dag(cron_schedule: str) -> DAG:
             "emr_core_instance_count": Param(
                 FEATURE_MART_CORE_INSTANCE_COUNT,
                 type="integer",
-                minimum=1,
+                minimum=_WRAPPER_NODE_RESERVATION + 1,
                 maximum=10,
                 description=(
                     "클러스터 생성 시점 core 노드 개수 — master 1대는 별도. 피처마트/학습 "
                     "단계 모두 이 개수를 그대로 쓴다(resize 없음). 대여/반납 두 사이클 모두 "
-                    "동일하게 적용된다."
+                    "동일하게 적용된다. Evaluate/Train이 중첩 YARN distributed-shell로 "
+                    "도는데(outer AM+워커+inner AM 최악 배치 시 노드 3개 소모,"
+                    " `_WRAPPER_NODE_RESERVATION` 참고) 그 이하로는 inner 워커를 하나도 "
+                    "못 띄운다 — 최솟값을 그만큼으로 잡는다."
                 ),
             ),
             "test_profile_only": Param(

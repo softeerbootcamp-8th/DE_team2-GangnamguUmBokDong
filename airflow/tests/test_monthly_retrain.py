@@ -5,6 +5,8 @@
 from datetime import timedelta
 from unittest.mock import MagicMock
 
+import pytest
+
 import dags.monthly_retrain as monthly_dag
 from airflow.task.trigger_rule import TriggerRule
 
@@ -375,6 +377,30 @@ def test_evaluate_passes_eval_num_workers_matching_provisioned_core_count(monkey
     script = submitted["command"][2]
     expected = monthly_dag.FEATURE_MART_CORE_INSTANCE_COUNT - monthly_dag._WRAPPER_NODE_RESERVATION
     assert f"--eval-num-workers {expected}" in script
+
+
+@pytest.mark.parametrize("core_count,expected_workers", [(4, 1), (5, 2), (8, 5)])
+def test_resolve_wrapper_worker_count_boundary_values(core_count, expected_workers) -> None:
+    """outer AM/워커 컨테이너 + inner AM 최악 배치 예약분(3)을 뺀 값 — 4가
+    inner 워커를 최소 1개라도 띄울 수 있는 가장 작은 유효 core 수다."""
+    assert monthly_dag._resolve_wrapper_worker_count(core_count) == expected_workers
+
+
+@pytest.mark.parametrize("core_count", [1, 2, 3])
+def test_resolve_wrapper_worker_count_rejects_too_small_core_count(core_count) -> None:
+    """core_count가 예약분(3) 이하면 outer AM/워커/inner AM 최악 배치만으로
+    이미 모든 노드가 차서 inner 워커를 하나도 못 띄운다 — `max(..., 1)`로
+    조용히 1로 내림 처리하면 barrier가 10분 타임아웃나는 것으로만 뒤늦게
+    드러나므로 즉시 실패해야 한다(PR #248 리뷰 지적, 2026-08-26)."""
+    with pytest.raises(ValueError, match="너무 작습니다"):
+        monthly_dag._resolve_wrapper_worker_count(core_count)
+
+
+def test_emr_core_instance_count_param_minimum_matches_wrapper_reservation() -> None:
+    """DAG Param의 minimum도 런타임 fail-fast(`_resolve_wrapper_worker_count`)와
+    같은 기준(`_WRAPPER_NODE_RESERVATION + 1`)이어야 UI에서부터 막힌다."""
+    param = _DAG.params.get_param("emr_core_instance_count")
+    assert param.schema["minimum"] == monthly_dag._WRAPPER_NODE_RESERVATION + 1
 
 
 def test_evaluate_eval_num_workers_respects_core_instance_count_override(monkeypatch) -> None:
