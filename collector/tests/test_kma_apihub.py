@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import logging
+import re
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -78,6 +80,62 @@ def test_fetch_calls_once_per_grid_in_order():
 
     assert [r.key for r in results] == ["grid-060x127", "grid-061x127"]
     assert len(calls) == 2
+
+
+def test_fetch_logs_elapsed_for_each_http_request(caplog):
+    """응답마다 인증정보 없이 endpoint·격자·페이지·상태·소요시간을 남긴다."""
+    client = httpx.Client(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, content=_body())
+        )
+    )
+
+    with caplog.at_level(logging.INFO, logger="adapters.kma_apihub"):
+        list(
+            KmaApiHubAdapter.fetch(
+                _config(grids=[[60, 127]]), _window(), client=client
+            )
+        )
+
+    messages = [record.getMessage() for record in caplog.records]
+    request_logs = [message for message in messages if "stage=kma_http_request" in message]
+    assert len(request_logs) == 1
+    assert "endpoint=getUltraSrtNcst" in request_logs[0]
+    assert "grid=060x127" in request_logs[0]
+    assert "page=1" in request_logs[0]
+    assert "outcome=response" in request_logs[0]
+    assert "status_code=200" in request_logs[0]
+    assert re.search(r"elapsed_ms=\d+\.\d", request_logs[0])
+    assert "secret-key-456" not in request_logs[0]
+
+
+def test_fetch_logs_elapsed_on_request_error(caplog):
+    """응답을 받지 못해도 요청 예외 종류와 경과시간을 남긴다."""
+    def handler(request):
+        raise httpx.ReadTimeout("timed out", request=request)
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+
+    with caplog.at_level(logging.INFO, logger="adapters.kma_apihub"):
+        results = list(
+            KmaApiHubAdapter.fetch(
+                _config(grids=[[60, 127]]), _window(), client=client
+            )
+        )
+
+    request_log = next(
+        record.getMessage()
+        for record in caplog.records
+        if "stage=kma_http_request" in record.getMessage()
+    )
+    assert results[0].error is FetchErrorKind.TRANSIENT
+    assert "endpoint=getUltraSrtNcst" in request_log
+    assert "grid=060x127" in request_log
+    assert "page=1" in request_log
+    assert "outcome=request_error" in request_log
+    assert "error_type=ReadTimeout" in request_log
+    assert re.search(r"elapsed_ms=\d+\.\d", request_log)
+    assert "secret-key-456" not in request_log
 
 
 def test_planned_parts_fixes_all_34_grids_before_fetch():

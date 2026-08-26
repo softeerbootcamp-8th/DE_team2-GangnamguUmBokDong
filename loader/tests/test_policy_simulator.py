@@ -8,7 +8,8 @@ from evaluation.historical_inputs import HistoricalStation, PredictionAudit
 from evaluation.policy_simulator import simulate_no_rebalance, simulate_policy
 from evaluation.rebalance_backtest import RentalTrip
 from gold.demand import DemandForecastRecord
-from gold.rebalance_route import DispatchCenterTopology
+from gold.rebalance_policy import risk_band_policy
+from gold.rebalance_route import MAX_STOPS_PER_ROUTE, DispatchCenterTopology
 
 SEOUL = ZoneInfo("Asia/Seoul")
 START = datetime(2025, 6, 17, 6, tzinfo=SEOUL)
@@ -27,10 +28,16 @@ def _station(number: int, capacity: int, latitude: float) -> HistoricalStation:
     )
 
 
-def _trip(minute: int, rent_station: int, return_station: int) -> RentalTrip:
+def _trip(
+    minute: int,
+    rent_station: int,
+    return_station: int,
+    *,
+    bike_id_suffix: str = "",
+) -> RentalTrip:
     """10분 길이의 합성 시민 대여를 만든다."""
     return RentalTrip(
-        bike_id=f"B-{minute}-{rent_station}",
+        bike_id=f"B-{minute}-{rent_station}{bike_id_suffix}",
         rented_at=START + timedelta(minutes=minute),
         rent_station_no=rent_station,
         returned_at=START + timedelta(minutes=minute + 10),
@@ -50,14 +57,18 @@ def _forecast(anchor, stock, successful):
                     base_dttm=base,
                     sta_id=station_id,
                     predicted_dttm=base + timedelta(hours=horizon),
-                    predicted_rent_cnt=5 if station_id == "ST-2" and horizon == 1 else 0,
+                    predicted_rent_cnt=5
+                    if station_id == "ST-2" and horizon == 1
+                    else 0,
                     predicted_rtn_cnt=5 if station_id == "ST-1" and horizon == 1 else 0,
                 )
             )
     rows.sort(key=lambda row: (row.sta_id, row.predicted_dttm))
     audit = PredictionAudit(
         anchor=anchor.isoformat(),
-        weather_observed_at=(anchor - timedelta(hours=1)).replace(tzinfo=None).isoformat(),
+        weather_observed_at=(anchor - timedelta(hours=1))
+        .replace(tzinfo=None)
+        .isoformat(),
         weather_cutoff=(anchor - timedelta(hours=1)).isoformat(),
         population_candidate_dates=("2025-06-10",),
         rental_lag_start=(anchor - timedelta(minutes=100)).isoformat(),
@@ -85,9 +96,15 @@ def test_no_rebalance_removes_return_of_failed_rental() -> None:
     assert result.observed_requests == 1
     assert result.unfulfilled_requests == 1
     assert result.fulfilled_requests == 0
+    assert (
+        result.policy_configuration["max_stops_per_route"]
+        == MAX_STOPS_PER_ROUTE
+    )
 
 
-def test_policy_replans_every_five_minutes_without_double_dispatching_covered_work() -> None:
+def test_policy_replans_every_five_minutes_without_double_dispatching_covered_work() -> (
+    None
+):
     """진행 중 route coverage와 truck 점유가 다음 5분 tick의 중복 작업을 막는다."""
     contract = EvaluationContract(
         date(2025, 6, 17),
@@ -97,7 +114,7 @@ def test_policy_replans_every_five_minutes_without_double_dispatching_covered_wo
     )
     stations = (_station(1, 10, 37.5001), _station(2, 10, 37.5002))
     result = simulate_policy(
-        policy="model_route_v2",
+        policy="model_route_v4",
         contract=contract,
         center=DispatchCenterTopology("center", 127.0, 37.5, True),
         stations=stations,
@@ -114,6 +131,36 @@ def test_policy_replans_every_five_minutes_without_double_dispatching_covered_wo
     assert result.fulfilled_requests == 1
     assert result.completed_routes_by_cutoff == 1
     assert result.trucks_still_busy_at_cutoff == 0
+    assert result.policy_configuration["max_stops_per_route"] == 8
+
+
+def test_policy_does_not_truncate_route_to_remaining_movement_budget() -> None:
+    """남은 예산보다 큰 production route는 수량을 자르지 않고 배차하지 않는다."""
+    contract = EvaluationContract(
+        date(2025, 6, 17),
+        6,
+        evaluation_minutes=60,
+        fleet_size=1,
+    )
+    stations = (_station(1, 10, 37.5001), _station(2, 10, 37.5002))
+
+    result = simulate_policy(
+        policy="budget_smaller_than_route",
+        contract=contract,
+        center=DispatchCenterTopology("center", 127.0, 37.5, True),
+        stations=stations,
+        initial_stock={1: 10, 2: 0},
+        trips=(),
+        forecast_provider=_forecast,
+        max_stops_per_route=8,
+        movement_budget=4,
+    )
+
+    assert any(audit.proposed_routes == 1 for audit in result.tick_audits)
+    assert result.dispatched_routes == 0
+    assert result.movement_budget_used == 0
+    assert result.planned_bikes == 0
+    assert result.job_audits == ()
 
 
 def test_policy_does_not_dispatch_route_that_cannot_return_before_cutoff() -> None:
@@ -140,3 +187,83 @@ def test_policy_does_not_dispatch_route_that_cannot_return_before_cutoff() -> No
     assert result.dispatched_routes == 0
     assert result.trucks_still_busy_at_cutoff == 0
     assert all(audit.idle_trucks_before == 1 for audit in result.tick_audits)
+
+
+def test_pickup_execution_matches_production_planned_quantity_contract() -> None:
+    """시뮬레이터는 운영에 없는 실행시점 reserve clamp를 적용하지 않는다."""
+    contract = EvaluationContract(
+        date(2025, 6, 17),
+        6,
+        evaluation_minutes=60,
+        fleet_size=1,
+    )
+    stations = (_station(1, 5, 37.5001), _station(2, 5, 37.5002))
+    policy = risk_band_policy(
+        protection_horizon_hours=1,
+        minimum_stock_ratio=0.2,
+        uncertainty_z=0.0,
+    )
+    result = simulate_policy(
+        policy="risk_band",
+        contract=contract,
+        center=DispatchCenterTopology("center", 127.0, 37.5, True),
+        stations=stations,
+        initial_stock={1: 10, 2: 0},
+        trips=tuple(
+            _trip(11, 1, 1, bike_id_suffix=f"-{index}") for index in range(5)
+        ),
+        forecast_provider=_forecast,
+        max_stops_per_route=8,
+        movement_budget=5,
+        policy_config=policy,
+    )
+    pickup = next(
+        stop
+        for job in result.job_audits
+        for stop in job.stops
+        if stop.action == "pickup"
+    )
+    assert pickup.planned_quantity == 5
+    assert pickup.actual_quantity == 5
+    assert result.moved_bikes == 5
+
+
+def test_pickup_cooldown_starts_after_last_scheduled_stop() -> None:
+    """같은 공급원의 두 번째 배차는 첫 작업 마지막 stop 뒤 cooldown까지 기다린다."""
+    contract = EvaluationContract(
+        date(2025, 6, 17),
+        6,
+        evaluation_minutes=180,
+        fleet_size=1,
+    )
+    stations = (_station(1, 5, 37.5001), _station(2, 5, 37.5002))
+    policy = risk_band_policy(
+        protection_horizon_hours=1,
+        minimum_stock_ratio=0.2,
+        uncertainty_z=0.0,
+        pickup_cooldown_minutes=60,
+    )
+    result = simulate_policy(
+        policy="risk_band_cooldown",
+        contract=contract,
+        center=DispatchCenterTopology("center", 127.0, 37.5, True),
+        stations=stations,
+        initial_stock={1: 20, 2: 0},
+        trips=tuple(
+            _trip(minute, 2, 99, bike_id_suffix=f"-{minute}")
+            for minute in range(20, 25)
+        ),
+        forecast_provider=_forecast,
+        max_stops_per_route=8,
+        movement_budget=10,
+        policy_config=policy,
+    )
+
+    jobs = sorted(result.job_audits, key=lambda job: job.dispatched_at)
+    assert len(jobs) == 2
+    first_last_stop = max(
+        datetime.fromisoformat(stop.executed_at) for stop in jobs[0].stops
+    )
+    second_dispatch = datetime.fromisoformat(jobs[1].dispatched_at)
+    assert second_dispatch >= first_last_stop + timedelta(minutes=60)
+    assert second_dispatch < first_last_stop + timedelta(minutes=65)

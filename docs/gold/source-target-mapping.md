@@ -52,13 +52,15 @@ Dispatch center seed에는 좌표의 source와 정확도 등급이 포함된다.
 
 ### 준비 단계
 
-`prepare_serving_plan`은 다음 입력을 pin한다.
+`prepare_serving_plan`은 Gold projection·서빙 범위·최종 transaction에 필요한 다음
+입력을 pin한다.
 
 - 최신 허용 범위의 `bike_station_master`
 - exact 현재 `bike_station_realtime`
 - `weather_ultra_short_forecast`와 `weather_short_term_forecast`
 - 현재 `weather_grid`, `dispatch_center` publication dependency
-- rental·return model serving release와 지원 station ID set
+- prepare 시점 rental·return model에서 얻은 exact 지원 station ID set
+- 최신 enriched station master에서 검증한 inference 가능 station ID set
 - 기존 station·stock·weather state
 
 계획 단계는 아직 Gold를 바꾸지 않는다. 다음 prepared publication을 S3에 만든다.
@@ -71,7 +73,16 @@ weather_forecast
 
 ### 추론과 최종 게시
 
-Inference는 plan과 동일한 model·source input을 사용해 station별 미래 1~12시간 대여·반납량을 만든다. Finalize는 inference manifest를 검증한 뒤 다음 네 key를 한 DB transaction으로 게시한다.
+Serving plan은 모델 artifact나 모든 모델 feature source를 고정하는 input plan이 아니다.
+Inference는 plan의 logical time·station dependency·expected station set을 소비하되,
+실행 시작에 serving release를 고정하고 rental history, horizon별 날씨·생활인구와
+stockout 입력을 직접 선택한다. 계산 중 실제 읽은 non-model S3 object는 exact bytes로
+inference manifest에 기록한다.
+
+따라서 prepare는 **Gold projection/scope/transaction authority**, inference는
+**actual model-input selection/provenance authority**다. Finalize는 두 manifest의
+plan ref·station dependency·expected ID·model support 결합을 검증한 뒤 다음 네 key를
+한 DB transaction으로 게시한다.
 
 | Publication key | Target | 핵심 입력 |
 | --- | --- | --- |
@@ -140,7 +151,18 @@ dispatch_center + station topology + 진행 중 route
 
 ### `rebalance_route`
 
-Route publisher는 `station_urgency` publication manifest와 현재 Gold topology를 입력으로 사용한다. 센터별 pickup·dropoff station을 묶어 결정적 UUID와 stop 순서를 만들고 proposed route와 stop을 원자 게시한다.
+`route-v4-supply-led-pickup-sla` publisher는 `station_urgency` publication manifest와 현재
+Gold topology를 입력으로 사용한다. 센터별 최고 supply urgency가 경로 순서를 소유하고
+`center→pickup→supply` 총거리로 안전한 pickup을 고른다. 실제 pickup 방문은 센터부터
+최근접 순서이며 이동속도 20km/h와 stop당 3분을 적용한 마지막 pickup 실행시각이 dispatch
+뒤 30분 이하여야 한다. 큰 split이 이 SLA를 넘으면 더 작은 pickup·dropoff 완결 route로
+분리하고, 단일 pickup도 30분 밖인 donor는 제외한다. 모든 pickup 뒤 최고 supply를 첫
+dropoff로 두어 결정적 UUID와 stop 순서를 만들고 proposed route와 stop을 원자 게시한다.
+
+정책의 exclusive 설정은 같은 pickup station을 한 plan의 여러 route로 나누지 않는다.
+진행 중 route가 예약한 pickup과 완료 뒤 cooldown 안의 pickup은
+`pickup_cooldown_station_ids` artifact로 고정해 새 후보에서 제외하며, 해당 정책 config와
+SLA 속도·작업시간·상한·버전은 route input fingerprint에 남긴다.
 
 이미 dispatched·completed·cancelled인 route와 해당 stop은 새 제안 publication이 삭제하지 않는다.
 

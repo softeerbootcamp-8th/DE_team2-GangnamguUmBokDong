@@ -91,10 +91,10 @@ import json
 import re
 import sys
 import threading
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from contextvars import ContextVar
+from contextvars import Context, ContextVar, copy_context
 from datetime import datetime
 from functools import wraps
 
@@ -178,6 +178,13 @@ _raw_rental_trips: pd.DataFrame | None = (
 _recent_population_by_ts: dict[
     pd.Timestamp, pd.DataFrame
 ] = {}  # _get_recent_population() 캐시 — target_ts별로 한 번만 S3에서 읽는다
+_weather_snapshot_by_key: dict[str, pd.DataFrame | None] = {}
+_recent_weather_by_query: dict[
+    tuple[pd.Timestamp, float], tuple[dict[str, float], str]
+] = {}
+_forecast_weather_by_query: dict[
+    tuple[pd.Timestamp, float], tuple[dict[str, float] | None, str | None]
+] = {}
 _PINNED_STATION_PROFILE: ContextVar[
     tuple[dict[int, int], dict[tuple[int, int], np.ndarray]] | None
 ] = (
@@ -233,6 +240,9 @@ def _clear_runtime_caches() -> None:
     _holidays_by_year.clear()
     _raw_rental_trips = None
     _recent_population_by_ts.clear()
+    _weather_snapshot_by_key.clear()
+    _recent_weather_by_query.clear()
+    _forecast_weather_by_query.clear()
 
 
 @contextmanager
@@ -327,15 +337,20 @@ def authority_inference_run(
         _PREDICTION_RUN_LOCK.release()
 
 
-def _read_authoritative_collector_many(
+def _read_authoritative_collector_snapshots(
     logical_keys: list[str],
     columns: list[str] | None = None,
 ) -> list[pd.DataFrame | None]:
-    """옛 logical Silver key 목록을 authority manifest 기반 snapshot으로 해석한다.
+    """logical Silver key 목록을 authority snapshot으로 읽고 metadata는 남기지 않는다.
 
     ``silver_schema``의 key builder는 저장 객체의 실제 위치가 아니라 source와 KST
     logical window를 결정적으로 표현하는 주소로만 쓴다. 실제 bytes는 Collector가
     발행한 최신 correction manifest가 가리키는 content-addressed Parquet에서 읽는다.
+
+    호출자가 실제로 선택한 snapshot을 알기 전에는 provenance를 확정할 수 없다.
+    따라서 이 저수준 함수는 I/O만 담당하고, 일반 호출부는
+    ``_read_authoritative_collector_many()``가, 유효성 fallback이 있는 날씨 호출부는
+    최종 선택 뒤 ``_emit_source_selection_metadata()``가 metadata를 한 번 남긴다.
     """
 
     def _read(logical_key: str) -> pd.DataFrame | None:
@@ -364,16 +379,47 @@ def _read_authoritative_collector_many(
 
     if not logical_keys:
         return []
+
+    # ContextVar는 worker thread로 자동 전파되지 않는다. Inference publication의
+    # S3 read capture를 각 source authority 조회에 전달하되, Context 객체 자체는
+    # 동시에 재진입할 수 없으므로 작업마다 독립 copy를 만든다.
+    contexts = [copy_context() for _ in logical_keys]
+
+    def _read_in_context(item: tuple[Context, str]) -> pd.DataFrame | None:
+        """복사한 caller context 안에서 source snapshot 하나를 읽는다."""
+        context, logical_key = item
+        return context.run(_read, logical_key)
+
     with ThreadPoolExecutor(max_workers=min(16, len(logical_keys))) as pool:
-        snapshots = list(pool.map(_read, logical_keys))
-    _emit_source_selection_metadata(logical_keys, snapshots)
+        return list(
+            pool.map(_read_in_context, zip(contexts, logical_keys, strict=True))
+        )
+
+
+def _read_authoritative_collector_many(
+    logical_keys: list[str],
+    columns: list[str] | None = None,
+) -> list[pd.DataFrame | None]:
+    """authority snapshot들을 병렬로 읽고 기존 query 단위 metadata를 남긴다."""
+    snapshots = _read_authoritative_collector_snapshots(logical_keys, columns)
+    selected_index = next(
+        (
+            index
+            for index in range(len(snapshots) - 1, -1, -1)
+            if snapshots[index] is not None
+        ),
+        None,
+    )
+    _emit_source_selection_metadata(logical_keys, selected_index)
     return snapshots
 
 
 def _emit_source_selection_metadata(
-    logical_keys: list[str], snapshots: list[pd.DataFrame | None]
+    logical_keys: list[str], selected_index: int | None
 ) -> None:
-    """이미 읽은 결과에서 공통 metadata를 계산해 구조화 로그로 남긴다."""
+    """요청 범위와 실제 선택 index에서 공통 metadata를 구조화 로그로 남긴다."""
+    if not logical_keys:
+        return
     parsed: list[tuple[str, datetime]] = []
     for key in logical_keys:
         match = _COLLECTOR_LOGICAL_KEY.fullmatch(key)
@@ -383,10 +429,6 @@ def _emit_source_selection_metadata(
         ).tz_localize("Asia/Seoul")
         parsed.append((match.group("source"), logical.to_pydatetime()))
     source_id, requested = parsed[-1]
-    selected_index = next(
-        (index for index in range(len(snapshots) - 1, -1, -1) if snapshots[index] is not None),
-        None,
-    )
     if selected_index is None:
         metadata = SourceSelectionMetadata(
             source_id=source_id,
@@ -398,6 +440,8 @@ def _emit_source_selection_metadata(
             selected_dttm=None,
         )
     else:
+        if not 0 <= selected_index < len(parsed):
+            raise IndexError("selected_index가 logical key 범위를 벗어났습니다.")
         selected_source, selected = parsed[selected_index]
         assert selected_source == source_id
         metadata = SourceSelectionMetadata(
@@ -405,7 +449,7 @@ def _emit_source_selection_metadata(
             status=SourceDataStatus.SUCCESS,
             freshness=(
                 SourceFreshness.CURRENT
-                if selected_index == len(snapshots) - 1
+                if selected_index == len(logical_keys) - 1
                 else SourceFreshness.STALE
             ),
             partial_policy=PartialConsumptionPolicy.REJECT,
@@ -1100,6 +1144,58 @@ def _weather_values(df: pd.DataFrame | None) -> dict[str, float] | None:
     return {"temp": float(means["temp"]), "precip": float(means["precip"])}
 
 
+def _cache_weather_snapshots(logical_keys: list[str]) -> None:
+    """아직 cache에 없는 날씨 snapshot들을 병렬로 읽어 raw 결과를 보존한다."""
+    missing_keys = [
+        logical_key
+        for logical_key in logical_keys
+        if logical_key not in _weather_snapshot_by_key
+    ]
+    if not missing_keys:
+        return
+    snapshots = _read_authoritative_collector_snapshots(missing_keys)
+    _weather_snapshot_by_key.update(zip(missing_keys, snapshots))
+
+
+def _select_weather_snapshot(
+    logical_keys: list[str],
+    selector: Callable[[pd.DataFrame | None], dict[str, float] | None],
+) -> tuple[dict[str, float] | None, str | None]:
+    """최신 snapshot을 먼저 확인하고 miss면 나머지를 병렬 조회해 선택한다.
+
+    최신 key가 유효한 happy path는 authority 조회 한 건으로 끝낸다. 최신 snapshot이
+    없거나 내용이 무효인 cold miss에서는 남은 후보를 한꺼번에 prefetch하므로,
+    과거 key를 하나씩 직렬 조회하던 latency 회귀를 만들지 않는다. Cache에 이미 든
+    raw snapshot도 같은 선택 규칙으로 재사용하되 query provenance는 호출자가 매번
+    남길 수 있도록 실제 선택 key를 함께 반환한다.
+    """
+    if not logical_keys:
+        return None, None
+
+    newest_key = logical_keys[-1]
+    _cache_weather_snapshots([newest_key])
+    selected = selector(_weather_snapshot_by_key[newest_key])
+    if selected is not None:
+        return selected, newest_key
+
+    _cache_weather_snapshots(logical_keys[:-1])
+    for logical_key in reversed(logical_keys[:-1]):
+        selected = selector(_weather_snapshot_by_key[logical_key])
+        if selected is not None:
+            return selected, logical_key
+    return None, None
+
+
+def _emit_weather_selection_metadata(
+    logical_keys: list[str], selected_key: str | None
+) -> None:
+    """Cache hit을 포함한 날씨 query마다 실제 선택 provenance를 한 번 남긴다."""
+    selected_index = (
+        None if selected_key is None else logical_keys.index(selected_key)
+    )
+    _emit_source_selection_metadata(logical_keys, selected_index)
+
+
 def _get_recent_weather(
     target_ts: pd.Timestamp,
     lookback_hours: float = silver_schema.WEATHER_MAX_STALENESS_HOURS,
@@ -1122,13 +1218,19 @@ def _get_recent_weather(
     raises:
         ValueError: target_ts부터 lookback_hours시간 전까지 전부 데이터가 없을 때
     """
+    query = (target_ts, lookback_hours)
     keys = silver_schema.weather_tick_keys(target_ts, lookback_hours)
-    for df in reversed(
-        _read_authoritative_collector_many(keys)
-    ):  # target_ts에 가장 가까운 것부터
-        weather = _weather_values(df)
-        if weather is not None:
-            return weather
+    if query in _recent_weather_by_query:
+        weather, selected_key = _recent_weather_by_query[query]
+        _emit_weather_selection_metadata(keys, selected_key)
+        return weather
+
+    weather, selected_key = _select_weather_snapshot(keys, _weather_values)
+    _emit_weather_selection_metadata(keys, selected_key)
+    if weather is not None:
+        assert selected_key is not None
+        _recent_weather_by_query[query] = (weather, selected_key)
+        return weather
     raise ValueError(
         f"최근 {lookback_hours}시간 안에 날씨 데이터가 없습니다(target_ts={target_ts})"
     )
@@ -1161,21 +1263,27 @@ def _get_forecast_weather(
             타겟 시각 컬럼이 없거나 강수량 파싱에 전부 실패하면 None(호출부가
             관측치 fallback으로 넘어감)
     """
+    query = (target_ts, issue_lookback_hours)
     keys = silver_schema.weather_forecast_issue_keys(target_ts, issue_lookback_hours)
+    if query in _forecast_weather_by_query:
+        weather, selected_key = _forecast_weather_by_query[query]
+        _emit_weather_selection_metadata(keys, selected_key)
+        return weather
+
     date_col, time_col = (
         silver_schema.WEATHER_FORECAST_DATE_COLUMN,
         silver_schema.WEATHER_FORECAST_TIME_COLUMN,
     )
-    for df in reversed(
-        _read_authoritative_collector_many(keys)
-    ):  # 가장 최근 발표 파일부터
+
+    def _select(df: pd.DataFrame | None) -> dict[str, float] | None:
+        """한 발표 snapshot에서 target 시각에 쓸 유효한 서울 평균을 고른다."""
         if (
             df is None
             or df.empty
             or date_col not in df.columns
             or time_col not in df.columns
         ):
-            continue
+            return None
         fcst_ts = pd.to_datetime(
             df[date_col].astype(str).str.zfill(8)
             + df[time_col].astype(str).str.zfill(4),
@@ -1184,10 +1292,10 @@ def _get_forecast_weather(
         )
         distances = (fcst_ts - target_ts).abs()
         if distances.isna().all():
-            continue
+            return None
         minimum_distance = distances.min()
         if minimum_distance > _MAX_FORECAST_DISTANCE:
-            continue
+            return None
         # 한 발표 파일에는 같은 예보 시각의 서울 격자 행이 여러 개 있다. 임의의
         # 첫 행 하나를 고르면 S3/concat 순서에 따라 값이 달라지므로, 최소 시간거리인
         # 행을 모두 모은 뒤 유효한 격자들의 서울 평균을 사용한다.
@@ -1195,7 +1303,7 @@ def _get_forecast_weather(
             columns=silver_schema.WEATHER_FORECAST_COLUMN_MAP
         )
         if "temp" not in nearest.columns or "PCP" not in nearest.columns:
-            continue
+            return None
         numeric = pd.DataFrame(
             {
                 "temp": pd.to_numeric(nearest["temp"], errors="coerce"),
@@ -1216,10 +1324,14 @@ def _get_forecast_weather(
             )
         )
         if not valid.any():
-            continue
+            return None
         means = numeric.loc[valid, ["temp", "precip"]].mean()
         return {"temp": float(means["temp"]), "precip": float(means["precip"])}
-    return None
+
+    weather, selected_key = _select_weather_snapshot(keys, _select)
+    _emit_weather_selection_metadata(keys, selected_key)
+    _forecast_weather_by_query[query] = (weather, selected_key)
+    return weather
 
 
 def _get_recent_bike_status(

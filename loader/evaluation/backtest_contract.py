@@ -6,8 +6,13 @@ from dataclasses import asdict, dataclass
 from datetime import date
 from typing import Any
 
+from gold.rebalance_route import (
+    PICKUP_DISPATCH_ASSUMED_SPEED_KMH,
+    PICKUP_DISPATCH_SERVICE_MINUTES_PER_STOP,
+)
 
 EVIDENCE_GRADE = "retrospective_heldout_replay"
+BACKTEST_CONTRACT_VERSION = "point-in-time-policy-backtest-v3"
 PRIMARY_METRIC = "observed_demand_fulfillment_rate"
 SUPPORTED_CLAIM = (
     "고정된 관측 수요와 명시한 모의 운영 자원 아래에서 우리 정책을 "
@@ -29,8 +34,8 @@ class EvaluationContract:
     tick_minutes: int = 5
     fleet_size: int = 3
     truck_capacity: int = 20
-    speed_kmh: float = 20.0
-    service_minutes_per_stop: float = 3.0
+    speed_kmh: float = PICKUP_DISPATCH_ASSUMED_SPEED_KMH
+    service_minutes_per_stop: float = PICKUP_DISPATCH_SERVICE_MINUTES_PER_STOP
     approval_delay_minutes: int = 0
     weather_publication_lag_minutes: int = 60
     population_lookback_weeks: int = 4

@@ -1518,7 +1518,13 @@ def _inference_output_bytes(
                     "minute": target.minute,
                     "horizon": horizon,
                     "rental_pred_mean": prediction_offset + 1.0,
+                    "rental_pred_p10": 0.25,
+                    "rental_pred_p50": prediction_offset + 0.5,
+                    "rental_pred_p90": prediction_offset + 1.5,
                     "return_pred_mean": 2.5,
+                    "return_pred_p10": 1.0,
+                    "return_pred_p50": 2.5,
+                    "return_pred_p90": 3.5,
                 }
             )
     table = canonicalize_inference_output_table(

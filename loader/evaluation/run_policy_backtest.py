@@ -2,24 +2,33 @@
 
 from __future__ import annotations
 
-import argparse
 import hashlib
 import json
-import os
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from core.scoring_config import URGENCY_SCORING_CONFIG_VERSION
 from gold.demand import DemandForecastRecord
-from gold.rebalance_route import DispatchCenterTopology
+from gold.rebalance_policy import (
+    DEFAULT_REBALANCE_POLICY,
+    RebalancePolicyConfig,
+)
+from gold.rebalance_route import (
+    MAX_STOPS_PER_ROUTE,
+    ROUTE_ALGORITHM_VERSION,
+    DispatchCenterTopology,
+)
 
 from .backtest_contract import (
+    BACKTEST_CONTRACT_VERSION,
     EVIDENCE_GRADE,
     EvaluationContract,
     validate_sensitivity_contracts,
 )
+from .evaluation_profiles import PRODUCTION_POLICY_NAME
 from .historical_inputs import (
     HORIZON_COUNT,
     HistoricalStation,
@@ -82,6 +91,48 @@ class DurationResult:
 
 
 @dataclass(frozen=True, slots=True)
+class PolicyVariant:
+    """한 백테스트에서 비교할 정책 설정과 작업 대여소 상한을 묶는다."""
+
+    name: str
+    max_stops_per_route: int
+    policy_config: RebalancePolicyConfig
+
+    def __post_init__(self) -> None:
+        """정책 이름·대여소 상한·설정 타입을 검증한다."""
+        if type(self.name) is not str or not self.name.strip():
+            raise ValueError("policy variant name은 nonblank여야 합니다.")
+        if (
+            type(self.max_stops_per_route) is not int
+            or not 2 <= self.max_stops_per_route <= 32767
+        ):
+            raise ValueError("policy variant max stops는 2..32767이어야 합니다.")
+        if type(self.policy_config) is not RebalancePolicyConfig:
+            raise ValueError("policy variant config 타입이 잘못됐습니다.")
+
+
+def default_policy_variants(
+    max_stops_variants: tuple[int, ...],
+) -> tuple[PolicyVariant, ...]:
+    """직접 실행의 기본 후보를 production 정책과 명시적 작업 상한으로 만든다."""
+    return tuple(
+        PolicyVariant(
+            name=(
+                PRODUCTION_POLICY_NAME
+                if max_stops == MAX_STOPS_PER_ROUTE
+                else (
+                    f"experimental_{ROUTE_ALGORITHM_VERSION.replace('-', '_')}_"
+                    f"max_stops_{max_stops}"
+                )
+            ),
+            max_stops_per_route=max_stops,
+            policy_config=DEFAULT_REBALANCE_POLICY,
+        )
+        for max_stops in max_stops_variants
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class PolicyBacktestResult:
     """사전 계약·근거 gate·민감도 결과를 한 문서로 묶는다."""
 
@@ -93,7 +144,7 @@ class PolicyBacktestResult:
     model_bundle_root: str
     model_bundle_sha256: str
     source_trip_count: int
-    source_provenance: "SourceProvenance"
+    source_provenance: SourceProvenance
     evidence_gate: EvidenceGate
     contracts: tuple[Mapping[str, object], ...]
     durations: tuple[DurationResult, ...]
@@ -123,6 +174,7 @@ class SourceProvenance:
     population_excluded_grid_ids: tuple[str, ...]
     backtest_contract_version: str
     route_algorithm_version: str
+    urgency_scoring_config_version: str
 
 
 def run_policy_backtest(
@@ -143,6 +195,7 @@ def run_policy_backtest(
     bucket: str,
     access_key: str,
     secret_key: str,
+    policy_variants: tuple[PolicyVariant, ...] | None = None,
 ) -> PolicyBacktestResult:
     """실제 입력 로드부터 동일 예산 정책 민감도까지 전체 평가를 실행한다."""
     contracts = tuple(
@@ -156,6 +209,18 @@ def run_policy_backtest(
     )
     if evaluation_minutes == (60, 120, 180):
         validate_sensitivity_contracts(contracts)
+    variants = (
+        default_policy_variants(max_stops_variants)
+        if policy_variants is None
+        else policy_variants
+    )
+    if (
+        type(variants) is not tuple
+        or not variants
+        or any(type(variant) is not PolicyVariant for variant in variants)
+        or len({variant.name for variant in variants}) != len(variants)
+    ):
+        raise ValueError("policy variants는 이름이 고유한 nonempty tuple이어야 합니다.")
     centers = load_centers(center_seed)
     matches = [row for row in centers if row[0].dispatch_center_id == center_id]
     if len(matches) != 1:
@@ -190,16 +255,16 @@ def run_policy_backtest(
         window_end=max_end,
     )
     if not selected:
-        raise ValueError("선택 권역에서 model·station·재고 공통 평가 대여소가 없습니다.")
+        raise ValueError(
+            "선택 권역에서 model·station·재고 공통 평가 대여소가 없습니다."
+        )
     population_requirements = _population_required_hours(
         window_start=_window_start(target_date, start_hour),
         window_end=max_end,
         tick_minutes=contracts[0].tick_minutes,
     )
     population_dates = tuple(population_requirements)
-    candidate_grid_ids = frozenset(
-        station.grid_id for station in selected.values()
-    )
+    candidate_grid_ids = frozenset(station.grid_id for station in selected.values())
     population = build_population_nowcast(
         population_dir=population_dir,
         target_dates=population_dates,
@@ -211,9 +276,7 @@ def run_policy_backtest(
         candidate_grid_ids,
         population_requirements,
     )
-    population_excluded_grid_ids = tuple(
-        sorted(candidate_grid_ids - complete_grid_ids)
-    )
+    population_excluded_grid_ids = tuple(sorted(candidate_grid_ids - complete_grid_ids))
     station_count_before_population = len(selected)
     selected = {
         station_no: station
@@ -248,8 +311,9 @@ def run_policy_backtest(
         station_crosswalk_sha256=_station_crosswalk_sha256(station_crosswalk),
         population_excluded_station_count=population_excluded_station_count,
         population_excluded_grid_ids=population_excluded_grid_ids,
-        backtest_contract_version="point-in-time-policy-backtest-v2",
-        route_algorithm_version="route-v2",
+        backtest_contract_version=BACKTEST_CONTRACT_VERSION,
+        route_algorithm_version=ROUTE_ALGORITHM_VERSION,
+        urgency_scoring_config_version=URGENCY_SCORING_CONFIG_VERSION,
     )
 
     def provider(
@@ -310,17 +374,18 @@ def run_policy_backtest(
         )
         model_policies = tuple(
             simulate_policy(
-                policy=f"model_route_v2_max_stops_{max_stops}",
+                policy=variant.name,
                 contract=contract,
                 center=center,
                 stations=tuple(selected.values()),
                 initial_stock=initial_stock,
                 trips=trips,
                 forecast_provider=provider,
-                max_stops_per_route=max_stops,
+                max_stops_per_route=variant.max_stops_per_route,
                 movement_budget=legacy.balanced_movement_budget,
+                policy_config=variant.policy_config,
             )
-            for max_stops in max_stops_variants
+            for variant in variants
         )
         duration_results.append(
             DurationResult(
@@ -332,7 +397,9 @@ def run_policy_backtest(
                 model_policies=model_policies,
             )
         )
-    point_in_time_passed = _audit_prediction_inputs(tuple(duration_results), target_date)
+    point_in_time_passed = _audit_prediction_inputs(
+        tuple(duration_results), target_date
+    )
     operation_contract_passed = _audit_operation_contract(
         tuple(duration_results),
         contracts,
@@ -464,7 +531,10 @@ def _audit_prediction_inputs(
         weather = datetime.fromisoformat(audit.weather_observed_at)
         if weather > cutoff.replace(tzinfo=None):
             return False
-        if any(date.fromisoformat(day) >= target_date for day in audit.population_candidate_dates):
+        if any(
+            date.fromisoformat(day) >= target_date
+            for day in audit.population_candidate_dates
+        ):
             return False
         if datetime.fromisoformat(audit.rental_visibility_cutoff) != anchor:
             return False
@@ -528,8 +598,7 @@ def _population_required_hours(
             required.setdefault(target.date(), set()).add(target.hour)
         anchor += timedelta(minutes=tick_minutes)
     return {
-        target_date: frozenset(hours)
-        for target_date, hours in sorted(required.items())
+        target_date: frozenset(hours) for target_date, hours in sorted(required.items())
     }
 
 
@@ -584,157 +653,3 @@ def _station_crosswalk_sha256(station_crosswalk: Mapping[int, int]) -> str:
         sort_keys=True,
     ).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
-
-
-def result_markdown(result: PolicyBacktestResult) -> str:
-    """백테스트 결과를 과장 주장 방지 문구와 함께 검토용 표로 만든다."""
-    lines = [
-        f"# {result.target_date} {result.center_name} 정책 백테스트",
-        "",
-        f"- 근거 등급: `{result.evidence_grade}`",
-        f"- 모델 SHA-256: `{result.model_bundle_sha256}`",
-        f"- 발표용 시스템 개선 주장 허용: **{result.evidence_gate.publication_grade_system_claim_allowed}**",
-        f"- 제한 이유: {result.evidence_gate.reason}",
-        "",
-        "| 평가 | 정책 | 관측 수요 충족률 | 미충족 | 품절 대여소-분 | 이동 대수 | 경로 | 차량 분 |",
-        "|---:|---|---:|---:|---:|---:|---:|---:|",
-    ]
-    for duration in result.durations:
-        base = duration.no_rebalance
-        lines.append(
-            f"| {duration.evaluation_minutes}분 | 재배치 없음 | "
-            f"{base.observed_demand_fulfillment_rate:.4f} | {base.unfulfilled_requests} | "
-            f"{base.empty_station_minutes:.1f} | 0 | 0 | 0.0 |"
-        )
-        for policy in duration.model_policies:
-            lines.append(
-                f"| {duration.evaluation_minutes}분 | {policy.policy} | "
-                f"{policy.observed_demand_fulfillment_rate:.4f} | "
-                f"{policy.unfulfilled_requests} | {policy.empty_station_minutes:.1f} | "
-                f"{policy.moved_bikes} | {policy.dispatched_routes} | "
-                f"{policy.vehicle_busy_minutes:.1f} |"
-            )
-        legacy_values = [row.empty_station_minutes for row in duration.legacy_timing]
-        lines.append(
-            f"| {duration.evaluation_minutes}분 | 추정 기존 운영 범위 | 해당 없음 | 해당 없음 | "
-            f"{min(legacy_values):.1f}~{max(legacy_values):.1f} | "
-            f"예산 {duration.legacy_movement.balanced_movement_budget} | 경로 미관측 | 미관측 |"
-        )
-    lines.extend(
-        (
-            "",
-            "> 기존 운영 범위는 시간별 재고 잔차를 구간 초·중·말에 적용한 민감도다. "
-            "운영 route·truck과 실패 수요가 없으므로 실제 운영 대비 인과적 우월성으로 인용하면 안 된다.",
-            "",
-        )
-    )
-    return "\n".join(lines)
-
-
-def write_result(result: PolicyBacktestResult, output_dir: Path) -> tuple[Path, Path]:
-    """전체 tick 감사 JSON과 사람이 검토할 Markdown 결과를 저장한다."""
-    output_dir.mkdir(parents=True, exist_ok=True)
-    stem = f"{result.target_date}-{result.center_id}-{result.start_hour:02d}h-policy"
-    json_path = output_dir / f"{stem}.json"
-    markdown_path = output_dir / f"{stem}.md"
-    json_path.write_text(
-        json.dumps(
-            asdict(result),
-            ensure_ascii=False,
-            indent=2,
-            default=_json_default,
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    markdown_path.write_text(result_markdown(result), encoding="utf-8")
-    return json_path, markdown_path
-
-
-def _json_default(value: object) -> str:
-    """JSON 표준형이 아닌 date·datetime만 ISO 문자열로 직렬화한다."""
-    if isinstance(value, (date, datetime)):
-        return value.isoformat()
-    raise TypeError(f"JSON으로 직렬화할 수 없는 타입입니다: {type(value).__name__}")
-
-
-def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    """point-in-time 정책 백테스트 CLI 인자를 파싱한다."""
-    parser = argparse.ArgumentParser(description="실제 모델 5분 재배치 정책 백테스트")
-    parser.add_argument("--date", required=True, type=date.fromisoformat)
-    parser.add_argument("--center", required=True)
-    parser.add_argument("--start-hour", type=int, default=6)
-    parser.add_argument("--evaluation-minutes", nargs="+", type=int, default=[60, 120, 180])
-    parser.add_argument("--fleet-size", type=int, default=3)
-    parser.add_argument("--max-stops", nargs="+", type=int, default=[5, 8])
-    parser.add_argument("--rental-csv", required=True, type=Path)
-    parser.add_argument("--stock-csv", required=True, type=Path)
-    parser.add_argument(
-        "--weather-csv",
-        type=Path,
-        default=Path("../data/issue163-full-year/bootstrap/weather_realtime_2025.csv"),
-    )
-    parser.add_argument(
-        "--population-dir",
-        type=Path,
-        default=Path("../data/issue163-full-year/population"),
-    )
-    parser.add_argument(
-        "--model-bundle",
-        type=Path,
-        default=Path("../models/aws-temporary-model-2025-d20-h12-r20"),
-    )
-    parser.add_argument(
-        "--center-seed",
-        type=Path,
-        default=Path("../docs/gold/dispatch-center-seed.yaml"),
-    )
-    parser.add_argument("--s3-endpoint", default=os.environ.get("S3_ENDPOINT_URL", "http://localhost:9000"))
-    parser.add_argument("--s3-bucket", default="issue163-full-year")
-    parser.add_argument("--access-key", default=os.environ.get("AWS_ACCESS_KEY_ID", "minioadmin"))
-    parser.add_argument("--secret-key", default=os.environ.get("AWS_SECRET_ACCESS_KEY", "minioadmin"))
-    parser.add_argument("--output-dir", type=Path, default=Path("../data/backtest-results"))
-    args = parser.parse_args(argv)
-    if not 0 <= args.start_hour <= 23:
-        parser.error("--start-hour는 0..23이어야 합니다.")
-    if args.date.day != 17:
-        parser.error("현재 고정 모델의 held-out test split인 매월 17일만 평가합니다.")
-    if tuple(args.evaluation_minutes) != (60, 120, 180):
-        parser.error("기본 근거 실행은 --evaluation-minutes 60 120 180을 모두 사용해야 합니다.")
-    if args.fleet_size <= 0:
-        parser.error("--fleet-size는 양수여야 합니다.")
-    if any(not 2 <= value <= 32767 for value in args.max_stops):
-        parser.error("--max-stops는 각각 2..32767이어야 합니다.")
-    return args
-
-
-def main(argv: Sequence[str] | None = None) -> int:
-    """실제 정책 백테스트를 실행하고 결과 위치를 출력한다."""
-    args = parse_args(argv)
-    result = run_policy_backtest(
-        target_date=args.date,
-        center_id=args.center,
-        start_hour=args.start_hour,
-        evaluation_minutes=tuple(args.evaluation_minutes),
-        fleet_size=args.fleet_size,
-        max_stops_variants=tuple(dict.fromkeys(args.max_stops)),
-        rental_csv=args.rental_csv,
-        stock_csv=args.stock_csv,
-        weather_csv=args.weather_csv,
-        population_dir=args.population_dir,
-        model_bundle_root=args.model_bundle,
-        center_seed=args.center_seed,
-        endpoint_url=args.s3_endpoint,
-        bucket=args.s3_bucket,
-        access_key=args.access_key,
-        secret_key=args.secret_key,
-    )
-    json_path, markdown_path = write_result(result, args.output_dir)
-    print(result_markdown(result))
-    print(f"JSON: {json_path}")
-    print(f"Markdown: {markdown_path}")
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

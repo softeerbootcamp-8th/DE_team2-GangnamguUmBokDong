@@ -6,7 +6,7 @@ enrich_forecast_points는 실시간(apps/api)과 배치가 함께 쓰므로 이 
 libs/core에서 공유한다.
 """
 
-URGENCY_SCORING_CONFIG_VERSION = "urgency-scoring-v1"
+URGENCY_SCORING_CONFIG_VERSION = "urgency-scoring-v5-capacity-reserve"
 
 # 현행 urgency reader가 anchor-25분부터 anchor-5분까지 읽는 과거 window의
 # 시간 방향을 byte contract로 고정한다. 현재 anchor는 별도

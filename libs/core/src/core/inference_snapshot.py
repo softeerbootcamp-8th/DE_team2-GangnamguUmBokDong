@@ -35,8 +35,18 @@ from .model_snapshot import (
     validate_model_snapshot_manifest,
 )
 
-INFERENCE_SNAPSHOT_MANIFEST_SCHEMA_VERSION = "ml-inference-snapshot-manifest-v1"
-"""Gold ``inference_output`` role이 가리키는 manifest schema version이다."""
+LEGACY_INFERENCE_SNAPSHOT_MANIFEST_SCHEMA_VERSION = "ml-inference-snapshot-manifest-v1"
+"""Mean-only dual-read를 지원하는 구 inference manifest schema version이다."""
+
+INFERENCE_SNAPSHOT_MANIFEST_SCHEMA_VERSION = "ml-inference-snapshot-manifest-v2"
+"""신규 inference producer가 쓰는 current manifest schema version이다."""
+
+_SUPPORTED_INFERENCE_SNAPSHOT_MANIFEST_SCHEMA_VERSIONS = frozenset(
+    {
+        LEGACY_INFERENCE_SNAPSHOT_MANIFEST_SCHEMA_VERSION,
+        INFERENCE_SNAPSHOT_MANIFEST_SCHEMA_VERSION,
+    }
+)
 
 INFERENCE_HORIZON_COUNT = 12
 """Gold demand publication이 요구하는 exact horizon 수다."""
@@ -48,7 +58,13 @@ INFERENCE_OUTPUT_COLUMN_NAMES = (
     "minute",
     "horizon",
     "rental_pred_mean",
+    "rental_pred_p10",
+    "rental_pred_p50",
+    "rental_pred_p90",
     "return_pred_mean",
+    "return_pred_p10",
+    "return_pred_p50",
+    "return_pred_p90",
 )
 """Gold demand가 소비하는 inference output의 exact column 순서다."""
 
@@ -60,10 +76,40 @@ INFERENCE_OUTPUT_ARROW_SCHEMA = pa.schema(
         pa.field("minute", pa.uint8(), nullable=False),
         pa.field("horizon", pa.uint8(), nullable=False),
         pa.field("rental_pred_mean", pa.float64(), nullable=False),
+        pa.field("rental_pred_p10", pa.float64(), nullable=False),
+        pa.field("rental_pred_p50", pa.float64(), nullable=False),
+        pa.field("rental_pred_p90", pa.float64(), nullable=False),
         pa.field("return_pred_mean", pa.float64(), nullable=False),
+        pa.field("return_pred_p10", pa.float64(), nullable=False),
+        pa.field("return_pred_p50", pa.float64(), nullable=False),
+        pa.field("return_pred_p90", pa.float64(), nullable=False),
     )
 )
 """Inference authority Parquet의 metadata 없는 exact non-null Arrow schema다."""
+
+LEGACY_INFERENCE_OUTPUT_COLUMN_NAMES = (
+    "station_id",
+    "date",
+    "hour",
+    "minute",
+    "horizon",
+    "rental_pred_mean",
+    "return_pred_mean",
+)
+"""Mean-only v1 inference output의 exact column 순서다."""
+
+LEGACY_INFERENCE_OUTPUT_ARROW_SCHEMA = pa.schema(
+    (
+        pa.field("station_id", pa.string(), nullable=False),
+        pa.field("date", pa.date32(), nullable=False),
+        pa.field("hour", pa.uint8(), nullable=False),
+        pa.field("minute", pa.uint8(), nullable=False),
+        pa.field("horizon", pa.uint8(), nullable=False),
+        pa.field("rental_pred_mean", pa.float64(), nullable=False),
+        pa.field("return_pred_mean", pa.float64(), nullable=False),
+    )
+)
+"""Dual-read가 허용하는 v1 inference output Arrow schema다."""
 
 _MANIFEST_KEYS = frozenset(
     {
@@ -363,7 +409,7 @@ def build_inference_snapshot_manifest(
     horizon_count: int,
     output: ParquetOutputRef | None,
 ) -> InferenceSnapshotManifest:
-    """Validated inputs를 canonical 순서로 묶어 v1 inference manifest를 만든다."""
+    """Validated inputs를 canonical 순서로 묶어 v2 inference manifest를 만든다."""
     values = tuple(inputs)
     _require_instances(values, ImmutableInputRef, "inference input")
     ordered = tuple(
@@ -397,7 +443,7 @@ def canonicalize_inference_output_table(
     logical_dttm: datetime,
     expected_sta_ids: IdSet,
 ) -> pa.Table:
-    """Producer row를 Gold가 소비하는 7-column authority로 정규화한다.
+    """Producer row를 Gold가 소비하는 13-column authority로 정규화한다.
 
     Extra producer metadata column은 authority에서 제외하고, station×12
     완전성과 KST target time을 검증한 뒤 station UTF-8 byte·horizon
@@ -498,9 +544,33 @@ def canonicalize_inference_output_table(
                     raw["rental_pred_mean"],
                     f"inference output row {index} rental_pred_mean",
                 ),
+                "rental_pred_p10": _require_quantile_prediction(
+                    raw["rental_pred_p10"],
+                    f"inference output row {index} rental_pred_p10",
+                ),
+                "rental_pred_p50": _require_quantile_prediction(
+                    raw["rental_pred_p50"],
+                    f"inference output row {index} rental_pred_p50",
+                ),
+                "rental_pred_p90": _require_quantile_prediction(
+                    raw["rental_pred_p90"],
+                    f"inference output row {index} rental_pred_p90",
+                ),
                 "return_pred_mean": _require_prediction(
                     raw["return_pred_mean"],
                     f"inference output row {index} return_pred_mean",
+                ),
+                "return_pred_p10": _require_quantile_prediction(
+                    raw["return_pred_p10"],
+                    f"inference output row {index} return_pred_p10",
+                ),
+                "return_pred_p50": _require_quantile_prediction(
+                    raw["return_pred_p50"],
+                    f"inference output row {index} return_pred_p50",
+                ),
+                "return_pred_p90": _require_quantile_prediction(
+                    raw["return_pred_p90"],
+                    f"inference output row {index} return_pred_p90",
                 ),
             }
         )
@@ -539,7 +609,7 @@ def canonicalize_inference_output_table(
 
 
 def serialize_inference_output_parquet(table: pa.Table) -> bytes:
-    """Exact 7-column authority table을 고정 writer option의 Parquet bytes로 만든다."""
+    """Exact 13-column authority table을 고정 writer option의 Parquet bytes로 만든다."""
     _require_exact_output_schema(table)
     _require_canonical_output_order(table)
     sink = pa.BufferOutputStream()
@@ -555,13 +625,45 @@ def serialize_inference_output_parquet(table: pa.Table) -> bytes:
     return sink.getvalue().to_pybytes()
 
 
+def _canonicalize_legacy_inference_output_table(
+    table: pa.Table,
+    *,
+    logical_dttm: datetime,
+    expected_sta_ids: IdSet,
+) -> pa.Table:
+    """v1 mean-only table을 current 공통 불변식으로 검증해 canonicalize한다."""
+    _require_exact_legacy_output_schema(table)
+    augmented_rows = []
+    for row in table.to_pylist():
+        augmented_rows.append(
+            {
+                **row,
+                "rental_pred_p10": row["rental_pred_mean"],
+                "rental_pred_p50": row["rental_pred_mean"],
+                "rental_pred_p90": row["rental_pred_mean"],
+                "return_pred_p10": row["return_pred_mean"],
+                "return_pred_p50": row["return_pred_mean"],
+                "return_pred_p90": row["return_pred_mean"],
+            }
+        )
+    current = canonicalize_inference_output_table(
+        pa.Table.from_pylist(augmented_rows),
+        logical_dttm=logical_dttm,
+        expected_sta_ids=expected_sta_ids,
+    )
+    legacy = current.select(LEGACY_INFERENCE_OUTPUT_COLUMN_NAMES)
+    _require_exact_legacy_output_schema(legacy)
+    return legacy
+
+
 def parse_inference_output_parquet(
     payload: bytes,
     *,
     logical_dttm: datetime,
     expected_sta_ids: IdSet,
+    schema_version: str = INFERENCE_SNAPSHOT_MANIFEST_SCHEMA_VERSION,
 ) -> pa.Table:
-    """Parquet bytes를 exact schema·KST target·completeness 검증 후 읽는다."""
+    """v1/v2 Parquet bytes를 schema·KST target·completeness 검증 후 읽는다."""
     if type(payload) is not bytes:
         raise InferenceSnapshotContractError(
             "inference output Parquet payload는 exact bytes여야 합니다."
@@ -572,12 +674,20 @@ def parse_inference_output_parquet(
         raise InferenceSnapshotContractError(
             "inference output Parquet bytes를 읽을 수 없습니다."
         ) from exc
-    _require_exact_output_schema(table)
-    canonical = canonicalize_inference_output_table(
-        table,
-        logical_dttm=logical_dttm,
-        expected_sta_ids=expected_sta_ids,
-    )
+    _require_supported_inference_schema_version(schema_version)
+    if schema_version == LEGACY_INFERENCE_SNAPSHOT_MANIFEST_SCHEMA_VERSION:
+        canonical = _canonicalize_legacy_inference_output_table(
+            table,
+            logical_dttm=logical_dttm,
+            expected_sta_ids=expected_sta_ids,
+        )
+    else:
+        _require_exact_output_schema(table)
+        canonical = canonicalize_inference_output_table(
+            table,
+            logical_dttm=logical_dttm,
+            expected_sta_ids=expected_sta_ids,
+        )
     if not table.equals(canonical, check_metadata=True):
         raise InferenceSnapshotContractError(
             "inference output Parquet row는 canonical station/horizon 순서여야 합니다."
@@ -586,7 +696,7 @@ def parse_inference_output_parquet(
 
 
 def parse_inference_snapshot_manifest(payload: bytes) -> InferenceSnapshotManifest:
-    """Canonical bytes를 exact-key v1 inference snapshot manifest로 파싱한다."""
+    """Canonical bytes를 exact-key v1/v2 inference manifest로 파싱한다."""
     document = _require_exact_object(
         parse_canonical_json(payload),
         _MANIFEST_KEYS,
@@ -641,11 +751,7 @@ def validate_inference_snapshot_manifest(
         raise InferenceSnapshotContractError(
             "manifest는 exact InferenceSnapshotManifest여야 합니다."
         )
-    _require_exact_string(
-        manifest.schema_version,
-        INFERENCE_SNAPSHOT_MANIFEST_SCHEMA_VERSION,
-        "inference snapshot schema_version",
-    )
+    _require_supported_inference_schema_version(manifest.schema_version)
     _utc_dttm(manifest.logical_dttm)
     _require_nonnegative_integer(manifest.revision_no, "revision_no")
     if type(manifest.status) is not InferenceSnapshotStatus:
@@ -1098,7 +1204,7 @@ def _to_arrow_table(value: pa.Table | pd.DataFrame) -> pa.Table:
 
 
 def _require_exact_output_schema(table: pa.Table) -> None:
-    """Arrow table이 metadata 없는 exact 7-column non-null schema인지 확인한다."""
+    """Arrow table이 metadata 없는 exact 13-column non-null schema인지 확인한다."""
     if type(table) is not pa.Table:
         raise InferenceSnapshotContractError(
             "inference output authority는 exact pyarrow.Table이어야 합니다."
@@ -1108,12 +1214,43 @@ def _require_exact_output_schema(table: pa.Table) -> None:
         check_metadata=True,
     ):
         raise InferenceSnapshotContractError(
-            "inference output Arrow schema가 exact 7-column contract와 다릅니다."
+            "inference output Arrow schema가 exact 13-column contract와 다릅니다."
         )
     if any(column.null_count for column in table.columns):
         raise InferenceSnapshotContractError(
             "inference output authority column은 null을 가질 수 없습니다."
         )
+
+
+def _require_exact_legacy_output_schema(table: pa.Table) -> None:
+    """Arrow table이 metadata 없는 exact v1 7-column schema인지 확인한다."""
+    if type(table) is not pa.Table:
+        raise InferenceSnapshotContractError(
+            "legacy inference output authority는 exact pyarrow.Table이어야 합니다."
+        )
+    if not table.schema.equals(
+        LEGACY_INFERENCE_OUTPUT_ARROW_SCHEMA,
+        check_metadata=True,
+    ):
+        raise InferenceSnapshotContractError(
+            "legacy inference output Arrow schema가 exact 7-column contract와 다릅니다."
+        )
+    if any(column.null_count for column in table.columns):
+        raise InferenceSnapshotContractError(
+            "legacy inference output authority column은 null을 가질 수 없습니다."
+        )
+
+
+def _require_supported_inference_schema_version(value: object) -> str:
+    """Inference manifest/output schema version이 v1 또는 v2인지 확인한다."""
+    if (
+        type(value) is not str
+        or value not in _SUPPORTED_INFERENCE_SNAPSHOT_MANIFEST_SCHEMA_VERSIONS
+    ):
+        raise InferenceSnapshotContractError(
+            "inference snapshot schema_version은 v1 또는 v2여야 합니다."
+        )
+    return value
 
 
 def _require_canonical_output_order(table: pa.Table) -> None:
@@ -1148,6 +1285,18 @@ def _require_canonical_output_order(table: pa.Table) -> None:
             raw["rental_pred_mean"],
             f"inference output row {index} rental_pred_mean",
         )
+        for name in (
+            "rental_pred_p10",
+            "rental_pred_p50",
+            "rental_pred_p90",
+            "return_pred_p10",
+            "return_pred_p50",
+            "return_pred_p90",
+        ):
+            _require_quantile_prediction(
+                raw[name],
+                f"inference output row {index} {name}",
+            )
         _require_prediction(
             raw["return_pred_mean"],
             f"inference output row {index} return_pred_mean",
@@ -1210,6 +1359,18 @@ def _require_prediction(value: Any, label: str) -> float:
         raise InferenceSnapshotContractError(
             f"{label}은 finite nonnegative float64여야 합니다."
         )
+    return 0.0 if normalized == 0 else normalized
+
+
+def _require_quantile_prediction(value: Any, label: str) -> float:
+    """Quantile scalar를 부호와 순서를 바꾸지 않고 finite float64로 정규화한다."""
+    if type(value) not in {int, float} or type(value) is bool:
+        raise InferenceSnapshotContractError(
+            f"{label}은 float64-compatible 숫자여야 합니다."
+        )
+    normalized = float(value)
+    if not math.isfinite(normalized):
+        raise InferenceSnapshotContractError(f"{label}은 finite float64여야 합니다.")
     return 0.0 if normalized == 0 else normalized
 
 

@@ -571,6 +571,8 @@ def _fixture_fingerprint(
             if name == "expected_sta_id_sha256"
             else artifact_by_role["route_coverage"].byte_sha256
             if name == "route_coverage_sha256"
+            else "fixture:rebalance_policy_config"
+            if name == "rebalance_policy_config"
             else f"{salt}:{name}",
         )
         for name in spec.parameter_names
