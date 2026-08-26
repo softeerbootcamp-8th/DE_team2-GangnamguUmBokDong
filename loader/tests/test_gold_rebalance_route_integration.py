@@ -24,8 +24,10 @@ from core.gold_publication import (
     build_publication_manifest,
     sha256_hex,
 )
+from core.scoring_config import URGENCY_SCORING_CONFIG_VERSION
 from gold import rebalance_route as route_module
 from gold.common import parquet_bytes
+from gold.rebalance_policy import DEFAULT_REBALANCE_POLICY
 from gold.rebalance_route import publish_rebalance_route
 from gold.state import load_dependencies
 from psycopg import Connection
@@ -72,7 +74,7 @@ def test_route_publish_replay_coverage_correction_stale_empty_and_rollback(
     gold_connection: Connection[Any],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Clean PostGIS에서 route version·coverage·EMPTY·원자성을 함께 검증한다."""
+    """Clean PostGIS에서 version·coverage·single-flight·원자성을 검증한다."""
     store = S3ImmutableObjectStore(boto3.client("s3", region_name="us-east-1"))
     anchor = datetime.now(UTC).replace(second=0, microsecond=0) - timedelta(minutes=30)
     _insert_topology_and_dependency_states(gold_connection, anchor)
@@ -87,6 +89,28 @@ def test_route_publish_replay_coverage_correction_stale_empty_and_rollback(
     )
     first = _publish(gold_connection, store, first_uri, first_sha)
     assert first.result.outcome is PublicationOutcome.PUBLISHED
+    first_parameters = {
+        parameter.name: parameter.value
+        for parameter in first.evidence[0].input_fingerprint.parameters
+    }
+    assert first_parameters["route_algorithm_version"] == (
+        route_module.ROUTE_ALGORITHM_VERSION
+    )
+    assert first_parameters["route_work_unit_config_version"] == (
+        route_module.ROUTE_WORK_UNIT_CONFIG_VERSION
+    )
+    assert first_parameters["pickup_dispatch_sla_config_version"] == (
+        route_module.PICKUP_DISPATCH_SLA_CONFIG_VERSION
+    )
+    assert first_parameters["pickup_dispatch_assumed_speed_kmh"] == str(
+        route_module.PICKUP_DISPATCH_ASSUMED_SPEED_KMH
+    )
+    assert first_parameters["pickup_dispatch_service_minutes_per_stop"] == str(
+        route_module.PICKUP_DISPATCH_SERVICE_MINUTES_PER_STOP
+    )
+    assert first_parameters["pickup_dispatch_max_lag_minutes"] == str(
+        route_module.PICKUP_DISPATCH_MAX_LAG_MINUTES
+    )
     assert _route_state(gold_connection) == (anchor, 0, 1)
     first_routes, first_stops = _route_rows(gold_connection)
     assert len(first_routes) == 1
@@ -134,14 +158,10 @@ def test_route_publish_replay_coverage_correction_stale_empty_and_rollback(
         correction_sha,
     )
     assert correction.result.outcome is PublicationOutcome.PUBLISHED
-    assert _route_state(gold_connection) == (anchor, 2, 1)
+    assert correction.evidence[0].manifest.artifacts == ()
+    assert _route_state(gold_connection) == (anchor, 2, 0)
     corrected_routes, corrected_stops = _proposed_rows(gold_connection)
-    assert len(corrected_routes) == 1
-    assert corrected_routes[0][0] != route_id
-    assert [(row[2], row[3]) for row in corrected_stops] == [
-        ("pickup", 3),
-        ("dropoff", 3),
-    ]
+    assert (corrected_routes, corrected_stops) == ((), ())
     assert _terminal_rows(gold_connection) == terminal_before
 
     rollback_uri, rollback_sha = _put_urgency_publication(
@@ -163,7 +183,7 @@ def test_route_publish_replay_coverage_correction_stale_empty_and_rollback(
         patch.setattr(route_module, "_reconcile_route_plan", fail_after_reconcile)
         with pytest.raises(RuntimeError, match="forced route reconcile failure"):
             _publish(gold_connection, store, rollback_uri, rollback_sha)
-    assert _route_state(gold_connection) == (anchor, 2, 1)
+    assert _route_state(gold_connection) == (anchor, 2, 0)
     assert _proposed_rows(gold_connection) == (corrected_routes, corrected_stops)
     assert _terminal_rows(gold_connection) == terminal_before
 
@@ -171,7 +191,7 @@ def test_route_publish_replay_coverage_correction_stale_empty_and_rollback(
     _advance_route_state_logical(gold_connection, future_route_logical)
     stale = _publish(gold_connection, store, rollback_uri, rollback_sha)
     assert stale.result.outcome is PublicationOutcome.STALE
-    assert _route_state(gold_connection) == (future_route_logical, 0, 1)
+    assert _route_state(gold_connection) == (future_route_logical, 0, 0)
     assert _proposed_rows(gold_connection) == (corrected_routes, corrected_stops)
 
     empty_anchor = anchor + timedelta(minutes=10)
@@ -254,6 +274,49 @@ def test_concurrent_same_route_publication_is_publish_plus_replay(
     assert _route_state(gold_connection) == (anchor, 0, 1)
 
 
+def test_pickup_cooldown_uses_terminal_lifecycle_semantics(
+    gold_connection: Connection[Any],
+) -> None:
+    """오래된 dispatched와 최근 completed는 막고 cooldown 밖 completed는 허용한다."""
+    store = S3ImmutableObjectStore(boto3.client("s3", region_name="us-east-1"))
+    anchor = datetime.now(UTC).replace(second=0, microsecond=0) - timedelta(minutes=30)
+
+    def publish_fresh_route() -> str:
+        """각 lifecycle 반례를 독립 DB 상태에서 만들고 route ID를 반환한다."""
+        _reset_database(gold_connection)
+        _insert_topology_and_dependency_states(gold_connection, anchor)
+        manifest_uri, manifest_sha = _put_urgency_publication(
+            gold_connection,
+            store,
+            logical_dttm=anchor,
+            revision_no=0,
+            pickup_qty=5,
+            dropoff_qty=5,
+        )
+        _publish(gold_connection, store, manifest_uri, manifest_sha)
+        return _route_rows(gold_connection)[0][0][0]
+
+    logical = anchor + timedelta(hours=10)
+    dispatched_at = anchor + timedelta(minutes=1)
+    route_id = publish_fresh_route()
+    _dispatch_route(gold_connection, route_id, dispatched_at)
+    snapshot = route_module._load_route_database_snapshot(gold_connection, logical)
+    assert snapshot.pickup_cooldown_sta_ids == ("ST-1",)
+
+    route_id = publish_fresh_route()
+    _dispatch_route(gold_connection, route_id, dispatched_at)
+    _complete_route(gold_connection, route_id, logical - timedelta(minutes=1))
+    snapshot = route_module._load_route_database_snapshot(gold_connection, logical)
+    assert snapshot.pickup_cooldown_sta_ids == ("ST-1",)
+
+    route_id = publish_fresh_route()
+    _dispatch_route(gold_connection, route_id, dispatched_at)
+    cooldown = DEFAULT_REBALANCE_POLICY.pickup_cooldown_minutes
+    _complete_route(gold_connection, route_id, logical - timedelta(minutes=cooldown))
+    snapshot = route_module._load_route_database_snapshot(gold_connection, logical)
+    assert snapshot.pickup_cooldown_sta_ids == ()
+
+
 def _put_urgency_publication(
     connection: Connection[Any],
     store: S3ImmutableObjectStore,
@@ -321,7 +384,11 @@ def _put_urgency_publication(
         input_artifacts,
         (
             Parameter("expected_sta_id_sha256", expected_ids.sha256),
-            Parameter("scoring_config_version", "urgency-scoring-v1"),
+            Parameter(
+                "rebalance_policy_config",
+                DEFAULT_REBALANCE_POLICY.canonical_json,
+            ),
+            Parameter("scoring_config_version", URGENCY_SCORING_CONFIG_VERSION),
             Parameter("stock_history_offsets", "-25,-20,-15,-10,-5"),
             Parameter("stock_window_count", "6"),
         ),
@@ -353,7 +420,7 @@ def _put_urgency_publication(
         input_fingerprint=fingerprint,
         input_fingerprint_uri=fingerprint_uri,
         logical_dttm=logical_dttm,
-        publisher_version="urgency-integration-v1",
+        publisher_version="urgency-integration-v2",
         revision_no=revision_no,
         target_row_counts={"station_urgency": len(rows)},
         conditional_empty_proven=not rows,
@@ -528,6 +595,24 @@ def _dispatch_route(
              WHERE route_id = %s
             """,
             (dispatched_dttm, route_id),
+        )
+
+
+def _complete_route(
+    connection: Connection[Any],
+    route_id: str,
+    completed_dttm: datetime,
+) -> None:
+    """Dispatched fixture route를 지정 시각에 completed로 전환한다."""
+    with connection.transaction(), connection.cursor() as cursor:
+        cursor.execute(
+            """
+            UPDATE rebalance_route
+               SET route_status_cd = 'completed',
+                   completed_dttm = %s
+             WHERE route_id = %s
+            """,
+            (completed_dttm, route_id),
         )
 
 

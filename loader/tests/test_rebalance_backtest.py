@@ -1,12 +1,16 @@
-"""재배치 정책 백테스트의 잔차·재생·route-v2 연결을 검증한다."""
+"""재배치 정책 백테스트의 잔차·재생·route-v4 연결을 검증한다."""
 
+import json
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pytest
 from evaluation.rebalance_backtest import (
+    BacktestResult,
+    ExistingOperationEstimate,
     RentalTrip,
+    ReplayMetrics,
     RouteAction,
     StationMetadata,
     StockObservation,
@@ -20,6 +24,7 @@ from evaluation.rebalance_backtest import (
     read_stock_observations,
     replay_policy,
     schedule_route_actions,
+    write_result,
 )
 from gold.rebalance_route import DispatchCenterTopology
 
@@ -102,8 +107,8 @@ def test_replay_applies_pickup_then_dropoff_with_truck_conservation() -> None:
     assert metrics.fulfilled_requests == 1
 
 
-def test_oracle_need_runs_current_route_v2_without_copying_planner() -> None:
-    """실제 미래 shortage와 surplus가 운영 route-v2의 완결 작업으로 이어진다."""
+def test_oracle_need_runs_current_route_v4_without_copying_planner() -> None:
+    """실제 미래 shortage와 surplus가 운영 route-v4의 완결 작업으로 이어진다."""
     center = DispatchCenterTopology("center", 127.0, 37.5, True)
     stations = {
         1: StationMetadata(1, "ST-1", "회수", 37.501, 127.001, "center"),
@@ -182,6 +187,65 @@ def test_current_planner_accepts_evaluation_stop_limit() -> None:
         for route in plan.routes
     }
     assert all(len(stops) <= 5 for stops in stops_by_route.values())
+
+
+def test_oracle_output_identifies_current_route_v4_contract(tmp_path: Path) -> None:
+    """Oracle JSON과 Markdown은 실제 planner를 route-v4로 식별한다."""
+    no_rebalance = ReplayMetrics(
+        policy="no_rebalance",
+        observed_requests=1,
+        fulfilled_requests=1,
+        unfulfilled_requests=0,
+        fulfillment_rate=1.0,
+        empty_station_hours=0,
+        moved_bikes=0,
+        planned_bikes=0,
+        route_count=0,
+        route_stop_count=0,
+        estimated_vehicle_minutes=0.0,
+    )
+    current = ReplayMetrics(
+        policy="route_v4_max_stops_5_oracle_need",
+        observed_requests=1,
+        fulfilled_requests=1,
+        unfulfilled_requests=0,
+        fulfillment_rate=1.0,
+        empty_station_hours=0,
+        moved_bikes=1,
+        planned_bikes=1,
+        route_count=1,
+        route_stop_count=2,
+        estimated_vehicle_minutes=10.0,
+    )
+    result = BacktestResult(
+        evidence_grade="exploratory_oracle",
+        target_date="2025-01-17",
+        center_id="center",
+        center_name="센터",
+        window_start=START.isoformat(),
+        window_end=END.isoformat(),
+        station_count=2,
+        trip_count=1,
+        relocation_candidate_count=0,
+        existing_operation=ExistingOperationEstimate(0, 0, 0, 0, 0.0),
+        existing_empty_station_hours=0,
+        no_rebalance=no_rebalance,
+        current_route_v4=current,
+        route_variants=(current,),
+        empty_station_hour_change_vs_existing_pct=None,
+        assumptions=(),
+    )
+
+    json_path, markdown_path = write_result(result, tmp_path)
+    document = json.loads(json_path.read_text(encoding="utf-8"))
+    markdown = markdown_path.read_text(encoding="utf-8")
+
+    assert document["current_route_v4"]["policy"] == current.policy
+    assert "current_route_v3" not in document
+    assert "current_route_v2" not in document
+    assert "route-v4" in markdown
+    assert "route-v3" not in markdown
+    assert "route-v2" not in markdown
 
 
 def test_detect_relocation_candidates_uses_consecutive_bike_locations() -> None:
