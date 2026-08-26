@@ -85,8 +85,15 @@ def _classify_result_code(code: str | None) -> FetchErrorKind | None:
     return FetchErrorKind.PERMANENT
 
 
-def _adjust_base_time(dt: datetime, rule: str | None) -> datetime:
-    """기상청 API가 허용하는 가장 최근의 base_time으로 내림한다."""
+def adjust_base_time(dt: datetime, rule: str | None) -> datetime:
+    """기상청 API가 허용하는 가장 최근의 base_time으로 내림한다.
+
+    fetch 경로(API 호출 파라미터 계산)뿐 아니라 `main.py`의 freshness
+    판단(`--check-due-after-seconds`)에서도 쓴다 — 발표 그리드(예: 단기예보
+    02/05/08...시)에 스냅한 두 시각을 비교해야 "마지막 성공이 실제로 어느
+    슬롯이었는지"를 wall-clock 실행 시각과 무관하게 알 수 있다(그렇지 않으면
+    수집이 한 번 늦어질 때마다 그 지연이 다음 판단 기준에 그대로 누적돼
+    발표 슬롯과 점점 어긋난다 — 실제 운영에서 확인, 2026-08-26)."""
     if not rule:
         return dt
 
@@ -266,7 +273,7 @@ class KmaApiHubAdapter:
         time_rule = params.get("time_rule")
 
         # time_rule 규칙에 따라 API 유효 시각으로 보정
-        adjusted_time = _adjust_base_time(window.window_start, time_rule)
+        adjusted_time = adjust_base_time(window.window_start, time_rule)
         base_date = adjusted_time.strftime("%Y%m%d")
         base_time = adjusted_time.strftime("%H%M")
 
