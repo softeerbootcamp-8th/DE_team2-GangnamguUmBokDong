@@ -91,19 +91,25 @@ XCom에서 전체 payload가 아닌 manifest `uri`와 `byte_sha256`만 전달받
 
 ### 1. Prepare
 
-`serving_cli.py prepare --logical-dttm ...`는 다음 입력을 고정한 immutable serving plan을
-만든다.
+`serving_cli.py prepare --logical-dttm ...`는 Gold projection·서빙 범위·최종 transaction에
+필요한 다음 입력을 고정한 immutable serving plan을 만든다.
 
 - Exact realtime station snapshot
 - Lookback 안의 최신 station master
 - 최신 단기·초단기 forecast snapshot
-- 현재 rental/return model pair와 support ID set
+- prepare 시점 rental/return model에서 얻은 exact support ID set
 - 최신 enriched station master에서 계산한 inference 가능 station ID
 - 선택적 relocation approval URI·SHA 쌍
 - 기존 Gold station state와 realtime window set
 
 Master/realtime lookback은 각각 `GOLD_STATION_MASTER_LOOKBACK_HOURS`,
 `GOLD_STATION_REALTIME_LOOKBACK_HOURS`의 양의 정수 시간으로 받는다.
+
+Prepare는 actual model-input plan이 아니다. Model artifact identity와 rental history,
+horizon별 날씨·생활인구, stockout source는 inference가 실행 중 선택하고 실제 읽은
+bytes를 inference manifest에 기록한다. 즉 prepare는 Gold
+projection/scope/transaction authority이고 inference는 actual model-input
+selection/provenance authority다.
 
 ### 2. Finalize
 
