@@ -50,30 +50,34 @@ def evaluate_source_stats(source_id: str, stats: dict) -> SourceStatEvaluation:
     }
 
 
-_COLUMNS = ("SOURCE", "OK", "FAIL", "PART", "MISS", "OUT")
+_COLUMNS = ("STATUS", "SOURCE", "OK", "FAIL", "PART", "MISS", "OUT")
+_STATUS_OK = "OK"
+_STATUS_RISK = "RISK"
+_STATUS_WIDTH = max(len(_STATUS_OK), len(_STATUS_RISK), len(_COLUMNS[0]))
 
 
 def _table(evaluations: list[SourceStatEvaluation]) -> str:
     """소스별 통계를 Slack 코드 블록 안에 넣을 고정폭 표로 만든다.
 
     한글/이모지는 폰트마다 폭이 달라 고정폭 정렬이 어긋나므로, 표 안은 전부
-    ASCII로 채우고 위험 소스만 앞의 `!` 컬럼으로 표시한다.
+    ASCII로 채운다. 정상/위험 둘 다 빈칸이 아니라 "OK"/"RISK" 텍스트로 명시해
+    한쪽이 안 보이는 일이 없게 한다.
     """
     name_width = max(
-        (len(e["source_id"]) for e in evaluations), default=len(_COLUMNS[0])
+        (len(e["source_id"]) for e in evaluations), default=len(_COLUMNS[1])
     )
-    name_width = max(name_width, len(_COLUMNS[0]))
+    name_width = max(name_width, len(_COLUMNS[1]))
     header = (
-        f"  {_COLUMNS[0]:<{name_width}}  {_COLUMNS[1]:>4} {_COLUMNS[2]:>4} "
-        f"{_COLUMNS[3]:>4} {_COLUMNS[4]:>5} {_COLUMNS[5]:>5}"
+        f"{_COLUMNS[0]:<{_STATUS_WIDTH}}  {_COLUMNS[1]:<{name_width}}  "
+        f"{_COLUMNS[2]:>4} {_COLUMNS[3]:>4} {_COLUMNS[4]:>4} {_COLUMNS[5]:>5} {_COLUMNS[6]:>5}"
     )
     rows = [header, "-" * len(header)]
     for e in evaluations:
         stats = e["stats"]
         status_counts = stats["status_counts"]
-        flag = "!" if e["is_risky"] else " "
+        status = _STATUS_RISK if e["is_risky"] else _STATUS_OK
         rows.append(
-            f"{flag} {e['source_id']:<{name_width}}  "
+            f"{status:<{_STATUS_WIDTH}}  {e['source_id']:<{name_width}}  "
             f"{status_counts.get('succeeded', 0):>4} {status_counts.get('failed', 0):>4} "
             f"{status_counts.get('partial', 0):>4} {stats['missing_count']:>5} "
             f"{stats['outlier_count']:>5}"
