@@ -35,6 +35,60 @@ resource "aws_iam_role_policy_attachment" "emr_service" {
   policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonEMRServicePolicy_v2"
 }
 
+# 세 번째 실제 실행에서 "Service role gng-ubd-emr-service has insufficient EC2
+# permissions"로 실패했다 — 이번엔 EC2 쪽 상세 메시지 없이 뭉뚱그려져서 어느
+# 액션이 빠졌는지 특정할 수 없었다(2026-08-25). AmazonEMRServicePolicy_v2의
+# 실제 원문(AWS 공식 문서로 재확인)을 서브넷/보안그룹 태그 조건까지 전부 대조해
+# 봤지만 이미 다 맞춰져 있었다 — 즉 v2 정책 자체에 없는 좀 더 최신/세부적인
+# 읍기 전용 액션이 빠졌을 가능성이 높다. 전부 Describe*(읍기 전용, 위험 없음)라
+# 한 번에 넉넉히 추가해 재추측 왕복을 줄인다.
+resource "aws_iam_role_policy" "emr_service_extra_describe" {
+  name = "${var.project}-emr-service-extra-describe"
+  role = aws_iam_role.emr_service.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "ExtraDescribeActionsNotInV2ManagedPolicy"
+        Effect = "Allow"
+        Action = [
+          # AmazonEMRServicePolicy_v2에 없는, 커스텀(미리 만든) 보안그룹을 EMR이
+          # 검사할 때 필요할 수 있는 최신 액션.
+          "ec2:DescribeSecurityGroupRules",
+          # v2 정책이 명시적으로 빠뜨린(구버전 v1/일반 EC2 체크리스트에는 있던) 항목들.
+          "ec2:DescribeAvailabilityZones",
+          "ec2:DescribeKeyPairs",
+          "ec2:DescribePrefixLists",
+          "ec2:DescribeInstanceStatus",
+          "ec2:DescribeTags",
+          "ec2:DescribeInstanceCreditSpecifications",
+        ]
+        Resource = "*"
+      },
+      {
+        # AmazonEMRServicePolicy_v2의 PassRoleForEC2 statement는 iam:PassRole을
+        # 하드코딩된 기본 이름 "EMR_EC2_DefaultRole"에만 허용한다 — 우리 EC2
+        # instance profile role 이름은 gng-ubd-emr-ec2라 이 조건에 안 걸려서,
+        # EMR 서비스가 노드를 띄울 때 이 role을 인스턴스에 붙일 권한이 아예
+        # 없었다. RunInstances가 인스턴스 프로필을 못 붙여 그대로 실패하고
+        # "insufficient EC2 permissions"로만 뭉뚱그려져서 원인 특정이 어려웠다
+        # (2026-08-25, 인스턴스가 0개 생성된 것으로 실측 확인 — AWS 공식
+        # AmazonEMRServicePolicy_v2 원문과 대조해 발견).
+        Sid      = "PassCustomEmrEc2RoleToLaunchedInstances"
+        Effect   = "Allow"
+        Action   = "iam:PassRole"
+        Resource = aws_iam_role.emr_ec2.arn
+        Condition = {
+          StringLike = {
+            "iam:PassedToService" = "ec2.amazonaws.com*"
+          }
+        }
+      }
+    ]
+  })
+}
+
 # --- EMR 노드(EC2)가 쓰는 역할 ---
 
 resource "aws_iam_role" "emr_ec2" {
@@ -64,6 +118,80 @@ resource "aws_iam_instance_profile" "emr_ec2" {
   provider = aws.untagged
   name     = "${var.project}-emr-ec2"
   role     = aws_iam_role.emr_ec2.name
+}
+
+# --- EMR 마스터/코어 보안그룹 (EMR이 알아서 만들게 두지 않고 직접 관리) ---
+#
+# RunJobFlow에서 Instances.EmrManagedMasterSecurityGroup/EmrManagedSlaveSecurityGroup을
+# 안 넘기면 EMR이 기본 보안그룹을 스스로 만들려고 시도하는데, 그러려면
+# ec2:CreateSecurityGroup을 호출할 VPC 자체가 `for-use-with-amazon-emr-managed-policies`
+# 태그를 갖고 있어야 한다(AmazonEMRServicePolicy_v2의 조건부 권한, 2026-08-25 첫
+# 실제 실행에서 실측 확인 — "Service role ... has insufficient EC2 permissions:
+# ec2:CreateSecurityGroup"). VPC 전체에 태그를 붙이는 것보다, 필요한 보안그룹
+# 딱 2개만 미리 만들어서 명시적으로 넘기는 쪽이 범위가 좁고 terraform으로
+# diff도 볼 수 있어 더 안전하다 — AWS 공식 문서도 이 방식을 지원한다.
+resource "aws_security_group" "emr_master" {
+  name        = "${var.project}-emr-master"
+  description = "EMR primary(master) node"
+  vpc_id      = aws_vpc.main.id
+
+  tags = {
+    Name = "${var.project}-emr-master"
+    # 이 태그가 있어야 AmazonEMRServicePolicy_v2의 Authorize/RevokeSecurityGroup*
+    # 권한 조건(aws:ResourceTag)이 충족된다 — EMR이 만드는 기본 보안그룹은
+    # 스스로 이 태그를 붙이지만, 우리가 직접 만드는 건 수동으로 붙여야 한다.
+    "for-use-with-amazon-emr-managed-policies" = "true"
+  }
+}
+
+resource "aws_security_group" "emr_core" {
+  name        = "${var.project}-emr-core"
+  description = "EMR core node"
+  vpc_id      = aws_vpc.main.id
+
+  tags = {
+    Name                                       = "${var.project}-emr-core"
+    "for-use-with-amazon-emr-managed-policies" = "true"
+  }
+}
+
+# 마스터/코어 노드 간 내부 통신(HDFS/YARN 등 다수 포트)은 전부 허용한다 — EMR
+# 기본 관리형 보안그룹도 같은 방식(자기 자신 + 상대 보안그룹 전체 허용)이라
+# 포트를 개별로 나열하지 않는다.
+resource "aws_vpc_security_group_ingress_rule" "emr_master_from_master" {
+  security_group_id            = aws_security_group.emr_master.id
+  referenced_security_group_id = aws_security_group.emr_master.id
+  ip_protocol                  = "-1"
+}
+
+resource "aws_vpc_security_group_ingress_rule" "emr_master_from_core" {
+  security_group_id            = aws_security_group.emr_master.id
+  referenced_security_group_id = aws_security_group.emr_core.id
+  ip_protocol                  = "-1"
+}
+
+resource "aws_vpc_security_group_ingress_rule" "emr_core_from_master" {
+  security_group_id            = aws_security_group.emr_core.id
+  referenced_security_group_id = aws_security_group.emr_master.id
+  ip_protocol                  = "-1"
+}
+
+resource "aws_vpc_security_group_ingress_rule" "emr_core_from_core" {
+  security_group_id            = aws_security_group.emr_core.id
+  referenced_security_group_id = aws_security_group.emr_core.id
+  ip_protocol                  = "-1"
+}
+
+resource "aws_vpc_security_group_egress_rule" "emr_master_all" {
+  security_group_id = aws_security_group.emr_master.id
+  cidr_ipv4         = "0.0.0.0/0"
+  ip_protocol       = "-1"
+}
+
+resource "aws_vpc_security_group_egress_rule" "emr_core_all" {
+  security_group_id = aws_security_group.emr_core.id
+  cidr_ipv4         = "0.0.0.0/0"
+  ip_protocol       = "-1"
 }
 
 # --- 상시 EC2(Airflow)가 EC2/EMR을 직접 호출하는 데 필요한 권한 ---
@@ -112,7 +240,22 @@ data "aws_iam_policy_document" "airflow_infra_control" {
     effect = "Allow"
     actions = [
       "elasticmapreduce:RunJobFlow",
+      # RunJobFlow 요청에 Tags를 같이 넣으면(aws_infra_task.create_emr_cluster()가
+      # 항상 그렇게 함) EC2 RunInstances+CreateTags 조합과 같은 이유로 AddTags도
+      # 별도로 필요하다 — 2026-08-25 첫 실제 실행에서 이게 없어서
+      # AccessDeniedException으로 즉시 실패한 걸 실측으로 확인.
+      "elasticmapreduce:AddTags",
       "elasticmapreduce:DescribeCluster",
+      # emr_orphan_reaper.py의 list_active_emr_clusters()/get_cluster_step_activity()가
+      # 쓰는 액션 — 이게 빠져있으면 15분마다 도는 안전망(reaper)이 매번 조용히
+      # 실패해서 "EMR은 무슨 일이 있어도 삭제돼야 한다"는 요구사항이 실제로는
+      # 전혀 보장되지 않는다(2026-08-25, 코드 대조로 발견 — 실측 에러는 아직
+      # 안 남, RunJobFlow 실패가 먼저 나서 reaper 호출까지 못 가봤을 뿐).
+      "elasticmapreduce:ListClusters",
+      "elasticmapreduce:ListSteps",
+      # 진단용 — 클러스터 상태가 뭉뚱그려진 일반 에러일 때 인스턴스 단위 상세
+      # 사유를 보려고 추가(2026-08-25, 세 번째 실제 실행에서 필요해짐).
+      "elasticmapreduce:ListInstances",
       "elasticmapreduce:TerminateJobFlows",
       "elasticmapreduce:AddJobFlowSteps",
       "elasticmapreduce:DescribeStep",
@@ -128,11 +271,38 @@ data "aws_iam_policy_document" "airflow_infra_control" {
     actions   = ["iam:PassRole"]
     resources = [aws_iam_role.emr_service.arn, aws_iam_role.emr_ec2.arn]
   }
+
+  # EMR은 클러스터 생성/정리에 계정 전역 서비스 연결 역할(service-linked role)
+  # `AWSServiceRoleForEMRCleanup`이 필요한데, 이 계정엔 아직 없고 호출 주체에
+  # 이걸 자동 생성할 권한도 없어서 RunJobFlow가 VALIDATION_ERROR로 즉시
+  # TERMINATED_WITH_ERRORS 됐다(2026-08-25 첫 실제 실행, 실측 확인). AWS가
+  # 권장하는 최소 권한 패턴대로 이 역할 하나만, EMR 서비스가 요청할 때만
+  # 만들 수 있게 좁혀서 추가한다 — 한 번 생성되면 계정 전체에 영구히 남으므로
+  # (서비스 연결 역할은 계정당 1개, 재사용됨) 이후로는 이 권한이 다시 쓰일
+  # 일이 없다.
+  statement {
+    sid       = "EmrServiceLinkedRoleBootstrap"
+    effect    = "Allow"
+    actions   = ["iam:CreateServiceLinkedRole"]
+    resources = ["arn:aws:iam::*:role/aws-service-role/elasticmapreduce.amazonaws.com/AWSServiceRoleForEMRCleanup"]
+
+    condition {
+      test     = "StringEquals"
+      variable = "iam:AWSServiceName"
+      values   = ["elasticmapreduce.amazonaws.com"]
+    }
+  }
 }
 
 resource "aws_iam_policy" "airflow_infra_control" {
-  provider    = aws.untagged
-  name        = "${var.project}-airflow-infra-control"
+  provider = aws.untagged
+  # 이름에 버전을 넣어 내용이 바뀔 때마다 IAM이 "새 정책 생성"으로 처리하게
+  # 한다(2026-08-25) — 이 계정의 edu 사용자는 iam:CreatePolicy는 되지만
+  # iam:CreatePolicyVersion(기존 정책 내용 수정)은 막혀있는 것으로 실측
+  # 확인됨(AccessDeniedException). IAM은 정책 rename API가 아예 없어서
+  # name이 바뀌면 terraform이 자동으로 삭제+재생성하므로, 내용을 고칠 때마다
+  # 이 접미사 숫자를 올리면 CreatePolicyVersion을 아예 안 거치게 된다.
+  name        = "${var.project}-airflow-infra-control-v4"
   description = "Airflow 상시 EC2가 학습 EC2/EMR 클러스터를 직접 제어하는 데 필요한 권한"
   policy      = data.aws_iam_policy_document.airflow_infra_control.json
 }

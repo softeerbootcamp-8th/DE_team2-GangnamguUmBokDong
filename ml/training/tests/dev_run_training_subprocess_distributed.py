@@ -74,6 +74,40 @@ def test_run_training_subprocess_launches_yarn_distributed_shell_when_num_machin
     assert run_id_args == [f"TRAINING_RUN_ID={_ARCHIVE_DATE}-{_PROFILE}-return"]
     shell_command = cmd[cmd.index("-shell_command") + 1]
     assert "training.scripts.yarn_worker_bootstrap --model return" in shell_command
+    # distributed-shell 자체 AM에 메모리를 명시 안 하면 기본 100MB로 떠서
+    # OutOfMemoryError로 즉시 죽는다(겉보기엔 "JNI error"라 Java 17 비호환처럼
+    # 보였지만 실제로는 순수 메모리 부족이었다 — 실제 EMR 실행에서 확인,
+    # 2026-08-26).
+    assert "-master_memory" in cmd
+    assert cmd[cmd.index("-master_memory") + 1] == str(mrc.YARN_AM_MEMORY_MB)
+    assert "-master_vcores" in cmd
+
+
+def test_run_training_subprocess_forwards_mlflow_tracking_uri_to_distributed_shell(monkeypatch):
+    """MLFLOW_TRACKING_URI가 -shell_env로 안 넘어가면 컨테이너 안에서
+    mlflow_tracking.configure()가 기본값(http://localhost:5000)으로 떨어져
+    ConnectionRefusedError로 학습이 죽는다 — 실제 EMR 실행에서 확인,
+    2026-08-26. spark-submit 경로와 달리 distributed-shell은 부모 프로세스의
+    환경을 상속하지 않으므로 반드시 명시적으로 forwarding해야 한다."""
+    _seed_metrics("return")
+    captured = {}
+
+    def _fake_run(cmd, **kwargs):
+        if cmd[0] == "find":
+            return _FakeCompletedProcess(stdout="/usr/lib/hadoop-yarn/hadoop-yarn-applications-distributedshell.jar\n")
+        captured.update(cmd=cmd)
+        return _FakeCompletedProcess()
+
+    monkeypatch.setattr("training.scripts.monthly_retrain_check.subprocess.run", _fake_run)
+    monkeypatch.setenv("MLFLOW_TRACKING_URI", "http://10.0.0.5:5000/mlflow")
+
+    _run_training_subprocess("return", _PROFILE, _ARCHIVE_DATE, {"LGB_NUM_MACHINES": "8"})
+
+    cmd = captured["cmd"]
+    assert any(
+        cmd[i] == "-shell_env" and cmd[i + 1] == "MLFLOW_TRACKING_URI=http://10.0.0.5:5000/mlflow"
+        for i in range(len(cmd) - 1)
+    )
 
 
 def test_resolve_distributed_shell_jar_prefers_explicit_env_override(monkeypatch):
@@ -103,6 +137,33 @@ def test_resolve_distributed_shell_jar_finds_via_search_roots(monkeypatch):
     monkeypatch.setattr(mrc.subprocess, "run", _fake_run)
 
     assert mrc._resolve_distributed_shell_jar() == found_path
+
+
+def test_run_training_subprocess_forwards_train_lookback_months_override(monkeypatch):
+    """`_candidate_profiles()`의 1차 후보는 하이퍼파라미터는 그대로 두고 학습기간만
+    "지금의 기본 롤링 윈도우"로 갱신하려고 TRAIN_LOOKBACK_MONTHS 하나만
+    env_overrides로 얹는다 — distributed-shell 화이트리스트에서 빠지면 워커가
+    프로필에 저장된 챔피언의 원래(옛날) lookback을 그대로 써서 "최신 데이터로
+    다시 학습"이라는 재시도 목적 자체가 조용히 무력화된다."""
+    _seed_metrics("return")
+    captured = {}
+
+    def _fake_run(cmd, **kwargs):
+        if cmd[0] == "find":
+            return _FakeCompletedProcess(stdout="/usr/lib/hadoop-yarn/hadoop-yarn-applications-distributedshell.jar\n")
+        captured.update(cmd=cmd)
+        return _FakeCompletedProcess()
+
+    monkeypatch.setattr("training.scripts.monthly_retrain_check.subprocess.run", _fake_run)
+
+    _run_training_subprocess(
+        "return", _PROFILE, _ARCHIVE_DATE, {"LGB_NUM_MACHINES": "8", "TRAIN_LOOKBACK_MONTHS": "3"}
+    )
+
+    cmd = captured["cmd"]
+    assert any(
+        cmd[i] == "-shell_env" and cmd[i + 1] == "TRAIN_LOOKBACK_MONTHS=3" for i in range(len(cmd) - 1)
+    )
 
 
 def test_resolve_distributed_shell_jar_raises_when_not_found_anywhere(monkeypatch):

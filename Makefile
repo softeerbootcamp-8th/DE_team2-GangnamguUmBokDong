@@ -225,7 +225,7 @@ PSQL_IMAGE        ?= postgres:16
 SSH_KEY           ?= ~/.ssh/gng-ubd-admin.pem
 
 EMR_STAGE          = .emr-stage
-EMR_RELEASE       ?= emr-7.9.0
+EMR_RELEASE       ?= emr-7.13.0
 EMR_INSTANCE_TYPE ?= m5.xlarge
 EMR_INSTANCE_COUNT?= 3
 

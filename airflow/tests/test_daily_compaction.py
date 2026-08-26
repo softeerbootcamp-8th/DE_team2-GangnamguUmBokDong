@@ -132,14 +132,21 @@ class TestDag:
     def test_non_authority_silver_gc_runs_after_thirty_day_retention(self):
         for source in COLD_BRONZE_SOURCES:
             task = dag.get_task(f"gc_silver_{source}")
-            assert task.upstream_task_ids == {f"cold_compact_{source}"}
+            assert task.upstream_task_ids == {f"gc_hot_bronze_{source}"}
             assert "silver_gc_cli.py" in task.bash_command
             assert "macros.timedelta(days=36)" in task.bash_command
             assert ("--require-archive" in task.bash_command) is (
                 source in COMPACTION_SOURCES
             )
 
+    def test_hot_bronze_gc_runs_after_cold_recovery(self):
+        for source in COLD_BRONZE_SOURCES:
+            task = dag.get_task(f"gc_hot_bronze_{source}")
+            assert task.upstream_task_ids == {f"cold_compact_{source}"}
+            assert "hot_bronze_gc_cli.py" in task.bash_command
+            assert "--retention-days 30" in task.bash_command
+
     def test_expected_task_count(self):
         assert len(dag.task_ids) == (
-            24 + len(COMPACTION_SOURCES) + 2 * len(COLD_BRONZE_SOURCES)
+            24 + len(COMPACTION_SOURCES) + 3 * len(COLD_BRONZE_SOURCES)
         )

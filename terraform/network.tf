@@ -34,7 +34,14 @@ resource "aws_subnet" "public" {
   # EC2에 퍼블릭 IP를 자동 할당한다. 노출 통제는 SG가 한다.
   map_public_ip_on_launch = true
 
-  tags = { Name = "${var.project}-public-${var.azs[count.index]}" }
+  tags = {
+    Name = "${var.project}-public-${var.azs[count.index]}"
+    # AmazonEMRServicePolicy_v2의 ec2:RunInstances/CreateNetworkInterface
+    # 권한이 이 태그가 붙은 서브넷+보안그룹 조합에만 조건부로 허용된다
+    # (CreateInTaggedNetwork 구문, aws:ResourceTag 조건) — 없으면 EMR
+    # 클러스터가 노드를 못 띄운다(2026-08-25, 첫 실제 실행에서 실측 확인).
+    "for-use-with-amazon-emr-managed-policies" = "true"
+  }
 }
 
 resource "aws_route_table" "public" {
@@ -164,6 +171,28 @@ resource "aws_vpc_security_group_ingress_rule" "app_mlflow_from_train" {
   security_group_id            = aws_security_group.app.id
   description                  = "mlflow tracking from train instance"
   referenced_security_group_id = aws_security_group.train.id
+  from_port                    = 5000
+  to_port                      = 5000
+  ip_protocol                  = "tcp"
+}
+
+# 월간 재학습이 EC2(train)에서 EMR로 옮겨간 뒤에도 학습 스텝(train_common.py)이
+# 여전히 MLflow에 기록한다 — EMR 마스터/코어 SG도 같은 이유로 열어야 한다(PR 리뷰
+# 지적, 2026-08). command-runner.jar 스텝은 마스터 노드에서 돌고, YARN
+# distributed-shell 워커(계획 중)는 코어 노드에서 돌 수 있어 둘 다 연다.
+resource "aws_vpc_security_group_ingress_rule" "app_mlflow_from_emr_master" {
+  security_group_id            = aws_security_group.app.id
+  description                  = "mlflow tracking from emr master"
+  referenced_security_group_id = aws_security_group.emr_master.id
+  from_port                    = 5000
+  to_port                      = 5000
+  ip_protocol                  = "tcp"
+}
+
+resource "aws_vpc_security_group_ingress_rule" "app_mlflow_from_emr_core" {
+  security_group_id            = aws_security_group.app.id
+  description                  = "mlflow tracking from emr core"
+  referenced_security_group_id = aws_security_group.emr_core.id
   from_port                    = 5000
   to_port                      = 5000
   ip_protocol                  = "tcp"

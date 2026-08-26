@@ -61,26 +61,8 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "data" {
 resource "aws_s3_bucket_lifecycle_configuration" "data" {
   bucket = aws_s3_bucket.data.id
 
-  # Collector가 응답 도착 즉시 조각으로 쓰는 원본. Cold readback 검증이 끝나
-  # cold_compacted=true가 붙은 Hot 객체만 생성 30일 뒤 지운다. 실패·미처리 원본은
-  # 태그가 없으므로 보존된다.
-  rule {
-    id     = "expire-bronze"
-    status = "Enabled"
-
-    filter {
-      and {
-        prefix = "bronze/hot/"
-        tags = {
-          cold_compacted = "true"
-        }
-      }
-    }
-
-    expiration {
-      days = 30
-    }
-  }
+  # Hot Bronze는 애플리케이션 GC가 검증된 Cold inventory의 exact key만 30일 뒤
+  # 삭제한다. IAM tagging 권한 없이도 late revision을 fail-closed로 보존하기 위함이다.
 
   # 이관 전 legacy Bronze는 기존과 같은 30일 보존 정책을 유지한다. cold/와
   # cold_manifest/는 이 prefix에 들어오지 않아 장기 보관된다.
@@ -223,14 +205,29 @@ locals {
 
     S3_BUCKET=${aws_s3_bucket.data.id}
     MODELS_PREFIX=models
+    # m4.large는 VPC 서브넷 지정 없이 못 뜬다 — 계정/리전마다 다른 실제 리소스
+    # ID라 aws_infra_task.py에 합리적인 기본값을 둘 수 없어 여기서 채운다
+    # (2026-08-25, 첫 실제 EMR 실행에서 이게 빠져 실패한 걸 발견).
+    AWS_EMR_SUBNET_ID=${aws_subnet.public[0].id}
+    # EMR이 기본 보안그룹을 스스로 만들려면 VPC에 특정 태그가 있어야 하는데
+    # (AmazonEMRServicePolicy_v2의 조건부 권한), 그 대신 미리 만들어둔 보안그룹을
+    # 명시적으로 넘긴다 — emr.tf의 aws_security_group.emr_master/emr_core 참고.
+    AWS_EMR_MASTER_SG_ID=${aws_security_group.emr_master.id}
+    AWS_EMR_CORE_SG_ID=${aws_security_group.emr_core.id}
     GOLD_STATION_MASTER_LOOKBACK_HOURS=168
     GOLD_STATION_REALTIME_LOOKBACK_HOURS=24
 
     # 컨테이너 안에서 mlflow 서비스는 compose 네트워크 이름으로 붙는다.
-    # 학습 EC2는 이 값 대신 상시 EC2의 사설 IP를 쓴다.
+    # 학습 EC2/EMR은 이 값 대신 상시 EC2의 사설 IP를 쓴다(아래
+    # AWS_EMR_MLFLOW_TRACKING_URI).
     # 끝의 /mlflow는 오타가 아니다 — 트래킹 서버를 --static-prefix /mlflow로 띄워
     # UI를 web(nginx)의 /mlflow/ 아래에 붙였고, API 경로도 같은 접두를 갖는다.
     MLFLOW_TRACKING_URI=http://mlflow:5000/mlflow
+    # EMR 노드에서는 docker 네트워크 이름("mlflow")이 안 풀리므로 상시 EC2의 사설
+    # IP를 직접 쓴다 — network.tf의 app_mlflow_from_emr_master/core 인그레스 규칙이
+    # 이 접근을 허용한다(PR 리뷰 지적, 2026-08 — 학습 스텝이 MLflow에 못 붙어
+    # 실패할 것이었다).
+    AWS_EMR_MLFLOW_TRACKING_URI=http://${aws_instance.app.private_ip}:5000/mlflow
   EOT
 }
 

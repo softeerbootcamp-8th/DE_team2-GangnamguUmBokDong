@@ -57,6 +57,7 @@ from core import s3 as s3_io
 from ml_core import common_config, profile_contract
 from ml_core.paths import (
     ML_ROOT,
+    TRAINING_RUNS_PREFIX,
     archive_models_prefix,
     model_json_key,
     read_champion_prefix,
@@ -67,8 +68,16 @@ from ml_core.serving_contract import (
     assert_serving_profiles_compatible,
 )
 
-from ..config import unique_archive_date
-from ..monitor_performance import _load_baseline_metrics, check_all_models
+from ..config import MONITOR_LOOKBACK_MONTHS, unique_archive_date
+from ..monitor_performance import (
+    MODEL_SPECS,
+    _load_baseline_metrics,
+    _log_to_mlflow,
+    _recent_month_range,
+    check_all_models,
+    combine_evaluation_shards,
+    decide_retrain,
+)
 from ..promotion import promote_challenger, should_promote
 
 SPARK_PYTHON = ML_ROOT / "feature_engine" / ".venv" / "bin" / "python"
@@ -96,6 +105,14 @@ _YARN_DISTRIBUTED_SHELL_JAR_SEARCH_ROOTS = ("/usr/lib/hadoop-yarn", "/usr/lib/ha
 # (`yarn_worker_bootstrap._resolve_rank_and_machines()` 중복 host 가드 참고).
 YARN_CONTAINER_MEMORY_MB = int(os.environ.get("YARN_CONTAINER_MEMORY_MB", "6144"))
 YARN_CONTAINER_VCORES = int(os.environ.get("YARN_CONTAINER_VCORES", "2"))
+# distributed-shell의 자체 ApplicationMaster(워커 컨테이너와 별개 — 이 AM은 그냥
+# 컨테이너들을 띄우고 감시만 함) 메모리를 명시하지 않으면 기본값 100MB로 뜨는데,
+# 이 JVM이 클래스 로딩만 하다가도 100MB로는 부족해 OutOfMemoryError로 즉시
+# 죽는다 — 겉보기 증상은 "WARNING: package javax.script not in java.base" +
+# "JNI error"라 Java 17 비호환처럼 보였지만, 실제로는 순수 메모리 부족이었다
+# (실제 EMR 실행에서 -master_memory 512로 재현/해결 확인, 2026-08-26).
+YARN_AM_MEMORY_MB = int(os.environ.get("YARN_AM_MEMORY_MB", "1024"))
+YARN_AM_VCORES = int(os.environ.get("YARN_AM_VCORES", "1"))
 # 컨테이너로 반드시 넘겨야 하는 환경변수 — distributed-shell 컨테이너는 이 프로세스의
 # 환경을 상속하지 않고 `-shell_env`로 명시한 것만 받는다.
 _YARN_SHELL_ENV_KEYS = (
@@ -106,6 +123,35 @@ _YARN_SHELL_ENV_KEYS = (
     "LGB_LOCAL_LISTEN_PORT",
     "LGB_TIME_OUT",
     "TRAINING_RUN_ID",
+    "S3_BUCKET",
+    # 빠지면 train_common.py의 mlflow_tracking.configure()가 기본값
+    # (http://localhost:5000)으로 떨어져 컨테이너 안에 없는 로컬 서버에 붙으려다
+    # ConnectionRefusedError로 학습 자체가 죽는다(실제 EMR 실행에서 확인,
+    # 2026-08-26) — spark-submit 경로(_yarn_python_module_step)는 AM 환경변수로
+    # 자동 전달되지만, distributed-shell은 -shell_env로 명시한 것만 받는다.
+    "MLFLOW_TRACKING_URI",
+    # `_candidate_profiles()`의 1차 후보(챔피언이 실제 학습됐던 프로필)는
+    # 하이퍼파라미터는 그대로 두고 학습기간만 "지금의 기본 롤링 윈도우"로
+    # 갱신하려고 이 키 하나만 env_overrides로 얹는다 — 여기서 빠지면
+    # distributed-shell 워커가 프로필에 저장된 챔피언의 **원래(옛날)** lookback을
+    # 그대로 써서, "최신 데이터로 다시 학습"이라는 1차 재시도의 목적 자체가
+    # 조용히 무력화된다(로컬 subprocess 경로는 env 전체를 상속해 원래도 문제
+    # 없었다 — distributed-shell만 화이트리스트라 새는 경로였음).
+    "TRAIN_LOOKBACK_MONTHS",
+)
+# 분산 평가(`yarn_eval_worker.py`) 컨테이너로 넘길 환경변수. 학습과 달리
+# LightGBM 소켓 설정(LGB_LOCAL_LISTEN_PORT 등)은 필요 없다 — predict()는
+# embarrassingly parallel이라 워커끼리 통신하지 않는다
+# (`monitor_performance.combine_evaluation_shards()` 참고).
+_EVAL_SHELL_ENV_KEYS = (
+    "EVAL_RUN_ID",
+    "EVAL_MODEL",
+    "EVAL_TARGET_COL",
+    "EVAL_EXPOSURE_COL",
+    "EVAL_HORIZON",
+    "EVAL_WINDOW_START",
+    "EVAL_WINDOW_END",
+    "EVAL_NUM_WORKERS",
     "S3_BUCKET",
 )
 
@@ -371,10 +417,124 @@ def _run_distributed_training_via_yarn(model_name: str, env: dict[str, str]) -> 
         str(YARN_CONTAINER_MEMORY_MB),
         "-container_vcores",
         str(YARN_CONTAINER_VCORES),
+        "-master_memory",
+        str(YARN_AM_MEMORY_MB),
+        "-master_vcores",
+        str(YARN_AM_VCORES),
         *shell_env_args,
     ]
     _notify(f"[{model_name}] YARN distributed-shell 제출 (컨테이너 {num_machines}개)...")
     subprocess.run(cmd, check=True)
+
+
+def _run_distributed_evaluation_via_yarn(
+    model_name: str,
+    target_col: str,
+    exposure_col: str | None,
+    horizon: int,
+    num_workers: int,
+    as_of=None,
+) -> dict:
+    """평가(`evaluate_recent_performance()`)를 `num_workers`개 YARN
+    distributed-shell 컨테이너에 날짜 기준으로 나눠 돌리고 결과를 합친다.
+
+    학습 분산과 달리 워커끼리 소켓 통신이 필요 없는 embarrassingly parallel
+    작업이라(`monitor_performance.combine_evaluation_shards()` 참고 — poisson_
+    deviance/RMSE/coverage가 전부 행 단위 평균이라 부분합만 합치면 근사 없이
+    정확히 같은 결과) `yarn_worker_bootstrap.py`의 barrier(IP 교환)까지는 필요
+    없지만, "정확히 num_workers개 조각이 도착했는지"는 여기서도 그대로
+    검증한다 — 컨테이너 하나가 조용히 유실되면 일부 날짜가 평가에서 빠진 채로
+    (에러 없이) 재학습 판단이 내려질 수 있기 때문이다(fail-closed).
+
+    args:
+        model_name: "rental" 또는 "return"
+        target_col, exposure_col: `evaluate_recent_performance()` 참고
+        horizon: `evaluate_recent_performance()` 참고
+        num_workers: 나눌 컨테이너 수(2 이상이어야 의미가 있음)
+        as_of: 기준 날짜 override(테스트/CLI `--as-of`)
+    returns:
+        dict: `evaluate_recent_performance()`와 정확히 같은 키
+    raises:
+        RuntimeError: YARN 애플리케이션 실패, 또는 도착한 조각 수가 num_workers와 다름
+    """
+    window_start, window_end = _recent_month_range(MONITOR_LOOKBACK_MONTHS, as_of)
+    run_id = f"eval-{unique_archive_date()}-{model_name}"
+
+    env = {
+        "EVAL_RUN_ID": run_id,
+        "EVAL_MODEL": model_name,
+        "EVAL_TARGET_COL": target_col,
+        "EVAL_EXPOSURE_COL": exposure_col or "",
+        "EVAL_HORIZON": str(horizon),
+        "EVAL_WINDOW_START": window_start,
+        "EVAL_WINDOW_END": window_end,
+        "EVAL_NUM_WORKERS": str(num_workers),
+        "S3_BUCKET": os.environ.get("S3_BUCKET", ""),
+    }
+    shell_command = (
+        f"cd {_EMR_PYTHONPATH} && PYTHONPATH={_EMR_PYTHONPATH} {_EMR_PYTHON} -m training.scripts.yarn_eval_worker"
+    )
+    shell_env_args = []
+    for key in _EVAL_SHELL_ENV_KEYS:
+        if env.get(key):
+            shell_env_args += ["-shell_env", f"{key}={env[key]}"]
+
+    cmd = [
+        "yarn",
+        "org.apache.hadoop.yarn.applications.distributedshell.Client",
+        "-jar",
+        _resolve_distributed_shell_jar(),
+        "-shell_command",
+        shell_command,
+        "-num_containers",
+        str(num_workers),
+        "-container_memory",
+        str(YARN_CONTAINER_MEMORY_MB),
+        "-container_vcores",
+        str(YARN_CONTAINER_VCORES),
+        "-master_memory",
+        str(YARN_AM_MEMORY_MB),
+        "-master_vcores",
+        str(YARN_AM_VCORES),
+        *shell_env_args,
+    ]
+    _notify(f"[{model_name}] 분산 평가 YARN distributed-shell 제출 (워커 {num_workers}개)...")
+    subprocess.run(cmd, check=True)
+
+    shard_prefix = f"{TRAINING_RUNS_PREFIX}/{run_id}/eval-shards/{model_name}/"
+    shard_keys = s3_io.list_keys(shard_prefix)
+    if len(shard_keys) != num_workers:
+        raise RuntimeError(
+            f"[{model_name}] 분산 평가 조각이 {len(shard_keys)}/{num_workers}개만 도착함(run_id={run_id})"
+        )
+    shards = [s3_io.read_json(key) for key in shard_keys]
+    baseline = _load_baseline_metrics(model_name)
+    return combine_evaluation_shards(model_name, (window_start, window_end), shards, baseline)
+
+
+def _check_all_models_distributed(
+    as_of, horizon: int, model_names: list[str] | None, num_workers: int
+) -> list[dict]:
+    """`check_all_models()`와 같은 형태의 결과를 내지만, `num_workers>1`이면
+    모델마다 평가를 YARN distributed-shell로 나눠 돌린다.
+
+    `num_workers<=1`(기본값)이면 기존 `check_all_models()`를 그대로 호출해
+    동작을 바꾸지 않는다 — DAG가 명시적으로 `--eval-num-workers`를 주지 않는
+    한 이 함수를 거쳐도 이전과 완전히 같다.
+    """
+    if num_workers <= 1:
+        return check_all_models(as_of=as_of, model_names=model_names)
+
+    specs = [spec for spec in MODEL_SPECS if spec[0] in model_names] if model_names else MODEL_SPECS
+    results = []
+    for model_name, target_col, exposure_col in specs:
+        evaluation = _run_distributed_evaluation_via_yarn(
+            model_name, target_col, exposure_col, horizon, num_workers, as_of=as_of
+        )
+        result = decide_retrain(evaluation)
+        _log_to_mlflow(result, horizon)
+        results.append(result)
+    return results
 
 
 def _run_training_subprocess(
@@ -443,6 +603,7 @@ def _attempt_promotion(
     skip_feature_pipeline: bool = False,
     target_profile: str | None = None,
     archive_date: str | None = None,
+    no_promote: bool = False,
 ) -> bool:
     """후보 프로필을 시도하며 챔피언을 대체할 최적의 챌린저를 선정하여 승격한다.
 
@@ -456,8 +617,11 @@ def _attempt_promotion(
         skip_feature_pipeline: True면 EMR이 이미 피처를 생성했다고 보고 Spark 생략
         target_profile: 특정 프로필만 단독 실행할 때 프로필 이름
         archive_date: 아카이브 날짜 접미사 (None이면 새로 생성)
+        no_promote: True면 학습/후보 평가는 그대로 하되 실제
+            `promote_challenger()` 호출(챔피언 포인터 갱신)만 건너뛴다 — 반환값은
+            "승격했을지" 그대로라 호출부가 결과를 구분해서 로그로 남길 수 있다.
     returns:
-        bool: 승격이 일어났는지
+        bool: 승격이 일어났는지(no_promote=True면 "일어났을지")
     """
     exec_archive_date = archive_date or unique_archive_date()
     candidates = (
@@ -532,10 +696,13 @@ def _attempt_promotion(
     )
     for best in fully_qualified:
         try:
-            promote_challenger(model_name, best["archive_prefix"])
+            if not no_promote:
+                promote_challenger(model_name, best["archive_prefix"])
             _notify(
                 f"[{model_name}] '{best['profile_name']}' 완전 승격 기준 충족 "
-                f"(deviance={best['deviance']:.4f}) — 챔피언으로 승격 ({best['archive_prefix']})"
+                f"(deviance={best['deviance']:.4f}) — "
+                f"{'[DRY-RUN] 실제로는 승격 안 함' if no_promote else '챔피언으로 승격'} "
+                f"({best['archive_prefix']})"
             )
             return True
         except ServingProfileContractError as exc:
@@ -548,11 +715,13 @@ def _attempt_promotion(
     )
     for best in better_candidates:
         try:
-            promote_challenger(model_name, best["archive_prefix"])
+            if not no_promote:
+                promote_challenger(model_name, best["archive_prefix"])
             _notify(
                 f"[{model_name}] '{best['profile_name']}' 완전 기준(Coverage 등)에는 미달했으나 "
                 f"기존 챔피언보다 성능 우수 (deviance {best['deviance']:.4f} < {champion_deviance:.4f}) "
-                f"— 차선책으로 챔피언 교체 ({best['archive_prefix']})"
+                f"— {'[DRY-RUN] 실제로는 승격 안 함' if no_promote else '차선책으로 챔피언 교체'} "
+                f"({best['archive_prefix']})"
             )
             return True
         except ServingProfileContractError as exc:
@@ -580,6 +749,17 @@ def main() -> list[dict]:
         "--check-only",
         action="store_true",
         help="성능 점검만 수행하고 재학습은 일체 진행하지 않는다",
+    )
+    parser.add_argument(
+        "--no-promote",
+        action="store_true",
+        help=(
+            "학습/후보 평가는 그대로 진행하되 실제 챔피언 포인터(models/champion/*.json)는 "
+            "건드리지 않는다 — 어느 후보가 이겼을지만 로그로 남긴다. 프로덕션 챔피언과 "
+            "물리 경로가 겹칠 수 있는 테스트 프로필로 파이프라인 전체를 스모크 테스트할 "
+            "때 실수로 진짜 승격이 일어나는 걸 막는 용도(airflow monthly_retrain DAG의 "
+            "test_profile_only 참고)."
+        ),
     )
     parser.add_argument(
         "--skip-feature-pipeline",
@@ -615,22 +795,32 @@ def main() -> list[dict]:
             "후 이 키를 읽어 재학습 필요 여부/승격 결과를 판단한다(월간 재학습 DAG 참고)."
         ),
     )
+    parser.add_argument(
+        "--eval-num-workers",
+        type=int,
+        default=1,
+        help=(
+            "1보다 크면 성능 점검(evaluate_recent_performance)을 이 개수만큼 YARN "
+            "distributed-shell 컨테이너에 날짜 기준으로 나눠 돌린다. 기본값 1은 기존과 "
+            "동일하게 현재 프로세스에서 단일로 평가한다."
+        ),
+    )
     args = parser.parse_args()
-
-    results = check_all_models(as_of=args.as_of)
-    if not args.json_output:
-        _print_report(results)
 
     requested_models = (
         [m.strip() for m in args.models.split(",") if m.strip()]
         if args.models
         else None
     )
-    relevant_results = (
-        [r for r in results if r["model_name"] in requested_models]
-        if requested_models
-        else results
-    )
+    # `check_all_models()`에 처음부터 요청받은 모델만 넘긴다 — 안 그러면
+    # `--models rental`이어도 return용 feature mart까지 통째로 읽어들여
+    # m4.large 컨테이너 메모리 예산에서 OOM(exitCode 137)이 난다(실제 EMR
+    # 실행에서 확인, 2026-08-26).
+    results = _check_all_models_distributed(args.as_of, 1, requested_models, args.eval_num_workers)
+    if not args.json_output:
+        _print_report(results)
+
+    relevant_results = results
     retrain_needed = [r for r in relevant_results if r["needs_retrain"]]
     target_models = [r["model_name"] for r in retrain_needed]
 
@@ -676,11 +866,20 @@ def main() -> list[dict]:
             champion_metrics,
             skip_feature_pipeline=args.skip_feature_pipeline,
             target_profile=args.profile_name,
+            no_promote=args.no_promote,
         )
 
     if args.result_s3_key:
         s3_io.write_json(
-            args.result_s3_key, {"promoted": promoted_by_model, "target_models": target_models}
+            args.result_s3_key,
+            {
+                "promoted": promoted_by_model,
+                "target_models": target_models,
+                # no_promote=True면 위 promoted 값은 "실제 승격"이 아니라
+                # "승격 기준을 충족했을지"다 — 호출부(airflow DAG)가 이 플래그로
+                # 구분해서 착각하지 않게 명시적으로 같이 남긴다.
+                "no_promote": args.no_promote,
+            },
         )
     return results
 
