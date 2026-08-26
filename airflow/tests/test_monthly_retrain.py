@@ -364,6 +364,32 @@ def test_orchestrate_retrain_loop_submits_feature_mart_then_trains_without_resiz
     assert "spark.yarn.appMasterEnv.LGB_NUM_MACHINES=8" in train_command
 
 
+def test_orchestrate_retrain_loop_passes_no_promote_when_test_profile_only(monkeypatch) -> None:
+    """test_profile_only는 "재평가만 건너뛴다"는 뜻이지 "승격을 막는다"는 뜻이
+    아니다 — 테스트 프로필이 우연히 챔피언보다 좋게 나오면 이 플래그 없이는
+    진짜 챔피언이 바뀐다. 학습 스텝에 --no-promote를 반드시 같이 실어야 한다."""
+    mock_ti = MagicMock()
+    mock_ti.xcom_pull.side_effect = lambda task_ids, key: {
+        "cluster_id": "j-1",
+        "candidate_profiles": [monthly_dag.TEST_ONLY_PROFILE_NAME],
+    }.get(key)
+
+    submitted_commands = {}
+
+    def _fake_submit_emr_step(cluster_id, name, command, **kwargs):
+        submitted_commands[name] = command
+        return {"StepId": "s", "State": "COMPLETED"}
+
+    monkeypatch.setattr(monthly_dag, "submit_emr_step", _fake_submit_emr_step)
+    monkeypatch.setattr(monthly_dag, "read_s3_json", lambda key: {"promoted": {"rental": False}})
+
+    loop_fn = monthly_dag.make_task_orchestrate_retrain_loop("rental")
+    loop_fn(ti=mock_ti, params={"test_profile_only": True}, run_id="run-1")
+
+    train_command = submitted_commands[f"Train-rental-{monthly_dag.TEST_ONLY_PROFILE_NAME}"][2]
+    assert "--no-promote" in train_command
+
+
 def test_terminate_cluster_task_calls_terminate_when_cluster_exists(monkeypatch) -> None:
     mock_ti = MagicMock()
     mock_ti.xcom_pull.return_value = "j-1"

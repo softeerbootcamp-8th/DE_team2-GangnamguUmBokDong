@@ -574,19 +574,26 @@ def make_task_orchestrate_retrain_loop(model_name: str) -> Any:
 
                 logger.info("=== [%s 프로필: %s] YARN distributed-shell 학습 스텝 제출 ===", model_name, profile)
                 train_result_key = _result_s3_key(run_id, f"train-{model_name}-{profile}")
+                train_args = [
+                    "--execute",
+                    "--skip-feature-pipeline",
+                    "--profile-name",
+                    profile,
+                    "--models",
+                    model_name,
+                    "--result-s3-key",
+                    train_result_key,
+                ]
+                if params.get("test_profile_only"):
+                    # test_profile_only는 "재평가만 건너뛴다"는 뜻이지 "승격을
+                    # 막는다"는 뜻이 아니다 — 프로필이 우연히 챔피언보다 좋게
+                    # 나오면 이 플래그 없이는 진짜 models/champion/*.json이
+                    # 바뀐다. 스모크 테스트 목적과 안 맞으므로 명시적으로 막는다.
+                    train_args.append("--no-promote")
                 train_name, train_command = _yarn_python_module_step(
                     f"Train-{model_name}-{profile}",
                     "training.scripts.monthly_retrain_check",
-                    [
-                        "--execute",
-                        "--skip-feature-pipeline",
-                        "--profile-name",
-                        profile,
-                        "--models",
-                        model_name,
-                        "--result-s3-key",
-                        train_result_key,
-                    ],
+                    train_args,
                     env={
                         "LGB_NUM_MACHINES": str(TRAINING_CORE_INSTANCE_COUNT),
                         "LGB_TREE_LEARNER": "data",

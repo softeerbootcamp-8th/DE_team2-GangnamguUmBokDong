@@ -443,6 +443,7 @@ def _attempt_promotion(
     skip_feature_pipeline: bool = False,
     target_profile: str | None = None,
     archive_date: str | None = None,
+    no_promote: bool = False,
 ) -> bool:
     """후보 프로필을 시도하며 챔피언을 대체할 최적의 챌린저를 선정하여 승격한다.
 
@@ -456,8 +457,11 @@ def _attempt_promotion(
         skip_feature_pipeline: True면 EMR이 이미 피처를 생성했다고 보고 Spark 생략
         target_profile: 특정 프로필만 단독 실행할 때 프로필 이름
         archive_date: 아카이브 날짜 접미사 (None이면 새로 생성)
+        no_promote: True면 학습/후보 평가는 그대로 하되 실제
+            `promote_challenger()` 호출(챔피언 포인터 갱신)만 건너뛴다 — 반환값은
+            "승격했을지" 그대로라 호출부가 결과를 구분해서 로그로 남길 수 있다.
     returns:
-        bool: 승격이 일어났는지
+        bool: 승격이 일어났는지(no_promote=True면 "일어났을지")
     """
     exec_archive_date = archive_date or unique_archive_date()
     candidates = (
@@ -532,10 +536,13 @@ def _attempt_promotion(
     )
     for best in fully_qualified:
         try:
-            promote_challenger(model_name, best["archive_prefix"])
+            if not no_promote:
+                promote_challenger(model_name, best["archive_prefix"])
             _notify(
                 f"[{model_name}] '{best['profile_name']}' 완전 승격 기준 충족 "
-                f"(deviance={best['deviance']:.4f}) — 챔피언으로 승격 ({best['archive_prefix']})"
+                f"(deviance={best['deviance']:.4f}) — "
+                f"{'[DRY-RUN] 실제로는 승격 안 함' if no_promote else '챔피언으로 승격'} "
+                f"({best['archive_prefix']})"
             )
             return True
         except ServingProfileContractError as exc:
@@ -548,11 +555,13 @@ def _attempt_promotion(
     )
     for best in better_candidates:
         try:
-            promote_challenger(model_name, best["archive_prefix"])
+            if not no_promote:
+                promote_challenger(model_name, best["archive_prefix"])
             _notify(
                 f"[{model_name}] '{best['profile_name']}' 완전 기준(Coverage 등)에는 미달했으나 "
                 f"기존 챔피언보다 성능 우수 (deviance {best['deviance']:.4f} < {champion_deviance:.4f}) "
-                f"— 차선책으로 챔피언 교체 ({best['archive_prefix']})"
+                f"— {'[DRY-RUN] 실제로는 승격 안 함' if no_promote else '차선책으로 챔피언 교체'} "
+                f"({best['archive_prefix']})"
             )
             return True
         except ServingProfileContractError as exc:
@@ -580,6 +589,17 @@ def main() -> list[dict]:
         "--check-only",
         action="store_true",
         help="성능 점검만 수행하고 재학습은 일체 진행하지 않는다",
+    )
+    parser.add_argument(
+        "--no-promote",
+        action="store_true",
+        help=(
+            "학습/후보 평가는 그대로 진행하되 실제 챔피언 포인터(models/champion/*.json)는 "
+            "건드리지 않는다 — 어느 후보가 이겼을지만 로그로 남긴다. 프로덕션 챔피언과 "
+            "물리 경로가 겹칠 수 있는 테스트 프로필로 파이프라인 전체를 스모크 테스트할 "
+            "때 실수로 진짜 승격이 일어나는 걸 막는 용도(airflow monthly_retrain DAG의 "
+            "test_profile_only 참고)."
+        ),
     )
     parser.add_argument(
         "--skip-feature-pipeline",
@@ -676,11 +696,20 @@ def main() -> list[dict]:
             champion_metrics,
             skip_feature_pipeline=args.skip_feature_pipeline,
             target_profile=args.profile_name,
+            no_promote=args.no_promote,
         )
 
     if args.result_s3_key:
         s3_io.write_json(
-            args.result_s3_key, {"promoted": promoted_by_model, "target_models": target_models}
+            args.result_s3_key,
+            {
+                "promoted": promoted_by_model,
+                "target_models": target_models,
+                # no_promote=True면 위 promoted 값은 "실제 승격"이 아니라
+                # "승격 기준을 충족했을지"다 — 호출부(airflow DAG)가 이 플래그로
+                # 구분해서 착각하지 않게 명시적으로 같이 남긴다.
+                "no_promote": args.no_promote,
+            },
         )
     return results
 
