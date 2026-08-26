@@ -19,6 +19,7 @@ from gold.common import parquet_bytes
 from gold.source_catalog import SourceManifestArtifact
 from gold.station import StationRecord
 from gold.station_release import (
+    _POSTGIS_DISTANCE_BATCH_MAX_PAIRS,
     _STATION_SCHEMA,
     _STATION_STOCK_SCHEMA,
     _build_window_set,
@@ -305,6 +306,25 @@ def test_postgis_distance_batch_skips_query_for_empty_input() -> None:
 
     assert distance.batch(()) == ()
     assert cursor.statements == []
+
+
+def test_postgis_distance_batch_chunks_at_safe_statement_boundary() -> None:
+    """상한을 한 쌍 넘으면 입력 순서를 유지한 두 statement로 나눈다."""
+    pair_count = _POSTGIS_DISTANCE_BATCH_MAX_PAIRS + 1
+    cursor = _DistanceCursor(tuple(float(index) for index in range(pair_count)))
+    distance = _postgis_distance(cursor)  # type: ignore[arg-type]
+    pair = ((127.0, 37.5), (127.001, 37.5))
+
+    values = distance.batch((pair,) * pair_count)
+
+    assert len(values) == pair_count
+    assert values[0] == 0.0
+    assert values[-1] == float(pair_count - 1)
+    assert len(cursor.statements) == 2
+    assert [len(parameters[0]) for parameters in cursor.parameters] == [
+        _POSTGIS_DISTANCE_BATCH_MAX_PAIRS,
+        1,
+    ]
 
 
 def test_direct_prior_payload_uses_actual_immutable_bytes() -> None:
