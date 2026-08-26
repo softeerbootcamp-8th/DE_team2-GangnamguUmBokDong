@@ -99,6 +99,16 @@ _EMR_PYTHONPATH = "/opt/gng"
 # mock_mode(AWS 호출을 흉내낼지 여부)와는 완전히 별개 축이다: test_profile_only는
 # 실제 AWS 자원으로 전체 파이프라인(피처마트 생성 → 학습 → 승격 판정)을 작은
 # 프로필 하나로 빠르게 스모크 테스트하려는 용도다.
+#
+# **주의**: 이 프로필의 ROLLING_WINDOW_MINUTES/ROLLING_EMBARGO_MINUTES(현재
+# 65/45)는 프로덕션 챔피언 프로필의 값(기본 60/40)과 반드시 달라야 한다 —
+# feature mart 출력 경로가 이 셋의 조합(w{window}_e{embargo}_t{tick})으로만
+# 키잉되므로, 값이 같으면 서로 다른 TRAIN_LOOKBACK_MONTHS를 가진 프로필끼리
+# 같은 물리 경로를 공유하게 된다. build_multi_horizon_features.py가
+# partitionOverwriteMode=dynamic이라도 겹치는 날짜 파티션은 그대로 덮어쓰므로,
+# 완전히 겹치지 않는 값으로 격리해야 안전하다 — 실제로 이 프로필이 챔피언과
+# 같은 값을 썼다가 프로덕션 feature mart 365개 파티션 중 332개가 삭제되는
+# 사고가 났다(2026-08-26, 원본 데이터에서 재생성해 복구함).
 TEST_ONLY_PROFILE_NAME = "a-test-sparse-flat"
 
 # DAG params의 "mock_mode" 값 → aws_infra_task의 override 인자로 변환하는 매핑.
