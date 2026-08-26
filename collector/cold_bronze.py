@@ -23,7 +23,6 @@ from core.s3 import (
     get_object_bytes,
     list_keys,
     list_objects,
-    merge_object_tags,
     object_exists,
     put_object_bytes,
     read_json,
@@ -90,13 +89,6 @@ def write_pending_marker(source_id: str, day: date, hot_key: str) -> None:
         write_json(key, payload)
 
 
-def _tag_hot_objects(hot_keys: list[str]) -> None:
-    """검증된 Cold에 포함된 Hot에 Lifecycle 허용 태그를 붙인다."""
-    for hot_key in hot_keys:
-        if hot_key.startswith("bronze/hot/"):
-            merge_object_tags(hot_key, {"cold_compacted": "true"})
-
-
 def _sha256(payload: bytes) -> str:
     """Bytes의 lowercase SHA-256을 반환한다."""
     return hashlib.sha256(payload).hexdigest()
@@ -153,23 +145,22 @@ def _parse_key(key: str, source_id: str, day: date) -> dict:
 def compact_date(source_id: str, day: date) -> ColdBronzeResult:
     """모든 Hot Bronze revision을 원본 bytes 그대로 날짜 파일 하나에 보관한다."""
     objects = _input_objects(source_id, day)
-    if not objects:
-        return ColdBronzeResult(status="empty", objects=0, cold_key=None)
-
-    input_signature = _input_signature(objects)
     manifest_key = f"bronze/cold_manifest/{source_id}/dt={day.isoformat()}.json"
     previous = read_json(manifest_key)
-    if (
-        previous
-        and previous.get("input_signature") == input_signature
-        and previous.get("verified") is True
-    ):
-        cold_key = previous.get("cold_key")
-        if isinstance(cold_key, str) and object_exists(cold_key):
-            _tag_hot_objects([obj.key for obj in objects])
-            return ColdBronzeResult("skipped", len(objects), cold_key)
+    previous_rows: list[dict] = []
+    if isinstance(previous, dict) and previous.get("verified") is True:
+        previous_key = previous.get("cold_key")
+        previous_sha256 = previous.get("cold_sha256")
+        if isinstance(previous_key, str) and isinstance(previous_sha256, str):
+            previous_payload = get_object_bytes(previous_key)
+            if previous_payload is None or _sha256(previous_payload) != previous_sha256:
+                raise RuntimeError(f"기존 Cold Bronze 검증에 실패했다: {previous_key}")
+            previous_rows = pq.read_table(pa.BufferReader(previous_payload)).to_pylist()
 
-    rows = []
+    if not objects and not previous_rows:
+        return ColdBronzeResult(status="empty", objects=0, cold_key=None)
+
+    rows_by_key = {row["original_key"]: row for row in previous_rows}
     for obj in objects:
         identity = _parse_key(obj.key, source_id, day)
         stored = get_object_bytes(obj.key)
@@ -179,17 +170,34 @@ def compact_date(source_id: str, day: date) -> ColdBronzeResult:
             raw = gzip.decompress(stored)
         except gzip.BadGzipFile as exc:
             raise ValueError(f"Hot Bronze가 gzip이 아니다: {obj.key}") from exc
-        rows.append(
-            {
-                "source_id": source_id,
-                **identity,
-                "original_key": obj.key,
-                "collected_at": obj.last_modified.isoformat(),
-                "stored_sha256": _sha256(stored),
-                "payload_sha256": _sha256(raw),
-                "stored_bytes": stored,
-            }
-        )
+        row = {
+            "source_id": source_id,
+            **identity,
+            "original_key": obj.key,
+            "collected_at": obj.last_modified.isoformat(),
+            "stored_sha256": _sha256(stored),
+            "payload_sha256": _sha256(raw),
+            "stored_bytes": stored,
+        }
+        previous_row = rows_by_key.get(obj.key)
+        if (
+            previous_row is not None
+            and previous_row["stored_sha256"] != row["stored_sha256"]
+        ):
+            raise RuntimeError(f"immutable Hot Bronze key 내용이 변경됐다: {obj.key}")
+        rows_by_key[obj.key] = row
+
+    rows = [rows_by_key[key] for key in sorted(rows_by_key, key=str.encode)]
+    inventory_keys = [row["original_key"] for row in rows]
+    inventory_signature = _sha256("\n".join(inventory_keys).encode())
+    if (
+        isinstance(previous, dict)
+        and previous.get("inventory_keys") == inventory_keys
+        and previous.get("verified") is True
+    ):
+        cold_key = previous.get("cold_key")
+        if isinstance(cold_key, str) and object_exists(cold_key):
+            return ColdBronzeResult("skipped", len(rows), cold_key)
 
     schema = pa.schema(
         [
@@ -221,7 +229,7 @@ def compact_date(source_id: str, day: date) -> ColdBronzeResult:
     readback = get_object_bytes(cold_key)
     if readback is None or _sha256(readback) != cold_sha256:
         raise RuntimeError(f"Cold Bronze readback checksum 검증에 실패했다: {cold_key}")
-    if pq.ParquetFile(pa.BufferReader(readback)).metadata.num_rows != len(objects):
+    if pq.ParquetFile(pa.BufferReader(readback)).metadata.num_rows != len(rows):
         raise RuntimeError(f"Cold Bronze readback row 수가 입력 object 수와 다르다: {cold_key}")
 
     write_json(
@@ -229,16 +237,17 @@ def compact_date(source_id: str, day: date) -> ColdBronzeResult:
         {
             "source_id": source_id,
             "date": day.isoformat(),
-            "input_signature": input_signature,
-            "input_objects": len(objects),
+            "input_signature": inventory_signature,
+            "inventory_signature": inventory_signature,
+            "input_objects": len(rows),
+            "inventory_keys": inventory_keys,
             "cold_key": cold_key,
             "cold_sha256": cold_sha256,
-            "stored_bytes": sum(obj.size for obj in objects),
+            "stored_bytes": sum(len(row["stored_bytes"]) for row in rows),
             "verified": True,
         },
     )
-    _tag_hot_objects([obj.key for obj in objects])
-    return ColdBronzeResult("compacted", len(objects), cold_key)
+    return ColdBronzeResult("compacted", len(rows), cold_key)
 
 
 def recover_pending(
@@ -281,10 +290,15 @@ def recover_pending(
                 f"bronze/cold_manifest/{source_id}/dt={day.isoformat()}.json"
             )
             current_signature = _input_signature(current)
+            inventory_keys = (
+                set(manifest.get("inventory_keys", []))
+                if isinstance(manifest, dict)
+                else set()
+            )
             if current and (
                 not isinstance(manifest, dict)
                 or manifest.get("verified") is not True
-                or manifest.get("input_signature") != current_signature
+                or not {obj.key for obj in current}.issubset(inventory_keys)
             ):
                 raise RuntimeError(
                     f"Cold 생성 중 Hot 입력이 변경됐다: source={source_id}, day={day}"

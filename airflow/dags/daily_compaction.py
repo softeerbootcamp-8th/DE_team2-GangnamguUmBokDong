@@ -22,6 +22,7 @@ from orchestration.collector_task import build_daily_history_replay_task
 from orchestration.compaction_task import (
     build_cold_bronze_compaction_task,
     build_compaction_task,
+    build_hot_bronze_gc_task,
     build_silver_gc_task,
 )
 from orchestration.templates import KST_DATE, kst_date_days_ago
@@ -29,6 +30,7 @@ from orchestration.templates import KST_DATE, kst_date_days_ago
 from airflow import DAG
 
 SILVER_GC_RETENTION_DAYS = 30
+HOT_BRONZE_RETENTION_DAYS = 30
 
 with DAG(
     dag_id="daily_compaction",
@@ -75,6 +77,14 @@ with DAG(
         if source_id == "bike_rental_history":
             replay_chain >> cold
 
+        hot_gc = build_hot_bronze_gc_task(
+            dag,
+            source_id,
+            today=KST_DATE,
+            retention_days=HOT_BRONZE_RETENTION_DAYS,
+        )
+        cold >> hot_gc
+
     for source_id in COLD_BRONZE_SOURCES:
         gc_target_date = kst_date_days_ago(
             DAILY_ARCHIVE_DELAY_DAYS + SILVER_GC_RETENTION_DAYS
@@ -85,4 +95,4 @@ with DAG(
             gc_target_date,
             require_archive=source_id in COMPACTION_SOURCES,
         )
-        cold_tasks[source_id] >> gc
+        dag.get_task(f"gc_hot_bronze_{source_id}") >> gc

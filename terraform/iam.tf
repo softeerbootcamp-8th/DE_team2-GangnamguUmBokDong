@@ -46,18 +46,6 @@ data "aws_iam_policy_document" "data_access" {
     resources = ["${aws_s3_bucket.data.arn}/*"]
   }
 
-  # Cold Bronze readback 검증이 끝난 Hot object에만 Lifecycle 허용 태그를 붙인다.
-  # 일반 object namespace까지 tagging 권한을 넓히지 않고 Hot Bronze로 제한한다.
-  statement {
-    sid    = "TagVerifiedHotBronze"
-    effect = "Allow"
-    actions = [
-      "s3:GetObjectTagging",
-      "s3:PutObjectTagging",
-    ]
-    resources = ["${aws_s3_bucket.data.arn}/bronze/hot/*"]
-  }
-
   # POI Master는 content-addressed artifact와 append-only activation history다.
   # 실행 역할의 실수나 잘못된 정리 작업이 최초 게시 이후 static fixture로 되돌리는
   # 상태를 만들지 못하도록 이 네 namespace의 삭제를 명시적으로 거부한다.

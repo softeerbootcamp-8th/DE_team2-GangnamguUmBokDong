@@ -46,9 +46,13 @@ bronze/hot/<source_id>/dt=YYYY-MM-DD/hh=HH/HHMM/revision=NNNNNNNNNN/part=<part_k
 - Silver Archive 대상 여부와 관계없이 모든 Collector source의 검증된 날짜 revision은
   `bronze/cold/<source_id>/dt=YYYY-MM-DD/sha256=...parquet`에 원본 gzip bytes 그대로
   장기 보관한다.
-- Cold object의 checksum·row count readback이 끝나면 포함된 Hot object에
-  `cold_compacted=true` 태그를 붙인 뒤 marker를 제거한다. Hot 30일 Lifecycle은 이
-  태그가 있는 object에만 적용되므로 Cold 실패 원본은 삭제되지 않는다.
+- Cold object의 checksum·row count readback이 끝나면 marker를 제거한다. 기존 Cold
+  bundle이 있는 날짜에 늦은 revision이 들어오면 기존 rows와 새 Hot을 합쳐 최신 Cold
+  manifest가 모든 revision을 계속 가리키게 한다.
+- Hot GC는 Cold manifest 목록만 작은 recovery queue로 조회한다. 30일이 지난 날짜에서
+  검증된 Cold inventory에 정확히 포함된 Hot key만 삭제하고
+  `_hot_gc_manifest/<source_id>/dt=YYYY-MM-DD.json`에 준비·완료 상태를 남긴다. Cold에
+  포함되지 않은 late revision이 하나라도 있으면 삭제하지 않고 실패한다.
 - 모든 source에서 Cold Bronze가 검증되면 최신 authority가 아닌 Silver를 객체 생성 후
   30일간 보존한 다음 삭제한다. 일 단위 Archive 대상 source는 Archive와 현재 authority
   signature 일치도 추가로 검증하고
