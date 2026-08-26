@@ -266,6 +266,47 @@ def _distributed_params() -> dict:
     return params
 
 
+_LGB_SOCKET_RETRY_ATTEMPTS = 3
+_LGB_SOCKET_RETRY_DELAY_SECONDS = 5
+_LGB_SOCKET_ERROR_KEYWORDS = ("socket", "bind", "connect", "address already in use")
+
+
+def _is_transient_socket_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return any(keyword in message for keyword in _LGB_SOCKET_ERROR_KEYWORDS)
+
+
+def _lgb_train_with_socket_retry(params: dict, train_set: lgb.Dataset, **kwargs) -> lgb.Booster:
+    """분산 학습에서 `lgb.train()`이 소켓 bind/connect 오류로 죽으면 짧게 재시도한다.
+
+    한 프로세스 안에서 `lgb.train()`을 phase마다(포아송/q10/q50/q90, 최대 4번)
+    연속 호출하는데, 매번 같은 `LGB_LOCAL_LISTEN_PORT`로 새 소켓 핸드셰이크를
+    맺는다 — 이전 phase의 소켓이 OS 레벨에서 완전히 정리되기 전에(TIME_WAIT 등)
+    다음 phase가 같은 포트를 다시 bind/connect하려 하면 일시적으로 실패할 수
+    있다는 게 이론적 우려다(리뷰 지적, 2026-08-26 — 실제 재현 사례는 아직 없다).
+    분산이 아니면(`tree_learner="serial"`) 포트 재사용 이슈 자체가 없으므로
+    바로 한 번만 시도한다. 재시도는 이 프로세스(자기 rank)만 다시 `lgb.train()`을
+    호출하는 것이라 완전한 보장은 아니다 — 다른 머신이 동시에 같은 종류의
+    일시적 오류를 겪어야 재동기화되는데, 그 쪽도 같은 코드를 실행하므로 대개는
+    비슷한 시점에 같이 재시도하게 된다.
+    """
+    if params.get("tree_learner", "serial") == "serial":
+        return lgb.train(params, train_set, **kwargs)
+    for attempt in range(1, _LGB_SOCKET_RETRY_ATTEMPTS + 1):
+        try:
+            return lgb.train(params, train_set, **kwargs)
+        except lgb.basic.LightGBMError as exc:
+            if attempt == _LGB_SOCKET_RETRY_ATTEMPTS or not _is_transient_socket_error(exc):
+                raise
+            print(
+                f"[train_common] 분산 학습 소켓 오류(시도 {attempt}/{_LGB_SOCKET_RETRY_ATTEMPTS}), "
+                f"{_LGB_SOCKET_RETRY_DELAY_SECONDS}초 후 재시도: {exc}",
+                flush=True,
+            )
+            time.sleep(_LGB_SOCKET_RETRY_DELAY_SECONDS)
+    raise AssertionError("unreachable")  # pragma: no cover
+
+
 def _conformal_correction(y_valid: np.ndarray, lower: np.ndarray, upper: np.ndarray, target_coverage: float) -> float:
     """Split-conformal 보정값 계산 (Romano et al., CQR).
 
@@ -364,7 +405,7 @@ def _train_phase_with_checkpoint(
                 0,
                 lgb.early_stopping(config.LGB_EARLY_STOPPING_ROUNDS, verbose=False),
             )
-        booster = lgb.train(
+        booster = _lgb_train_with_socket_retry(
             params,
             train_set,
             num_boost_round=config.LGB_NUM_BOOST_ROUND,
@@ -442,7 +483,7 @@ def _train_phase_with_checkpoint(
                 )
             booster = resume_state.booster
         else:
-            booster = lgb.train(
+            booster = _lgb_train_with_socket_retry(
                 params,
                 train_set,
                 num_boost_round=remaining_rounds,

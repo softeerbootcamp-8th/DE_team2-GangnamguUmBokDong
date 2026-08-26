@@ -53,11 +53,19 @@ S3_BUCKET = os.environ.get("S3_BUCKET", "local-dev")
 def _s3a(key: str) -> str:
     """S3 키를 Spark용 단일 URI 문자열로 만든다.
 
-    로컬 MinIO(`S3_ENDPOINT_URL` 설정됨)는 반드시 Hadoop-S3A 커넥터가 필요해
-    `s3a://`를 쓴다. 실제 AWS(EMR)에서는 `s3a://`가 EMR의 IAM 인스턴스 프로필
-    자격증명을 안 타고(EMRFS는 `s3://`에만 연결돼 있다) 존재하지 않는 access key로
-    S3에 요청을 보내 403(InvalidAccessKeyId)로 즉시 실패한다(실제 EMR 실행에서
-    확인, 2026-08-25) — EMR에서는 EMRFS가 처리하는 `s3://`를 쓴다.
+    로컬 MinIO(`S3_ENDPOINT_URL` 설정됨)는 Hadoop-S3A 커넥터가 필요해 `s3a://`를
+    쓴다. **주의(2026-08-25 → 26 정정)**: 이 함수를 처음 만들 때는 "실제 AWS/EMR은
+    EMRFS가 `s3://`에만 연결돼 있어 `s3a://`를 쓰면 403이 난다"고 추정했지만,
+    emr-7.13.0(Hadoop 3.4.2)으로 올라온 뒤 다시 확인해보니 이 버전에서는 `s3://`도
+    EMRFS 전용 구현이 아니라 **표준 S3A 커넥터를 그대로** 타서(emr-7.2.0/Hadoop
+    3.3.6과 다른 점) 스킴 자체는 더 이상 결과에 영향이 없다 — 그때 실제로 403을
+    고친 건 스킴 변경이 아니라 `spark.hadoop.fs.s3a.aws.credentials.provider`를
+    EC2 인스턴스 프로필 전용 provider로 명시한 것이었다(`airflow/dags/
+    monthly_retrain.py`의 `_feature_mart_spark_steps()` 주석 참고). 그럼에도 이
+    분기 자체는 유지한다 — 로컬 MinIO는 여전히 `s3a://`가 필요하고, 클라우드에서는
+    `s3://`/`s3a://` 어느 쪽이든 동작하므로 굳이 바꿀 이유가 없다. 다만 writer와
+    reader가 서로 다른 `S3_ENDPOINT_URL` 상태로 뜨면 다른 스킴의 경로 문자열을
+    만들어낼 수 있다는 점은 여전한 잠재 위험이라 인지하고 있을 것(PR #248 리뷰 지적).
     """
     scheme = "s3a" if os.environ.get("S3_ENDPOINT_URL") else "s3"
     return f"{scheme}://{S3_BUCKET}/{key}"

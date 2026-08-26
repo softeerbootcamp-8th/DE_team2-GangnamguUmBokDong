@@ -95,6 +95,153 @@ def _recent_month_range(lookback_months: int, as_of: date | None = None) -> tupl
     return start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")
 
 
+def _split_date_range(start: str, end: str, num_shards: int) -> list[tuple[str, str] | None]:
+    """[start, end](양끝 포함, "YYYY-MM-DD")를 날짜 수 기준으로 거의 균등한
+    `num_shards`개의 연속 구간으로 나눈다.
+
+    station_no가 아니라 날짜로 샤딩하는 이유: feature mart가 날짜별 Spark
+    파티션 파일이라(`date=YYYY-MM-DD/*.parquet`), 날짜로 나누면 워커마다 서로
+    다른 파일만 읽어 총 I/O가 그대로 유지된다. station_no로 나누면 워커 전원이
+    같은 전체 파티션을 다 읽은 뒤 행만 버려야 해서 총 I/O가 워커 수만큼 늘어난다.
+
+    args:
+        start, end: 전체 구간(양끝 포함)
+        num_shards: 나눌 조각 수(1 이상)
+    returns:
+        list[tuple[str, str] | None]: 길이 num_shards. 구간 안 날짜 수가
+            num_shards보다 적으면 뒤쪽 일부 원소는 `None`(그 워커가 담당할
+            날짜가 하나도 없다는 뜻 — `evaluate_recent_performance_shard()`를
+            부르는 쪽이 S3를 읽지 않고 곧바로 n_rows=0 부분합을 반환해야 한다.
+            barrier 자체는 여전히 num_shards개 등록을 기다리므로 에러가 아니다).
+    """
+    all_days = pd.date_range(start, end, freq="D")
+    chunks = np.array_split(all_days, num_shards)
+    return [(chunk[0].strftime("%Y-%m-%d"), chunk[-1].strftime("%Y-%m-%d")) if len(chunk) else None for chunk in chunks]
+
+
+def evaluate_recent_performance_shard(
+    model_name: str,
+    target_col: str,
+    exposure_col: str | None,
+    date_range: tuple[str, str] | None,
+    horizon: int = 1,
+) -> dict:
+    """`date_range`(전체 평가 구간의 부분 조각일 수 있음)에 대해서만 예측하고,
+    최종 지표로 합치기 전의 "부분합"을 반환한다.
+
+    분산 평가(`training/scripts/yarn_eval_worker.py`)의 워커 하나가 부르는
+    함수 — 오케스트레이터(`monthly_retrain_check._run_distributed_evaluation_via_yarn()`)가
+    이 부분합들을 모아 `combine_evaluation_shards()`로 합친다. `evaluate_recent_
+    performance()`도 내부적으로 이 함수를 (전체 구간을 "조각 1개"로) 호출해서
+    두 경로가 정확히 같은 계산을 공유하게 한다.
+
+    poisson_deviance/RMSE/coverage가 전부 "행 단위 값의 평균"이라(`ml_core.
+    metrics.poisson_deviance` 참고) 부분합(합계 + 행 수)만 있으면 나중에
+    합쳐도 전체를 한 번에 계산한 것과 수학적으로 완전히 동일하다 — 근사가
+    아니다.
+
+    args:
+        model_name: "rental" 또는 "return"
+        target_col: "rental_count" 또는 "return_count"
+        exposure_col: predict()에 전달할 exposure 컬럼명 (반납은 None)
+        date_range: (start, end) — 이 워커가 담당할 부분구간(양끝 포함).
+            `_split_date_range()`가 이 워커에 배정할 날짜가 없다고 판단하면
+            `None` — 이때는 S3를 읽지 않고 곧바로 빈 부분합을 반환한다.
+        horizon: `evaluate_recent_performance()` 참고
+    returns:
+        dict: n_rows, sum_deviance_term, sum_sq_err, sum_coverage_hits.
+            n_rows=0이면 나머지 sum_*은 전부 0.0(이 조각에 해당 날짜가 없거나
+            비어 있었다는 뜻 — 오류가 아니다).
+    """
+    if date_range is None:
+        return {"n_rows": 0, "sum_deviance_term": 0.0, "sum_sq_err": 0.0, "sum_coverage_hits": 0.0}
+    start, end = date_range
+    table_path = _TRAINING_TABLE_BY_MODEL[model_name]
+    feature_columns = _FEATURE_COLUMNS_BY_MODEL[model_name]
+    # "date"/"hour"도 넣어야 한다 — scoring.predict()가 마지막에
+    # `df[["station_no", "date", "hour"]]`로 식별 컬럼을 그대로 뽑아 쓴다(리뷰
+    # 지적: 예전엔 여기서 뺐다가 predict()에서 매번 KeyError로 죽었다). "date"는
+    # Spark 파티션 컬럼이라 파일엔 없지만 core.s3._read_parquet_by_dates()가
+    # columns=에 포함된 경우에만 복원한다(그 함수의 2026-08 수정 참고 — 포함 안
+    # 하면 그 복원 자체를 건너뛰므로, 여기서 넣는다고 불필요한 비용이 생기진
+    # 않는다). "hour"는 더 이상 모델 feature가 아니지만(minute이 대체) 파일
+    # 내용에는 여전히 있는 식별용 컬럼이라 feature_columns에 안 잡힌다.
+    needed = sorted(
+        set(feature_columns) | {target_col, "horizon", "date", "hour"} | ({exposure_col} if exposure_col else set())
+    )
+    # multi-horizon 테이블은 같은 날짜 파티션 안에 horizon마다 행이 다 섞여 있다
+    # (기본 8개: common_config.TRAIN_HORIZONS) — `filters`를 안 주면 이 구간의
+    # 8개 horizon 전부를 pandas로 읽어들인 "뒤"에 `df["horizon"]==horizon`으로
+    # 걸러서, 실제 필요한 양의 최대 8배를 메모리에 올린다(m4.large 컨테이너
+    # 메모리 상한 6144MB를 꽉 채워도 exitCode 137로 죽는 것으로 실제 EMR
+    # 실행에서 확인, 2026-08-26). pyarrow row-group 필터(`filters=`)로 애초에
+    # 이 horizon 행만 읽는다 — `core.s3.read_parquet()` docstring 참고.
+    df = s3_io.read_parquet(table_path, columns=needed, date_range=(start, end), filters=[("horizon", "==", horizon)])
+    if df is None:
+        raise FileNotFoundError(f"S3에 없음: {table_path}")
+    if df.empty:
+        return {"n_rows": 0, "sum_deviance_term": 0.0, "sum_sq_err": 0.0, "sum_coverage_hits": 0.0}
+
+    preds = predict(df, model_name, exposure_col=exposure_col)
+    y = df[target_col].to_numpy()
+    pred_mean = preds["pred_mean"].to_numpy()
+
+    mu = np.clip(pred_mean, 1e-6, None)
+    y_safe = np.where(y > 0, y, 1.0)
+    deviance_term = np.where(y > 0, y * np.log(y_safe / mu) - (y - mu), mu)
+    coverage_hit = (y >= preds["pred_p10"].to_numpy()) & (y <= preds["pred_p90"].to_numpy())
+
+    return {
+        "n_rows": len(df),
+        "sum_deviance_term": float(np.sum(deviance_term)),
+        "sum_sq_err": float(np.sum((y - pred_mean) ** 2)),
+        "sum_coverage_hits": float(np.sum(coverage_hit)),
+    }
+
+
+def combine_evaluation_shards(
+    model_name: str, period: tuple[str, str], shards: list[dict], baseline: dict
+) -> dict:
+    """`evaluate_recent_performance_shard()` 부분합들을 최종 지표로 합친다.
+
+    args:
+        model_name: "rental" 또는 "return"
+        period: (start, end) — 전체 평가 구간(로그/응답용, 계산에는 안 쓰임)
+        shards: evaluate_recent_performance_shard()가 반환한 dict들
+        baseline: `_load_baseline_metrics()`가 반환한 dict
+    returns:
+        dict: evaluate_recent_performance()와 정확히 같은 키
+    raises:
+        ValueError: 모든 조각의 n_rows 합이 0(구간 전체에 데이터가 없음)
+    """
+    n_rows = sum(s["n_rows"] for s in shards)
+    if n_rows == 0:
+        raise ValueError(
+            f"{period[0]}~{period[1]} 구간에 feature mart 데이터가 없음 — 최신 데이터가 반영됐는지 확인하세요"
+        )
+
+    current_deviance = 2 * sum(s["sum_deviance_term"] for s in shards) / n_rows
+    current_rmse = float(np.sqrt(sum(s["sum_sq_err"] for s in shards) / n_rows))
+    current_coverage = sum(s["sum_coverage_hits"] for s in shards) / n_rows
+
+    baseline_deviance = baseline["poisson_deviance_test"]
+    baseline_coverage = baseline["p10_p90_coverage_calibrated_test"]
+
+    return {
+        "model_name": model_name,
+        "period": {"start": period[0], "end": period[1]},
+        "n_rows": n_rows,
+        "baseline_deviance": baseline_deviance,
+        "current_deviance": current_deviance,
+        "deviance_relative_change": (current_deviance - baseline_deviance) / baseline_deviance,
+        "baseline_rmse": baseline["rmse_test"],
+        "current_rmse": current_rmse,
+        "baseline_coverage": baseline_coverage,
+        "current_coverage": current_coverage,
+        "coverage_drift": abs(current_coverage - baseline_coverage),
+    }
+
+
 def evaluate_recent_performance(
     model_name: str,
     target_col: str,
@@ -126,58 +273,9 @@ def evaluate_recent_performance(
     # date_range로 이번에 볼 N개월 파티션만 받는다 — 그동안 쌓인 전체 히스토리를 매달
     # 실행할 때마다 다 받으면, 실행 비용이 "최근 N개월"이 아니라 "서비스 시작 이후
     # 전체 기간"에 비례해서 계속 커진다(s3_io.py 모듈 docstring 참고).
-    table_path = _TRAINING_TABLE_BY_MODEL[model_name]
-    feature_columns = _FEATURE_COLUMNS_BY_MODEL[model_name]
-    # "date"/"hour"도 넣어야 한다 — scoring.predict()가 마지막에
-    # `df[["station_no", "date", "hour"]]`로 식별 컬럼을 그대로 뽑아 쓴다(리뷰
-    # 지적: 예전엔 여기서 뺐다가 predict()에서 매번 KeyError로 죽었다). "date"는
-    # Spark 파티션 컬럼이라 파일엔 없지만 core.s3._read_parquet_by_dates()가
-    # columns=에 포함된 경우에만 복원한다(그 함수의 2026-08 수정 참고 — 포함 안
-    # 하면 그 복원 자체를 건너뛰므로, 여기서 넣는다고 불필요한 비용이 생기진
-    # 않는다). "hour"는 더 이상 모델 feature가 아니지만(minute이 대체) 파일
-    # 내용에는 여전히 있는 식별용 컬럼이라 feature_columns에 안 잡힌다.
-    needed = sorted(
-        set(feature_columns) | {target_col, "horizon", "date", "hour"} | ({exposure_col} if exposure_col else set())
-    )
-    # multi-horizon 테이블은 같은 날짜 파티션 안에 horizon마다 행이 다 섞여 있다
-    # (기본 8개: common_config.TRAIN_HORIZONS) — `filters`를 안 주면 이 구간의
-    # 8개 horizon 전부를 pandas로 읽어들인 "뒤"에 `df["horizon"]==horizon`으로
-    # 걸러서, 실제 필요한 양의 최대 8배를 메모리에 올린다(m4.large 컨테이너
-    # 메모리 상한 6144MB를 꽉 채워도 exitCode 137로 죽는 것으로 실제 EMR
-    # 실행에서 확인, 2026-08-26). pyarrow row-group 필터(`filters=`)로 애초에
-    # 이 horizon 행만 읽는다 — `core.s3.read_parquet()` docstring 참고.
-    df = s3_io.read_parquet(table_path, columns=needed, date_range=(start, end), filters=[("horizon", "==", horizon)])
-    if df is None:
-        raise FileNotFoundError(f"S3에 없음: {table_path}")
-    if df.empty:
-        raise ValueError(
-            f"{start}~{end} 구간·horizon={horizon}에 feature mart 데이터가 없음 — 최신 데이터가 반영됐는지 확인하세요"
-        )
-
-    preds = predict(df, model_name, exposure_col=exposure_col)
-    y = df[target_col].to_numpy()
+    shard = evaluate_recent_performance_shard(model_name, target_col, exposure_col, (start, end), horizon)
     baseline = _load_baseline_metrics(model_name)
-
-    current_deviance = _poisson_deviance(y, preds["pred_mean"].to_numpy())
-    current_rmse = float(np.sqrt(np.mean((y - preds["pred_mean"].to_numpy()) ** 2)))
-    current_coverage = float(np.mean((y >= preds["pred_p10"].to_numpy()) & (y <= preds["pred_p90"].to_numpy())))
-
-    baseline_deviance = baseline["poisson_deviance_test"]
-    baseline_coverage = baseline["p10_p90_coverage_calibrated_test"]
-
-    return {
-        "model_name": model_name,
-        "period": {"start": start, "end": end},
-        "n_rows": len(df),
-        "baseline_deviance": baseline_deviance,
-        "current_deviance": current_deviance,
-        "deviance_relative_change": (current_deviance - baseline_deviance) / baseline_deviance,
-        "baseline_rmse": baseline["rmse_test"],
-        "current_rmse": current_rmse,
-        "baseline_coverage": baseline_coverage,
-        "current_coverage": current_coverage,
-        "coverage_drift": abs(current_coverage - baseline_coverage),
-    }
+    return combine_evaluation_shards(model_name, (start, end), [shard], baseline)
 
 
 def decide_retrain(evaluation: dict) -> dict:
