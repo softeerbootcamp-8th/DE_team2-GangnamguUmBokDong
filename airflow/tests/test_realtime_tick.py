@@ -69,11 +69,11 @@ def test_weather_collector_sits_behind_its_own_freshness_gate(source_id: str) ->
     assert gate.ignore_downstream_trigger_rules is False
     assert collect.upstream_task_ids == {f"freshness_gate_{source_id}"}
 
-    # 재시도 없이 60초 안에 실패시킨다(세 소스 다 동일값, 소스별 dict라 필요하면
+    # 재시도 없이 90초 안에 실패시킨다(세 소스 다 동일값, 소스별 dict라 필요하면
     # 하나만 바꿀 수 있다 — realtime_tick.py의 _WEATHER_COLLECTOR_TIMEOUTS 참고).
     assert f"--source {source_id}" in collect.bash_command
     assert collect.retries == 0
-    assert collect.execution_timeout == timedelta(seconds=60)
+    assert collect.execution_timeout == timedelta(seconds=90)
 
 
 def test_weather_ready_gate_tolerates_skipped_or_failed_collectors() -> None:

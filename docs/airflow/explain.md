@@ -78,7 +78,7 @@ run의 날씨 태스크가 끝난 직후 실행되므로 의존성과 실행 상
 단, 날씨 장애가 전체 serving을 막지는 않는다. `weather_ready_gate`는
 `TriggerRule.ALL_DONE`이므로 새 날씨 수집이 실패해도 성공하고, prepare는 이전의
 유효한 weather snapshot으로 계속 진행할 수 있다. 이는 기존 sensor의 soft-fail
-정책을 유지한 것이다. 각 날씨 collector는 `retries=0`, timeout 60초로 제한하여
+정책을 유지한 것이다. 각 날씨 collector는 `retries=0`, timeout 90초로 제한하여
 날씨 장애가 realtime 체인을 장시간 붙잡지 않게 했다.
 
 ### 왜 하나가 아니라 4개 realtime DAG인가
@@ -141,7 +141,7 @@ bike_rental_history → 1시간 전 replay  (serving과 독립된 side chain)
 | Finalize | station, stock, demand, weather projection을 한 트랜잭션으로 게시 | 입력 drift 또는 불완전 결과면 전체 게시 중단 |
 | Urgency·route | 새 release로 긴급도와 센터별 제안 경로 계산 | serving release는 유지되고 파생 정보만 갱신되지 않음 |
 
-날씨 collector는 재시도 없이 60초 안에 끝내도록 제한한다. 실패해도 `ALL_DONE` gate를 통과시켜 이전의 유효한 날씨로 serving을 계속할 수 있게 한다. 반면 재고, 대여이력과 정규화 인구는 inference의 필수 upstream이다.
+날씨 collector는 재시도 없이 90초 안에 끝내도록 제한한다. 실패해도 `ALL_DONE` gate를 통과시켜 이전의 유효한 날씨로 serving을 계속할 수 있게 한다. 반면 재고, 대여이력과 정규화 인구는 inference의 필수 upstream이다.
 
 ## 일·월 단위 체인
 

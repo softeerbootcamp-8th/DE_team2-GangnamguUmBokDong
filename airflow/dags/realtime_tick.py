@@ -5,7 +5,7 @@
 시각에만 날씨 collector를 그 cron의 DAG에 직접 의존성으로 묶는 방식). 그런데
 서로 다른 DAG는 `max_active_runs`를 각자 따로 관리해서, 한 DAG의 tick이 늦어지면
 다른 DAG의 tick과 실행 시각이 겹칠 수 있었다 — 약한 인스턴스에서 CPU 경합이 나면
-60초 타임아웃(retries=0)인 날씨 collector가 죽을 위험이 있다(`config.schedules.
+90초 타임아웃(retries=0)인 날씨 collector가 죽을 위험이 있다(`config.schedules.
 REALTIME_TICK_CRON` 주석의 2026-08-22 실측 참고). 게다가 3시간짜리(단기예보)
 수집이 한 번 실패하면 다음 cron 경계까지 최대 3시간을 기다려야 했다.
 
@@ -73,16 +73,16 @@ _WEATHER_SOURCES = tuple(_WEATHER_MIN_INTERVAL_BY_SOURCE)
 # prepare_serving_plan~publish_rebalance_route 체인 전체를 최대 13분까지 묶어두는
 # 일을 막는다.
 #
-# 소스별 dict로 둔다 — 지금은 셋 다 60초로 같지만, 세 API의 실측 소요가 원래
+# 소스별 dict로 둔다 — 지금은 셋 다 90초로 같지만, 세 API의 실측 소요가 원래
 # 꽤 달라서(단기예보만 격자당 페이지 2장 필요, concurrency:8로 줄인 뒤에도
 # 14~16초대, 나머지 둘은 7~11초대 — collector/sources/weather_*.yaml 참고) 나중에
 # 하나만 튜닝해야 할 상황이 다시 생길 수 있다. 그때 이 dict만 고치면 된다
-# (2026-08-23 실측 근거로 30초에서 60초로 올림 — 3개 동시 실행 시 단기예보가
-# 16.36초까지 늘어나는 걸 봐서 여유를 더 뒀다).
+# (2026-08-26 APIHub 지연 때 60초를 초과한 뒤 다음 tick에는 31초 안에 복구된
+# 사례를 반영해, 일시적인 외부 지연을 흡수할 여유를 더 뒀다).
 _WEATHER_COLLECTOR_TIMEOUTS = {
-    WEATHER_10MIN_SOURCE: timedelta(seconds=60),
-    WEATHER_ULTRA_SHORT_FORECAST_SOURCE: timedelta(seconds=60),
-    WEATHER_3H_SOURCE: timedelta(seconds=60),
+    WEATHER_10MIN_SOURCE: timedelta(seconds=90),
+    WEATHER_ULTRA_SHORT_FORECAST_SOURCE: timedelta(seconds=90),
+    WEATHER_3H_SOURCE: timedelta(seconds=90),
 }
 
 
