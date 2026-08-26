@@ -74,6 +74,13 @@ def test_run_training_subprocess_launches_yarn_distributed_shell_when_num_machin
     assert run_id_args == [f"TRAINING_RUN_ID={_ARCHIVE_DATE}-{_PROFILE}-return"]
     shell_command = cmd[cmd.index("-shell_command") + 1]
     assert "training.scripts.yarn_worker_bootstrap --model return" in shell_command
+    # distributed-shell 자체 AM에 메모리를 명시 안 하면 기본 100MB로 떠서
+    # OutOfMemoryError로 즉시 죽는다(겉보기엔 "JNI error"라 Java 17 비호환처럼
+    # 보였지만 실제로는 순수 메모리 부족이었다 — 실제 EMR 실행에서 확인,
+    # 2026-08-26).
+    assert "-master_memory" in cmd
+    assert cmd[cmd.index("-master_memory") + 1] == str(mrc.YARN_AM_MEMORY_MB)
+    assert "-master_vcores" in cmd
 
 
 def test_resolve_distributed_shell_jar_prefers_explicit_env_override(monkeypatch):

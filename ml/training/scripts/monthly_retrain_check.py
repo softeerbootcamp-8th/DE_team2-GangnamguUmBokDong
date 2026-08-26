@@ -96,6 +96,14 @@ _YARN_DISTRIBUTED_SHELL_JAR_SEARCH_ROOTS = ("/usr/lib/hadoop-yarn", "/usr/lib/ha
 # (`yarn_worker_bootstrap._resolve_rank_and_machines()` 중복 host 가드 참고).
 YARN_CONTAINER_MEMORY_MB = int(os.environ.get("YARN_CONTAINER_MEMORY_MB", "6144"))
 YARN_CONTAINER_VCORES = int(os.environ.get("YARN_CONTAINER_VCORES", "2"))
+# distributed-shell의 자체 ApplicationMaster(워커 컨테이너와 별개 — 이 AM은 그냥
+# 컨테이너들을 띄우고 감시만 함) 메모리를 명시하지 않으면 기본값 100MB로 뜨는데,
+# 이 JVM이 클래스 로딩만 하다가도 100MB로는 부족해 OutOfMemoryError로 즉시
+# 죽는다 — 겉보기 증상은 "WARNING: package javax.script not in java.base" +
+# "JNI error"라 Java 17 비호환처럼 보였지만, 실제로는 순수 메모리 부족이었다
+# (실제 EMR 실행에서 -master_memory 512로 재현/해결 확인, 2026-08-26).
+YARN_AM_MEMORY_MB = int(os.environ.get("YARN_AM_MEMORY_MB", "1024"))
+YARN_AM_VCORES = int(os.environ.get("YARN_AM_VCORES", "1"))
 # 컨테이너로 반드시 넘겨야 하는 환경변수 — distributed-shell 컨테이너는 이 프로세스의
 # 환경을 상속하지 않고 `-shell_env`로 명시한 것만 받는다.
 _YARN_SHELL_ENV_KEYS = (
@@ -371,6 +379,10 @@ def _run_distributed_training_via_yarn(model_name: str, env: dict[str, str]) -> 
         str(YARN_CONTAINER_MEMORY_MB),
         "-container_vcores",
         str(YARN_CONTAINER_VCORES),
+        "-master_memory",
+        str(YARN_AM_MEMORY_MB),
+        "-master_vcores",
+        str(YARN_AM_VCORES),
         *shell_env_args,
     ]
     _notify(f"[{model_name}] YARN distributed-shell 제출 (컨테이너 {num_machines}개)...")
