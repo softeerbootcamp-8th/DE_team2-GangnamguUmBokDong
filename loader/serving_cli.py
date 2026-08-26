@@ -17,10 +17,13 @@ import pyarrow.parquet as pq
 from core.db import get_connection
 from core.gold_publication import (
     ContractViolation,
+    InputArtifact,
     PublicationOutcome,
     S3ImmutableObjectStore,
     parse_publication_manifest,
+    sha256_hex,
 )
+from core.inference_snapshot import ServingReleaseRef
 from core.inference_catalog import S3InferenceRevisionCatalog
 from core.source_snapshot_io import (
     PartialConsumptionPolicy,
@@ -81,7 +84,9 @@ def prepare(
         relocation_approval_sha256,
         "relocation approval",
     )
-    eligible_ids, excluded = _load_inference_eligible_station_ids(client, bucket)
+    eligible_ids, excluded, enriched_master_ref = (
+        _load_inference_eligible_station_ids(client, bucket)
+    )
     if excluded:
         preview = ", ".join(
             f"{station_id}({reason})" for station_id, reason in excluded[:20]
@@ -124,6 +129,15 @@ def prepare(
             return_support_sta_ids=(
                 pinned.return_model.support_sta_ids
             ),
+            serving_release=ServingReleaseRef(
+                byte_sha256=pinned.pointer.release_manifest_byte_sha256,
+                effective_contract_version=(
+                    pinned.manifest.effective_contract.version
+                ),
+                release_version=pinned.manifest.release_version,
+                uri=pinned.pointer.release_manifest_uri,
+            ),
+            station_master_enriched=enriched_master_ref,
             inference_eligible_sta_ids=eligible_ids,
             source_catalog=source_catalog,
             object_base_uri=object_base_uri,
@@ -185,8 +199,8 @@ def _stock_history_refs(
 
 def _load_inference_eligible_station_ids(
     client: Any, bucket: str
-) -> tuple[tuple[str, ...], tuple[tuple[str, str], ...]]:
-    """최신 enriched master에서 추론 가능 ID와 제외 사유를 계산한다."""
+) -> tuple[tuple[str, ...], tuple[tuple[str, str], ...], InputArtifact]:
+    """최신 enriched master에서 추론 가능 ID와 exact artifact ref를 만든다."""
     keys: list[str] = []
     token: str | None = None
     while True:
@@ -211,13 +225,20 @@ def _load_inference_eligible_station_ids(
         raise ContractViolation("최신 station_master_enriched parquet이 없습니다.")
     key = max(keys)
     payload = client.get_object(Bucket=bucket, Key=key)["Body"].read()
+    reference = InputArtifact(
+        byte_sha256=sha256_hex(payload),
+        role="station_master_enriched",
+        uri=f"s3://{bucket}/{key}",
+    )
     raw = pq.read_table(io.BytesIO(payload)).to_pandas()
     master = raw.rename(columns=silver_schema.STATION_COLUMN_MAP)
     if "station_id" not in master:
         raise ContractViolation("station_master_enriched에 station_id가 없습니다.")
     if (
         master["station_id"].isna().any()
-        or not master["station_id"].map(lambda value: type(value) is str and bool(value)).all()
+        or not master["station_id"]
+        .map(lambda value: type(value) is str and bool(value))
+        .all()
         or master["station_id"].duplicated().any()
     ):
         raise ContractViolation(
@@ -226,7 +247,10 @@ def _load_inference_eligible_station_ids(
     eligible: list[str] = []
     excluded: list[tuple[str, str]] = []
     indexed = master.set_index("station_id")
-    for station_id in sorted(indexed.index.astype(str), key=lambda value: value.encode("utf-8")):
+    for station_id in sorted(
+        indexed.index.astype(str),
+        key=lambda value: value.encode("utf-8"),
+    ):
         try:
             silver_schema.validate_inference_station_row(
                 station_id, indexed.loc[station_id]
@@ -235,7 +259,7 @@ def _load_inference_eligible_station_ids(
             excluded.append((station_id, str(exc)))
         else:
             eligible.append(station_id)
-    return tuple(eligible), tuple(excluded)
+    return tuple(eligible), tuple(excluded), reference
 
 
 def finalize(

@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
+from urllib.parse import urlsplit
 
 from core.gold_publication import (
     ContractViolation,
@@ -31,7 +32,12 @@ from core.gold_publication import (
     validate_station_stock_release,
 )
 from core.inference_catalog import InferenceRevisionCatalog
-from core.inference_snapshot import ServingPlanRef
+from core.inference_snapshot import (
+    InferenceSnapshotManifest,
+    InferenceSnapshotStatus,
+    ServingPlanRef,
+    ServingReleaseRef,
+)
 from core.model_snapshot import (
     IdSetArtifactRef,
     build_id_set_artifact_ref,
@@ -63,13 +69,16 @@ from .station_stock import StationStockProjection, StationStockRecord
 from .versioning import PublicationCandidate, allocate_revision
 from .weather_forecast import WeatherForecastProjection
 
-SERVING_PLAN_SCHEMA_VERSION = "gold-serving-plan-v2"
+LEGACY_SERVING_PLAN_SCHEMA_VERSION = "gold-serving-plan-v2"
+"""Shared identity가 없지만 finalize 호환을 유지하는 legacy plan version이다."""
+
+SERVING_PLAN_SCHEMA_VERSION = "gold-serving-plan-v3"
 """Inference 전 orchestration plan의 exact schema version이다."""
 
 MAX_INFERENCE_INELIGIBLE_RATIO = 0.01
 """활성·모델지원 후보 중 입력 품질 문제로 제외할 수 있는 최대 비율이다."""
 
-_PLAN_KEYS = frozenset(
+_PLAN_V2_KEYS = frozenset(
     {
         "activation_ready_sta_ids",
         "expected_sta_ids",
@@ -85,8 +94,15 @@ _PLAN_KEYS = frozenset(
         "station_dependency",
     }
 )
+_PLAN_V3_KEYS = frozenset(
+    (*_PLAN_V2_KEYS, "serving_release", "station_master_enriched")
+)
 _PREPARED_REF_KEYS = frozenset({"byte_sha256", "publication_key", "uri"})
 _ID_SET_REF_KEYS = frozenset({"byte_sha256", "id_count", "schema_version", "uri"})
+_INPUT_ARTIFACT_KEYS = frozenset({"byte_sha256", "role", "uri"})
+_SERVING_RELEASE_REF_KEYS = frozenset(
+    {"byte_sha256", "effective_contract_version", "release_version", "uri"}
+)
 _DEPENDENCY_KEYS = frozenset(
     {
         "artifact_set_sha256",
@@ -113,6 +129,7 @@ _FINAL_PUBLICATION_KEYS = (
     "station_stock",
     "weather_forecast",
 )
+_STATION_MASTER_ENRICHED_ROLE = "station_master_enriched"
 
 
 @dataclass(frozen=True, slots=True)
@@ -175,15 +192,46 @@ class ServingPlan:
     prepared_publications: tuple[PreparedManifestRef, ...]
     prior_states: tuple[PublicationStateRecord, ...]
     source_lookbacks: SourceLookbacks
+    serving_release: ServingReleaseRef | None = None
+    station_master_enriched: InputArtifact | None = None
     schema_version: str = SERVING_PLAN_SCHEMA_VERSION
 
     def __post_init__(self) -> None:
         """Plan field와 canonical key 순서를 검증한다."""
-        if self.schema_version != SERVING_PLAN_SCHEMA_VERSION:
+        if self.schema_version not in (
+            LEGACY_SERVING_PLAN_SCHEMA_VERSION,
+            SERVING_PLAN_SCHEMA_VERSION,
+        ):
             raise ContractViolation("serving plan schema_version이 다릅니다.")
+        if self.schema_version == LEGACY_SERVING_PLAN_SCHEMA_VERSION:
+            if (
+                self.serving_release is not None
+                or self.station_master_enriched is not None
+            ):
+                raise ContractViolation("v2 serving plan에는 shared identity가 없어야 합니다.")
+        else:
+            if type(self.serving_release) is not ServingReleaseRef:
+                raise ContractViolation(
+                    "v3 serving plan에는 exact serving release가 필요합니다."
+                )
+            if type(self.station_master_enriched) is not InputArtifact:
+                raise ContractViolation(
+                    "v3 serving plan에는 exact station_master_enriched가 필요합니다."
+                )
         logical = _utc(self.logical_dttm, "serving plan logical_dttm")
         object.__setattr__(self, "logical_dttm", logical)
-        _require_s3_base_uri(self.object_base_uri)
+        object_base_uri = _require_s3_base_uri(self.object_base_uri)
+        if self.serving_release is not None:
+            _require_same_s3_bucket(
+                self.serving_release.uri,
+                object_base_uri,
+                "serving release",
+            )
+        if self.station_master_enriched is not None:
+            _require_enriched_master_ref(
+                self.station_master_enriched,
+                object_base_uri,
+            )
         if (
             type(self.station_dependency) is not Dependency
             or self.station_dependency.publication_key != "station"
@@ -293,6 +341,8 @@ def prepare_serving_plan(
     ultra_short_artifact: SourceManifestArtifact,
     rental_support_sta_ids: IdSetArtifactRef,
     return_support_sta_ids: IdSetArtifactRef,
+    serving_release: ServingReleaseRef,
+    station_master_enriched: InputArtifact,
     source_catalog: S3SourceSnapshotCatalog,
     object_base_uri: str,
     source_lookbacks: SourceLookbacks,
@@ -704,6 +754,8 @@ def prepare_serving_plan(
         ),
         prior_states=initial_states,
         source_lookbacks=source_lookbacks,
+        serving_release=serving_release,
+        station_master_enriched=station_master_enriched,
     )
     plan_uri = (
         f"{object_base_uri.rstrip('/')}/serving-plan/plans/sha256={plan.sha256}.json"
@@ -807,6 +859,7 @@ def publish_serving_plan(
         raise ContractViolation(
             "inference manifest가 plan anchor·station dependency·expected ID와 다릅니다."
         )
+    _validate_shared_identity_binding(plan, snapshot.manifest)
     _validate_inference_catalog_latest(
         inference_catalog,
         logical_dttm=plan.logical_dttm,
@@ -827,7 +880,6 @@ def publish_serving_plan(
         raise ContractViolation(
             "inference actual model support가 serving plan과 다릅니다."
         )
-
     station_output = station_release._single_output(
         station_prepared.manifest,
         "station",
@@ -1150,6 +1202,39 @@ def publish_serving_plan(
     return execution
 
 
+def _validate_shared_identity_binding(
+    plan: ServingPlan,
+    manifest: InferenceSnapshotManifest,
+) -> None:
+    """v3 plan의 release와 enriched-master identity를 inference에 결합한다.
+
+    Legacy v2 plan은 이미 생성된 inference manifest의 finalize/replay 호환을 위해
+    기존 검증만 유지한다. 신규 inference reader는 v2를 fail-closed하므로 이 예외가
+    새로운 unpinned 계산을 허용하지는 않는다.
+    """
+    if plan.schema_version == LEGACY_SERVING_PLAN_SCHEMA_VERSION:
+        return
+    if manifest.serving_release != plan.serving_release:
+        raise ContractViolation(
+            "inference manifest serving release가 v3 serving plan ref와 다릅니다."
+        )
+    if manifest.status is InferenceSnapshotStatus.EMPTY:
+        return
+    assert plan.station_master_enriched is not None
+    matches = tuple(
+        item for item in manifest.inputs if item.role == _STATION_MASTER_ENRICHED_ROLE
+    )
+    if len(matches) != 1:
+        raise ContractViolation(
+            "SUCCEEDED inference manifest에 station_master_enriched input이 "
+            "정확히 하나가 아닙니다."
+        )
+    if matches[0].byte_sha256 != plan.station_master_enriched.byte_sha256:
+        raise ContractViolation(
+            "inference station_master_enriched bytes가 v3 serving plan과 다릅니다."
+        )
+
+
 def read_serving_plan(
     object_store: ImmutableObjectStore,
     *,
@@ -1173,12 +1258,15 @@ def read_serving_plan(
 
 def parse_serving_plan(payload: bytes) -> ServingPlan:
     """Exact-key canonical JSON bytes를 ServingPlan으로 파싱한다."""
-    document = _exact_object(
-        parse_canonical_json(payload),
-        _PLAN_KEYS,
-        "serving plan",
-    )
-    if document["schema_version"] != SERVING_PLAN_SCHEMA_VERSION:
+    parsed = parse_canonical_json(payload)
+    if type(parsed) is not dict:
+        raise ContractViolation("serving plan은 JSON object여야 합니다.")
+    version = _string(parsed.get("schema_version"), "schema_version")
+    if version == LEGACY_SERVING_PLAN_SCHEMA_VERSION:
+        document = _exact_object(parsed, _PLAN_V2_KEYS, "serving plan")
+    elif version == SERVING_PLAN_SCHEMA_VERSION:
+        document = _exact_object(parsed, _PLAN_V3_KEYS, "serving plan")
+    else:
         raise ContractViolation("serving plan schema_version이 다릅니다.")
     prepared_values = _array(
         document["prepared_publications"],
@@ -1186,7 +1274,7 @@ def parse_serving_plan(payload: bytes) -> ServingPlan:
     )
     prior_values = _array(document["prior_states"], "prior_states")
     return ServingPlan(
-        schema_version=_string(document["schema_version"], "schema_version"),
+        schema_version=version,
         logical_dttm=parse_utc_dttm(_string(document["logical_dttm"], "logical_dttm")),
         object_base_uri=_string(document["object_base_uri"], "object_base_uri"),
         station_dependency=_parse_dependency(document["station_dependency"]),
@@ -1215,6 +1303,19 @@ def parse_serving_plan(payload: bytes) -> ServingPlan:
         ),
         prior_states=tuple(_parse_state(value) for value in prior_values),
         source_lookbacks=_parse_lookbacks(document["source_lookbacks"]),
+        serving_release=(
+            None
+            if version == LEGACY_SERVING_PLAN_SCHEMA_VERSION
+            else _parse_serving_release_ref(document["serving_release"])
+        ),
+        station_master_enriched=(
+            None
+            if version == LEGACY_SERVING_PLAN_SCHEMA_VERSION
+            else _parse_input_artifact(
+                document["station_master_enriched"],
+                _STATION_MASTER_ENRICHED_ROLE,
+            )
+        ),
     )
 
 
@@ -2038,7 +2139,7 @@ def _input_by_role(fingerprint: Any, role: str) -> InputArtifact:
 
 def _plan_document(plan: ServingPlan) -> dict[str, Any]:
     """ServingPlan을 canonical serializer용 exact-key document로 바꾼다."""
-    return {
+    document = {
         "activation_ready_sta_ids": _id_set_ref_document(plan.activation_ready_sta_ids),
         "expected_sta_ids": _id_set_ref_document(plan.expected_sta_ids),
         "inference_eligible_sta_ids": _id_set_ref_document(
@@ -2067,6 +2168,35 @@ def _plan_document(plan: ServingPlan) -> dict[str, Any]:
             ),
         },
         "station_dependency": _dependency_document(plan.station_dependency),
+    }
+    if plan.schema_version == SERVING_PLAN_SCHEMA_VERSION:
+        assert plan.serving_release is not None
+        assert plan.station_master_enriched is not None
+        document["serving_release"] = _serving_release_ref_document(
+            plan.serving_release
+        )
+        document["station_master_enriched"] = _input_artifact_document(
+            plan.station_master_enriched
+        )
+    return document
+
+
+def _serving_release_ref_document(reference: ServingReleaseRef) -> dict[str, Any]:
+    """Serving release ref를 canonical plan document로 바꾼다."""
+    return {
+        "byte_sha256": reference.byte_sha256,
+        "effective_contract_version": reference.effective_contract_version,
+        "release_version": reference.release_version,
+        "uri": reference.uri,
+    }
+
+
+def _input_artifact_document(reference: InputArtifact) -> dict[str, Any]:
+    """Exact non-authority S3 input ref를 canonical plan document로 바꾼다."""
+    return {
+        "byte_sha256": reference.byte_sha256,
+        "role": reference.role,
+        "uri": reference.uri,
     }
 
 
@@ -2122,6 +2252,46 @@ def _parse_id_set_ref(value: Any, name: str) -> IdSetArtifactRef:
         ),
         uri=_string(document["uri"], f"{name}.uri"),
     )
+
+
+def _parse_serving_release_ref(value: Any) -> ServingReleaseRef:
+    """Serving release reference exact object를 파싱한다."""
+    document = _exact_object(
+        value,
+        _SERVING_RELEASE_REF_KEYS,
+        "serving release ref",
+    )
+    return ServingReleaseRef(
+        byte_sha256=_string(
+            document["byte_sha256"],
+            "serving release byte_sha256",
+        ),
+        effective_contract_version=_string(
+            document["effective_contract_version"],
+            "serving release effective_contract_version",
+        ),
+        release_version=_string(
+            document["release_version"],
+            "serving release release_version",
+        ),
+        uri=_string(document["uri"], "serving release uri"),
+    )
+
+
+def _parse_input_artifact(value: Any, expected_role: str) -> InputArtifact:
+    """Plan의 exact S3 input artifact를 role까지 검증해 파싱한다."""
+    document = _exact_object(value, _INPUT_ARTIFACT_KEYS, expected_role)
+    artifact = InputArtifact(
+        byte_sha256=_string(
+            document["byte_sha256"],
+            f"{expected_role}.byte_sha256",
+        ),
+        role=_string(document["role"], f"{expected_role}.role"),
+        uri=_string(document["uri"], f"{expected_role}.uri"),
+    )
+    if artifact.role != expected_role:
+        raise ContractViolation(f"{expected_role} role이 잘못됐습니다.")
+    return artifact
 
 
 def _parse_dependency(value: Any) -> Dependency:
@@ -2272,6 +2442,39 @@ def _require_s3_base_uri(value: Any) -> str:
     if not bucket or not separator or not key or key.startswith("/"):
         raise ContractViolation("object_base_uri는 bucket과 key가 필요합니다.")
     return text
+
+
+def _require_same_s3_bucket(uri: str, base_uri: str, name: str) -> None:
+    """Exact ref와 plan object base가 같은 S3 bucket인지 검증한다."""
+    reference = urlsplit(uri)
+    base = urlsplit(base_uri)
+    if (
+        reference.scheme != "s3"
+        or reference.netloc != base.netloc
+        or not reference.path.lstrip("/")
+        or reference.query
+        or reference.fragment
+    ):
+        raise ContractViolation(f"{name} URI가 serving plan bucket과 다릅니다.")
+
+
+def _require_enriched_master_ref(
+    reference: InputArtifact,
+    object_base_uri: str,
+) -> None:
+    """Enriched master ref를 same-bucket Silver Parquet identity로 제한한다."""
+    if reference.role != _STATION_MASTER_ENRICHED_ROLE:
+        raise ContractViolation("station_master_enriched role이 잘못됐습니다.")
+    _require_same_s3_bucket(
+        reference.uri,
+        object_base_uri,
+        "station_master_enriched",
+    )
+    key = urlsplit(reference.uri).path.lstrip("/")
+    if not key.startswith("silver/station_master_enriched/") or not key.endswith(
+        ".parquet"
+    ):
+        raise ContractViolation("station_master_enriched URI 경로가 잘못됐습니다.")
 
 
 def _require_catalog(value: Any) -> None:

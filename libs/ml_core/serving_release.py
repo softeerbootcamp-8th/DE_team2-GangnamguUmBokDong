@@ -550,6 +550,48 @@ class PinnedServingRelease:
 
 
 @dataclass(frozen=True, slots=True)
+class ExactServingRelease:
+    """Mutable pointer 없이 exact manifest ref에서 검증한 serving release다."""
+
+    manifest_uri: str
+    manifest: ServingReleaseManifest
+    manifest_payload: bytes
+    preflight: ServingReleasePreflight
+
+    def __post_init__(self) -> None:
+        """Manifest URI·bytes·preflight가 동일한 release인지 검증한다."""
+        if type(self.manifest) is not ServingReleaseManifest:
+            raise ServingReleasePreflightError(
+                "exact serving release manifest 타입이 잘못됐습니다."
+            )
+        if (
+            type(self.manifest_payload) is not bytes
+            or parse_serving_release_manifest(self.manifest_payload) != self.manifest
+        ):
+            raise ServingReleasePreflightError(
+                "exact serving release manifest bytes가 typed manifest와 다릅니다."
+            )
+        validate_content_addressed_s3_uri(
+            self.manifest_uri,
+            self.manifest.sha256,
+            expected_extension="json",
+        )
+        if type(self.preflight) is not ServingReleasePreflight:
+            raise ServingReleasePreflightError(
+                "exact serving release preflight 타입이 잘못됐습니다."
+            )
+        if (
+            sha256_hex(self.preflight.effective_contract_payload)
+            != self.manifest.effective_contract.byte_sha256
+            or sha256_hex(self.preflight.station_profile_payload)
+            != self.manifest.station_profile.byte_sha256
+        ):
+            raise ServingReleasePreflightError(
+                "exact serving release artifact가 manifest ref와 다릅니다."
+            )
+
+
+@dataclass(frozen=True, slots=True)
 class PinnedServingPlanRelease:
     """Serving plan에 필요한 pointer와 model manifest만 고정한 경량 snapshot이다."""
 
@@ -1663,20 +1705,54 @@ def load_current_serving_release_for_inference(
             f"serving release pointer가 없습니다: {resolved_pointer_key}"
         )
     pointer = parse_serving_release_pointer(pointer_read.payload)
+    exact = load_exact_serving_release_for_inference(
+        release_manifest_uri=pointer.release_manifest_uri,
+        release_manifest_byte_sha256=pointer.release_manifest_byte_sha256,
+        object_store=immutable,
+    )
+    return PinnedServingRelease(
+        pointer=pointer,
+        pointer_payload=pointer_read.payload,
+        manifest=exact.manifest,
+        manifest_payload=exact.manifest_payload,
+        preflight=exact.preflight,
+    )
+
+
+def load_exact_serving_release_for_inference(
+    *,
+    release_manifest_uri: str,
+    release_manifest_byte_sha256: str,
+    object_store: ImmutableObjectStore | None = None,
+) -> ExactServingRelease:
+    """Plan이 pin한 exact release를 mutable pointer 재조회 없이 연다."""
+    immutable = object_store if object_store is not None else S3ImmutableObjectStore()
+    digest = _require_sha256(
+        release_manifest_byte_sha256,
+        "exact serving release manifest byte_sha256",
+    )
+    validate_content_addressed_s3_uri(
+        release_manifest_uri,
+        digest,
+        expected_extension="json",
+    )
     manifest_payload = immutable.read_bytes(
-        pointer.release_manifest_uri,
-        pointer.release_manifest_byte_sha256,
+        release_manifest_uri,
+        digest,
         require_canonical_json=True,
     )
     manifest = parse_serving_release_manifest(manifest_payload)
+    if manifest.sha256 != digest:
+        raise ServingReleasePreflightError(
+            "exact serving release manifest actual SHA가 plan ref와 다릅니다."
+        )
     preflight = preflight_serving_release(
         manifest,
         immutable,
         trust_published_station_profile=True,
     )
-    return PinnedServingRelease(
-        pointer=pointer,
-        pointer_payload=pointer_read.payload,
+    return ExactServingRelease(
+        manifest_uri=release_manifest_uri,
         manifest=manifest,
         manifest_payload=manifest_payload,
         preflight=preflight,

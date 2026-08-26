@@ -14,7 +14,6 @@ import boto3
 from core.gold_publication import ContractViolation, S3ImmutableObjectStore
 from core.inference_catalog import S3InferenceRevisionCatalog
 from core.serving_plan_input import read_serving_plan_inference_inputs
-from ml_core.serving_release import S3ServingReleasePointerStore
 
 from .publication import run_and_publish_inference
 
@@ -41,11 +40,12 @@ def run(*, plan_uri: str, plan_sha256: str) -> dict[str, dict[str, str]]:
         logical_dttm=inputs.logical_dttm,
         station_dependency=inputs.station_dependency,
         serving_plan=inputs.serving_plan,
+        serving_release=inputs.serving_release,
+        station_master_enriched=inputs.station_master_enriched,
         expected_sta_ids=inputs.expected_sta_ids,
         expected_sta_ids_ref=inputs.expected_sta_ids_ref,
         object_base_uri=inputs.object_base_uri,
         object_store=object_store,
-        pointer_store=S3ServingReleasePointerStore(client, bucket),
         revision_catalog=catalog,
     )
     return {

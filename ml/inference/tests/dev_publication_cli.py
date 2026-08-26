@@ -51,6 +51,8 @@ def test_run_exact_reads_plan_and_shares_injected_backend(monkeypatch) -> None:
         expected_sta_ids=expected_sta_ids,
         expected_sta_ids_ref=expected_sta_ids_ref,
         object_base_uri="s3://fixture/gold_publication",
+        serving_release=object(),
+        station_master_enriched=object(),
     )
     captured = {}
 
@@ -65,8 +67,8 @@ def test_run_exact_reads_plan_and_shares_injected_backend(monkeypatch) -> None:
         captured["publish"] = kwargs
         assert kwargs["object_store"] is captured["object_store"]
         assert kwargs["revision_catalog"]._client is client
-        assert kwargs["pointer_store"]._client is client
-        assert kwargs["pointer_store"]._bucket == "fixture"
+        assert kwargs["serving_release"] is inputs.serving_release
+        assert kwargs["station_master_enriched"] is inputs.station_master_enriched
         return SimpleNamespace(
             manifest_uri="s3://fixture/gold_publication/inference/manifests/m.json",
             manifest_sha256="b" * 64,
