@@ -57,7 +57,7 @@ def _profiled_bash_command(command: str) -> str:
         '--metadata "executor=${AIRFLOW__CORE__EXECUTOR:-LocalExecutor}" '
         '--metadata "parallelism=${AIRFLOW__CORE__PARALLELISM:-3}" '
         '--metadata "max_active_tasks_per_dag='
-        '${AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG:-2}" '
+        '${AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG:-3}" '
         f"-- /bin/bash -c \"$(cat <<'{_RESOURCE_COMMAND_DELIMITER}'\n"
         f"{command}\n"
         f"{_RESOURCE_COMMAND_DELIMITER}\n"

@@ -11,11 +11,11 @@ Airflow의 모듈 CLI 태스크는 실행 시간뿐 아니라 **자기 process t
 ```dotenv
 AIRFLOW__CORE__EXECUTOR=LocalExecutor
 AIRFLOW__CORE__PARALLELISM=3
-AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG=2
+AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG=3
 AIRFLOW_RESOURCE_PROBE_SAMPLE_SECONDS=1
 ```
 
-운영 기본값이 작은 이유는 하나의 scheduler 컨테이너에서 pandas, PyArrow와 LightGBM subprocess가 동시에 실행되기 때문이다. 측정값을 비교할 때는 executor, 병렬 태스크 수와 표본 주기가 같은지 먼저 확인한다.
+운영 기본값은 t4g.large(2 vCPU, 8GB)에서 pandas, PyArrow와 LightGBM subprocess의 무제한 병렬화를 피하면서, I/O-bound 작업이 많은 realtime DAG 초반에는 최대 3개 task를 실행하도록 전체 병렬도와 DAG별 병렬도를 3으로 맞춘 실측용 설정이다. 향후 DAG wall-clock과 p95, CPU, available memory, swap-in/out을 비교해 다시 조정한다. 측정값을 비교할 때는 executor, 병렬 태스크 수와 표본 주기가 같은지 먼저 확인한다.
 
 ## 계측되는 태스크
 
