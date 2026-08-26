@@ -9,6 +9,7 @@ from core.gold_publication import (
     build_station_relocation_approval,
     point_ewkb_xdr_hex,
 )
+from gold import station as station_module
 from gold.station import (
     DispatchCenterReference,
     MasterSnapshot,
@@ -456,3 +457,75 @@ def test_batch_distance_rejects_non_finite_values() -> None:
 
     with pytest.raises(ContractViolation):
         _build(centers=centers, distance_meters=distance)
+
+
+def test_global_batch_group_boundary_mismatch_is_rejected(monkeypatch) -> None:
+    """Flatten 결과 수가 group 경계 합과 다르면 re-slice 전에 실패한다."""
+    pair = ((LON, LAT), (LON + 0.001, LAT))
+    groups = ((pair,), (pair,))
+    monkeypatch.setattr(
+        station_module,
+        "_checked_distances",
+        lambda *_args, **_kwargs: (1.0,),
+    )
+
+    with pytest.raises(ContractViolation, match="flatten 입력"):
+        station_module._checked_distance_groups(lambda *_: 1.0, groups)
+
+
+def test_relocation_measurement_keeps_identity_when_result_order_changes(
+    monkeypatch,
+) -> None:
+    """측정 객체 순서가 달라져도 meter가 다른 comparison 승인에 결합되지 않는다."""
+    master_lon = LON + 0.001
+    realtime_lon = LON + 0.003
+    approval = build_station_relocation_approval(
+        (
+            RelocationApproval(
+                approval_id="REL-ORDER",
+                approved_by="data-owner",
+                approved_dttm=CANDIDATE_TIME,
+                candidate_point_ewkb=point_ewkb_xdr_hex(master_lon, LAT),
+                comparison_cd="master_vs_realtime",
+                reference_point_ewkb=point_ewkb_xdr_hex(realtime_lon, LAT),
+                sta_id="ST-1",
+            ),
+        )
+    )
+
+    def distance(*_: float) -> float:
+        """이 테스트는 global batch callback만 사용한다."""
+        raise AssertionError("scalar distance must not be called")
+
+    def batch(pairs):
+        """Gold 비교는 50m, realtime 비교는 150m, center 비교는 1m로 둔다."""
+        if len(pairs) == 2 and pairs[0][1] == (LON, LAT):
+            return 50.0, 150.0
+        return (1.0,) * len(pairs)
+
+    distance.batch = batch  # type: ignore[attr-defined]
+    real_measure = station_module._measured_comparison_groups
+
+    def reordered(*args, **kwargs):
+        """계산된 comparison 객체들의 소비 순서만 의도적으로 뒤집는다."""
+        measured = real_measure(*args, **kwargs)
+        return tuple(tuple(reversed(group)) for group in measured)
+
+    monkeypatch.setattr(station_module, "_measured_comparison_groups", reordered)
+
+    projection = _build(
+        master_rows=(_master_row(LOT=master_lon),),
+        windows=(
+            _window(
+                CANDIDATE_TIME,
+                _realtime_row(stationLongitude=realtime_lon),
+            ),
+        ),
+        previous=(_previous(),),
+        approval=approval,
+        distance_meters=distance,
+    )
+
+    [record] = projection.records
+    assert record.longitude == master_lon
+    assert projection.relocation_applied is True

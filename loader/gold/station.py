@@ -175,6 +175,28 @@ class _StationCandidate:
 
 
 @dataclass(frozen=True, slots=True)
+class _RelocationComparison:
+    """Relocation 승인 identity와 거리 입력 Point 쌍을 함께 고정한다."""
+
+    comparison_cd: str
+    candidate_point: tuple[float, float]
+    reference_point: tuple[float, float]
+
+    @property
+    def pair(self) -> tuple[tuple[float, float], tuple[float, float]]:
+        """거리 callback에 전달할 candidate/reference Point 쌍을 반환한다."""
+        return self.candidate_point, self.reference_point
+
+
+@dataclass(frozen=True, slots=True)
+class _MeasuredRelocationComparison:
+    """Relocation comparison identity와 계산된 meter를 분리 불가능하게 결합한다."""
+
+    comparison: _RelocationComparison
+    meters: float
+
+
+@dataclass(frozen=True, slots=True)
 class _ResolvedStation:
     """거리 기반 center 배정 직전의 station 전체 필드를 보관한다."""
 
@@ -322,14 +344,13 @@ def _resolve_station_ordered(
     center_distances: list[tuple[float, ...]] = []
     for candidate in candidates:
         comparisons = _master_point_comparisons(candidate)
-        comparison_meters = _checked_distances(
+        [comparison_distances] = _measured_comparison_groups(
             distance_meters,
-            _comparison_pairs(comparisons),
+            (comparisons,),
         )
         item = _resolve_station(
             candidate,
-            comparisons=comparisons,
-            comparison_meters=comparison_meters,
+            comparison_distances=comparison_distances,
             master_base_dttm=master_base_dttm,
             candidate_logical_dttm=candidate_logical_dttm,
             window_maps=window_maps,
@@ -362,17 +383,16 @@ def _resolve_station_globally_batched(
 ) -> tuple[tuple[_ResolvedStation, ...], tuple[tuple[float, ...], ...]]:
     """projection 전체 relocation과 center 거리를 각각 한 번에 계산한다."""
     comparisons = tuple(_master_point_comparisons(item) for item in candidates)
-    comparison_distances = _checked_distance_groups(
+    comparison_distances = _measured_comparison_groups(
         distance_meters,
-        tuple(_comparison_pairs(group) for group in comparisons),
+        comparisons,
     )
     resolved = tuple(
         item
         for item in (
             _resolve_station(
                 candidate,
-                comparisons=group,
-                comparison_meters=meters,
+                comparison_distances=measured,
                 master_base_dttm=master_base_dttm,
                 candidate_logical_dttm=candidate_logical_dttm,
                 window_maps=window_maps,
@@ -381,9 +401,8 @@ def _resolve_station_globally_batched(
                 approvals=approvals,
                 used_approvals=used_approvals,
             )
-            for candidate, group, meters in zip(
+            for candidate, measured in zip(
                 candidates,
-                comparisons,
                 comparison_distances,
                 strict=True,
             )
@@ -400,8 +419,7 @@ def _resolve_station_globally_batched(
 def _resolve_station(
     candidate: _StationCandidate,
     *,
-    comparisons: tuple[tuple[str, tuple[float, float], tuple[float, float]], ...],
-    comparison_meters: tuple[float, ...],
+    comparison_distances: tuple[_MeasuredRelocationComparison, ...],
     master_base_dttm: datetime,
     candidate_logical_dttm: datetime,
     window_maps: tuple[dict[str, Mapping[str, Any]], ...],
@@ -419,8 +437,7 @@ def _resolve_station(
         previous=candidate.previous,
         approvals=approvals,
         used_approvals=used_approvals,
-        comparisons=comparisons,
-        comparison_meters=comparison_meters,
+        comparison_distances=comparison_distances,
     )
     if point_choice is None:
         if candidate.previous is None:
@@ -643,8 +660,7 @@ def _choose_master_values_and_point(
     previous: StationRecord | None,
     approvals: Mapping[tuple[str, str], Any],
     used_approvals: set[tuple[str, str]],
-    comparisons: tuple[tuple[str, tuple[float, float], tuple[float, float]], ...],
-    comparison_meters: tuple[float, ...],
+    comparison_distances: tuple[_MeasuredRelocationComparison, ...],
 ) -> tuple[str, float, float, str, datetime, bool] | None:
     """검증된 거리로 master LKG·fallback·>100m Point를 선택한다."""
     address, master_point = master_values
@@ -673,22 +689,20 @@ def _choose_master_values_and_point(
             False,
         )
     master_lon, master_lat = master_point
-    if len(comparison_meters) != len(comparisons):
-        raise ContractViolation("station relocation 거리 결과 수가 입력과 다릅니다.")
     approved_keys: list[tuple[str, str]] = []
-    for meters, (comparison_cd, candidate_point, reference_point) in zip(
-        comparison_meters, comparisons, strict=True
-    ):
-        if meters <= RELOCATION_THRESHOLD_M:
+    for measured in comparison_distances:
+        if measured.meters <= RELOCATION_THRESHOLD_M:
             continue
+        comparison = measured.comparison
+        comparison_cd = comparison.comparison_cd
         key = (station_id, comparison_cd)
         approval = approvals.get(key)
         if approval is None or not _approval_matches(
             approval,
             station_id=station_id,
             comparison_cd=comparison_cd,
-            candidate_point=candidate_point,
-            reference_point=reference_point,
+            candidate_point=comparison.candidate_point,
+            reference_point=comparison.reference_point,
         ):
             return None
         approved_keys.append(key)
@@ -705,7 +719,7 @@ def _choose_master_values_and_point(
 
 def _master_point_comparisons(
     candidate: _StationCandidate,
-) -> tuple[tuple[str, tuple[float, float], tuple[float, float]], ...]:
+) -> tuple[_RelocationComparison, ...]:
     """기존 순서로 station의 relocation 비교 좌표를 만든다."""
     address, master_point = candidate.master_values
     if address is None or master_point is None:
@@ -718,28 +732,61 @@ def _master_point_comparisons(
         if candidate.realtime_row is not None
         else None
     )
-    comparisons: list[tuple[str, tuple[float, float], tuple[float, float]]] = []
+    comparisons: list[_RelocationComparison] = []
     if candidate.previous is not None:
         comparisons.append(
-            (
-                "gold_vs_master",
-                master_point,
-                (candidate.previous.longitude, candidate.previous.latitude),
+            _RelocationComparison(
+                comparison_cd="gold_vs_master",
+                candidate_point=master_point,
+                reference_point=(
+                    candidate.previous.longitude,
+                    candidate.previous.latitude,
+                ),
             )
         )
     if realtime_point is not None:
-        comparisons.append(("master_vs_realtime", master_point, realtime_point))
+        comparisons.append(
+            _RelocationComparison(
+                comparison_cd="master_vs_realtime",
+                candidate_point=master_point,
+                reference_point=realtime_point,
+            )
+        )
     return tuple(comparisons)
 
 
 def _comparison_pairs(
-    comparisons: tuple[tuple[str, tuple[float, float], tuple[float, float]], ...],
+    comparisons: tuple[_RelocationComparison, ...],
 ) -> tuple[tuple[tuple[float, float], tuple[float, float]], ...]:
     """relocation 비교에서 PostGIS가 소비할 좌표 쌍만 반환한다."""
-    return tuple(
-        (candidate_point, reference_point)
-        for _, candidate_point, reference_point in comparisons
+    return tuple(comparison.pair for comparison in comparisons)
+
+
+def _measured_comparison_groups(
+    distance_meters: Callable[[float, float, float, float], float],
+    groups: tuple[tuple[_RelocationComparison, ...], ...],
+) -> tuple[tuple[_MeasuredRelocationComparison, ...], ...]:
+    """Comparison identity와 같은 입력 순서로 계산한 meter를 함께 묶는다."""
+    meter_groups = _checked_distance_groups(
+        distance_meters,
+        tuple(_comparison_pairs(group) for group in groups),
     )
+    measured_groups: list[tuple[_MeasuredRelocationComparison, ...]] = []
+    for index, (group, meters) in enumerate(
+        zip(groups, meter_groups, strict=True)
+    ):
+        if len(group) != len(meters):
+            raise ContractViolation(
+                "station relocation comparison identity와 거리 결과 경계가 다릅니다: "
+                f"group={index} comparisons={len(group)} meters={len(meters)}"
+            )
+        measured_groups.append(
+            tuple(
+                _MeasuredRelocationComparison(comparison, value)
+                for comparison, value in zip(group, meters, strict=True)
+            )
+        )
+    return tuple(measured_groups)
 
 
 def _approval_lookup(
@@ -829,14 +876,23 @@ def _checked_distance_groups(
     """station별 좌표 쌍을 한 batch로 계산한 뒤 원래 경계로 복원한다."""
     flattened = tuple(pair for group in groups for pair in group)
     values = _checked_distances(distance_meters, flattened)
+    if len(values) != len(flattened):
+        raise ContractViolation(
+            "global batch 거리 결과 수가 flatten 입력과 다릅니다: "
+            f"expected={len(flattened)} actual={len(values)}"
+        )
     resolved: list[tuple[float, ...]] = []
     offset = 0
-    for group in groups:
+    for index, group in enumerate(groups):
         next_offset = offset + len(group)
-        resolved.append(values[offset:next_offset])
+        group_values = values[offset:next_offset]
+        if len(group_values) != len(group):
+            raise ContractViolation(
+                "global batch 거리 결과 group 경계가 입력과 다릅니다: "
+                f"group={index} expected={len(group)} actual={len(group_values)}"
+            )
+        resolved.append(group_values)
         offset = next_offset
-    if offset != len(values):
-        raise ContractViolation("global batch 거리 결과 경계가 입력과 다릅니다.")
     return tuple(resolved)
 
 
