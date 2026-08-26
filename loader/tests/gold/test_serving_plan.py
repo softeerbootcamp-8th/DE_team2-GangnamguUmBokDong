@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -10,14 +12,21 @@ from core.gold_publication import (
     ContractViolation,
     Dependency,
     ImmutablePutOutcome,
+    InputArtifact,
     build_id_set,
     canonical_json_bytes,
     parse_canonical_json,
     sha256_hex,
 )
+from core.inference_snapshot import (
+    ImmutableInputRef,
+    InferenceSnapshotStatus,
+    ServingReleaseRef,
+)
 from core.model_snapshot import IdSetArtifactRef, build_id_set_artifact_ref
 from core.serving_plan_input import read_serving_plan_inference_inputs
 from gold.serving_plan import (
+    LEGACY_SERVING_PLAN_SCHEMA_VERSION,
     PreparedManifestRef,
     ServingPlan,
     ServingPlanArtifact,
@@ -25,6 +34,7 @@ from gold.serving_plan import (
     _activation_ready_station_ids,
     _inference_expected_station_ids,
     _store_id_set,
+    _validate_shared_identity_binding,
     parse_serving_plan,
 )
 from gold.station import StationProjection, StationRecord
@@ -153,6 +163,20 @@ def _plan() -> ServingPlan:
             short_term=timedelta(hours=3),
             ultra_short=timedelta(minutes=30),
         ),
+        serving_release=ServingReleaseRef(
+            byte_sha256=_SHA_C,
+            effective_contract_version=f"sha256:{_SHA_A}",
+            release_version=f"sha256:{_SHA_B}",
+            uri=f"s3://fixture/models/serving-release/manifests/sha256={_SHA_C}.json",
+        ),
+        station_master_enriched=InputArtifact(
+            byte_sha256=_SHA_B,
+            role="station_master_enriched",
+            uri=(
+                "s3://fixture/silver/station_master_enriched/"
+                "dt=2026-08-20/hh=00/0005.parquet"
+            ),
+        ),
     )
 
 
@@ -237,6 +261,8 @@ def test_core_inference_extractor_matches_loader_canonical_plan() -> None:
     assert extracted.station_dependency == plan.station_dependency
     assert extracted.expected_sta_ids_ref == plan.expected_sta_ids
     assert extracted.expected_sta_ids == expected
+    assert extracted.serving_release == plan.serving_release
+    assert extracted.station_master_enriched == plan.station_master_enriched
     assert (
         extracted.serving_plan
         == ServingPlanArtifact(
@@ -273,6 +299,76 @@ def test_core_inference_extractor_rejects_cross_bucket_expected_ref() -> None:
         )
 
 
+def test_legacy_v2_plan_replays_in_finalize_but_cannot_start_new_inference() -> None:
+    """기존 v2 finalize 호환은 유지하고 신규 unpinned inference는 거부한다."""
+    store = _MemoryStore()
+    legacy = replace(
+        _plan(),
+        schema_version=LEGACY_SERVING_PLAN_SCHEMA_VERSION,
+        serving_release=None,
+        station_master_enriched=None,
+    )
+    plan_uri = f"s3://fixture/gold/serving-plan/plans/sha256={legacy.sha256}.json"
+    store.put_once(
+        plan_uri,
+        legacy.canonical_bytes,
+        expected_sha256=legacy.sha256,
+        require_canonical_json=True,
+    )
+
+    assert parse_serving_plan(legacy.canonical_bytes) == legacy
+    _validate_shared_identity_binding(legacy, object())
+    with pytest.raises(ContractViolation, match="prepare를 다시 실행"):
+        read_serving_plan_inference_inputs(
+            store,  # type: ignore[arg-type]
+            plan_uri=plan_uri,
+            plan_sha256=legacy.sha256,
+        )
+
+
+def test_v3_finalize_rejects_release_and_enriched_master_drift() -> None:
+    """Plan 뒤 shared identity가 바뀐 inference manifest를 fail-closed한다."""
+    plan = _plan()
+    assert plan.serving_release is not None
+    assert plan.station_master_enriched is not None
+    wrong_release = replace(plan.serving_release, byte_sha256="d" * 64, uri=(
+        "s3://fixture/models/serving-release/manifests/"
+        + "sha256="
+        + "d" * 64
+        + ".json"
+    ))
+    with pytest.raises(ContractViolation, match="serving release"):
+        _validate_shared_identity_binding(
+            plan,
+            SimpleNamespace(
+                serving_release=wrong_release,
+                status=InferenceSnapshotStatus.SUCCEEDED,
+                inputs=(),
+            ),
+        )
+
+    with pytest.raises(ContractViolation, match="station_master_enriched bytes"):
+        _validate_shared_identity_binding(
+            plan,
+            SimpleNamespace(
+                serving_release=plan.serving_release,
+                status=InferenceSnapshotStatus.SUCCEEDED,
+                inputs=(
+                    ImmutableInputRef(
+                        byte_sha256="d" * 64,
+                        role="station_master_enriched",
+                        uri=(
+                            "s3://fixture/gold/inference/inputs/"
+                            "station-master/sha256="
+                            + "d" * 64
+                            + ".parquet"
+                        ),
+                    ),
+                ),
+            ),
+        )
+
+
 def test_plan_requires_same_anchor_station_dependency_and_prepared_order() -> None:
     """Inference station tuple과 prepared key 순서가 흔들리면 plan을 거부한다."""
     values = _plan()
@@ -289,6 +385,8 @@ def test_plan_requires_same_anchor_station_dependency_and_prepared_order() -> No
             prepared_publications=values.prepared_publications,
             prior_states=(),
             source_lookbacks=values.source_lookbacks,
+            serving_release=values.serving_release,
+            station_master_enriched=values.station_master_enriched,
         )
     with pytest.raises(ContractViolation, match="key 순서"):
         ServingPlan(
@@ -303,6 +401,8 @@ def test_plan_requires_same_anchor_station_dependency_and_prepared_order() -> No
             prepared_publications=tuple(reversed(values.prepared_publications)),
             prior_states=(),
             source_lookbacks=values.source_lookbacks,
+            serving_release=values.serving_release,
+            station_master_enriched=values.station_master_enriched,
         )
 
 
