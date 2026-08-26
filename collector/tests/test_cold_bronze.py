@@ -125,6 +125,35 @@ def test_pending_recovery_only_processes_dates_after_delay():
     assert read_json("bronze/cold_manifest/test_source/dt=2026-08-12.json")
 
 
+def test_pending_marker_is_one_per_revision_not_per_part():
+    """part가 많은 source도 같은 window revision에는 marker 하나만 만든다."""
+    storage.write_bronze_part("test_source", WINDOW, "page-001", b"first", 0)
+    storage.write_bronze_part("test_source", WINDOW, "page-002", b"second", 0)
+
+    assert len(list_keys("_cold_pending/test_source/")) == 1
+
+
+def test_missing_hot_marker_is_ignored_until_due_and_then_cleaned():
+    """Hot put 전에 중단된 marker는 D-6 전 task를 막지 않고 기한 뒤 정리된다."""
+    missing_hot = (
+        "bronze/hot/test_source/dt=2026-08-12/hh=14/1455/"
+        "revision=0000000000/part=missing.json.gz"
+    )
+    cold_bronze.write_pending_marker("test_source", DAY, missing_hot)
+
+    before_due = cold_bronze.recover_pending(
+        "test_source", today=date(2026, 8, 17), delay_days=6
+    )
+    due = cold_bronze.recover_pending(
+        "test_source", today=date(2026, 8, 18), delay_days=6
+    )
+
+    assert before_due.dates == 0
+    assert due.dates == 1
+    assert due.objects == 0
+    assert list_keys("_cold_pending/test_source/") == []
+
+
 def test_late_revision_creates_new_pending_work_after_cold():
     """Cold 완료 날짜의 늦은 revision은 새 marker로 다시 compaction된다."""
     storage.write_bronze_part("test_source", WINDOW, "page-001", b"first", 0)

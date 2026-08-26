@@ -39,6 +39,10 @@ _LEGACY_KEY = re.compile(
     r"\Abronze/(?P<source>[a-z][a-z0-9_]*)/dt=(?P<day>\d{4}-\d{2}-\d{2})/"
     r"hh=(?P<hour>\d{2})/(?P<hhmm>\d{4})/part=(?P<part>.+)\.json\.gz\Z"
 )
+_PENDING_MARKER_KEY = re.compile(
+    r"\A_cold_pending/(?P<source>[a-z][a-z0-9_]*)/"
+    r"dt=(?P<day>\d{4}-\d{2}-\d{2})/sha256=[0-9a-f]{64}\.json\Z"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,10 +63,14 @@ class ColdRecoveryResult:
 
 
 def _pending_marker_key(source_id: str, day: date, hot_key: str) -> str:
-    """Hot object 하나에 대응하는 immutable pending marker key를 만든다."""
+    """Hot revision prefix 하나에 대응하는 immutable pending marker key를 만든다."""
+    try:
+        hot_revision_prefix, _ = hot_key.rsplit("/part=", 1)
+    except ValueError as exc:
+        raise ValueError(f"pending marker의 Hot key 형식이 잘못됐다: {hot_key}") from exc
     return (
         f"_cold_pending/{source_id}/dt={day.isoformat()}/"
-        f"sha256={_sha256(hot_key.encode())}.json"
+        f"sha256={_sha256(hot_revision_prefix.encode())}.json"
     )
 
 
@@ -72,7 +80,7 @@ def write_pending_marker(source_id: str, day: date, hot_key: str) -> None:
     payload = {
         "source_id": source_id,
         "date": day.isoformat(),
-        "hot_key": hot_key,
+        "hot_revision_prefix": hot_key.rsplit("/part=", 1)[0],
     }
     previous = read_json(key)
     if previous is not None and previous != payload:
@@ -226,35 +234,32 @@ def recover_pending(
     if delay_days < 0:
         raise ValueError("Cold recovery delay_days는 0 이상이어야 한다.")
     marker_keys = list_keys(f"_cold_pending/{source_id}/")
-    days: set[date] = set()
+    markers_by_day: dict[date, list[str]] = {}
     for marker_key in marker_keys:
-        marker = read_json(marker_key)
-        if not isinstance(marker, dict):
-            raise TypeError(f"Cold pending marker를 읽을 수 없다: {marker_key}")
-        if marker.get("source_id") != source_id:
+        matched = _PENDING_MARKER_KEY.fullmatch(marker_key)
+        if matched is None or matched.group("source") != source_id:
             raise RuntimeError(f"Cold pending marker source가 다르다: {marker_key}")
         try:
-            day = date.fromisoformat(marker["date"])
-        except (KeyError, TypeError, ValueError) as exc:
+            day = date.fromisoformat(matched.group("day"))
+        except ValueError as exc:
             raise RuntimeError(f"Cold pending marker 날짜가 잘못됐다: {marker_key}") from exc
-        hot_key = marker.get("hot_key")
-        if not isinstance(hot_key, str) or not object_exists(hot_key):
-            raise RuntimeError(f"Cold pending marker의 Hot object가 없다: {marker_key}")
         if day + timedelta(days=delay_days) <= today:
-            days.add(day)
+            markers_by_day.setdefault(day, []).append(marker_key)
 
     failures = []
     object_count = 0
-    for day in sorted(days):
+    for day in sorted(markers_by_day):
         try:
             result = compact_date(source_id, day)
             object_count += result.objects
+            # 실행 시작 뒤 생긴 marker는 지우지 않아 late revision을 다음 실행이 처리한다.
+            delete_objects(markers_by_day[day])
         except (ClientError, OSError, RuntimeError, ValueError) as exc:
             failures.append((day, exc))
     if failures:
         detail = ", ".join(f"{day}: {exc}" for day, exc in failures)
         raise RuntimeError(f"Cold pending recovery 일부 날짜가 실패했다: {detail}")
-    return ColdRecoveryResult(dates=len(days), objects=object_count)
+    return ColdRecoveryResult(dates=len(markers_by_day), objects=object_count)
 
 
 def read_revision(
