@@ -20,6 +20,9 @@ from core.inference_snapshot import (
     INFERENCE_OUTPUT_ARROW_SCHEMA,
     INFERENCE_OUTPUT_COLUMN_NAMES,
     INFERENCE_SNAPSHOT_MANIFEST_SCHEMA_VERSION,
+    LEGACY_INFERENCE_OUTPUT_ARROW_SCHEMA,
+    LEGACY_INFERENCE_OUTPUT_COLUMN_NAMES,
+    LEGACY_INFERENCE_SNAPSHOT_MANIFEST_SCHEMA_VERSION,
     ImmutableInputRef,
     InferenceSnapshotContractError,
     InferenceSnapshotCounts,
@@ -175,8 +178,13 @@ def _producer_output_frame(
                     "minute": target.minute,
                     "horizon": horizon,
                     "rental_pred_mean": horizon + 0.25,
+                    "rental_pred_p10": -0.25,
+                    "rental_pred_p50": horizon + 0.5,
+                    "rental_pred_p90": horizon + 0.25,
                     "return_pred_mean": horizon + 0.75,
-                    "rental_pred_p10": 0.0,
+                    "return_pred_p10": -0.75,
+                    "return_pred_p50": horizon + 0.5,
+                    "return_pred_p90": horizon + 1.0,
                     "lag_data_freshness": 1.0,
                 }
             )
@@ -265,7 +273,7 @@ def test_inference_manifest_has_stable_exact_canonical_bytes() -> None:
         b'2222222222222222222222222222222222222222222222222222222222222222",'
         b'"uri":"s3://fixture/model-manifests/return/'
         b'sha256=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc.json"},'
-        b'"revision_no":0,"schema_version":"ml-inference-snapshot-manifest-v1",'
+        b'"revision_no":0,"schema_version":"ml-inference-snapshot-manifest-v2",'
         b'"serving_plan":{"byte_sha256":"9999999999999999999999999999999999999999999999999999999999999999",'
         b'"uri":"s3://fixture/serving-plans/'
         b'sha256=9999999999999999999999999999999999999999999999999999999999999999.json"},'
@@ -552,7 +560,7 @@ def test_manifest_bytes_become_gold_inference_output_not_raw_parquet() -> None:
     assert artifact.uri == uri
 
 
-def test_output_table_canonicalizes_exact_seven_columns_and_round_trips() -> None:
+def test_output_table_canonicalizes_exact_columns_and_round_trips() -> None:
     """Producer extra metadata를 제외하고 exact Arrow authority를 Parquet으로 읽는다."""
     expected_ids = build_id_set(("ST-2", "ST-1"))
 
@@ -573,7 +581,47 @@ def test_output_table_canonicalizes_exact_seven_columns_and_round_trips() -> Non
     assert table.num_rows == 24
     assert table.column("station_id").to_pylist()[:12] == ["ST-1"] * 12
     assert table.column("horizon").to_pylist()[:12] == list(range(1, 13))
+    assert table.column("rental_pred_p10").to_pylist()[0] == -0.25
+    assert (
+        table.column("rental_pred_p50").to_pylist()[0]
+        > table.column("rental_pred_p90").to_pylist()[0]
+    )
     assert parsed.equals(table, check_metadata=True)
+
+
+def test_v1_manifest_and_mean_only_output_remain_dual_readable() -> None:
+    """기존 v1 manifest와 7-column output을 mean-only authority로 읽는다."""
+    current = _succeeded()
+    legacy_payload = current.canonical_bytes.replace(
+        INFERENCE_SNAPSHOT_MANIFEST_SCHEMA_VERSION.encode(),
+        LEGACY_INFERENCE_SNAPSHOT_MANIFEST_SCHEMA_VERSION.encode(),
+    )
+    legacy_manifest = parse_inference_snapshot_manifest(legacy_payload)
+    expected_ids = build_id_set(("ST-1", "ST-2"))
+    current_table = canonicalize_inference_output_table(
+        _producer_output_frame(),
+        logical_dttm=LOGICAL_DTTM,
+        expected_sta_ids=expected_ids,
+    )
+    legacy_table = current_table.select(LEGACY_INFERENCE_OUTPUT_COLUMN_NAMES)
+    buffer = BytesIO()
+    pq.write_table(legacy_table, buffer)
+
+    parsed = parse_inference_output_parquet(
+        buffer.getvalue(),
+        logical_dttm=LOGICAL_DTTM,
+        expected_sta_ids=expected_ids,
+        schema_version=LEGACY_INFERENCE_SNAPSHOT_MANIFEST_SCHEMA_VERSION,
+    )
+
+    assert legacy_manifest.schema_version == (
+        LEGACY_INFERENCE_SNAPSHOT_MANIFEST_SCHEMA_VERSION
+    )
+    assert parsed.schema.equals(
+        LEGACY_INFERENCE_OUTPUT_ARROW_SCHEMA,
+        check_metadata=True,
+    )
+    assert tuple(parsed.column_names) == LEGACY_INFERENCE_OUTPUT_COLUMN_NAMES
 
 
 def test_output_table_uses_kst_target_across_date_boundary() -> None:
@@ -641,7 +689,7 @@ def test_output_table_rejects_partial_duplicate_time_or_nonfinite_prediction(
 
 
 def test_output_parser_rejects_extra_schema_and_noncanonical_row_order() -> None:
-    """Stored Parquet은 exact 7 columns과 canonical station/horizon order를 유지한다."""
+    """Stored Parquet은 exact 13 columns과 canonical station/horizon order를 유지한다."""
     expected_ids = build_id_set(("ST-1", "ST-2"))
     table = canonicalize_inference_output_table(
         _producer_output_frame(),
@@ -707,9 +755,13 @@ def test_schema_and_horizon_constants_are_disk_contract() -> None:
     """Inference manifest schema와 12 horizon을 회귀 고정한다."""
     assert (
         INFERENCE_SNAPSHOT_MANIFEST_SCHEMA_VERSION
-        == "ml-inference-snapshot-manifest-v1"
+        == "ml-inference-snapshot-manifest-v2"
     )
     assert INFERENCE_HORIZON_COUNT == 12
+    assert (
+        LEGACY_INFERENCE_SNAPSHOT_MANIFEST_SCHEMA_VERSION
+        == "ml-inference-snapshot-manifest-v1"
+    )
     assert INFERENCE_OUTPUT_COLUMN_NAMES == (
         "station_id",
         "date",
@@ -717,7 +769,13 @@ def test_schema_and_horizon_constants_are_disk_contract() -> None:
         "minute",
         "horizon",
         "rental_pred_mean",
+        "rental_pred_p10",
+        "rental_pred_p50",
+        "rental_pred_p90",
         "return_pred_mean",
+        "return_pred_p10",
+        "return_pred_p50",
+        "return_pred_p90",
     )
     assert INFERENCE_OUTPUT_ARROW_SCHEMA == pa.schema(
         (
@@ -727,6 +785,12 @@ def test_schema_and_horizon_constants_are_disk_contract() -> None:
             pa.field("minute", pa.uint8(), nullable=False),
             pa.field("horizon", pa.uint8(), nullable=False),
             pa.field("rental_pred_mean", pa.float64(), nullable=False),
+            pa.field("rental_pred_p10", pa.float64(), nullable=False),
+            pa.field("rental_pred_p50", pa.float64(), nullable=False),
+            pa.field("rental_pred_p90", pa.float64(), nullable=False),
             pa.field("return_pred_mean", pa.float64(), nullable=False),
+            pa.field("return_pred_p10", pa.float64(), nullable=False),
+            pa.field("return_pred_p50", pa.float64(), nullable=False),
+            pa.field("return_pred_p90", pa.float64(), nullable=False),
         )
     )
