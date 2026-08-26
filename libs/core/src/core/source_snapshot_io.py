@@ -8,6 +8,7 @@ import os
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from enum import StrEnum
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
@@ -55,6 +56,189 @@ class SourceSnapshotData:
 
     manifest: SourceSnapshotManifest
     table: pa.Table | None
+
+
+class SourceDataStatus(StrEnum):
+    """Producer가 판정한 source 데이터의 객관적 상태다."""
+
+    SUCCESS = "success"
+    PARTIAL = "partial"
+    FAILED = "failed"
+
+
+class PartialConsumptionPolicy(StrEnum):
+    """Consumer가 PARTIAL 입력을 처리하는 명시적 정책이다."""
+
+    REJECT = "reject"
+    REPAIR = "repair"
+
+
+class SourceFreshness(StrEnum):
+    """선택된 source 데이터가 현재 window인지 과거 window인지 나타낸다."""
+
+    CURRENT = "current"
+    STALE = "stale"
+
+
+class SourceResolution(StrEnum):
+    """Consumer가 source 입력을 실제로 처리한 결과다."""
+
+    OBSERVED = "observed"
+    REPAIRED = "repaired"
+    UNAVAILABLE = "unavailable"
+
+
+@dataclass(frozen=True, slots=True)
+class SourceSelectionMetadata:
+    """추가 I/O 없이 consumer 경계에서 전파하는 공통 source 선택 metadata다."""
+
+    source_id: str
+    status: SourceDataStatus
+    freshness: SourceFreshness
+    partial_policy: PartialConsumptionPolicy
+    resolution: SourceResolution
+    requested_dttm: datetime
+    selected_dttm: datetime | None
+
+    def __post_init__(self) -> None:
+        """필드 타입과 시각 관계를 검증하고 시각을 UTC로 고정한다."""
+        source = _validated_source_id(self.source_id)
+        if type(self.status) is not SourceDataStatus:
+            raise TypeError("status는 SourceDataStatus여야 합니다.")
+        if type(self.freshness) is not SourceFreshness:
+            raise TypeError("freshness는 SourceFreshness여야 합니다.")
+        if type(self.partial_policy) is not PartialConsumptionPolicy:
+            raise TypeError("partial_policy는 PartialConsumptionPolicy여야 합니다.")
+        if type(self.resolution) is not SourceResolution:
+            raise TypeError("resolution은 SourceResolution이어야 합니다.")
+        requested = _aware_utc(self.requested_dttm)
+        selected = (
+            None if self.selected_dttm is None else _aware_utc(self.selected_dttm)
+        )
+        if self.status is SourceDataStatus.FAILED:
+            if selected is not None or self.resolution is not SourceResolution.UNAVAILABLE:
+                raise ValueError("FAILED metadata는 selected_dttm 없이 unavailable이어야 합니다.")
+        elif selected is None:
+            raise ValueError("SUCCESS/PARTIAL metadata에는 selected_dttm이 필요합니다.")
+        if selected is not None and selected > requested:
+            raise ValueError("selected_dttm은 requested_dttm보다 미래일 수 없습니다.")
+        object.__setattr__(self, "source_id", source)
+        object.__setattr__(self, "requested_dttm", requested)
+        object.__setattr__(self, "selected_dttm", selected)
+
+    def as_dict(self) -> dict[str, str | None]:
+        """Manifest와 구조화 로그에 함께 쓰는 안정적인 JSON object를 반환한다."""
+        return {
+            "freshness": self.freshness.value,
+            "partial_policy": self.partial_policy.value,
+            "requested_dttm": self.requested_dttm.isoformat(),
+            "resolution": self.resolution.value,
+            "selected_dttm": (
+                None if self.selected_dttm is None else self.selected_dttm.isoformat()
+            ),
+            "source_id": self.source_id,
+            "status": self.status.value,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class AvailableSourceSnapshot:
+    """상태와 freshness를 섞지 않고 선택한 serving 입력을 표현한다."""
+
+    status: SourceDataStatus
+    freshness: SourceFreshness
+    logical_dttm: datetime
+    table: pa.Table
+    manifest: SourceSnapshotManifest | None
+
+    def selection_metadata(
+        self,
+        source_id: str,
+        requested_dttm: datetime,
+        *,
+        partial_policy: PartialConsumptionPolicy,
+    ) -> SourceSelectionMetadata:
+        """이미 선택한 snapshot에서 추가 조회 없이 공통 metadata를 만든다."""
+        resolution = (
+            SourceResolution.REPAIRED
+            if self.status is SourceDataStatus.PARTIAL
+            else SourceResolution.OBSERVED
+        )
+        return SourceSelectionMetadata(
+            source_id=source_id,
+            status=self.status,
+            freshness=self.freshness,
+            partial_policy=partial_policy,
+            resolution=resolution,
+            requested_dttm=requested_dttm,
+            selected_dttm=self.logical_dttm,
+        )
+
+
+def read_available_source_snapshot(
+    source_id: str,
+    logical_dttm: datetime,
+    *,
+    lookback: timedelta,
+    partial_policy: PartialConsumptionPolicy = PartialConsumptionPolicy.REJECT,
+    columns: list[str] | None = None,
+) -> AvailableSourceSnapshot:
+    """Consumer 정책에 따라 현재 입력을 판정한 뒤 bounded 과거 성공을 선택한다.
+
+    PARTIAL 허용 비율은 이 reader가 다시 해석하지 않는다. Collector가 source별
+    ``max_missing_ratio`` 품질 게이트를 통과시켜 completed/partial로 확정한 결과만
+    ``read_partial_source_snapshot``이 열 수 있으므로 그 계약을 단일 기준으로 쓴다.
+    PARTIAL은 기본적으로 거부하며, ``REPAIR``를 명시한 consumer에만 반환한다.
+    반환된 PARTIAL의 누락 보정은 source 의미를 아는 호출자가 책임진다.
+    """
+    if type(lookback) is not timedelta or lookback <= timedelta(0):
+        raise ValueError("lookback은 양수 timedelta여야 합니다.")
+    if type(partial_policy) is not PartialConsumptionPolicy:
+        raise TypeError("partial_policy는 PartialConsumptionPolicy여야 합니다.")
+    logical = _aware_utc(logical_dttm)
+    try:
+        exact = read_exact_source_snapshot(source_id, logical, columns=columns)
+    except SourceSnapshotNotFoundError:
+        exact = None
+    if exact is not None and exact.table is not None:
+        return AvailableSourceSnapshot(
+            SourceDataStatus.SUCCESS,
+            SourceFreshness.CURRENT,
+            exact.manifest.logical_dttm,
+            exact.table,
+            exact.manifest,
+        )
+
+    if partial_policy is PartialConsumptionPolicy.REPAIR:
+        try:
+            partial = read_partial_source_snapshot(source_id, logical, columns=columns)
+        except SourceSnapshotNotFoundError:
+            partial = None
+        if partial is not None:
+            return AvailableSourceSnapshot(
+                SourceDataStatus.PARTIAL,
+                SourceFreshness.CURRENT,
+                logical,
+                partial,
+                None,
+            )
+    stale = read_latest_source_snapshot(
+        source_id,
+        logical - timedelta(microseconds=1),
+        lookback=lookback,
+        columns=columns,
+    )
+    if stale.table is None:  # read_latest는 non-empty만 반환하지만 계약을 방어한다.
+        raise SourceSnapshotNotFoundError(
+            f"{source_id} 사용 가능한 과거 성공 snapshot이 없습니다."
+        )
+    return AvailableSourceSnapshot(
+        SourceDataStatus.SUCCESS,
+        SourceFreshness.STALE,
+        stale.manifest.logical_dttm,
+        stale.table,
+        stale.manifest,
+    )
 
 
 def read_exact_source_snapshot_manifest(

@@ -95,6 +95,7 @@ legacy 백필 호환: 예전 설정처럼 `backfill.enabled`이면 `_retry_queue
 from __future__ import annotations
 
 import logging
+import math
 import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -665,7 +666,13 @@ def execute_window(
         )
         missing = _build_missing(missing_keys, expected_total, fetched_rows)
 
-    if ratio > config.quality.max_missing_ratio:
+    exceeds_missing_gate = ratio > config.quality.max_missing_ratio and not math.isclose(
+        ratio,
+        config.quality.max_missing_ratio,
+        rel_tol=0.0,
+        abs_tol=1e-12,
+    )
+    if exceeds_missing_gate:
         # 완결도 게이트 초과 — silver를 쓰지 않고 fetch_error로 끝낸다. stage는
         # BRONZE_WRITTEN 그대로라 재실행하면 기존 Bronze 재사용 분기로 들어간다.
         logger.error(
