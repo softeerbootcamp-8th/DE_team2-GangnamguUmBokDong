@@ -40,6 +40,22 @@ finalize_serving → urgency → routes
 선행 task로 실행된다. 수집 실패 시에는 `ALL_DONE` gate를 지나 이전에 게시된 날씨로
 계속할 수 있지만, serving plan·정류소·대여이력·normalizer 의존성은 우회하지 않는다.
 
+### Prepare와 inference의 authority 경계
+
+두 task는 같은 입력 준비 작업을 앞뒤로 나눈 것이 아니라 서로 다른 authority를
+소유한다.
+
+| Task | 소유하는 authority | 소유하지 않는 것 |
+|---|---|---|
+| `prepare_serving_plan` | Gold station·stock·weather projection, expected station scope, 기존 Gold/RDS state와 final transaction 전제 | 모델 artifact identity, rental history, horizon별 모델 날씨·생활인구·stockout source resolution |
+| `run_inference` | 실행 중 고정한 serving release, actual model-input 선택, 실제 읽은 non-model S3 bytes와 prediction provenance | Gold station·stock·weather projection과 RDS publication transaction |
+
+Prepare가 보존하는 rental·return support ID ref는 expected station scope를 계산하고
+inference model support와 대조하기 위한 것이다. Serving release 자체를 plan에 pin한다는
+뜻은 아니다. Inference는 plan의 logical time·station dependency·expected ID를 지키면서
+실행 시작 시 serving pointer를 한 번 읽고, 이후 실제 모델과 feature input을 immutable
+manifest에 기록한다.
+
 ## 2. Pinned serving release
 
 운영 실행은 mutable champion key를 채점 도중 다시 읽지 않는다.
@@ -54,6 +70,10 @@ finalize_serving → urgency → routes
 이 구조는 실행 중 champion이 교체돼 대여·반납 모델 또는 category 순서가 서로 다른
 버전으로 섞이는 것을 막는다. 모델 feature 순서와 dtype의 단일 기준은
 `libs/ml_core/model_contract.py`다.
+
+다만 prepare와 inference 사이의 pointer identity까지 serving plan이 고정하는 계약은
+현재 범위에 없다. Plan은 support ID ref를 고정하고, inference manifest가 실제 사용한
+release와 model manifest를 기록한다.
 
 ## 3. 시간과 multi-horizon 계약
 
@@ -143,6 +163,9 @@ P10/P50/P90과 fallback 진단값은 직접 호출 결과에는 존재하지만 
 5. 기록한 manifest bytes를 다시 읽어 SHA-256과 구조를 검증한다.
 
 같은 logical time과 같은 bytes의 재실행은 새 revision을 만들지 않는 exact replay다.
+Rental history, authority weather, realtime처럼 worker thread에서 읽는 source도 caller의
+capture context를 전달해 authority manifest와 연결된 Parquet bytes를 빠짐없이 같은
+input 집합에 포함한다.
 계산 결과가 달라지면 기존 latest manifest가 완전한지 검증한 뒤 다음 revision을 만든다.
 manifest가 공개되기 전의 object는 authority가 아니므로 소비자는 catalog와 manifest만
 따라가야 한다.

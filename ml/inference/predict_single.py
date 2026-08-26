@@ -94,7 +94,7 @@ import threading
 from collections.abc import Callable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from contextvars import ContextVar
+from contextvars import Context, ContextVar, copy_context
 from datetime import datetime
 from functools import wraps
 
@@ -379,8 +379,21 @@ def _read_authoritative_collector_snapshots(
 
     if not logical_keys:
         return []
+
+    # ContextVar는 worker thread로 자동 전파되지 않는다. Inference publication의
+    # S3 read capture를 각 source authority 조회에 전달하되, Context 객체 자체는
+    # 동시에 재진입할 수 없으므로 작업마다 독립 copy를 만든다.
+    contexts = [copy_context() for _ in logical_keys]
+
+    def _read_in_context(item: tuple[Context, str]) -> pd.DataFrame | None:
+        """복사한 caller context 안에서 source snapshot 하나를 읽는다."""
+        context, logical_key = item
+        return context.run(_read, logical_key)
+
     with ThreadPoolExecutor(max_workers=min(16, len(logical_keys))) as pool:
-        return list(pool.map(_read, logical_keys))
+        return list(
+            pool.map(_read_in_context, zip(contexts, logical_keys, strict=True))
+        )
 
 
 def _read_authoritative_collector_many(

@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import io
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
+from typing import Any
+from zoneinfo import ZoneInfo
 
 import boto3
+import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
@@ -32,6 +36,11 @@ from core.model_snapshot import (
     ModelKind,
     build_id_set_artifact_ref,
     build_model_snapshot_manifest,
+)
+from core.source_snapshot import (
+    SourceSnapshotCounts,
+    SourceSnapshotStatus,
+    build_source_snapshot_manifest,
 )
 from ml_core.serving_contract import SERVING_FEATURE_PROFILE_KEYS
 from ml_core.serving_release import validate_station_profile_payload
@@ -64,6 +73,11 @@ _STATION_PROFILE_COLUMNS = (
     "return_mean",
     "return_std",
     "n_samples",
+)
+_THREADED_SOURCE_IDS = (
+    "bike_rental_history",
+    "weather_short_term_forecast",
+    "bike_station_realtime",
 )
 
 
@@ -353,6 +367,78 @@ def _serving_plan_ref(label: str = "plan-a") -> ServingPlanRef:
     )
 
 
+def _put_threaded_source_snapshot(
+    client: Any,
+    *,
+    bucket: str,
+    source_id: str,
+    logical: datetime,
+) -> tuple[str, str, str]:
+    """Threaded inference source의 authority manifest와 Parquet을 게시한다."""
+    sink = io.BytesIO()
+    pq.write_table(pa.Table.from_pylist([{"source_id": source_id}]), sink)
+    parquet_payload = sink.getvalue()
+    parquet_sha = sha256_hex(parquet_payload)
+    parquet_key = (
+        f"silver/{source_id}/dt={logical:%Y-%m-%d}/hh={logical:%H}/"
+        f"{logical:%H%M}/sha256={parquet_sha}.parquet"
+    )
+    manifest = build_source_snapshot_manifest(
+        source_id=source_id,
+        logical_dttm=logical,
+        revision_no=0,
+        status=SourceSnapshotStatus.SUCCEEDED,
+        config_version="threaded-capture-fixture-v1",
+        silver_uri=f"s3://{bucket}/{parquet_key}",
+        silver_byte_sha256=parquet_sha,
+        counts=SourceSnapshotCounts(1, 1, 1, 0, 0),
+        planned_parts=("page=1",),
+        completed_parts=("page=1",),
+    )
+    utc = logical.astimezone(UTC)
+    manifest_key = (
+        f"source_snapshot_manifest/{source_id}/dt={utc:%Y-%m-%d}/hh={utc:%H}/"
+        f"logical={utc:%Y%m%dT%H%M%S}{utc.microsecond:06d}Z/"
+        "revision=0000000000.json"
+    )
+    client.put_object(Bucket=bucket, Key=parquet_key, Body=parquet_payload)
+    client.put_object(
+        Bucket=bucket,
+        Key=manifest_key,
+        Body=manifest.canonical_bytes,
+    )
+    logical_key = (
+        f"silver/{source_id}/dt={logical:%Y-%m-%d}/hh={logical:%H}/"
+        f"{logical:%H%M}.parquet"
+    )
+    return logical_key, manifest_key, parquet_key
+
+
+@pytest.fixture
+def _threaded_source_keys(monkeypatch):
+    """세 inference authority source와 예상 capture key 집합을 제공한다."""
+    bucket = "threaded-source-capture-fixture"
+    logical = LOGICAL.astimezone(ZoneInfo("Asia/Seoul"))
+    with mock_aws():
+        client = boto3.client("s3", region_name="us-east-1")
+        client.create_bucket(Bucket=bucket)
+        monkeypatch.setenv("S3_BUCKET", bucket)
+        monkeypatch.setattr(s3_io, "_client", lambda _timeout=None: client)
+        refs = tuple(
+            _put_threaded_source_snapshot(
+                client,
+                bucket=bucket,
+                source_id=source_id,
+                logical=logical,
+            )
+            for source_id in _THREADED_SOURCE_IDS
+        )
+        yield (
+            tuple(item[0] for item in refs),
+            frozenset(key for item in refs for key in item[1:]),
+        )
+
+
 def _predictor_state() -> tuple[dict[str, object], object]:
     """Captured source bytes와 prediction 값을 바꿀 수 있는 complete predictor를 만든다."""
     state: dict[str, object] = {"payload": b"silver-a", "prediction": 1.25}
@@ -425,6 +511,62 @@ def _install_release_loader(monkeypatch, pinned: object) -> list[dict[str, objec
 
     monkeypatch.setattr(pub, "load_current_serving_release", _load)
     return calls
+
+
+def test_threaded_authority_reads_capture_every_manifest_and_parquet(
+    _threaded_source_keys,
+):
+    """Worker가 읽은 rental·weather·realtime exact bytes를 모두 capture한다."""
+    logical_keys, expected_captured_keys = _threaded_source_keys
+    baseline_frames = ps._read_authoritative_collector_many(list(logical_keys))
+
+    with s3_io.capture_object_reads() as capture:
+        frames = ps._read_authoritative_collector_many(list(logical_keys))
+
+    for baseline, captured in zip(baseline_frames, frames, strict=True):
+        assert baseline is not None
+        assert captured is not None
+        pd.testing.assert_frame_equal(baseline, captured)
+    assert [frame.iloc[0]["source_id"] for frame in frames if frame is not None] == list(
+        _THREADED_SOURCE_IDS
+    )
+    assert frozenset(item.key for item in capture.objects) == expected_captured_keys
+    assert len(capture.objects) == len(_THREADED_SOURCE_IDS) * 2
+
+
+def test_threaded_authority_inputs_are_preserved_in_inference_manifest(
+    monkeypatch,
+    _pinned_scoring_stubs,
+    _threaded_source_keys,
+):
+    """실제 threaded source GET 집합을 inference manifest input과 exact 대조한다."""
+    logical_keys, expected_captured_keys = _threaded_source_keys
+    _install_release_loader(monkeypatch, _pinned_release())
+    _state, complete_predictor = _predictor_state()
+
+    def _predictor(**kwargs):
+        """세 authority source를 읽은 뒤 완전한 station×12 결과를 반환한다."""
+        frames = ps._read_authoritative_collector_many(list(logical_keys))
+        assert all(frame is not None for frame in frames)
+        return complete_predictor(**kwargs)
+
+    _install_predictor(monkeypatch, _predictor)
+    result = pub.run_and_publish_inference(
+        logical_dttm=LOGICAL,
+        station_dependency=_dependency(),
+        serving_plan=_serving_plan_ref(),
+        expected_sta_ids=build_id_set(["ST-1"]),
+        object_base_uri=OBJECT_BASE_URI,
+        object_store=MemoryObjectStore(),
+        revision_catalog=pub.InMemoryInferenceRevisionCatalog(),
+    )
+
+    expected_input_keys = expected_captured_keys | {"silver/source.parquet"}
+    expected_roles = {
+        f"s3_input_{sha256_hex(key.encode('utf-8'))}" for key in expected_input_keys
+    }
+    assert {reference.role for reference in result.manifest.inputs} == expected_roles
+    assert len(result.manifest.inputs) == len(expected_input_keys)
 
 
 def test_success_exact_replay_and_correction_are_revisioned_manifest_last(
