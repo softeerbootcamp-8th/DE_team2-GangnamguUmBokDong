@@ -2,6 +2,7 @@
 
 import boto3
 import pytest
+from core import s3 as s3_io
 from ml_core import mlflow_tracking
 from moto import mock_aws
 
@@ -10,10 +11,14 @@ TEST_BUCKET = "test-bucket"
 
 @pytest.fixture(autouse=True)
 def _s3_env(monkeypatch):
+    """환경과 process-local S3 client cache를 테스트마다 격리한다."""
+    s3_io._clear_client_cache()
     monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "testing")
     monkeypatch.delenv("S3_ENDPOINT_URL", raising=False)
     monkeypatch.setenv("S3_BUCKET", TEST_BUCKET)
+    yield
+    s3_io._clear_client_cache()
 
 
 @pytest.fixture(autouse=True)
