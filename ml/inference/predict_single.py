@@ -158,15 +158,17 @@ _all_rental_events_sorted: tuple | None = (
     None  # (station_id 배열, start_dt로 정렬된 배열, 같은 순서의 end_dt 배열) — 전체 정류소 통합, _rental_visible_batch_all_stations() 캐시
 )
 _rental_events_coverage: tuple[pd.Timestamp, pd.Timestamp] | None = None
-_STATION_PROFILE_STAT_COLS = ("rental_mean", "rental_std", "return_mean", "return_std")
+_STATION_PROFILE_STAT_COLS = ("rental_mean", "return_mean")
 _STATION_PROFILE_STAT_INDEX = {
     name: i for i, name in enumerate(_STATION_PROFILE_STAT_COLS)
 }
-# station_no -> station 축 인덱스, 그리고 (station, model minute//tick, dow,
-# month-1, stat) dense 배열 — dict[tuple, dict[str,float]] 대신 쓰는 이유는
-# _get_station_profile() 참고.
+# station_no -> station 축 인덱스, 그리고 실제로 읽은 (month, dow)별
+# (station, model minute//tick, stat) dense 배열. Authority run은 현재 시각과
+# 1시간 전의 달력 조합만 profile에서 읽으므로, 존재하지 않는 나머지 82개
+# month×dow 조합까지 큰 NaN 배열로 잡지 않는다. 실제 fallback에서 쓰지 않는
+# rental_std/return_std도 배열에 넣지 않는다.
 _station_profile_station_index: dict[int, int] | None = None
-_station_profile_values: np.ndarray | None = None
+_station_profile_values: dict[tuple[int, int], np.ndarray] | None = None
 _population_profile: dict[tuple[str, int, int], dict[str, float]] | None = None
 _station_master: pd.DataFrame | None = None
 _holidays_by_year: dict[int, set[str]] = {}
@@ -176,7 +178,9 @@ _raw_rental_trips: pd.DataFrame | None = (
 _recent_population_by_ts: dict[
     pd.Timestamp, pd.DataFrame
 ] = {}  # _get_recent_population() 캐시 — target_ts별로 한 번만 S3에서 읽는다
-_PINNED_STATION_PROFILE: ContextVar[tuple[dict[int, int], np.ndarray] | None] = (
+_PINNED_STATION_PROFILE: ContextVar[
+    tuple[dict[int, int], dict[tuple[int, int], np.ndarray]] | None
+] = (
     ContextVar(
         "inference_pinned_station_profile",
         default=None,
@@ -812,19 +816,19 @@ def _get_holidays(year: int) -> set[str]:
 
 def _build_station_profile_arrays(
     df: pd.DataFrame,
-) -> tuple[dict[int, int], np.ndarray]:
-    """station_hourly_profile 행들을 (station_no -> 축 인덱스) dict + dense numpy 배열로 압축한다.
+) -> tuple[dict[int, int], dict[tuple[int, int], np.ndarray]]:
+    """station profile을 station 인덱스와 달력별 작은 dense 배열로 압축한다.
 
     예전엔 (station_no, minute, dow, month) 튜플을 key로, {rental_mean, ...} dict를
     value로 갖는 파이썬 dict를 그대로 캐시했다 — 정류소 약 수천 개 x
     (1440/모델 tick) x 7요일 x 12개월 조합이라, dict-of-dict 하나당 파이썬 객체
     오버헤드(키 튜플 + 값 dict, 항목당 수백 바이트)만으로 프로세스당 수 GB를
     먹었다(리뷰 지적). minute/dow/month는 전부 값의 범위가 좁고 촘촘해서(tick
-    간격으로 나누면 촘촘한 인덱스, dow 7개, month 12개) 해시 테이블이 필요 없다 — station마다
-    dense numpy 배열 한 칸을 두면 항목당 파이썬 객체 오버헤드 없이 float32 4개만
-    쓴다(5분 grid는 약 1GB, 기본 20분 grid는 그 약 1/4). station_no만 정수값
-    자체가 넓게 흩어져 있어(정류소 자체는 수천 개뿐) 그것만 작은 dict로 따로
-    0-based 인덱스로 압축한다.
+    간격으로 나누면 촘촘한 인덱스) 해시 테이블이 필요 없다. 실제로 읽은
+    (month, dow) 조합마다 station×minute×평균 2개의 작은 배열만 만들면 항목당
+    파이썬 객체와 읽지 않은 달력 조합의 NaN 공간이 사라진다. station_no만 정수값
+    자체가 넓게 흩어져 있어(정류소 자체는 수천 개뿐) 작은 dict로 따로 0-based
+    인덱스로 압축한다.
 
     hour가 아니라 minute(자정 기준 경과분)으로 묶는 이유: rental_count/return_count
     자체가 60분짜리 미래 방향 롤링 합이라 인접한 모델 tick끼리 창이 많이 겹쳐
@@ -838,15 +842,17 @@ def _build_station_profile_arrays(
     1월 결측과 6월 결측이 똑같은 연간 평균으로 채워지는 문제가 생긴다.
 
     args:
-        df: station_no, minute, dow, month, rental_mean, rental_std, return_mean,
-            return_std 컬럼을 가진 프로필 행들 (build_station_profile.py 산출물과 같은 스키마).
+        df: station_no, minute, dow, month, rental_mean, return_mean 컬럼을 가진
+            프로필 행들. 원본 artifact의 표준편차는 서빙 fallback이 쓰지 않으므로
+            호출부가 읽지 않는다.
             minute은 GRID_TICK_MINUTES의 배수라고 가정한다(업스트림 grid 집계 결과이므로).
     returns:
-        (station_no -> station 축 인덱스 dict, shape (n_station, 1440//tick, 7, 12, 4) float32 배열)
+        (station_no -> station 축 인덱스, (month, dow)별
+        shape (n_station, 1440//tick, 2) float32 배열)
     raises:
         ValueError: profile key 차원 값이 범위를 벗어나거나 minute이 활성 모델
             grid에 맞지 않거나 logical key가 중복되어 dense 배열 한 칸을 여러
-            행이 덮어쓸 수 있을 때
+            행이 덮어쓸 수 있거나 통계값이 숫자가 아닐 때
     """
     logical_key = ["station_no", "minute", "dow", "month"]
     station_no_values = pd.to_numeric(df["station_no"], errors="coerce")
@@ -904,24 +910,46 @@ def _build_station_profile_arrays(
     station_index = {station_no: i for i, station_no in enumerate(station_nos)}
     n_minute_buckets = 1440 // config.GRID_TICK_MINUTES
 
-    values = np.full(
-        (len(station_nos), n_minute_buckets, 7, 12, len(_STATION_PROFILE_STAT_COLS)),
+    station_idx = station_no_values.map(station_index).to_numpy()
+    minute_idx = minute_values.to_numpy(dtype="int64") // config.GRID_TICK_MINUTES
+    dow_array = dow_values.to_numpy(dtype="int16")
+    month_array = month_values.to_numpy(dtype="int16")
+    stat_arrays = {
+        col: pd.to_numeric(df[col], errors="raise").to_numpy(dtype="float32")
+        for col in _STATION_PROFILE_STAT_COLS
+    }
+    calendar_codes = month_array * 7 + dow_array
+    unique_calendar_codes = np.unique(calendar_codes)
+    calendar_slot_by_code = np.full(91, -1, dtype="int16")
+    calendar_slot_by_code[unique_calendar_codes] = np.arange(
+        len(unique_calendar_codes), dtype="int16"
+    )
+    calendar_idx = calendar_slot_by_code[calendar_codes]
+    calendar_values = np.full(
+        (
+            len(unique_calendar_codes),
+            len(station_nos),
+            n_minute_buckets,
+            len(_STATION_PROFILE_STAT_COLS),
+        ),
         np.nan,
         dtype="float32",
     )
-    station_idx = station_no_values.map(station_index).to_numpy()
-    minute_idx = minute_values.to_numpy(dtype="int64") // config.GRID_TICK_MINUTES
-    dow_idx = dow_values.to_numpy(dtype="int64")
-    month_idx = month_values.to_numpy(dtype="int64") - 1
     for stat_idx, col in enumerate(_STATION_PROFILE_STAT_COLS):
-        values[station_idx, minute_idx, dow_idx, month_idx, stat_idx] = df[
+        calendar_values[calendar_idx, station_idx, minute_idx, stat_idx] = stat_arrays[
             col
-        ].to_numpy()
+        ]
+    values = {
+        (int(code) // 7, int(code) % 7): calendar_values[slot]
+        for slot, code in enumerate(unique_calendar_codes)
+    }
 
     return station_index, values
 
 
-def _get_station_profile() -> tuple[dict[int, int], np.ndarray]:
+def _get_station_profile() -> tuple[
+    dict[int, int], dict[tuple[int, int], np.ndarray]
+]:
     """station_hourly_profile.parquet을 station_no 인덱스 dict + dense 배열로 캐시해 반환한다.
 
     station_id(텍스트)가 아니라 station_no(정수)로 조회한다 — build_station_profile.py가
@@ -930,7 +958,8 @@ def _get_station_profile() -> tuple[dict[int, int], np.ndarray]:
     `_build_station_profile_arrays()` 참고.
 
     returns:
-        (station_no -> station 축 인덱스 dict, dense 배열) — `_profile_stat()` 참고
+        (station_no -> station 축 인덱스, (month, dow)별 dense 배열) —
+        `_profile_stat()` 참고
     """
     pinned = _PINNED_STATION_PROFILE.get()
     if pinned is not None:
@@ -938,7 +967,16 @@ def _get_station_profile() -> tuple[dict[int, int], np.ndarray]:
 
     global _station_profile_station_index, _station_profile_values
     if _station_profile_values is None:
-        df = s3_io.read_parquet(config.STATION_HOURLY_PROFILE_PARQUET)
+        df = s3_io.read_parquet(
+            config.STATION_HOURLY_PROFILE_PARQUET,
+            columns=[
+                "station_no",
+                "minute",
+                "dow",
+                "month",
+                *_STATION_PROFILE_STAT_COLS,
+            ],
+        )
         if df is None:
             raise FileNotFoundError(
                 f"S3에 없음: {config.STATION_HOURLY_PROFILE_PARQUET}"
@@ -963,22 +1001,23 @@ def _profile_stat(station_no: int, ts: pd.Timestamp, stat_key: str) -> float:
     args:
         station_no: 정류소 일련번호(station_master 크로스워크로 얻은 정수)
         ts: 조회할 시각 (minute_of_day/dayofweek/month를 사용 — month으로 계절성 반영)
-        stat_key: "rental_mean" / "rental_std" / "return_mean" / "return_std" 중 하나
+        stat_key: "rental_mean" / "return_mean" 중 하나
     returns:
         float: 직전 학습 anchor의 프로필 값. 해당 station 또는 조합의 프로필이
             없으면 NaN
     """
-    station_index, values = _get_station_profile()
+    station_index, values_by_calendar = _get_station_profile()
     row = station_index.get(station_no)
     if row is None:
+        return np.nan
+    values = values_by_calendar.get((ts.month, ts.dayofweek))
+    if values is None:
         return np.nan
     minute = minute_of_day(ts)
     profile_minute = minute - minute % config.TRAIN_ANCHOR_TICK_MINUTES
     return values[
         row,
         profile_minute // config.GRID_TICK_MINUTES,
-        ts.dayofweek,
-        ts.month - 1,
         _STATION_PROFILE_STAT_INDEX[stat_key],
     ]
 
@@ -1223,10 +1262,10 @@ def _get_recent_population(
     정답 라벨(피처마트)은 사후 보정 없는 실측 그대로여야 학습-서빙 간 값의 의미가
     갈리지 않는다.
 
-    `weather_ultra_short_live`/`bike_station_realtime`과 같은 5분 tick 소스라
-    `_get_recent_weather()`/`_get_recent_bike_status()`와 동일한 패턴을 쓴다 —
+    `weather_ultra_short_live`/`bike_station_realtime`과 같은 5분 tick 소스와 동일하게
     target_ts를 5분 단위로 내림한 키가 있으면 그걸, 없으면(직접 호출·수동 재실행
     또는 미래 예보 일부 누락) 거슬러 올라가 최대 1시간 안의 최근 값을 대신 쓴다.
+    조회는 최신 key 하나를 먼저 확인하고, 없으면 나머지 key를 병렬로 읽는다.
     운영 DAG의 현재 tick은 normalizer 성공이 필수라 이 조회가 task 실패를 우회하지
     않는다. 원본과 달리 시각이 이미 S3 키
     경로(dt=/hh=/HHMM)에 있어 파일 내용에 YMD/TT 컬럼이 없다 — 그래서 원본처럼
@@ -1253,7 +1292,15 @@ def _get_recent_population(
 
     keys = silver_schema.population_normalized_tick_keys(target_ts, lookback_hours)
     result = pd.DataFrame(columns=["pop_total"])
-    for df in reversed(s3_io.read_parquet_many(keys)):  # target_ts에 가장 가까운 것부터
+    # 정상 tick은 최신 key 하나만 읽는다. 최신 key가 비었을 때는 나머지를 병렬로
+    # 읽어 결측 구간의 S3 왕복이 직렬로 누적되지 않게 하면서 가장 최근 값을 고른다.
+    latest = s3_io.read_parquet(keys[-1])
+    candidates = (
+        [latest]
+        if latest is not None and not latest.empty
+        else reversed(s3_io.read_parquet_many(keys[:-1]))
+    )
+    for df in candidates:
         if df is not None and not df.empty:
             df = df.rename(columns=silver_schema.POPULATION_COLUMN_MAP)
             result = df.set_index("grid_id")[["pop_total"]]

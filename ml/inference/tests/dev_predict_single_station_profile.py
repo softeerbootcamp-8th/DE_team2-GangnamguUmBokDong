@@ -1,10 +1,10 @@
-"""_build_station_profile_arrays()/_profile_stat()의 dense 배열 기반 구현을 검증한다
+"""_build_station_profile_arrays()/_profile_stat()의 달력별 dense 배열을 검증한다.
 (PR 리뷰 지적 — 예전 dict[tuple, dict[str,float]] 캐시가 station x minute x dow x month
 전체 조합(수천 정류소 기준 약 1,800만 항목)을 그대로 담아 프로세스당 수 GB를 먹었다,
 predict_single.py의 `_build_station_profile_arrays()` 모듈 docstring 참고).
 
-이 테스트는 그 결과가 예전 dict 기반 구현과 정확히 같은 값을 돌려주는지(값 자체는
-바뀌면 안 됨 — 순수 내부 표현 교체이므로) 확인한다.
+이 테스트는 그 결과가 예전 전체 달력 dense 구현과 정확히 같은 값을 돌려주는지
+(값 자체는 바뀌면 안 됨 — 순수 내부 표현 교체이므로) 확인한다.
 """
 
 import numpy as np
@@ -44,9 +44,47 @@ def test_build_station_profile_arrays_round_trips_exact_values():
     ps._station_profile_station_index, ps._station_profile_values = ps._build_station_profile_arrays(df)
 
     assert ps._profile_stat(5, ts_a, "rental_mean") == pytest.approx(1.0)
-    assert ps._profile_stat(5, ts_a, "return_std") == pytest.approx(0.25)
+    assert ps._profile_stat(5, ts_a, "return_mean") == pytest.approx(2.0)
     assert ps._profile_stat(5, ts_b, "rental_mean") == pytest.approx(9.0)
     assert ps._profile_stat(9, ts_a, "return_mean") == pytest.approx(50.0)
+
+
+def test_get_station_profile_reads_only_columns_used_by_fallback(monkeypatch):
+    """서빙 fallback이 쓰지 않는 표준편차 컬럼은 Parquet에서 읽지 않는다."""
+    requested_columns = None
+    frame = _profile_df(
+        [
+            {
+                "station_no": 5,
+                "minute": 0,
+                "dow": 0,
+                "month": 1,
+                "rental_mean": 1.0,
+                "return_mean": 2.0,
+            }
+        ]
+    )
+
+    def _fake_read_parquet(key, columns=None):
+        """요청 컬럼을 기록하고 최소 profile을 반환한다."""
+        nonlocal requested_columns
+        requested_columns = columns
+        return frame
+
+    monkeypatch.setattr(ps.s3_io, "read_parquet", _fake_read_parquet)
+    ps._station_profile_station_index = None
+    ps._station_profile_values = None
+
+    ps._get_station_profile()
+
+    assert requested_columns == [
+        "station_no",
+        "minute",
+        "dow",
+        "month",
+        "rental_mean",
+        "return_mean",
+    ]
 
 
 def test_profile_stat_returns_nan_for_missing_combination():
@@ -265,6 +303,23 @@ def test_build_station_profile_arrays_rejects_duplicate_logical_key(monkeypatch)
         ps._build_station_profile_arrays(df)
 
 
+@pytest.mark.parametrize("column", ["rental_mean", "return_mean"])
+def test_build_station_profile_arrays_rejects_non_numeric_stat(column):
+    """비수치 profile 통계는 NaN으로 숨기지 않고 artifact 계약 오류로 실패한다."""
+    row = {
+        "station_no": 5,
+        "minute": 0,
+        "dow": 0,
+        "month": 1,
+        "rental_mean": 1.0,
+        "return_mean": 2.0,
+    }
+    row[column] = "broken"
+
+    with pytest.raises(ValueError):
+        ps._build_station_profile_arrays(_profile_df([row]))
+
+
 def test_build_station_profile_arrays_uses_compact_dense_shape_not_per_combo_dict():
     """station 축은 실제로 등장한 station_no 개수만큼만 잡아야 한다(예: 정류소가
     2개뿐인데 station_no 값 자체는 1과 9000처럼 멀리 떨어져 있어도 배열 크기가
@@ -279,5 +334,7 @@ def test_build_station_profile_arrays_uses_compact_dense_shape_not_per_combo_dic
     )
     station_index, values = ps._build_station_profile_arrays(df)
 
-    assert values.shape[0] == 2  # station_no 값 범위(1~9000)가 아니라 실제 등장 개수
+    assert set(values) == {(1, 0)}
+    assert values[(1, 0)].shape[0] == 2  # station_no 값 범위가 아니라 실제 등장 개수
+    assert values[(1, 0)].shape[-1] == 2  # 실제 fallback에 쓰는 mean 두 개만 보관
     assert set(station_index) == {1, 9000}
