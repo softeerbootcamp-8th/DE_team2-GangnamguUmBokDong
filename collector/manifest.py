@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from enum import Enum, IntEnum
 from typing import Annotated, Literal
 
@@ -184,6 +184,51 @@ def save(manifest: Manifest) -> None:
     storage.write_manifest(
         manifest.source_id, manifest.window_start, manifest.model_dump(mode="json")
     )
+
+
+def load_window_manifests(
+    source_id: str, day: date, hour: str | None = None
+) -> list[Manifest]:
+    """해당 KST 날짜(및 선택적으로 시)에 속한 manifest를 모두 읽어 모델로 변환한다."""
+
+    return [
+        Manifest.model_validate(d)
+        for d in storage.list_window_manifest_payloads(source_id, day, hour)
+    ]
+
+
+def summarize_window(manifests: list[Manifest]) -> dict:
+    """manifest 목록을 데이터 수집 모니터링 알림용 통계로 요약한다.
+
+    `status_counts`는 이미 quality gate(collector/pipeline.py)가 각 실행마다 내린
+    성공/실패 판정을 집계한 것이다. `missing_count`/`outlier_count`는 그 게이트가
+    보지 않는 `column_issues`(컬럼 값 단위 결측·이상치)를 합산한 것으로, quality
+    게이트의 `max_missing_ratio`(수집 자체의 fetch/페이지네이션 완결성 비율 —
+    이름은 비슷하지만 다른 개념이다)와는 무관하다.
+    """
+    status_counts: dict[str, int] = {}
+    missing = outlier = type_error = dropped = kept = 0
+    max_drop_ratio = 0.0
+    for m in manifests:
+        status_counts[m.status.value] = status_counts.get(m.status.value, 0) + 1
+        for issue in m.column_issues.values():
+            missing += issue.missing
+            outlier += issue.outlier
+            type_error += issue.type_error
+        dropped += m.counts.dropped
+        kept += m.counts.kept
+        if m.drop_ratio is not None:
+            max_drop_ratio = max(max_drop_ratio, m.drop_ratio)
+    return {
+        "run_count": len(manifests),
+        "status_counts": status_counts,
+        "missing_count": missing,
+        "outlier_count": outlier,
+        "type_error_count": type_error,
+        "dropped_count": dropped,
+        "kept_count": kept,
+        "max_drop_ratio": max_drop_ratio,
+    }
 
 
 def load_source_snapshots(

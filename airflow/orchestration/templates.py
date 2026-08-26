@@ -47,6 +47,27 @@ def kst_day_hour_replay_days_ago(days: int, hour: int) -> str:
     return "{{ " + f"{window_start}.isoformat()" + " }}"
 
 
+def kst_hours_ago_date(hours: int) -> str:
+    """공통 기준 시각에서 `hours`시간 전의 KST 날짜 템플릿을 반환한다.
+
+    `hourly_collection_alert` DAG가 "지난 1시간"의 manifest dt= partition을 고르는
+    데 쓴다 — `kst_window_start_shifted`와 같은 시각 기준을 공유하므로 별도 변환이
+    갈리지 않는다.
+    """
+    if hours <= 0:
+        raise ValueError(f"hours는 양수여야 한다: {hours}")
+    shifted = f"({_KST_WINDOW_TS} - macros.timedelta(hours={hours}))"
+    return "{{ " + f'{shifted}.strftime("%Y-%m-%d")' + " }}"
+
+
+def kst_hours_ago_hour(hours: int) -> str:
+    """공통 기준 시각에서 `hours`시간 전의 KST hh 템플릿을 반환한다. `kst_hours_ago_date` 참고."""
+    if hours <= 0:
+        raise ValueError(f"hours는 양수여야 한다: {hours}")
+    shifted = f"({_KST_WINDOW_TS} - macros.timedelta(hours={hours}))"
+    return "{{ " + f'{shifted}.strftime("%H")' + " }}"
+
+
 def kst_window_start_shifted(hours: int) -> str:
     """공통 기준 시각을 `hours`시간 앞으로 당긴 `--window-start` 템플릿.
 

@@ -19,6 +19,7 @@ from orchestration.collector_task import (
     build_population_collector_task,
     build_weather_freshness_gate_task,
 )
+from orchestration.collection_stats_task import build_window_stats_task
 from orchestration.gold_publisher_task import (
     GOLD_PUBLISHER_DIR,
     build_gold_publisher_task,
@@ -46,6 +47,8 @@ from orchestration.templates import (
     KST_WINDOW_START,
     kst_date_days_ago,
     kst_day_hour_replay_days_ago,
+    kst_hours_ago_date,
+    kst_hours_ago_hour,
     kst_window_start_shifted,
 )
 from orchestration.urgency_task import build_urgency_task
@@ -519,3 +522,85 @@ def test_daily_history_replay_task_contract(dag) -> None:
     assert "--force" in task.bash_command
     assert "macros.timedelta(days=6)" in task.bash_command
     assert "hour=23, minute=55" in task.bash_command
+
+
+def test_window_stats_task_reports_a_full_day_without_hour_flag(dag) -> None:
+    """day_template만 주면 --window-hour 없이 하루 전체를 요청한다."""
+    task = build_window_stats_task(
+        dag, "bike_station_realtime", day_template=kst_date_days_ago(1)
+    )
+
+    assert task.task_id == "collection_stats_bike_station_realtime"
+    assert task.cwd == COLLECTOR_DIR
+    assert "--report-window-stats" in task.bash_command
+    assert "--source bike_station_realtime" in task.bash_command
+    assert "--window-day" in task.bash_command
+    assert "--window-hour" not in task.bash_command
+    assert callable(task.output_processor)
+    assert task.output_processor('{"run_count": 0}') == {"run_count": 0}
+
+
+def test_window_stats_task_adds_hour_flag_when_given(dag) -> None:
+    """hour_template을 주면 --window-hour가 함께 붙는다."""
+    task = build_window_stats_task(
+        dag,
+        "weather_ultra_short_live",
+        day_template=kst_hours_ago_date(1),
+        hour_template=kst_hours_ago_hour(1),
+    )
+
+    assert "--window-day" in task.bash_command
+    assert "--window-hour" in task.bash_command
+
+
+def test_hours_ago_templates_render_one_hour_earlier() -> None:
+    """kst_hours_ago_date/hour가 기준 시각에서 정확히 N시간 전 날짜·시를 렌더링한다."""
+    kst = timezone(timedelta(hours=9))
+    context = {
+        "dag_run": type(
+            "R",
+            (),
+            {
+                "logical_date": datetime(2026, 8, 27, 8, 0, 0, tzinfo=kst),
+                "start_date": None,
+            },
+        )(),
+        "macros": macros,
+    }
+    environment = jinja2.Environment()
+
+    date_rendered = environment.from_string(kst_hours_ago_date(1)).render(context)
+    hour_rendered = environment.from_string(kst_hours_ago_hour(1)).render(context)
+
+    assert date_rendered == "2026-08-27"
+    assert hour_rendered == "07"
+
+
+def test_hours_ago_templates_cross_day_boundary() -> None:
+    """자정 직후 기준 시각이면 전날 23시로 넘어간다."""
+    kst = timezone(timedelta(hours=9))
+    context = {
+        "dag_run": type(
+            "R",
+            (),
+            {
+                "logical_date": datetime(2026, 8, 27, 0, 0, 0, tzinfo=kst),
+                "start_date": None,
+            },
+        )(),
+        "macros": macros,
+    }
+    environment = jinja2.Environment()
+
+    date_rendered = environment.from_string(kst_hours_ago_date(1)).render(context)
+    hour_rendered = environment.from_string(kst_hours_ago_hour(1)).render(context)
+
+    assert date_rendered == "2026-08-26"
+    assert hour_rendered == "23"
+
+
+def test_hours_ago_templates_reject_non_positive_hours() -> None:
+    with pytest.raises(ValueError):
+        kst_hours_ago_date(0)
+    with pytest.raises(ValueError):
+        kst_hours_ago_hour(0)

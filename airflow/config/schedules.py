@@ -63,6 +63,13 @@ MONTHLY_RETRAIN_CRON = "0 3 1 * *"
 # 결정한다 — 재학습 사이클 자체의 정상 소요 시간과는 무관하다.
 EMR_ORPHAN_REAPER_CRON = "*/15 * * * *"
 
+# 전날(00:00~24:00 KST) 전체 소스 수집 통계를 Slack에 보고한다. 새벽 배치(03:00대)가
+# 끝나 하루치 결과가 안정된 뒤인 07:00으로 잡는다.
+DAILY_COLLECTION_REPORT_CRON = "0 7 * * *"
+# 수집 주기가 1시간 이내인 소스만 매시 정각 지난 1시간 통계를 확인해 이상이 있을
+# 때만 Slack에 경고한다.
+HOURLY_COLLECTION_ALERT_CRON = "0 * * * *"
+
 DEFAULT_RETRIES = 2
 DEFAULT_RETRY_DELAY = timedelta(seconds=30)
 DEFAULT_EXECUTION_TIMEOUT = timedelta(seconds=240)
