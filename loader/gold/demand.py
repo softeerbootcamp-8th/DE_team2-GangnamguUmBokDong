@@ -924,7 +924,9 @@ def _reconcile_demand_records(
         """
     )
     if records:
-        cursor.executemany(
+        # Projection 계약과 staging PK가 중복 key를 차단해 단일 statement가 성립한다.
+        # C 정렬은 ON CONFLICT가 기존 row를 잠그는 순서를 locale과 무관하게 고정한다.
+        cursor.execute(
             """
             INSERT INTO gold_demand_staging (
                 base_dttm,
@@ -932,18 +934,34 @@ def _reconcile_demand_records(
                 predicted_dttm,
                 predicted_rent_cnt,
                 predicted_rtn_cnt
-            ) VALUES (%s, %s, %s, %s, %s)
+            )
+            SELECT incoming.base_dttm,
+                   incoming.sta_id,
+                   incoming.predicted_dttm,
+                   incoming.predicted_rent_cnt,
+                   incoming.predicted_rtn_cnt
+              FROM unnest(
+                       %s::TIMESTAMPTZ[],
+                       %s::TEXT[],
+                       %s::TIMESTAMPTZ[],
+                       %s::INTEGER[],
+                       %s::INTEGER[]
+                   ) AS incoming(
+                       base_dttm,
+                       sta_id,
+                       predicted_dttm,
+                       predicted_rent_cnt,
+                       predicted_rtn_cnt
+                   )
+             ORDER BY incoming.sta_id COLLATE "C", incoming.predicted_dttm
             """,
-            [
-                (
-                    record.base_dttm,
-                    record.sta_id,
-                    record.predicted_dttm,
-                    record.predicted_rent_cnt,
-                    record.predicted_rtn_cnt,
-                )
-                for record in records
-            ],
+            (
+                [record.base_dttm for record in records],
+                [record.sta_id for record in records],
+                [record.predicted_dttm for record in records],
+                [record.predicted_rent_cnt for record in records],
+                [record.predicted_rtn_cnt for record in records],
+            ),
         )
         cursor.execute(
             """

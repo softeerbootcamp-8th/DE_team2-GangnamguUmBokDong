@@ -12,10 +12,21 @@ lookback_hours) 넘게 미래면 그 구간에 관측 데이터가 원천적으�
 테스트에서 검증).
 """
 
+import json
+
 import numpy as np
 import pandas as pd
+import pytest
 
 from inference import predict_single as ps
+
+
+@pytest.fixture(autouse=True)
+def _clear_weather_caches():
+    """각 테스트가 독립된 inference run의 날씨 cache에서 시작하게 한다."""
+    ps._clear_runtime_caches()
+    yield
+    ps._clear_runtime_caches()
 
 
 def test_uses_observation_when_target_equals_anchor(monkeypatch):
@@ -137,7 +148,7 @@ def test_get_forecast_weather_picks_nearest_row_from_latest_issue_file(monkeypat
         )
         return [None] * (len(keys) - 1) + [latest]
 
-    monkeypatch.setattr(ps, "_read_authoritative_collector_many", _fake_read_many)
+    monkeypatch.setattr(ps, "_read_authoritative_collector_snapshots", _fake_read_many)
 
     result = ps._get_forecast_weather(target_ts)
 
@@ -159,7 +170,7 @@ def test_get_forecast_weather_averages_all_valid_grids_at_nearest_time(monkeypat
         )
         return [None] * (len(keys) - 1) + [latest]
 
-    monkeypatch.setattr(ps, "_read_authoritative_collector_many", _fake_read_many)
+    monkeypatch.setattr(ps, "_read_authoritative_collector_snapshots", _fake_read_many)
 
     result = ps._get_forecast_weather(target_ts)
 
@@ -170,7 +181,7 @@ def test_get_forecast_weather_returns_none_when_no_files_found(monkeypatch):
     target_ts = pd.Timestamp("2026-08-17 15:00:00")
     monkeypatch.setattr(
         ps,
-        "_read_authoritative_collector_many",
+        "_read_authoritative_collector_snapshots",
         lambda keys, columns=None: [None] * len(keys),
     )
 
@@ -186,7 +197,7 @@ def test_get_forecast_weather_returns_none_when_precip_unparseable(monkeypatch):
             _forecast_row("20260817", "1500", 24.0, None)
         ]
 
-    monkeypatch.setattr(ps, "_read_authoritative_collector_many", _fake_read_many)
+    monkeypatch.setattr(ps, "_read_authoritative_collector_snapshots", _fake_read_many)
 
     assert ps._get_forecast_weather(target_ts) is None
 
@@ -204,7 +215,7 @@ def test_get_forecast_weather_coerces_broken_timestamp_and_uses_valid_row(monkey
         )
         return [None] * (len(keys) - 1) + [latest]
 
-    monkeypatch.setattr(ps, "_read_authoritative_collector_many", _fake_read_many)
+    monkeypatch.setattr(ps, "_read_authoritative_collector_snapshots", _fake_read_many)
 
     assert ps._get_forecast_weather(target_ts) == {"temp": 24.0, "precip": 1.5}
 
@@ -217,7 +228,7 @@ def test_get_forecast_weather_rejects_row_too_far_from_target(monkeypatch):
         distant = _forecast_row("20260817", "1800", 22.0, "강수없음")
         return [None] * (len(keys) - 1) + [distant]
 
-    monkeypatch.setattr(ps, "_read_authoritative_collector_many", _fake_read_many)
+    monkeypatch.setattr(ps, "_read_authoritative_collector_snapshots", _fake_read_many)
 
     assert ps._get_forecast_weather(target_ts) is None
 
@@ -231,27 +242,172 @@ def test_get_recent_weather_skips_invalid_latest_tick(monkeypatch):
     """최신 tick이 NaN이면 그대로 반환하지 않고 이전의 유효한 관측으로 돌아간다."""
     target_ts = pd.Timestamp("2026-08-17 15:00:00")
 
-    def _fake_read_many(keys, columns=None):
-        values = [None] * len(keys)
-        values[-2] = _observed_row(23.0, 0.5)
-        values[-1] = _observed_row(np.nan, "broken")
-        return values
+    calls = []
 
-    monkeypatch.setattr(ps, "_read_authoritative_collector_many", _fake_read_many)
+    def _fake_read_many(keys, columns=None):
+        calls.append(keys)
+        if len(calls) == 1:
+            return [_observed_row(np.nan, "broken")]
+        return [None] * (len(keys) - 1) + [_observed_row(23.0, 0.5)]
+
+    monkeypatch.setattr(ps, "_read_authoritative_collector_snapshots", _fake_read_many)
 
     assert ps._get_recent_weather(target_ts) == {"temp": 23.0, "precip": 0.5}
+    assert [len(keys) for keys in calls] == [1, 36]
 
 
 def test_get_recent_weather_skips_out_of_range_latest_tick(monkeypatch):
     """Collector 계약 범위를 벗어난 최신 관측도 이전 정상 tick으로 대체한다."""
     target_ts = pd.Timestamp("2026-08-17 15:00:00")
 
-    def _fake_read_many(keys, columns=None):
-        values = [None] * len(keys)
-        values[-2] = _observed_row(23.0, 0.5)
-        values[-1] = _observed_row(999.0, -1.0)
-        return values
+    calls = []
 
-    monkeypatch.setattr(ps, "_read_authoritative_collector_many", _fake_read_many)
+    def _fake_read_many(keys, columns=None):
+        calls.append(keys)
+        if len(calls) == 1:
+            return [_observed_row(999.0, -1.0)]
+        return [None] * (len(keys) - 1) + [_observed_row(23.0, 0.5)]
+
+    monkeypatch.setattr(ps, "_read_authoritative_collector_snapshots", _fake_read_many)
 
     assert ps._get_recent_weather(target_ts) == {"temp": 23.0, "precip": 0.5}
+    assert [len(keys) for keys in calls] == [1, 36]
+
+
+def _selection_metadata(stderr: str) -> list[dict]:
+    """stderr의 source selection 구조화 로그만 JSON object로 파싱한다."""
+    prefix = "Source selection metadata: "
+    return [
+        json.loads(line.removeprefix(prefix))
+        for line in stderr.splitlines()
+        if line.startswith(prefix)
+    ]
+
+
+def test_recent_weather_fresh_metadata_and_happy_path(monkeypatch, capsys):
+    """Fresh 관측은 최신 한 건만 읽고 requested/selected를 같은 current로 남긴다."""
+    target_ts = pd.Timestamp("2026-08-17 15:00:00")
+    calls = []
+
+    def _fake_read_many(keys, columns=None):
+        calls.append(keys)
+        return [_observed_row(23.0, 0.5)]
+
+    monkeypatch.setattr(ps, "_read_authoritative_collector_snapshots", _fake_read_many)
+
+    assert ps._get_recent_weather(target_ts) == {"temp": 23.0, "precip": 0.5}
+
+    metadata = _selection_metadata(capsys.readouterr().err)
+    assert [len(keys) for keys in calls] == [1]
+    assert len(metadata) == 1
+    assert metadata[0]["status"] == "success"
+    assert metadata[0]["freshness"] == "current"
+    assert metadata[0]["requested_dttm"] == metadata[0]["selected_dttm"]
+
+
+def test_recent_weather_stale_metadata_and_parallel_cold_miss(monkeypatch, capsys):
+    """최신 miss는 나머지를 한 batch로 읽고 실제 fallback 시각을 stale로 남긴다."""
+    target_ts = pd.Timestamp("2026-08-17 15:00:00")
+    calls = []
+
+    def _fake_read_many(keys, columns=None):
+        calls.append(keys)
+        if len(calls) == 1:
+            return [None]
+        return [None] * (len(keys) - 1) + [_observed_row(22.0, 0.0)]
+
+    monkeypatch.setattr(ps, "_read_authoritative_collector_snapshots", _fake_read_many)
+
+    assert ps._get_recent_weather(target_ts) == {"temp": 22.0, "precip": 0.0}
+
+    metadata = _selection_metadata(capsys.readouterr().err)
+    assert [len(keys) for keys in calls] == [1, 36]
+    assert len(metadata) == 1
+    assert metadata[0]["status"] == "success"
+    assert metadata[0]["freshness"] == "stale"
+    assert metadata[0]["selected_dttm"] < metadata[0]["requested_dttm"]
+
+
+def test_recent_weather_full_miss_emits_one_failed_record(monkeypatch, capsys):
+    """전체 결측은 hybrid 조회 뒤 selected 없이 failed provenance 한 건만 남긴다."""
+    target_ts = pd.Timestamp("2026-08-17 15:00:00")
+    calls = []
+
+    def _fake_read_many(keys, columns=None):
+        calls.append(keys)
+        return [None] * len(keys)
+
+    monkeypatch.setattr(ps, "_read_authoritative_collector_snapshots", _fake_read_many)
+
+    with pytest.raises(ValueError, match="날씨 데이터가 없습니다"):
+        ps._get_recent_weather(target_ts)
+
+    metadata = _selection_metadata(capsys.readouterr().err)
+    assert [len(keys) for keys in calls] == [1, 36]
+    assert len(metadata) == 1
+    assert metadata[0]["status"] == "failed"
+    assert metadata[0]["resolution"] == "unavailable"
+    assert metadata[0]["selected_dttm"] is None
+
+
+def test_recent_weather_cache_hit_preserves_provenance(monkeypatch, capsys):
+    """같은 query의 result cache hit도 I/O 없이 selection metadata를 다시 남긴다."""
+    target_ts = pd.Timestamp("2026-08-17 15:00:00")
+    calls = []
+
+    def _fake_read_many(keys, columns=None):
+        calls.append(keys)
+        return [_observed_row(23.0, 0.5)]
+
+    monkeypatch.setattr(ps, "_read_authoritative_collector_snapshots", _fake_read_many)
+
+    first = ps._get_recent_weather(target_ts)
+    second = ps._get_recent_weather(target_ts)
+
+    metadata = _selection_metadata(capsys.readouterr().err)
+    assert first == second == {"temp": 23.0, "precip": 0.5}
+    assert [len(keys) for keys in calls] == [1]
+    assert len(metadata) == 2
+    assert metadata[0] == metadata[1]
+
+
+def test_recent_weather_reuses_same_anchor_result(monkeypatch):
+    """예보 실패가 horizon마다 반복돼도 같은 관측 fallback은 한 번만 읽는다."""
+    target_ts = pd.Timestamp("2026-08-17 15:00:00")
+    calls = []
+
+    def _fake_read_many(keys, columns=None):
+        calls.append(keys[0])
+        return [_observed_row(23.0, 0.5)]
+
+    monkeypatch.setattr(ps, "_read_authoritative_collector_snapshots", _fake_read_many)
+
+    first = ps._get_recent_weather(target_ts)
+    second = ps._get_recent_weather(target_ts)
+
+    assert first == second == {"temp": 23.0, "precip": 0.5}
+    assert len(calls) == 1
+
+
+def test_forecast_reuses_same_issue_snapshot_across_targets(monkeypatch):
+    """같은 발표본에 든 서로 다른 horizon은 source snapshot을 다시 읽지 않는다."""
+    snapshots = pd.concat(
+        [
+            _forecast_row("20260817", "1500", 24.0, "1.5mm"),
+            _forecast_row("20260817", "1600", 25.0, "강수없음"),
+        ]
+    )
+    calls = []
+
+    def _fake_read_many(keys, columns=None):
+        calls.append(keys[0])
+        return [snapshots]
+
+    monkeypatch.setattr(ps, "_read_authoritative_collector_snapshots", _fake_read_many)
+
+    at_15 = ps._get_forecast_weather(pd.Timestamp("2026-08-17 15:00:00"))
+    at_16 = ps._get_forecast_weather(pd.Timestamp("2026-08-17 16:00:00"))
+
+    assert at_15 == {"temp": 24.0, "precip": 1.5}
+    assert at_16 == {"temp": 25.0, "precip": 0.0}
+    assert len(calls) == 1
