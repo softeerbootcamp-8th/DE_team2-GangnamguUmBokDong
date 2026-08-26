@@ -20,6 +20,9 @@ from core.inference_snapshot import (
     INFERENCE_OUTPUT_ARROW_SCHEMA,
     INFERENCE_OUTPUT_COLUMN_NAMES,
     INFERENCE_SNAPSHOT_MANIFEST_SCHEMA_VERSION,
+    LEGACY_INFERENCE_OUTPUT_ARROW_SCHEMA,
+    LEGACY_INFERENCE_OUTPUT_COLUMN_NAMES,
+    LEGACY_INFERENCE_SNAPSHOT_MANIFEST_SCHEMA_VERSION,
     ImmutableInputRef,
     InferenceSnapshotContractError,
     InferenceSnapshotCounts,
@@ -579,10 +582,46 @@ def test_output_table_canonicalizes_exact_columns_and_round_trips() -> None:
     assert table.column("station_id").to_pylist()[:12] == ["ST-1"] * 12
     assert table.column("horizon").to_pylist()[:12] == list(range(1, 13))
     assert table.column("rental_pred_p10").to_pylist()[0] == -0.25
-    assert table.column("rental_pred_p50").to_pylist()[0] > table.column(
-        "rental_pred_p90"
-    ).to_pylist()[0]
+    assert (
+        table.column("rental_pred_p50").to_pylist()[0]
+        > table.column("rental_pred_p90").to_pylist()[0]
+    )
     assert parsed.equals(table, check_metadata=True)
+
+
+def test_v1_manifest_and_mean_only_output_remain_dual_readable() -> None:
+    """기존 v1 manifest와 7-column output을 mean-only authority로 읽는다."""
+    current = _succeeded()
+    legacy_payload = current.canonical_bytes.replace(
+        INFERENCE_SNAPSHOT_MANIFEST_SCHEMA_VERSION.encode(),
+        LEGACY_INFERENCE_SNAPSHOT_MANIFEST_SCHEMA_VERSION.encode(),
+    )
+    legacy_manifest = parse_inference_snapshot_manifest(legacy_payload)
+    expected_ids = build_id_set(("ST-1", "ST-2"))
+    current_table = canonicalize_inference_output_table(
+        _producer_output_frame(),
+        logical_dttm=LOGICAL_DTTM,
+        expected_sta_ids=expected_ids,
+    )
+    legacy_table = current_table.select(LEGACY_INFERENCE_OUTPUT_COLUMN_NAMES)
+    buffer = BytesIO()
+    pq.write_table(legacy_table, buffer)
+
+    parsed = parse_inference_output_parquet(
+        buffer.getvalue(),
+        logical_dttm=LOGICAL_DTTM,
+        expected_sta_ids=expected_ids,
+        schema_version=LEGACY_INFERENCE_SNAPSHOT_MANIFEST_SCHEMA_VERSION,
+    )
+
+    assert legacy_manifest.schema_version == (
+        LEGACY_INFERENCE_SNAPSHOT_MANIFEST_SCHEMA_VERSION
+    )
+    assert parsed.schema.equals(
+        LEGACY_INFERENCE_OUTPUT_ARROW_SCHEMA,
+        check_metadata=True,
+    )
+    assert tuple(parsed.column_names) == LEGACY_INFERENCE_OUTPUT_COLUMN_NAMES
 
 
 def test_output_table_uses_kst_target_across_date_boundary() -> None:
@@ -719,6 +758,10 @@ def test_schema_and_horizon_constants_are_disk_contract() -> None:
         == "ml-inference-snapshot-manifest-v2"
     )
     assert INFERENCE_HORIZON_COUNT == 12
+    assert (
+        LEGACY_INFERENCE_SNAPSHOT_MANIFEST_SCHEMA_VERSION
+        == "ml-inference-snapshot-manifest-v1"
+    )
     assert INFERENCE_OUTPUT_COLUMN_NAMES == (
         "station_id",
         "date",

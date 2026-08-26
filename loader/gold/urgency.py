@@ -419,9 +419,16 @@ def _complete_quantile_index(
     records: tuple[DemandPredictionRecord, ...],
     expected_sta_ids: tuple[str, ...],
 ) -> dict[tuple[str, int], DemandPredictionRecord]:
-    """Quantile strategy 입력을 expected station×12 완전 집합에 결합한다."""
+    """Quantile 입력에서 expected station×12만 골라 완전성을 검증한다."""
+    expected_station_set = set(expected_sta_ids)
     indexed: dict[tuple[str, int], DemandPredictionRecord] = {}
     for record in records:
+        if record.station_id not in expected_station_set:
+            continue
+        if record.rental_pred_p90 is None or record.return_pred_p10 is None:
+            raise ContractViolation(
+                "quantile-adverse는 v2 quantile inference가 필요합니다."
+            )
         key = (record.station_id, record.horizon)
         if key in indexed:
             raise ContractViolation("quantile 입력에 중복 station·horizon이 있습니다.")
@@ -438,6 +445,47 @@ def _complete_quantile_index(
     return indexed
 
 
+def _demand_horizon(record: DemandForecastRecord, base: datetime) -> int:
+    """Demand target 시각을 base 이후 exact 1..12 horizon으로 변환한다."""
+    delta_seconds = (record.predicted_dttm - base).total_seconds()
+    if delta_seconds % 3600 != 0:
+        raise ContractViolation(
+            "demand predicted_dttm은 exact 시간 horizon이어야 합니다."
+        )
+    horizon = int(delta_seconds // 3600)
+    if not 1 <= horizon <= 12:
+        raise ContractViolation("demand horizon은 정확히 1..12여야 합니다.")
+    return horizon
+
+
+def _demand_forecasts_by_station(
+    records: tuple[DemandForecastRecord, ...],
+    base: datetime,
+) -> dict[str, tuple[DemandForecastRecord, ...]]:
+    """Demand 행을 station별 exact horizon 1..12 순서로 결합한다."""
+    indexed: dict[str, dict[int, DemandForecastRecord]] = {}
+    for record in records:
+        horizon = _demand_horizon(record, base)
+        station = indexed.setdefault(record.sta_id, {})
+        if horizon in station:
+            raise ContractViolation("demand에 중복 station·horizon이 있습니다.")
+        station[horizon] = record
+    expected_horizons = set(range(1, 13))
+    incomplete = sorted(
+        station_id
+        for station_id, forecasts in indexed.items()
+        if set(forecasts) != expected_horizons
+    )
+    if incomplete:
+        raise ContractViolation(
+            f"urgency demand는 station별 horizon 1..12가 필요합니다: {incomplete}"
+        )
+    return {
+        station_id: tuple(forecasts[horizon] for horizon in range(1, 13))
+        for station_id, forecasts in indexed.items()
+    }
+
+
 def compute_urgency_projection(
     inputs: UrgencyCalculationInputs,
     *,
@@ -450,9 +498,7 @@ def compute_urgency_projection(
         raise ContractViolation("policy_config는 RebalancePolicyConfig여야 합니다.")
     active_by_id = {station.sta_id: station for station in inputs.active_stations}
     current_by_id = {record.sta_id: record for record in inputs.current_stock}
-    demand_by_id: dict[str, list[DemandForecastRecord]] = {}
-    for record in inputs.demand:
-        demand_by_id.setdefault(record.sta_id, []).append(record)
+    demand_by_id = _demand_forecasts_by_station(inputs.demand, inputs.base_dttm)
     demand_ids = tuple(sorted(demand_by_id, key=_utf8_key))
     expected = tuple(
         sorted(
@@ -466,10 +512,7 @@ def compute_urgency_projection(
             if point.sta_id in expected:
                 history_by_id.setdefault(point.sta_id, []).append(point)
     quantile_by_key: dict[tuple[str, int], DemandPredictionRecord] = {}
-    if (
-        policy_config.pickup_safety_strategy
-        == PICKUP_SAFETY_STRATEGY_QUANTILE_ADVERSE
-    ):
+    if policy_config.pickup_safety_strategy == PICKUP_SAFETY_STRATEGY_QUANTILE_ADVERSE:
         quantile_by_key = _complete_quantile_index(inputs.demand_quantiles, expected)
 
     computed: list[UrgencyRecord] = []
@@ -478,7 +521,8 @@ def compute_urgency_projection(
         current = current_by_id[station_id].parking_bike_tot_cnt
         forecasts = demand_by_id[station_id]
         raw_points = []
-        for horizon, record in enumerate(forecasts, start=1):
+        for record in forecasts:
+            horizon = _demand_horizon(record, inputs.base_dttm)
             raw = {
                 "predicted_rent_cnt": record.predicted_rent_cnt,
                 "predicted_return_cnt": record.predicted_rtn_cnt,
@@ -1631,10 +1675,13 @@ def _bike_qty_risk_band_v5(
         if recent_projection is None:
             return 0
         _recent_slope, recent_lower = recent_projection
+        pickup_horizon_hours = math.ceil(
+            (policy_config.protection_horizon_hours * 60 + RESPONSE_LAG_MIN) / 60
+        )
         model_lower = min(
             _pickup_model_lower_stock_path(
                 current,
-                horizon_points,
+                points[:pickup_horizon_hours],
                 policy_config,
             )
         )
@@ -1661,11 +1708,7 @@ def _recent_stock_projection_v3(
 ) -> tuple[float, float] | None:
     """최근 최소제곱 기울기와 보호 구간 하방 재고를 함께 반환한다."""
     recent = sorted(
-        (
-            row
-            for row in stock_history
-            if row["observed_at"] <= now
-        ),
+        (row for row in stock_history if row["observed_at"] <= now),
         key=lambda row: row["observed_at"],
     )
     if (
@@ -1736,15 +1779,23 @@ def _poisson_mean_pickup_stock_path(
 def _quantile_adverse_stock_path(
     current: int,
     points: list[dict[str, Any]],
-    _policy_config: RebalancePolicyConfig,
+    policy_config: RebalancePolicyConfig,
 ) -> tuple[float, ...]:
-    """Return q10과 rental q90을 조합한 componentwise adverse 경로를 만든다."""
+    """Quantile adverse와 poisson 하방 중 작은 재고 경로를 반환한다."""
     stock = float(current)
-    path = [stock]
+    quantile_path = [stock]
     for point in points:
         stock += float(point["return_pred_p10"]) - float(point["rental_pred_p90"])
-        path.append(stock)
-    return tuple(path)
+        quantile_path.append(stock)
+    poisson_path = _poisson_mean_pickup_stock_path(current, points, policy_config)
+    return tuple(
+        min(quantile_stock, poisson_stock)
+        for quantile_stock, poisson_stock in zip(
+            quantile_path,
+            poisson_path,
+            strict=True,
+        )
+    )
 
 
 def _urgency_score_v1(

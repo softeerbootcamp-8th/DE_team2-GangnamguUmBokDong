@@ -107,6 +107,18 @@ canonical config만 소비하며, 구버전 점수 또는 다른 정책 fingerpr
 거부한다. `rebalance_policy_config`에는 같은 pickup station을 plan 안에서 한 경로에만 쓰는
 exclusive 설정과 완료 후 재회수 cooldown을 포함한다.
 
+### v2 inference·urgency-v5 전환 규칙
+
+- 신규 inference producer는 `ml-inference-snapshot-manifest-v2`와 quantile 포함
+  13-column output만 게시한다.
+- Gold demand는 기존 `ml-inference-snapshot-manifest-v1`의 7-column output을
+  mean-only로 dual-read한다. 이때 quantile은 없는 값으로 유지하며
+  `poisson-mean`만 사용할 수 있다. `quantile-adverse`는 v1 lineage를 fail-closed한다.
+- 정상 realtime DAG는 같은 run의 새 urgency-v5 manifest를 route-v4에 직접 넘긴다.
+  이미 urgency-v1/v4가 끝난 과거 anchor를 route-v4로 재실행할 때는 route만 단독
+  재실행하지 않고, 같은 anchor의 urgency-v5를 먼저 다시 게시한 뒤 그 manifest로
+  route를 실행한다. 서로 다른 정책 fingerprint를 compatibility 명목으로 섞지 않는다.
+
 Pickup SLA provenance는 다음 네 parameter로 고정한다.
 
 - `pickup_dispatch_sla_config_version=pickup-dispatch-sla-v1`

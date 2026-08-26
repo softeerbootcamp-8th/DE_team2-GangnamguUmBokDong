@@ -26,6 +26,7 @@ from core.gold_publication import (
     validate_input_fingerprint,
 )
 from core.inference_snapshot import (
+    INFERENCE_SNAPSHOT_MANIFEST_SCHEMA_VERSION,
     InferenceSnapshotManifest,
     InferenceSnapshotStatus,
     ModelManifestRef,
@@ -124,13 +125,13 @@ class DemandPredictionRecord:
     horizon: int
     target_dttm: datetime
     rental_pred_mean: float
-    rental_pred_p10: float
-    rental_pred_p50: float
-    rental_pred_p90: float
+    rental_pred_p10: float | None
+    rental_pred_p50: float | None
+    rental_pred_p90: float | None
     return_pred_mean: float
-    return_pred_p10: float
-    return_pred_p50: float
-    return_pred_p90: float
+    return_pred_p10: float | None
+    return_pred_p50: float | None
+    return_pred_p90: float | None
 
     def __post_init__(self) -> None:
         """source의 base·horizon·구간 시작시각·float64 계약을 검증한다."""
@@ -152,14 +153,22 @@ class DemandPredictionRecord:
             )
         _prediction_mean(self.rental_pred_mean, "rental_pred_mean")
         _prediction_mean(self.return_pred_mean, "return_pred_mean")
-        for value, name in (
+        quantiles = (
             (self.rental_pred_p10, "rental_pred_p10"),
             (self.rental_pred_p50, "rental_pred_p50"),
             (self.rental_pred_p90, "rental_pred_p90"),
             (self.return_pred_p10, "return_pred_p10"),
             (self.return_pred_p50, "return_pred_p50"),
             (self.return_pred_p90, "return_pred_p90"),
-        ):
+        )
+        missing_count = sum(value is None for value, _name in quantiles)
+        if missing_count not in {0, len(quantiles)}:
+            raise ContractViolation(
+                "inference quantile은 전부 존재하거나 전부 없어야 합니다."
+            )
+        for value, name in quantiles:
+            if value is None:
+                continue
             _prediction_quantile(value, name)
 
 
@@ -539,15 +548,18 @@ def demand_predictions_from_inference_parquet(
     *,
     expected_base_dttm: datetime,
     expected_sta_ids: tuple[str, ...],
+    schema_version: str = INFERENCE_SNAPSHOT_MANIFEST_SCHEMA_VERSION,
 ) -> tuple[DemandPredictionRecord, ...]:
-    """Core exact authority Parquet을 Gold typed prediction으로 변환한다."""
+    """Core v1/v2 authority Parquet을 Gold typed prediction으로 변환한다."""
     base = _utc_dttm(expected_base_dttm, "inference expected base_dttm")
     expected = build_id_set(_station_id_set(expected_sta_ids, "inference expected"))
     table = parse_inference_output_parquet(
         payload,
         logical_dttm=base,
         expected_sta_ids=expected,
+        schema_version=schema_version,
     )
+    has_quantiles = "rental_pred_p10" in table.column_names
     return tuple(
         DemandPredictionRecord(
             base_dttm=base,
@@ -559,13 +571,13 @@ def demand_predictions_from_inference_parquet(
                 "inference target",
             ),
             rental_pred_mean=row["rental_pred_mean"],
-            rental_pred_p10=row["rental_pred_p10"],
-            rental_pred_p50=row["rental_pred_p50"],
-            rental_pred_p90=row["rental_pred_p90"],
+            rental_pred_p10=row["rental_pred_p10"] if has_quantiles else None,
+            rental_pred_p50=row["rental_pred_p50"] if has_quantiles else None,
+            rental_pred_p90=row["rental_pred_p90"] if has_quantiles else None,
             return_pred_mean=row["return_pred_mean"],
-            return_pred_p10=row["return_pred_p10"],
-            return_pred_p50=row["return_pred_p50"],
-            return_pred_p90=row["return_pred_p90"],
+            return_pred_p10=row["return_pred_p10"] if has_quantiles else None,
+            return_pred_p50=row["return_pred_p50"] if has_quantiles else None,
+            return_pred_p90=row["return_pred_p90"] if has_quantiles else None,
         )
         for row in table.to_pylist()
     )
@@ -732,6 +744,7 @@ def _build_inference_snapshot(
             output_payload,
             expected_base_dttm=manifest.logical_dttm,
             expected_sta_ids=expected_ids,
+            schema_version=manifest.schema_version,
         )
     if len(predictions) != manifest.counts.actual_row_count:
         raise ContractViolation(
@@ -818,9 +831,7 @@ def _projection_from_snapshot(
         expected_station_ids=expected_sta_ids,
     )
     if projection.expected_sta_ids != snapshot.expected_sta_ids:
-        raise ContractViolation(
-            "inference expected ID set이 plan expected와 다릅니다."
-        )
+        raise ContractViolation("inference expected ID set이 plan expected와 다릅니다.")
     return projection
 
 

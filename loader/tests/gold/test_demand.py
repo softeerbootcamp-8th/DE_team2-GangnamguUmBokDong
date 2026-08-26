@@ -9,6 +9,8 @@ import pyarrow as pa
 import pytest
 from core.gold_publication import ContractViolation, build_id_set
 from core.inference_snapshot import (
+    LEGACY_INFERENCE_OUTPUT_COLUMN_NAMES,
+    LEGACY_INFERENCE_SNAPSHOT_MANIFEST_SCHEMA_VERSION,
     canonicalize_inference_output_table,
     serialize_inference_output_parquet,
 )
@@ -157,6 +159,27 @@ def test_inference_authority_adapter_uses_core_exact_schema_and_utc_anchor() -> 
         return_pred_p90=3.0,
     )
     assert records[-1].target_dttm == BASE + timedelta(hours=11)
+
+
+def test_v1_inference_adapter_preserves_mean_and_marks_quantiles_missing() -> None:
+    """v1 7-column authority는 mean-only로 읽고 quantile 부재를 보존한다."""
+    current_payload = _inference_authority_payload()
+    current_table = read_parquet_bytes(current_payload)
+    legacy_payload = parquet_bytes(
+        current_table.select(LEGACY_INFERENCE_OUTPUT_COLUMN_NAMES)
+    )
+
+    records = demand_predictions_from_inference_parquet(
+        legacy_payload,
+        expected_base_dttm=BASE,
+        expected_sta_ids=("ST-1",),
+        schema_version=LEGACY_INFERENCE_SNAPSHOT_MANIFEST_SCHEMA_VERSION,
+    )
+
+    assert records[0].rental_pred_mean == 1.5
+    assert records[0].return_pred_mean == 2.5
+    assert records[0].rental_pred_p90 is None
+    assert records[0].return_pred_p10 is None
 
 
 def test_inference_authority_adapter_binds_expected_station_id_set() -> None:

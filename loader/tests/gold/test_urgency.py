@@ -23,7 +23,7 @@ from core.source_snapshot import (
     build_source_snapshot_manifest,
 )
 from gold.common import parquet_bytes
-from gold.demand import DemandForecastRecord
+from gold.demand import DemandForecastRecord, DemandPredictionRecord
 from gold.rebalance_policy import (
     PICKUP_SAFETY_STRATEGY_QUANTILE_ADVERSE,
     risk_band_policy,
@@ -40,6 +40,7 @@ from gold.urgency import (
     UrgencyRecord,
     _bike_qty_risk_band_v5,
     _bike_qty_v1,
+    _complete_quantile_index,
     _history_window_from_manifest,
     _pickup_model_lower_stock_path,
     _recent_stock_projection_v3,
@@ -362,6 +363,66 @@ def test_compute_projection_allows_new_station_absent_from_old_complete_windows(
     )
 
 
+def _quantile_predictions(
+    station_ids: tuple[str, ...],
+    *,
+    include_quantiles: bool = True,
+) -> tuple[DemandPredictionRecord, ...]:
+    """Quantile 결합 테스트용 station×12 prediction을 만든다."""
+    return tuple(
+        DemandPredictionRecord(
+            base_dttm=BASE,
+            station_id=station_id,
+            horizon=horizon,
+            target_dttm=BASE + timedelta(hours=horizon - 1),
+            rental_pred_mean=3.0,
+            rental_pred_p10=1.0 if include_quantiles else None,
+            rental_pred_p50=2.0 if include_quantiles else None,
+            rental_pred_p90=4.0 if include_quantiles else None,
+            return_pred_mean=1.0,
+            return_pred_p10=0.5 if include_quantiles else None,
+            return_pred_p50=1.0 if include_quantiles else None,
+            return_pred_p90=2.0 if include_quantiles else None,
+        )
+        for station_id in station_ids
+        for horizon in range(1, 13)
+    )
+
+
+def test_quantile_index_ignores_stations_outside_urgency_intersection() -> None:
+    """Stock 교집합 밖 lineage quantile은 expected 완전성을 깨지 않는다."""
+    indexed = _complete_quantile_index(
+        _quantile_predictions(("ST-1", "ST-2")),
+        ("ST-1",),
+    )
+
+    assert set(indexed) == {("ST-1", horizon) for horizon in range(1, 13)}
+
+
+def test_quantile_index_requires_v2_quantiles_for_expected_station() -> None:
+    """Mean-only v1 lineage는 quantile-adverse에서 fail-closed한다."""
+    with pytest.raises(ContractViolation, match="v2 quantile"):
+        _complete_quantile_index(
+            _quantile_predictions(("ST-1",), include_quantiles=False),
+            ("ST-1",),
+        )
+
+
+def test_compute_projection_joins_quantile_by_target_horizon() -> None:
+    """Demand tuple 순서와 무관하게 predicted_dttm horizon으로 계산한다."""
+    inputs = _calculation_inputs(history_station_ids=("ST-1",))
+    reordered = UrgencyCalculationInputs(
+        active_stations=inputs.active_stations,
+        history_offsets_minutes=inputs.history_offsets_minutes,
+        history_windows=inputs.history_windows,
+        current_stock=inputs.current_stock,
+        demand=tuple(reversed(inputs.demand)),
+        base_dttm=inputs.base_dttm,
+    )
+
+    assert compute_urgency_projection(reordered) == compute_urgency_projection(inputs)
+
+
 def test_calculation_inputs_fix_history_roles_to_oldest_first_offsets() -> None:
     """History role 하나라도 t-25..-5 순서를 바꾸면 계산 전에 거부한다."""
     inputs = _calculation_inputs(history_station_ids=("ST-1",))
@@ -470,6 +531,65 @@ def test_pickup_safety_strategies_share_stock_path_interface() -> None:
         20.0,
         17.0,
         16.0,
+    )
+
+
+def test_quantile_adverse_is_never_looser_than_poisson_lower_path() -> None:
+    """교차 quantile도 검증된 poisson 하방보다 큰 donor pickup을 만들지 않는다."""
+    points = [
+        {
+            "predicted_rent_cnt": 5,
+            "predicted_return_cnt": 0,
+            "rental_pred_p90": 0.5,
+            "return_pred_p10": 2.0,
+        }
+        for _ in range(2)
+    ]
+    poisson = risk_band_policy(
+        protection_horizon_hours=2,
+        minimum_stock_ratio=0.2,
+        uncertainty_z=1.645,
+    )
+    quantile = risk_band_policy(
+        protection_horizon_hours=2,
+        minimum_stock_ratio=0.2,
+        uncertainty_z=1.645,
+        pickup_safety_strategy=PICKUP_SAFETY_STRATEGY_QUANTILE_ADVERSE,
+    )
+
+    assert _pickup_model_lower_stock_path(
+        40, points, quantile
+    ) == _pickup_model_lower_stock_path(40, points, poisson)
+
+
+def test_pickup_model_horizon_covers_response_lag() -> None:
+    """Donor 모델 하방은 보호 2시간 뒤 30분 출동 지연까지 보수적으로 덮는다."""
+    points = enrich_forecast_points(
+        40,
+        30,
+        [
+            {"predicted_rent_cnt": 0, "predicted_return_cnt": 0},
+            {"predicted_rent_cnt": 0, "predicted_return_cnt": 0},
+            {"predicted_rent_cnt": 20, "predicted_return_cnt": 0},
+        ],
+    )
+    policy = risk_band_policy(
+        protection_horizon_hours=2,
+        minimum_stock_ratio=0.2,
+        uncertainty_z=1.645,
+    )
+
+    assert (
+        _bike_qty_risk_band_v5(
+            40,
+            30,
+            "retrieval_needed",
+            points,
+            _stock_history(40, 40, 40),
+            BASE,
+            policy,
+        )
+        == 0
     )
 
 
