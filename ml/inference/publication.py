@@ -1,9 +1,9 @@
 """Pinned serving release로 canonical inference authority를 게시한다.
 
 Mutable champion pointer나 ``predictions/...`` overwrite는 이 모듈의 authority가
-아니다. Serving-release pointer를 run 시작에 정확히 한 번 읽고, 계산이 실제로 읽은
-non-model S3 bytes와 7-column 결과를 content-addressed object로 고정한 뒤 immutable
-revision catalog를 claim하고 success/EMPTY manifest를 마지막에 기록한다.
+아니다. Serving plan이 pin한 exact release와 enriched station master를 읽고, 계산이
+실제로 읽은 non-model S3 bytes와 13-column 결과를 content-addressed object로 고정한
+뒤 immutable revision catalog를 claim하고 success/EMPTY manifest를 마지막에 기록한다.
 """
 
 from __future__ import annotations
@@ -20,6 +20,7 @@ from core import s3 as s3_io
 from core.gold_publication import (
     Dependency,
     IdSet,
+    InputArtifact,
     ImmutableObjectStore,
     ObjectMissingError,
     S3ImmutableObjectStore,
@@ -62,13 +63,10 @@ from core.model_snapshot import (
 from ml_core.scoring import build_pinned_scoring_model, use_pinned_scoring_models
 from ml_core.serving_contract import SERVING_FEATURE_PROFILE_KEYS
 from ml_core.serving_release import (
-    PinnedServingRelease,
-    ServingReleasePointerStore,
+    ExactServingRelease,
     VerifiedStationProfile,
+    load_exact_serving_release_for_inference,
     parse_effective_serving_contract,
-)
-from ml_core.serving_release import (
-    load_current_serving_release_for_inference as load_current_serving_release,
 )
 
 from . import config
@@ -77,7 +75,7 @@ from .predict_single import (
     predict_demand_multi_hour_all_stations,
 )
 
-INFERENCE_PRODUCER_VERSION = "gold-inference-producer-v1"
+INFERENCE_PRODUCER_VERSION = "gold-inference-producer-v2-quantiles"
 """Inference manifest에 기록하는 producer implementation version이다."""
 
 InferencePublicationError = InferenceCatalogError
@@ -113,13 +111,13 @@ def run_and_publish_inference(
     logical_dttm: datetime,
     station_dependency: Dependency,
     serving_plan: ServingPlanRef,
+    serving_release: ServingReleaseRef,
+    station_master_enriched: InputArtifact,
     expected_sta_ids: IdSet,
     expected_sta_ids_ref: IdSetArtifactRef | None = None,
     object_base_uri: str,
     producer_version: str = INFERENCE_PRODUCER_VERSION,
     object_store: ImmutableObjectStore | None = None,
-    pointer_store: ServingReleasePointerStore | None = None,
-    pointer_key: str | None = None,
     revision_catalog: InferenceRevisionCatalog | None = None,
 ) -> PublishedInferenceSnapshot:
     """Pinned model 쌍으로 station×12를 계산하고 immutable authority를 공개한다.
@@ -130,7 +128,9 @@ def run_and_publish_inference(
     failed station은 output/manifest를 쓰기 전에 실패한다. Model/release/profile
     bytes는 explicit manifest field라 generic ``inputs``에 중복하지 않고, 계산
     구간에서 ``core.s3``가 실제 반환한 non-model bytes만 stable
-    ``s3_input_<key-sha256>`` role로 고정한다.
+    ``s3_input_<key-sha256>`` role로 고정한다. Prepare가 pin한 enriched master는
+    source key·SHA로 exact-read한 뒤 명시적 ``station_master_enriched`` input role로
+    고정한다.
     """
     logical = _utc_dttm(logical_dttm)
     if type(station_dependency) is not Dependency:
@@ -145,6 +145,16 @@ def run_and_publish_inference(
         )
     if type(serving_plan) is not ServingPlanRef:
         raise TypeError("serving_plan은 exact ServingPlanRef여야 합니다.")
+    if type(serving_release) is not ServingReleaseRef:
+        raise TypeError("serving_release는 exact ServingReleaseRef여야 합니다.")
+    if type(station_master_enriched) is not InputArtifact:
+        raise TypeError(
+            "station_master_enriched는 exact InputArtifact여야 합니다."
+        )
+    if station_master_enriched.role != "station_master_enriched":
+        raise InferencePublicationError(
+            "station_master_enriched input role이 잘못됐습니다."
+        )
     if type(expected_sta_ids) is not IdSet:
         raise TypeError("expected_sta_ids는 exact IdSet이어야 합니다.")
     if (
@@ -184,13 +194,17 @@ def run_and_publish_inference(
         )
     initial_catalog = catalog.snapshot(logical)
 
-    # 이 함수 안에서 유일한 serving pointer read다. Returned preflight가 exact
-    # transitive payload를 보존하므로 이후 legacy champion pointer나 model key를
-    # 다시 읽지 않는다.
-    pinned = load_current_serving_release(
+    # Prepare가 plan에 고정한 exact release만 읽는다. Mutable current pointer는
+    # inference에서 다시 해석하지 않으므로 prepare 뒤 pointer 변경과 무관하다.
+    pinned = load_exact_serving_release_for_inference(
+        release_manifest_uri=serving_release.uri,
+        release_manifest_byte_sha256=serving_release.byte_sha256,
         object_store=immutable,
-        pointer_store=pointer_store,
-        pointer_key=pointer_key,
+    )
+    _validate_serving_release_ref(pinned, serving_release)
+    station_master_payload = immutable.read_bytes(
+        station_master_enriched.uri,
+        station_master_enriched.byte_sha256,
     )
     _validate_runtime_contract(pinned.preflight.effective_contract_payload)
     if logical.second != 0 or logical.microsecond != 0:
@@ -236,6 +250,7 @@ def run_and_publish_inference(
         with (
             authority_inference_run(
                 pinned.preflight.station_profile,
+                station_master_enriched_payload=station_master_payload,
                 logical_dttm=logical,
             ),
             use_pinned_scoring_models(pinned_models),
@@ -258,6 +273,20 @@ def run_and_publish_inference(
             raise InferencePublicationError(
                 "SUCCEEDED inference 계산이 실제로 읽은 non-model S3 input이 없습니다."
             )
+        inputs = tuple(
+            sorted(
+                (
+                    *inputs,
+                    _publish_pinned_input(
+                        station_master_enriched,
+                        station_master_payload,
+                        object_base_uri=object_base_uri,
+                        object_store=immutable,
+                    ),
+                ),
+                key=lambda ref: (ref.role.encode(), ref.uri.encode()),
+            )
+        )
         output_ref = _publish_output(
             table,
             logical_dttm=logical,
@@ -283,6 +312,7 @@ def run_and_publish_inference(
         logical_dttm=logical,
         producer_version=producer_version,
         pinned=pinned,
+        serving_release=serving_release,
         serving_plan=serving_plan,
         station_dependency=station_dependency,
         inputs=inputs,
@@ -297,7 +327,25 @@ def run_and_publish_inference(
     )
 
 
-def _validate_expected_support(pinned: PinnedServingRelease, expected: IdSet) -> IdSet:
+def _validate_serving_release_ref(
+    pinned: ExactServingRelease,
+    reference: ServingReleaseRef,
+) -> None:
+    """Plan release metadata와 exact-read manifest identity를 모두 비교한다."""
+    manifest = pinned.manifest
+    if (
+        pinned.manifest_uri != reference.uri
+        or manifest.sha256 != reference.byte_sha256
+        or manifest.release_version != reference.release_version
+        or manifest.effective_contract.version
+        != reference.effective_contract_version
+    ):
+        raise InferencePublicationError(
+            "serving plan release ref가 exact release manifest와 다릅니다."
+        )
+
+
+def _validate_expected_support(pinned: ExactServingRelease, expected: IdSet) -> IdSet:
     """Caller expected가 pinned rental/return support 교집합의 subset인지 검증한다."""
     rental = pinned.preflight.rental_snapshot.support_sta_ids
     returned = pinned.preflight.return_snapshot.support_sta_ids
@@ -333,7 +381,7 @@ def _validate_runtime_contract(payload: bytes) -> None:
         )
 
 
-def _required_station_nos(pinned: PinnedServingRelease) -> set[int]:
+def _required_station_nos(pinned: ExactServingRelease) -> set[int]:
     """두 pinned model category bytes에서 profile이 반드시 지원할 station_no를 얻는다."""
     rental = parse_station_categories(
         pinned.preflight.rental_snapshot.artifact_payload("station_categories")
@@ -429,7 +477,7 @@ def _complete_output_table(
     logical_dttm: datetime,
     expected_sta_ids: IdSet,
 ) -> pa.Table:
-    """Legacy batch result를 exact complete 7-column authority table로 바꾼다."""
+    """Legacy batch result를 exact complete 13-column authority table로 바꾼다."""
     if type(outcome) is not dict:
         raise InferencePublicationError("inference predictor 결과는 dict여야 합니다.")
     failed = outcome.get("failed")
@@ -459,7 +507,13 @@ def _complete_output_table(
                     "minute": result["minute"],
                     "horizon": result["horizon"],
                     "rental_pred_mean": result["rental"]["pred_mean"],
+                    "rental_pred_p10": result["rental"]["pred_p10"],
+                    "rental_pred_p50": result["rental"]["pred_p50"],
+                    "rental_pred_p90": result["rental"]["pred_p90"],
                     "return_pred_mean": result["return"]["pred_mean"],
+                    "return_pred_p10": result["return"]["pred_p10"],
+                    "return_pred_p50": result["return"]["pred_p50"],
+                    "return_pred_p90": result["return"]["pred_p90"],
                 }
             )
     except (KeyError, TypeError) as exc:
@@ -502,6 +556,33 @@ def _publish_captured_inputs(
     return tuple(sorted(refs, key=lambda ref: (ref.role.encode(), ref.uri.encode())))
 
 
+def _publish_pinned_input(
+    reference: InputArtifact,
+    payload: bytes,
+    *,
+    object_base_uri: str,
+    object_store: ImmutableObjectStore,
+) -> ImmutableInputRef:
+    """Plan이 pin한 input bytes를 inference content namespace에 보존한다."""
+    if sha256_hex(payload) != reference.byte_sha256:
+        raise InferencePublicationError(
+            f"{reference.role} actual bytes SHA가 plan ref와 다릅니다."
+        )
+    extension = _source_extension(reference.uri)
+    uri = _content_uri(
+        object_base_uri,
+        f"inference/inputs/{reference.role}",
+        reference.byte_sha256,
+        extension,
+    )
+    _put_once_and_readback(object_store, uri, payload)
+    return ImmutableInputRef(
+        byte_sha256=reference.byte_sha256,
+        role=reference.role,
+        uri=uri,
+    )
+
+
 def _publish_output(
     table: pa.Table,
     *,
@@ -532,7 +613,8 @@ def _publish_revisioned_manifest(
     *,
     logical_dttm: datetime,
     producer_version: str,
-    pinned: PinnedServingRelease,
+    pinned: ExactServingRelease,
+    serving_release: ServingReleaseRef,
     serving_plan: ServingPlanRef,
     station_dependency: Dependency,
     inputs: tuple[ImmutableInputRef, ...],
@@ -546,7 +628,10 @@ def _publish_revisioned_manifest(
     initial_catalog: InferenceCatalogSnapshot,
 ) -> PublishedInferenceSnapshot:
     """Exact replay 또는 next revision을 정하고 manifest-last로 공개한다."""
-    serving_ref, rental_ref, return_ref = _pinned_manifest_refs(pinned)
+    serving_ref, rental_ref, return_ref = _pinned_manifest_refs(
+        pinned,
+        serving_release,
+    )
     latest = initial_catalog.records[-1] if initial_catalog.records else None
     revision_no = 0 if latest is None else latest.revision_no
     same_revision_candidate = build_inference_snapshot_manifest(
@@ -659,16 +744,13 @@ def _publish_revisioned_manifest(
 
 
 def _pinned_manifest_refs(
-    pinned: PinnedServingRelease,
+    pinned: ExactServingRelease,
+    serving_release: ServingReleaseRef,
 ) -> tuple[ServingReleaseRef, ModelManifestRef, ModelManifestRef]:
     """Pinned ml_core release를 core inference manifest의 explicit refs로 바꾼다."""
     release = pinned.manifest
-    serving_ref = ServingReleaseRef(
-        byte_sha256=pinned.pointer.release_manifest_byte_sha256,
-        effective_contract_version=release.effective_contract.version,
-        release_version=release.release_version,
-        uri=pinned.pointer.release_manifest_uri,
-    )
+    _validate_serving_release_ref(pinned, serving_release)
+    serving_ref = serving_release
     rental_ref = build_model_manifest_ref(
         pinned.preflight.rental_snapshot.manifest,
         release.rental_model_manifest.uri,

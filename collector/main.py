@@ -39,19 +39,18 @@ import re
 import sys
 from datetime import datetime
 
+import adapters  # noqa: F401 (어댑터 레지스트리 로드용)
+import config.loader as config_loader
 import httpx
+import manifest as manifest_module
+import pipeline
 
 # pyrefly: ignore [missing-import]
 import pyarrow as pa
-from core.poi_master import PoiMasterRef, read_poi_master
-
-import adapters  # noqa: F401 (어댑터 레지스트리 로드용)
-import config.loader as config_loader
-import manifest as manifest_module
-import pipeline
 import storage
 from config.schema import SourceConfig
-from logging_setup import configure_logging
+from core.poi_master import PoiMasterRef, read_poi_master
+from logging_setup import configure_httpx_request_logging, configure_logging
 from manifest import RunStatus
 
 _OK_STATUSES = frozenset({RunStatus.SUCCEEDED, RunStatus.PARTIAL, RunStatus.EMPTY, RunStatus.SKIPPED})
@@ -313,6 +312,7 @@ def main(argv: list[str] | None = None) -> int:
 
     configure_logging(args.source, window_start, attempt=1)
     config = config_loader.load(args.source)
+    configure_httpx_request_logging(getattr(config, "adapter", ""))
     if args.poi_master_mode == "s3":
         ref = PoiMasterRef(
             mode="s3",

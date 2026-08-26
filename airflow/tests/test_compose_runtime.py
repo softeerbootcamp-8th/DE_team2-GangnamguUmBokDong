@@ -49,7 +49,7 @@ def test_local_and_production_use_same_airflow_concurrency_contract():
     expected = {
         "AIRFLOW__CORE__PARALLELISM": "${AIRFLOW__CORE__PARALLELISM:-3}",
         "AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG": (
-            "${AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG:-2}"
+            "${AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG:-3}"
         ),
     }
 
@@ -62,7 +62,7 @@ def test_local_and_production_use_same_airflow_concurrency_contract():
 
     env_example = _ENV_EXAMPLE_PATH.read_text(encoding="utf-8")
     assert "AIRFLOW__CORE__PARALLELISM=3" in env_example
-    assert "AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG=2" in env_example
+    assert "AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG=3" in env_example
 
 
 def test_local_airflow_starts_project_dags_paused_without_examples():

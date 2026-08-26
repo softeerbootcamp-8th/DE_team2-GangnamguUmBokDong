@@ -36,24 +36,55 @@ run_inference
 finalize_serving → urgency → routes
 ```
 
+책임 경계는 다음과 같다. Prepare는 Gold projection·station scope·final transaction에
+필요한 authority를 고정한다. Inference는 rental history·생활인구·모델용 horizon별
+weather를 포함한 실제 ML 입력 선택과 provenance authority를 담당한다. 두 단계가 함께
+사용하는 serving release와 `station_master_enriched`만 plan v3 exact identity로
+명시적으로 결합한다.
+
 날씨가 필요한 tick에서는 초단기실황·초단기예보·단기예보 collector가 같은 DAG의
 선행 task로 실행된다. 수집 실패 시에는 `ALL_DONE` gate를 지나 이전에 게시된 날씨로
 계속할 수 있지만, serving plan·정류소·대여이력·normalizer 의존성은 우회하지 않는다.
+
+### Prepare와 inference의 authority 경계
+
+두 task는 같은 입력 준비 작업을 앞뒤로 나눈 것이 아니라 서로 다른 authority를
+소유한다.
+
+| Task | 소유하는 authority | 소유하지 않는 것 |
+|---|---|---|
+| `prepare_serving_plan` | Gold station·stock·weather projection, expected station scope, 기존 Gold/RDS state와 final transaction 전제, 두 task가 공유하는 serving release·enriched master exact identity | rental history, horizon별 모델 날씨·생활인구·stockout source resolution |
+| `run_inference` | plan이 pin한 shared identity 소비, actual model-input 선택, 실제 읽은 non-model S3 bytes와 prediction provenance | Gold station·stock·weather projection과 RDS publication transaction |
+
+Prepare가 보존하는 rental·return support ID ref는 expected station scope를 계산하고
+inference model support와 대조하기 위한 것이다. Serving plan v3는 그 support ID를
+만든 exact serving release와 eligible station 계산에 쓴 enriched master identity도 함께
+pin한다. Inference는 pointer/latest를 다시 선택하지 않고 plan의 shared identity를
+검증·소비한 뒤, 자신이 선택한 rental history·날씨·생활인구 등 실제 model
+input을 immutable inference manifest에 기록한다.
 
 ## 2. Pinned serving release
 
 운영 실행은 mutable champion key를 채점 도중 다시 읽지 않는다.
 
 1. serving plan이 지정한 logical time과 expected station set을 읽는다.
-2. serving release pointer를 실행 시작에 한 번 읽는다.
+2. prepare가 plan에 기록한 exact serving-release manifest URI·SHA를 읽는다.
 3. release에 결합된 rental/return model snapshot, station categories, effective
    profile, station fallback profile을 실제 bytes와 checksum으로 검증한다.
 4. 두 모델과 fallback profile을 한 실행 동안 고정한다.
 5. 현재 `common_config`와 artifact의 serving feature 계약이 다르면 실패한다.
 
-이 구조는 실행 중 champion이 교체돼 대여·반납 모델 또는 category 순서가 서로 다른
-버전으로 섞이는 것을 막는다. 모델 feature 순서와 dtype의 단일 기준은
+Inference는 mutable current pointer를 다시 해석하지 않는다. 따라서 prepare 뒤
+champion pointer가 바뀌어도 해당 tick은 plan이 처음 pin한 release로 끝난다. 이 구조는
+대여·반납 모델 또는 category 순서가 서로 다른 버전으로 섞이는 것을 막는다. 모델
+feature 순서와 dtype의 단일 기준은
 `libs/ml_core/model_contract.py`다.
+
+Serving plan v3는 prepare가 eligible station 계산에 실제 사용한
+`station_master_enriched` key·SHA도 기록한다. Inference는 latest를 다시 탐색하지 않고
+그 exact Parquet을 feature의 capacity·좌표·grid 기준으로 사용한다. v2 plan은 이미
+생성된 inference의 finalize/replay에는 호환되지만, 새 inference 실행은 두 shared
+identity가 없으므로 fail-closed하고 같은 tick prepare 재실행을 요구한다.
 
 ## 3. 시간과 multi-horizon 계약
 
@@ -143,6 +174,9 @@ P10/P50/P90과 fallback 진단값은 직접 호출 결과에는 존재하지만 
 5. 기록한 manifest bytes를 다시 읽어 SHA-256과 구조를 검증한다.
 
 같은 logical time과 같은 bytes의 재실행은 새 revision을 만들지 않는 exact replay다.
+Rental history, authority weather, realtime처럼 worker thread에서 읽는 source도 caller의
+capture context를 전달해 authority manifest와 연결된 Parquet bytes를 빠짐없이 같은
+input 집합에 포함한다.
 계산 결과가 달라지면 기존 latest manifest가 완전한지 검증한 뒤 다음 revision을 만든다.
 manifest가 공개되기 전의 object는 authority가 아니므로 소비자는 catalog와 manifest만
 따라가야 한다.
@@ -150,7 +184,7 @@ manifest가 공개되기 전의 object는 authority가 아니므로 소비자는
 ## 7. 알려진 한계
 
 - 정류소 master는 current dimension이므로 과거 좌표·capacity를 시점별로 복원하지
-  못한다.
+  못한다. 다만 한 tick의 prepare→inference 사이에는 exact bytes가 고정된다.
 - fallback profile은 평소 패턴이라 돌발 수요를 반영하지 못한다.
 - 실시간 재고 결측 시 `stockout=False`는 대여 수요를 높게 만들 수 있다.
 - 학습 support에 없거나 current active set에 없는 정류소는 serving surface에서

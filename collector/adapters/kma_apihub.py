@@ -34,8 +34,10 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import math
 import os
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING
@@ -62,6 +64,8 @@ _EXPECTED_GRID_COUNT = 34
 # 같은 opt-in 관례). 단기예보(getVilageFcst)만 격자당 페이지 2장이 필요해 무거워서
 # concurrency를 켠다 — 실측(2026-08-23): 순차 50.89초 -> 4개씩 병렬로 크게 단축.
 _DEFAULT_CONCURRENCY = 1
+
+logger = logging.getLogger(__name__)
 
 
 def _api_key() -> str:
@@ -185,10 +189,32 @@ def _fetch_grid(
 
     while page_no <= total_pages:
         url = f"{base_url}&pageNo={page_no}"
+        started_at = time.monotonic()
         try:
             response = client.get(url)
-        except httpx.RequestError:
+        except httpx.RequestError as exc:
+            logger.info(
+                "stage=kma_http_request endpoint=%s grid=%03dx%03d page=%d "
+                "outcome=request_error error_type=%s elapsed_ms=%.1f",
+                endpoint,
+                nx,
+                ny,
+                page_no,
+                type(exc).__name__,
+                (time.monotonic() - started_at) * 1000,
+            )
             return _GridOutcome(payload=None, error=FetchErrorKind.TRANSIENT)
+
+        logger.info(
+            "stage=kma_http_request endpoint=%s grid=%03dx%03d page=%d "
+            "outcome=response status_code=%d elapsed_ms=%.1f",
+            endpoint,
+            nx,
+            ny,
+            page_no,
+            response.status_code,
+            (time.monotonic() - started_at) * 1000,
+        )
 
         category = classify_http_status(response.status_code)
         if category is not None:

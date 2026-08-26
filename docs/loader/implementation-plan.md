@@ -91,19 +91,32 @@ XCom에서 전체 payload가 아닌 manifest `uri`와 `byte_sha256`만 전달받
 
 ### 1. Prepare
 
-`serving_cli.py prepare --logical-dttm ...`는 다음 입력을 고정한 immutable serving plan을
-만든다.
+`serving_cli.py prepare --logical-dttm ...`는 Gold projection·서빙 범위·최종 transaction에
+필요한 다음 입력을 고정한 immutable serving plan을 만든다.
 
 - Exact realtime station snapshot
 - Lookback 안의 최신 station master
 - 최신 단기·초단기 forecast snapshot
-- 현재 rental/return model pair와 support ID set
-- 최신 enriched station master에서 계산한 inference 가능 station ID
+- prepare가 pin한 exact serving release와 rental/return support ID set
+- 최신 enriched station master에서 계산한 inference 가능 station ID와 exact key·SHA
 - 선택적 relocation approval URI·SHA 쌍
 - 기존 Gold station state와 realtime window set
 
 Master/realtime lookback은 각각 `GOLD_STATION_MASTER_LOOKBACK_HOURS`,
 `GOLD_STATION_REALTIME_LOOKBACK_HOURS`의 양의 정수 시간으로 받는다.
+
+Writer는 `gold-serving-plan-v3`를 사용해 serving release와 enriched master identity를
+기록한다. Inference는 current pointer나 enriched-master latest를 다시 선택하지 않는다.
+기존 v2 plan과 이미 생성된 inference manifest는 finalize/replay할 수 있지만, v2 plan으로
+새 inference를 시작하는 것은 fail-closed하며 같은 logical tick의 prepare 재실행이
+필요하다. Rental history·생활인구·모델용 weather 입력 선택은 계속 inference provenance
+authority의 책임이다.
+
+Prepare는 actual model-input 전체를 선택하는 plan이 아니다. Gold
+projection/scope/transaction authority로서 두 task가 공유하는 serving release와 enriched
+master의 exact identity만 고정한다. Inference는 rental history, horizon별
+모델 날씨·생활인구, stockout source를 실행 중 선택하고 실제 읽은 bytes를
+inference manifest에 기록하는 actual model-input selection/provenance authority다.
 
 ### 2. Finalize
 

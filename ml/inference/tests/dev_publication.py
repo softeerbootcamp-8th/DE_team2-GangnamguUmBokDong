@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import io
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
+from typing import Any
+from zoneinfo import ZoneInfo
 
 import boto3
+import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
@@ -16,6 +20,7 @@ from core import s3 as s3_io
 from core.gold_publication import (
     Dependency,
     ImmutablePutOutcome,
+    InputArtifact,
     ObjectChecksumMismatchError,
     ObjectCollisionError,
     ObjectMissingError,
@@ -24,7 +29,11 @@ from core.gold_publication import (
     parse_canonical_json,
     sha256_hex,
 )
-from core.inference_snapshot import ServingPlanRef, parse_inference_output_parquet
+from core.inference_snapshot import (
+    ServingPlanRef,
+    ServingReleaseRef,
+    parse_inference_output_parquet,
+)
 from core.model_snapshot import (
     MODEL_ARTIFACT_ROLES,
     IdSetArtifactRef,
@@ -32,6 +41,11 @@ from core.model_snapshot import (
     ModelKind,
     build_id_set_artifact_ref,
     build_model_snapshot_manifest,
+)
+from core.source_snapshot import (
+    SourceSnapshotCounts,
+    SourceSnapshotStatus,
+    build_source_snapshot_manifest,
 )
 from ml_core.serving_contract import SERVING_FEATURE_PROFILE_KEYS
 from ml_core.serving_release import validate_station_profile_payload
@@ -65,6 +79,11 @@ _STATION_PROFILE_COLUMNS = (
     "return_std",
     "n_samples",
 )
+_THREADED_SOURCE_IDS = (
+    "bike_rental_history",
+    "weather_short_term_forecast",
+    "bike_station_realtime",
+)
 
 
 class MemoryObjectStore:
@@ -83,6 +102,8 @@ class MemoryObjectStore:
     ) -> bytes:
         """Missing/checksum/canonical 검증 뒤 exact bytes를 반환한다."""
         if uri not in self.objects:
+            if uri == _station_master_ref().uri:
+                return _station_master_payload()
             raise ObjectMissingError(f"missing: {uri}")
         payload = self.objects[uri]
         if sha256_hex(payload) != expected_sha256:
@@ -312,11 +333,9 @@ def _pinned_release(
         sorted(set(rental_station_nos).union(return_station_nos))
     )
     return SimpleNamespace(
-        pointer=SimpleNamespace(
-            release_manifest_byte_sha256=release_sha,
-            release_manifest_uri=release_uri,
-        ),
+        manifest_uri=release_uri,
         manifest=SimpleNamespace(
+            sha256=release_sha,
             effective_contract=SimpleNamespace(version=contract_version),
             release_version=f"sha256:{'b' * 64}",
             rental_model_manifest=SimpleNamespace(uri=rental_manifest_uri),
@@ -329,6 +348,54 @@ def _pinned_release(
             station_profile=_verified_station_profile(station_nos),
         ),
     )
+
+
+def _serving_release_ref(pinned: object) -> ServingReleaseRef:
+    """Exact release fixture를 plan에 기록하는 core ref로 바꾼다."""
+    return ServingReleaseRef(
+        byte_sha256=pinned.manifest.sha256,
+        effective_contract_version=pinned.manifest.effective_contract.version,
+        release_version=pinned.manifest.release_version,
+        uri=pinned.manifest_uri,
+    )
+
+
+def _station_master_payload(*, capacity: int = 20) -> bytes:
+    """Pinned station master context가 읽을 최소 valid Parquet bytes를 만든다."""
+    table = pa.table(
+        {
+            "station_id": ["ST-1"],
+            "station_no": [1],
+            "capacity": [capacity],
+            "lat": [37.5],
+            "lon": [127.0],
+            "grid_id": ["61_126"],
+        }
+    )
+    sink = pa.BufferOutputStream()
+    pq.write_table(table, sink)
+    return sink.getvalue().to_pybytes()
+
+
+def _station_master_ref() -> InputArtifact:
+    """Prepare가 pin한 enriched master source identity를 반환한다."""
+    payload = _station_master_payload()
+    return InputArtifact(
+        byte_sha256=sha256_hex(payload),
+        role="station_master_enriched",
+        uri=(
+            "s3://fixture/silver/station_master_enriched/"
+            "dt=2026-08-20/hh=14/0055.parquet"
+        ),
+    )
+
+
+def _shared_identity_kwargs(pinned: object) -> dict[str, object]:
+    """Publication 호출에 필요한 두 shared exact identity를 반환한다."""
+    return {
+        "serving_release": _serving_release_ref(pinned),
+        "station_master_enriched": _station_master_ref(),
+    }
 
 
 def _dependency(logical: datetime = LOGICAL) -> Dependency:
@@ -353,6 +420,78 @@ def _serving_plan_ref(label: str = "plan-a") -> ServingPlanRef:
     )
 
 
+def _put_threaded_source_snapshot(
+    client: Any,
+    *,
+    bucket: str,
+    source_id: str,
+    logical: datetime,
+) -> tuple[str, str, str]:
+    """Threaded inference source의 authority manifest와 Parquet을 게시한다."""
+    sink = io.BytesIO()
+    pq.write_table(pa.Table.from_pylist([{"source_id": source_id}]), sink)
+    parquet_payload = sink.getvalue()
+    parquet_sha = sha256_hex(parquet_payload)
+    parquet_key = (
+        f"silver/{source_id}/dt={logical:%Y-%m-%d}/hh={logical:%H}/"
+        f"{logical:%H%M}/sha256={parquet_sha}.parquet"
+    )
+    manifest = build_source_snapshot_manifest(
+        source_id=source_id,
+        logical_dttm=logical,
+        revision_no=0,
+        status=SourceSnapshotStatus.SUCCEEDED,
+        config_version="threaded-capture-fixture-v1",
+        silver_uri=f"s3://{bucket}/{parquet_key}",
+        silver_byte_sha256=parquet_sha,
+        counts=SourceSnapshotCounts(1, 1, 1, 0, 0),
+        planned_parts=("page=1",),
+        completed_parts=("page=1",),
+    )
+    utc = logical.astimezone(UTC)
+    manifest_key = (
+        f"source_snapshot_manifest/{source_id}/dt={utc:%Y-%m-%d}/hh={utc:%H}/"
+        f"logical={utc:%Y%m%dT%H%M%S}{utc.microsecond:06d}Z/"
+        "revision=0000000000.json"
+    )
+    client.put_object(Bucket=bucket, Key=parquet_key, Body=parquet_payload)
+    client.put_object(
+        Bucket=bucket,
+        Key=manifest_key,
+        Body=manifest.canonical_bytes,
+    )
+    logical_key = (
+        f"silver/{source_id}/dt={logical:%Y-%m-%d}/hh={logical:%H}/"
+        f"{logical:%H%M}.parquet"
+    )
+    return logical_key, manifest_key, parquet_key
+
+
+@pytest.fixture
+def _threaded_source_keys(monkeypatch):
+    """세 inference authority source와 예상 capture key 집합을 제공한다."""
+    bucket = "threaded-source-capture-fixture"
+    logical = LOGICAL.astimezone(ZoneInfo("Asia/Seoul"))
+    with mock_aws():
+        client = boto3.client("s3", region_name="us-east-1")
+        client.create_bucket(Bucket=bucket)
+        monkeypatch.setenv("S3_BUCKET", bucket)
+        monkeypatch.setattr(s3_io, "_client", lambda _timeout=None: client)
+        refs = tuple(
+            _put_threaded_source_snapshot(
+                client,
+                bucket=bucket,
+                source_id=source_id,
+                logical=logical,
+            )
+            for source_id in _THREADED_SOURCE_IDS
+        )
+        yield (
+            tuple(item[0] for item in refs),
+            frozenset(key for item in refs for key in item[1:]),
+        )
+
+
 def _predictor_state() -> tuple[dict[str, object], object]:
     """Captured source bytes와 prediction 값을 바꿀 수 있는 complete predictor를 만든다."""
     state: dict[str, object] = {"payload": b"silver-a", "prediction": 1.25}
@@ -373,8 +512,18 @@ def _predictor_state() -> tuple[dict[str, object], object]:
                         "hour": target.hour,
                         "minute": target.minute,
                         "horizon": horizon,
-                        "rental": {"pred_mean": state["prediction"]},
-                        "return": {"pred_mean": state["prediction"]},
+                        "rental": {
+                            "pred_mean": state["prediction"],
+                            "pred_p10": 0.5,
+                            "pred_p50": 1.0,
+                            "pred_p90": 1.5,
+                        },
+                        "return": {
+                            "pred_mean": state["prediction"],
+                            "pred_p10": 0.25,
+                            "pred_p50": 0.75,
+                            "pred_p90": 1.25,
+                        },
                     }
                 )
         count = len(kwargs["station_ids"]) * 12
@@ -413,8 +562,68 @@ def _install_release_loader(monkeypatch, pinned: object) -> list[dict[str, objec
         calls.append(kwargs)
         return pinned
 
-    monkeypatch.setattr(pub, "load_current_serving_release", _load)
+    monkeypatch.setattr(pub, "load_exact_serving_release_for_inference", _load)
     return calls
+
+
+def test_threaded_authority_reads_capture_every_manifest_and_parquet(
+    _threaded_source_keys,
+):
+    """Worker가 읽은 rental·weather·realtime exact bytes를 모두 capture한다."""
+    logical_keys, expected_captured_keys = _threaded_source_keys
+    baseline_frames = ps._read_authoritative_collector_many(list(logical_keys))
+
+    with s3_io.capture_object_reads() as capture:
+        frames = ps._read_authoritative_collector_many(list(logical_keys))
+
+    for baseline, captured in zip(baseline_frames, frames, strict=True):
+        assert baseline is not None
+        assert captured is not None
+        pd.testing.assert_frame_equal(baseline, captured)
+    assert [frame.iloc[0]["source_id"] for frame in frames if frame is not None] == list(
+        _THREADED_SOURCE_IDS
+    )
+    assert frozenset(item.key for item in capture.objects) == expected_captured_keys
+    assert len(capture.objects) == len(_THREADED_SOURCE_IDS) * 2
+
+
+def test_threaded_authority_inputs_are_preserved_in_inference_manifest(
+    monkeypatch,
+    _pinned_scoring_stubs,
+    _threaded_source_keys,
+):
+    """실제 threaded source GET 집합을 inference manifest input과 exact 대조한다."""
+    logical_keys, expected_captured_keys = _threaded_source_keys
+    pinned = _pinned_release()
+    _install_release_loader(monkeypatch, pinned)
+    _state, complete_predictor = _predictor_state()
+
+    def _predictor(**kwargs):
+        """세 authority source를 읽은 뒤 완전한 station×12 결과를 반환한다."""
+        frames = ps._read_authoritative_collector_many(list(logical_keys))
+        assert all(frame is not None for frame in frames)
+        return complete_predictor(**kwargs)
+
+    _install_predictor(monkeypatch, _predictor)
+    result = pub.run_and_publish_inference(
+        logical_dttm=LOGICAL,
+        station_dependency=_dependency(),
+        serving_plan=_serving_plan_ref(),
+        expected_sta_ids=build_id_set(["ST-1"]),
+        object_base_uri=OBJECT_BASE_URI,
+        object_store=MemoryObjectStore(),
+        revision_catalog=pub.InMemoryInferenceRevisionCatalog(),
+        **_shared_identity_kwargs(pinned),
+    )
+
+    expected_input_keys = expected_captured_keys | {"silver/source.parquet"}
+    expected_roles = {
+        f"s3_input_{sha256_hex(key.encode('utf-8'))}" for key in expected_input_keys
+    }
+    assert {reference.role for reference in result.manifest.inputs} == (
+        expected_roles | {"station_master_enriched"}
+    )
+    assert len(result.manifest.inputs) == len(expected_input_keys) + 1
 
 
 def test_success_exact_replay_and_correction_are_revisioned_manifest_last(
@@ -436,6 +645,7 @@ def test_success_exact_replay_and_correction_are_revisioned_manifest_last(
         "object_base_uri": OBJECT_BASE_URI,
         "object_store": store,
         "revision_catalog": catalog,
+        **_shared_identity_kwargs(pinned),
     }
 
     first = pub.run_and_publish_inference(**kwargs)
@@ -443,7 +653,7 @@ def test_success_exact_replay_and_correction_are_revisioned_manifest_last(
     state.update(payload=b"silver-b", prediction=2.5)
     corrected = pub.run_and_publish_inference(**kwargs)
 
-    assert len(calls) == 3  # run마다 pointer를 정확히 한 번 pin한다.
+    assert len(calls) == 3  # run마다 plan의 exact release를 한 번 연다.
     assert first.status is pub.InferenceRunStatus.PUBLISHED
     assert replay.status is pub.InferenceRunStatus.REPLAYED
     assert replay.manifest_uri == first.manifest_uri
@@ -452,6 +662,17 @@ def test_success_exact_replay_and_correction_are_revisioned_manifest_last(
     assert corrected.manifest.revision_no == 1
     assert corrected.manifest_uri != first.manifest_uri
     assert corrected.manifest.output.row_count == 12
+    enriched_inputs = tuple(
+        item
+        for item in corrected.manifest.inputs
+        if item.role == "station_master_enriched"
+    )
+    assert len(enriched_inputs) == 1
+    assert enriched_inputs[0].byte_sha256 == _station_master_ref().byte_sha256
+    assert calls[0]["release_manifest_uri"] == _serving_release_ref(pinned).uri
+    assert calls[0]["release_manifest_byte_sha256"] == (
+        _serving_release_ref(pinned).byte_sha256
+    )
     assert corrected.manifest.inputs[0].role == (
         f"s3_input_{sha256_hex(b'silver/source.parquet')}"
     )
@@ -478,7 +699,8 @@ def test_serving_plan_correction_forces_new_inference_revision(
     _pinned_scoring_stubs,
 ):
     """같은 anchor/expected라도 exact serving plan identity가 바뀌면 replay하지 않는다."""
-    _install_release_loader(monkeypatch, _pinned_release())
+    pinned = _pinned_release()
+    _install_release_loader(monkeypatch, pinned)
     _state, predictor = _predictor_state()
     _install_predictor(monkeypatch, predictor)
     store = MemoryObjectStore()
@@ -490,6 +712,7 @@ def test_serving_plan_correction_forces_new_inference_revision(
         "object_base_uri": OBJECT_BASE_URI,
         "object_store": store,
         "revision_catalog": catalog,
+        **_shared_identity_kwargs(_pinned_release()),
     }
 
     first = pub.run_and_publish_inference(
@@ -511,7 +734,8 @@ def test_partial_failure_writes_no_output_manifest_or_catalog_record(
     _pinned_scoring_stubs,
 ):
     """Station 하나라도 failed면 authority object와 revision claim을 만들지 않는다."""
-    _install_release_loader(monkeypatch, _pinned_release())
+    pinned = _pinned_release()
+    _install_release_loader(monkeypatch, pinned)
     store = MemoryObjectStore()
     catalog = pub.InMemoryInferenceRevisionCatalog()
 
@@ -535,6 +759,7 @@ def test_partial_failure_writes_no_output_manifest_or_catalog_record(
             object_base_uri=OBJECT_BASE_URI,
             object_store=store,
             revision_catalog=catalog,
+            **_shared_identity_kwargs(pinned),
         )
 
     assert not any("/outputs/" in uri or "/manifests/" in uri for uri in store.objects)
@@ -545,7 +770,8 @@ def test_input_drift_fails_before_authority_manifest(
     monkeypatch, _pinned_scoring_stubs
 ):
     """같은 mutable source key의 두 번째 GET bytes가 달라지면 run을 중단한다."""
-    _install_release_loader(monkeypatch, _pinned_release())
+    pinned = _pinned_release()
+    _install_release_loader(monkeypatch, pinned)
     store = MemoryObjectStore()
     catalog = pub.InMemoryInferenceRevisionCatalog()
 
@@ -564,6 +790,7 @@ def test_input_drift_fails_before_authority_manifest(
             object_base_uri=OBJECT_BASE_URI,
             object_store=store,
             revision_catalog=catalog,
+            **_shared_identity_kwargs(pinned),
         )
 
     assert not any("/manifests/" in uri for uri in store.objects)
@@ -598,6 +825,7 @@ def test_disjoint_model_support_publishes_true_empty_without_predictor(
         object_base_uri=OBJECT_BASE_URI,
         object_store=store,
         revision_catalog=catalog,
+        **_shared_identity_kwargs(pinned),
     )
 
     assert result.manifest.status.value == "empty"
@@ -608,7 +836,8 @@ def test_disjoint_model_support_publishes_true_empty_without_predictor(
 
 def test_support_mismatch_fails_before_predictor(monkeypatch, _pinned_scoring_stubs):
     """Caller expected에 pinned support 교집합 밖 ID가 있으면 fail-closed한다."""
-    _install_release_loader(monkeypatch, _pinned_release())
+    pinned = _pinned_release()
+    _install_release_loader(monkeypatch, pinned)
     with pytest.raises(pub.InferencePublicationError, match="support 밖"):
         pub.run_and_publish_inference(
             logical_dttm=LOGICAL,
@@ -618,6 +847,7 @@ def test_support_mismatch_fails_before_predictor(monkeypatch, _pinned_scoring_st
             object_base_uri=OBJECT_BASE_URI,
             object_store=MemoryObjectStore(),
             revision_catalog=pub.InMemoryInferenceRevisionCatalog(),
+            **_shared_identity_kwargs(pinned),
         )
 
 
@@ -644,6 +874,7 @@ def test_active_expected_subset_of_model_support_publishes_exact_subset(
         object_base_uri=OBJECT_BASE_URI,
         object_store=MemoryObjectStore(),
         revision_catalog=pub.InMemoryInferenceRevisionCatalog(),
+        **_shared_identity_kwargs(pinned),
     )
 
     assert result.manifest.counts.expected_station_count == 1
@@ -658,7 +889,8 @@ def test_runtime_contract_mismatch_fails_before_profile_or_scoring(
     contract = _runtime_contract()
     contract["GRID_TICK_MINUTES"] = 10
     contract["ROLLING_TICK_MINUTES"] = 10
-    _install_release_loader(monkeypatch, _pinned_release(contract=contract))
+    pinned = _pinned_release(contract=contract)
+    _install_release_loader(monkeypatch, pinned)
     store = MemoryObjectStore()
 
     with pytest.raises(pub.InferencePublicationError, match="runtime config"):
@@ -670,6 +902,7 @@ def test_runtime_contract_mismatch_fails_before_profile_or_scoring(
             object_base_uri=OBJECT_BASE_URI,
             object_store=store,
             revision_catalog=pub.InMemoryInferenceRevisionCatalog(),
+            **_shared_identity_kwargs(pinned),
         )
     assert not any("/manifests/" in uri for uri in store.objects)
 
@@ -697,6 +930,7 @@ def test_station_profile_must_cover_both_model_category_sets(
             object_base_uri=OBJECT_BASE_URI,
             object_store=MemoryObjectStore(),
             revision_catalog=pub.InMemoryInferenceRevisionCatalog(),
+            **_shared_identity_kwargs(pinned),
         )
 
 
@@ -717,7 +951,8 @@ def test_cross_logical_out_of_order_publish_keeps_catalog_latest_max(
             ),
         )
     )
-    _install_release_loader(monkeypatch, _pinned_release())
+    pinned = _pinned_release()
+    _install_release_loader(monkeypatch, pinned)
     _state, predictor = _predictor_state()
     _install_predictor(monkeypatch, predictor)
 
@@ -729,6 +964,7 @@ def test_cross_logical_out_of_order_publish_keeps_catalog_latest_max(
         object_base_uri=OBJECT_BASE_URI,
         object_store=MemoryObjectStore(),
         revision_catalog=catalog,
+        **_shared_identity_kwargs(pinned),
     )
 
     snapshot = catalog.snapshot(LOGICAL)
@@ -742,7 +978,8 @@ def test_catalog_change_during_compute_is_concurrent_writer_conflict(
     _pinned_scoring_stubs,
 ):
     """계산 시작 snapshot 이후 catalog가 바뀌면 manifest write 전에 중단한다."""
-    _install_release_loader(monkeypatch, _pinned_release())
+    pinned = _pinned_release()
+    _install_release_loader(monkeypatch, pinned)
     state, predictor = _predictor_state()
     del state
     _install_predictor(monkeypatch, predictor)
@@ -781,6 +1018,7 @@ def test_catalog_change_during_compute_is_concurrent_writer_conflict(
             object_base_uri=OBJECT_BASE_URI,
             object_store=store,
             revision_catalog=catalog,
+            **_shared_identity_kwargs(pinned),
         )
     assert not any("/manifests/" in uri for uri in store.objects)
 
@@ -790,7 +1028,8 @@ def test_same_logical_claim_race_is_fail_closed(
     _pinned_scoring_stubs,
 ):
     """Final snapshot 뒤 같은 revision slot을 선점한 writer가 있으면 manifest를 쓰지 않는다."""
-    _install_release_loader(monkeypatch, _pinned_release())
+    pinned = _pinned_release()
+    _install_release_loader(monkeypatch, pinned)
     _state, predictor = _predictor_state()
     _install_predictor(monkeypatch, predictor)
     store = MemoryObjectStore()
@@ -817,6 +1056,7 @@ def test_same_logical_claim_race_is_fail_closed(
             object_base_uri=OBJECT_BASE_URI,
             object_store=store,
             revision_catalog=_ClaimRaceCatalog(),
+            **_shared_identity_kwargs(pinned),
         )
 
     assert not any("/manifests/" in uri for uri in store.objects)
@@ -832,6 +1072,7 @@ def test_custom_object_store_requires_matching_revision_catalog():
             expected_sta_ids=build_id_set(["ST-1"]),
             object_base_uri=OBJECT_BASE_URI,
             object_store=MemoryObjectStore(),
+            **_shared_identity_kwargs(_pinned_release()),
         )
 
 
@@ -876,7 +1117,8 @@ def test_output_collision_or_readback_failure_never_claims_manifest(
     failure,
 ):
     """Output put/readback이 완전하지 않으면 catalog와 authority manifest를 건드리지 않는다."""
-    _install_release_loader(monkeypatch, _pinned_release())
+    pinned = _pinned_release()
+    _install_release_loader(monkeypatch, pinned)
     _state, predictor = _predictor_state()
     _install_predictor(monkeypatch, predictor)
     store = RejectingObjectStore(
@@ -894,6 +1136,7 @@ def test_output_collision_or_readback_failure_never_claims_manifest(
             object_base_uri=OBJECT_BASE_URI,
             object_store=store,
             revision_catalog=catalog,
+            **_shared_identity_kwargs(pinned),
         )
 
     assert catalog.snapshot(LOGICAL).records == ()
@@ -905,7 +1148,8 @@ def test_manifest_collision_leaves_no_authority_bytes_and_retryable_reservation(
     _pinned_scoring_stubs,
 ):
     """Catalog claim 뒤 manifest put collision은 기존 bytes를 덮지 않고 slot만 남긴다."""
-    _install_release_loader(monkeypatch, _pinned_release())
+    pinned = _pinned_release()
+    _install_release_loader(monkeypatch, pinned)
     _state, predictor = _predictor_state()
     _install_predictor(monkeypatch, predictor)
     store = RejectingObjectStore(reject_put="/inference/manifests/")
@@ -920,6 +1164,7 @@ def test_manifest_collision_leaves_no_authority_bytes_and_retryable_reservation(
             object_base_uri=OBJECT_BASE_URI,
             object_store=store,
             revision_catalog=catalog,
+            **_shared_identity_kwargs(pinned),
         )
 
     assert len(catalog.snapshot(LOGICAL).records) == 1
@@ -931,12 +1176,40 @@ def test_authority_context_uses_pinned_profile_instead_of_legacy_global_cache():
     ps._station_profile_station_index = {999: 0}
     ps._station_profile_values = pa.array([999.0]).to_numpy()
 
-    with ps.authority_inference_run(_verified_station_profile((1,))):
+    with ps.authority_inference_run(
+        _verified_station_profile((1,)),
+        station_master_enriched_payload=_station_master_payload(),
+    ):
         station_index, values = ps._get_station_profile()
 
     assert station_index == {1: 0}
-    assert values.shape[0] == 1
+    assert set(values) == {(1, 0)}
+    assert values[(1, 0)].shape[0] == 1
     assert ps._station_profile_values is None
+
+
+def test_authority_context_uses_pinned_master_when_latest_changes(monkeypatch) -> None:
+    """Prepare 뒤 latest master가 바뀌어도 plan payload의 값을 계속 사용한다."""
+    monkeypatch.setattr(
+        s3_io,
+        "list_keys",
+        lambda _prefix: (_ for _ in ()).throw(AssertionError("latest LIST forbidden")),
+    )
+    old_payload = _station_master_payload(capacity=20)
+    _new_latest_payload = _station_master_payload(capacity=99)
+    assert sha256_hex(old_payload) != sha256_hex(_new_latest_payload)
+
+    with ps.authority_inference_run(
+        _verified_station_profile((1,)),
+        station_master_enriched_payload=old_payload,
+    ):
+        master = ps._get_station_master()
+
+    assert int(master.loc["ST-1", "capacity"]) == 20
+    expected = ps._station_master_from_raw(
+        pq.read_table(pa.BufferReader(old_payload)).to_pandas()
+    )
+    pd.testing.assert_frame_equal(master, expected)
 
 
 def test_authority_context_rejects_concurrent_legacy_prediction_run():
@@ -955,7 +1228,10 @@ def test_authority_context_rejects_concurrent_legacy_prediction_run():
     try:
         with (
             pytest.raises(RuntimeError, match="다른 prediction run"),
-            ps.authority_inference_run(_verified_station_profile((1,))),
+            ps.authority_inference_run(
+                _verified_station_profile((1,)),
+                station_master_enriched_payload=_station_master_payload(),
+            ),
         ):
             pass
     finally:

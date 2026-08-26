@@ -91,15 +91,16 @@ import json
 import re
 import sys
 import threading
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from contextvars import ContextVar
+from contextvars import Context, ContextVar, copy_context
 from datetime import datetime
 from functools import wraps
 
 import numpy as np
 import pandas as pd
+import pyarrow as pa
 from core import s3 as s3_io
 from core.source_snapshot_io import (
     PartialConsumptionPolicy,
@@ -158,15 +159,17 @@ _all_rental_events_sorted: tuple | None = (
     None  # (station_id 배열, start_dt로 정렬된 배열, 같은 순서의 end_dt 배열) — 전체 정류소 통합, _rental_visible_batch_all_stations() 캐시
 )
 _rental_events_coverage: tuple[pd.Timestamp, pd.Timestamp] | None = None
-_STATION_PROFILE_STAT_COLS = ("rental_mean", "rental_std", "return_mean", "return_std")
+_STATION_PROFILE_STAT_COLS = ("rental_mean", "return_mean")
 _STATION_PROFILE_STAT_INDEX = {
     name: i for i, name in enumerate(_STATION_PROFILE_STAT_COLS)
 }
-# station_no -> station 축 인덱스, 그리고 (station, model minute//tick, dow,
-# month-1, stat) dense 배열 — dict[tuple, dict[str,float]] 대신 쓰는 이유는
-# _get_station_profile() 참고.
+# station_no -> station 축 인덱스, 그리고 실제로 읽은 (month, dow)별
+# (station, model minute//tick, stat) dense 배열. Authority run은 현재 시각과
+# 1시간 전의 달력 조합만 profile에서 읽으므로, 존재하지 않는 나머지 82개
+# month×dow 조합까지 큰 NaN 배열로 잡지 않는다. 실제 fallback에서 쓰지 않는
+# rental_std/return_std도 배열에 넣지 않는다.
 _station_profile_station_index: dict[int, int] | None = None
-_station_profile_values: np.ndarray | None = None
+_station_profile_values: dict[tuple[int, int], np.ndarray] | None = None
 _population_profile: dict[tuple[str, int, int], dict[str, float]] | None = None
 _station_master: pd.DataFrame | None = None
 _holidays_by_year: dict[int, set[str]] = {}
@@ -176,11 +179,24 @@ _raw_rental_trips: pd.DataFrame | None = (
 _recent_population_by_ts: dict[
     pd.Timestamp, pd.DataFrame
 ] = {}  # _get_recent_population() 캐시 — target_ts별로 한 번만 S3에서 읽는다
-_PINNED_STATION_PROFILE: ContextVar[tuple[dict[int, int], np.ndarray] | None] = (
+_weather_snapshot_by_key: dict[str, pd.DataFrame | None] = {}
+_recent_weather_by_query: dict[
+    tuple[pd.Timestamp, float], tuple[dict[str, float], str]
+] = {}
+_forecast_weather_by_query: dict[
+    tuple[pd.Timestamp, float], tuple[dict[str, float] | None, str | None]
+] = {}
+_PINNED_STATION_PROFILE: ContextVar[
+    tuple[dict[int, int], dict[tuple[int, int], np.ndarray]] | None
+] = (
     ContextVar(
         "inference_pinned_station_profile",
         default=None,
     )
+)
+_PINNED_STATION_MASTER: ContextVar[pd.DataFrame | None] = ContextVar(
+    "inference_pinned_station_master",
+    default=None,
 )
 _PREDICTION_RUN_LOCK = threading.RLock()
 
@@ -229,15 +245,19 @@ def _clear_runtime_caches() -> None:
     _holidays_by_year.clear()
     _raw_rental_trips = None
     _recent_population_by_ts.clear()
+    _weather_snapshot_by_key.clear()
+    _recent_weather_by_query.clear()
+    _forecast_weather_by_query.clear()
 
 
 @contextmanager
 def authority_inference_run(
     station_profile: VerifiedStationProfile,
     *,
+    station_master_enriched_payload: bytes,
     logical_dttm: datetime | None = None,
 ) -> Iterator[None]:
-    """Pinned station profile을 쓰는 격리된 authority 계산 cache 경계를 연다.
+    """Pinned profile·station master를 쓰는 authority 계산 경계를 연다.
 
     Legacy 단일/모니터링 API는 기존 process cache를 유지한다. Publication만 이
     경계를 사용해 이전 호출의 mutable-source cache를 재사용하지 않고 release가
@@ -252,11 +272,20 @@ def authority_inference_run(
             f"pinned={station_profile.grid_tick_minutes}, "
             f"runtime={config.GRID_TICK_MINUTES}"
         )
+    if type(station_master_enriched_payload) is not bytes:
+        raise TypeError("station_master_enriched_payload는 exact bytes여야 합니다.")
+    try:
+        station_master = _station_master_from_raw(
+            pd.read_parquet(io.BytesIO(station_master_enriched_payload))
+        )
+    except (OSError, ValueError, pa.ArrowException) as exc:
+        raise ValueError("pinned station_master_enriched를 읽을 수 없습니다.") from exc
     if not _PREDICTION_RUN_LOCK.acquire(blocking=False):
         raise RuntimeError(
             "같은 process에서 다른 prediction run과 authority run을 동시에 실행할 수 없습니다."
         )
     token = None
+    station_master_token = None
     try:
         filters = None
         if logical_dttm is not None:
@@ -315,23 +344,31 @@ def authority_inference_run(
             )
         _clear_runtime_caches()
         token = _PINNED_STATION_PROFILE.set(pinned_profile)
+        station_master_token = _PINNED_STATION_MASTER.set(station_master)
         yield
     finally:
         _clear_runtime_caches()
+        if station_master_token is not None:
+            _PINNED_STATION_MASTER.reset(station_master_token)
         if token is not None:
             _PINNED_STATION_PROFILE.reset(token)
         _PREDICTION_RUN_LOCK.release()
 
 
-def _read_authoritative_collector_many(
+def _read_authoritative_collector_snapshots(
     logical_keys: list[str],
     columns: list[str] | None = None,
 ) -> list[pd.DataFrame | None]:
-    """옛 logical Silver key 목록을 authority manifest 기반 snapshot으로 해석한다.
+    """logical Silver key 목록을 authority snapshot으로 읽고 metadata는 남기지 않는다.
 
     ``silver_schema``의 key builder는 저장 객체의 실제 위치가 아니라 source와 KST
     logical window를 결정적으로 표현하는 주소로만 쓴다. 실제 bytes는 Collector가
     발행한 최신 correction manifest가 가리키는 content-addressed Parquet에서 읽는다.
+
+    호출자가 실제로 선택한 snapshot을 알기 전에는 provenance를 확정할 수 없다.
+    따라서 이 저수준 함수는 I/O만 담당하고, 일반 호출부는
+    ``_read_authoritative_collector_many()``가, 유효성 fallback이 있는 날씨 호출부는
+    최종 선택 뒤 ``_emit_source_selection_metadata()``가 metadata를 한 번 남긴다.
     """
 
     def _read(logical_key: str) -> pd.DataFrame | None:
@@ -360,16 +397,47 @@ def _read_authoritative_collector_many(
 
     if not logical_keys:
         return []
+
+    # ContextVar는 worker thread로 자동 전파되지 않는다. Inference publication의
+    # S3 read capture를 각 source authority 조회에 전달하되, Context 객체 자체는
+    # 동시에 재진입할 수 없으므로 작업마다 독립 copy를 만든다.
+    contexts = [copy_context() for _ in logical_keys]
+
+    def _read_in_context(item: tuple[Context, str]) -> pd.DataFrame | None:
+        """복사한 caller context 안에서 source snapshot 하나를 읽는다."""
+        context, logical_key = item
+        return context.run(_read, logical_key)
+
     with ThreadPoolExecutor(max_workers=min(16, len(logical_keys))) as pool:
-        snapshots = list(pool.map(_read, logical_keys))
-    _emit_source_selection_metadata(logical_keys, snapshots)
+        return list(
+            pool.map(_read_in_context, zip(contexts, logical_keys, strict=True))
+        )
+
+
+def _read_authoritative_collector_many(
+    logical_keys: list[str],
+    columns: list[str] | None = None,
+) -> list[pd.DataFrame | None]:
+    """authority snapshot들을 병렬로 읽고 기존 query 단위 metadata를 남긴다."""
+    snapshots = _read_authoritative_collector_snapshots(logical_keys, columns)
+    selected_index = next(
+        (
+            index
+            for index in range(len(snapshots) - 1, -1, -1)
+            if snapshots[index] is not None
+        ),
+        None,
+    )
+    _emit_source_selection_metadata(logical_keys, selected_index)
     return snapshots
 
 
 def _emit_source_selection_metadata(
-    logical_keys: list[str], snapshots: list[pd.DataFrame | None]
+    logical_keys: list[str], selected_index: int | None
 ) -> None:
-    """이미 읽은 결과에서 공통 metadata를 계산해 구조화 로그로 남긴다."""
+    """요청 범위와 실제 선택 index에서 공통 metadata를 구조화 로그로 남긴다."""
+    if not logical_keys:
+        return
     parsed: list[tuple[str, datetime]] = []
     for key in logical_keys:
         match = _COLLECTOR_LOGICAL_KEY.fullmatch(key)
@@ -379,10 +447,6 @@ def _emit_source_selection_metadata(
         ).tz_localize("Asia/Seoul")
         parsed.append((match.group("source"), logical.to_pydatetime()))
     source_id, requested = parsed[-1]
-    selected_index = next(
-        (index for index in range(len(snapshots) - 1, -1, -1) if snapshots[index] is not None),
-        None,
-    )
     if selected_index is None:
         metadata = SourceSelectionMetadata(
             source_id=source_id,
@@ -394,6 +458,8 @@ def _emit_source_selection_metadata(
             selected_dttm=None,
         )
     else:
+        if not 0 <= selected_index < len(parsed):
+            raise IndexError("selected_index가 logical key 범위를 벗어났습니다.")
         selected_source, selected = parsed[selected_index]
         assert selected_source == source_id
         metadata = SourceSelectionMetadata(
@@ -401,7 +467,7 @@ def _emit_source_selection_metadata(
             status=SourceDataStatus.SUCCESS,
             freshness=(
                 SourceFreshness.CURRENT
-                if selected_index == len(snapshots) - 1
+                if selected_index == len(logical_keys) - 1
                 else SourceFreshness.STALE
             ),
             partial_policy=PartialConsumptionPolicy.REJECT,
@@ -729,7 +795,7 @@ def _rental_visible_batch_all_stations(
 
 
 def _get_station_master() -> pd.DataFrame:
-    """최신 Silver 보강 정류소 마스터를 station_id 인덱스로 캐시해 반환한다.
+    """Pinned 또는 legacy latest 보강 정류소 마스터를 캐시해 반환한다.
 
     feature_engine도 같은 보강 Silver의 최신 snapshot을 1차정제 산출물로 만들지만,
     inference는 그 중간 산출물 대신 Silver를 직접 읽어 정류소 신설/폐쇄를 즉시
@@ -739,6 +805,9 @@ def _get_station_master() -> pd.DataFrame:
         pd.DataFrame: station_id로 인덱싱된 정류소 마스터 (station_no, capacity, lat, lon, grid_id)
     """
     global _station_master
+    pinned = _PINNED_STATION_MASTER.get()
+    if pinned is not None:
+        return pinned
     if _station_master is None:
         keys = [
             key
@@ -753,23 +822,27 @@ def _get_station_master() -> pd.DataFrame:
         raw = s3_io.read_parquet(latest_key)
         if raw is None:
             raise FileNotFoundError(f"S3에 없음: {latest_key}")
-        master = raw.rename(columns=silver_schema.STATION_COLUMN_MAP)
-        if "grid_id" not in master:
-            raise ValueError("보강 station master에 grid_id 컬럼이 없음")
-        valid_grid = master["grid_id"].notna() & master["grid_id"].astype(
-            str
-        ).str.strip().ne("")
-        grid_coverage = float(valid_grid.mean())
-        if grid_coverage < 0.95:
-            raise ValueError(
-                f"보강 station master의 grid_id 매핑률이 기준 미달: {grid_coverage:.3%}"
-            )
-        master = master.set_index("station_id")
-        # 행 전체를 한 번에 astype(int)하면 깨진 station_no 하나가 전체 배치를
-        # 중단한다. 형 변환과 유효성 검사는 `_validated_station_row()`에서 station별로
-        # 수행해 정상 정류소는 계속 서빙한다.
-        _station_master = master
+        _station_master = _station_master_from_raw(raw)
     return _station_master
+
+
+def _station_master_from_raw(raw: pd.DataFrame) -> pd.DataFrame:
+    """보강 station master raw frame을 inference lookup 형태로 검증한다."""
+    master = raw.rename(columns=silver_schema.STATION_COLUMN_MAP)
+    if "grid_id" not in master:
+        raise ValueError("보강 station master에 grid_id 컬럼이 없음")
+    valid_grid = master["grid_id"].notna() & master["grid_id"].astype(
+        str
+    ).str.strip().ne("")
+    grid_coverage = float(valid_grid.mean())
+    if grid_coverage < 0.95:
+        raise ValueError(
+            f"보강 station master의 grid_id 매핑률이 기준 미달: {grid_coverage:.3%}"
+        )
+    # 행 전체를 한 번에 astype(int)하면 깨진 station_no 하나가 전체 배치를
+    # 중단한다. 형 변환과 유효성 검사는 `_validated_station_row()`에서 station별로
+    # 수행해 정상 정류소는 계속 서빙한다.
+    return master.set_index("station_id")
 
 
 def _validated_station_row(
@@ -812,19 +885,19 @@ def _get_holidays(year: int) -> set[str]:
 
 def _build_station_profile_arrays(
     df: pd.DataFrame,
-) -> tuple[dict[int, int], np.ndarray]:
-    """station_hourly_profile 행들을 (station_no -> 축 인덱스) dict + dense numpy 배열로 압축한다.
+) -> tuple[dict[int, int], dict[tuple[int, int], np.ndarray]]:
+    """station profile을 station 인덱스와 달력별 작은 dense 배열로 압축한다.
 
     예전엔 (station_no, minute, dow, month) 튜플을 key로, {rental_mean, ...} dict를
     value로 갖는 파이썬 dict를 그대로 캐시했다 — 정류소 약 수천 개 x
     (1440/모델 tick) x 7요일 x 12개월 조합이라, dict-of-dict 하나당 파이썬 객체
     오버헤드(키 튜플 + 값 dict, 항목당 수백 바이트)만으로 프로세스당 수 GB를
     먹었다(리뷰 지적). minute/dow/month는 전부 값의 범위가 좁고 촘촘해서(tick
-    간격으로 나누면 촘촘한 인덱스, dow 7개, month 12개) 해시 테이블이 필요 없다 — station마다
-    dense numpy 배열 한 칸을 두면 항목당 파이썬 객체 오버헤드 없이 float32 4개만
-    쓴다(5분 grid는 약 1GB, 기본 20분 grid는 그 약 1/4). station_no만 정수값
-    자체가 넓게 흩어져 있어(정류소 자체는 수천 개뿐) 그것만 작은 dict로 따로
-    0-based 인덱스로 압축한다.
+    간격으로 나누면 촘촘한 인덱스) 해시 테이블이 필요 없다. 실제로 읽은
+    (month, dow) 조합마다 station×minute×평균 2개의 작은 배열만 만들면 항목당
+    파이썬 객체와 읽지 않은 달력 조합의 NaN 공간이 사라진다. station_no만 정수값
+    자체가 넓게 흩어져 있어(정류소 자체는 수천 개뿐) 작은 dict로 따로 0-based
+    인덱스로 압축한다.
 
     hour가 아니라 minute(자정 기준 경과분)으로 묶는 이유: rental_count/return_count
     자체가 60분짜리 미래 방향 롤링 합이라 인접한 모델 tick끼리 창이 많이 겹쳐
@@ -838,15 +911,17 @@ def _build_station_profile_arrays(
     1월 결측과 6월 결측이 똑같은 연간 평균으로 채워지는 문제가 생긴다.
 
     args:
-        df: station_no, minute, dow, month, rental_mean, rental_std, return_mean,
-            return_std 컬럼을 가진 프로필 행들 (build_station_profile.py 산출물과 같은 스키마).
+        df: station_no, minute, dow, month, rental_mean, return_mean 컬럼을 가진
+            프로필 행들. 원본 artifact의 표준편차는 서빙 fallback이 쓰지 않으므로
+            호출부가 읽지 않는다.
             minute은 GRID_TICK_MINUTES의 배수라고 가정한다(업스트림 grid 집계 결과이므로).
     returns:
-        (station_no -> station 축 인덱스 dict, shape (n_station, 1440//tick, 7, 12, 4) float32 배열)
+        (station_no -> station 축 인덱스, (month, dow)별
+        shape (n_station, 1440//tick, 2) float32 배열)
     raises:
         ValueError: profile key 차원 값이 범위를 벗어나거나 minute이 활성 모델
             grid에 맞지 않거나 logical key가 중복되어 dense 배열 한 칸을 여러
-            행이 덮어쓸 수 있을 때
+            행이 덮어쓸 수 있거나 통계값이 숫자가 아닐 때
     """
     logical_key = ["station_no", "minute", "dow", "month"]
     station_no_values = pd.to_numeric(df["station_no"], errors="coerce")
@@ -904,24 +979,46 @@ def _build_station_profile_arrays(
     station_index = {station_no: i for i, station_no in enumerate(station_nos)}
     n_minute_buckets = 1440 // config.GRID_TICK_MINUTES
 
-    values = np.full(
-        (len(station_nos), n_minute_buckets, 7, 12, len(_STATION_PROFILE_STAT_COLS)),
+    station_idx = station_no_values.map(station_index).to_numpy()
+    minute_idx = minute_values.to_numpy(dtype="int64") // config.GRID_TICK_MINUTES
+    dow_array = dow_values.to_numpy(dtype="int16")
+    month_array = month_values.to_numpy(dtype="int16")
+    stat_arrays = {
+        col: pd.to_numeric(df[col], errors="raise").to_numpy(dtype="float32")
+        for col in _STATION_PROFILE_STAT_COLS
+    }
+    calendar_codes = month_array * 7 + dow_array
+    unique_calendar_codes = np.unique(calendar_codes)
+    calendar_slot_by_code = np.full(91, -1, dtype="int16")
+    calendar_slot_by_code[unique_calendar_codes] = np.arange(
+        len(unique_calendar_codes), dtype="int16"
+    )
+    calendar_idx = calendar_slot_by_code[calendar_codes]
+    calendar_values = np.full(
+        (
+            len(unique_calendar_codes),
+            len(station_nos),
+            n_minute_buckets,
+            len(_STATION_PROFILE_STAT_COLS),
+        ),
         np.nan,
         dtype="float32",
     )
-    station_idx = station_no_values.map(station_index).to_numpy()
-    minute_idx = minute_values.to_numpy(dtype="int64") // config.GRID_TICK_MINUTES
-    dow_idx = dow_values.to_numpy(dtype="int64")
-    month_idx = month_values.to_numpy(dtype="int64") - 1
     for stat_idx, col in enumerate(_STATION_PROFILE_STAT_COLS):
-        values[station_idx, minute_idx, dow_idx, month_idx, stat_idx] = df[
+        calendar_values[calendar_idx, station_idx, minute_idx, stat_idx] = stat_arrays[
             col
-        ].to_numpy()
+        ]
+    values = {
+        (int(code) // 7, int(code) % 7): calendar_values[slot]
+        for slot, code in enumerate(unique_calendar_codes)
+    }
 
     return station_index, values
 
 
-def _get_station_profile() -> tuple[dict[int, int], np.ndarray]:
+def _get_station_profile() -> tuple[
+    dict[int, int], dict[tuple[int, int], np.ndarray]
+]:
     """station_hourly_profile.parquet을 station_no 인덱스 dict + dense 배열로 캐시해 반환한다.
 
     station_id(텍스트)가 아니라 station_no(정수)로 조회한다 — build_station_profile.py가
@@ -930,7 +1027,8 @@ def _get_station_profile() -> tuple[dict[int, int], np.ndarray]:
     `_build_station_profile_arrays()` 참고.
 
     returns:
-        (station_no -> station 축 인덱스 dict, dense 배열) — `_profile_stat()` 참고
+        (station_no -> station 축 인덱스, (month, dow)별 dense 배열) —
+        `_profile_stat()` 참고
     """
     pinned = _PINNED_STATION_PROFILE.get()
     if pinned is not None:
@@ -938,7 +1036,16 @@ def _get_station_profile() -> tuple[dict[int, int], np.ndarray]:
 
     global _station_profile_station_index, _station_profile_values
     if _station_profile_values is None:
-        df = s3_io.read_parquet(config.STATION_HOURLY_PROFILE_PARQUET)
+        df = s3_io.read_parquet(
+            config.STATION_HOURLY_PROFILE_PARQUET,
+            columns=[
+                "station_no",
+                "minute",
+                "dow",
+                "month",
+                *_STATION_PROFILE_STAT_COLS,
+            ],
+        )
         if df is None:
             raise FileNotFoundError(
                 f"S3에 없음: {config.STATION_HOURLY_PROFILE_PARQUET}"
@@ -963,22 +1070,23 @@ def _profile_stat(station_no: int, ts: pd.Timestamp, stat_key: str) -> float:
     args:
         station_no: 정류소 일련번호(station_master 크로스워크로 얻은 정수)
         ts: 조회할 시각 (minute_of_day/dayofweek/month를 사용 — month으로 계절성 반영)
-        stat_key: "rental_mean" / "rental_std" / "return_mean" / "return_std" 중 하나
+        stat_key: "rental_mean" / "return_mean" 중 하나
     returns:
         float: 직전 학습 anchor의 프로필 값. 해당 station 또는 조합의 프로필이
             없으면 NaN
     """
-    station_index, values = _get_station_profile()
+    station_index, values_by_calendar = _get_station_profile()
     row = station_index.get(station_no)
     if row is None:
+        return np.nan
+    values = values_by_calendar.get((ts.month, ts.dayofweek))
+    if values is None:
         return np.nan
     minute = minute_of_day(ts)
     profile_minute = minute - minute % config.TRAIN_ANCHOR_TICK_MINUTES
     return values[
         row,
         profile_minute // config.GRID_TICK_MINUTES,
-        ts.dayofweek,
-        ts.month - 1,
         _STATION_PROFILE_STAT_INDEX[stat_key],
     ]
 
@@ -1061,6 +1169,58 @@ def _weather_values(df: pd.DataFrame | None) -> dict[str, float] | None:
     return {"temp": float(means["temp"]), "precip": float(means["precip"])}
 
 
+def _cache_weather_snapshots(logical_keys: list[str]) -> None:
+    """아직 cache에 없는 날씨 snapshot들을 병렬로 읽어 raw 결과를 보존한다."""
+    missing_keys = [
+        logical_key
+        for logical_key in logical_keys
+        if logical_key not in _weather_snapshot_by_key
+    ]
+    if not missing_keys:
+        return
+    snapshots = _read_authoritative_collector_snapshots(missing_keys)
+    _weather_snapshot_by_key.update(zip(missing_keys, snapshots))
+
+
+def _select_weather_snapshot(
+    logical_keys: list[str],
+    selector: Callable[[pd.DataFrame | None], dict[str, float] | None],
+) -> tuple[dict[str, float] | None, str | None]:
+    """최신 snapshot을 먼저 확인하고 miss면 나머지를 병렬 조회해 선택한다.
+
+    최신 key가 유효한 happy path는 authority 조회 한 건으로 끝낸다. 최신 snapshot이
+    없거나 내용이 무효인 cold miss에서는 남은 후보를 한꺼번에 prefetch하므로,
+    과거 key를 하나씩 직렬 조회하던 latency 회귀를 만들지 않는다. Cache에 이미 든
+    raw snapshot도 같은 선택 규칙으로 재사용하되 query provenance는 호출자가 매번
+    남길 수 있도록 실제 선택 key를 함께 반환한다.
+    """
+    if not logical_keys:
+        return None, None
+
+    newest_key = logical_keys[-1]
+    _cache_weather_snapshots([newest_key])
+    selected = selector(_weather_snapshot_by_key[newest_key])
+    if selected is not None:
+        return selected, newest_key
+
+    _cache_weather_snapshots(logical_keys[:-1])
+    for logical_key in reversed(logical_keys[:-1]):
+        selected = selector(_weather_snapshot_by_key[logical_key])
+        if selected is not None:
+            return selected, logical_key
+    return None, None
+
+
+def _emit_weather_selection_metadata(
+    logical_keys: list[str], selected_key: str | None
+) -> None:
+    """Cache hit을 포함한 날씨 query마다 실제 선택 provenance를 한 번 남긴다."""
+    selected_index = (
+        None if selected_key is None else logical_keys.index(selected_key)
+    )
+    _emit_source_selection_metadata(logical_keys, selected_index)
+
+
 def _get_recent_weather(
     target_ts: pd.Timestamp,
     lookback_hours: float = silver_schema.WEATHER_MAX_STALENESS_HOURS,
@@ -1083,13 +1243,19 @@ def _get_recent_weather(
     raises:
         ValueError: target_ts부터 lookback_hours시간 전까지 전부 데이터가 없을 때
     """
+    query = (target_ts, lookback_hours)
     keys = silver_schema.weather_tick_keys(target_ts, lookback_hours)
-    for df in reversed(
-        _read_authoritative_collector_many(keys)
-    ):  # target_ts에 가장 가까운 것부터
-        weather = _weather_values(df)
-        if weather is not None:
-            return weather
+    if query in _recent_weather_by_query:
+        weather, selected_key = _recent_weather_by_query[query]
+        _emit_weather_selection_metadata(keys, selected_key)
+        return weather
+
+    weather, selected_key = _select_weather_snapshot(keys, _weather_values)
+    _emit_weather_selection_metadata(keys, selected_key)
+    if weather is not None:
+        assert selected_key is not None
+        _recent_weather_by_query[query] = (weather, selected_key)
+        return weather
     raise ValueError(
         f"최근 {lookback_hours}시간 안에 날씨 데이터가 없습니다(target_ts={target_ts})"
     )
@@ -1122,21 +1288,27 @@ def _get_forecast_weather(
             타겟 시각 컬럼이 없거나 강수량 파싱에 전부 실패하면 None(호출부가
             관측치 fallback으로 넘어감)
     """
+    query = (target_ts, issue_lookback_hours)
     keys = silver_schema.weather_forecast_issue_keys(target_ts, issue_lookback_hours)
+    if query in _forecast_weather_by_query:
+        weather, selected_key = _forecast_weather_by_query[query]
+        _emit_weather_selection_metadata(keys, selected_key)
+        return weather
+
     date_col, time_col = (
         silver_schema.WEATHER_FORECAST_DATE_COLUMN,
         silver_schema.WEATHER_FORECAST_TIME_COLUMN,
     )
-    for df in reversed(
-        _read_authoritative_collector_many(keys)
-    ):  # 가장 최근 발표 파일부터
+
+    def _select(df: pd.DataFrame | None) -> dict[str, float] | None:
+        """한 발표 snapshot에서 target 시각에 쓸 유효한 서울 평균을 고른다."""
         if (
             df is None
             or df.empty
             or date_col not in df.columns
             or time_col not in df.columns
         ):
-            continue
+            return None
         fcst_ts = pd.to_datetime(
             df[date_col].astype(str).str.zfill(8)
             + df[time_col].astype(str).str.zfill(4),
@@ -1145,10 +1317,10 @@ def _get_forecast_weather(
         )
         distances = (fcst_ts - target_ts).abs()
         if distances.isna().all():
-            continue
+            return None
         minimum_distance = distances.min()
         if minimum_distance > _MAX_FORECAST_DISTANCE:
-            continue
+            return None
         # 한 발표 파일에는 같은 예보 시각의 서울 격자 행이 여러 개 있다. 임의의
         # 첫 행 하나를 고르면 S3/concat 순서에 따라 값이 달라지므로, 최소 시간거리인
         # 행을 모두 모은 뒤 유효한 격자들의 서울 평균을 사용한다.
@@ -1156,7 +1328,7 @@ def _get_forecast_weather(
             columns=silver_schema.WEATHER_FORECAST_COLUMN_MAP
         )
         if "temp" not in nearest.columns or "PCP" not in nearest.columns:
-            continue
+            return None
         numeric = pd.DataFrame(
             {
                 "temp": pd.to_numeric(nearest["temp"], errors="coerce"),
@@ -1177,10 +1349,14 @@ def _get_forecast_weather(
             )
         )
         if not valid.any():
-            continue
+            return None
         means = numeric.loc[valid, ["temp", "precip"]].mean()
         return {"temp": float(means["temp"]), "precip": float(means["precip"])}
-    return None
+
+    weather, selected_key = _select_weather_snapshot(keys, _select)
+    _emit_weather_selection_metadata(keys, selected_key)
+    _forecast_weather_by_query[query] = (weather, selected_key)
+    return weather
 
 
 def _get_recent_bike_status(
@@ -1223,10 +1399,10 @@ def _get_recent_population(
     정답 라벨(피처마트)은 사후 보정 없는 실측 그대로여야 학습-서빙 간 값의 의미가
     갈리지 않는다.
 
-    `weather_ultra_short_live`/`bike_station_realtime`과 같은 5분 tick 소스라
-    `_get_recent_weather()`/`_get_recent_bike_status()`와 동일한 패턴을 쓴다 —
+    `weather_ultra_short_live`/`bike_station_realtime`과 같은 5분 tick 소스와 동일하게
     target_ts를 5분 단위로 내림한 키가 있으면 그걸, 없으면(직접 호출·수동 재실행
     또는 미래 예보 일부 누락) 거슬러 올라가 최대 1시간 안의 최근 값을 대신 쓴다.
+    조회는 최신 key 하나를 먼저 확인하고, 없으면 나머지 key를 병렬로 읽는다.
     운영 DAG의 현재 tick은 normalizer 성공이 필수라 이 조회가 task 실패를 우회하지
     않는다. 원본과 달리 시각이 이미 S3 키
     경로(dt=/hh=/HHMM)에 있어 파일 내용에 YMD/TT 컬럼이 없다 — 그래서 원본처럼
@@ -1253,7 +1429,15 @@ def _get_recent_population(
 
     keys = silver_schema.population_normalized_tick_keys(target_ts, lookback_hours)
     result = pd.DataFrame(columns=["pop_total"])
-    for df in reversed(s3_io.read_parquet_many(keys)):  # target_ts에 가장 가까운 것부터
+    # 정상 tick은 최신 key 하나만 읽는다. 최신 key가 비었을 때는 나머지를 병렬로
+    # 읽어 결측 구간의 S3 왕복이 직렬로 누적되지 않게 하면서 가장 최근 값을 고른다.
+    latest = s3_io.read_parquet(keys[-1])
+    candidates = (
+        [latest]
+        if latest is not None and not latest.empty
+        else reversed(s3_io.read_parquet_many(keys[:-1]))
+    )
+    for df in candidates:
         if df is not None and not df.empty:
             df = df.rename(columns=silver_schema.POPULATION_COLUMN_MAP)
             result = df.set_index("grid_id")[["pop_total"]]

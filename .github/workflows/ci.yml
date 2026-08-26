@@ -68,6 +68,7 @@ jobs:
       - name: Test
         env:
           DATABASE_URL: postgresql://postgres:postgres@localhost:5433/app
+          GOLD_PUBLICATION_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5433/gold151_ci
         run: make test-ci-integration
 
       - name: Stop test infrastructure

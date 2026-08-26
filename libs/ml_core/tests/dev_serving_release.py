@@ -25,6 +25,7 @@ from ml_core.serving_release import (
     PointerRead,
     S3ServingReleasePointerStore,
     ServingReleaseManifest,
+    ServingReleasePointer,
     ServingReleasePointerConflictError,
     ServingReleasePreflightError,
     build_effective_contract_ref,
@@ -34,6 +35,7 @@ from ml_core.serving_release import (
     load_current_serving_release,
     load_current_serving_release_for_inference,
     load_current_serving_release_for_plan,
+    load_exact_serving_release_for_inference,
     parse_effective_serving_contract,
     parse_serving_release_manifest,
     parse_serving_release_pointer,
@@ -739,6 +741,49 @@ def test_inference_loader_uses_published_profile_footer_metadata() -> None:
     assert profile.payload == store.objects[manifest.station_profile.uri]
     assert profile.row_count == pq.ParquetFile(io.BytesIO(profile.payload)).metadata.num_rows
     assert profile.minute_values == tuple(range(0, 1440, 20))
+
+
+def test_exact_inference_loader_ignores_changed_current_pointer() -> None:
+    """Prepare가 pin한 release는 이후 mutable pointer 변경과 무관하게 열린다."""
+    store, pointer_store, manifest, source = _release_fixture()
+    uri = (
+        "s3://test-bucket/models/serving-release/manifests/"
+        f"sha256={manifest.sha256}.json"
+    )
+    publish_serving_release(
+        manifest,
+        station_source=source,
+        object_store=store,
+        pointer_store=pointer_store,
+        release_manifest_uri=uri,
+    )
+    changed_sha = "d" * 64
+    pointer_store.payload = ServingReleasePointer(
+        schema_version="ml-serving-release-pointer-v1",
+        generation=1,
+        release_manifest_byte_sha256=changed_sha,
+        release_manifest_uri=(
+            "s3://test-bucket/models/serving-release/manifests/"
+            f"sha256={changed_sha}.json"
+        ),
+    ).canonical_bytes
+    pointer_store.token = "1"
+    pointer_reads_before = sum(
+        operation == "pointer-read" for operation, _value in store.events
+    )
+
+    exact = load_exact_serving_release_for_inference(
+        release_manifest_uri=uri,
+        release_manifest_byte_sha256=manifest.sha256,
+        object_store=store,
+    )
+
+    assert exact.manifest == manifest
+    assert exact.manifest_uri == uri
+    assert (
+        sum(operation == "pointer-read" for operation, _value in store.events)
+        == pointer_reads_before
+    )
 
 
 def test_pointer_cas_conflict_keeps_previous_release_active() -> None:

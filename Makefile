@@ -8,7 +8,7 @@ PLATFORM_COMPOSE := $(shell bash ops/compose/platform_args.sh)
 LOCAL_ENV_FILE := $(if $(wildcard .env),.env,.env.example)
 COMPOSE = docker compose --env-file ops/compose/local.defaults.env --env-file $(LOCAL_ENV_FILE) -f ops/compose/docker-compose.prod.yml -f ops/compose/docker-compose.yml $(PLATFORM_COMPOSE)
 
-.PHONY: sync-all sync-ci-unit lint test-gold-bootstrap test-gold-transition-available test test-ci test-ci-unit test-ci-integration bootstrap local-nginx-auth up down logs ps migrate-route-cancellation migrate-route-dismiss-restore migrate-route-restore-uniqueness migrate-route-restore-in-place seed bootstrap-gold-seeds seed-e2e e2e-preflight e2e-smoke
+.PHONY: sync-all sync-ci-unit lint test-gold-bootstrap test-gold-transition-available prepare-gold-ci-integration-db test test-ci test-ci-unit test-ci-integration bootstrap local-nginx-auth up down logs ps migrate-route-cancellation migrate-route-dismiss-restore migrate-route-restore-uniqueness migrate-route-restore-in-place seed bootstrap-gold-seeds seed-e2e e2e-preflight e2e-smoke
 
 E2E_LOGICAL_DTTM ?= $(shell TZ=Asia/Seoul date '+%Y-%m-%dT%H:%M:00+09:00' | awk -F: '{ printf "%s:%02d:00+09:00\n", $$1, int($$2 / 5) * 5 }')
 E2E_STATION_SOURCE_DTTM ?= $(shell python3 ops/e2e_time.py station-source '$(E2E_LOGICAL_DTTM)')
@@ -40,6 +40,14 @@ test-gold-bootstrap:
 test-gold-transition-available:
 	bash ops/gold/tests/run_transition_validation.sh
 
+prepare-gold-ci-integration-db:
+	@$(COMPOSE) exec -T postgres bash -ceu '\
+		user="$${POSTGRES_USER:-postgres}"; \
+		dropdb --if-exists --force --username "$$user" gold151_ci; \
+		createdb --username "$$user" gold151_ci; \
+		psql -X --set ON_ERROR_STOP=1 --username "$$user" \
+			--dbname gold151_ci --file /opt/gold/target-schema.sql'
+
 test: test-gold-bootstrap
 	@for p in $(LOCAL_TEST_PROJECTS); do \
 		echo "==> $$p"; \
@@ -70,7 +78,7 @@ test-ci-unit: test-gold-bootstrap
 		if [ $$code -ne 0 ] && [ $$code -ne 5 ]; then exit $$code; fi; \
 	done
 
-test-ci-integration:
+test-ci-integration: prepare-gold-ci-integration-db
 	@for p in $(CI_INTEGRATION_PROJECTS); do \
 		echo "==> $$p"; \
 		(cd $$p && uv run --with pytest pytest -q); \
