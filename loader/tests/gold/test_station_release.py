@@ -34,6 +34,7 @@ from gold.station_release import (
     _station_records_to_parquet,
     _stock_records_from_parquet,
     _stock_records_to_parquet,
+    _upsert_station,
     _validate_station_ids,
 )
 from gold.station_stock import StationStockRecord
@@ -245,6 +246,23 @@ def test_route_cleanup_sql_targets_proposed_headers_by_stop_station() -> None:
     assert "route.route_status_cd = 'proposed'" in statement
     assert "FROM rebalance_route_stop AS stop" in statement
     assert parameters == (["ST-1", "ST-2"],)
+
+
+def test_station_batch_normalizes_mixed_integer_and_float_points() -> None:
+    """좌표 array에 int와 float가 섞여도 psycopg에 float만 전달한다."""
+    cursor = _RouteCleanupCursor()
+    records = (
+        _station(longitude=127, latitude=37),
+        _station(sta_id="ST-2", longitude=127.1, latitude=37.1),
+    )
+
+    _upsert_station(cursor, records)  # type: ignore[arg-type]
+
+    [(statement, parameters)] = cursor.calls
+    assert "unnest(" in statement
+    assert parameters[4] == [127.0, 127.1]
+    assert parameters[5] == [37.0, 37.1]
+    assert all(type(value) is float for value in (*parameters[4], *parameters[5]))
 
 
 def test_postgis_distance_callback_uses_geography_and_exact_boundary() -> None:

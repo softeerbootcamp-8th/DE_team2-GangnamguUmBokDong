@@ -2407,9 +2407,13 @@ def _upsert_station(
     cursor: Cursor[tuple[Any, ...]],
     records: tuple[StationRecord, ...],
 ) -> None:
-    """station 전체 projection을 FK 이력 행 삭제 없이 upsert한다."""
+    """station 전체 projection을 단일 SQL로 FK 이력 행 삭제 없이 upsert한다."""
     _validate_station_ids(tuple(record.sta_id for record in records))
-    cursor.executemany(
+    if not records:
+        return
+    # 위 중복 검증이 동일 key의 statement 내 재충돌을 차단한다. C 정렬은
+    # ON CONFLICT가 기존 station row를 잠그는 순서를 locale과 무관하게 고정한다.
+    cursor.execute(
         """
         INSERT INTO station (
             sta_id,
@@ -2424,11 +2428,48 @@ def _upsert_station(
             last_seen_dttm,
             is_active
         )
-        VALUES (
-            %s, %s, %s, %s,
-            ST_SetSRID(ST_MakePoint(%s, %s), 4326),
-            %s, %s, %s, %s, %s, %s
-        )
+        SELECT incoming.sta_id,
+               incoming.sta_nm,
+               incoming.sta_addr,
+               incoming.hold_cnt,
+               ST_SetSRID(
+                   ST_MakePoint(incoming.longitude, incoming.latitude),
+                   4326
+               ),
+               incoming.sta_point_source_cd,
+               incoming.weather_grid_id,
+               incoming.dispatch_center_id,
+               incoming.master_base_dttm,
+               incoming.last_seen_dttm,
+               incoming.is_active
+          FROM unnest(
+                   %s::TEXT[],
+                   %s::TEXT[],
+                   %s::TEXT[],
+                   %s::INTEGER[],
+                   %s::DOUBLE PRECISION[],
+                   %s::DOUBLE PRECISION[],
+                   %s::TEXT[],
+                   %s::TEXT[],
+                   %s::TEXT[],
+                   %s::TIMESTAMPTZ[],
+                   %s::TIMESTAMPTZ[],
+                   %s::BOOLEAN[]
+               ) AS incoming(
+                   sta_id,
+                   sta_nm,
+                   sta_addr,
+                   hold_cnt,
+                   longitude,
+                   latitude,
+                   sta_point_source_cd,
+                   weather_grid_id,
+                   dispatch_center_id,
+                   master_base_dttm,
+                   last_seen_dttm,
+                   is_active
+               )
+         ORDER BY incoming.sta_id COLLATE "C"
         ON CONFLICT (sta_id) DO UPDATE
         SET sta_nm = EXCLUDED.sta_nm,
             sta_addr = EXCLUDED.sta_addr,
@@ -2441,22 +2482,19 @@ def _upsert_station(
             last_seen_dttm = EXCLUDED.last_seen_dttm,
             is_active = EXCLUDED.is_active
         """,
-        tuple(
-            (
-                record.sta_id,
-                record.sta_nm,
-                record.sta_addr,
-                record.hold_cnt,
-                record.longitude,
-                record.latitude,
-                record.sta_point_source_cd,
-                record.weather_grid_id,
-                record.dispatch_center_id,
-                record.master_base_dttm,
-                record.last_seen_dttm,
-                record.is_active,
-            )
-            for record in records
+        (
+            [record.sta_id for record in records],
+            [record.sta_nm for record in records],
+            [record.sta_addr for record in records],
+            [record.hold_cnt for record in records],
+            [float(record.longitude) for record in records],
+            [float(record.latitude) for record in records],
+            [record.sta_point_source_cd for record in records],
+            [record.weather_grid_id for record in records],
+            [record.dispatch_center_id for record in records],
+            [record.master_base_dttm for record in records],
+            [record.last_seen_dttm for record in records],
+            [record.is_active for record in records],
         ),
     )
 
@@ -2465,24 +2503,41 @@ def _replace_station_stock(
     cursor: Cursor[tuple[Any, ...]],
     records: tuple[StationStockRecord, ...],
 ) -> None:
-    """station_stock을 created_dttm 보존 upsert 후 absent-key 삭제로 reconcile한다."""
+    """station_stock을 단일 upsert 후 absent-key 삭제로 reconcile한다."""
     _validate_station_ids(tuple(record.sta_id for record in records))
-    cursor.executemany(
-        """
-        INSERT INTO station_stock (
-            sta_id,
-            base_dttm,
-            parking_bike_tot_cnt
-        ) VALUES (%s, %s, %s)
-        ON CONFLICT (sta_id) DO UPDATE
-        SET base_dttm = EXCLUDED.base_dttm,
-            parking_bike_tot_cnt = EXCLUDED.parking_bike_tot_cnt
-        """,
-        tuple(
-            (record.sta_id, record.base_dttm, record.parking_bike_tot_cnt)
-            for record in records
-        ),
-    )
+    if records:
+        # 위 중복 검증이 동일 key의 statement 내 재충돌을 차단한다. C 정렬은
+        # ON CONFLICT가 기존 stock row를 잠그는 순서를 locale과 무관하게 고정한다.
+        cursor.execute(
+            """
+            INSERT INTO station_stock (
+                sta_id,
+                base_dttm,
+                parking_bike_tot_cnt
+            )
+            SELECT incoming.sta_id,
+                   incoming.base_dttm,
+                   incoming.parking_bike_tot_cnt
+              FROM unnest(
+                       %s::TEXT[],
+                       %s::TIMESTAMPTZ[],
+                       %s::INTEGER[]
+                   ) AS incoming(
+                       sta_id,
+                       base_dttm,
+                       parking_bike_tot_cnt
+                   )
+             ORDER BY incoming.sta_id COLLATE "C"
+            ON CONFLICT (sta_id) DO UPDATE
+            SET base_dttm = EXCLUDED.base_dttm,
+                parking_bike_tot_cnt = EXCLUDED.parking_bike_tot_cnt
+            """,
+            (
+                [record.sta_id for record in records],
+                [record.base_dttm for record in records],
+                [record.parking_bike_tot_cnt for record in records],
+            ),
+        )
     cursor.execute(
         "DELETE FROM station_stock WHERE NOT (sta_id = ANY(%s::TEXT[]))",
         ([record.sta_id for record in records],),
