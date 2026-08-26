@@ -61,26 +61,8 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "data" {
 resource "aws_s3_bucket_lifecycle_configuration" "data" {
   bucket = aws_s3_bucket.data.id
 
-  # Collector가 응답 도착 즉시 조각으로 쓰는 원본. Cold readback 검증이 끝나
-  # cold_compacted=true가 붙은 Hot 객체만 생성 30일 뒤 지운다. 실패·미처리 원본은
-  # 태그가 없으므로 보존된다.
-  rule {
-    id     = "expire-bronze"
-    status = "Enabled"
-
-    filter {
-      and {
-        prefix = "bronze/hot/"
-        tags = {
-          cold_compacted = "true"
-        }
-      }
-    }
-
-    expiration {
-      days = 30
-    }
-  }
+  # Hot Bronze는 애플리케이션 GC가 검증된 Cold inventory의 exact key만 30일 뒤
+  # 삭제한다. IAM tagging 권한 없이도 late revision을 fail-closed로 보존하기 위함이다.
 
   # 이관 전 legacy Bronze는 기존과 같은 30일 보존 정책을 유지한다. cold/와
   # cold_manifest/는 이 prefix에 들어오지 않아 장기 보관된다.

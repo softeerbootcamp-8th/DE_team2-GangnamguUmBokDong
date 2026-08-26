@@ -11,7 +11,6 @@ import storage
 from core.s3 import (
     delete_objects,
     get_object_bytes,
-    get_object_tags,
     list_keys,
     read_json,
     write_json,
@@ -44,8 +43,7 @@ def test_compacts_every_revision_and_preserves_exact_stored_bytes():
     assert manifest["input_objects"] == 2
     assert manifest["cold_key"] == result.cold_key
     assert len(list_keys("_cold_pending/test_source/")) == 2
-    for key in list_keys("bronze/hot/test_source/"):
-        assert get_object_tags(key)["cold_compacted"] == "true"
+    assert len(manifest["inventory_keys"]) == 2
 
 
 def test_unchanged_inputs_skip_rewrite():
@@ -170,6 +168,20 @@ def test_late_revision_creates_new_pending_work_after_cold():
     assert recovered.objects == 2
     assert current["cold_key"] != first.cold_key
     assert list_keys("_cold_pending/test_source/") == []
+
+
+def test_late_revision_merges_with_cold_after_hot_was_deleted():
+    """Hot GC 이후의 늦은 revision도 기존 Cold rows를 잃지 않고 누적한다."""
+    storage.write_bronze_part("test_source", WINDOW, "page-001", b"first", 0)
+    first = cold_bronze.compact_date("test_source", DAY)
+    delete_objects(list_keys("bronze/hot/test_source/"))
+    storage.write_bronze_part("test_source", WINDOW, "page-001", b"late", 1)
+
+    second = cold_bronze.compact_date("test_source", DAY)
+    table = pq.read_table(pa.BufferReader(get_object_bytes(second.cold_key)))
+
+    assert second.cold_key != first.cold_key
+    assert table["revision"].to_pylist() == [0, 1]
 
 
 def test_hot_put_during_sweep_keeps_revision_pending(monkeypatch):
