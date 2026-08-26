@@ -3,7 +3,6 @@
 한다(`_stockout_from_status()` 참고, `predict_single.py` 모듈 docstring 참고).
 """
 
-import numpy as np
 import pandas as pd
 import pytest
 
@@ -76,7 +75,7 @@ def _setup_single_station(station_id: str = "A") -> None:
     _set_rental_events(trips)
     _set_return_history(station_id, "2025-06-01 09:00:00")
     ps._station_profile_station_index = {}
-    ps._station_profile_values = np.empty((0, 0, 0, 0, 0), dtype="float32")
+    ps._station_profile_values = {}
     ps._population_profile = {}
     _set_station_master([station_id])
     ps._holidays_by_year = {2025: set()}
@@ -153,7 +152,7 @@ def test_predict_demand_multi_hour_all_stations_reports_fallback_per_station(mon
         sid: pd.DataFrame({"return_count": [0.0]}, index=[point]) for sid in ("A", "B")
     }
     ps._station_profile_station_index = {}
-    ps._station_profile_values = np.empty((0, 0, 0, 0, 0), dtype="float32")
+    ps._station_profile_values = {}
     ps._population_profile = {}
     _set_station_master(["A", "B"])
     ps._holidays_by_year = {2025: set()}

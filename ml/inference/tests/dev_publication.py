@@ -945,7 +945,8 @@ def test_authority_context_uses_pinned_profile_instead_of_legacy_global_cache():
         station_index, values = ps._get_station_profile()
 
     assert station_index == {1: 0}
-    assert values.shape[0] == 1
+    assert set(values) == {(1, 0)}
+    assert values[(1, 0)].shape[0] == 1
     assert ps._station_profile_values is None
 
 
