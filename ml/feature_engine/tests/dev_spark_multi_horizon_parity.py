@@ -25,7 +25,9 @@ from feature_engine.spark.build_multi_horizon_features import (
     RETURN_ANCHOR_COLUMNS,
     RETURN_TARGET_COLUMNS,
     _anchor_input,
+    _balanced_union_by_name,
     _features_in_training_window,
+    _multi_horizon_marts_are_fresh,
     _write_date_partitioned,
     build_multi_horizon_features,
 )
@@ -220,3 +222,76 @@ def test_anchor_input_thins_five_minute_grid_to_twenty_minute_anchors(spark, mon
     got = _anchor_input(features).orderBy("hour_ts").toPandas()
 
     assert got["hour_ts"].dt.strftime("%H:%M").tolist() == ["00:00", "00:20", "00:40"]
+
+
+def test_balanced_union_matches_sequential_fold_result(spark):
+    """균형 이진트리 union도 순차 fold와 같은 row 집합을 만들어야 한다."""
+    frames = [
+        spark.createDataFrame(pd.DataFrame({"station_no": [i], "horizon": [i]}))
+        for i in range(1, 8)
+    ]
+
+    balanced = _balanced_union_by_name(frames).toPandas().sort_values("horizon").reset_index(drop=True)
+
+    sequential = frames[0]
+    for frame in frames[1:]:
+        sequential = sequential.unionByName(frame)
+    sequential = sequential.toPandas().sort_values("horizon").reset_index(drop=True)
+
+    pd.testing.assert_frame_equal(balanced, sequential)
+
+
+def test_balanced_union_single_frame_returns_as_is(spark):
+    frame = spark.createDataFrame(pd.DataFrame({"station_no": [1], "horizon": [1]}))
+
+    assert _balanced_union_by_name([frame]) is frame
+
+
+def test_balanced_union_rejects_empty_list():
+    with pytest.raises(ValueError):
+        _balanced_union_by_name([])
+
+
+class TestMultiHorizonMartsAreFresh:
+    """monthly_retrain.py가 대여/반납 체인·후보 프로필 재시도로 같은 profile의
+    feature mart를 중복 요청해도, 소스가 안 바뀌었으면 재생성을 건너뛸 수 있는지."""
+
+    def test_no_prior_marker_is_never_fresh(self):
+        source_watermark = {"max_hour_ts": "2026-08-20T00:00:00"}
+
+        assert _multi_horizon_marts_are_fresh(source_watermark, None, "2026-06-01", "2026-08-27") is False
+
+    def test_matching_watermark_and_window_is_fresh(self):
+        source_watermark = {"max_hour_ts": "2026-08-20T00:00:00"}
+        existing_marker = {
+            "max_hour_ts": "2026-08-20T00:00:00",
+            "params": {"window_since": "2026-06-01", "window_until": "2026-08-27"},
+        }
+
+        assert _multi_horizon_marts_are_fresh(
+            source_watermark, existing_marker, "2026-06-01", "2026-08-27"
+        ) is True
+
+    def test_advanced_source_watermark_is_not_fresh(self):
+        """대여 체인이 만든 뒤 반납 체인이 돌기 전에 소스가 더 진행됐다면(새 데이터
+        도착) 재생성해야 한다."""
+        source_watermark = {"max_hour_ts": "2026-08-21T00:00:00"}
+        existing_marker = {
+            "max_hour_ts": "2026-08-20T00:00:00",
+            "params": {"window_since": "2026-06-01", "window_until": "2026-08-27"},
+        }
+
+        assert _multi_horizon_marts_are_fresh(
+            source_watermark, existing_marker, "2026-06-01", "2026-08-27"
+        ) is False
+
+    def test_shifted_training_window_is_not_fresh(self):
+        source_watermark = {"max_hour_ts": "2026-08-20T00:00:00"}
+        existing_marker = {
+            "max_hour_ts": "2026-08-20T00:00:00",
+            "params": {"window_since": "2026-06-01", "window_until": "2026-08-27"},
+        }
+
+        assert _multi_horizon_marts_are_fresh(
+            source_watermark, existing_marker, "2026-06-02", "2026-08-28"
+        ) is False

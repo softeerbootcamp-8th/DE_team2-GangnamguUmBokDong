@@ -250,7 +250,55 @@ def _write_date_partitioned(features: DataFrame, output_path: str) -> None:
     writer.write.mode("overwrite").partitionBy("date").parquet(output_path)
 
 
+def _multi_horizon_marts_are_fresh(
+    source_watermark: dict, existing_marker: dict | None, window_since: str, window_until: str
+) -> bool:
+    """이 profile의 마지막 multi-horizon 생성이 지금 소스 watermark/학습 윈도우와
+    동일한 상태에서 이뤄졌으면 True(=재생성 불필요).
+
+    args:
+        source_watermark: `run_pipeline.py`가 남긴 현재 `WATERMARK_PATH` 내용
+            (`watermark.read_watermark()` 결과, `max_hour_ts` 포함)
+        existing_marker: 이전 multi-horizon 생성이 남긴 `MULTI_HORIZON_WATERMARK_PATH`
+            내용(없으면 None — 이 profile로 처음 만드는 것이라 항상 False)
+        window_since, window_until: 지금 이 실행이 쓰는 학습 윈도우 경계
+            (`config.WINDOW_START`/`WINDOW_END`를 문자열로 바꾼 것)
+    """
+    if existing_marker is None:
+        return False
+    marker_params = existing_marker.get("params") or {}
+    return (
+        existing_marker.get("max_hour_ts") == source_watermark.get("max_hour_ts")
+        and marker_params.get("window_since") == window_since
+        and marker_params.get("window_until") == window_until
+    )
+
+
 def _run_cli() -> None:
+    from .watermark import read_watermark, write_watermark
+
+    window_since_str = str(config.WINDOW_START)
+    window_until_str = str(config.WINDOW_END)
+    source_watermark = read_watermark(config.WATERMARK_PATH)
+    if source_watermark is None:
+        raise RuntimeError(
+            f"{config.WATERMARK_PATH}에 watermark가 없습니다 — run_pipeline.py가 이 "
+            "profile의 base feature 테이블을 먼저 만들어야 합니다."
+        )
+    if _multi_horizon_marts_are_fresh(
+        source_watermark,
+        read_watermark(config.MULTI_HORIZON_WATERMARK_PATH),
+        window_since_str,
+        window_until_str,
+    ):
+        print(
+            f"[build_multi_horizon_features] {config.PARAM_COMBO_ID}/"
+            f"a{config.TRAIN_ANCHOR_TICK_MINUTES}: 소스 watermark"
+            f"({source_watermark['max_hour_ts']})와 학습 윈도우가 마지막 생성 때와 "
+            "동일 — 재생성 건너뜀"
+        )
+        return
+
     from .spark_session import get_spark
 
     spark = get_spark()
@@ -295,6 +343,12 @@ def _run_cli() -> None:
         config.RETURN_MULTI_HORIZON_FEATURES_TABLE_PARQUET,
     )
     print(f"return multi-horizon features -> {config.RETURN_MULTI_HORIZON_FEATURES_TABLE_PARQUET}")
+
+    write_watermark(
+        config.MULTI_HORIZON_WATERMARK_PATH,
+        source_watermark["max_hour_ts"],
+        {"window_since": window_since_str, "window_until": window_until_str},
+    )
 
 
 if __name__ == "__main__":

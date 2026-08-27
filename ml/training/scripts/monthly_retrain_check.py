@@ -267,10 +267,14 @@ def _trigger_feature_pipeline(profile_name: str, env_overrides: dict[str, str]) 
     있다 — 워터마크 덕분에 두 번째 실행은 재계산 낭비가 없고, 월 1회 배치라 비용
     문제도 아니라 단순하게 모델별로 각자 실행한다.
 
-    **주의(1단계 한계)**: `build_multi_horizon_features`는 아직 증분(watermark)을 지원하지
-    않아 매번 전체를 다시 만든다(feature_engine/spark/build_multi_horizon_features.py
-    docstring 참고) — multi-horizon 테이블이 원본의 최대 HORIZON_COUNT배라 이 단계가
-    가장 오래 걸리는 부분이 될 수 있다.
+    **주의(1단계 한계)**: `build_multi_horizon_features`는 아직 진짜 증분(부분 재계산)은
+    지원하지 않아, 실제로 다시 만들 때는 매번 전체를 처음부터 다시 만든다
+    (feature_engine/spark/build_multi_horizon_features.py docstring 참고) —
+    multi-horizon 테이블이 원본의 최대 HORIZON_COUNT배라 이 단계가 가장 오래 걸리는
+    부분이 될 수 있다. 다만 2026-08-27부터는 소스 watermark와 학습 윈도우가 마지막
+    생성 때와 동일하면(같은 profile을 대여/반납 체인이나 후보 재시도가 반복 요청하는
+    경우) 재생성 자체를 건너뛴다 — 소스가 실제로 바뀐 경우에만 이 "매번 전체 재생성"
+    비용이 든다.
 
     args:
         env_overrides: `ML_PROFILE=profile_name` 위에 이 시도에서만 덮어쓸 환경변수
