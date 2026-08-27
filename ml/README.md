@@ -53,9 +53,10 @@ brew install libomp   # macOS에서 LightGBM 실행에 필요
 (cd training && uv sync)
 (cd inference && uv sync)
 
-# 0) 로컬 개발만: MinIO/Postgres/MLflow 기동 + 샘플 원본을 Silver 스키마로 시딩 (저장소 루트에서)
+# 0) 로컬 개발만: MinIO/Postgres/MLflow 기동 후 collector bootstrap/nowcaster로 Archive 시딩 (저장소 루트에서)
 (cd .. && make up)
-uv run python ../dev/seed_s3_from_local.py --start-date 2025-01-01 --end-date 2025-12-31
+# collector bootstrap/compaction + nowcaster로 요청 구간의 flat daily Archive를 채운다 —
+# 절차는 docs/ml/LOCAL_TRAINING_SMOKE.md 참고(옛 dev/seed_s3_from_local.py는 폐기되어 더 이상 없음)
 
 # 1) 데이터셋 생성 (feature_engine/README.md) — Silver를 직접 읽는다, 로컬 legacy 1차정제 없음
 ./feature_engine/.venv/bin/python -m feature_engine.spark.run_pipeline

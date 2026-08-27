@@ -44,9 +44,13 @@ Archive fact + current Silver station dimension
 | 날씨 관측 | `archive/weather_ultra_short_live/dt=YYYY-MM-DD.parquet` |
 | 생활인구 | `archive/living_population_grid/dt=YYYY-MM-DD.parquet` |
 
-과거 fact는 날짜별 Archive 파일만 읽으며 누락 또는 스키마 불일치 시 실패한다.
-Silver fallback은 하지 않는다. 정류소 마스터만 historical snapshot이 아닌 최신 current
-dimension을 사용하므로 과거 좌표·거치대 수 변경을 시점별로 복원하지 못한다.
+과거 fact는 날짜별 Archive 파일만 읽고 Silver fallback은 하지 않는다. 요청 범위 중
+일부 날짜 partition만 없으면(수집 공백 등) 그 날짜만 건너뛰고 경고를 남긴 채
+계속하며, 요청 범위 **전체**가 다 없거나 스키마가 불일치할 때만 실패한다(월간
+재학습이 하루치 결측으로 통째로 실패하지 않도록 2026-08에 완화됨,
+`feature_engine/spark/silver_source.py::_read_archive_daily`). 정류소 마스터만
+historical snapshot이 아닌 최신 current dimension을 사용하므로 과거 좌표·거치대 수
+변경을 시점별로 복원하지 못한다.
 
 `processed_v2/`는 로컬 입력 폴더가 아니라 Spark가 원천을 재집계해 쓰는 S3 중간
 prefix다. source ID와 컬럼 매핑의 단일 기준은 `libs/ml_core/silver_schema.py`다.
@@ -154,4 +158,5 @@ cd ml
 2. 증분 재계산 결과가 같은 범위의 전체 재빌드와 같다.
 3. 늦게 도착한 트립이 과거 날짜 partition에 반영된다.
 4. horizon=1 결과가 base tick feature와 같다.
-5. Archive 누락·스키마 오류·경로 불일치는 fallback 없이 실패한다.
+5. Archive 요청 범위 전체 누락·스키마 오류·경로 불일치는 fallback 없이 실패한다
+   (요청 범위 중 일부 날짜만 없는 경우는 실패가 아니라 건너뛰고 계속한다 — §2 참고).

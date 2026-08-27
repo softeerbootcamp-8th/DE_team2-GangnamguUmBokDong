@@ -118,7 +118,7 @@ profile에 month가 없는 것은 의도된 계약이다. 생활인구의 월별
 변화가 크고, month까지 나누면 fallback 그룹의 표본만 줄어든다.
 
 결과의 `population_source`로 직접값/실시간값 사용과 profile fallback 여부를
-구분한다. 정식 7-column Gold inference 결과에는 이 진단 필드가 포함되지 않지만
+구분한다. 정식 13-column Gold inference 결과에는 이 진단 필드가 포함되지 않지만
 직접 예측 API와 내부 결과에는 유지된다.
 
 ## 8. 재고와 exposure

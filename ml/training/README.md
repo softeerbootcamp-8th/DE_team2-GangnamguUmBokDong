@@ -195,7 +195,7 @@ LightGBM 파라미터만 다른 프로필은 호환되는 것으로 본다.
 
 ### Pair serving release 수동 게시
 
-운영 `realtime_5min`은 개별 champion pointer가 아니라
+운영 `realtime_tick*` 계열 DAG(합쳐서 5분마다)는 개별 champion pointer가 아니라
 `models/serving-release/current.json`에 고정된 rental/return pair와 station
 dependency를 읽는다. 전체 학습과 검수를 마친 뒤 운영자가 아래 명령에 exact
 archive prefix 둘과 station 산출물을 명시해 수동 게시한다.

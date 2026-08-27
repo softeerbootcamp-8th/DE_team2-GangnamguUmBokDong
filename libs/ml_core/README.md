@@ -11,23 +11,35 @@
 `ml/feature_engine`/`ml/training`/`ml/inference`는 각자의 `pyproject.toml`에서
 `ml_core`을 editable path 의존성으로 참조한다(`uv sync`로 설치).
 
-이 폴더는 순수 pandas 로직(+ 일부 lightgbm)만 담는다 — `ml/feature_engine/spark/`는
+이 폴더는 주로 순수 pandas 로직(+ 일부 lightgbm)을 담는다 — `ml/feature_engine/spark/`는
 pyspark 의존성이 있어 별도로 분리돼 있고, `common_config.py`만 예외적으로
-아주 가벼운 상수 모듈이라 Spark 쪽도 함께 참조한다.
+아주 가벼운 상수 모듈이라 Spark 쪽도 함께 참조한다. 다만 `model_io.py`/
+`model_contract.py`/`serving_release.py`는 S3 I/O·publication 계약을 위해 저장소의
+또 다른 형제 라이브러리인 `<repo-root>/libs/core/`(`core` 패키지, S3/PostgreSQL 제네릭
+I/O)도 editable 의존성으로 추가로 참조한다(`pyproject.toml` 참고).
 
 ## 파일별 역할
 
 | 파일 | 담당 | 누가 쓰나 |
 |---|---|---|
 | `common_config.py` | 하이퍼파라미터/censoring 파라미터 — **프로필 로더** | 전부(`feature_engine`, `feature_engine/spark`, `training`, `inference`) |
-| `profiles/*.json` | 프로필 파일(파라미터 조합) | `common_config.py`가 읽음 |
+| `profiles/*.json` | 프로필 파일(파라미터 조합) — S3(`profiles/{name}.json`)에만 존재, 로컬 저장소에는 없음 | `common_config.py`가 읽음 |
 | `paths.py` | `data/processed_v2/*.parquet` 산출물 경로, `MODELS_DIR` | 전부 |
 | `rolling_window_features.py` | point-in-time censoring 핵심 로직(차분 배열, as-of 조회) | `feature_engine`(배치), `inference`(서빙 시뮬레이션) |
 | `trip_events.py` | 대여이력 원본 로딩 + station_no 정규화 | `feature_engine`(배치), `inference`(실시간 시뮬레이션) |
 | `model_contract.py` | `FEATURE_COLUMNS`(모델 입력 스키마), station_id 카테고리 저장/로드 | `training`(학습), `inference`(서빙) |
+| `model_io.py` | S3 LightGBM Booster 업/다운로드(+ 선택적 MLflow 로깅) | `training`(`checkpointing.py`) |
 | `serving_contract.py` | 모델 아티팩트와 현재 서빙의 피처 프로필 호환성 계약 | `scoring`, `training.promotion` |
+| `serving_release.py` | rental/return 모델 쌍 + station fallback profile을 하나의 immutable serving release로 고정(CAS pointer) | `training`(`publish_serving_release.py`, `promotion.py`), `inference`(`publication.py`, `predict_single.py`) |
+| `silver_schema.py` | Collector Silver 계층 컬럼명 매핑 + S3 키 빌더 | `feature_engine`(`spark/silver_source.py`, `spark/config.py`, `spark/build_merged_table.py`), `inference`(`predict_single.py`) |
+| `day_index.py` | 연도 경계 문제 없는 날짜 정수 인코딩(`day`) feature | `feature_engine`(`spark/build_merged_table.py`), `training`(`lazy_train_dataset.py`), `inference`(`predict_single.py`) |
+| `minute_of_day.py` | 자정 기준 경과분(0~1439)으로 모델 tick을 구분하는 `minute` feature | `feature_engine`(`spark/build_merged_table.py`, `spark/build_multi_horizon_features.py`), `inference`(`build_station_profile.py`, `predict_single.py`) |
+| `holidays_kr.py` | `holidays` 패키지 기반 임의 연도 대한민국 공휴일 계산 | `feature_engine`(`spark/build_merged_table.py`), `training`(`lazy_train_dataset.py`), `inference`(`predict_single.py`) |
 | `metrics.py` | poisson deviance, pinball loss | `training`, `ml_core/scoring.py` |
-| `scoring.py` | 저장된 booster로 채점(`predict()`) | `inference`, `training/monitor_performance.py`, `training/legacy/scripts/compare_baselines.py` |
+| `scoring.py` | 저장된 booster로 채점(`predict()`) | `inference`(`predict_common.py`, `predict_single.py`, `publication.py`), `training`(`monitor_performance.py`, `promotion.py`) |
+| `profile_contract.py` | 런타임 의존성(boto3/pandas) 없는 프로필 기본값·검증 계약 — `common_config` import가 실패해도 동작 | 프로필 관리 CLI |
+| `profile_registry.py` | S3 프로필 생성/조회 + MLflow 변경 이력 기록(실제 런타임 조회 경로는 아님) | `ml_core.scripts.push_profile` |
+| `mlflow_tracking.py` | 공통 `MLFLOW_TRACKING_URI` 설정 | `feature_engine`/`training`/`inference` |
 
 ## 경로 계약(`paths.py`)에서 꼭 알아야 할 것
 

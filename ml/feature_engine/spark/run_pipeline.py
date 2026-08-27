@@ -199,7 +199,8 @@ def _run_full_build(spark) -> None:
     # _run_incremental 참고), 전체 빌드도 처음부터 같은 파티션 레이아웃으로 써야 한다.
     features_df.write.mode("overwrite").partitionBy("date").parquet(config.FEATURES_TABLE_PARQUET)
 
-    max_hour_ts = features_df.agg(F.max("hour_ts")).collect()[0][0]
+    # 방금 저장한 Parquet에서 max(hour_ts)를 직접 읽어와 무거운 upstream 재계산을 방지한다.
+    max_hour_ts = spark.read.parquet(config.FEATURES_TABLE_PARQUET).agg(F.max("hour_ts")).collect()[0][0]
     write_watermark(config.WATERMARK_PATH, max_hour_ts.isoformat(), _current_params())
     print(f"[{config.PARAM_COMBO_ID}] 전체 빌드 완료 -> {config.FEATURES_TABLE_PARQUET} (워터마크={max_hour_ts})")
 
@@ -320,9 +321,15 @@ def _run_incremental(spark, watermark: dict) -> None:
         (F.col("hour_ts") >= F.lit(since_str))
         & (F.col("hour_ts") <= F.lit(target_complete_through))
     )
+    # 아래에서 이 DataFrame에 count/write/collect 액션을 4번 호출한다 — 캐싱이
+    # 없으면 액션마다 상류 lineage(다중 소스 조인 + build_features의 rolling
+    # self-join) 전체를 처음부터 다시 계산한다(2026-08-27 Spark UI 실측: 같은
+    # 크기의 parquet/count stage가 액션 수만큼 반복됨).
+    features_increment = features_increment.cache()
 
     if features_increment.limit(1).count() == 0:
         print(f"[{config.PARAM_COMBO_ID}] 재계산 구간({since_str}~)에 데이터 없음 — 건너뜀")
+        features_increment.unpersist()
         return
 
     new_count = features_increment.filter(F.col("hour_ts") > F.lit(watermark["max_hour_ts"])).count()
@@ -334,6 +341,7 @@ def _run_incremental(spark, watermark: dict) -> None:
     features_increment.write.mode("overwrite").partitionBy("date").parquet(config.FEATURES_TABLE_PARQUET)
 
     max_hour_ts = features_increment.agg(F.max("hour_ts")).collect()[0][0]
+    features_increment.unpersist()
     write_watermark(config.WATERMARK_PATH, max_hour_ts.isoformat(), _current_params())
     print(f"[{config.PARAM_COMBO_ID}] {since_str}~{max_hour_ts} 재계산(신규 {new_count:,}행 포함) -> "
           f"{config.FEATURES_TABLE_PARQUET} 날짜 파티션 덮어씀 (워터마크 갱신={max_hour_ts})")
