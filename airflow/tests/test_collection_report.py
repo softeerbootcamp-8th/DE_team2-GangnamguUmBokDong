@@ -107,7 +107,16 @@ class TestEvaluateSourceStats:
         result = evaluate_source_stats("bike_station_realtime", stats)
 
         assert result["failure_rate"] == 0.0
-        assert result["is_risky"] is False
+
+    def test_zero_run_count_is_risky(self, monkeypatch):
+        """run_count == 0은 collector/Airflow가 그 기간 내내 완전히 멈춘, 비율
+        임계값보다 심한 장애다 — 비율이 전부 0이어도 위험으로 판정해야 한다."""
+        _fixed_thresholds(monkeypatch)
+        stats = _stats(run_count=0, status_counts={})
+
+        result = evaluate_source_stats("bike_station_realtime", stats)
+
+        assert result["is_risky"] is True
 
 
 class TestBuildDailyReportMessage:
