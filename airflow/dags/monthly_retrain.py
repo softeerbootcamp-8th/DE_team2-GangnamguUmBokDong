@@ -868,14 +868,20 @@ def make_task_stop_mlflow() -> Any:
     return task_stop_mlflow
 
 
-def build_model_task_chain(model_name: str) -> dict[str, Any]:
-    """모델 하나(대여 또는 반납)의 평가→재학습 태스크 체인을 만들어 반환한다."""
+def build_model_task_chain(model_name: str, is_first: bool = False) -> dict[str, Any]:
+    """모델 하나(대여 또는 반납)의 평가→재학습 태스크 체인을 만들어 반환한다.
+
+    Setup 태스크(create_cluster) 바로 뒤에 오는 첫 번째 모델(rental)의 첫 태스크는
+    Airflow 제약상 trigger_rule이 ALL_SUCCESS여야 한다. 두 번째 모델(return)의 첫 태스크는
+    이전 모델의 브랜치(loop 또는 skip) 이후에 실행되므로 NONE_FAILED_MIN_ONE_SUCCESS를 쓴다."""
+    trigger_rule = TriggerRule.ALL_SUCCESS if is_first else TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS
     refresh_feature_mart = PythonOperator(
         task_id=_task_id(model_name, "refresh_feature_mart"),
         python_callable=make_task_refresh_feature_mart(model_name),
         execution_timeout=MONTHLY_FEATURE_REFRESH_TIMEOUT,
-        trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS,
+        trigger_rule=trigger_rule,
     )
+
 
     evaluate = PythonOperator(
         task_id=_task_id(model_name, "evaluate"),
@@ -1001,13 +1007,14 @@ def build_monthly_retrain_dag(cron_schedule: str) -> DAG:
         )
         terminate_cluster.as_teardown(setups=create_cluster)
 
-        rental_chain = build_model_task_chain("rental")
-        return_chain = build_model_task_chain("return")
+        rental_chain = build_model_task_chain("rental", is_first=True)
+        return_chain = build_model_task_chain("return", is_first=False)
 
         start_mlflow >> create_cluster >> rental_chain["start"]
         rental_chain["ends"] >> return_chain["start"]
         return_chain["ends"] >> terminate_cluster
         terminate_cluster >> stop_mlflow
+
 
     return dag
 
