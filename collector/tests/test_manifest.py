@@ -243,18 +243,16 @@ class TestSummarizeWindow:
         assert summary == {
             "run_count": 0,
             "status_counts": {},
-            "missing_count": 0,
-            "outlier_count": 0,
-            "type_error_count": 0,
-            "dropped_count": 0,
+            "fetched_count": 0,
             "kept_count": 0,
-            "max_drop_ratio": 0.0,
+            "dropped_count": 0,
+            "repaired_count": 0,
         }
 
-    def test_aggregates_status_counts_and_column_issues_across_runs(self):
+    def test_aggregates_status_counts_and_row_counts_across_runs(self):
         succeeded = _minimal_manifest(
             status=RunStatus.SUCCEEDED,
-            counts=Counts(fetched=10, kept=9, dropped=1),
+            counts=Counts(fetched=10, kept=9, repaired=1, dropped=1),
             drop_ratio=0.1,
             column_issues={
                 "stationName": ColumnIssueCount(missing=2, outlier=0, type_error=0),
@@ -273,12 +271,10 @@ class TestSummarizeWindow:
 
         assert summary["run_count"] == 2
         assert summary["status_counts"] == {"succeeded": 1, "failed": 1}
-        assert summary["missing_count"] == 2
-        assert summary["outlier_count"] == 3
-        assert summary["type_error_count"] == 1
-        assert summary["dropped_count"] == 11
+        assert summary["fetched_count"] == 20
         assert summary["kept_count"] == 9
-        assert summary["max_drop_ratio"] == 1.0
+        assert summary["dropped_count"] == 11
+        assert summary["repaired_count"] == 1
 
 
 class TestRetryMarker:

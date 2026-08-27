@@ -528,9 +528,7 @@ class TestReportWindowStats:
     def test_prints_summary_json_and_returns_zero(self, monkeypatch, capsys):
         stub_manifest = SimpleNamespace(
             status=RunStatus.SUCCEEDED,
-            column_issues={},
-            counts=SimpleNamespace(dropped=0, kept=5),
-            drop_ratio=0.0,
+            counts=SimpleNamespace(fetched=5, dropped=0, kept=5, repaired=0),
         )
         monkeypatch.setattr(
             main.manifest_module, "load_window_manifests",

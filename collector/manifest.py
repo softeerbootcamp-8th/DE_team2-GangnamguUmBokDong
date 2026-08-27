@@ -200,34 +200,28 @@ def load_window_manifests(
 def summarize_window(manifests: list[Manifest]) -> dict:
     """manifest 목록을 데이터 수집 모니터링 알림용 통계로 요약한다.
 
-    `status_counts`는 이미 quality gate(collector/pipeline.py)가 각 실행마다 내린
-    성공/실패 판정을 집계한 것이다. `missing_count`/`outlier_count`는 그 게이트가
-    보지 않는 `column_issues`(컬럼 값 단위 결측·이상치)를 합산한 것으로, quality
-    게이트의 `max_missing_ratio`(수집 자체의 fetch/페이지네이션 완결성 비율 —
-    이름은 비슷하지만 다른 개념이다)와는 무관하다.
+    행(row) 단위로만 집계한다 — 컬럼 값 단위 `column_issues`(결측·이상치)는 소스마다
+    "정상 기준선"이 크게 달라(예: 비회원 대여의 성별·생년 컬럼은 평소에도 결측이
+    30%에 가깝다) 일률적인 임계값을 적용하면 노이즈가 크다. 대신 collector가 이미
+    각 실행마다 정확히 남기는 `RunStatus`와 `Counts`(fetched·kept·dropped)를 그대로
+    합산한다 — quality gate(collector/pipeline.py)가 내린 성공/실패 판정과
+    "실제로 몇 행을 살렸고 몇 행을 버렸는지"만 본다.
     """
     status_counts: dict[str, int] = {}
-    missing = outlier = type_error = dropped = kept = 0
-    max_drop_ratio = 0.0
+    fetched = kept = dropped = repaired = 0
     for m in manifests:
         status_counts[m.status.value] = status_counts.get(m.status.value, 0) + 1
-        for issue in m.column_issues.values():
-            missing += issue.missing
-            outlier += issue.outlier
-            type_error += issue.type_error
-        dropped += m.counts.dropped
+        fetched += m.counts.fetched
         kept += m.counts.kept
-        if m.drop_ratio is not None:
-            max_drop_ratio = max(max_drop_ratio, m.drop_ratio)
+        dropped += m.counts.dropped
+        repaired += m.counts.repaired
     return {
         "run_count": len(manifests),
         "status_counts": status_counts,
-        "missing_count": missing,
-        "outlier_count": outlier,
-        "type_error_count": type_error,
-        "dropped_count": dropped,
+        "fetched_count": fetched,
         "kept_count": kept,
-        "max_drop_ratio": max_drop_ratio,
+        "dropped_count": dropped,
+        "repaired_count": repaired,
     }
 
 
