@@ -1,12 +1,13 @@
 # inference — 실행 방법
 
 학습이 끝난 모델(S3 아카이브 또는 챔피언, `training/README.md` 참고)로 예측을
-실행하는 두 가지 경로를 제공한다.
+실행하는 세 가지 경로를 제공한다.
 
 | 경로 | 언제 쓰나 | 입력 |
 |---|---|---|
 | **배치 조회** (`predict_common.py` + `predict_{rental,return}_demand.py`) | 이미 만들어둔 feature 테이블에서 특정 station/기간을 조회 (백테스트, 결과 확인 전용) | station_id, 날짜/시간 범위 |
-| **단일/다중 시점 예측** (`predict_single.py`) | 날짜/시각/horizon/날씨/(선택)인구 값을 직접 넣어서 예측 (**실제 운영 진입점**, Airflow `realtime_5min` DAG가 5분마다 `--all-stations`로 호출) | station_id(또는 전체), date, hour, minute, horizon, 날씨(선택), 인구(선택) |
+| **단일/다중 시점 예측** (`predict_single.py`) | 날짜/시각/horizon/날씨/(선택)인구 값을 직접 넣어서 예측·진단하는 계산 엔진 — authority는 아니며, 아래 운영 게시가 내부적으로 이 모듈의 `predict_demand_multi_hour_all_stations()`를 호출한다 | station_id(또는 전체), date, hour, minute, horizon, 날씨(선택), 인구(선택) |
+| **운영 게시** (`publication_cli.py` → `publication.py`) | Airflow `realtime_tick*` 계열 DAG(합쳐서 5분마다)가 호출하는 **실제 운영 진입점(정식 authority)** — serving plan이 pin한 입력으로 위 계산 엔진을 돌리고, 검증된 결과를 immutable snapshot으로 게시한다 | serving plan URI + SHA-256 |
 
 설계 배경은 [DESIGN.md](../../docs/ml/inference/DESIGN.md) 참고.
 
@@ -14,7 +15,7 @@
 
 ```bash
 cd ml/inference
-uv sync   # pyproject.toml/uv.lock 기준 .venv 생성 — pandas/numpy + ml_core(editable) 포함
+uv sync   # pyproject.toml/uv.lock 기준 .venv 생성 — pandas/numpy/boto3/holidays + ml_core·core(editable) 포함
 ```
 
 `training`이 먼저 모델을 학습·승격해둬야 한다([training/README.md](../training/README.md)).
@@ -119,7 +120,11 @@ horizon마다 그 target_ts(anchor_ts+(horizon-1)시간) 기준으로 새로 계
 target_ts가 미래면(horizon>1) 날씨는 예보를 먼저 시도하고 없으면 관측으로
 fallback한다.
 
-## 전체 정류소 배치 (Airflow `realtime_5min` DAG가 5분마다 호출)
+## 전체 정류소 배치 (`publication.py`가 내부적으로 호출)
+
+운영에서는 Airflow `realtime_tick*` 계열 DAG(합쳐서 5분마다)가 `publication_cli.py` →
+`publication.py`를 호출하고, `publication.py`가 아래 함수를 내부적으로 호출한다 —
+CLI로 직접 호출하는 것은 수동 진단·백필용이다.
 
 ```python
 from inference.predict_single import predict_demand_multi_hour_all_stations

@@ -137,14 +137,37 @@ def build_multi_horizon_features(
     """
     del spark  # 시그니처 대칭용 — 이 함수 자체는 SparkSession을 직접 쓰지 않음
     anchor_source = anchor_df if anchor_df is not None else features_df
-    anchor = anchor_source.select(*anchor_columns)
-    target = features_df.select(*target_columns)
+    # HORIZON_COUNT(기본 12)번의 self-join이 전부 같은 anchor/target lineage를
+    # 공유한다 — 캐싱이 없으면 Spark가 join마다 독립적으로 재분석·재실행할 수 있어
+    # 매 horizon마다 같은 원본을 다시 훑는 중복 비용이 붙는다(2026-08-27 Spark UI
+    # 실측: horizon 루프 구간에서 같은 크기의 parquet read job이 반복되며 소요
+    # 시간이 계속 늘어남). 두 DataFrame 다 작으므로(tick 단위 feature 테이블) 캐싱
+    # 비용은 무시할 만하다.
+    anchor = anchor_source.select(*anchor_columns).cache()
+    target = features_df.select(*target_columns).cache()
 
     horizon_frames = [_shift_for_horizon(anchor, target, h) for h in range(1, config.HORIZON_COUNT + 1)]
-    combined = horizon_frames[0]
-    for frame in horizon_frames[1:]:
-        combined = combined.unionByName(frame)
-    return combined
+    return _balanced_union_by_name(horizon_frames)
+
+
+def _balanced_union_by_name(frames: list[DataFrame]) -> DataFrame:
+    """`frames`를 순차(left-deep) fold 대신 균형 이진트리로 union한다.
+
+    `combined = combined.unionByName(frame)`을 반복하면 union 깊이가 프레임
+    개수만큼(n=HORIZON_COUNT) 길어져, 이후 액션마다 Catalyst가 매번 그 전체 누적
+    계획을 다시 분석해야 한다(2026-08-27 Spark UI 실측: 같은 크기의 작업인데도
+    horizon이 늘어날수록 job 소요 시간이 계속 증가). 균형 트리로 묶으면 깊이가
+    `log2(n)`으로 줄어 재분석 비용이 크게 준다 — 최종 union 결과(row 집합)는
+    fold 방식과 동일하다.
+    """
+    if not frames:
+        raise ValueError("union할 frame이 최소 1개 이상 필요합니다.")
+    if len(frames) == 1:
+        return frames[0]
+    mid = len(frames) // 2
+    left = _balanced_union_by_name(frames[:mid])
+    right = _balanced_union_by_name(frames[mid:])
+    return left.unionByName(right)
 
 
 def _anchor_input(features: DataFrame) -> DataFrame | None:
@@ -218,9 +241,13 @@ def _write_date_partitioned(features: DataFrame, output_path: str) -> None:
     """
     if "date" not in features.columns:
         raise ValueError("multi-horizon 출력에는 date 컬럼이 필요합니다")
-    features.repartition("date").write.mode("overwrite").partitionBy("date").parquet(
-        output_path
-    )
+    # date로 repartition 후 파티션 내부를 정렬하여 Parquet RLE/Snappy 압축률과 읽기 I/O를 최적화한다.
+    preferred_sort_cols = ["date", "anchor_ts", "station_no", "horizon"]
+    sort_cols = [c for c in preferred_sort_cols if c in features.columns]
+    writer = features.repartition("date")
+    if sort_cols:
+        writer = writer.sortWithinPartitions(*sort_cols)
+    writer.write.mode("overwrite").partitionBy("date").parquet(output_path)
 
 
 def _run_cli() -> None:
@@ -254,6 +281,11 @@ def _run_cli() -> None:
         config.RENTAL_MULTI_HORIZON_FEATURES_TABLE_PARQUET,
     )
     print(f"rental multi-horizon features -> {config.RENTAL_MULTI_HORIZON_FEATURES_TABLE_PARQUET}")
+
+    # build_multi_horizon_features()가 캐싱한 대여용 anchor/target을 반납 계산 전에
+    # 비운다 — 안 그러면 "두 self-join 결과를 동시에 메모리에 띄우지 않는다"는 위
+    # 설계 의도가 캐시 잔존으로 새어나간다.
+    spark.catalog.clearCache()
 
     return_result = build_multi_horizon_features(
         spark, features, RETURN_ANCHOR_COLUMNS, RETURN_TARGET_COLUMNS, anchor_df=anchor_input

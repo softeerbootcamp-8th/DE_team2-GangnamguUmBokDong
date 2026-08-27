@@ -2,7 +2,7 @@
 
 > **현재 runtime + 보관 inventory:** 먼저 현재 학습·추론이 읽는 S3 계약을 설명하고,
 > 이후 절에는 초기 모델 개발 때 조사한 `ml/data/` 로컬 자산의 규모와 품질 기록을
-> 보존한다. 코드 확인일: 2026-08-24.
+> 보존한다. 코드 확인일: 2026-08-27.
 
 ## 현재 runtime 데이터 지도
 
@@ -22,8 +22,11 @@ compaction, Nowcaster, Normalizer가 만든 S3 객체가 authority이며 schema�
 | 날씨 관측 | `archive/weather_ultra_short_live/dt=YYYY-MM-DD.parquet` | 기온·강수·습도·풍속 |
 | 생활인구 | `archive/living_population_grid/dt=YYYY-MM-DD.parquet` | `CELL_ID`별 실측 생활인구 |
 
-Historical fact는 요청 범위에 필요한 일별 partition 하나라도 없으면 Silver로 fallback하지
-않고 실패한다. Station master만 current dimension이므로 최신 enriched Silver를 사용한다.
+Historical fact는 Silver로 fallback하지 않고 Archive만 읽는다. 요청 범위 중 일부
+날짜 partition만 없으면(수집 공백 등) 그 날짜만 건너뛰고 경고를 남긴 채 계속하며,
+요청 범위 전체가 다 없을 때만 실패한다(월간 재학습이 하루치 결측으로 통째로
+실패하지 않도록 2026-08에 완화됨, `feature_engine/spark/silver_source.py`).
+Station master만 current dimension이므로 최신 enriched Silver를 사용한다.
 
 ### 실시간 추론 입력
 

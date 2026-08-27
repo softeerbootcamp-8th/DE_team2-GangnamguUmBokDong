@@ -47,10 +47,15 @@ training / monitoring / profile CLI
 make up
 ```
 
-MLflow만 다시 빌드·시작하려면 다음을 사용한다.
+MLflow만 다시 빌드·시작하려면 다음을 사용한다. Airflow/API/MLflow/web 정의는
+`docker-compose.prod.yml`을 단일 원본으로 쓰고 `docker-compose.yml`은 AWS managed
+service만 로컬 대체재로 바꾸는 override이므로(`Makefile`의 `COMPOSE` 변수 참고),
+두 파일을 항상 함께 지정해야 한다 — `docker-compose.yml` 하나만으로는 실행되지
+않는다.
 
 ```bash
 docker compose --env-file .env \
+  -f ops/compose/docker-compose.prod.yml \
   -f ops/compose/docker-compose.yml \
   up -d --build mlflow
 ```
@@ -59,9 +64,11 @@ docker compose --env-file .env \
 
 ```bash
 docker compose --env-file .env \
+  -f ops/compose/docker-compose.prod.yml \
   -f ops/compose/docker-compose.yml ps mlflow
 
 docker compose --env-file .env \
+  -f ops/compose/docker-compose.prod.yml \
   -f ops/compose/docker-compose.yml logs mlflow
 ```
 
@@ -71,6 +78,7 @@ docker compose --env-file .env \
 
 ```bash
 docker compose --env-file .env \
+  -f ops/compose/docker-compose.prod.yml \
   -f ops/compose/docker-compose.yml \
   exec postgres createdb -U "${POSTGRES_USER:-postgres}" "${POSTGRES_MLFLOW_DB:-mlflow}"
 ```
@@ -223,6 +231,12 @@ cd ml
 ```
 
 ## 11. 장애 확인 순서
+
+`monthly_retrain` DAG는 `start_mlflow`/`stop_mlflow` task로 자기 실행 구간에만
+`mlflow` 컨테이너를 켰다 끈다(호스트 Docker 소켓을 직접 호출, EC2 리소스 절약
+목적, 2026-08). 즉 재학습이 돌고 있지 않은 동안 `mlflow` 컨테이너가 꺼져 있는
+것 자체는 정상이다 — 아래 1번은 "지금 켜져 있어야 하는 상황(로컬 `make up` 직후,
+또는 `monthly_retrain` 실행 중)"에서만 장애 신호로 본다.
 
 1. `mlflow` 컨테이너가 실행 중인지 확인한다.
 2. MLflow 로그에서 PostgreSQL 연결 오류를 확인한다.

@@ -21,7 +21,10 @@ Inference는 pinned serving release의 대여·반납 모델로 전체 서빙 �
 | `predict_single.py` | 단일 정류소 또는 전체 정류소의 실시간 feature 조립·채점 | 계산 엔진 |
 | `publication_cli.py` → `publication.py` | serving plan 기반 운영 추론·검증·게시 | **정식 authority** |
 
-Airflow의 네 `realtime_tick*` DAG는 공통 체인을 사용한다.
+Airflow는 5분마다 도는 단일 `realtime_tick` DAG 하나로 이 체인을 실행한다(과거에는
+날씨 필요 시각에 맞춰 4개 cron/DAG로 쪼갰으나, 서로 다른 DAG의 `max_active_runs`가
+겹칠 때 생기는 경합을 없애기 위해 다시 하나로 합쳤다 — `airflow/dags/realtime_tick.py`
+참고).
 
 ```text
 collector / normalizer
@@ -119,7 +122,7 @@ identity가 없으므로 fail-closed하고 같은 tick prepare 재실행을 요�
 
 target 시각이 미래면 `weather_short_term_forecast`를 먼저 조회하고, 유효한 예보가
 없거나 target이 현재·과거이면 `weather_ultra_short_live` 관측을 사용한다. 날씨
-collector는 현재 `realtime_tick*` DAG에 통합돼 있으며, 실패 시 이전 snapshot을
+collector는 현재 `realtime_tick` DAG에 통합돼 있으며, 실패 시 이전 snapshot을
 사용할 수 있다.
 
 ### 생활인구와 재고
@@ -131,7 +134,7 @@ collector는 현재 `realtime_tick*` DAG에 통합돼 있으며, 실패 시 이�
 
 직접 호출 API는 `lag_fallback_used`, `lag_data_freshness`, `population_source`,
 `stockout_source`를 반환한다. 다만 이 진단 필드는 정식 Gold inference authority의
-7개 컬럼에는 포함하지 않는다.
+13개 컬럼에는 포함하지 않는다.
 
 ## 5. 전체 정류소 계산과 완전성
 
@@ -150,25 +153,27 @@ expected set으로 고정한다. horizon별로 정류소를 묶어 LightGBM을 �
 - target date/hour/minute가 logical time과 horizon 관계에 맞지 않음
 - 예측값이 유한한 non-negative 값이 아님
 
-정식 결과는 다음 exact 7-column schema로 canonicalize한다.
+정식 결과는 다음 exact 13-column schema로 canonicalize한다
+(`INFERENCE_OUTPUT_COLUMN_NAMES`, `libs/core/src/core/inference_snapshot.py`).
 
 | 컬럼 | 의미 |
 |---|---|
 | `station_id` | 서빙 정류소 ID |
 | `date`, `hour`, `minute` | KST target 시각 |
 | `horizon` | 1..12 |
-| `rental_pred_mean` | 대여 평균 예측 |
-| `return_pred_mean` | 반납 평균 예측 |
+| `rental_pred_mean`, `rental_pred_p10`, `rental_pred_p50`, `rental_pred_p90` | 대여 평균·분위 예측 |
+| `return_pred_mean`, `return_pred_p10`, `return_pred_p50`, `return_pred_p90` | 반납 평균·분위 예측 |
 
-P10/P50/P90과 fallback 진단값은 직접 호출 결과에는 존재하지만 Gold 전달 authority에는
-포함하지 않는다.
+`lag_fallback_used`/`lag_data_freshness`/`population_source`/`stockout_source` 같은
+fallback 진단값은 직접 호출 결과에는 존재하지만 Gold 전달 authority에는 포함하지
+않는다 — P10/P50/P90은 진단값이 아니라 예측 분위값이라 13개 컬럼에 포함된다.
 
 ## 6. Immutable publication
 
 `run_and_publish_inference()`는 결과를 다음 순서로 공개한다.
 
 1. 계산 중 실제로 읽은 non-model S3 bytes를 캡처한다.
-2. 입력과 7-column Parquet을 content-addressed object로 고정한다.
+2. 입력과 13-column Parquet을 content-addressed object로 고정한다.
 3. logical time별 immutable revision catalog를 claim한다.
 4. 성공 또는 `EMPTY` manifest를 마지막에 기록한다.
 5. 기록한 manifest bytes를 다시 읽어 SHA-256과 구조를 검증한다.
