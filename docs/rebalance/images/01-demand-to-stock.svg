@@ -1,0 +1,154 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 812 598" width="812" height="598">
+
+  <style>
+    svg{
+      --bg:#FCFCFB; --sf2:#EDF0EE; --ink:#131A18; --ink-2:#3A4744; --muted:#5C6A66;
+      --line:#D5DCDA; --line-2:#C2CBC8; --grid:#00000010;
+      --accent:#0A8B6E; --accent-soft:#0a8b6e1c;
+      --supply:#C1571A; --supply-soft:#c1571a18;
+      --retrieval:#3F51A8; --retrieval-soft:#3f51a818;
+      --surface:#FCFCFB; --surface-2:#EDF0EE;
+      --sans:"Apple SD Gothic Neo","Pretendard","Malgun Gothic","Noto Sans KR","Helvetica Neue",sans-serif;
+      --mono:"SF Mono","JetBrains Mono","D2Coding",ui-monospace,Menlo,monospace;
+    }
+    @media (prefers-color-scheme: dark){
+      svg{
+        --bg:#141B19; --sf2:#1F2825; --ink:#E4EBE8; --ink-2:#C3CFCB; --muted:#93A29D;
+        --line:#2A3532; --line-2:#3F4C48; --grid:#ffffff10;
+        --accent:#22A88F; --accent-soft:#22a88f24;
+        --supply:#D07C28; --supply-soft:#d07c2822;
+        --retrieval:#6E85DD; --retrieval-soft:#6e85dd22;
+        --surface:#141B19; --surface-2:#1F2825;
+      }
+    }
+    .page{fill:var(--bg)}
+    .bx{fill:var(--sf2); stroke:var(--line-2); stroke-width:1}
+    .bx-a{fill:var(--accent-soft); stroke:var(--accent); stroke-width:1.4}
+    .t{font-family:var(--sans); font-size:13px; font-weight:500; fill:var(--ink)}
+    .t-b{font-family:var(--sans); font-size:13.5px; font-weight:700; fill:var(--ink)}
+    .t-s{font-family:var(--sans); font-size:11.5px; fill:var(--muted)}
+    .m{font-family:var(--mono); font-size:10px; fill:var(--muted)}
+    .m-b{font-family:var(--mono); font-size:11px; font-weight:600; fill:var(--ink)}
+    .num{font-family:var(--mono); font-size:11.5px; font-weight:600; fill:var(--ink)}
+    .ln{stroke:var(--ink-2); stroke-width:1.4; fill:none}
+    .ln-a{stroke:var(--accent); stroke-width:1.6; fill:none}
+    .ln-d{stroke:var(--line-2); stroke-width:1; stroke-dasharray:3 3; fill:none}
+    .grid{stroke:var(--grid); stroke-width:1}
+    .axis{stroke:var(--line-2); stroke-width:1}
+    .h1{font-family:var(--sans); font-size:19px; font-weight:700; fill:var(--ink)}
+    .h2{font-family:var(--sans); font-size:13px; font-weight:600; fill:var(--accent)}
+    .step{font-family:var(--mono); font-size:12px; font-weight:600; fill:var(--accent); letter-spacing:.08em}
+    .cap{font-family:var(--sans); font-size:12.5px; fill:var(--muted)}
+    .capb{font-family:var(--sans); font-size:12.5px; font-weight:700; fill:var(--ink-2)}
+  </style>
+
+<rect class="page" x="0" y="0" width="812" height="598"/>
+<text x="26" y="30" class="step">01</text>
+<text x="64" y="31" class="h1">대여·반납 수요 → 예측 재고 곡선 → action_type</text>
+<line x1="26" y1="46" x2="786" y2="46" stroke="var(--line)" stroke-width="1"/>
+<g transform="translate(26,66)">
+        <defs>
+          <marker id="a2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5.5" markerHeight="5.5" orient="auto-start-reverse">
+            <path d="M0,1 L9,5 L0,9 z" fill="var(--ink-2)"/>
+          </marker>
+        </defs>
+
+        <text x="0" y="18" class="m-b">대여소 A · hold_cnt 15대 · 현재 재고 12대</text>
+
+        <!-- zones -->
+        <rect x="90" y="44" width="610" height="102.8" fill="var(--retrieval-soft)"/>
+        <rect x="90" y="211.8" width="610" height="16.2" fill="var(--supply-soft)"/>
+        <text x="96" y="60" class="m" fill="var(--retrieval)">retrieval_needed 구간 (재고 ≥ 정원)</text>
+        <text x="694" y="224" class="m" text-anchor="end" fill="var(--supply)">supply_needed 구간 (재고 ≤ 정원의 20%)</text>
+
+        <!-- grid + y axis -->
+        <line x1="90" y1="228" x2="700" y2="228" class="axis"/>
+        <line x1="90" y1="65.6" x2="700" y2="65.6" class="grid"/>
+        <line x1="90" y1="119.8" x2="700" y2="119.8" class="grid"/>
+        <line x1="90" y1="173.9" x2="700" y2="173.9" class="grid"/>
+        <text x="82" y="232" class="m" text-anchor="end">0</text>
+        <text x="82" y="177.9" class="m" text-anchor="end">10</text>
+        <text x="82" y="123.8" class="m" text-anchor="end">20</text>
+        <text x="82" y="69.6" class="m" text-anchor="end">30</text>
+        <text x="0" y="40" class="m">재고(대)</text>
+
+        <!-- thresholds -->
+        <line x1="90" y1="146.8" x2="700" y2="146.8" stroke="var(--retrieval)" stroke-width="1.2" stroke-dasharray="5 3"/>
+        <text x="96" y="142" class="m" fill="var(--retrieval)">정원 15</text>
+        <line x1="90" y1="211.8" x2="700" y2="211.8" stroke="var(--supply)" stroke-width="1.2" stroke-dasharray="5 3"/>
+        <text x="96" y="207" class="m" fill="var(--supply)">0.20 × hold_cnt = 3</text>
+
+        <!-- stock line -->
+        <polyline points="90.0,163.1 191.7,141.4 293.3,108.9 395.0,71.1 496.7,54.8 598.3,81.9 700.0,108.9" fill="none" stroke="var(--ink-2)" stroke-width="2" stroke-linejoin="round"/>
+        <circle cx="90" cy="163.1" r="4.5" fill="var(--surface)" stroke="var(--ink-2)" stroke-width="2"/>
+        <circle cx="191.7" cy="141.4" r="4" fill="var(--ink-2)" stroke="var(--surface)" stroke-width="2"/>
+        <circle cx="293.3" cy="108.9" r="4" fill="var(--ink-2)" stroke="var(--surface)" stroke-width="2"/>
+        <circle cx="395" cy="71.1" r="4" fill="var(--ink-2)" stroke="var(--surface)" stroke-width="2"/>
+        <circle cx="496.7" cy="54.8" r="5.5" fill="var(--retrieval)" stroke="var(--surface)" stroke-width="2"/>
+        <circle cx="598.3" cy="81.9" r="4" fill="var(--ink-2)" stroke="var(--surface)" stroke-width="2"/>
+        <circle cx="700" cy="108.9" r="4" fill="var(--ink-2)" stroke="var(--surface)" stroke-width="2"/>
+
+        <text x="100" y="181" class="num">12</text>
+        <text x="203" y="126" class="num" fill="var(--retrieval)">16</text>
+        <text x="496.7" y="45" class="num" text-anchor="middle" fill="var(--retrieval)">32</text>
+
+        <!-- overshoot bracket -->
+        <path d="M520,54.8 L536,54.8 M520,146.8 L536,146.8 M532,54.8 L532,146.8" stroke="var(--retrieval)" stroke-width="1.2" fill="none"/>
+        <text x="542" y="96" class="m-b" fill="var(--retrieval)">초과 17대</text>
+        <text x="542" y="112" class="m" fill="var(--retrieval)">_max_overshoot</text>
+
+        <!-- first breach callout -->
+        <line x1="191.7" y1="141.4" x2="228" y2="196" class="ln-d" marker-start="url(#a2)" stroke="var(--ink-2)"/>
+        <text x="234" y="194" class="t-s">첫 이상 시점 = +1h</text>
+        <text x="234" y="210" class="m">→ 예측감지 60분</text>
+
+        <!-- x labels top panel -->
+        <text x="90" y="248" class="m" text-anchor="middle">현재</text>
+        <text x="191.7" y="248" class="m" text-anchor="middle">+1h</text>
+        <text x="293.3" y="248" class="m" text-anchor="middle">+2h</text>
+        <text x="395" y="248" class="m" text-anchor="middle">+3h</text>
+        <text x="496.7" y="248" class="m" text-anchor="middle">+4h</text>
+        <text x="598.3" y="248" class="m" text-anchor="middle">+5h</text>
+        <text x="700" y="248" class="m" text-anchor="middle">+6h</text>
+
+        <!-- divider -->
+        <line x1="0" y1="276" x2="760" y2="276" stroke="var(--line)" stroke-width="1"/>
+        <text x="0" y="300" class="m-b">모델 원본 출력 — 시간대별 대여 / 반납 수요</text>
+
+        <!-- bottom panel -->
+        <line x1="90" y1="396" x2="700" y2="396" class="axis"/>
+        <line x1="90" y1="348" x2="700" y2="348" class="grid"/>
+        <text x="82" y="400" class="m" text-anchor="end">0</text>
+        <text x="82" y="352" class="m" text-anchor="end">5</text>
+        <text x="82" y="316" class="m" text-anchor="end">10</text>
+
+        <rect x="175.7" y="376.8" width="14" height="19.2" rx="2" fill="var(--supply)"/>
+        <rect x="193.7" y="338.4" width="14" height="57.6" rx="2" fill="var(--retrieval)"/>
+        <rect x="277.3" y="367.2" width="14" height="28.8" rx="2" fill="var(--supply)"/>
+        <rect x="295.3" y="309.6" width="14" height="86.4" rx="2" fill="var(--retrieval)"/>
+        <rect x="379.0" y="367.2" width="14" height="28.8" rx="2" fill="var(--supply)"/>
+        <rect x="397.0" y="300.0" width="14" height="96.0" rx="2" fill="var(--retrieval)"/>
+        <rect x="480.7" y="357.6" width="14" height="38.4" rx="2" fill="var(--supply)"/>
+        <rect x="498.7" y="328.8" width="14" height="67.2" rx="2" fill="var(--retrieval)"/>
+        <rect x="582.3" y="309.6" width="14" height="86.4" rx="2" fill="var(--supply)"/>
+        <rect x="600.3" y="357.6" width="14" height="38.4" rx="2" fill="var(--retrieval)"/>
+        <rect x="684.0" y="319.2" width="14" height="76.8" rx="2" fill="var(--supply)"/>
+        <rect x="702.0" y="367.2" width="14" height="28.8" rx="2" fill="var(--retrieval)"/>
+
+        <text x="182.7" y="371" class="m" text-anchor="middle" fill="var(--supply)">2</text>
+        <text x="200.7" y="332" class="m" text-anchor="middle" fill="var(--retrieval)">6</text>
+        <text x="404" y="294" class="m" text-anchor="middle" fill="var(--retrieval)">10</text>
+        <text x="589.3" y="304" class="m" text-anchor="middle" fill="var(--supply)">9</text>
+
+        <text x="191.7" y="414" class="m" text-anchor="middle">+1h</text>
+        <text x="293.3" y="414" class="m" text-anchor="middle">+2h</text>
+        <text x="395" y="414" class="m" text-anchor="middle">+3h</text>
+        <text x="496.7" y="414" class="m" text-anchor="middle">+4h</text>
+        <text x="598.3" y="414" class="m" text-anchor="middle">+5h</text>
+        <text x="700" y="414" class="m" text-anchor="middle">+6h</text>
+        
+      </g>
+<line x1="26" y1="528" x2="786" y2="528" stroke="var(--line)" stroke-width="1"/>
+<text x="26" y="548" class="capb">아래 두 줄이 모델이 실제로 내놓는 값이고, 위 곡선은 (반납 − 대여)를 누적해 만든 파생값이다. 정원 15대를 처음 넘는</text>
+<text x="26" y="566" class="cap">+1h가 시급성의 후보 시점, 가장 크게 넘는 +4h의 초과 17대가 심각도의 재료가 된다.</text>
+</svg>

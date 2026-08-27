@@ -1,0 +1,81 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 812 388" width="812" height="388">
+
+  <style>
+    svg{
+      --bg:#FCFCFB; --sf2:#EDF0EE; --ink:#131A18; --ink-2:#3A4744; --muted:#5C6A66;
+      --line:#D5DCDA; --line-2:#C2CBC8; --grid:#00000010;
+      --accent:#0A8B6E; --accent-soft:#0a8b6e1c;
+      --supply:#C1571A; --supply-soft:#c1571a18;
+      --retrieval:#3F51A8; --retrieval-soft:#3f51a818;
+      --surface:#FCFCFB; --surface-2:#EDF0EE;
+      --sans:"Apple SD Gothic Neo","Pretendard","Malgun Gothic","Noto Sans KR","Helvetica Neue",sans-serif;
+      --mono:"SF Mono","JetBrains Mono","D2Coding",ui-monospace,Menlo,monospace;
+    }
+    @media (prefers-color-scheme: dark){
+      svg{
+        --bg:#141B19; --sf2:#1F2825; --ink:#E4EBE8; --ink-2:#C3CFCB; --muted:#93A29D;
+        --line:#2A3532; --line-2:#3F4C48; --grid:#ffffff10;
+        --accent:#22A88F; --accent-soft:#22a88f24;
+        --supply:#D07C28; --supply-soft:#d07c2822;
+        --retrieval:#6E85DD; --retrieval-soft:#6e85dd22;
+        --surface:#141B19; --surface-2:#1F2825;
+      }
+    }
+    .page{fill:var(--bg)}
+    .bx{fill:var(--sf2); stroke:var(--line-2); stroke-width:1}
+    .bx-a{fill:var(--accent-soft); stroke:var(--accent); stroke-width:1.4}
+    .t{font-family:var(--sans); font-size:13px; font-weight:500; fill:var(--ink)}
+    .t-b{font-family:var(--sans); font-size:13.5px; font-weight:700; fill:var(--ink)}
+    .t-s{font-family:var(--sans); font-size:11.5px; fill:var(--muted)}
+    .m{font-family:var(--mono); font-size:10px; fill:var(--muted)}
+    .m-b{font-family:var(--mono); font-size:11px; font-weight:600; fill:var(--ink)}
+    .num{font-family:var(--mono); font-size:11.5px; font-weight:600; fill:var(--ink)}
+    .ln{stroke:var(--ink-2); stroke-width:1.4; fill:none}
+    .ln-a{stroke:var(--accent); stroke-width:1.6; fill:none}
+    .ln-d{stroke:var(--line-2); stroke-width:1; stroke-dasharray:3 3; fill:none}
+    .grid{stroke:var(--grid); stroke-width:1}
+    .axis{stroke:var(--line-2); stroke-width:1}
+    .h1{font-family:var(--sans); font-size:19px; font-weight:700; fill:var(--ink)}
+    .h2{font-family:var(--sans); font-size:13px; font-weight:600; fill:var(--accent)}
+    .step{font-family:var(--mono); font-size:12px; font-weight:600; fill:var(--accent); letter-spacing:.08em}
+    .cap{font-family:var(--sans); font-size:12.5px; fill:var(--muted)}
+    .capb{font-family:var(--sans); font-size:12.5px; font-weight:700; fill:var(--ink-2)}
+  </style>
+
+<rect class="page" x="0" y="0" width="812" height="388"/>
+<text x="26" y="30" class="step">04</text>
+<text x="64" y="31" class="h1">urgency_score = 100 × 시급성 × 심각도, 그리고 bike_qty</text>
+<line x1="26" y1="46" x2="786" y2="46" stroke="var(--line)" stroke-width="1"/>
+<text x="26" y="78" class="h2">urgency_score = 100 × time_factor × impact_factor  (둘 다 0~1이므로 점수는 0~100)</text>
+<g transform="translate(26,92)">
+        <text x="0" y="16" class="m-b">_severity_qty (랭킹용, 클램프 없음) &nbsp;→&nbsp; bike_qty (트럭에 실제로 싣고 내릴 대수)</text>
+
+        <!-- row A -->
+        <text x="172" y="52" class="t" text-anchor="end">대여소 A</text>
+        <text x="172" y="68" class="m" text-anchor="end">retrieval</text>
+        <rect x="180" y="40" width="264" height="30" rx="2" fill="var(--retrieval)"/>
+        <rect x="444" y="40" width="110" height="30" rx="2" fill="var(--retrieval-soft)" stroke="var(--retrieval)" stroke-width="1" stroke-dasharray="3 3"/>
+        <text x="312" y="60" class="num" fill="var(--surface)" text-anchor="middle">12대 적재</text>
+        <text x="499" y="60" class="m" fill="var(--retrieval)" text-anchor="middle">+5 잘림</text>
+        <line x1="444" y1="32" x2="444" y2="86" stroke="var(--ink)" stroke-width="1.6"/>
+        <text x="450" y="98" class="m">지금 재고 12대 — 없는 걸 실을 순 없다</text>
+        <text x="560" y="60" class="m">_severity_qty 17</text>
+
+        <!-- row B -->
+        <text x="172" y="140" class="t" text-anchor="end">대여소 B</text>
+        <text x="172" y="156" class="m" text-anchor="end">supply</text>
+        <rect x="180" y="128" width="220" height="30" rx="2" fill="var(--supply)"/>
+        <text x="290" y="148" class="num" fill="var(--surface)" text-anchor="middle">10대 하차</text>
+        <line x1="488" y1="120" x2="488" y2="174" stroke="var(--ink)" stroke-width="1.6" stroke-dasharray="4 3"/>
+        <text x="494" y="186" class="m">빈 거치대 14개 — 한도에 안 걸려 그대로 통과</text>
+        <text x="404" y="118" class="m">_severity_qty 10</text>
+
+        <line x1="180" y1="196" x2="180" y2="204" class="axis"/>
+        <line x1="180" y1="200" x2="620" y2="200" class="axis"/>
+        <text x="180" y="216" class="m" text-anchor="start">0대</text>
+        <text x="620" y="216" class="m" text-anchor="end">20대</text>
+      </g>
+<line x1="26" y1="318" x2="786" y2="318" stroke="var(--line)" stroke-width="1"/>
+<text x="26" y="338" class="capb">같은 대여소가 두 개의 수량을 갖는다. 심각도 계산에는 잘리지 않은 원본값이 들어가고(그래야 극단치까지 서열이 남는다),</text>
+<text x="26" y="356" class="cap">트럭 지시서에는 물리적 한계로 자른 값이 나간다.</text>
+</svg>

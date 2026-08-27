@@ -1,0 +1,114 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1286 532" width="1286" height="532">
+
+  <style>
+    svg{
+      --bg:#FCFCFB; --sf2:#EDF0EE; --ink:#131A18; --ink-2:#3A4744; --muted:#5C6A66;
+      --line:#D5DCDA; --line-2:#C2CBC8; --grid:#00000010;
+      --accent:#0A8B6E; --accent-soft:#0a8b6e1c;
+      --supply:#C1571A; --supply-soft:#c1571a18;
+      --retrieval:#3F51A8; --retrieval-soft:#3f51a818;
+      --surface:#FCFCFB; --surface-2:#EDF0EE;
+      --sans:"Apple SD Gothic Neo","Pretendard","Malgun Gothic","Noto Sans KR","Helvetica Neue",sans-serif;
+      --mono:"SF Mono","JetBrains Mono","D2Coding",ui-monospace,Menlo,monospace;
+    }
+    @media (prefers-color-scheme: dark){
+      svg{
+        --bg:#141B19; --sf2:#1F2825; --ink:#E4EBE8; --ink-2:#C3CFCB; --muted:#93A29D;
+        --line:#2A3532; --line-2:#3F4C48; --grid:#ffffff10;
+        --accent:#22A88F; --accent-soft:#22a88f24;
+        --supply:#D07C28; --supply-soft:#d07c2822;
+        --retrieval:#6E85DD; --retrieval-soft:#6e85dd22;
+        --surface:#141B19; --surface-2:#1F2825;
+      }
+    }
+    .page{fill:var(--bg)}
+    .bx{fill:var(--sf2); stroke:var(--line-2); stroke-width:1}
+    .bx-a{fill:var(--accent-soft); stroke:var(--accent); stroke-width:1.4}
+    .t{font-family:var(--sans); font-size:13px; font-weight:500; fill:var(--ink)}
+    .t-b{font-family:var(--sans); font-size:13.5px; font-weight:700; fill:var(--ink)}
+    .t-s{font-family:var(--sans); font-size:11.5px; fill:var(--muted)}
+    .m{font-family:var(--mono); font-size:10px; fill:var(--muted)}
+    .m-b{font-family:var(--mono); font-size:11px; font-weight:600; fill:var(--ink)}
+    .num{font-family:var(--mono); font-size:11.5px; font-weight:600; fill:var(--ink)}
+    .ln{stroke:var(--ink-2); stroke-width:1.4; fill:none}
+    .ln-a{stroke:var(--accent); stroke-width:1.6; fill:none}
+    .ln-d{stroke:var(--line-2); stroke-width:1; stroke-dasharray:3 3; fill:none}
+    .grid{stroke:var(--grid); stroke-width:1}
+    .axis{stroke:var(--line-2); stroke-width:1}
+    .h1{font-family:var(--sans); font-size:19px; font-weight:700; fill:var(--ink)}
+    .h2{font-family:var(--sans); font-size:13px; font-weight:600; fill:var(--accent)}
+    .step{font-family:var(--mono); font-size:12px; font-weight:600; fill:var(--accent); letter-spacing:.08em}
+    .cap{font-family:var(--sans); font-size:12.5px; fill:var(--muted)}
+    .capb{font-family:var(--sans); font-size:12.5px; font-weight:700; fill:var(--ink-2)}
+  </style>
+
+<rect class="page" x="0" y="0" width="1286" height="532"/>
+<text x="26" y="30" class="step">MAP</text>
+<text x="64" y="31" class="h1">전체 지형 — 배치 두 개와 그 사이의 parquet 하나</text>
+<line x1="26" y1="46" x2="1260" y2="46" stroke="var(--line)" stroke-width="1"/>
+<g transform="translate(26,66)">
+<defs>
+  <marker id="a1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+    <path d="M0,1 L9,5 L0,9 z" fill="var(--ink-2)"/></marker>
+  <marker id="a1t" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+    <path d="M0,1 L9,5 L0,9 z" fill="var(--accent)"/></marker>
+</defs>
+
+<path d="M300,32 L300,20 L1040,20 L1040,32" class="ln-d"/>
+<text x="670" y="14" class="m" text-anchor="middle">Airflow 5분 DAG · compute_urgency &gt;&gt; compute_routes</text>
+
+<rect x="14" y="52" width="200" height="62" rx="4" class="bx"/>
+<text x="32" y="78" class="t">실시간 재고 스냅샷</text>
+<text x="32" y="98" class="m">5분 tick · S3</text>
+<rect x="14" y="148" width="200" height="62" rx="4" class="bx"/>
+<text x="32" y="174" class="t">수요 예측 결과</text>
+<text x="32" y="194" class="m">ml 추론 · S3</text>
+
+<rect x="300" y="52" width="220" height="158" rx="5" class="bx-a"/>
+<text x="410" y="84" class="t-b" text-anchor="middle">compute_urgency</text>
+<text x="410" y="104" class="m" text-anchor="middle">main.py → urgency.py</text>
+<line x1="322" y1="120" x2="498" y2="120" class="ln-d"/>
+<text x="410" y="148" class="t-s" text-anchor="middle">대여소별 시급성 × 심각도</text>
+<text x="410" y="176" class="m-b" text-anchor="middle">urgency_score</text>
+
+<rect x="590" y="100" width="160" height="62" rx="4" class="bx"/>
+<text x="670" y="126" class="t" text-anchor="middle">urgency</text>
+<text x="670" y="146" class="m" text-anchor="middle">parquet · S3</text>
+
+<rect x="820" y="52" width="220" height="158" rx="5" class="bx-a"/>
+<text x="930" y="84" class="t-b" text-anchor="middle">compute_routes</text>
+<text x="930" y="104" class="m" text-anchor="middle">routes_main.py → routes.py</text>
+<line x1="842" y1="120" x2="1018" y2="120" class="ln-d"/>
+<text x="930" y="148" class="t-s" text-anchor="middle">11개 권역 · 용량 20대 그리디</text>
+<text x="930" y="176" class="m-b" text-anchor="middle">route + stops</text>
+
+<rect x="1090" y="100" width="130" height="62" rx="4" class="bx"/>
+<text x="1155" y="126" class="t" text-anchor="middle">routes</text>
+<text x="1155" y="146" class="m" text-anchor="middle">parquet · S3</text>
+
+<line x1="216" y1="83" x2="294" y2="108" class="ln" marker-end="url(#a1)"/>
+<line x1="216" y1="179" x2="294" y2="154" class="ln" marker-end="url(#a1)"/>
+<line x1="522" y1="131" x2="584" y2="131" class="ln-a" marker-end="url(#a1t)"/>
+<line x1="752" y1="131" x2="814" y2="131" class="ln-a" marker-end="url(#a1t)"/>
+<line x1="1042" y1="131" x2="1084" y2="131" class="ln-a" marker-end="url(#a1t)"/>
+
+<rect x="380" y="316" width="520" height="62" rx="4" class="bx"/>
+<text x="640" y="342" class="t" text-anchor="middle">RDS</text>
+<text x="640" y="362" class="m" text-anchor="middle">station_urgency · rebalance_routes · rebalance_route_stops · stations</text>
+
+<line x1="670" y1="164" x2="670" y2="310" class="ln" marker-end="url(#a1)"/>
+<text x="680" y="246" class="m">loader 적재</text>
+<polyline points="1155,164 1155,347 906,347" class="ln" fill="none" marker-end="url(#a1)"/>
+<text x="1165" y="246" class="m">loader</text>
+
+<line x1="450" y1="316" x2="450" y2="216" class="ln-d" marker-end="url(#a1)" stroke="var(--ink-2)"/>
+<text x="440" y="266" class="m" text-anchor="end">sta_id FK 필터</text>
+<line x1="860" y1="316" x2="860" y2="216" class="ln-d" marker-end="url(#a1)" stroke="var(--ink-2)"/>
+<text x="870" y="260" class="m">dispatched</text>
+<text x="870" y="276" class="m">넷팅 조회</text>
+
+<text x="14" y="398" class="m">— 실선: 계산 흐름     ┄ 점선: 두 배치가 RDS를 건드리는 유일한 두 지점</text>
+</g>
+<line x1="26" y1="480" x2="1260" y2="480" stroke="var(--line)" stroke-width="1"/>
+<text x="26" y="500" class="capb">계산은 거의 전부 S3 위에서 일어난다. compute_routes는 urgency를 다시 계산하지 않고 앞 배치가 써둔 parquet을 그대로 읽는다.</text>
+</svg>

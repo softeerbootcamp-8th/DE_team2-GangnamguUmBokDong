@@ -1,0 +1,143 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 812 916" width="812" height="916">
+
+  <style>
+    svg{
+      --bg:#FCFCFB; --sf2:#EDF0EE; --ink:#131A18; --ink-2:#3A4744; --muted:#5C6A66;
+      --line:#D5DCDA; --line-2:#C2CBC8; --grid:#00000010;
+      --accent:#0A8B6E; --accent-soft:#0a8b6e1c;
+      --supply:#C1571A; --supply-soft:#c1571a18;
+      --retrieval:#3F51A8; --retrieval-soft:#3f51a818;
+      --surface:#FCFCFB; --surface-2:#EDF0EE;
+      --sans:"Apple SD Gothic Neo","Pretendard","Malgun Gothic","Noto Sans KR","Helvetica Neue",sans-serif;
+      --mono:"SF Mono","JetBrains Mono","D2Coding",ui-monospace,Menlo,monospace;
+    }
+    @media (prefers-color-scheme: dark){
+      svg{
+        --bg:#141B19; --sf2:#1F2825; --ink:#E4EBE8; --ink-2:#C3CFCB; --muted:#93A29D;
+        --line:#2A3532; --line-2:#3F4C48; --grid:#ffffff10;
+        --accent:#22A88F; --accent-soft:#22a88f24;
+        --supply:#D07C28; --supply-soft:#d07c2822;
+        --retrieval:#6E85DD; --retrieval-soft:#6e85dd22;
+        --surface:#141B19; --surface-2:#1F2825;
+      }
+    }
+    .page{fill:var(--bg)}
+    .bx{fill:var(--sf2); stroke:var(--line-2); stroke-width:1}
+    .bx-a{fill:var(--accent-soft); stroke:var(--accent); stroke-width:1.4}
+    .t{font-family:var(--sans); font-size:13px; font-weight:500; fill:var(--ink)}
+    .t-b{font-family:var(--sans); font-size:13.5px; font-weight:700; fill:var(--ink)}
+    .t-s{font-family:var(--sans); font-size:11.5px; fill:var(--muted)}
+    .m{font-family:var(--mono); font-size:10px; fill:var(--muted)}
+    .m-b{font-family:var(--mono); font-size:11px; font-weight:600; fill:var(--ink)}
+    .num{font-family:var(--mono); font-size:11.5px; font-weight:600; fill:var(--ink)}
+    .ln{stroke:var(--ink-2); stroke-width:1.4; fill:none}
+    .ln-a{stroke:var(--accent); stroke-width:1.6; fill:none}
+    .ln-d{stroke:var(--line-2); stroke-width:1; stroke-dasharray:3 3; fill:none}
+    .grid{stroke:var(--grid); stroke-width:1}
+    .axis{stroke:var(--line-2); stroke-width:1}
+    .h1{font-family:var(--sans); font-size:19px; font-weight:700; fill:var(--ink)}
+    .h2{font-family:var(--sans); font-size:13px; font-weight:600; fill:var(--accent)}
+    .step{font-family:var(--mono); font-size:12px; font-weight:600; fill:var(--accent); letter-spacing:.08em}
+    .cap{font-family:var(--sans); font-size:12.5px; fill:var(--muted)}
+    .capb{font-family:var(--sans); font-size:12.5px; font-weight:700; fill:var(--ink-2)}
+  </style>
+
+<rect class="page" x="0" y="0" width="812" height="916"/>
+<text x="26" y="30" class="step">06</text>
+<text x="64" y="31" class="h1">라우트 (2) — 누가 먼저, 몇 번째로</text>
+<line x1="26" y1="46" x2="786" y2="46" stroke="var(--line)" stroke-width="1"/>
+<text x="26" y="78" class="h2">긴급도 내림차순으로 트럭 20대를 채운다</text>
+<g transform="translate(26,92)">
+        <text x="0" y="16" class="m-b">한 권역의 잔여 수요 — urgency_score 내림차순</text>
+
+        <!-- candidate list -->
+        <text x="0" y="44" class="m">픽업</text>
+        <text x="60" y="44" class="num" fill="var(--retrieval)">71.4</text><text x="112" y="44" class="t-s">P1 · 9대</text>
+        <text x="196" y="44" class="num" fill="var(--retrieval)">53.0</text><text x="248" y="44" class="t-s">P2 · 12대</text>
+        <text x="336" y="44" class="num" fill="var(--retrieval)">44.2</text><text x="388" y="44" class="t-s">P3 · 8대</text>
+        <text x="0" y="66" class="m">드롭</text>
+        <text x="60" y="66" class="num" fill="var(--supply)">31.5</text><text x="112" y="66" class="t-s">D1 · 10대</text>
+        <text x="196" y="66" class="num" fill="var(--supply)">23.1</text><text x="248" y="66" class="t-s">D2 · 10대</text>
+
+        <line x1="0" y1="86" x2="760" y2="86" stroke="var(--line)" stroke-width="1"/>
+
+        <!-- truck 1 -->
+        <text x="140" y="126" class="t-b" text-anchor="end">라우트 1</text>
+        <text x="140" y="142" class="m" text-anchor="end">트럭 1회차</text>
+        <rect x="150" y="106" width="446" height="34" rx="3" fill="none" stroke="var(--line-2)" stroke-width="1"/>
+        <rect x="150" y="106" width="198" height="34" rx="2" fill="var(--retrieval)"/>
+        <rect x="350" y="106" width="242" height="34" rx="2" fill="var(--retrieval)"/>
+        <text x="249" y="128" class="num" fill="var(--surface)" text-anchor="middle">P1 · 9</text>
+        <text x="471" y="128" class="num" fill="var(--surface)" text-anchor="middle">P2 · 11 &nbsp;(12 중 11만)</text>
+        <text x="608" y="128" class="m">용량 20/20 — 드롭 자리 없음</text>
+
+        <!-- leftover arrows -->
+        <path d="M592,142 L592,164 L172,164 L172,190" fill="none" stroke="var(--supply)" stroke-width="1.4" stroke-dasharray="4 3" marker-end="url(#a5)"/>
+        <text x="380" y="160" class="m" text-anchor="middle" fill="var(--supply)">잘린 1대는 버리지 않고 다음 회차로</text>
+        <defs>
+          <marker id="a5" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5.5" markerHeight="5.5" orient="auto-start-reverse">
+            <path d="M0,1 L9,5 L0,9 z" fill="var(--supply)"/>
+          </marker>
+        </defs>
+
+        <!-- truck 2 -->
+        <text x="140" y="216" class="t-b" text-anchor="end">라우트 2</text>
+        <text x="140" y="232" class="m" text-anchor="end">트럭 2회차</text>
+        <rect x="150" y="196" width="446" height="34" rx="3" fill="none" stroke="var(--line-2)" stroke-width="1"/>
+        <rect x="150" y="196" width="22" height="34" rx="2" fill="var(--retrieval)"/>
+        <rect x="174" y="196" width="176" height="34" rx="2" fill="var(--retrieval)"/>
+        <rect x="352" y="196" width="220" height="34" rx="2" fill="var(--supply)"/>
+        <rect x="574" y="196" width="22" height="34" rx="2" fill="var(--supply)"/>
+        <text x="262" y="218" class="num" fill="var(--surface)" text-anchor="middle">P3 · 8</text>
+        <text x="462" y="218" class="num" fill="var(--surface)" text-anchor="middle">D1 · 10</text>
+        <text x="161" y="248" class="m" text-anchor="middle" fill="var(--retrieval)">P2 1</text>
+        <text x="585" y="248" class="m" text-anchor="middle" fill="var(--supply)">D2 1</text>
+        <text x="608" y="218" class="m">픽업 9 + 드롭 11</text>
+
+        <line x1="0" y1="272" x2="760" y2="272" stroke="var(--line)" stroke-width="1"/>
+        <text x="0" y="296" class="t-s">D2의 남은 9대는 다음 5분 사이클로 이월된다 — 이번 배치의 트럭은 여기까지.</text>
+        <text x="0" y="322" class="m" fill="var(--supply)">픽업이 하나도 없으면 드롭 수요만 있어도 라우트를 만들지 않는다 — 채워줄 자전거를 어디서도 구할 수 없기 때문.</text>
+        <text x="0" y="344" class="m" fill="var(--retrieval)">반대로 드롭 대상이 없어도 픽업만 있는 라우트는 유효하다 — 다음 사이클 재분배용으로 실어둔다.</text>
+        <text x="0" y="366" class="m">눈금: 막대 하나의 전체 폭 = 트럭 용량 20대 (TRUCK_CAPACITY)</text>
+      </g>
+<text x="26" y="506" class="h2">센터에서 출발해 픽업 전부 → 드롭 전부 순으로 돈다</text>
+<g transform="translate(26,520)">
+<defs>
+  <marker id="a6" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse">
+    <path d="M0,1 L9,5 L0,9 z" fill="var(--retrieval)"/></marker>
+  <marker id="a7" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse">
+    <path d="M0,1 L9,5 L0,9 z" fill="var(--supply)"/></marker>
+</defs>
+<text x="0" y="16" class="m-b">방문 순서 = 최근접 탐욕 (픽업 전부 → 드롭 전부)</text>
+
+<polyline points="90,185 190,105 290,140 250,240" fill="none" stroke="var(--retrieval)" stroke-width="2" marker-end="url(#a6)"/>
+<polyline points="90,185 440,60 545,170 640,70" fill="none" stroke="var(--supply)" stroke-width="2" marker-end="url(#a7)"/>
+<path d="M250,240 C330,262 390,160 434,72" fill="none" stroke="var(--line-2)" stroke-width="1.4" stroke-dasharray="4 3"/>
+
+<path d="M90,173 L100,191 L80,191 z" fill="var(--accent)"/>
+<circle cx="90" cy="185" r="11" fill="none" stroke="var(--accent)" stroke-width="2"/>
+<text x="90" y="217" class="t-b" text-anchor="middle" fill="var(--accent)">지역센터</text>
+<text x="90" y="233" class="m" text-anchor="middle">depot</text>
+
+<circle cx="190" cy="105" r="13" fill="var(--retrieval)"/><text x="190" y="110" class="num" fill="var(--surface)" text-anchor="middle">1</text>
+<circle cx="290" cy="140" r="13" fill="var(--retrieval)"/><text x="290" y="145" class="num" fill="var(--surface)" text-anchor="middle">2</text>
+<circle cx="250" cy="240" r="13" fill="var(--retrieval)"/><text x="250" y="245" class="num" fill="var(--surface)" text-anchor="middle">3</text>
+<text x="190" y="83" class="t-s" text-anchor="middle">P1 · 9대 싣기</text>
+<text x="312" y="136" class="t-s">P2 · 11대 싣기</text>
+<text x="230" y="245" class="t-s" text-anchor="end">P3</text>
+
+<circle cx="440" cy="60" r="13" fill="var(--supply)"/><text x="440" y="65" class="num" fill="var(--surface)" text-anchor="middle">4</text>
+<circle cx="545" cy="170" r="13" fill="var(--supply)"/><text x="545" y="175" class="num" fill="var(--surface)" text-anchor="middle">5</text>
+<circle cx="640" cy="70" r="13" fill="var(--supply)"/><text x="640" y="75" class="num" fill="var(--surface)" text-anchor="middle">6</text>
+<text x="440" y="38" class="t-s" text-anchor="middle">D1 · 10대 내리기</text>
+<text x="566" y="182" class="t-s">D2</text>
+<text x="640" y="48" class="t-s" text-anchor="middle">D3</text>
+
+<line x1="0" y1="272" x2="760" y2="272" stroke="var(--line)" stroke-width="1"/>
+<text x="0" y="294" class="m">픽업 구간과 드롭 구간의 순서는 각각 depot을 기준으로 따로 계산된다 —</text>
+<text x="0" y="310" class="m">드롭 첫 지점(4)은 마지막 픽업(3)이 아니라 센터에서 가장 가까운 곳이다. ┄ 는 실제 이동 구간.</text>
+</g>
+<line x1="26" y1="846" x2="786" y2="846" stroke="var(--line)" stroke-width="1"/>
+<text x="26" y="866" class="capb">부분 적재를 남기는 게 핵심이다. 용량이 모자란다고 통째로 빼면 그 대여소의 남은 수요가 이번 배치에서 사라진다.</text>
+<text x="26" y="884" class="cap">urgency_score는 &#x27;몇 대&#x27;가 아니라 &#x27;누가 먼저&#x27;만 결정한다.</text>
+</svg>
