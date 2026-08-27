@@ -39,6 +39,8 @@ vi.mock("./components/Header", () => ({
     <div>
       <span>header</span>
       <button type="button" onClick={() => onRegionChange("다른센터")}>권역 변경</button>
+      <button type="button" onClick={() => onRegionChange("강북")}>강북 선택</button>
+      <button type="button" onClick={() => onRegionChange("강남")}>강남 선택</button>
     </div>
   ),
 }));
@@ -61,6 +63,11 @@ vi.mock("./components/StationMap", () => ({
       <button type="button" onClick={() => onSelect("ST-2")}>
         두 번째 대여소 선택
       </button>
+      {stations.some((station) => station.sta_id === "ST-3") && (
+        <button type="button" onClick={() => onSelect("ST-3")}>
+          세 번째 대여소 선택
+        </button>
+      )}
     </div>
   ),
 }));
@@ -259,6 +266,71 @@ afterEach(() => {
 });
 
 describe("App polling state", () => {
+  it("관리소 선택 시 같은 관리소의 센터 데이터만 표시한다", async () => {
+    const gangbukStation = {
+      ...STATIONS[0],
+      sta_id: "ST-3",
+      sta_nm: "강북 대여소",
+      region: "도봉",
+    };
+    const gangbukAlert = {
+      ...ALERTS[0],
+      sta_id: "ST-3",
+      sta_nm: "강북 대여소",
+      region: "도봉",
+    };
+    const gangbukRoute = {
+      ...ROUTES[0],
+      route_id: "22222222-2222-4222-8222-222222222222",
+      region: "도봉",
+    };
+    apiMock.stations.mockResolvedValue([...STATIONS, gangbukStation]);
+    apiMock.alerts.mockResolvedValue([...ALERTS, gangbukAlert]);
+    apiMock.routes.mockResolvedValueOnce(ROUTES).mockResolvedValueOnce([...ROUTES, gangbukRoute]);
+    render(<App />);
+    await settleRequests();
+    await settleRequests();
+
+    fireEvent.click(screen.getByRole("button", { name: "강남 선택" }));
+    await settleRequests();
+
+    expect(apiMock.routes).toHaveBeenLastCalledWith({
+      region: undefined,
+      closedWithinMinutes: 60,
+      limit: 500,
+      offset: 0,
+    });
+    expect(screen.getByTestId("map-stations").textContent).toBe("ST-1,ST-2");
+    expect(screen.getByTestId("map-alerts").textContent).toBe("ST-1");
+    expect(screen.getByTestId("map-route").textContent).toBe(ROUTES[0].route_id);
+  });
+
+  it("관리소 변경 시 새 관리소 밖의 선택 대여소와 forecast를 초기화한다", async () => {
+    const gangbukStation = {
+      ...STATIONS[0],
+      sta_id: "ST-3",
+      sta_nm: "강북 대여소",
+      region: "도봉",
+    };
+    apiMock.stations.mockResolvedValue([...STATIONS, gangbukStation]);
+    apiMock.routes.mockResolvedValue([]);
+    render(<App />);
+    await settleRequests();
+    await settleRequests();
+
+    fireEvent.click(screen.getByRole("button", { name: "대여소" }));
+    fireEvent.click(screen.getByRole("button", { name: "강북 선택" }));
+    fireEvent.click(screen.getByRole("button", { name: "세 번째 대여소 선택" }));
+    await settleRequests();
+    expect(screen.getByTestId("detail-station").textContent).toBe("ST-3");
+    expect(screen.getByTestId("forecast-state").textContent).toContain(FORECAST.base_dttm);
+
+    fireEvent.click(screen.getByRole("button", { name: "강남 선택" }));
+
+    expect(screen.getByTestId("detail-station").textContent).toBe("none");
+    expect(screen.getByTestId("forecast-state").textContent).toBe("empty");
+  });
+
   it("측정 전 패널을 절반으로 배치하고 사용자 조절 제한을 두지 않는다", async () => {
     apiMock.stations.mockResolvedValue(STATIONS);
     render(<App />);
