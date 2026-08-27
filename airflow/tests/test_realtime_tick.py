@@ -1,7 +1,8 @@
 """단일 realtime tick DAG(5분 격자 + 날씨 freshness gate)를 검증한다."""
 
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from itertools import pairwise
+from types import SimpleNamespace
 
 import pytest
 from airflow.providers.standard.operators.bash import BashOperator
@@ -10,6 +11,7 @@ from airflow.providers.standard.operators.python import ShortCircuitOperator
 from airflow.task.trigger_rule import TriggerRule
 from airflow.timetables.trigger import CronTriggerTimetable
 
+import dags.realtime_tick as realtime_tick_dag
 from config.schedules import REALTIME_TICK_CRON, TIMEZONE
 from config.sources import REALTIME_5MIN_SOURCES, RENTAL_HISTORY_LOOKBACK_HOURS
 from dags.realtime_tick import dag
@@ -28,13 +30,14 @@ def test_schedule_is_five_minute_grid_without_catchup() -> None:
     assert TIMEZONE == "Asia/Seoul"
     assert dag.catchup is False
     assert dag.max_active_runs == 1
-    assert dag.dagrun_timeout == timedelta(minutes=5)
+    assert dag.dagrun_timeout == timedelta(minutes=15)
 
 
 def _core_task_ids() -> set[str]:
     return (
         {f"collect_{source}" for source in REALTIME_5MIN_SOURCES}
         | {
+            "allow_current_tick",
             "run_normalizer",
             "resolve_poi_master",
             "prepare_serving_plan",
@@ -51,6 +54,103 @@ def _core_task_ids() -> set[str]:
             for hour in range(1, RENTAL_HISTORY_LOOKBACK_HOURS + 1)
         }
     )
+
+
+def test_all_realtime_roots_wait_for_current_tick_gate() -> None:
+    """실제 작업의 모든 root는 stale run 판정 뒤에만 실행된다."""
+    gate = dag.get_task("allow_current_tick")
+    assert isinstance(gate, ShortCircuitOperator)
+    assert gate.retries == 0
+    assert gate.ignore_downstream_trigger_rules is True
+    assert gate.upstream_task_ids == set()
+    assert gate.downstream_task_ids == {
+        "resolve_poi_master",
+        "collect_bike_rental_history",
+        "collect_bike_station_realtime",
+        *{f"freshness_gate_{source}" for source in _WEATHER_SOURCES},
+    }
+
+
+def test_current_scheduled_tick_is_allowed(monkeypatch) -> None:
+    """1분 이내 scheduler 지연은 정상 실행으로 허용한다."""
+    logical_date = datetime(2026, 8, 27, 0, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(
+        realtime_tick_dag.pendulum,
+        "now",
+        lambda _tz: datetime(2026, 8, 27, 0, 0, 59, tzinfo=timezone.utc),
+    )
+    messages = []
+    monkeypatch.setattr(realtime_tick_dag, "send_message", messages.append)
+
+    assert realtime_tick_dag._allow_current_tick(
+        dag_run=SimpleNamespace(
+            run_id="scheduled__2026-08-27T00:00:00+00:00",
+            logical_date=logical_date,
+        )
+    ) is True
+    assert messages == []
+
+
+def test_stale_scheduled_tick_is_skipped_and_alerted(monkeypatch) -> None:
+    """1분 넘게 밀린 scheduled run은 Slack 알림 후 스킵한다."""
+    logical_date = datetime(2026, 8, 27, 0, 5, tzinfo=timezone.utc)
+    monkeypatch.setattr(
+        realtime_tick_dag.pendulum,
+        "now",
+        lambda _tz: datetime(2026, 8, 27, 0, 7, tzinfo=timezone.utc),
+    )
+    messages = []
+    monkeypatch.setattr(realtime_tick_dag, "send_message", messages.append)
+    monkeypatch.setattr(realtime_tick_dag, "de2_group_mention", lambda: "@de2조")
+
+    assert realtime_tick_dag._allow_current_tick(
+        dag_run=SimpleNamespace(
+            run_id="scheduled__2026-08-27T00:05:00+00:00",
+            logical_date=logical_date,
+        )
+    ) is False
+    assert len(messages) == 1
+    assert "120초" in messages[0]
+    assert "scheduled__2026-08-27T00:05:00+00:00" in messages[0]
+
+
+def test_manual_tick_is_always_allowed(monkeypatch) -> None:
+    """의도적으로 실행한 오래된 logical date는 스킵하지 않는다."""
+    monkeypatch.setattr(
+        realtime_tick_dag.pendulum,
+        "now",
+        lambda _tz: datetime(2026, 8, 27, 1, 0, tzinfo=timezone.utc),
+    )
+
+    assert realtime_tick_dag._allow_current_tick(
+        dag_run=SimpleNamespace(
+            run_id="manual__2026-08-27T00:00:00+00:00",
+            logical_date=datetime(2026, 8, 27, 0, 0, tzinfo=timezone.utc),
+        )
+    ) is True
+
+
+def test_stale_tick_is_still_skipped_when_slack_fails(monkeypatch, caplog) -> None:
+    """Slack 장애가 stale run 정리를 막지 않는다."""
+    logical_date = datetime(2026, 8, 27, 0, 5, tzinfo=timezone.utc)
+    monkeypatch.setattr(
+        realtime_tick_dag.pendulum,
+        "now",
+        lambda _tz: datetime(2026, 8, 27, 0, 7, tzinfo=timezone.utc),
+    )
+
+    def fail_to_send(_message: str) -> None:
+        raise RuntimeError("slack unavailable")
+
+    monkeypatch.setattr(realtime_tick_dag, "send_message", fail_to_send)
+
+    assert realtime_tick_dag._allow_current_tick(
+        dag_run=SimpleNamespace(
+            run_id="scheduled__2026-08-27T00:05:00+00:00",
+            logical_date=logical_date,
+        )
+    ) is False
+    assert "Slack 알림 전송에 실패" in caplog.text
 
 
 def test_dag_has_exactly_the_expected_tasks() -> None:

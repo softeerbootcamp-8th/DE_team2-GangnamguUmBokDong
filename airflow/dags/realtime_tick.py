@@ -19,11 +19,14 @@ REALTIME_TICK_CRON` 주석의 2026-08-22 실측 참고). 게다가 3시간짜리
 
 from __future__ import annotations
 
+import logging
 from datetime import timedelta
+from typing import Any
 
 import pendulum
 from airflow import DAG
 from airflow.providers.standard.operators.empty import EmptyOperator
+from airflow.providers.standard.operators.python import ShortCircuitOperator
 from airflow.task.trigger_rule import TriggerRule
 from airflow.timetables.trigger import CronTriggerTimetable
 
@@ -32,6 +35,7 @@ from config.schedules import (
     CATCHUP,
     MAX_ACTIVE_RUNS,
     REALTIME_TICK_CRON,
+    REALTIME_TICK_MAX_START_DELAY,
     REALTIME_TICK_RUN_TIMEOUT,
     TIMEZONE,
 )
@@ -42,6 +46,7 @@ from config.sources import (
     WEATHER_10MIN_SOURCE,
     WEATHER_ULTRA_SHORT_FORECAST_SOURCE,
 )
+from notifications.slack import de2_group_mention, send_message
 from orchestration.collector_task import (
     build_collector_replay_task,
     build_collector_task,
@@ -57,6 +62,8 @@ from orchestration.serving_task import (
     build_prepare_serving_task,
 )
 from orchestration.urgency_task import build_urgency_task
+
+logger = logging.getLogger(__name__)
 
 # 초단기(실황+예보)는 10분, 단기예보는 3시간 — 기상청이 그보다 자주 새 값을 내지
 # 않으므로, 마지막 성공 수집이 이보다 최근이면 이번 tick은 건너뛴다.
@@ -87,8 +94,38 @@ _WEATHER_COLLECTOR_TIMEOUTS = {
 }
 
 
+def _allow_current_tick(**context: Any) -> bool:
+    """정시에 가까운 scheduled run과 모든 수동 run만 실행한다."""
+    dag_run = context["dag_run"]
+    if not dag_run.run_id.startswith("scheduled__"):
+        return True
+
+    logical_date = dag_run.logical_date
+    if logical_date is None:
+        return True
+
+    now = pendulum.now("UTC")
+    start_delay = now - logical_date
+    if start_delay <= REALTIME_TICK_MAX_START_DELAY:
+        return True
+
+    message = (
+        f"{de2_group_mention()} :warning: "
+        "realtime_tick 지연 Run을 건너뜁니다.\n"
+        f"• run_id: `{dag_run.run_id}`\n"
+        f"• 예약 시각: `{logical_date.isoformat()}`\n"
+        f"• 시작 지연: `{int(start_delay.total_seconds())}초`\n"
+        "• 조치: 밀린 Run 전체를 skip하고 다음 5분 tick에서 재개합니다."
+    )
+    try:
+        send_message(message)
+    except Exception:
+        logger.exception("realtime_tick 지연 Slack 알림 전송에 실패했습니다")
+    return False
+
+
 def _build_realtime_tick_dag() -> DAG:
-    """realtime 체인 하나를 만든다. 날씨는 freshness gate로 매 tick 필요 여부를 정한다."""
+    """stale run gate와 날씨 freshness gate를 둔 realtime 체인을 만든다."""
     with DAG(
         dag_id="realtime_tick",
         schedule=CronTriggerTimetable(REALTIME_TICK_CRON, timezone=TIMEZONE),
@@ -98,6 +135,12 @@ def _build_realtime_tick_dag() -> DAG:
         dagrun_timeout=REALTIME_TICK_RUN_TIMEOUT,
         tags=["realtime"],
     ) as dag:
+        allow_current_tick = ShortCircuitOperator(
+            task_id="allow_current_tick",
+            python_callable=_allow_current_tick,
+            retries=0,
+            dag=dag,
+        )
         resolve_poi_master = build_poi_master_resolve_task(dag)
         collector_tasks = {
             source_id: build_collector_task(dag, source_id)
@@ -175,6 +218,13 @@ def _build_realtime_tick_dag() -> DAG:
             replay = build_collector_replay_task(dag, "bike_rental_history", hours_back)
             replay_chain >> replay
             replay_chain = replay
+
+        root_tasks = [
+            task
+            for task in dag.tasks
+            if task is not allow_current_tick and not task.upstream_task_ids
+        ]
+        allow_current_tick >> root_tasks
     return dag
 
 
