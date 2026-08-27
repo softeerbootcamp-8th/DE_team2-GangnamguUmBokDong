@@ -38,7 +38,7 @@ from core.gold_publication import (
     sha256_hex,
     validate_route_urgency_dependencies,
 )
-from core.scoring_config import URGENCY_SCORING_CONFIG_VERSION
+from core.scoring_config import SUPPLY_LOW_STOCK_RATIO, URGENCY_SCORING_CONFIG_VERSION
 from psycopg import Connection, Cursor
 from psycopg.pq import TransactionStatus
 from psycopg.rows import tuple_row
@@ -62,18 +62,18 @@ from .state import (
     read_state_manifest,
 )
 
-ROUTE_ALGORITHM_VERSION = "route-v4-supply-led-pickup-sla"
-TRUCK_CAPACITY = 20
-TRUCK_CAPACITY_CONFIG_VERSION = "truck-capacity-v1"
+ROUTE_ALGORITHM_VERSION = "route-v5-supply-led-mixed-fleet"
+FLEET_CAPACITIES = (20, 20, 15, 15)
+FLEET_CONFIG_VERSION = "mixed-fleet-v1-two-20-two-15-per-center"
+MAX_TRUCK_CAPACITY = max(FLEET_CAPACITIES)
 INITIAL_TRUCK_LOAD = 0
-MAX_STOPS_PER_ROUTE = 5
-MAX_ROUTES_PER_CENTER = 3
-ROUTE_WORK_UNIT_CONFIG_VERSION = "route-work-unit-v3-pickup-sla"
-PICKUP_DISPATCH_SLA_CONFIG_VERSION = "pickup-dispatch-sla-v1"
-PICKUP_DISPATCH_ASSUMED_SPEED_KMH = 20.0
-PICKUP_DISPATCH_SERVICE_MINUTES_PER_STOP = 3.0
-PICKUP_DISPATCH_MAX_LAG_MINUTES = 30.0
-ROUTE_PUBLISHER_VERSION = "gold-route-publisher-v3-pickup-sla"
+ROUTE_MAX_DURATION_MINUTES = 120.0
+ROUTE_ROAD_DISTANCE_FACTOR = 1.25
+ROUTE_ASSUMED_SPEED_KMH = 18.0
+ROUTE_SERVICE_MINUTES_PER_STOP = 4.0
+ROUTE_BIKE_HANDLING_MINUTES = 0.5
+SUPPLY_VISIT_TARGET_STOCK_RATIO = 0.40
+ROUTE_PUBLISHER_VERSION = "gold-route-publisher-v4-mixed-fleet"
 _MAX_DATABASE_REVISION = 2_147_483_647
 
 _STATION_ID = re.compile(r"ST-[0-9]+\Z")
@@ -131,26 +131,34 @@ class DispatchCenterTopology:
 
 @dataclass(frozen=True, slots=True)
 class StationRouteTopology:
-    """현재 Gold station의 경로 계산용 Point와 물리화된 센터 FK를 표현한다."""
+    """현재 Gold station의 경로 계산용 위치·센터·재고 물리 상태를 표현한다."""
 
     sta_id: str
     dispatch_center_id: str
     longitude: float
     latitude: float
     is_active: bool
+    hold_cnt: int = 1
+    current_bike_qty: int = 1
 
     def __post_init__(self) -> None:
-        """station ID·센터 FK·Point·활성 상태 타입을 검증한다."""
+        """station ID·센터 FK·Point·활성 상태·재고 타입을 검증한다."""
         _station_id(self.sta_id)
         _nonblank_text(self.dispatch_center_id, "station dispatch_center_id")
         _point(self.longitude, self.latitude, "station")
         if type(self.is_active) is not bool:
             raise ContractViolation("station is_active는 bool이어야 합니다.")
+        if type(self.hold_cnt) is not int or self.hold_cnt <= 0:
+            raise ContractViolation("station hold_cnt는 양수 integer여야 합니다.")
+        if type(self.current_bike_qty) is not int or self.current_bike_qty < 0:
+            raise ContractViolation(
+                "station current_bike_qty는 비음수 integer여야 합니다."
+            )
 
 
 @dataclass(frozen=True, slots=True)
 class RouteUrgencyInput:
-    """urgency artifact에서 route-v4가 소비하는 최소 typed 필드를 표현한다."""
+    """urgency artifact에서 route-v5가 소비하는 최소 typed 필드를 표현한다."""
 
     sta_id: str
     urgency_score: float
@@ -537,11 +545,10 @@ def plan_rebalance_routes(
     stations: tuple[StationRouteTopology, ...],
     urgency: tuple[RouteUrgencyInput, ...],
     route_coverage: RouteCoverageDocument,
-    max_stops_per_route: int = MAX_STOPS_PER_ROUTE,
     policy_config: RebalancePolicyConfig = DEFAULT_REBALANCE_POLICY,
     pickup_cooldown_sta_ids: frozenset[str] = frozenset(),
 ) -> RebalanceRoutePlan:
-    """route-v4 완결 작업·pickup SLA·coverage 계약으로 proposed aggregate를 계산한다.
+    """route-v5 혼합 차량·완결 작업·coverage 계약으로 proposed aggregate를 계산한다.
 
     ``normal``과 ``bike_qty<=0`` 행은 route 후보가 아니므로 이 순수 planner는
     topology 존재를 요구하지 않는다. urgency 기대 집합의 완전성은 publication
@@ -549,8 +556,6 @@ def plan_rebalance_routes(
     """
     logical = _utc_dttm(logical_dttm, "logical_dttm")
     _nonnegative_integer(revision_no, "revision_no")
-    if type(max_stops_per_route) is not int or not 2 <= max_stops_per_route <= 32767:
-        raise ContractViolation("max_stops_per_route는 2..32767 integer여야 합니다.")
     if type(route_coverage) is not RouteCoverageDocument:
         raise ContractViolation("route_coverage는 RouteCoverageDocument여야 합니다.")
     if type(policy_config) is not RebalancePolicyConfig:
@@ -590,58 +595,69 @@ def plan_rebalance_routes(
         dropoffs = [
             candidate for candidate in candidates if candidate.action == "dropoff"
         ]
-        ordinal = 1
-        while pickups and dropoffs and ordinal <= MAX_ROUTES_PER_CENTER:
+        for ordinal, vehicle_capacity in enumerate(FLEET_CAPACITIES, start=1):
+            if not pickups or not dropoffs:
+                break
             anchor_candidate = dropoffs[0]
             ranked_pickups = _rank_pickups_for_supply(
                 pickups,
                 anchor=anchor_candidate,
                 center=center,
             )
-            route_start = (center.longitude, center.latitude)
-            route_pickups = [
-                candidate
-                for candidate in ranked_pickups
-                if _pickup_dispatch_lag_minutes(
-                    (_SelectedStop(candidate, 1),),
-                    start=route_start,
-                )
-                <= PICKUP_DISPATCH_MAX_LAG_MINUTES
-            ]
-            unreachable_pickups = [
-                candidate
-                for candidate in ranked_pickups
-                if candidate not in route_pickups
-            ]
-            route_pickups = _prioritize_pickup_sla_prefix(
-                route_pickups,
-                start=route_start,
-                max_pickup_stops=max_stops_per_route - 1,
-            )
             route_dropoffs = _rank_for_route(
                 dropoffs,
                 anchor=anchor_candidate,
                 keep_anchor_first=True,
             )
-            split = _choose_balanced_stop_split(
-                route_pickups,
-                route_dropoffs,
-                start=route_start,
-                max_stops_per_route=max_stops_per_route,
+            max_transfer_qty = min(
+                vehicle_capacity,
+                sum(candidate.remaining_qty for candidate in ranked_pickups),
+                sum(candidate.remaining_qty for candidate in route_dropoffs),
             )
-            if split is None:
+            if max_transfer_qty <= 0:
                 break
-            pickup_stop_limit, dropoff_stop_limit, transfer_qty = split
-            selected_pickups, pickup_remainder = _take_by_priority(
-                route_pickups,
+            route_selection = None
+            for transfer_qty in range(max_transfer_qty, 0, -1):
+                selected_pickups, pickup_remainder = _take_by_priority(
+                    ranked_pickups,
+                    transfer_qty,
+                )
+                selected_dropoffs, dropoff_remainder = _take_by_priority(
+                    route_dropoffs,
+                    transfer_qty,
+                )
+                ordered_stops = _nearest_stops(
+                    selected_pickups,
+                    selected_dropoffs,
+                    start=(center.longitude, center.latitude),
+                    anchor_dropoff=anchor_candidate,
+                )
+                if (
+                    _estimated_route_duration_minutes(
+                        ordered_stops,
+                        center=center,
+                    )
+                    <= ROUTE_MAX_DURATION_MINUTES
+                ):
+                    route_selection = (
+                        transfer_qty,
+                        selected_pickups,
+                        pickup_remainder,
+                        selected_dropoffs,
+                        dropoff_remainder,
+                        ordered_stops,
+                    )
+                    break
+            if route_selection is None:
+                break
+            (
                 transfer_qty,
-                stop_limit=pickup_stop_limit,
-            )
-            selected_dropoffs, dropoff_remainder = _take_by_priority(
-                route_dropoffs,
-                transfer_qty,
-                stop_limit=dropoff_stop_limit,
-            )
+                selected_pickups,
+                pickup_remainder,
+                selected_dropoffs,
+                dropoff_remainder,
+                ordered_stops,
+            ) = route_selection
             if policy_config.exclusive_pickup_station:
                 selected_pickup_ids = {
                     stop.candidate.sta_id for stop in selected_pickups
@@ -652,7 +668,7 @@ def plan_rebalance_routes(
                     if candidate.sta_id not in selected_pickup_ids
                 ]
             pickups = sorted(
-                [*pickup_remainder, *unreachable_pickups],
+                pickup_remainder,
                 key=_candidate_priority,
             )
             dropoffs = sorted(dropoff_remainder, key=_candidate_priority)
@@ -661,10 +677,9 @@ def plan_rebalance_routes(
             if (
                 picked_qty != transfer_qty
                 or dropped_qty != transfer_qty
-                or len(selected_pickups) + len(selected_dropoffs) > max_stops_per_route
             ):
                 raise ContractViolation(
-                    "route-v4 작업 단위 선택이 완결 수량·stop 제한을 위반했습니다."
+                    "route-v5 작업 단위 선택이 차량 용량·완결 수량을 위반했습니다."
                 )
             route_id = str(route_uuid_v5(center_id, logical, revision_no, ordinal))
             routes.append(
@@ -677,12 +692,6 @@ def plan_rebalance_routes(
                     completed_dttm=None,
                 )
             )
-            ordered_stops = _nearest_stops(
-                selected_pickups,
-                selected_dropoffs,
-                start=route_start,
-                anchor_dropoff=anchor_candidate,
-            )
             route_stops.extend(
                 RebalanceRouteStop(
                     route_id=route_id,
@@ -693,7 +702,6 @@ def plan_rebalance_routes(
                 )
                 for visit_no, stop in enumerate(ordered_stops, start=1)
             )
-            ordinal += 1
     return RebalanceRoutePlan(tuple(routes), tuple(route_stops))
 
 
@@ -871,36 +879,42 @@ def publish_rebalance_route(
                 DEFAULT_REBALANCE_POLICY.canonical_json,
             ),
             Parameter(
-                "pickup_dispatch_assumed_speed_kmh",
-                str(PICKUP_DISPATCH_ASSUMED_SPEED_KMH),
+                "fleet_capacities",
+                ",".join(str(capacity) for capacity in FLEET_CAPACITIES),
             ),
-            Parameter(
-                "pickup_dispatch_max_lag_minutes",
-                str(PICKUP_DISPATCH_MAX_LAG_MINUTES),
-            ),
-            Parameter(
-                "pickup_dispatch_service_minutes_per_stop",
-                str(PICKUP_DISPATCH_SERVICE_MINUTES_PER_STOP),
-            ),
-            Parameter(
-                "pickup_dispatch_sla_config_version",
-                PICKUP_DISPATCH_SLA_CONFIG_VERSION,
-            ),
+            Parameter("fleet_config_version", FLEET_CONFIG_VERSION),
             Parameter("route_algorithm_version", ROUTE_ALGORITHM_VERSION),
+            Parameter(
+                "route_max_duration_minutes",
+                f"{ROUTE_MAX_DURATION_MINUTES:.2f}",
+            ),
+            Parameter(
+                "route_road_distance_factor",
+                f"{ROUTE_ROAD_DISTANCE_FACTOR:.2f}",
+            ),
+            Parameter(
+                "route_assumed_speed_kmh",
+                f"{ROUTE_ASSUMED_SPEED_KMH:.2f}",
+            ),
+            Parameter(
+                "route_service_minutes_per_stop",
+                f"{ROUTE_SERVICE_MINUTES_PER_STOP:.2f}",
+            ),
+            Parameter(
+                "route_bike_handling_minutes",
+                f"{ROUTE_BIKE_HANDLING_MINUTES:.2f}",
+            ),
+            Parameter(
+                "supply_trigger_stock_ratio",
+                f"{SUPPLY_LOW_STOCK_RATIO:.2f}",
+            ),
+            Parameter(
+                "supply_visit_target_stock_ratio",
+                f"{SUPPLY_VISIT_TARGET_STOCK_RATIO:.2f}",
+            ),
             Parameter(
                 "route_coverage_sha256",
                 database_snapshot.route_coverage.sha256,
-            ),
-            Parameter("truck_capacity", str(TRUCK_CAPACITY)),
-            Parameter(
-                "truck_capacity_config_version",
-                TRUCK_CAPACITY_CONFIG_VERSION,
-            ),
-            Parameter("max_stops_per_route", str(MAX_STOPS_PER_ROUTE)),
-            Parameter("max_routes_per_center", str(MAX_ROUTES_PER_CENTER)),
-            Parameter(
-                "route_work_unit_config_version",
-                ROUTE_WORK_UNIT_CONFIG_VERSION,
             ),
         ),
     )
@@ -1165,7 +1179,7 @@ def _plan_from_snapshots(
     database_snapshot: RouteDatabaseSnapshot,
     urgency_snapshot: RouteUrgencySnapshot,
 ) -> RebalanceRoutePlan:
-    """Typed urgency와 DB snapshot을 pure route-v4 planner 입력으로 바꾼다."""
+    """Typed urgency와 DB snapshot을 pure route-v5 planner 입력으로 바꾼다."""
     return plan_rebalance_routes(
         logical_dttm=logical_dttm,
         revision_no=revision_no,
@@ -1333,7 +1347,7 @@ def _validate_supported_urgency_fingerprint(
     for name, expected_value in expected.items():
         if parameters[name] != expected_value:
             raise ContractViolation(
-                f"route-v4가 지원하지 않는 urgency {name}입니다: "
+                f"route-v5가 지원하지 않는 urgency {name}입니다: "
                 f"expected={expected_value}, actual={parameters[name]}"
             )
 
@@ -1423,10 +1437,15 @@ def _route_database_snapshot_locked(
                dispatch_center_id,
                ST_X(sta_point),
                ST_Y(sta_point),
-               is_active
+               is_active,
+               hold_cnt,
+               stock.parking_bike_tot_cnt
           FROM station
+          JOIN station_stock AS stock USING (sta_id)
+         WHERE stock.base_dttm = %s
          ORDER BY sta_id COLLATE "C"
-        """
+        """,
+        (logical,),
     )
     stations = tuple(StationRouteTopology(*row) for row in cursor.fetchall())
     coverage = _route_coverage_locked(cursor, logical)
@@ -1780,7 +1799,7 @@ def _coverage_quantities(
                 load += stop.bike_cnt
             else:
                 load -= stop.bike_cnt
-            if not INITIAL_TRUCK_LOAD <= load <= TRUCK_CAPACITY:
+            if not INITIAL_TRUCK_LOAD <= load <= MAX_TRUCK_CAPACITY:
                 raise ContractViolation(
                     "route coverage stop prefix 적재량이 0..20 범위를 벗어납니다."
                 )
@@ -1819,7 +1838,10 @@ def _build_candidates(
         covered = coverage_qty.get((row.sta_id, action), 0)
         if exclusive_pickup_station and action == "pickup" and covered > 0:
             continue
-        remaining = row.bike_qty - covered
+        planned_qty = row.bike_qty
+        if action == "dropoff":
+            planned_qty = _supply_visit_target_qty(row.bike_qty, station)
+        remaining = planned_qty - covered
         if remaining <= 0:
             continue
         candidates.setdefault(station.dispatch_center_id, []).append(
@@ -1836,6 +1858,18 @@ def _build_candidates(
         center_id: tuple(sorted(rows, key=_candidate_priority))
         for center_id, rows in candidates.items()
     }
+
+
+def _supply_visit_target_qty(
+    required_qty: int,
+    station: StationRouteTopology,
+) -> int:
+    """양수 공급 후보를 20% 발생 기준에서 40% 방문 회복 목표까지 완충한다."""
+    trigger_stock = math.ceil(SUPPLY_LOW_STOCK_RATIO * station.hold_cnt)
+    visit_target_stock = math.ceil(SUPPLY_VISIT_TARGET_STOCK_RATIO * station.hold_cnt)
+    recovery_buffer = max(0, visit_target_stock - trigger_stock)
+    physical_headroom = max(0, station.hold_cnt - station.current_bike_qty)
+    return min(required_qty + recovery_buffer, physical_headroom)
 
 
 def _route_action(action_type: str) -> str | None:
@@ -1925,39 +1959,6 @@ def _rank_pickups_for_supply(
     return sorted(candidates, key=pickup_path_key)
 
 
-def _prioritize_pickup_sla_prefix(
-    candidates: list[_Candidate],
-    *,
-    start: tuple[float, float],
-    max_pickup_stops: int,
-) -> list[_Candidate]:
-    """SLA 가능 donor를 정렬 prefix 중 최대한 앞으로 모은다.
-
-    기본 공급 경로 순위는 유지하되, 먼 donor 하나 때문에 그 뒤의
-    가까운 donor까지 prefix 탐색에서 누락되지 않도록 순서만 안정적으로
-    재배치한다. 미선택 후보는 후속 route 탐색을 위해 모두 보존한다.
-    """
-    if type(max_pickup_stops) is not int or max_pickup_stops < 1:
-        raise ContractViolation("max_pickup_stops는 1 이상 integer여야 합니다.")
-    feasible_prefix: list[_Candidate] = []
-    deferred: list[_Candidate] = []
-    for candidate in candidates:
-        if len(feasible_prefix) >= max_pickup_stops:
-            deferred.append(candidate)
-            continue
-        proposed = tuple(
-            _SelectedStop(item, 1) for item in (*feasible_prefix, candidate)
-        )
-        if (
-            _pickup_dispatch_lag_minutes(proposed, start=start)
-            <= PICKUP_DISPATCH_MAX_LAG_MINUTES
-        ):
-            feasible_prefix.append(candidate)
-        else:
-            deferred.append(candidate)
-    return [*feasible_prefix, *deferred]
-
-
 def _take_by_priority(
     candidates: list[_Candidate],
     limit: int,
@@ -1993,96 +1994,6 @@ def _take_by_priority(
                 )
             )
     return tuple(selected), remaining
-
-
-def _choose_balanced_stop_split(
-    pickups: list[_Candidate],
-    dropoffs: list[_Candidate],
-    *,
-    start: tuple[float, float],
-    max_stops_per_route: int = MAX_STOPS_PER_ROUTE,
-) -> tuple[int, int, int] | None:
-    """Pickup SLA와 대여소 상한 안에서 가장 많은 완결 수량을 고른다.
-
-    pickup과 dropoff에 각각 한 자리를 보장하고, 처리 가능 수량이 같으면 더 적은
-    대여소와 더 높은 긴급도 합을 우선한다. 실제 planner와 같은 센터 기준 최근접
-    pickup 순서의 마지막 실행시각이 30분을 넘는 후보는 제외한다. 따라서 큰 작업이
-    SLA를 위반하면 같은 입력에서 더 작은 완결 작업으로 결정적으로 분리된다.
-    """
-    if not pickups or not dropoffs:
-        return None
-    if type(max_stops_per_route) is not int or not 2 <= max_stops_per_route <= 32767:
-        raise ContractViolation("max_stops_per_route는 2..32767 integer여야 합니다.")
-    best: tuple[tuple[int, int, float, int, int], tuple[int, int, int]] | None = None
-    max_pickup_stops = min(len(pickups), max_stops_per_route - 1)
-    for pickup_stop_limit in range(1, max_pickup_stops + 1):
-        max_dropoff_stops = min(
-            len(dropoffs),
-            max_stops_per_route - pickup_stop_limit,
-        )
-        pickup_candidates = pickups[:pickup_stop_limit]
-        pickup_capacity = sum(item.remaining_qty for item in pickup_candidates)
-        for dropoff_stop_limit in range(1, max_dropoff_stops + 1):
-            dropoff_candidates = dropoffs[:dropoff_stop_limit]
-            transfer_qty = min(
-                TRUCK_CAPACITY,
-                pickup_capacity,
-                sum(item.remaining_qty for item in dropoff_candidates),
-            )
-            if transfer_qty <= 0:
-                continue
-            selected_pickups, _ = _take_by_priority(
-                pickups,
-                transfer_qty,
-                stop_limit=pickup_stop_limit,
-            )
-            if (
-                not selected_pickups
-                or _pickup_dispatch_lag_minutes(selected_pickups, start=start)
-                > PICKUP_DISPATCH_MAX_LAG_MINUTES
-            ):
-                continue
-            stop_count = pickup_stop_limit + dropoff_stop_limit
-            urgency_sum = sum(
-                item.urgency_score for item in (*pickup_candidates, *dropoff_candidates)
-            )
-            key = (
-                transfer_qty,
-                -stop_count,
-                urgency_sum,
-                -pickup_stop_limit,
-                -dropoff_stop_limit,
-            )
-            value = (pickup_stop_limit, dropoff_stop_limit, transfer_qty)
-            if best is None or key > best[0]:
-                best = (key, value)
-    return None if best is None else best[1]
-
-
-def _pickup_dispatch_lag_minutes(
-    pickups: tuple[_SelectedStop, ...],
-    *,
-    start: tuple[float, float],
-) -> float:
-    """센터 출발부터 마지막 pickup 실행까지의 production 가정 시간을 계산한다."""
-    ordered, _ = _nearest_order(pickups, start=start)
-    current = start
-    elapsed = 0.0
-    for stop in ordered:
-        candidate = stop.candidate
-        elapsed += (
-            _haversine_km(
-                current[0],
-                current[1],
-                candidate.longitude,
-                candidate.latitude,
-            )
-            / PICKUP_DISPATCH_ASSUMED_SPEED_KMH
-            * 60.0
-            + PICKUP_DISPATCH_SERVICE_MINUTES_PER_STOP
-        )
-        current = (candidate.longitude, candidate.latitude)
-    return elapsed
 
 
 def _nearest_stops(
@@ -2138,6 +2049,33 @@ def _nearest_order(
     return tuple(ordered), current
 
 
+def _estimated_route_duration_minutes(
+    stops: tuple[_SelectedStop, ...],
+    *,
+    center: DispatchCenterTopology,
+) -> float:
+    """센터 왕복 이동·정차·상하차를 포함한 경로 예상시간을 계산한다."""
+    points = (
+        (center.longitude, center.latitude),
+        *(
+            (stop.candidate.longitude, stop.candidate.latitude)
+            for stop in stops
+        ),
+        (center.longitude, center.latitude),
+    )
+    direct_distance_km = sum(
+        _haversine_km(*start, *end)
+        for start, end in zip(points, points[1:])
+    )
+    road_distance_km = direct_distance_km * ROUTE_ROAD_DISTANCE_FACTOR
+    travel_minutes = road_distance_km / ROUTE_ASSUMED_SPEED_KMH * 60.0
+    service_minutes = len(stops) * ROUTE_SERVICE_MINUTES_PER_STOP
+    handling_minutes = (
+        sum(stop.bike_cnt for stop in stops) * ROUTE_BIKE_HANDLING_MINUTES
+    )
+    return travel_minutes + service_minutes + handling_minutes
+
+
 def _validate_running_load(stops: list[RebalanceRouteStop]) -> None:
     """초기 0부터 모든 stop prefix 적재량이 0..20인지 검증한다."""
     load = INITIAL_TRUCK_LOAD
@@ -2146,7 +2084,7 @@ def _validate_running_load(stops: list[RebalanceRouteStop]) -> None:
             load += stop.bike_cnt
         else:
             load -= stop.bike_cnt
-        if not INITIAL_TRUCK_LOAD <= load <= TRUCK_CAPACITY:
+        if not INITIAL_TRUCK_LOAD <= load <= MAX_TRUCK_CAPACITY:
             raise ContractViolation(
                 "route stop prefix 적재량이 0..20 범위를 벗어납니다."
             )
@@ -2160,7 +2098,7 @@ def _validate_existing_running_load(stops: tuple[ExistingRouteStop, ...]) -> Non
             load += stop.bike_cnt
         else:
             load -= stop.bike_cnt
-        if not INITIAL_TRUCK_LOAD <= load <= TRUCK_CAPACITY:
+        if not INITIAL_TRUCK_LOAD <= load <= MAX_TRUCK_CAPACITY:
             raise ContractViolation(
                 "existing route stop prefix 적재량이 0..20 범위를 벗어납니다."
             )

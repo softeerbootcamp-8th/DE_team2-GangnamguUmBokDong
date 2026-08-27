@@ -118,6 +118,16 @@ function byProposedAtDesc(left: Route, right: Route): number {
   return (proposedAtMs(right) ?? 0) - (proposedAtMs(left) ?? 0);
 }
 
+function byCandidateDisplayPriority(left: Route, right: Route): number {
+  const proposedOrder = byProposedAtDesc(left, right);
+  if (proposedOrder !== 0) return proposedOrder;
+  const regionOrder = left.region.localeCompare(right.region, "ko");
+  if (regionOrder !== 0) return regionOrder;
+  const priorityOrder = (left.route_priority_no ?? 99) - (right.route_priority_no ?? 99);
+  if (priorityOrder !== 0) return priorityOrder;
+  return left.route_id.localeCompare(right.route_id);
+}
+
 export interface WorkRouteGroups {
   candidates: Route[];
   operations: Route[];
@@ -143,7 +153,7 @@ export function groupWorkRoutes(
     route.status === "proposed"
     && (isFreshCandidate(route, referenceMs) || route.route_id === keepRouteId);
 
-  const candidates = routes.filter(isCandidate).sort(byProposedAtDesc);
+  const candidates = routes.filter(isCandidate).sort(byCandidateDisplayPriority);
   const proposedCount = routes.filter((route) => route.status === "proposed").length;
   const hiddenCandidateCount = proposedCount - candidates.length;
   const operations = routes

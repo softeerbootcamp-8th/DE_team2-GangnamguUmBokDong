@@ -18,7 +18,6 @@ from zoneinfo import ZoneInfo
 import yaml
 from core.gold_publication import build_route_coverage
 from gold.rebalance_route import (
-    MAX_STOPS_PER_ROUTE,
     DispatchCenterTopology,
     RebalanceRoutePlan,
     RouteUrgencyInput,
@@ -119,7 +118,7 @@ class BacktestResult:
     existing_operation: ExistingOperationEstimate
     existing_empty_station_hours: int
     no_rebalance: ReplayMetrics
-    current_route_v4: ReplayMetrics
+    current_route_v5: ReplayMetrics
     route_variants: tuple[ReplayMetrics, ...]
     empty_station_hour_change_vs_existing_pct: float | None
     assumptions: tuple[str, ...]
@@ -433,7 +432,7 @@ def build_oracle_urgency(
     window_end: datetime,
     movement_budget: int,
 ) -> tuple[RouteUrgencyInput, ...]:
-    """실제 미래 수요로 route-v4의 탐색용 상한 urgency를 구성한다.
+    """실제 미래 수요로 route-v5의 탐색용 상한 urgency를 구성한다.
 
     이 함수는 미래 정보를 사용하므로 운영 성능 근거가 아니라 경로 구성의 잠재
     효과와 제약을 확인하는 oracle 실험에만 사용해야 한다.
@@ -513,9 +512,13 @@ def build_current_route_plan(
     center: DispatchCenterTopology,
     stations: dict[int, StationMetadata],
     urgency: tuple[RouteUrgencyInput, ...],
-    max_stops_per_route: int = MAX_STOPS_PER_ROUTE,
 ) -> RebalanceRoutePlan:
-    """운영 코드의 현재 route-v4 planner로 한 센터의 작업을 계산한다."""
+    """운영 코드의 현재 route-v5 planner로 한 센터의 작업을 계산한다."""
+    supply_qty_by_id = {
+        row.sta_id: row.bike_qty
+        for row in urgency
+        if row.action_type == "supply_needed" and row.bike_qty > 0
+    }
     topology = tuple(
         StationRouteTopology(
             sta_id=station.station_id,
@@ -523,6 +526,10 @@ def build_current_route_plan(
             longitude=station.longitude,
             latitude=station.latitude,
             is_active=True,
+            hold_cnt=max(1, supply_qty_by_id.get(station.station_id, 1)),
+            current_bike_qty=(
+                0 if station.station_id in supply_qty_by_id else 1
+            ),
         )
         for station in sorted(stations.values(), key=lambda row: row.station_id)
     )
@@ -536,7 +543,6 @@ def build_current_route_plan(
             stock_anchor_dttm=logical_dttm.astimezone(UTC),
             routes=(),
         ),
-        max_stops_per_route=max_stops_per_route,
     )
 
 
@@ -710,9 +716,8 @@ def run_backtest(
     stock_csv: Path,
     station_json: Path,
     center_seed: Path,
-    max_stops_variants: tuple[int, ...] = (5, MAX_STOPS_PER_ROUTE),
 ) -> BacktestResult:
-    """하루·한 센터의 탐색용 route-v4 백테스트 전체 절차를 실행한다."""
+    """하루·한 센터의 탐색용 route-v5 백테스트 전체 절차를 실행한다."""
     centers = load_centers(center_seed)
     center_rows = [row for row in centers if row[0].dispatch_center_id == center_id]
     if len(center_rows) != 1:
@@ -777,39 +782,29 @@ def run_backtest(
         window_end=window_end,
         checkpoints=checkpoints,
     )
-    variant_metrics = []
-    for max_stops in dict.fromkeys((*max_stops_variants, MAX_STOPS_PER_ROUTE)):
-        plan = build_current_route_plan(
-            logical_dttm=window_start,
-            center=center,
-            stations=selected,
-            urgency=urgency,
-            max_stops_per_route=max_stops,
-        )
-        actions = schedule_route_actions(
-            plan=plan,
-            center=center,
-            stations=selected,
-            window_start=window_start,
-        )
-        variant_metrics.append(
-            replay_policy(
-                policy=f"route_v4_max_stops_{max_stops}_oracle_need",
-                trips=trips,
-                initial_stock=initial_stock,
-                station_nos=station_nos,
-                window_start=window_start,
-                window_end=window_end,
-                checkpoints=checkpoints,
-                route_actions=actions,
-            )
-        )
-    variants = tuple(variant_metrics)
-    current = next(
-        row
-        for row in variants
-        if row.policy == f"route_v4_max_stops_{MAX_STOPS_PER_ROUTE}_oracle_need"
+    plan = build_current_route_plan(
+        logical_dttm=window_start,
+        center=center,
+        stations=selected,
+        urgency=urgency,
     )
+    actions = schedule_route_actions(
+        plan=plan,
+        center=center,
+        stations=selected,
+        window_start=window_start,
+    )
+    current = replay_policy(
+        policy="route_v5_mixed_fleet_oracle_need",
+        trips=trips,
+        initial_stock=initial_stock,
+        station_nos=station_nos,
+        window_start=window_start,
+        window_end=window_end,
+        checkpoints=checkpoints,
+        route_actions=actions,
+    )
+    variants = (current,)
     actual_empty = _actual_empty_station_hours(by_time, station_nos, checkpoints)
     change = (
         (actual_empty - current.empty_station_hours) / actual_empty * 100.0
@@ -839,14 +834,14 @@ def run_backtest(
         existing_operation=existing,
         existing_empty_station_hours=actual_empty,
         no_rebalance=no_rebalance,
-        current_route_v4=current,
+        current_route_v5=current,
         route_variants=variants,
         empty_station_hour_change_vs_existing_pct=change,
         assumptions=(
             "기존 운영 이동량은 시간대별 실측 재고 변화에서 시민 대여·반납을 제거한 순잔차다.",
             "운영자 이동 시각·트럭 경로는 공개 데이터로 식별할 수 없다.",
             "현재 정책의 필요량은 평가 구간의 미래 실제 수요를 사용한 oracle 상한이며 모델 성능이 아니다.",
-            "route-v4 트럭은 동시에 출발하고 직선거리 20km/h, 대여소당 3분 작업으로 근사한다.",
+            "route-v5 트럭은 동시에 출발하고 직선거리 20km/h, 대여소당 3분 작업으로 근사한다.",
             "실패해 관측되지 않은 잠재 대여 요청은 평가할 수 없다.",
         ),
     )
@@ -916,9 +911,8 @@ def result_markdown(result: BacktestResult) -> str:
         ),
     ]
     for metrics in result.route_variants:
-        max_stops = metrics.policy.split("_")[4]
         lines.append(
-            f"| route-v4 최대 {max_stops}곳 (oracle need) | "
+            f"| route-v5 혼합 차량 (oracle need) | "
             f"{metrics.empty_station_hours} | {metrics.unfulfilled_requests} | "
             f"{metrics.moved_bikes} | {metrics.route_count}/{metrics.route_stop_count} | "
             f"{metrics.estimated_vehicle_minutes:.1f} |"
@@ -926,7 +920,7 @@ def result_markdown(result: BacktestResult) -> str:
     lines.extend(
         (
             "",
-            f"실제 운영 대비 현재 route-v4 품절 대여소-시간 변화: **{change}**",
+            f"실제 운영 대비 현재 route-v5 품절 대여소-시간 변화: **{change}**",
             "",
             "## 해석 제한",
             "",

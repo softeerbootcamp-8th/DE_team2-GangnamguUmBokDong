@@ -641,6 +641,10 @@ def test_fetch_routes_builds_bounded_single_statement_aggregate(
     assert "route.route_id::text AS route_id" not in normalized
     assert "page.route_id::text AS route_id" in normalized
     assert "page.work_no" in normalized
+    assert "page.route_priority_no" in normalized
+    assert "DENSE_RANK() OVER" in normalized
+    assert "urgency.base_dttm = candidate.proposed_dttm" in normalized
+    assert "stop.route_action_type_cd = 'dropoff'" in normalized
     assert "LEFT JOIN approved_route_number AS number USING (route_id)" in normalized
     assert "ORDER BY route.proposed_dttm DESC, route.route_id ASC" in normalized
     assert "ORDER BY stop.visit_no" in normalized

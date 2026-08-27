@@ -93,7 +93,7 @@ def _document(cell: EvaluationCell) -> dict[str, object]:
             target_date=cell.target_date,
             start_hour=cell.start_hour,
             evaluation_minutes=minutes,
-            fleet_size=3,
+            fleet_size=4,
         ).audit_document()
         for minutes in (60, 120, 180)
     ]
@@ -143,7 +143,7 @@ def _document(cell: EvaluationCell) -> dict[str, object]:
         "contracts": contracts,
         "source_provenance": {
             "backtest_contract_version": "point-in-time-policy-backtest-v3",
-            "route_algorithm_version": "route-v4-supply-led-pickup-sla",
+            "route_algorithm_version": "route-v5-supply-led-mixed-fleet",
             "urgency_scoring_config_version": "urgency-scoring-v5-capacity-reserve",
             "rental_csv": _source_file("rental"),
             "stock_csv": _source_file("stock"),
@@ -184,6 +184,8 @@ def test_profiles_only_change_data_and_gate() -> None:
     assert get_evaluation_profile("production") is PRODUCTION_PROFILE
     assert {len(profile.cells) for profile in (CALIBRATION_PROFILE, CONFIRMATORY_PROFILE)} == {12}
     assert len(PRODUCTION_PROFILE.cells) == 10
+    assert CALIBRATION_PROFILE.gate.max_pickup_dispatch_lag_minutes is None
+    assert CONFIRMATORY_PROFILE.gate.max_pickup_dispatch_lag_minutes is None
     assert {
         profile.evaluation_minutes
         for profile in (CALIBRATION_PROFILE, CONFIRMATORY_PROFILE, PRODUCTION_PROFILE)

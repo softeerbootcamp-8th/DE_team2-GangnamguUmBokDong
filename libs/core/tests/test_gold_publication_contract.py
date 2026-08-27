@@ -42,11 +42,11 @@ _ROUTE_ARTIFACT_SET_BYTES = (
 _ROUTE_ARTIFACT_SET_SHA256 = (
     "576eec2c53f1be8985ce531f512f4f4014fe05879d1f53714128dd774d8abf87"
 )
-_ROUTE_INPUT_SHA256 = "047eb834d15205766513e37c85f47628c81806272daa7d32e077afd106d7fb36"
+_ROUTE_INPUT_SHA256 = "bc631585de4fec0f4216e5545099092ea23b248e092ebdb15936e84d63b8feb5"
 _ID_SET_BYTES = b'{"ids":["ST-1","ST-2"],"schema_version":"gold-id-set-v1"}'
 _ID_SET_SHA256 = "a080d2f47ea7c4d0f5d27704264ed23d5a93ec525dd12544812f81b3519fa52f"
 _ROUTE_MANIFEST_SHA256 = (
-    "e5cd4827e6cb5334b2b73f819a1603ba390d91719c8bf43d8b16ccfccd71ce2a"
+    "6c192b62c5104aee82e8941d7697dd84ad1d5c452d8ade455629993832cf1c62"
 )
 
 
@@ -135,30 +135,27 @@ def _route_input_fingerprint() -> InputFingerprint:
         ),
     )
     parameters = (
-        Parameter("max_routes_per_center", "3"),
-        Parameter("max_stops_per_route", "5"),
-        Parameter("pickup_dispatch_assumed_speed_kmh", "20.0"),
-        Parameter("pickup_dispatch_max_lag_minutes", "30.0"),
-        Parameter("pickup_dispatch_service_minutes_per_stop", "3.0"),
-        Parameter("pickup_dispatch_sla_config_version", "pickup-dispatch-sla-v1"),
+        Parameter("fleet_capacities", "20,20,15,15"),
+        Parameter("fleet_config_version", "mixed-fleet-v1-two-20-two-15-per-center"),
         Parameter(
             "rebalance_policy_config",
             "fixture-rebalance-policy-config",
         ),
-        Parameter("truck_capacity_config_version", "truck-capacity-v1"),
-        Parameter("truck_capacity", "20"),
         Parameter(
             "route_coverage_sha256",
             "13cd1f4fe82d4b09370fd4141d1ee1a727f25c5b109de11f06bb904f9c001e8b",
         ),
         Parameter(
-            "route_work_unit_config_version",
-            "route-work-unit-v3-pickup-sla",
-        ),
-        Parameter(
             "route_algorithm_version",
-            "route-v4-supply-led-pickup-sla",
+            "route-v5-supply-led-mixed-fleet",
         ),
+        Parameter("route_assumed_speed_kmh", "18.00"),
+        Parameter("route_bike_handling_minutes", "0.50"),
+        Parameter("route_max_duration_minutes", "120.00"),
+        Parameter("route_road_distance_factor", "1.25"),
+        Parameter("route_service_minutes_per_stop", "4.00"),
+        Parameter("supply_trigger_stock_ratio", "0.20"),
+        Parameter("supply_visit_target_stock_ratio", "0.40"),
     )
     return build_input_fingerprint(
         "rebalance_route",
@@ -446,18 +443,18 @@ def test_registry_matches_all_ten_ssot_publication_keys() -> None:
                 "urgency_publication_manifest",
             ),
             (
-                "max_routes_per_center",
-                "max_stops_per_route",
-                "pickup_dispatch_assumed_speed_kmh",
-                "pickup_dispatch_max_lag_minutes",
-                "pickup_dispatch_service_minutes_per_stop",
-                "pickup_dispatch_sla_config_version",
+                "fleet_capacities",
+                "fleet_config_version",
                 "rebalance_policy_config",
                 "route_algorithm_version",
+                "route_assumed_speed_kmh",
+                "route_bike_handling_minutes",
                 "route_coverage_sha256",
-                "route_work_unit_config_version",
-                "truck_capacity",
-                "truck_capacity_config_version",
+                "route_max_duration_minutes",
+                "route_road_distance_factor",
+                "route_service_minutes_per_stop",
+                "supply_trigger_stock_ratio",
+                "supply_visit_target_stock_ratio",
             ),
             ("route_stops", "routes"),
             ("rebalance_route", "rebalance_route_stop"),
