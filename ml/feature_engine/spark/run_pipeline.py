@@ -201,9 +201,14 @@ def _run_full_build(spark) -> None:
     features_df.write.mode("overwrite").partitionBy("date").parquet(config.FEATURES_TABLE_PARQUET)
 
     # 방금 저장한 Parquet에서 max(hour_ts)를 직접 읽어와 무거운 upstream 재계산을 방지한다.
-    max_hour_ts = spark.read.parquet(config.FEATURES_TABLE_PARQUET).agg(F.max("hour_ts")).collect()[0][0]
-    write_watermark(config.WATERMARK_PATH, max_hour_ts.isoformat(), _current_params())
-    print(f"[{config.PARAM_COMBO_ID}] 전체 빌드 완료 -> {config.FEATURES_TABLE_PARQUET} (워터마크={max_hour_ts})")
+    max_hour_row = spark.read.parquet(config.FEATURES_TABLE_PARQUET).agg(F.max("hour_ts")).collect()[0][0]
+    if max_hour_row is not None:
+        max_hour_str = max_hour_row.isoformat() if hasattr(max_hour_row, "isoformat") else str(max_hour_row)
+        write_watermark(config.WATERMARK_PATH, max_hour_str, _current_params())
+        print(f"[{config.PARAM_COMBO_ID}] 전체 빌드 완료 -> {config.FEATURES_TABLE_PARQUET} (워터마크={max_hour_str})")
+    else:
+        print(f"[{config.PARAM_COMBO_ID}] 전체 빌드 완료 (데이터 없음) -> {config.FEATURES_TABLE_PARQUET}")
+
 
 
 def _incremental_since(watermark_dt: datetime) -> datetime:
@@ -341,21 +346,25 @@ def _run_incremental(spark, watermark: dict) -> None:
     spark.conf.set("spark.sql.sources.partitionOverwriteMode", "dynamic")
     features_increment.write.mode("overwrite").partitionBy("date").parquet(config.FEATURES_TABLE_PARQUET)
 
-    max_hour_ts = features_increment.agg(F.max("hour_ts")).collect()[0][0]
+    max_hour_row = features_increment.agg(F.max("hour_ts")).collect()[0][0]
     features_increment.unpersist()
-    write_watermark(config.WATERMARK_PATH, max_hour_ts.isoformat(), _current_params())
-    print(f"[{config.PARAM_COMBO_ID}] {since_str}~{max_hour_ts} 재계산(신규 {new_count:,}행 포함) -> "
-          f"{config.FEATURES_TABLE_PARQUET} 날짜 파티션 덮어씀 (워터마크 갱신={max_hour_ts})")
+    if max_hour_row is not None:
+        max_hour_str = max_hour_row.isoformat() if hasattr(max_hour_row, "isoformat") else str(max_hour_row)
+        write_watermark(config.WATERMARK_PATH, max_hour_str, _current_params())
+        print(f"[{config.PARAM_COMBO_ID}] {since_str}~{max_hour_str} 재계산(신규 {new_count:,}행 포함) -> "
+              f"{config.FEATURES_TABLE_PARQUET} 날짜 파티션 덮어씀 (워터마크 갱신={max_hour_str})")
+    else:
+        print(f"[{config.PARAM_COMBO_ID}] 증분 계산 결과 행 없음")
 
 
 def main() -> None:
     """피처마트 파이프라인을 실행한다 (워터마크 유무에 따라 전체 빌드 또는 증분 실행)."""
+    spark = get_spark()
     watermark = read_watermark(config.WATERMARK_PATH)
     # 명시적 window는 같은 profile output에 과거 rolling 실행의 바깥 파티션이 남아
     # 있을 수 있다. incremental dynamic overwrite로는 이번 DataFrame에 없는 미래
     # 파티션을 지울 수 없으므로, watermark 존재 여부와 무관하게 전체 overwrite한다.
     if watermark is None or _explicit_window_requested():
-        spark = get_spark()
         _run_full_build(spark)
     else:
         window_until = None if config.WINDOW_END is None else str(config.WINDOW_END)
@@ -370,9 +379,10 @@ def main() -> None:
                 f"(워터마크={watermark['max_hour_ts']}, 갱신={watermark.get('updated_at')})입니다 "
                 "— 실행 건너뜀"
             )
+            spark.stop()
             return
-        spark = get_spark()
         _run_incremental(spark, watermark)
+
 
 
 

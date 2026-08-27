@@ -291,6 +291,9 @@ def _run_cli() -> None:
     )
     args, _ = parser.parse_known_args()
 
+    from .spark_session import get_spark
+
+    spark = get_spark()
     requested_models = [m.strip() for m in args.models.split(",") if m.strip()]
     if not requested_models or "all" in requested_models:
         requested_models = ["rental", "return"]
@@ -328,15 +331,14 @@ def _run_cli() -> None:
 
     if not models_to_build:
         print("[build_multi_horizon_features] 모든 요청 모델의 Multi-horizon 피처가 최신 상태입니다 — 종료")
+        spark.stop()
         return
 
-    from .spark_session import get_spark
-
-    spark = get_spark()
     spark.conf.set("spark.sql.sources.partitionOverwriteMode", "dynamic")
     features = _features_in_training_window(
         spark.read.parquet(config.FEATURES_TABLE_PARQUET)
     )
+
     anchor_input = _anchor_input(features)
 
     for i, model in enumerate(models_to_build):

@@ -400,12 +400,15 @@ def _champion_profile_name(model_name: str) -> str | None:
 def _is_feature_mart_fresh(profile: str, model_name: str, max_age_hours: float = 24.0) -> bool:
     """S3 워터마크를 확인해 피처마트가 최근 max_age_hours 이내에 이미 갱신되었는지 판정한다."""
     try:
-        profile_data = read_s3_json(f"{MODELS_PREFIX}/profiles/{profile}.json") or {}
+        profile_data = read_s3_json(f"profiles/{profile}.json")
+        if not profile_data:
+            profile_data = read_s3_json(f"{MODELS_PREFIX}/profiles/{profile}.json") or {}
         window = profile_data.get("rolling_window_minutes", 60)
         embargo = profile_data.get("rolling_embargo_minutes", 30)
         tick = profile_data.get("rolling_tick_minutes", 20)
         combo_id = f"w{window}_e{embargo}_t{tick}"
         anchor_tick = profile_data.get("train_anchor_tick_minutes", 20)
+
 
         base_wm = read_s3_json(f"processed/features/{combo_id}/_watermark.json")
         if not base_wm or not base_wm.get("updated_at"):
