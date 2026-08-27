@@ -1,105 +1,108 @@
-schema_version: 1
-seed_version: dispatch-center-v1
-effective_dttm: "2026-08-19T03:15:38Z"
+schema_version: 2
+seed_version: dispatch-center-v3
+effective_dttm: "2026-08-27T05:10:00Z"
 coordinate_reference_system: EPSG:4326
 coordinate_order: [longitude, latitude]
 assignment_policy:
-  method: nearest_geography_distance
+  method: documented_management_area_then_nearest_geography_distance
   tie_breaker: dispatch_center_id_ascending
 source:
   repository_path: libs/core/src/core/regions.py
-  git_commit: afa840e5dabcdc6aa12eb2c988b8d1c2aeacc734
-  file_sha256: ae65ca27ca8fe8603bfd4048c3e8e4cbd5070665c019751428603336373dbbad
+  file_sha256: d23a54c185e61f4b5248ddda1128bba2cc3184799859f3da7a9de732a9b9f796
+  source_url: https://github.com/softeerbootcamp-8th/DE_team2-GangnamguUmBokDong/issues/60
+  retrieved_dt: "2026-08-27"
   description: >-
-    서울시설공단 지역센터 주소 조사에서 만든 기존 프로젝트 좌표를 구조화한 seed다.
-    현장 측량 좌표나 공식 관할 경계가 아니며 라우팅 그룹의 최근접 기준점으로만 쓴다.
+    서울시설공단 내부 자료를 전재한 이슈 #60의 센터 위치를 공개 주소 검색으로
+    대조한 seed다. 천왕은 과거 자료의 시설 주소를 동일 시설의 현재 공식 주소로
+    정규화했다. 센터와 대여소는 공공자전거 종합현황의 관리소·자치구 구분을 먼저
+    적용하고 같은 관리소 센터 안에서만 최근접을 계산한다.
 
 centers:
   - dispatch_center_id: sangam
     dispatch_center_nm: 상암
-    longitude: 126.8972
-    latitude: 37.5683
+    longitude: 126.897273034482
+    latitude: 37.5682884450841
     location_accuracy_cd: landmark_approximation
-    location_source_desc: core.regions.py의 주소 조사 기반 랜드마크 근사
-    location_verified_dt: null
+    location_source_desc: 이슈 #60 원주소를 공개 주소 검색으로 대조
+    location_verified_dt: "2026-08-27"
     is_active: true
   - dispatch_center_id: jungnang
     dispatch_center_nm: 중랑
-    longitude: 127.0581
-    latitude: 37.5583
+    longitude: 127.060282308271
+    latitude: 37.5555327873138
     location_accuracy_cd: landmark_approximation
-    location_source_desc: core.regions.py의 주소 조사 기반 랜드마크 근사
-    location_verified_dt: null
+    location_source_desc: 이슈 #60 원주소를 공개 주소 검색으로 대조
+    location_verified_dt: "2026-08-27"
     is_active: true
   - dispatch_center_id: sejongno
     dispatch_center_nm: 세종로
-    longitude: 126.9769
-    latitude: 37.5716
+    longitude: 126.975914786533
+    latitude: 37.5733740925746
     location_accuracy_cd: landmark_approximation
-    location_source_desc: core.regions.py의 주소 조사 기반 랜드마크 근사
-    location_verified_dt: null
+    location_source_desc: 이슈 #60 원주소를 공개 주소 검색으로 대조
+    location_verified_dt: "2026-08-27"
     is_active: true
   - dispatch_center_id: dobong
     dispatch_center_nm: 도봉
-    longitude: 127.04583
-    latitude: 37.68944
+    longitude: 127.044811612656
+    latitude: 37.6897145198121
     location_accuracy_cd: landmark_approximation
-    location_source_desc: core.regions.py의 주소 조사 기반 랜드마크 근사
-    location_verified_dt: null
+    location_source_desc: 이슈 #60 원주소를 공개 주소 검색으로 대조
+    location_verified_dt: "2026-08-27"
     is_active: true
   - dispatch_center_id: hunryeonwon
     dispatch_center_nm: 훈련원
-    longitude: 127.0031
-    latitude: 37.5674
+    longitude: 127.003544929278
+    latitude: 37.5673947880932
     location_accuracy_cd: landmark_approximation
-    location_source_desc: core.regions.py의 주소 조사 기반 랜드마크 근사
-    location_verified_dt: null
+    location_source_desc: 이슈 #60 원주소를 공개 주소 검색으로 대조
+    location_verified_dt: "2026-08-27"
     is_active: true
   - dispatch_center_id: isu
     dispatch_center_nm: 이수
-    longitude: 126.9845
-    latitude: 37.4982
+    longitude: 126.982400620133
+    latitude: 37.4837582703213
     location_accuracy_cd: landmark_approximation
-    location_source_desc: core.regions.py의 주소 조사 기반 랜드마크 근사
-    location_verified_dt: null
+    location_source_desc: 이슈 #60 원주소를 공개 주소 검색으로 대조
+    location_verified_dt: "2026-08-27"
     is_active: true
   - dispatch_center_id: gaehwa
     dispatch_center_nm: 개화
-    longitude: 126.7980
-    latitude: 37.5780
+    longitude: 126.798145262463
+    latitude: 37.5779633833321
     location_accuracy_cd: landmark_approximation
-    location_source_desc: core.regions.py의 주소 조사 기반 랜드마크 근사
-    location_verified_dt: null
+    location_source_desc: 이슈 #60 원주소를 공개 주소 검색으로 대조
+    location_verified_dt: "2026-08-27"
     is_active: true
   - dispatch_center_id: cheonwang
     dispatch_center_nm: 천왕
-    longitude: 126.83861
-    latitude: 37.48667
+    longitude: 126.839135337627
+    latitude: 37.4871043528524
     location_accuracy_cd: landmark_approximation
-    location_source_desc: core.regions.py의 주소 조사 기반 랜드마크 근사
-    location_verified_dt: null
+    location_source_desc: 과거 시설 주소를 현재 공식 시설 주소 서울특별시 구로구 오리로 1156으로 정규화
+    location_verified_dt: "2026-08-27"
     is_active: true
   - dispatch_center_id: yeongnam
     dispatch_center_nm: 영남
-    longitude: 126.9037
-    latitude: 37.5178
-    location_accuracy_cd: administrative_centroid
-    location_source_desc: core.regions.py의 행정동 중심점 근사; 최대 약 1km 오차 가능
-    location_verified_dt: null
+    longitude: 126.902588056831
+    latitude: 37.5194560071619
+    location_accuracy_cd: landmark_approximation
+    location_source_desc: 이슈 #60 원주소를 공개 주소 검색으로 대조
+    location_verified_dt: "2026-08-27"
     is_active: true
   - dispatch_center_id: cheonho
     dispatch_center_nm: 천호
-    longitude: 127.1237667
-    latitude: 37.5385167
+    longitude: 127.125111736335
+    latitude: 37.5385036573159
     location_accuracy_cd: landmark_approximation
-    location_source_desc: core.regions.py의 주소 조사 기반 랜드마크 근사
-    location_verified_dt: null
+    location_source_desc: 이슈 #60 원주소를 공개 주소 검색으로 대조
+    location_verified_dt: "2026-08-27"
     is_active: true
   - dispatch_center_id: hangnyeoul
     dispatch_center_nm: 학여울
-    longitude: 127.07954
-    latitude: 37.49352
+    longitude: 127.071795320112
+    latitude: 37.4957890132293
     location_accuracy_cd: landmark_approximation
-    location_source_desc: core.regions.py의 주소 조사 기반 랜드마크 근사
-    location_verified_dt: null
+    location_source_desc: 이슈 #60 원주소를 공개 주소 검색으로 대조
+    location_verified_dt: "2026-08-27"
     is_active: true
