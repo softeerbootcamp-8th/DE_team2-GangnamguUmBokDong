@@ -3,10 +3,14 @@ import math
 from pathlib import Path
 
 from gu_mapping import (
+    MANAGEMENT_AREA_BY_CENTER_ID,
+    MANAGEMENT_AREA_BY_GU,
     grid_to_gu,
     grid_to_latlon,
     latlon_to_grid,
     latlon_to_gu,
+    latlon_to_management_area,
+    seoul_constrained_distance_m,
 )
 
 _STATIONS_PATH = Path(__file__).resolve().parents[2] / "apps" / "api" / "seed_data" / "stations_seoul.json"
@@ -45,6 +49,63 @@ def test_latlon_to_gu_known_points():
 
 def test_latlon_to_gu_outside_seoul_returns_none():
     assert latlon_to_gu(*BUSAN_CITY_HALL) is None
+
+
+def test_management_area_uses_polygon_then_nearest_gu_fallback():
+    """Polygon 밖 station도 최근접 자치구로 귀속해 14/11 구분을 적용한다."""
+    assert latlon_to_management_area(*SEOUL_CITY_HALL) == "gangbuk"
+    assert latlon_to_management_area(*GANGNAM_GU_OFFICE) == "gangnam"
+    for latitude, longitude, gu_name in (
+        (37.460934, 126.887169, "금천구"),
+        (37.474377, 127.140671, "송파구"),
+        (37.47818, 127.147102, "송파구"),
+        (37.474346, 127.143265, "송파구"),
+        (37.48885, 127.156998, "송파구"),
+    ):
+        assert latlon_to_gu(latitude, longitude) == gu_name
+        assert latlon_to_management_area(latitude, longitude) == "gangnam"
+    assert latlon_to_gu(37.688599, 127.053406) is None
+    assert latlon_to_management_area(37.688599, 127.053406) == "gangbuk"
+    assert latlon_to_gu(37.484833, 127.149918) is None
+    assert latlon_to_management_area(37.484833, 127.149918) == "gangnam"
+    assert latlon_to_gu(37.46455, 126.883728) is None
+    assert latlon_to_management_area(37.46455, 126.883728) == "gangnam"
+
+
+def test_seoul_constrained_distance_preserves_inside_line_and_detours_exit():
+    """서울 내부 직선은 유지하고 외곽을 뚫는 직선만 경계로 우회한다."""
+    inside = seoul_constrained_distance_m(
+        126.982400620133,
+        37.4837582703213,
+        127.071795320112,
+        37.4957890132293,
+        direct_distance_m=123.0,
+    )
+    detour = seoul_constrained_distance_m(
+        126.888458,
+        37.475552,
+        126.839135337627,
+        37.4871043528524,
+        direct_distance_m=1.0,
+    )
+
+    assert inside == 123.0
+    assert math.isfinite(detour)
+    assert detour > 1.0
+
+
+def test_dispatch_centers_are_exactly_partitioned_into_two_management_areas():
+    """11개 센터가 강북 5개와 강남 6개로 빠짐없이 나뉜다."""
+    assert len(MANAGEMENT_AREA_BY_CENTER_ID) == 11
+    assert list(MANAGEMENT_AREA_BY_CENTER_ID.values()).count("gangbuk") == 5
+    assert list(MANAGEMENT_AREA_BY_CENTER_ID.values()).count("gangnam") == 6
+
+
+def test_seoul_gu_are_exactly_partitioned_into_two_management_areas():
+    """서울 25개 자치구가 문서의 강북 14개·강남 11개로 나뉜다."""
+    assert len(MANAGEMENT_AREA_BY_GU) == 25
+    assert list(MANAGEMENT_AREA_BY_GU.values()).count("gangbuk") == 14
+    assert list(MANAGEMENT_AREA_BY_GU.values()).count("gangnam") == 11
 
 
 def test_grid_to_latlon_roundtrips_within_seoul():
