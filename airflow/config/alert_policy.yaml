@@ -1,0 +1,29 @@
+# 데이터 수집 모니터링 Slack 알림(daily_collection_report/hourly_collection_alert)의
+# 위험 판단 기준. 소스별로 다시 튜닝하고 싶으면 이 파일만 고치면 된다(코드 변경 불필요).
+#
+# missing_ratio_threshold/outlier_ratio_threshold는 collector/sources/*.yaml의
+# quality.max_missing_ratio와 다른 개념이다 — quality.max_missing_ratio는 수집 자체의
+# fetch/페이지네이션 완결성 비율(이름은 비슷하지만 값 결측과 무관)이고, 여기서의 비율은
+# manifest의 column_issues(컬럼 값 단위 결측·이상치)를 kept_count로 나눈 것이다.
+# quality gate는 required 컬럼이 drop_row 정책일 때만 이 실패를 drop_ratio로 잡아내므로,
+# optional 컬럼이나 non-drop 정책의 결측·이상치는 quality gate를 통과하고도 여기서 잡힌다.
+default:
+  # status=failed 실행 비율(failed / run_count)이 이 이상이면 위험.
+  failure_rate_threshold: 0.2
+  # column_issues의 missing 합계를 kept_count로 나눈 비율.
+  missing_ratio_threshold: 0.05
+  # column_issues의 outlier 합계를 kept_count로 나눈 비율.
+  outlier_ratio_threshold: 0.05
+
+# 소스별 override. 빈 dict면 위 default를 그대로 쓴다.
+sources:
+  bike_rental_history: {}
+  bike_station_realtime: {}
+  population_realtime: {}
+  weather_ultra_short_live: {}
+  weather_ultra_short_forecast: {}
+  weather_short_term_forecast: {}
+  living_population_grid: {}
+  cultural_event: {}
+  performance_event: {}
+  bike_station_master: {}

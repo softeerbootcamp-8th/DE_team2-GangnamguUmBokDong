@@ -2,9 +2,11 @@
 
 from airflow.task.trigger_rule import TriggerRule
 
+import dags.daily_collection_report as daily_collection_report_dag
 import dags.daily_compaction as daily_compaction_dag
 import dags.daily_population_and_events as daily_dag
 import dags.emr_orphan_reaper as emr_orphan_reaper_dag
+import dags.hourly_collection_alert as hourly_collection_alert_dag
 import dags.monthly_retrain as monthly_retrain_dag
 import dags.poi_master_refresh as poi_master_refresh_dag
 import dags.realtime_tick as realtime_tick_dag
@@ -21,6 +23,8 @@ def test_all_dag_ids_import() -> None:
         monthly_retrain_dag.dag.dag_id,
         emr_orphan_reaper_dag.dag.dag_id,
         poi_master_refresh_dag.dag.dag_id,
+        daily_collection_report_dag.dag.dag_id,
+        hourly_collection_alert_dag.dag.dag_id,
     } == {
         "realtime_tick",
         "station_master",
@@ -29,6 +33,8 @@ def test_all_dag_ids_import() -> None:
         "monthly_retrain",
         "emr_orphan_reaper",
         "poi_master_refresh",
+        "daily_collection_report",
+        "hourly_collection_alert",
     }
 
 

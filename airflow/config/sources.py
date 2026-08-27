@@ -27,6 +27,14 @@ COLD_BRONZE_SOURCES = (
     STATION_MASTER_SOURCE,
 )
 
+# 수집 주기가 1시간 이내인 소스만. hourly_collection_alert DAG가 매시 지난 1시간
+# 통계를 확인할 때 이 목록만 본다 — WEATHER_3H_SOURCE(3시간)와 일 1회 소스는 제외.
+HOURLY_MONITORED_SOURCES = (
+    *REALTIME_5MIN_SOURCES,
+    WEATHER_10MIN_SOURCE,
+    WEATHER_ULTRA_SHORT_FORECAST_SOURCE,
+)
+
 # 하루치 silver를 archive로 묶을 대상. 예보 2종(weather_ultra_short_forecast,
 # weather_short_term_forecast)은 사후 재현이 불가해 archive 가치가 낮아 제외한다.
 # cultural_event·performance_event·living_population_grid는 하루 1파일이라 묶을 것이 없다.

@@ -805,6 +805,14 @@ def main() -> list[dict]:
             "동일하게 현재 프로세스에서 단일로 평가한다."
         ),
     )
+    parser.add_argument(
+        "--performance-already-checked",
+        action="store_true",
+        help=(
+            "상위 오케스트레이터가 성능 점검을 완료한 경우 재평가를 건너뛰고 "
+            "--models 대상을 바로 재학습한다. --execute 및 --models와 함께만 사용한다."
+        ),
+    )
     args = parser.parse_args()
 
     requested_models = (
@@ -812,17 +820,23 @@ def main() -> list[dict]:
         if args.models
         else None
     )
-    # `check_all_models()`에 처음부터 요청받은 모델만 넘긴다 — 안 그러면
-    # `--models rental`이어도 return용 feature mart까지 통째로 읽어들여
-    # m4.large 컨테이너 메모리 예산에서 OOM(exitCode 137)이 난다(실제 EMR
-    # 실행에서 확인, 2026-08-26).
-    results = _check_all_models_distributed(args.as_of, 1, requested_models, args.eval_num_workers)
-    if not args.json_output:
-        _print_report(results)
+    if args.performance_already_checked:
+        if not args.execute or not requested_models:
+            parser.error("--performance-already-checked는 --execute 및 --models와 함께 사용해야 합니다")
+        results = []
+        retrain_needed = []
+        target_models = requested_models
+    else:
+        # `check_all_models()`에 처음부터 요청받은 모델만 넘긴다 — 안 그러면
+        # `--models rental`이어도 return용 feature mart까지 통째로 읽어들여
+        # m4.large 컨테이너 메모리 예산에서 OOM(exitCode 137)이 난다(실제 EMR
+        # 실행에서 확인, 2026-08-26).
+        results = _check_all_models_distributed(args.as_of, 1, requested_models, args.eval_num_workers)
+        if not args.json_output:
+            _print_report(results)
 
-    relevant_results = results
-    retrain_needed = [r for r in relevant_results if r["needs_retrain"]]
-    target_models = [r["model_name"] for r in retrain_needed]
+        retrain_needed = [r for r in results if r["needs_retrain"]]
+        target_models = [r["model_name"] for r in retrain_needed]
 
     if args.check_only or not args.execute:
         summary = {
@@ -831,7 +845,7 @@ def main() -> list[dict]:
             "candidate_profiles": list(dict.fromkeys(
                 name for r in retrain_needed for name, _ in _candidate_profiles(r["model_name"])
             )) if retrain_needed else [],
-            "results": relevant_results,
+            "results": results,
         }
         if args.json_output:
             import json
@@ -846,7 +860,7 @@ def main() -> list[dict]:
                 )
         if args.result_s3_key:
             s3_io.write_json(args.result_s3_key, summary)
-        return relevant_results
+        return results
 
     if not target_models:
         _notify("재학습 대상 모델이 없음 — 종료")
