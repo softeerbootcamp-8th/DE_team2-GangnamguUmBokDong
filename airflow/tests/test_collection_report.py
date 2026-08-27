@@ -18,12 +18,10 @@ def _stats(**overrides) -> dict:
     base = {
         "run_count": 10,
         "status_counts": {"succeeded": 10},
-        "missing_count": 0,
-        "outlier_count": 0,
-        "type_error_count": 0,
+        "fetched_count": 1000,
+        "kept_count": 1000,
         "dropped_count": 0,
-        "kept_count": 100,
-        "max_drop_ratio": 0.0,
+        "repaired_count": 0,
     }
     base.update(overrides)
     return base
@@ -34,8 +32,7 @@ def _evaluation(source_id: str, *, is_risky: bool) -> dict:
         "source_id": source_id,
         "stats": _stats(),
         "failure_rate": 0.0,
-        "missing_ratio": 0.0,
-        "outlier_ratio": 0.0,
+        "drop_rate": 0.0,
         "is_risky": is_risky,
     }
 
@@ -46,8 +43,7 @@ def _fixed_thresholds(monkeypatch) -> None:
         "load_thresholds",
         lambda source_id: {
             "failure_rate_threshold": 0.2,
-            "missing_ratio_threshold": 0.05,
-            "outlier_ratio_threshold": 0.05,
+            "drop_rate_threshold": 0.05,
         },
     )
 
@@ -60,8 +56,7 @@ class TestEvaluateSourceStats:
 
         assert result["is_risky"] is False
         assert result["failure_rate"] == 0.0
-        assert result["missing_ratio"] == 0.0
-        assert result["outlier_ratio"] == 0.0
+        assert result["drop_rate"] == 0.0
 
     def test_failure_rate_at_threshold_is_risky(self, monkeypatch):
         _fixed_thresholds(monkeypatch)
@@ -72,32 +67,22 @@ class TestEvaluateSourceStats:
         assert result["failure_rate"] == 0.2
         assert result["is_risky"] is True
 
-    def test_missing_ratio_at_threshold_is_risky(self, monkeypatch):
+    def test_drop_rate_at_threshold_is_risky(self, monkeypatch):
         _fixed_thresholds(monkeypatch)
-        stats = _stats(missing_count=5, kept_count=100)
+        stats = _stats(fetched_count=1000, dropped_count=50, kept_count=950)
 
         result = evaluate_source_stats("bike_station_realtime", stats)
 
-        assert result["missing_ratio"] == 0.05
+        assert result["drop_rate"] == 0.05
         assert result["is_risky"] is True
 
-    def test_outlier_ratio_at_threshold_is_risky(self, monkeypatch):
+    def test_zero_fetched_count_does_not_divide_by_zero(self, monkeypatch):
         _fixed_thresholds(monkeypatch)
-        stats = _stats(outlier_count=5, kept_count=100)
+        stats = _stats(run_count=1, status_counts={"empty": 1}, fetched_count=0, dropped_count=0)
 
         result = evaluate_source_stats("bike_station_realtime", stats)
 
-        assert result["outlier_ratio"] == 0.05
-        assert result["is_risky"] is True
-
-    def test_zero_kept_count_does_not_divide_by_zero(self, monkeypatch):
-        _fixed_thresholds(monkeypatch)
-        stats = _stats(kept_count=0, missing_count=0, outlier_count=0)
-
-        result = evaluate_source_stats("bike_station_realtime", stats)
-
-        assert result["missing_ratio"] == 0.0
-        assert result["outlier_ratio"] == 0.0
+        assert result["drop_rate"] == 0.0
         assert result["is_risky"] is False
 
     def test_zero_run_count_does_not_divide_by_zero(self, monkeypatch):
@@ -165,8 +150,7 @@ class TestLoadThresholds:
     def test_known_source_falls_back_to_default_when_no_override(self):
         assert load_thresholds("bike_station_realtime") == {
             "failure_rate_threshold": 0.2,
-            "missing_ratio_threshold": 0.05,
-            "outlier_ratio_threshold": 0.05,
+            "drop_rate_threshold": 0.05,
         }
 
     def test_unknown_source_still_returns_default(self):
