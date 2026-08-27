@@ -16,6 +16,7 @@ import { candidateReferenceMs, isFreshCandidate, isRebalanceRoute, routeTransiti
 import { updateRoutesWithMotion } from "./routeCardMotion";
 import { detailPanelDefaultHeight } from "./panelLayout";
 import { ResizableHandle, ResizablePanel, ResizablePanelGroup } from "@/components/ui/resizable";
+import dispatchRegionBoundaries from "./dispatch_region_boundaries.json";
 
 const POLL_INTERVAL_MS = 15_000;
 const FORECAST_POLL_INTERVAL_MS = 60_000;
@@ -24,9 +25,26 @@ const STATUS_POLL_INTERVAL_MS = 30_000;
 const ROUTE_PAGE_SIZE = 500;
 const CLOSED_ROUTE_HISTORY_MINUTES = 60;
 const ALL_REGIONS = "all";
+const MANAGEMENT_AREA_KEYS = { "강북": "gangbuk", "강남": "gangnam" } as const;
+const MANAGEMENT_AREA_REGIONS = Object.fromEntries(
+  Object.entries(MANAGEMENT_AREA_KEYS).map(([label, key]) => [
+    label,
+    new Set(
+      dispatchRegionBoundaries.features
+        .filter((feature) => feature.properties.management_area === key)
+        .map((feature) => feature.properties.region),
+    ),
+  ]),
+) as Record<string, Set<string>>;
 type ListMode = "routes" | "stations";
 type RouteTransition = "dispatch" | "complete" | "cancel" | "dismiss" | "restore";
 type RouteRefreshState = "normal" | "soon" | "delayed";
+
+function isRegionVisible(itemRegion: string, selectedRegion: string): boolean {
+  if (selectedRegion === ALL_REGIONS) return true;
+  return MANAGEMENT_AREA_REGIONS[selectedRegion]?.has(itemRegion)
+    ?? itemRegion === selectedRegion;
+}
 
 function routeRefreshState(
   health: ServingHealthResponse | null,
@@ -61,11 +79,12 @@ function preferredRoute(routes: Route[]): Route | null {
 }
 
 async function fetchAllRoutes(region: string): Promise<Route[]> {
+  const managementAreaRegions = MANAGEMENT_AREA_REGIONS[region];
   const routesById = new Map<string, Route>();
   let offset = 0;
   while (true) {
     const page = await api.routes({
-      region: region === ALL_REGIONS ? undefined : region,
+      region: region === ALL_REGIONS || managementAreaRegions ? undefined : region,
       closedWithinMinutes: CLOSED_ROUTE_HISTORY_MINUTES,
       limit: ROUTE_PAGE_SIZE,
       offset,
@@ -74,7 +93,10 @@ async function fetchAllRoutes(region: string): Promise<Route[]> {
     if (page.length < ROUTE_PAGE_SIZE) {
       // 신선도 필터는 RouteList에서만 적용한다. 여기서 걸러내면 선택 중인
       // 제안이 후보 창을 벗어나는 순간 재선택이 돌아 지도와 상세가 튄다.
-      return [...routesById.values()].filter(isRebalanceRoute);
+      const rebalanceRoutes = [...routesById.values()].filter(isRebalanceRoute);
+      return managementAreaRegions
+        ? rebalanceRoutes.filter((route) => managementAreaRegions.has(route.region))
+        : rebalanceRoutes;
     }
     offset += page.length;
   }
@@ -334,10 +356,10 @@ export default function App() {
   const selectedStation = stations.find((station) => station.sta_id === selectedStationId) ?? null;
   const filteredStations = selectedRegion === ALL_REGIONS
     ? stations
-    : stations.filter((station) => station.region === selectedRegion);
+    : stations.filter((station) => isRegionVisible(station.region, selectedRegion));
   const filteredAlerts = selectedRegion === ALL_REGIONS
     ? alerts
-    : alerts.filter((alert) => alert.region === selectedRegion);
+    : alerts.filter((alert) => isRegionVisible(alert.region, selectedRegion));
   const canDispatchNewRoutes = !servingHealthError
     && servingHealth?.can_dispatch_new_routes === true;
   const stockHealth = servingHealth?.components.stock;
@@ -361,6 +383,14 @@ export default function App() {
     if (region === selectedRegion) return;
     routeViewGenerationRef.current += 1;
     setSelectedRegion(region);
+    if (selectedStation && !isRegionVisible(selectedStation.region, region)) {
+      selectedStationIdRef.current = null;
+      forecastRequestGenerationRef.current += 1;
+      setSelectedStationId(null);
+      setForecast(null);
+      setForecastError(null);
+      setFocusedEvent(null);
+    }
     setRouteTransitionError(null);
     setRoutesInitialized(false);
     selectedRouteIdRef.current = null;

@@ -5,9 +5,11 @@ import { Circle, CircleMarker, MapContainer, Marker, Polygon, Polyline, TileLaye
 import type { ActionType, Alert, DispatchCenter, Route, StationFilter, StationSummary } from "../api";
 import type { FocusedEvent } from "./DetailPanel";
 import dispatchRegionBoundaries from "../dispatch_region_boundaries.json";
+import managementAreaBoundaries from "../management_area_boundaries.json";
 import seoulBoundary from "../seoul_boundary.json";
 
 const ALL_REGIONS = "all"; // App.tsx의 선택 안 함 상태와 동일한 값이어야 한다.
+const MANAGEMENT_AREA_KEYS = { "강북": "gangbuk", "강남": "gangnam" } as const;
 type RegionCell = [number, number][][][];
 // 서울시 따릉이 서비스라 서울 윤곽선을 항상 기본으로 띄워둔다(권역 선택과 무관).
 const SEOUL_OUTLINE: [number, number][] = seoulBoundary.geometry.coordinates[0].map(
@@ -50,8 +52,29 @@ function outerRingsToLatLng(
   return polygons.map((rings) => [rings[0].map(([lon, lat]) => [lat, lon] as [number, number])]);
 }
 
+function largestOuterRingToLatLng(
+  geometry: { type: string; coordinates: number[][][] | number[][][][] },
+): RegionCell {
+  const polygons = geometry.type === "Polygon" ? [geometry.coordinates as number[][][]] : (geometry.coordinates as number[][][][]);
+  const ringArea = (ring: number[][]) => Math.abs(ring.reduce((area, [lon, lat], index) => {
+    const [nextLon, nextLat] = ring[(index + 1) % ring.length];
+    return area + lon * nextLat - nextLon * lat;
+  }, 0));
+  const largest = polygons.reduce((current, candidate) =>
+    ringArea(candidate[0]) > ringArea(current[0]) ? candidate : current);
+  return [[largest[0].map(([lon, lat]) => [lat, lon] as [number, number])]];
+}
+
 function computeRegionCell(centers: DispatchCenter[], selectedRegion: string): RegionCell | null {
-  if (selectedRegion === ALL_REGIONS || centers.length === 0) return null;
+  if (selectedRegion === ALL_REGIONS) return null;
+  const managementAreaKey = MANAGEMENT_AREA_KEYS[selectedRegion as keyof typeof MANAGEMENT_AREA_KEYS];
+  if (managementAreaKey) {
+    const boundary = managementAreaBoundaries.features.find(
+      (feature) => feature.properties.management_area === managementAreaKey,
+    );
+    return boundary ? largestOuterRingToLatLng(boundary.geometry) : null;
+  }
+  if (centers.length === 0) return null;
   if (!centers.some((center) => center.region === selectedRegion)) return null;
   const boundary = dispatchRegionBoundaries.features.find(
     (feature) => feature.properties.region === selectedRegion,
