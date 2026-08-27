@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import unicodedata
-import weakref
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -145,18 +144,12 @@ class BusinessTimeEvidence:
         )
 
 
-@dataclass(frozen=True, slots=True, weakref_slot=True, init=False)
+@dataclass(frozen=True, slots=True)
 class VerifiedPublicationEvidence:
-    """공통 verifier만 만들 수 있는 immutable publication 검증 token이다."""
+    """검증을 마친 publication과 business time의 immutable evidence다."""
 
     publication: PreparedPublication
     business_times: BusinessTimeEvidence
-
-    def __init__(self, *_args: object, **_kwargs: object) -> None:
-        """외부 생성과 ``dataclasses.replace`` 기반 token 복제를 거부한다."""
-        raise ContractViolation(
-            "공통 verifier가 만들지 않은 publication evidence입니다."
-        )
 
     @property
     def manifest(self) -> PublicationManifest:
@@ -200,7 +193,7 @@ def _verify_publication_evidence(
     object_store: ImmutableObjectStore,
     validate_staging: StagingEvidenceValidator,
 ) -> tuple[PreparedPublication, BusinessTimeEvidence]:
-    """실제 immutable bytes와 staging 시각을 검증하고 sealed evidence를 만든다.
+    """실제 immutable bytes와 staging 시각을 검증해 immutable evidence를 만든다.
 
     모든 input·output·fingerprint를 먼저 검증하고 table별 staging validator까지 성공한 뒤
     publication manifest를 ``put_once``로 마지막에 기록하고 다시 읽는다.
@@ -461,137 +454,15 @@ def _require_nfc_nonblank(value: Any, name: str) -> str:
     return value
 
 
-def _evidence_material(value: VerifiedPublicationEvidence) -> tuple[Any, ...]:
-    """token의 현재 값을 재검증해 closure registry용 불변 재료로 반환한다."""
-    fingerprint_payload = value.publication.input_fingerprint.canonical_bytes
-    fingerprint = parse_input_fingerprint(
-        fingerprint_payload,
-        value.publication.manifest.publication_key,
+def verify_publication_evidence(
+    publication: PreparedPublication,
+    object_store: ImmutableObjectStore,
+    validate_staging: StagingEvidenceValidator,
+) -> VerifiedPublicationEvidence:
+    """실제 object·business time·manifest-last를 검증해 evidence를 반환한다."""
+    verified_publication, business_times = _verify_publication_evidence(
+        publication,
+        object_store,
+        validate_staging,
     )
-    manifest_payload = value.publication.manifest.canonical_bytes
-    manifest = parse_publication_manifest(manifest_payload)
-    PreparedPublication(
-        manifest=manifest,
-        manifest_uri=value.publication.manifest_uri,
-        input_fingerprint=fingerprint,
-    )
-    business_times = BusinessTimeEvidence(
-        publication_key=value.business_times.publication_key,
-        published_row_cnt=value.business_times.published_row_cnt,
-        values_by_field=value.business_times.values_by_field,
-    )
-    return (
-        manifest_payload,
-        value.publication.manifest_uri,
-        fingerprint_payload,
-        business_times.publication_key,
-        business_times.published_row_cnt,
-        tuple(
-            (name, tuple(business_times.values_by_field[name]))
-            for name in sorted(business_times.values_by_field)
-        ),
-    )
-
-
-def _evidence_from_material(material: tuple[Any, ...]) -> VerifiedPublicationEvidence:
-    """closure registry의 불변 재료에서 executor용 fresh snapshot을 만든다."""
-    (
-        manifest_payload,
-        manifest_uri,
-        fingerprint_payload,
-        business_publication_key,
-        business_row_count,
-        business_fields,
-    ) = material
-    manifest = parse_publication_manifest(manifest_payload)
-    fingerprint = parse_input_fingerprint(
-        fingerprint_payload,
-        manifest.publication_key,
-    )
-    publication = PreparedPublication(manifest, manifest_uri, fingerprint)
-    business_times = BusinessTimeEvidence(
-        business_publication_key,
-        business_row_count,
-        dict(business_fields),
-    )
-    snapshot = object.__new__(VerifiedPublicationEvidence)
-    object.__setattr__(snapshot, "publication", publication)
-    object.__setattr__(snapshot, "business_times", business_times)
-    return snapshot
-
-
-def _build_verification_boundary() -> tuple[
-    Callable[..., Any],
-    Callable[[object], bool],
-    Callable[[object], VerifiedPublicationEvidence | None],
-]:
-    """발급 registry를 closure에 숨긴 verifier와 token 검증기를 만든다."""
-    issued: dict[
-        int,
-        tuple[
-            weakref.ReferenceType[VerifiedPublicationEvidence],
-            tuple[Any, ...],
-        ],
-    ] = {}
-
-    def verify_publication_evidence(
-        publication: PreparedPublication,
-        object_store: ImmutableObjectStore,
-        validate_staging: StagingEvidenceValidator,
-    ) -> VerifiedPublicationEvidence:
-        """실제 object·business time·manifest-last를 검증하고 token을 발급한다."""
-        verified_publication, business_times = _verify_publication_evidence(
-            publication,
-            object_store,
-            validate_staging,
-        )
-        token = object.__new__(VerifiedPublicationEvidence)
-        object.__setattr__(token, "publication", verified_publication)
-        object.__setattr__(token, "business_times", business_times)
-        identifier = id(token)
-
-        def unregister(
-            reference: weakref.ReferenceType[VerifiedPublicationEvidence],
-        ) -> None:
-            """token이 소멸하면 같은 identity의 registry 항목만 제거한다."""
-            current = issued.get(identifier)
-            if current is not None and current[0] is reference:
-                issued.pop(identifier, None)
-
-        reference = weakref.ref(token, unregister)
-        issued[identifier] = (reference, _evidence_material(token))
-        return token
-
-    def snapshot_verified_publication_evidence(
-        value: object,
-    ) -> VerifiedPublicationEvidence | None:
-        """발급·무변조 token의 registry 재료로 executor용 fresh snapshot을 만든다."""
-        if type(value) is not VerifiedPublicationEvidence:
-            return None
-        registered = issued.get(id(value))
-        if registered is None or registered[0]() is not value:
-            return None
-        try:
-            if registered[1] != _evidence_material(value):
-                return None
-            return _evidence_from_material(registered[1])
-        except (AttributeError, ContractViolation, TypeError, ValueError):
-            return None
-
-    def is_verified_publication_evidence(value: object) -> bool:
-        """값이 현재 process verifier가 발급하고 변조되지 않은 token인지 반환한다."""
-        return snapshot_verified_publication_evidence(value) is not None
-
-    return (
-        verify_publication_evidence,
-        is_verified_publication_evidence,
-        snapshot_verified_publication_evidence,
-    )
-
-
-(
-    verify_publication_evidence,
-    is_verified_publication_evidence,
-    _snapshot_verified_publication_evidence,
-) = _build_verification_boundary()
-del _build_verification_boundary
+    return VerifiedPublicationEvidence(verified_publication, business_times)

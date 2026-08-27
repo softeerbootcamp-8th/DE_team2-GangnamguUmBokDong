@@ -30,7 +30,6 @@ from .errors import (
 from .evidence import (
     PreparedPublication,
     VerifiedPublicationEvidence,
-    _snapshot_verified_publication_evidence,
 )
 
 _MAX_FUTURE_SKEW = timedelta(minutes=5)
@@ -146,7 +145,7 @@ def execute_publication(
 
     args:
         connection: transaction이 시작되지 않은 psycopg 연결
-        publications: immutable bytes와 business time을 검증한 sealed evidence 목록
+        publications: immutable bytes와 business time을 검증한 evidence 목록
         mutate_targets: 같은 cursor로 target projection을 변경하는 callback
         validate_locked: 모든 lock 뒤 dependency 외 table별 불변식을 검증하는 callback
         validate_conditional_empty: 조건부 EMPTY 근거를 lock 안에서 증명하는 callback
@@ -232,7 +231,7 @@ def execute_publication(
             assert validate_replay_targets_locked is not None
             replayed = tuple(
                 item
-                for item in _prepare_publications(issued_publications)
+                for item in ordered
                 if item.manifest.publication_key in replayed_keys
             )
             validate_replay_targets_locked(cursor, replayed)
@@ -240,18 +239,13 @@ def execute_publication(
             return PublicationResult(outcome, publication_keys)
         ordered = tuple(
             item
-            for item in _prepare_publications(issued_publications)
+            for item in ordered
             if item.manifest.publication_key in published_keys
         )
         _validate_empty_publications(
             cursor,
             ordered,
             validate_conditional_empty,
-        )
-        ordered = tuple(
-            item
-            for item in _prepare_publications(issued_publications)
-            if item.manifest.publication_key in published_keys
         )
         _claim_publications(cursor, ordered)
         mutate_targets(cursor, ordered)
@@ -266,18 +260,17 @@ def _prepare_publications(
     issued_values = tuple(publications)
     if not issued_values:
         raise ContractViolation("publication이 하나 이상 필요합니다.")
-    snapshots: list[VerifiedPublicationEvidence] = []
     for item in issued_values:
-        snapshot = _snapshot_verified_publication_evidence(item)
-        if snapshot is None:
+        if type(item) is not VerifiedPublicationEvidence:
             raise ContractViolation(
-                "모든 publication은 공통 verifier가 만든 evidence여야 합니다."
+                "모든 publication은 VerifiedPublicationEvidence여야 합니다."
             )
-        snapshots.append(snapshot)
-    values = tuple(snapshots)
 
     ordered = tuple(
-        sorted(values, key=lambda item: item.manifest.publication_key.encode("utf-8"))
+        sorted(
+            issued_values,
+            key=lambda item: item.manifest.publication_key.encode("utf-8"),
+        )
     )
     keys = tuple(item.manifest.publication_key for item in ordered)
     if len(set(keys)) != len(keys):
