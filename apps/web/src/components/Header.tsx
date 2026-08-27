@@ -113,7 +113,7 @@ const HEALTH_COMPONENTS = [
   ["demand", "수요예측"],
   ["urgency", "대여소 우선순위"],
   ["routes", "작업 추천"],
-  ["weather", "날씨"],
+  ["weather", "날씨 예보"],
   ["events", "행사"],
   ["regions", "권역 설정"],
 ] as const;
@@ -136,7 +136,7 @@ function componentStateLabel(
   state: ServingHealthState | undefined,
   reason: string | undefined,
 ): string {
-  if (key === "weather" && reason === "weather_issue_stale") return "원본 지연";
+  if (key === "weather" && reason === "weather_horizon_incomplete") return "구간 누락";
   return state ? HEALTH_STATE_LABEL[state] : "확인 중";
 }
 
@@ -216,6 +216,12 @@ function ServingHealthTime({
       <span className="serving-health-popover-header">
         <strong>데이터 상태</strong>
       </span>
+      <span className="serving-health-columns" aria-hidden="true">
+        <span />
+        <span>항목</span>
+        <span>상태</span>
+        <span>기준 시각</span>
+      </span>
       <span className="serving-health-list">
         {HEALTH_COMPONENTS.map(([key, label]) => {
           const component = health?.components[key];
@@ -228,12 +234,12 @@ function ServingHealthTime({
                 {componentStateLabel(key, state, component?.reason)}
               </span>
               <time>
-                <span>
-                  {component?.source_dttm ? "게시 " : ""}
-                  {componentTime(component?.data_dttm ?? null)}
-                </span>
+                <span>{componentTime(component?.data_dttm ?? null)}</span>
                 {component?.source_dttm && (
-                  <small>원본 {componentTime(component.source_dttm)}</small>
+                  <small>
+                    {key === "weather" ? "기상청 발표 " : "원본 "}
+                    {componentTime(component.source_dttm)}
+                  </small>
                 )}
               </time>
             </span>

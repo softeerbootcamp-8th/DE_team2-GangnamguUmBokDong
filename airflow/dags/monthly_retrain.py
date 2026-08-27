@@ -647,6 +647,7 @@ def make_task_orchestrate_retrain_loop(model_name: str) -> Any:
                 train_result_key = _result_s3_key(run_id, f"train-{model_name}-{profile}")
                 train_args = [
                     "--execute",
+                    "--performance-already-checked",
                     "--skip-feature-pipeline",
                     "--profile-name",
                     profile,

@@ -296,6 +296,7 @@ body {
 }
 
 .serving-health-popover-header,
+.serving-health-columns,
 .serving-health-row,
 .serving-health-footer {
   display: grid;
@@ -306,6 +307,17 @@ body {
   padding-bottom: 7px;
   border-bottom: 1px solid var(--border);
   color: var(--text-primary);
+}
+
+.serving-health-columns {
+  grid-template-columns: 8px minmax(98px, 1fr) 64px 100px;
+  gap: 7px;
+  color: var(--text-muted);
+  font-size: 9px;
+}
+
+.serving-health-columns span:last-child {
+  text-align: right;
 }
 
 .serving-health-list {
