@@ -19,6 +19,9 @@ TIMEZONE = "Asia/Seoul"
 # 3시간짜리 수집이 실패해도 다음 5분 tick에서 바로 재시도되어, cron 경계에 걸려
 # 최대 3시간을 기다리던 예전보다 복구가 훨씬 빠르다.
 REALTIME_TICK_CRON = "*/5 * * * *"
+# max_active_runs=1인 상태에서 한 tick이 다음 5분 주기까지 점유해 이후 실행을
+# 연쇄 지연시키지 않도록 DAG Run 자체의 실행 상한을 schedule 간격과 맞춘다.
+REALTIME_TICK_RUN_TIMEOUT = timedelta(minutes=5)
 # 서울시 POI 목록·영역 파일의 변경 여부를 매일 확인한다. 5분 realtime tick의
 # 정각 경계와 03:00 일별 배치를 피해 가벼운 기준정보 갱신을 독립 실행한다.
 POI_MASTER_REFRESH_CRON = "4 2 * * *"

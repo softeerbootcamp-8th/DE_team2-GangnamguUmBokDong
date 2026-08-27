@@ -28,6 +28,7 @@ def test_schedule_is_five_minute_grid_without_catchup() -> None:
     assert TIMEZONE == "Asia/Seoul"
     assert dag.catchup is False
     assert dag.max_active_runs == 1
+    assert dag.dagrun_timeout == timedelta(minutes=5)
 
 
 def _core_task_ids() -> set[str]:

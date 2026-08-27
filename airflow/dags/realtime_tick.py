@@ -32,6 +32,7 @@ from config.schedules import (
     CATCHUP,
     MAX_ACTIVE_RUNS,
     REALTIME_TICK_CRON,
+    REALTIME_TICK_RUN_TIMEOUT,
     TIMEZONE,
 )
 from config.sources import (
@@ -94,6 +95,7 @@ def _build_realtime_tick_dag() -> DAG:
         start_date=pendulum.datetime(2026, 8, 16, tz=TIMEZONE),
         catchup=CATCHUP,
         max_active_runs=MAX_ACTIVE_RUNS,
+        dagrun_timeout=REALTIME_TICK_RUN_TIMEOUT,
         tags=["realtime"],
     ) as dag:
         resolve_poi_master = build_poi_master_resolve_task(dag)
