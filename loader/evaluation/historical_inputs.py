@@ -14,6 +14,7 @@ from pathlib import Path
 
 import boto3
 import pandas as pd
+import psycopg
 import pyarrow.parquet as pq
 from gold.demand import DemandForecastRecord
 from ml_core.day_index import day_index
@@ -48,6 +49,7 @@ class HistoricalStation:
     latitude: float
     longitude: float
     grid_id: str
+    dispatch_center_id: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,9 +135,10 @@ def load_station_master_from_s3(
     bucket: str,
     access_key: str,
     secret_key: str,
+    dispatch_center_by_station_id: Mapping[str, str],
     prefix: str = "processed_v2/station_master.parquet/",
 ) -> tuple[HistoricalStation, ...]:
-    """모델 학습에 사용한 고정 station master Parquet을 객체 저장소에서 읽는다."""
+    """고정 station master에 운영 Gold의 center lineage를 결합해 읽는다."""
     client = boto3.client(
         "s3",
         endpoint_url=endpoint_url,
@@ -173,18 +176,68 @@ def load_station_master_from_s3(
     for row in frame.to_dict("records"):
         if any(pd.isna(row[name]) for name in required):
             continue
+        longitude = float(row["lon"])
+        latitude = float(row["lat"])
+        published_center_id = _dispatch_center_lineage(
+            row,
+            dispatch_center_by_station_id=dispatch_center_by_station_id,
+        )
         records.append(
             HistoricalStation(
                 station_id=str(row["station_id"]),
                 station_no=int(row["station_no"]),
                 station_name=str(row["station_name"]),
                 capacity=int(row["capacity"]),
-                latitude=float(row["lat"]),
-                longitude=float(row["lon"]),
+                latitude=latitude,
+                longitude=longitude,
                 grid_id=str(row["grid_id"]).strip(),
+                dispatch_center_id=published_center_id,
             )
         )
     return tuple(sorted(records, key=lambda row: row.station_id.encode("utf-8")))
+
+
+def _dispatch_center_lineage(
+    row: Mapping[str, object],
+    *,
+    dispatch_center_by_station_id: Mapping[str, str],
+) -> str:
+    """게시된 운영 Gold station center lineage를 검증해 반환한다."""
+    station_id = str(row["station_id"])
+    lineage_center_id = dispatch_center_by_station_id.get(station_id)
+    if lineage_center_id is None:
+        raise ValueError(
+            "운영 Gold station에 center lineage가 없습니다: "
+            f"sta_id={station_id}"
+        )
+    source_center_id = row.get("dispatch_center_id")
+    if (
+        source_center_id is not None
+        and not pd.isna(source_center_id)
+        and str(source_center_id) != lineage_center_id
+    ):
+        raise ValueError(
+            "station master center lineage가 운영 Gold 배정과 다릅니다: "
+            f"sta_id={station_id}"
+        )
+    return lineage_center_id
+
+
+def load_station_dispatch_center_lineage(database_url: str) -> dict[str, str]:
+    """운영 Gold station이 게시한 center lineage를 읽기 전용으로 반환한다."""
+    with psycopg.connect(database_url) as connection, connection.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT sta_id, dispatch_center_id
+              FROM station
+             ORDER BY sta_id COLLATE "C"
+            """
+        )
+        rows = cursor.fetchall()
+    lineage = {str(station_id): str(center_id) for station_id, center_id in rows}
+    if not lineage or len(lineage) != len(rows):
+        raise ValueError("운영 Gold station center lineage가 비었거나 중복됐습니다.")
+    return lineage
 
 
 def read_weather_history(path: Path) -> tuple[WeatherObservation, ...]:

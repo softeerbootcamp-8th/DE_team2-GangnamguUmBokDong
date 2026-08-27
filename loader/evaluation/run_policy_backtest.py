@@ -17,7 +17,6 @@ from gold.rebalance_policy import (
     RebalancePolicyConfig,
 )
 from gold.rebalance_route import (
-    MAX_STOPS_PER_ROUTE,
     ROUTE_ALGORITHM_VERSION,
     DispatchCenterTopology,
 )
@@ -37,6 +36,7 @@ from .historical_inputs import (
     build_population_nowcast,
     latest_published_weather,
     load_model_bundle,
+    load_station_dispatch_center_lineage,
     load_station_master_from_s3,
     predict_point_in_time,
     read_weather_history,
@@ -92,43 +92,26 @@ class DurationResult:
 
 @dataclass(frozen=True, slots=True)
 class PolicyVariant:
-    """한 백테스트에서 비교할 정책 설정과 작업 대여소 상한을 묶는다."""
+    """한 백테스트에서 비교할 정책 이름과 설정을 묶는다."""
 
     name: str
-    max_stops_per_route: int
     policy_config: RebalancePolicyConfig
 
     def __post_init__(self) -> None:
-        """정책 이름·대여소 상한·설정 타입을 검증한다."""
+        """정책 이름과 설정 타입을 검증한다."""
         if type(self.name) is not str or not self.name.strip():
             raise ValueError("policy variant name은 nonblank여야 합니다.")
-        if (
-            type(self.max_stops_per_route) is not int
-            or not 2 <= self.max_stops_per_route <= 32767
-        ):
-            raise ValueError("policy variant max stops는 2..32767이어야 합니다.")
         if type(self.policy_config) is not RebalancePolicyConfig:
             raise ValueError("policy variant config 타입이 잘못됐습니다.")
 
 
-def default_policy_variants(
-    max_stops_variants: tuple[int, ...],
-) -> tuple[PolicyVariant, ...]:
-    """직접 실행의 기본 후보를 production 정책과 명시적 작업 상한으로 만든다."""
-    return tuple(
+def default_policy_variants() -> tuple[PolicyVariant, ...]:
+    """직접 실행의 기본 production 정책 하나를 반환한다."""
+    return (
         PolicyVariant(
-            name=(
-                PRODUCTION_POLICY_NAME
-                if max_stops == MAX_STOPS_PER_ROUTE
-                else (
-                    f"experimental_{ROUTE_ALGORITHM_VERSION.replace('-', '_')}_"
-                    f"max_stops_{max_stops}"
-                )
-            ),
-            max_stops_per_route=max_stops,
+            name=PRODUCTION_POLICY_NAME,
             policy_config=DEFAULT_REBALANCE_POLICY,
-        )
-        for max_stops in max_stops_variants
+        ),
     )
 
 
@@ -184,7 +167,6 @@ def run_policy_backtest(
     start_hour: int,
     evaluation_minutes: tuple[int, ...],
     fleet_size: int,
-    max_stops_variants: tuple[int, ...],
     rental_csv: Path,
     stock_csv: Path,
     weather_csv: Path,
@@ -195,6 +177,7 @@ def run_policy_backtest(
     bucket: str,
     access_key: str,
     secret_key: str,
+    database_url: str,
     policy_variants: tuple[PolicyVariant, ...] | None = None,
 ) -> PolicyBacktestResult:
     """실제 입력 로드부터 동일 예산 정책 민감도까지 전체 평가를 실행한다."""
@@ -209,11 +192,7 @@ def run_policy_backtest(
     )
     if evaluation_minutes == (60, 120, 180):
         validate_sensitivity_contracts(contracts)
-    variants = (
-        default_policy_variants(max_stops_variants)
-        if policy_variants is None
-        else policy_variants
-    )
+    variants = default_policy_variants() if policy_variants is None else policy_variants
     if (
         type(variants) is not tuple
         or not variants
@@ -227,13 +206,15 @@ def run_policy_backtest(
         raise ValueError(f"활성 dispatch center를 하나 찾을 수 없습니다: {center_id}")
     center, center_name = matches[0]
     model = load_model_bundle(model_bundle_root)
+    dispatch_center_by_station_id = load_station_dispatch_center_lineage(database_url)
     station_master = load_station_master_from_s3(
         endpoint_url=endpoint_url,
         bucket=bucket,
         access_key=access_key,
         secret_key=secret_key,
+        dispatch_center_by_station_id=dispatch_center_by_station_id,
     )
-    selected = _select_center_stations(station_master, center, centers, model)
+    selected = _select_center_stations(station_master, center_id, model)
     station_crosswalk = read_station_crosswalk(rental_csv)
     trips = read_rental_trips(
         rental_csv,
@@ -381,7 +362,6 @@ def run_policy_backtest(
                 initial_stock=initial_stock,
                 trips=trips,
                 forecast_provider=provider,
-                max_stops_per_route=variant.max_stops_per_route,
                 movement_budget=legacy.balanced_movement_budget,
                 policy_config=variant.policy_config,
             )
@@ -450,24 +430,16 @@ def run_policy_backtest(
 
 def _select_center_stations(
     stations: Sequence[HistoricalStation],
-    center: DispatchCenterTopology,
-    centers: Sequence[tuple[DispatchCenterTopology, str]],
+    center_id: str,
     model: ModelBundle,
 ) -> dict[int, HistoricalStation]:
-    """최근접 센터·두 모델 category 교집합으로 평가 대여소를 선택한다."""
+    """운영 Gold center lineage와 두 모델 category 교집합을 선택한다."""
     rental = set(model.rental.station_dtype.categories)
     returned = set(model.returned.station_dtype.categories)
     selected = {}
     for station in stations:
-        nearest = min(
-            (row[0] for row in centers),
-            key=lambda item: (
-                _distance_sq(station, item),
-                item.dispatch_center_id,
-            ),
-        )
         if (
-            nearest.dispatch_center_id == center.dispatch_center_id
+            station.dispatch_center_id == center_id
             and station.station_no in rental
             and station.station_no in returned
         ):
@@ -600,16 +572,6 @@ def _population_required_hours(
     return {
         target_date: frozenset(hours) for target_date, hours in sorted(required.items())
     }
-
-
-def _distance_sq(
-    station: HistoricalStation,
-    center: DispatchCenterTopology,
-) -> float:
-    """최근접 센터 선택용 위경도 제곱거리를 반환한다."""
-    return (station.latitude - center.latitude) ** 2 + (
-        station.longitude - center.longitude
-    ) ** 2
 
 
 def _source_file(path: Path) -> SourceFile:

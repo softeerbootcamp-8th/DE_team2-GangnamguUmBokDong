@@ -77,7 +77,7 @@ dependency, role, parameter는 허용하지 않으며, 별도 표시가 없는 r
 | `event:cultural_event` | 없음 | `cultural_event_manifest` | `event_identity_version`, `event_policy_version` |
 | `event:performance_event` | 없음 | `performance_event_manifest`, `stadium_coordinate_seed` | `event_policy_version`, `stadium_coordinate_version` |
 | `station_urgency` | `station`, `station_demand_forecast`, `station_stock` | `demand_publication_manifest`, `stock_publication_manifest`, 선택적 `stock_history_manifest_m05`~`m25`, `urgency_output` | `expected_sta_id_sha256`, `rebalance_policy_config`, `scoring_config_version`, `stock_history_offsets`, `stock_window_count` |
-| `rebalance_route` | `dispatch_center`, `station`, `station_demand_forecast`, `station_stock`, `station_urgency` | `pickup_cooldown_station_ids`, `route_coverage`, `urgency_publication_manifest` | `max_routes_per_center`, `max_stops_per_route`, `pickup_dispatch_assumed_speed_kmh`, `pickup_dispatch_max_lag_minutes`, `pickup_dispatch_service_minutes_per_stop`, `pickup_dispatch_sla_config_version`, `rebalance_policy_config`, `route_algorithm_version`, `route_coverage_sha256`, `route_work_unit_config_version`, `truck_capacity`, `truck_capacity_config_version` |
+| `rebalance_route` | `dispatch_center`, `station`, `station_demand_forecast`, `station_stock`, `station_urgency` | `pickup_cooldown_station_ids`, `route_coverage`, `urgency_publication_manifest` | `fleet_capacities`, `fleet_config_version`, `rebalance_policy_config`, `route_algorithm_version`, `route_coverage_sha256` |
 
 ### 조건부 입력
 
@@ -102,7 +102,7 @@ dependency, role, parameter는 허용하지 않으며, 별도 표시가 없는 r
 artifact-set hash와 input-fingerprint hash가 dependency와 모두 같아야 한다. Route는 urgency
 fingerprint 내부의 `station`, demand, stock dependency도 자신의 dependency와 다시
 비교한다. 또한 두 fingerprint의 `rebalance_policy_config`가 byte-for-byte 같아야 한다.
-`route-v4-supply-led-pickup-sla`는 현행 `scoring_config_version`과 기본 재배치 정책의
+`route-v5-supply-led-mixed-fleet`는 현행 `scoring_config_version`과 기본 재배치 정책의
 canonical config만 소비하며, 구버전 점수 또는 다른 정책 fingerprint는 fail-closed로
 거부한다. `rebalance_policy_config`에는 같은 pickup station을 plan 안에서 한 경로에만 쓰는
 exclusive 설정과 완료 후 재회수 cooldown을 포함한다.
@@ -114,25 +114,23 @@ exclusive 설정과 완료 후 재회수 cooldown을 포함한다.
 - Gold demand는 기존 `ml-inference-snapshot-manifest-v1`의 7-column output을
   mean-only로 dual-read한다. 이때 quantile은 없는 값으로 유지하며
   `poisson-mean`만 사용할 수 있다. `quantile-adverse`는 v1 lineage를 fail-closed한다.
-- 정상 realtime DAG는 같은 run의 새 urgency-v5 manifest를 route-v4에 직접 넘긴다.
-  이미 urgency-v1/v4가 끝난 과거 anchor를 route-v4로 재실행할 때는 route만 단독
+- 정상 realtime DAG는 같은 run의 새 urgency-v5 manifest를 route-v5에 직접 넘긴다.
+  이미 urgency-v1/v4가 끝난 과거 anchor를 route-v5로 재실행할 때는 route만 단독
   재실행하지 않고, 같은 anchor의 urgency-v5를 먼저 다시 게시한 뒤 그 manifest로
   route를 실행한다. 서로 다른 정책 fingerprint를 compatibility 명목으로 섞지 않는다.
 
-Pickup SLA provenance는 다음 네 parameter로 고정한다.
-
-- `pickup_dispatch_sla_config_version=pickup-dispatch-sla-v1`
-- `pickup_dispatch_assumed_speed_kmh=20.0`
-- `pickup_dispatch_service_minutes_per_stop=3.0`
-- `pickup_dispatch_max_lag_minutes=30.0`
-
-가장 긴급한 supply가 경로 ordinal과 첫 dropoff를 소유하고, pickup 후보는
-`center→pickup→supply` 총거리 순으로 고른다. 실제 pickup 방문은 센터부터 최근접 순서이며
-이동시간과 stop 작업시간을 합친 마지막 pickup 실행시각이 dispatch 뒤 30분 이하여야 한다.
-큰 split이 이를 위반하면 더 작은 pickup·dropoff 완결 route를 고르고, 단일 pickup도
-30분 밖이면 그 donor를 제외한다. 이 작업 단위는
-`route_work_unit_config_version=route-work-unit-v3-pickup-sla`와
-`gold-route-publisher-v3-pickup-sla`로 식별한다.
+혼합 차량 provenance는 `fleet_capacities=20,20,15,15`와
+`fleet_config_version=mixed-fleet-v1-two-20-two-15-per-center`로 고정한다. 가장 긴급한
+supply가 경로 ordinal과 첫 dropoff를 소유하고, pickup 후보는
+`center→pickup→supply` 총거리 순으로 고른다. 양수 supply의 필수량은 그대로 작업 발생
+기준으로 쓰고, 실제 방문
+수량은 현재 빈 공간 안에서 `supply_trigger_stock_ratio=0.20`에서
+`supply_visit_target_stock_ratio=0.40`까지 회복한다. 두 비율은 route input fingerprint에
+고정하며 `bike_qty<=0`을 새 후보로 만들지는 않는다. 각 경로는 배정 차량 용량과 남은
+pickup·완충된 dropoff 중 가장 작은 수량만큼 옮긴다. 별도 stop 수 상한은 없고 차량 tuple이
+센터별 경로 수와 적재량을 함께 제한한다. 센터 왕복·이동·정차·상하차를 포함한 경로
+작업 예산은 120분이다. Publisher는
+`gold-route-publisher-v4-mixed-fleet`로 식별한다.
 
 ## Station 보조 문서
 

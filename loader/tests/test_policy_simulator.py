@@ -9,7 +9,7 @@ from evaluation.policy_simulator import simulate_no_rebalance, simulate_policy
 from evaluation.rebalance_backtest import RentalTrip
 from gold.demand import DemandForecastRecord
 from gold.rebalance_policy import risk_band_policy
-from gold.rebalance_route import MAX_STOPS_PER_ROUTE, DispatchCenterTopology
+from gold.rebalance_route import FLEET_CAPACITIES, DispatchCenterTopology
 
 SEOUL = ZoneInfo("Asia/Seoul")
 START = datetime(2025, 6, 17, 6, tzinfo=SEOUL)
@@ -25,6 +25,7 @@ def _station(number: int, capacity: int, latitude: float) -> HistoricalStation:
         latitude=latitude,
         longitude=127.0,
         grid_id=f"GRID-{number}",
+        dispatch_center_id="center",
     )
 
 
@@ -96,10 +97,6 @@ def test_no_rebalance_removes_return_of_failed_rental() -> None:
     assert result.observed_requests == 1
     assert result.unfulfilled_requests == 1
     assert result.fulfilled_requests == 0
-    assert (
-        result.policy_configuration["max_stops_per_route"]
-        == MAX_STOPS_PER_ROUTE
-    )
 
 
 def test_policy_replans_every_five_minutes_without_double_dispatching_covered_work() -> (
@@ -121,7 +118,6 @@ def test_policy_replans_every_five_minutes_without_double_dispatching_covered_wo
         initial_stock={1: 10, 2: 0},
         trips=(_trip(15, 2, 1),),
         forecast_provider=_forecast,
-        max_stops_per_route=8,
         movement_budget=5,
     )
     assert result.decision_ticks == 12
@@ -131,7 +127,7 @@ def test_policy_replans_every_five_minutes_without_double_dispatching_covered_wo
     assert result.fulfilled_requests == 1
     assert result.completed_routes_by_cutoff == 1
     assert result.trucks_still_busy_at_cutoff == 0
-    assert result.policy_configuration["max_stops_per_route"] == 8
+    assert result.policy_configuration["fleet_capacities"] == list(FLEET_CAPACITIES)
 
 
 def test_policy_does_not_truncate_route_to_remaining_movement_budget() -> None:
@@ -152,7 +148,6 @@ def test_policy_does_not_truncate_route_to_remaining_movement_budget() -> None:
         initial_stock={1: 10, 2: 0},
         trips=(),
         forecast_provider=_forecast,
-        max_stops_per_route=8,
         movement_budget=4,
     )
 
@@ -181,7 +176,6 @@ def test_policy_does_not_dispatch_route_that_cannot_return_before_cutoff() -> No
         initial_stock={1: 10, 2: 0},
         trips=(),
         forecast_provider=_forecast,
-        max_stops_per_route=8,
         movement_budget=10,
     )
     assert result.dispatched_routes == 0
@@ -213,7 +207,6 @@ def test_pickup_execution_matches_production_planned_quantity_contract() -> None
             _trip(11, 1, 1, bike_id_suffix=f"-{index}") for index in range(5)
         ),
         forecast_provider=_forecast,
-        max_stops_per_route=8,
         movement_budget=5,
         policy_config=policy,
     )
@@ -254,7 +247,6 @@ def test_pickup_cooldown_starts_after_last_scheduled_stop() -> None:
             for minute in range(20, 25)
         ),
         forecast_provider=_forecast,
-        max_stops_per_route=8,
         movement_budget=10,
         policy_config=policy,
     )
