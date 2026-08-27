@@ -276,15 +276,20 @@ def _yarn_python_module_step(
         "yarn org.apache.hadoop.yarn.applications.distributedshell.Client "
         f'-jar "$JAR" -shell_command \'{shell_command}\' '
         "-num_containers 1 -container_memory 6144 -container_vcores 2 "
-        f"-master_memory {_YARN_AM_MEMORY_MB} -master_vcores {_YARN_AM_VCORES} {shell_env_args}"
+        f"-master_memory {_YARN_AM_MEMORY_MB} -master_vcores {_YARN_AM_VCORES} "
+        "-timeout 345600000 "
+        f"{shell_env_args}"
     )
+
     return name, ["bash", "-c", script]
+
 
 
 def _feature_mart_spark_steps(
     profile: str,
     core_instance_count: int = FEATURE_MART_CORE_INSTANCE_COUNT,
     model_name: str | None = None,
+    force: bool = False,
 ) -> tuple[tuple[str, list[str]], tuple[str, list[str]]]:
     """`profile`로 feature mart(2차 정제)를 (재)생성하는 두 Spark 스텝(name, args)을
     반환한다 — run_pipeline.py는 watermark 기반 증분이라 매번 불러도 안전하다
@@ -298,6 +303,8 @@ def _feature_mart_spark_steps(
             그대로 두면 노드 수가 늘어나도 병렬도가 그대로라 유휴 노드가
             생긴다(PR #248 리뷰 지적).
         model_name: "rental", "return", 또는 None(둘 다). 지정 시 Multi-horizon
+        force: True이면 워터마크 신선도를 무시하고 무조건 강제 재생성.
+
             확장 스텝이 해당 모델의 피처마트만 단독 생성해 연산량을 절감한다.
     """
     common_confs = [
@@ -369,11 +376,14 @@ def _feature_mart_spark_steps(
         "--conf",
         "spark.hadoop.fs.s3a.aws.credentials.provider=org.apache.hadoop.fs.s3a.auth.IAMInstanceCredentialsProvider",
     ]
-    multi_horizon_args = ["--models", model_name] if model_name else []
+    run_pipeline_args = ["--force"] if force else []
+    multi_horizon_args = (["--models", model_name] if model_name else []) + (["--force"] if force else [])
     return (
         (
             f"Spark-RunPipeline-{profile}",
-            _spark_module_launcher_command("feature_engine.spark.run_pipeline", common_confs),
+            _spark_module_launcher_command(
+                "feature_engine.spark.run_pipeline", common_confs, app_args=run_pipeline_args
+            ),
         ),
         (
             f"Spark-BuildMultiHorizon-{profile}",
@@ -382,6 +392,7 @@ def _feature_mart_spark_steps(
             ),
         ),
     )
+
 
 
 
@@ -562,8 +573,9 @@ def make_task_refresh_feature_mart(model_name: str) -> Any:
             )
             return
 
+        force_refresh = bool(params.get("force_refresh_feature_mart", False))
         profile = _champion_profile_name(model_name) or "builtin-default"
-        if _is_feature_mart_fresh(profile, model_name):
+        if not force_refresh and _is_feature_mart_fresh(profile, model_name):
             logger.info(
                 "[%s 월별 재학습] 1.5단계: 프로필 '%s'의 피처마트가 이미 최신(24h 이내) 상태입니다 — Spark 스텝 제출 스킵",
                 model_name,
@@ -573,14 +585,18 @@ def make_task_refresh_feature_mart(model_name: str) -> Any:
             return
 
         logger.info(
-            "[%s 월별 재학습] 1.5단계: 챔피언 프로필 '%s' 기준으로 [%s] feature mart 증분 갱신",
+            "[%s 월별 재학습] 1.5단계: 챔피언 프로필 '%s' 기준으로 [%s] feature mart %s",
             model_name,
             profile,
             model_name,
+            "강제 전체 갱신" if force_refresh else "증분 갱신",
         )
-        for step_name, spark_args in _feature_mart_spark_steps(profile, params_core_count, model_name=model_name):
+        for step_name, spark_args in _feature_mart_spark_steps(
+            profile, params_core_count, model_name=model_name, force=force_refresh
+        ):
             submit_emr_step(cluster_id, step_name, spark_args, mock_override=mock_override)
         ti.xcom_push(key="profile", value=profile)
+
 
 
     return task_refresh_feature_mart
@@ -713,14 +729,16 @@ def make_task_orchestrate_retrain_loop(model_name: str) -> Any:
         # 시작 전에 곧바로 실패해야 한다.
         _resolve_wrapper_worker_count(core_instance_count)
 
+        force_refresh = bool(params.get("force_refresh_feature_mart", False))
         for profile in candidate_profiles:
             logger.info("=== [%s 프로필: %s] EMR 피처마트 스텝 제출 ===", model_name, profile)
             try:
                 for step_name, spark_args in _feature_mart_spark_steps(
-                    profile, core_instance_count, model_name=model_name
+                    profile, core_instance_count, model_name=model_name, force=force_refresh
                 ):
                     submit_emr_step(cluster_id, step_name, spark_args, mock_override=mock_override)
                 logger.info("=== [%s 프로필: %s] EMR 피처마트 완료 ===", model_name, profile)
+
 
 
                 logger.info("=== [%s 프로필: %s] YARN distributed-shell 학습 스텝 제출 ===", model_name, profile)
@@ -971,6 +989,14 @@ def build_monthly_retrain_dag(cron_schedule: str) -> DAG:
                     "못 띄운다 — 최솟값을 그만큼으로 잡는다."
                 ),
             ),
+            "force_refresh_feature_mart": Param(
+                False,
+                type="boolean",
+                description=(
+                    "켜면 워터마크 신선도 검사를 무시하고 1단계/2단계 피처마트를 무조건 강제로 "
+                    "전체 재생성합니다 (Spark 성능 최적화 계측 및 실측용)."
+                ),
+            ),
             "test_profile_only": Param(
                 False,
                 type="boolean",
@@ -984,6 +1010,7 @@ def build_monthly_retrain_dag(cron_schedule: str) -> DAG:
             ),
         },
     ) as dag:
+
         start_mlflow = PythonOperator(
             task_id="start_mlflow",
             python_callable=make_task_start_mlflow(),

@@ -64,11 +64,13 @@ config.py`의 `safety_cutoff_date()`, `monitor_performance.py`의 "완결된 달
     EMR:  spark-submit --deploy-mode cluster feature_engine/run_pipeline.py
 """
 
+import argparse
 import os
 from datetime import datetime, timedelta
 
 from core import s3 as s3_io
 from pyspark.sql import functions as F
+
 
 from . import config
 from .build_features import build_features
@@ -359,12 +361,15 @@ def _run_incremental(spark, watermark: dict) -> None:
 
 def main() -> None:
     """피처마트 파이프라인을 실행한다 (워터마크 유무에 따라 전체 빌드 또는 증분 실행)."""
+    parser = argparse.ArgumentParser(description="Base feature mart pipeline")
+    parser.add_argument("--force", action="store_true", help="워터마크 신선도를 무시하고 강제 실행")
+    args, _ = parser.parse_known_args()
+
     spark = get_spark()
     watermark = read_watermark(config.WATERMARK_PATH)
-    # 명시적 window는 같은 profile output에 과거 rolling 실행의 바깥 파티션이 남아
-    # 있을 수 있다. incremental dynamic overwrite로는 이번 DataFrame에 없는 미래
-    # 파티션을 지울 수 없으므로, watermark 존재 여부와 무관하게 전체 overwrite한다.
-    if watermark is None or _explicit_window_requested():
+    # 명시적 window나 --force는 같은 profile output에 과거 rolling 실행의 바깥 파티션이 남아
+    # 있을 수 있으므로, watermark 존재 여부/신선도와 무관하게 전체 overwrite한다.
+    if watermark is None or _explicit_window_requested() or args.force:
         _run_full_build(spark)
     else:
         window_until = None if config.WINDOW_END is None else str(config.WINDOW_END)
@@ -382,6 +387,7 @@ def main() -> None:
             spark.stop()
             return
         _run_incremental(spark, watermark)
+
 
 
 

@@ -425,8 +425,12 @@ def _run_distributed_training_via_yarn(model_name: str, env: dict[str, str]) -> 
         str(YARN_AM_MEMORY_MB),
         "-master_vcores",
         str(YARN_AM_VCORES),
+        "-timeout",
+        "345600000",
         *shell_env_args,
     ]
+
+
     _notify(f"[{model_name}] YARN distributed-shell 제출 (컨테이너 {num_machines}개)...")
     subprocess.run(cmd, check=True)
 
@@ -500,8 +504,12 @@ def _run_distributed_evaluation_via_yarn(
         str(YARN_AM_MEMORY_MB),
         "-master_vcores",
         str(YARN_AM_VCORES),
+        "-timeout",
+        "345600000",
         *shell_env_args,
     ]
+
+
     _notify(f"[{model_name}] 분산 평가 YARN distributed-shell 제출 (워커 {num_workers}개)...")
     subprocess.run(cmd, check=True)
 
