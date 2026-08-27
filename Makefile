@@ -12,7 +12,7 @@ COMPOSE = docker compose --env-file ops/compose/local.defaults.env --env-file $(
 
 E2E_LOGICAL_DTTM ?= $(shell TZ=Asia/Seoul date '+%Y-%m-%dT%H:%M:00+09:00' | awk -F: '{ printf "%s:%02d:00+09:00\n", $$1, int($$2 / 5) * 5 }')
 E2E_STATION_SOURCE_DTTM ?= $(shell python3 ops/e2e_time.py station-source '$(E2E_LOGICAL_DTTM)')
-GOLD_DISPATCH_CENTER_EFFECTIVE_DTTM := 2026-08-19T03:15:38Z
+GOLD_DISPATCH_CENTER_EFFECTIVE_DTTM := 2026-08-27T05:10:00Z
 GOLD_WEATHER_GRID_SEED_VERSION ?= local-dev-weather-grid-v1
 GOLD_WEATHER_GRID_EFFECTIVE_DTTM ?= 2026-08-19T03:15:38Z
 

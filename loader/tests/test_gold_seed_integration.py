@@ -16,17 +16,22 @@ from core.gold_publication.errors import (
     PublicationDependencyError,
     PublicationTimeError,
 )
+from psycopg import Connection
+
 from gold.dispatch_center import (
     load_dispatch_center_seed,
     parse_dispatch_center_seed,
     publish_dispatch_center,
+)
+from gold.station import (
+    DispatchCenterReference,
+    assign_dispatch_center_id,
 )
 from gold.weather_grid import (
     WEATHER_SOURCE_PATHS,
     build_weather_grid_seed,
     publish_weather_grid,
 )
-from psycopg import Connection
 
 _DATABASE_URL = os.environ.get("GOLD_PUBLICATION_TEST_DATABASE_URL")
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
@@ -92,6 +97,7 @@ def test_seed_publishers_replay_correction_stale_and_reference_rollback(
         seed=weather_seed,
         object_base_uri="s3://test-bucket/gold-publication",
     )
+    _insert_coordinate_transition_fixture(gold_connection)
     dispatch_first = publish_dispatch_center(
         gold_connection,
         object_store,
@@ -102,6 +108,38 @@ def test_seed_publishers_replay_correction_stale_and_reference_rollback(
     assert dispatch_first.result.outcome is PublicationOutcome.PUBLISHED
     assert _table_count(gold_connection, "weather_grid") == 34
     assert _table_count(gold_connection, "dispatch_center") == 11
+    assert _row_value(
+        gold_connection,
+        "SELECT dispatch_center_id FROM station WHERE sta_id = 'ST-888888'",
+    ) == "isu"
+    transition_center = _row_value(
+        gold_connection,
+        "SELECT dispatch_center_id FROM station WHERE sta_id = 'ST-1141'",
+    )
+    station_projection_center = _station_projection_center(
+        gold_connection,
+        dispatch_seed.rows,
+        "ST-1141",
+    )
+    assert transition_center == station_projection_center == "yeongnam"
+    assert _row_value(
+        gold_connection,
+        "SELECT count(*) FROM rebalance_route WHERE route_status_cd = 'proposed'",
+    ) == 0
+    assert _row_value(
+        gold_connection,
+        "SELECT count(*) FROM rebalance_route "
+        "WHERE route_id = '77777777-7777-4777-8777-777777777777' "
+        "AND route_status_cd = 'dispatched'",
+    ) == 1
+
+    dispatch_replay = publish_dispatch_center(
+        gold_connection,
+        object_store,
+        seed=dispatch_seed,
+        object_base_uri="s3://test-bucket/gold-publication",
+    )
+    assert dispatch_replay.result.outcome is PublicationOutcome.EXACT_REPLAY
 
     weather_replay = publish_weather_grid(
         gold_connection,
@@ -185,6 +223,73 @@ def _weather_source_payloads() -> dict[str, bytes]:
     return {
         path: (_REPOSITORY_ROOT / path).read_bytes() for path in WEATHER_SOURCE_PATHS
     }
+
+
+def _insert_coordinate_transition_fixture(connection: Connection[Any]) -> None:
+    """구 좌표 센터와 이를 참조하는 station·proposed route를 삽입한다."""
+    observed = datetime.now(UTC) - timedelta(minutes=1)
+    with connection.transaction(), connection.cursor() as cursor:
+        cursor.execute(
+            "INSERT INTO dispatch_center "
+            "(dispatch_center_id, dispatch_center_nm, dispatch_center_point, "
+            "location_accuracy_cd, location_source_desc, location_verified_dt, is_active) "
+            "VALUES ('sangam', '상암', ST_SetSRID(ST_MakePoint(126.8972, 37.5683), "
+            "4326), 'landmark_approximation', '좌표 전환 테스트용 구 Point', NULL, true)"
+        )
+        cursor.execute(
+            "SELECT weather_grid_id FROM weather_grid ORDER BY weather_grid_id LIMIT 1"
+        )
+        weather_grid_row = cursor.fetchone()
+        assert weather_grid_row is not None
+        cursor.execute(
+            "INSERT INTO station "
+            "(sta_id, sta_nm, sta_addr, hold_cnt, sta_point, sta_point_source_cd, "
+            "weather_grid_id, dispatch_center_id, master_base_dttm, last_seen_dttm, "
+            "is_active) VALUES ('ST-888888', '좌표 전환 테스트 대여소', "
+            "'서울시 테스트 주소', 10, ST_SetSRID(ST_MakePoint(126.982400620133, "
+            "37.4837582703213), 4326), 'bike_station_master', %s, 'sangam', %s, %s, true)",
+            (weather_grid_row[0], observed, observed),
+        )
+        cursor.execute(
+            "INSERT INTO station "
+            "(sta_id, sta_nm, sta_addr, hold_cnt, sta_point, sta_point_source_cd, "
+            "weather_grid_id, dispatch_center_id, master_base_dttm, last_seen_dttm, "
+            "is_active) VALUES ('ST-1141', '서울 외곽 제약거리 전환 대여소', "
+            "'서울시 테스트 주소', 10, ST_SetSRID(ST_MakePoint(126.888458, "
+            "37.475552), 4326), 'bike_station_master', %s, 'sangam', %s, %s, true)",
+            (weather_grid_row[0], observed, observed),
+        )
+        cursor.execute(
+            "INSERT INTO rebalance_route "
+            "(route_id, dispatch_center_id, route_status_cd, proposed_dttm) "
+            "VALUES ('88888888-8888-4888-8888-888888888888', 'sangam', 'proposed', %s)",
+            (observed,),
+        )
+        cursor.execute(
+            "INSERT INTO rebalance_route_stop "
+            "(route_id, visit_no, sta_id, route_action_type_cd, bike_cnt) "
+            "VALUES ('88888888-8888-4888-8888-888888888888', 1, 'ST-888888', "
+            "'pickup', 1)"
+        )
+        cursor.execute(
+            "INSERT INTO rebalance_route "
+            "(route_id, dispatch_center_id, route_status_cd, proposed_dttm) "
+            "VALUES ('77777777-7777-4777-8777-777777777777', 'sangam', "
+            "'proposed', %s)",
+            (observed - timedelta(minutes=1),),
+        )
+        cursor.execute(
+            "INSERT INTO rebalance_route_stop "
+            "(route_id, visit_no, sta_id, route_action_type_cd, bike_cnt) "
+            "VALUES ('77777777-7777-4777-8777-777777777777', 1, 'ST-1141', "
+            "'pickup', 1)"
+        )
+        cursor.execute(
+            "UPDATE rebalance_route "
+            "SET route_status_cd = 'dispatched', dispatched_dttm = %s "
+            "WHERE route_id = '77777777-7777-4777-8777-777777777777'",
+            (observed,),
+        )
 
 
 def _insert_referenced_extra_topology(connection: Connection[Any]) -> None:
@@ -313,6 +418,64 @@ def _row_exists(
     connection.rollback()
     assert row is not None
     return row[0]
+
+
+def _row_value(connection: Connection[Any], query: str) -> Any:
+    """테스트가 고정한 read-only SQL의 단일 scalar를 반환한다."""
+    with connection.cursor() as cursor:
+        cursor.execute(query)
+        row = cursor.fetchone()
+    connection.rollback()
+    assert row is not None
+    return row[0]
+
+
+def _station_projection_center(
+    connection: Connection[Any],
+    center_rows: tuple[Any, ...],
+    station_id: str,
+) -> str:
+    """station projection helper로 동일 Point의 center 배정을 계산한다."""
+    centers = tuple(
+        DispatchCenterReference(
+            row.dispatch_center_id,
+            row.longitude,
+            row.latitude,
+            row.is_active,
+        )
+        for row in sorted(center_rows)
+        if row.is_active
+    )
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT ST_X(station.sta_point),
+                   ST_Y(station.sta_point),
+                   array_agg(
+                       ST_Distance(
+                           station.sta_point::geography,
+                           center.dispatch_center_point::geography
+                       )
+                       ORDER BY center.dispatch_center_id COLLATE "C"
+                   )
+              FROM station
+             CROSS JOIN dispatch_center AS center
+             WHERE station.sta_id = %s
+               AND center.is_active
+             GROUP BY station.sta_point
+            """,
+            (station_id,),
+        )
+        row = cursor.fetchone()
+    connection.rollback()
+    assert row is not None
+    return assign_dispatch_center_id(
+        station_id=station_id,
+        longitude=float(row[0]),
+        latitude=float(row[1]),
+        centers=centers,
+        meters=tuple(float(value) for value in row[2]),
+    )
 
 
 def _reset_database(connection: Connection[Any]) -> None:

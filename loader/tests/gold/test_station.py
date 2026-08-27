@@ -24,8 +24,8 @@ LON = 127.0473
 LAT = 37.5172
 GRID_IDS = ("61_126",)
 CENTERS = (
-    DispatchCenterReference("CENTER-1", 127.05, 37.52, True),
-    DispatchCenterReference("CENTER-OFF", 127.04, 37.51, False),
+    DispatchCenterReference("hangnyeoul", 127.05, 37.52, True),
+    DispatchCenterReference("sangam", 127.04, 37.51, False),
 )
 
 
@@ -75,7 +75,7 @@ def _previous(**overrides: object) -> StationRecord:
         "latitude": LAT,
         "sta_point_source_cd": "bike_station_master",
         "weather_grid_id": "61_126",
-        "dispatch_center_id": "CENTER-1",
+        "dispatch_center_id": "hangnyeoul",
         "master_base_dttm": MASTER_TIME - timedelta(days=1),
         "last_seen_dttm": CANDIDATE_TIME - timedelta(minutes=5),
         "is_active": True,
@@ -317,18 +317,64 @@ def test_station_grid_must_exist_in_published_seed() -> None:
 def test_nearest_center_tie_breaks_by_utf8_id() -> None:
     """active center 거리가 동일하면 ID UTF-8 오름차순으로 고른다."""
     centers = (
-        DispatchCenterReference("CENTER-B", 127.06, 37.53, True),
-        DispatchCenterReference("CENTER-A", 127.03, 37.50, True),
+        DispatchCenterReference("isu", 127.06, 37.53, True),
+        DispatchCenterReference("hangnyeoul", 127.03, 37.50, True),
     )
     [record] = _build(centers=centers, distance_meters=lambda *_: 1.0).records
-    assert record.dispatch_center_id == "CENTER-A"
+    assert record.dispatch_center_id == "hangnyeoul"
+
+
+def test_nearest_center_uses_seoul_constrained_distance(monkeypatch) -> None:
+    """같은 관리소 center 선택은 서울 외곽 제약 거리를 사용한다."""
+    centers = (
+        DispatchCenterReference("isu", 127.06, 37.53, True),
+        DispatchCenterReference("hangnyeoul", 127.03, 37.50, True),
+    )
+
+    def constrained(*args: float, direct_distance_m: float | None = None) -> float:
+        """학여울 경로에만 외곽 우회 거리를 더한다."""
+        return float(direct_distance_m or 0.0) + (100.0 if args[2] == 127.03 else 0.0)
+
+    monkeypatch.setattr(
+        station_module,
+        "seoul_constrained_distance_m",
+        constrained,
+    )
+
+    [record] = _build(centers=centers, distance_meters=lambda *_: 1.0).records
+
+    assert record.dispatch_center_id == "isu"
+
+
+def test_station_ignores_closer_center_in_other_documented_management_area() -> None:
+    """강남 station은 더 가까운 강북 센터가 있어도 강남 센터에 배정한다."""
+    centers = (
+        DispatchCenterReference("sangam", LON, LAT, True),
+        DispatchCenterReference("isu", 126.982400620133, 37.4837582703213, True),
+    )
+
+    [record] = _build(centers=centers).records
+
+    assert record.dispatch_center_id == "isu"
+
+
+def test_station_without_gu_polygon_membership_is_rejected(monkeypatch) -> None:
+    """자치구 Polygon 미판정 station을 다른 관리소에 fallback하지 않는다."""
+    monkeypatch.setattr(
+        station_module,
+        "latlon_to_management_area",
+        lambda *_: None,
+    )
+
+    with pytest.raises(ContractViolation, match="자치구 관리권역"):
+        _build()
 
 
 def test_batch_capable_distance_callback_replaces_per_pair_calls() -> None:
     """callback이 batch를 노출하면 쌍마다 스칼라로 부르지 않고 묶어서 부른다."""
     centers = (
-        DispatchCenterReference("CENTER-B", 127.06, 37.53, True),
-        DispatchCenterReference("CENTER-A", 127.03, 37.50, True),
+        DispatchCenterReference("isu", 127.06, 37.53, True),
+        DispatchCenterReference("hangnyeoul", 127.03, 37.50, True),
     )
     scalar_calls: list[tuple[float, float, float, float]] = []
     batch_calls: list[tuple[tuple[tuple[float, float], tuple[float, float]], ...]] = []
@@ -343,7 +389,7 @@ def test_batch_capable_distance_callback_replaces_per_pair_calls() -> None:
     def batch(
         pairs: tuple[tuple[tuple[float, float], tuple[float, float]], ...],
     ) -> tuple[float, ...]:
-        """center 순서대로 거리를 돌려준다 — CENTER-A가 더 가깝다."""
+        """center 순서대로 거리를 돌려준다 — 학여울이 더 가깝다."""
         batch_calls.append(pairs)
         return tuple(2.0 if index == 0 else 1.0 for index in range(len(pairs)))
 
@@ -351,7 +397,7 @@ def test_batch_capable_distance_callback_replaces_per_pair_calls() -> None:
 
     [record] = _build(centers=centers, distance_meters=distance).records
 
-    assert record.dispatch_center_id == "CENTER-A"
+    assert record.dispatch_center_id == "hangnyeoul"
     assert scalar_calls == []
     # relocation 비교 쌍 1회 + center 12개(여기선 2개) 1회 = 정류소당 2회.
     # 쌍마다 부르면 3회가 된다.
@@ -365,8 +411,8 @@ def test_batch_capable_distance_callback_replaces_per_pair_calls() -> None:
 def test_batch_capable_distance_callback_batches_whole_projection() -> None:
     """여러 station의 relocation·center 거리를 projection당 두 번에 계산한다."""
     centers = (
-        DispatchCenterReference("CENTER-B", 127.06, 37.53, True),
-        DispatchCenterReference("CENTER-A", 127.03, 37.50, True),
+        DispatchCenterReference("isu", 127.06, 37.53, True),
+        DispatchCenterReference("hangnyeoul", 127.03, 37.50, True),
     )
     batch_calls: list[tuple[tuple[tuple[float, float], tuple[float, float]], ...]] = []
 
@@ -431,8 +477,8 @@ def test_batch_capable_distance_callback_batches_whole_projection() -> None:
 def test_batch_distance_result_count_mismatch_is_rejected() -> None:
     """batch가 입력보다 적게 돌려주면 조용히 넘기지 않는다."""
     centers = (
-        DispatchCenterReference("CENTER-B", 127.06, 37.53, True),
-        DispatchCenterReference("CENTER-A", 127.03, 37.50, True),
+        DispatchCenterReference("isu", 127.06, 37.53, True),
+        DispatchCenterReference("hangnyeoul", 127.03, 37.50, True),
     )
 
     def distance(*_: float) -> float:
@@ -447,7 +493,7 @@ def test_batch_distance_result_count_mismatch_is_rejected() -> None:
 
 def test_batch_distance_rejects_non_finite_values() -> None:
     """batch 결과도 스칼라와 같은 유한 비음수 계약을 통과해야 한다."""
-    centers = (DispatchCenterReference("CENTER-A", 127.03, 37.50, True),)
+    centers = (DispatchCenterReference("hangnyeoul", 127.03, 37.50, True),)
 
     def distance(*_: float) -> float:
         """스칼라 경로는 이 테스트에서 쓰이지 않는다."""
