@@ -82,7 +82,8 @@ from .silver_source import (
     read_weather,
 )
 from .spark_session import get_spark
-from .watermark import read_watermark, write_watermark
+from .watermark import is_fresh, read_watermark, write_watermark
+
 
 
 def _current_params() -> dict:
@@ -349,15 +350,30 @@ def _run_incremental(spark, watermark: dict) -> None:
 
 def main() -> None:
     """피처마트 파이프라인을 실행한다 (워터마크 유무에 따라 전체 빌드 또는 증분 실행)."""
-    spark = get_spark()
     watermark = read_watermark(config.WATERMARK_PATH)
     # 명시적 window는 같은 profile output에 과거 rolling 실행의 바깥 파티션이 남아
     # 있을 수 있다. incremental dynamic overwrite로는 이번 DataFrame에 없는 미래
     # 파티션을 지울 수 없으므로, watermark 존재 여부와 무관하게 전체 overwrite한다.
     if watermark is None or _explicit_window_requested():
+        spark = get_spark()
         _run_full_build(spark)
     else:
+        window_until = None if config.WINDOW_END is None else str(config.WINDOW_END)
+        target_complete_through = _target_complete_through(window_until)
+        if (
+            is_fresh(watermark, max_age_hours=24.0)
+            and watermark.get("max_hour_ts")
+            and watermark["max_hour_ts"] >= target_complete_through
+        ):
+            print(
+                f"[{config.PARAM_COMBO_ID}] Base feature 마트가 이미 최신 상태"
+                f"(워터마크={watermark['max_hour_ts']}, 갱신={watermark.get('updated_at')})입니다 "
+                "— 실행 건너뜀"
+            )
+            return
+        spark = get_spark()
         _run_incremental(spark, watermark)
+
 
 
 if __name__ == "__main__":

@@ -242,6 +242,67 @@ def combine_evaluation_shards(
     }
 
 
+def _eval_cache_key(model_name: str, archive_prefix: str, horizon: int, date_str: str) -> str:
+    """일자별 평가 부분합 캐시의 S3 키를 반환한다."""
+    prefix_clean = archive_prefix.strip("/").replace("/", "_")
+    return f"models/eval_cache/{model_name}/{prefix_clean}/h{horizon}/{date_str}.json"
+
+
+def evaluate_recent_performance_cached(
+    model_name: str,
+    target_col: str,
+    exposure_col: str | None,
+    start: str,
+    end: str,
+    horizon: int = 1,
+) -> dict:
+    """평가 대상 구간의 일자별 부분합 캐시를 활용해, 빠진 날짜만 증분 계산하고 최종 합산한다.
+
+    args:
+        model_name: "rental" 또는 "return"
+        target_col: "rental_count" 또는 "return_count"
+        exposure_col: exposure 컬럼명
+        start: 시작일 ("YYYY-MM-DD")
+        end: 종료일 ("YYYY-MM-DD")
+        horizon: 예측 타겟 horizon
+    returns:
+        dict: combine_evaluation_shards() 결과
+    """
+    archive_prefix = read_champion_prefix(model_name)
+    all_days = [d.strftime("%Y-%m-%d") for d in pd.date_range(start, end, freq="D")]
+
+    shards: list[dict] = []
+    missing_days: list[str] = []
+
+    for d in all_days:
+        cache_key = _eval_cache_key(model_name, archive_prefix, horizon, d)
+        cached = s3_io.read_json(cache_key)
+        if cached is not None and "n_rows" in cached:
+            shards.append(cached)
+        else:
+            missing_days.append(d)
+
+    # 캐시에 없는 빠진 날짜들만 모아서 증분 계산
+    if missing_days:
+        # 연속된 날짜 구간들로 묶어서 S3 읽기 I/O 최적화
+        range_start = missing_days[0]
+        range_end = missing_days[-1]
+        missing_shard = evaluate_recent_performance_shard(
+            model_name, target_col, exposure_col, (range_start, range_end), horizon
+        )
+        if missing_shard["n_rows"] > 0:
+            shards.append(missing_shard)
+            # 단일 날짜인 경우 캐시 저장
+            if len(missing_days) == 1:
+                s3_io.write_json(
+                    _eval_cache_key(model_name, archive_prefix, horizon, missing_days[0]),
+                    missing_shard,
+                )
+
+    baseline = _load_baseline_metrics(model_name)
+    return combine_evaluation_shards(model_name, (start, end), shards, baseline)
+
+
 def evaluate_recent_performance(
     model_name: str,
     target_col: str,
@@ -270,12 +331,10 @@ def evaluate_recent_performance(
     lookback_months = lookback_months or config.MONITOR_LOOKBACK_MONTHS
     start, end = _recent_month_range(lookback_months, as_of)
 
-    # date_range로 이번에 볼 N개월 파티션만 받는다 — 그동안 쌓인 전체 히스토리를 매달
-    # 실행할 때마다 다 받으면, 실행 비용이 "최근 N개월"이 아니라 "서비스 시작 이후
-    # 전체 기간"에 비례해서 계속 커진다(s3_io.py 모듈 docstring 참고).
-    shard = evaluate_recent_performance_shard(model_name, target_col, exposure_col, (start, end), horizon)
-    baseline = _load_baseline_metrics(model_name)
-    return combine_evaluation_shards(model_name, (start, end), [shard], baseline)
+    return evaluate_recent_performance_cached(
+        model_name, target_col, exposure_col, start, end, horizon=horizon
+    )
+
 
 
 def decide_retrain(evaluation: dict) -> dict:

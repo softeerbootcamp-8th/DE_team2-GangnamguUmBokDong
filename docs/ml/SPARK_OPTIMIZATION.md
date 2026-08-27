@@ -120,18 +120,70 @@ writer.write.mode("overwrite").partitionBy("date").parquet(output_path)
 
 ---
 
+### 3-5. 1단계/2단계 피처마트 Freshness 기반 조기 스킵(Skip)
+
+#### 🔍 문제 분석
+피처마트를 이미 생성한 직후이거나 데이터가 최신 상태(`max_hour_ts`가 최근 cutoff 이상이고 `updated_at`이 24시간 이내)임에도, 매 사이클마다 EMR에서 SparkSession을 띄워 전체/증분 빌드를 무조건 재시도하는 낭비가 발생함.
+
+#### 🛠️ 수정 사항
+1. **1단계 `run_pipeline.py`**:
+   - `main()` 진입 시 S3 워터마크(`_watermark.json`)의 `updated_at`과 `max_hour_ts`를 확인하여 24시간 이내에 이미 최신 윈도우까지 계산되었으면 SparkSession 초기화 전에 조기 종료(Skip).
+2. **2단계 `build_multi_horizon_features.py`**:
+   - 모델별 워터마크(`_multi_horizon_{model}_watermark.json`)를 도입하여 해당 모델의 2단계 테이블이 1단계와 동일한 최신 상태인 경우 해당 모델의 Self-Join 및 저장을 스킵.
+3. **Airflow `monthly_retrain.py`**:
+   - `make_task_refresh_feature_mart`에서 S3 워터마크를 사전에 확인하여 1단계와 2단계가 모두 신선하면 EMR Spark 스텝 제출 자체를 스킵.
+
+---
+
+### 3-6. 2단계 Multi-Horizon 대여/반납 분리 생성 (`--models` 지원)
+
+#### 🔍 문제 분석
+`monthly_retrain.py` DAG는 대여(rental) 사이클 $\to$ 반납(return) 사이클 순서로 실행되는데, 기존 `build_multi_horizon_features.py`는 항상 대여와 반납을 둘 다 생성함.
+- 대여 사이클에서 대여/반납 생성 (반납 낭비)
+- 반납 사이클에서 또 대여/반납 생성 (대여 낭비)
+- ➔ **12개 Self-Join 연산이 각각 2번씩 불필요하게 중복 실행됨.**
+
+#### 🛠️ 수정 사항
+1. `build_multi_horizon_features.py`에 `--models` CLI 인자 추가 (`--models rental`, `--models return`, `--models rental,return`).
+2. `monthly_retrain.py`에서 대여 사이클에는 `build_multi_horizon_features --models rental`만 제출, 반납 사이클에는 `--models return`만 제출.
+3. ➔ **1회 EMR Step 실행 시 Multi-Horizon 연산량 및 S3 쓰기 50% 절감!**
+
+---
+
+### 3-7. 월간 모델 성능 평가(`evaluate`) 일자별 캐시 기반 빠진 날짜만 증분 계산
+
+#### 🔍 문제 분석
+매월 챔피언 성능 점검(`evaluate`) 시 최근 1개월(30일치) Parquet 전체를 매번 처음부터 다시 읽어 예측을 수행함.
+
+#### 🛠️ 수정 사항
+1. `monitor_performance.py`에 일자별 부분합 캐싱(`models/eval_cache/{model_name}/{archive_prefix}/h{horizon}/{date}.json`) 도입.
+2. 30일 중 이미 캐시된 날짜의 부분합(`sum_deviance_term`, `sum_sq_err`, `sum_coverage_hits`, `n_rows`)은 그대로 재활용하고, **캐시가 없는 빠진 날짜(신규 추가된 날짜)만 예측**을 수행.
+3. 모든 부분합을 `combine_evaluation_shards()`로 합산하여 전체 재계산과 수학적으로 100% 동일한 결과 도출.
+4. ➔ **평가 소요 시간 대폭 단축 (30일 재계산 $\to$ 신규 1~2일치만 증분 계산).**
+
+---
+
 ## 4. 검증 결과
 
-`feature_engine/tests` 전체 테스트를 실행하여 기존 동작 및 데이터 Parity가 100% 보존됨을 확인했다.
+Feature Engine 및 Training 전체 테스트를 실행하여 무결성을 검증했다.
 
 ```bash
+# 1. Feature Engine 파이프라인 테스트 (70 passed)
 $ ./feature_engine/.venv/bin/python -m pytest feature_engine/tests -q
-...............................................................          [100%]
-============================== 63 passed in 99.81s ==============================
+70 passed in 113.55s
+
+# 2. Training 및 모니터링 테스트 (184 passed)
+$ ./training/.venv/bin/python -m pytest training/tests -q
+184 passed in 23.15s
+
+# 3. Airflow DAG 무결성 테스트 (46 passed)
+$ ./airflow/.venv/bin/python -m pytest airflow/tests/test_monthly_retrain.py -q
+46 passed in 0.63s
 ```
 
 - `dev_spark_incremental.py`: 증분 재계산 시 35일 Lookback 및 Partition Overwrite 무결성 검증 완료.
 - `dev_spark_multi_horizon_parity.py`: 균형 이진트리 Union 및 Horizon 1~12 Self-Join의 출력 데이터셋이 기존 fold 방식과 완전히 동일함을 검증 완료.
+- `test_monthly_retrain.py`: Airflow DAG에서 모델별 분리 스텝 제출 및 워터마크 신선도 검사 정상 통과.
 
 ---
 
@@ -161,3 +213,6 @@ make emr-package   # S3의 pyfiles.tar.gz 패키지 갱신 (필수!)
    - Horizon 루프 구간의 Job 소요 시간이 선형으로 늘어나지 않고 일정하게 유지되는지 확인.
 3. **Storage 탭 (Memory Usage)**:
    - 캐시된 `anchor`/`target`의 메모리 점유 상태 및 대여 $\to$ 반납 전환 시 캐시가 정상 클리어되는지 확인.
+4. **Step 실행 횟수 및 소요 시간**:
+   - `build_multi_horizon_features`가 대여/반납 각각에 대해 필요한 대상만 생성하여 실행 시간이 단축되었는지 확인.
+

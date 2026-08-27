@@ -44,3 +44,41 @@ def write_watermark(path: str, max_hour_ts: str, params: dict) -> dict:
     }
     s3_io.write_json(path, record)
     return record
+
+
+def is_fresh(watermark: dict | None, max_age_hours: float = 24.0) -> bool:
+    """워터마크의 updated_at이 최근 max_age_hours시간 이내인지 확인한다.
+
+    args:
+        watermark: read_watermark()로 읽은 dict 또는 None
+        max_age_hours: 신선하다고 간주할 최대 경과 시간 (시간 단위)
+    returns:
+        bool: 워터마크가 존재하고 max_age_hours 이내에 갱신되었으면 True
+    """
+    if watermark is None or not watermark.get("updated_at"):
+        return False
+    try:
+        updated_at = datetime.fromisoformat(watermark["updated_at"])
+        age_seconds = (datetime.now(UTC) - updated_at).total_seconds()
+        return age_seconds <= max_age_hours * 3600
+    except (ValueError, TypeError):
+        return False
+
+
+def multi_horizon_watermark_path(model_name: str | None = None) -> str:
+    """Multi-horizon feature mart의 워터마크 S3 키를 반환한다.
+
+    args:
+        model_name: "rental", "return", 또는 None(공통)
+    returns:
+        str: S3 키 경로
+    """
+    from . import config
+
+    if model_name:
+        return (
+            f"{config.OUTPUT_ROOT_KEY}/training_anchor_a{config.TRAIN_ANCHOR_TICK_MINUTES}/"
+            f"_multi_horizon_{model_name}_watermark.json"
+        )
+    return config.MULTI_HORIZON_WATERMARK_PATH
+

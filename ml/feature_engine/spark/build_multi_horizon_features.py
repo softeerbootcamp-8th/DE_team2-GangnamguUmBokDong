@@ -259,7 +259,7 @@ def _multi_horizon_marts_are_fresh(
     args:
         source_watermark: `run_pipeline.py`가 남긴 현재 `WATERMARK_PATH` 내용
             (`watermark.read_watermark()` 결과, `max_hour_ts` 포함)
-        existing_marker: 이전 multi-horizon 생성이 남긴 `MULTI_HORIZON_WATERMARK_PATH`
+        existing_marker: 이전 multi-horizon 생성이 남긴 워터마크
             내용(없으면 None — 이 profile로 처음 만드는 것이라 항상 False)
         window_since, window_until: 지금 이 실행이 쓰는 학습 윈도우 경계
             (`config.WINDOW_START`/`WINDOW_END`를 문자열로 바꾼 것)
@@ -275,7 +275,25 @@ def _multi_horizon_marts_are_fresh(
 
 
 def _run_cli() -> None:
-    from .watermark import read_watermark, write_watermark
+    import argparse
+    from .watermark import is_fresh, multi_horizon_watermark_path, read_watermark, write_watermark
+
+    parser = argparse.ArgumentParser(description="Multi-horizon feature table builder")
+    parser.add_argument(
+        "--models",
+        default="rental,return",
+        help="생성할 모델 대상 (rental, return, 또는 rental,return. 기본값 rental,return)",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="워터마크 신선도 검사를 무시하고 강제로 재생성",
+    )
+    args, _ = parser.parse_known_args()
+
+    requested_models = [m.strip() for m in args.models.split(",") if m.strip()]
+    if not requested_models or "all" in requested_models:
+        requested_models = ["rental", "return"]
 
     window_since_str = str(config.WINDOW_START)
     window_until_str = str(config.WINDOW_END)
@@ -285,65 +303,76 @@ def _run_cli() -> None:
             f"{config.WATERMARK_PATH}에 watermark가 없습니다 — run_pipeline.py가 이 "
             "profile의 base feature 테이블을 먼저 만들어야 합니다."
         )
-    if _multi_horizon_marts_are_fresh(
-        source_watermark,
-        read_watermark(config.MULTI_HORIZON_WATERMARK_PATH),
-        window_since_str,
-        window_until_str,
-    ):
-        print(
-            f"[build_multi_horizon_features] {config.PARAM_COMBO_ID}/"
-            f"a{config.TRAIN_ANCHOR_TICK_MINUTES}: 소스 watermark"
-            f"({source_watermark['max_hour_ts']})와 학습 윈도우가 마지막 생성 때와 "
-            "동일 — 재생성 건너뜀"
-        )
+
+    # 요청된 모델 중 실제로 생성이 필요한 모델만 선별
+    models_to_build: list[str] = []
+    for model in requested_models:
+        if args.force:
+            models_to_build.append(model)
+            continue
+        model_wm_path = multi_horizon_watermark_path(model)
+        existing_marker = read_watermark(model_wm_path)
+        # 1차: 동일 max_hour_ts + 동일 윈도우 검사
+        # 2차: 2단계 워터마크가 없는 경우 레거시 공통 워터마크 검사
+        if existing_marker is None:
+            existing_marker = read_watermark(config.MULTI_HORIZON_WATERMARK_PATH)
+
+        if _multi_horizon_marts_are_fresh(source_watermark, existing_marker, window_since_str, window_until_str):
+            print(
+                f"[build_multi_horizon_features] [{model}] {config.PARAM_COMBO_ID}/"
+                f"a{config.TRAIN_ANCHOR_TICK_MINUTES}: 소스 watermark"
+                f"({source_watermark['max_hour_ts']})와 학습 윈도우가 최신 — 재생성 건너뜀"
+            )
+        else:
+            models_to_build.append(model)
+
+    if not models_to_build:
+        print("[build_multi_horizon_features] 모든 요청 모델의 Multi-horizon 피처가 최신 상태입니다 — 종료")
         return
 
     from .spark_session import get_spark
 
     spark = get_spark()
-    # run_pipeline.py는 dynamic partition overwrite를 명시하는데 이 스크립트는
-    # 빠뜨려서, 기본값(static)이 이번 실행에 실제로 등장한 날짜 파티션만 남기고
-    # 테이블 전체를 지워버렸다 — WINDOW_START(TRAIN_LOOKBACK_MONTHS 기준, 프로필마다
-    # 다름)보다 오래된 파티션이 전부 사라지는 실제 데이터 유실로 확인됐다
-    # (2026-08-26, w/e/t가 같아 경로를 공유하는 테스트 프로필로 이 스크립트를
-    # 돌렸다가 프로덕션 테이블의 365개 파티션 중 332개가 삭제됨). dynamic으로
-    # 바꾸면 "이번에 실제로 쓴 날짜 파티션"만 교체되고 그 밖의 기존 파티션은
-    # 그대로 남는다.
     spark.conf.set("spark.sql.sources.partitionOverwriteMode", "dynamic")
     features = _features_in_training_window(
         spark.read.parquet(config.FEATURES_TABLE_PARQUET)
     )
     anchor_input = _anchor_input(features)
 
-    # 대여를 끝까지 만들어 S3에 쓰고 나서 반납을 시작한다 — 두 self-join 결과
-    # (원본의 최대 HORIZON_COUNT배 행 수) 를 동시에 메모리에 띄우지 않기 위함.
-    rental_result = build_multi_horizon_features(
-        spark, features, RENTAL_ANCHOR_COLUMNS, RENTAL_TARGET_COLUMNS, anchor_df=anchor_input
-    )
-    # date 파티션으로 써야 training/monitor_performance가 core.s3.read_parquet()의
-    # date_range로 필요한 기간만 읽을 수 있다(전체 히스토리를 매번 훑지 않음) — s3.py
-    # 모듈 docstring 참고.
-    _write_date_partitioned(
-        rental_result,
-        config.RENTAL_MULTI_HORIZON_FEATURES_TABLE_PARQUET,
-    )
-    print(f"rental multi-horizon features -> {config.RENTAL_MULTI_HORIZON_FEATURES_TABLE_PARQUET}")
+    for i, model in enumerate(models_to_build):
+        if i > 0:
+            spark.catalog.clearCache()
 
-    # build_multi_horizon_features()가 캐싱한 대여용 anchor/target을 반납 계산 전에
-    # 비운다 — 안 그러면 "두 self-join 결과를 동시에 메모리에 띄우지 않는다"는 위
-    # 설계 의도가 캐시 잔존으로 새어나간다.
-    spark.catalog.clearCache()
+        if model == "rental":
+            rental_result = build_multi_horizon_features(
+                spark, features, RENTAL_ANCHOR_COLUMNS, RENTAL_TARGET_COLUMNS, anchor_df=anchor_input
+            )
+            _write_date_partitioned(
+                rental_result,
+                config.RENTAL_MULTI_HORIZON_FEATURES_TABLE_PARQUET,
+            )
+            print(f"rental multi-horizon features -> {config.RENTAL_MULTI_HORIZON_FEATURES_TABLE_PARQUET}")
+            write_watermark(
+                multi_horizon_watermark_path("rental"),
+                source_watermark["max_hour_ts"],
+                {"window_since": window_since_str, "window_until": window_until_str},
+            )
+        elif model == "return":
+            return_result = build_multi_horizon_features(
+                spark, features, RETURN_ANCHOR_COLUMNS, RETURN_TARGET_COLUMNS, anchor_df=anchor_input
+            )
+            _write_date_partitioned(
+                return_result,
+                config.RETURN_MULTI_HORIZON_FEATURES_TABLE_PARQUET,
+            )
+            print(f"return multi-horizon features -> {config.RETURN_MULTI_HORIZON_FEATURES_TABLE_PARQUET}")
+            write_watermark(
+                multi_horizon_watermark_path("return"),
+                source_watermark["max_hour_ts"],
+                {"window_since": window_since_str, "window_until": window_until_str},
+            )
 
-    return_result = build_multi_horizon_features(
-        spark, features, RETURN_ANCHOR_COLUMNS, RETURN_TARGET_COLUMNS, anchor_df=anchor_input
-    )
-    _write_date_partitioned(
-        return_result,
-        config.RETURN_MULTI_HORIZON_FEATURES_TABLE_PARQUET,
-    )
-    print(f"return multi-horizon features -> {config.RETURN_MULTI_HORIZON_FEATURES_TABLE_PARQUET}")
-
+    # 레거시 호환용 공통 워터마크 갱신
     write_watermark(
         config.MULTI_HORIZON_WATERMARK_PATH,
         source_watermark["max_hour_ts"],
@@ -355,8 +384,6 @@ if __name__ == "__main__":
     try:
         _run_cli()
     except Exception as exc:
-        # training/scripts/monthly_retrain_check.py가 이 스크립트를 subprocess로
-        # 띄운다 — 표준출력이 그대로 스트리밍되므로, 실패 사유를 알아보기 쉬운
-        # 한 줄로 여기 남겨야 오케스트레이터 로그만 보고도 원인을 알 수 있다.
         print(f"[build_multi_horizon_features] 실패: {exc}", flush=True)
         raise
+

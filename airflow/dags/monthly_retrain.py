@@ -279,18 +279,23 @@ def _yarn_python_module_step(
 
 
 def _feature_mart_spark_steps(
-    profile: str, core_instance_count: int = FEATURE_MART_CORE_INSTANCE_COUNT
+    profile: str,
+    core_instance_count: int = FEATURE_MART_CORE_INSTANCE_COUNT,
+    model_name: str | None = None,
 ) -> tuple[tuple[str, list[str]], tuple[str, list[str]]]:
     """`profile`로 feature mart(2차 정제)를 (재)생성하는 두 Spark 스텝(name, args)을
     반환한다 — run_pipeline.py는 watermark 기반 증분이라 매번 불러도 안전하다
     (평가 전 최신화용 `refresh_feature_mart`와 재학습 루프 양쪽에서 재사용).
 
     args:
+        profile: 대상 ML 프로필 이름
         core_instance_count: 이 스텝이 실제로 돌 클러스터의 core 노드 수 —
             `--num-executors`를 여기 맞춰 노드마다 executor 하나씩 배치한다
             (노드 수보다 하나 적게 잡아 AM 자리를 남긴다). 하드코딩된 값을
             그대로 두면 노드 수가 늘어나도 병렬도가 그대로라 유휴 노드가
             생긴다(PR #248 리뷰 지적).
+        model_name: "rental", "return", 또는 None(둘 다). 지정 시 Multi-horizon
+            확장 스텝이 해당 모델의 피처마트만 단독 생성해 연산량을 절감한다.
     """
     common_confs = [
         # feature_engine/spark/spark_session.py의 get_spark()가 "지금 진짜 yarn
@@ -361,6 +366,7 @@ def _feature_mart_spark_steps(
         "--conf",
         "spark.hadoop.fs.s3a.aws.credentials.provider=org.apache.hadoop.fs.s3a.auth.IAMInstanceCredentialsProvider",
     ]
+    multi_horizon_args = ["--models", model_name] if model_name else []
     return (
         (
             f"Spark-RunPipeline-{profile}",
@@ -368,9 +374,13 @@ def _feature_mart_spark_steps(
         ),
         (
             f"Spark-BuildMultiHorizon-{profile}",
-            _spark_module_launcher_command("feature_engine.spark.build_multi_horizon_features", common_confs),
+            _spark_module_launcher_command(
+                "feature_engine.spark.build_multi_horizon_features", common_confs, app_args=multi_horizon_args
+            ),
         ),
     )
+
+
 
 
 def _champion_profile_name(model_name: str) -> str | None:
@@ -385,6 +395,46 @@ def _champion_profile_name(model_name: str) -> str | None:
         return None
     payload = read_s3_json(f"{archive_prefix}/{model_name}_profile.json")
     return (payload or {}).get("profile_name")
+
+
+def _is_feature_mart_fresh(profile: str, model_name: str, max_age_hours: float = 24.0) -> bool:
+    """S3 워터마크를 확인해 피처마트가 최근 max_age_hours 이내에 이미 갱신되었는지 판정한다."""
+    try:
+        profile_data = read_s3_json(f"{MODELS_PREFIX}/profiles/{profile}.json") or {}
+        window = profile_data.get("rolling_window_minutes", 60)
+        embargo = profile_data.get("rolling_embargo_minutes", 30)
+        tick = profile_data.get("rolling_tick_minutes", 20)
+        combo_id = f"w{window}_e{embargo}_t{tick}"
+        anchor_tick = profile_data.get("train_anchor_tick_minutes", 20)
+
+        base_wm = read_s3_json(f"processed/features/{combo_id}/_watermark.json")
+        if not base_wm or not base_wm.get("updated_at"):
+            return False
+
+        model_wm_key = (
+            f"processed/features/{combo_id}/training_anchor_a{anchor_tick}/_multi_horizon_{model_name}_watermark.json"
+        )
+        model_wm = read_s3_json(model_wm_key)
+        if not model_wm or not model_wm.get("updated_at"):
+            legacy_wm_key = (
+                f"processed/features/{combo_id}/training_anchor_a{anchor_tick}/_multi_horizon_watermark.json"
+            )
+            model_wm = read_s3_json(legacy_wm_key)
+            if not model_wm or not model_wm.get("updated_at"):
+                return False
+
+        now = datetime.now(UTC)
+        base_updated = datetime.fromisoformat(base_wm["updated_at"])
+        model_updated = datetime.fromisoformat(model_wm["updated_at"])
+        if (now - base_updated).total_seconds() > max_age_hours * 3600:
+            return False
+        if (now - model_updated).total_seconds() > max_age_hours * 3600:
+            return False
+        return base_wm.get("max_hour_ts") == model_wm.get("max_hour_ts")
+    except Exception:
+        return False
+
+
 
 
 def _bash_step(name: str, command: str) -> tuple[str, list[str]]:
@@ -500,12 +550,25 @@ def make_task_refresh_feature_mart(model_name: str) -> Any:
             return
 
         profile = _champion_profile_name(model_name) or "builtin-default"
+        if _is_feature_mart_fresh(profile, model_name):
+            logger.info(
+                "[%s 월별 재학습] 1.5단계: 프로필 '%s'의 피처마트가 이미 최신(24h 이내) 상태입니다 — Spark 스텝 제출 스킵",
+                model_name,
+                profile,
+            )
+            ti.xcom_push(key="profile", value=profile)
+            return
+
         logger.info(
-            "[%s 월별 재학습] 1.5단계: 챔피언 프로필 '%s' 기준으로 feature mart 증분 갱신", model_name, profile
+            "[%s 월별 재학습] 1.5단계: 챔피언 프로필 '%s' 기준으로 [%s] feature mart 증분 갱신",
+            model_name,
+            profile,
+            model_name,
         )
-        for step_name, spark_args in _feature_mart_spark_steps(profile, params_core_count):
+        for step_name, spark_args in _feature_mart_spark_steps(profile, params_core_count, model_name=model_name):
             submit_emr_step(cluster_id, step_name, spark_args, mock_override=mock_override)
         ti.xcom_push(key="profile", value=profile)
+
 
     return task_refresh_feature_mart
 
@@ -639,9 +702,12 @@ def make_task_orchestrate_retrain_loop(model_name: str) -> Any:
         for profile in candidate_profiles:
             logger.info("=== [%s 프로필: %s] EMR 피처마트 스텝 제출 ===", model_name, profile)
             try:
-                for step_name, spark_args in _feature_mart_spark_steps(profile, core_instance_count):
+                for step_name, spark_args in _feature_mart_spark_steps(
+                    profile, core_instance_count, model_name=model_name
+                ):
                     submit_emr_step(cluster_id, step_name, spark_args, mock_override=mock_override)
                 logger.info("=== [%s 프로필: %s] EMR 피처마트 완료 ===", model_name, profile)
+
 
                 logger.info("=== [%s 프로필: %s] YARN distributed-shell 학습 스텝 제출 ===", model_name, profile)
                 train_result_key = _result_s3_key(run_id, f"train-{model_name}-{profile}")
