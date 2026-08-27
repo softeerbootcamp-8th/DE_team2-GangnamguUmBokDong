@@ -1184,3 +1184,28 @@ editable 의존성이 새 경로(`../../libs/ml_core`)로 정확히 잡히는지
 - 네트워크 셔플 전송량: 13.0 GiB -> 6.6 GiB (49.2% 감소)
 - 총 태스크 수: 4,736개 -> 1,557개 (67.1% 감소)
 
+---
+
+## 32. YARN DistributedShell 기반 EMR 분산 오케스트레이션 정착
+
+**배경**: EMR(m4.large 8대) 환경에서 월간 재학습 오케스트레이터(`monthly_retrain_check`)와 분산 학습 워커 실행 시 마스터 노드 메모리 고갈과 자원 경합 문제가 발생했다.
+
+**원인 및 해결 과정**:
+1. **Master 노드 OOM (ExitCode 137)**: EMR Master 노드(m4.large 8GB)는 기본 데몬(ResourceManager, NameNode 등)만으로 ~5.7GB를 점유하여, 오케스트레이터 프로세스가 약 1.5GB만 사용해도 OOM-killer에 의해 강제 종료됨 -> 오케스트레이터 프로세스 자체를 Core 노드의 YARN 컨테이너(`-num_containers 1`)로 격리 실행.
+2. **DistributedShell AM 힙 부족 (JNI Error)**: DistributedShell의 기본 100MB AM 힙으로 인해 클래스 로딩 중 OutOfMemoryError가 발생하던 문제를 `-master_memory 1024`로 확장하여 해결.
+3. **Spark-submit 래퍼 자원 경합 제거**: Spark-submit으로 오케스트레이터를 감쌀 경우 연산을 안 해도 Dynamic Allocation이 executor를 최대 50개까지 점유하여 실제 분산학습 워커와 경합하던 문제를, 순수 YARN DistributedShell 호출로 전환하여 완전 해결.
+4. **중첩 분산 환경 노드 예약 (`_WRAPPER_NODE_RESERVATION = 3`)**: Outer AM, Outer Worker, Inner AM이 서로 다른 노드에 분산 배치되는 최악의 경우를 대비하여 `core_instance_count - 3`개의 워커를 요청하도록 설계(Barrier 타임아웃 방지).
+5. **클라이언트 타임아웃 확장**: YARN `distributedshell.Client`의 10분 기본 타임아웃을 `-timeout 345600000`(4일)으로 확장.
+
+---
+
+## 33. 월간 재학습 단일 EMR 생애주기 통합 및 Resize 제거
+
+**배경**: 기존 대여/반납 분리 DAG 및 2단계 클러스터 리사이즈(`resize_emr_cluster()`, 3노드 -> 8노드) 운영 시 노드 프로비저닝 지연과 실행 중 스텝 유실 위험이 존재했다.
+
+**원인 및 결정**:
+1. **단일 EMR 클러스터 순차 실행**: `monthly_retrain` 단일 DAG에서 하나의 EMR 클러스터 생애주기 동안 대여 사이클(평가 -> 재학습 -> 승격) 완료 후 반납 사이클을 순차 실행하여 클러스터 2중 기동 오버헤드(15분) 및 동시성 충돌 차단.
+2. **동적 Resize 제거**: 스텝 실행 중 노드가 축소/확장될 때 컨테이너가 유실되는 위험을 방지하기 위해, 처음부터 8노드(`TRAINING_CORE_INSTANCE_COUNT = 8`)로 고정 프로비저닝.
+3. **테스트 프로필 격리**: 테스트용 프로필(`a-test-sparse-flat`)의 피처마트 경로(`w65_e45_t20`)를 프로덕션 기본(`w60_e40_t20`)과 물리적으로 분리하여 덮어쓰기 데이터 오염 방지.
+
+

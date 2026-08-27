@@ -1,68 +1,10 @@
-"""피처마트(2차 정제) 생성 파이프라인 엔트리포인트 — EMR `spark-submit` 대상.
+"""피처마트(2차 정제) 생성 파이프라인 엔트리포인트 (EMR spark-submit 대상).
 
-파라미터 조합(`config.PARAM_COMBO_ID` — window/embargo/tick 값으로 정해짐)별로
-워터마크(`watermark.py`)를 확인한다:
-
-- **워터마크가 없으면**(이 조합으로 처음 만드는 것) 확정 일별 Archive fact와 최신
-  Silver station master로 1차 정제 산출물(targets/station_status/weather/population,
-  `silver_source.py`)을 새로 만들고, 그걸로 피처마트를 처음부터 만든다.
-- **워터마크가 있으면** "워터마크 - `config.INCREMENTAL_LOOKBACK_HOURS`"를 **그 날짜의
-  자정으로 내림**한 시각부터 다시 계산해서, 그 날짜 이후 파티션을 통째로
-  **덮어쓴다**(append가 아님 — 아래 "왜 append가 아니라 overwrite인가" 참고).
-
-**왜 append가 아니라 (날짜 파티션) overwrite인가 — 대여 건수의 지연 반영 문제**:
-Archive `bike_rental_history`는 트립이 **반납 완료된 시점에야** 한 행으로 나타날 수 있다
-(`silver_source.read_rental_trips()` 참고) — 대여 시작 시각(`start_dt`)이 아니라
-반납 시각을 기준으로 데이터가 들어온다. 즉 어떤 트립이 유난히 오래 걸리면(장시간
-대여, 반납 실패 후 재시도 등), 그 트립의 `start_dt`가 가리키는 시간대는 **이미
-피처마트에 발행되고 한참 지난 뒤에야** 실제 카운트에 반영될 수 있다 —
-`INCREMENTAL_LOOKBACK_HOURS`(기본 840시간=35일)가 lag_168h(7일)보다 훨씬 넉넉한
-이유도 이 여유를 감안한 것이다. 매 증분 실행이 lookback 구간을 "새 행 후보"가
-아니라 **아직 보정될 수 있는 구간**으로 보고 항상 통째로 다시 계산·덮어써야만,
-뒤늦게 나타난 트립이 이미 발행됐던 과거 시간대의 `rental_count`를 사후 보정한다.
-append 방식(이전 구현)은 워터마크 이하 행을 전부 버렸기 때문에 이 보정이 절대
-반영되지 않고 조용히 영구 누락됐다 — `return_count`는 반납 시각 자체가 곧
-"데이터가 들어오는 시각"이라 이 문제가 없다(수집 지연은 있어도 사후 보정 대상인
-"트립 진행 중"이 없음).
-
-**overwrite가 파티션 경계로 내림해야 하는 이유**: `FEATURES_TABLE_PARQUET`는
-`date`(`YYYY-MM-DD`) 컬럼으로 파티셔닝돼 있고, dynamic partition overwrite
-(`spark.sql.sources.partitionOverwriteMode=dynamic`)는 "이번에 쓰는 DataFrame에
-등장하는 날짜 파티션만" 통째로 교체한다. 재계산 구간이 하루 중간부터 시작하면
-그 날의 앞부분(이번에 다시 안 만든 시간대)까지 통째로 지워지므로, 반드시 자정
-경계로 내림한 뒤 그 날짜 전체를 다시 계산해야 한다.
-
-**"읽는" 시작점과 "덮어쓰는" 시작점은 다르다(2026-08 수정)**: `build_features()`의
-lag(`hour_ts - 1시간` self-join)/rolling(과거 최대 window+embargo분 트립 집계)은
-재계산 구간의 **경계 바로 이전** 데이터를 필요로 한다. 덮어쓰는 시작점(`since_dt`)
-그대로 읽기 시작점으로도 쓰면, `since_dt` 자정 근처 tick들이 그 이전 컨텍스트를
-전혀 못 보고 lag가 NULL이 되거나 rolling 카운트가 과소집계된다 — 이 문제는 매
-증분 실행마다 반복되므로, 그때마다 **이미 이전 실행에서 정상값으로 써져 있던**
-`since_dt` 날짜 파티션이 이 결함 있는 값으로 덮어써진다(신규 데이터가 아니라
-기존 정상 데이터가 손상되는 회귀). 그래서 실제로는 `since_dt`보다 하루 더 이전부터
-읽어서(`_run_incremental()`의 `read_since_dt`) self-join/rolling에 필요한 컨텍스트를
-확보하고, 계산이 끝난 뒤 `since_dt` 이후 행만 남겨서 그 부분만 덮어쓴다.
-
-**학습 시 주의 — "아직 확정 안 된 최근 구간"**: 워터마크 파일(`watermark.py`)의
-`updated_at`(이 파이프라인이 실제로 실행된 시각) 기준으로 `updated_at -
-INCREMENTAL_LOOKBACK_HOURS`보다 최신인 날짜는 아직 위 사후 보정 대상이다 — 다음
-증분 실행 때 `rental_count`가 더 늘어날 수 있으므로, 그 구간을 학습/평가에 "확정된
-라벨"로 쓰면 안 된다(과소집계된 값을 정답으로 학습하는 셈). 다만 `training/
-config.py`의 `safety_cutoff_date()`, `monitor_performance.py`의 "완결된 달만
-본다" 로직은 이 35일 전체가 아니라 더 짧은 `TRAINING_SAFETY_MARGIN_DAYS`(기본
-7일 — "이 정도면 거의 다 반납됐다"는 실용적 판단)만 뺀다 — 35일을 그대로 쓰면
-학습/모니터링이 항상 한두 달 뒤처진 데이터만 보게 돼서다. 즉 완전한 안전(35일)과
-신선함(7일) 사이의 의도적인 트레이드오프이니, 새로 이런 판단을 넣을 땐 어느 쪽
-마진이 맞는지(데이터 정확성이 더 중요한지, 최신성이 더 중요한지) 먼저 정할 것.
-
-다른 파라미터 조합(다른 모델)은 `config.OUTPUT_ROOT`가 조합 ID로 이미 분리돼 있어서
-서로 겹치지 않는다 — 조합별로 이 스크립트를 각자 실행하면 된다(예:
-`ROLLING_EMBARGO_MINUTES=45 python -m feature_engine.spark.run_pipeline`).
-
-실행 예:
-    로컬: ./.venv-spark/bin/python -m feature_engine.spark.run_pipeline
-    EMR:  spark-submit --deploy-mode cluster feature_engine/run_pipeline.py
+파라미터 조합(`config.PARAM_COMBO_ID`)별로 워터마크를 확인하여 전체 빌드 또는 증분 빌드를 수행한다.
+- 최초 실행: Archive fact와 Silver 마스터 데이터를 읽어 1차 정제 산출물을 생성하고 피처마트를 전체 빌드한다.
+- 증분 실행: INCREMENTAL_LOOKBACK_HOURS 구간을 자정 경계로 내림하여 해당 날짜 파티션들을 동적 덮어쓰기(Dynamic Partition Overwrite)한다.
 """
+
 
 import argparse
 import os
@@ -280,34 +222,12 @@ def _run_incremental(spark, watermark: dict) -> None:
     print(f"[{config.PARAM_COMBO_ID}] 워터마크={watermark_dt} -> {since_str}부터 재계산(증분, "
           f"lookback={config.INCREMENTAL_LOOKBACK_HOURS}시간, 날짜 경계로 내림)")
 
-    # **읽는 시작점(read_since_dt)과 실제로 덮어쓰는 시작점(since_dt)을 분리한다**
-    # (리뷰 지적, 2026-08 수정). build_features()의 rental_lag_1h/return_lag_1h는
-    # "hour_ts - 1시간" 행을 찾는 self-join이고, rental_lag_1h는 그 안에서
-    # censored_rolling_counts()가 최대 (ROLLING_WINDOW_MINUTES+ROLLING_EMBARGO_MINUTES)
-    # 분 이전 트립까지 봐야 한다 — 그런데 since_dt를 그대로 읽기 시작점으로 쓰면,
-    # merged_increment/rolling 계산에 since_dt 이전 데이터가 아예 없어서 since_dt
-    # 자정 근처 tick들의 lag가 NULL이 되거나(self-join 짝을 못 찾음) 과소집계된다
-    # (rolling 창이 실제보다 짧게 잘림). 문제는 이게 "새로 생기는 구간"이 아니라
-    # **이미 이전 실행에서 정상값으로 써져 있던 since_dt 날짜 파티션을 매 증분
-    # 실행마다 이 결함 있는 값으로 덮어쓴다**는 것 — 하루 여유를 두고 더 일찍부터
-    # 읽어서(day 경계 정렬을 유지하는 가장 단순한 마진 — 기본 프로필의 window+embargo
-    # 100분보다 넉넉함) self-join/rolling이 실제 과거 데이터를 보게 하고, 실제
-    # 파티션 덮어쓰기 대상(및 워터마크 갱신 기준)은 여전히 since_dt 이후로만
-    # 아래에서 다시 필터링해 제한한다.
     read_since_dt = since_dt - timedelta(days=1)
     read_since_str = read_since_dt.strftime("%Y-%m-%d %H:%M:%S")
 
-    # _refresh_primary_tables()는 위 since_str(증분 워터마크 기준, 보통 최근 며칠~몇 주)이
-    # 아니라 학습기간 롤링 윈도우 시작점(config.WINDOW_START)을 쓴다 — station_status/
-    # weather/population/targets는 그 자체가 학습에 쓰이는 전체 구간을 커버해야 하고,
-    # 증분 워터마크보다 훨씬 이전 데이터도 필요하기 때문이다.
     window_since, window_until = _window_timestamp_bounds()
     _refresh_primary_tables(spark, since=window_since, until=window_until)
 
-    # rolling_rental_features는 매번 챔피언 경로에 영구 저장하지 않는다 — lookback
-    # 구간(기본 35일)만 있으면 항상 다시 계산할 수 있을 만큼 가벼워서(창 폭이 최대
-    # 90분), 매 증분마다 저장소를 늘리기보다 build_features가 읽을 임시 parquet으로만
-    # 써둔다.
     rolling_tmp_path = f"{config.OUTPUT_ROOT}/_rolling_incremental_tmp.parquet"
     build_rolling_rental_features(
         spark,
@@ -322,18 +242,14 @@ def _run_incremental(spark, watermark: dict) -> None:
         until=window_until,
     )
     features_increment = build_features(spark, merged_increment, rolling_parquet_path=rolling_tmp_path)
-    # lag/rolling 계산용으로만 더 읽은 read_since_dt~since_dt 구간은 실제 overwrite
-    # 대상이 아니다(위 주석 참고) — since_dt 이후만 남긴다.
     target_complete_through = _target_complete_through(window_until)
     features_increment = features_increment.filter(
         (F.col("hour_ts") >= F.lit(since_str))
         & (F.col("hour_ts") <= F.lit(target_complete_through))
     )
-    # 아래에서 이 DataFrame에 count/write/collect 액션을 4번 호출한다 — 캐싱이
-    # 없으면 액션마다 상류 lineage(다중 소스 조인 + build_features의 rolling
-    # self-join) 전체를 처음부터 다시 계산한다(2026-08-27 Spark UI 실측: 같은
-    # 크기의 parquet/count stage가 액션 수만큼 반복됨).
+    # 액션 반복 실행 시 상류 연산 중복을 방지하기 위해 캐싱 적용
     features_increment = features_increment.cache()
+
 
     if features_increment.limit(1).count() == 0:
         print(f"[{config.PARAM_COMBO_ID}] 재계산 구간({since_str}~)에 데이터 없음 — 건너뜀")

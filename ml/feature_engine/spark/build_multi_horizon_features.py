@@ -1,43 +1,6 @@
-"""feature_engine이 만든 tick 단위 feature 테이블(FEATURES_TABLE_PARQUET, horizon=1
-전용)을 horizon=1..HORIZON_COUNT 학습 테이블로 확장한다 (PySpark).
+"""tick 단위 feature 테이블을 horizon=1..HORIZON_COUNT 학습 테이블로 확장하는 모듈 (PySpark).
 
-**핵심 아이디어(history.md 18번 항목에서 실험·검증됨) — "horizon을 feature로"**: 별도 모델을
-horizon마다 두거나 예측값을 재귀적으로 다음 입력에 먹이는 대신(오차 누적), lag(직전
-실적)는 항상 "지금(anchor_ts=T0)" 기준으로 고정하고, "몇 시간 뒤를 묻는지"만 horizon
-feature로 모델에 알려준다. 그래서 이 테이블의 한 행은 **원본 테이블의 서로 다른 두 시점을
-조합**한 것뿐이다:
-
-- anchor_ts(T0) 쪽에서: 그 모델의 lag 컬럼(`rental_lag_1h` 또는 `return_lag_1h`, "지금 아는 것") 1개.
-- target_ts(T0+(horizon-1)시간) 쪽에서: 날씨/인구/캘린더/(대여면 `rental_exposure`)/타겟 카운트
-  ("그 미래 시점에 실제로 어땠는지") + `date`.
-
-horizon=1이면 anchor_ts==target_ts라 원본 테이블의 해당 행과 완전히 같은 값이 나온다 —
-`tests/dev_spark_multi_horizon_parity.py`가 이 불변조건을 회귀 테스트로 고정한다.
-
-**대여/반납이 완전히 분리된 데이터셋이다** — 서로 상대방의 lag를 보지 않으므로
-(`RENTAL_ANCHOR_COLUMNS`/`RETURN_ANCHOR_COLUMNS`가 서로 다름) self-join도, 결과
-테이블도 따로 만든다. `run_pipeline.py`가 대여 쪽을 끝까지 만들어 S3에 쓰고 나서
-반납 쪽을 시작한다 — 이 self-join 자체가 원본의 최대 HORIZON_COUNT배 행 수로
-불어나므로(아래 "규모" 참고), 두 개를 동시에 메모리에 띄우지 않기 위함이다.
-
-**`date`를 target_ts 쪽에서 가져오는 이유**: `training/train_common._dates_for_split()`이
-`date`로 train/valid/test 경계를 가른다. 라벨(타겟 이벤트)이 실제로 언제 일어났는지를
-기준으로 나누고, 같은 anchor가 target 날짜 경계를 넘어 두 split에 들어가는 문제는
-training의 `SPLIT_EMBARGO_DAYS` purge로 막는다. anchor_ts 날짜만으로 자르면 horizon이
-큰 행의 라벨이 다음 split으로 새는 더 직접적인 누출이 생긴다.
-
-**station 활성 구간 밖 처리**: target_ts에 해당하는 행이 그리드에 없으면(station 비활성
-구간이거나, 아직 관측되지 않은 미래라 증분 파이프라인이 그 시점까지 못 만들었을 때) inner
-join으로 그 (anchor, horizon) 조합 자체가 자연히 빠진다 — build_merged_table.py의 "그리드
-구멍" 철학과 동일. 12/31 오후처럼 target_ts가 다음 해로 넘어가는 앵커도 같은 이유로
-자동으로 걸러진다(별도 예외 처리 불필요) — 워터마크 기반 증분 생성을 나중에 이
-파이프라인에 붙일 때도 이 성질 덕분에 "target이 아직 없으면 그냥 빠지고, 다음 증분 때
-채워짐"이 자동으로 성립한다.
-
-**규모**: T0은 `TRAIN_ANCHOR_TICK_MINUTES` 간격으로 선택한다. 기본 20분 base
-grid에서는 anchor도 20분이고, 5분 base grid에서는 a5(전체) 또는 a20(thinning)처럼
-명시할 수 있다. 결과는 선택된 anchor 행의 최대 HORIZON_COUNT배이므로 전체 연도는
-여전히 EMR 대상이다(로컬 검증은 짧은 기간의 합성 데이터로만).
+단일 모델 다중 시계열 확장을 위해 앵커 시점(T0)의 lag 정보와 미래 목표 시점(T0 + horizon - 1)의 컨텍스트 피처(날씨, 인구 등) 및 타겟을 결합한다.
 """
 
 from __future__ import annotations
@@ -50,32 +13,19 @@ from pyspark.sql import functions as F
 
 from . import config
 
-# station_no/capacity/lat/lon/temp/precip/pop_total/minute/dow/is_holiday/day는
-# common_config.BASE_FEATURE_COLUMNS와 정확히 겹친다(horizon만 예외 — 그건
-# _shift_for_horizon()이 self-join 뒤에 직접 붙이는 값이라 원본 tick 테이블엔
-# 아직 없는 컬럼이고, 여기서 select하면 실패한다). 하드코딩으로 다시 나열하면
-# BASE_FEATURE_COLUMNS에 피처를 추가/삭제할 때 여기를 깜빡하고 안 고쳐서 학습
-# 테이블에서 그 컬럼만 조용히 빠지는 사고가 날 수 있어(2026-08 리뷰 지적),
-# BASE_FEATURE_COLUMNS에서 그대로 파생시켜 이 두 목록이 어긋날 가능성 자체를
-# 없앤다. hour_ts/hour/date는 모델 feature가 아니라 이 파일 자체의 self-join
-# 키/식별용/split 경계 판정용이라 별도로 붙인다.
+# BASE_FEATURE_COLUMNS에서 horizon을 제외한 공통 피처 컬럼 및 메타데이터 컬럼 정의
 _COMMON_TARGET_COLUMNS = [
     *(c for c in common_config.BASE_FEATURE_COLUMNS if c != "horizon"),
-    "hour_ts",  # self-join 키(target_ts) — _shift_for_horizon()이 소모하고 버림
-    "hour",  # 더 이상 모델 feature 아님(minute이 대체) — scoring.predict() 출력/CLI 식별용
-    "date",  # train_common._dates_for_split()의 train/valid/test 경계 판정용 — 모델 feature 아님
+    "hour_ts",
+    "hour",
+    "date",
 ]
 
-# station_id(텍스트)는 이 테이블에 아예 안 담는다 — horizon self-join으로 원본의
-# 최대 HORIZON_COUNT배까지 불어나는 테이블이라, 안 쓸 텍스트 컬럼을 그만큼 배로
-# 복제해 저장하는 낭비가 크다(공간뿐 아니라 Spark 쓰기 비용도). 조인 키/모델
-# feature 전부 station_no(정수) 하나로 충분하고, station_id가 필요한 곳(사람이 보는
-# 출력 등)은 그때그때 station_master로 작게 join해서 붙인다
-# (`inference/predict_common.py` 참고).
 RENTAL_ANCHOR_COLUMNS = ["station_no", "hour_ts", "rental_lag_1h"]
 RENTAL_TARGET_COLUMNS = [*_COMMON_TARGET_COLUMNS, "rental_exposure", "rental_count"]
 RETURN_ANCHOR_COLUMNS = ["station_no", "hour_ts", "return_lag_1h"]
 RETURN_TARGET_COLUMNS = [*_COMMON_TARGET_COLUMNS, "return_count"]
+
 
 
 def _shift_for_horizon(anchor: DataFrame, target: DataFrame, horizon: int) -> DataFrame:
