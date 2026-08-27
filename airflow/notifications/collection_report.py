@@ -15,8 +15,7 @@ class SourceStatEvaluation(TypedDict):
     source_id: str
     stats: dict
     failure_rate: float
-    missing_ratio: float
-    outlier_ratio: float
+    drop_rate: float
     is_risky: bool
 
 
@@ -25,17 +24,24 @@ def _ratio(numerator: int, denominator: int) -> float:
 
 
 def evaluate_source_stats(source_id: str, stats: dict) -> SourceStatEvaluation:
-    """소스 하나의 통계를 alert_policy.yaml 기준과 비교해 위험 여부를 판정한다."""
+    """소스 하나의 통계를 alert_policy.yaml 기준과 비교해 위험 여부를 판정한다.
+
+    전부 행(row) 단위다 — 실행(run) 중 몇 번이 실패했는지, 가져온 행 중 몇 행이
+    버려졌는지만 본다. 컬럼 값 단위 결측·이상치 비율은 쓰지 않는다: 소스마다
+    "정상 기준선"이 크게 달라(예: 비회원 대여의 성별·생년 컬럼은 평소에도 결측이
+    30%에 가깝다) 일률적인 임계값을 적용하면 노이즈가 컸다(2026-08-27 실측,
+    bike_rental_history).
+    """
     thresholds = load_thresholds(source_id)
     run_count = stats["run_count"]
     failed = stats["status_counts"].get("failed", 0)
-    kept = stats["kept_count"]
+    fetched = stats["fetched_count"]
+    dropped = stats["dropped_count"]
 
     failure_rate = _ratio(failed, run_count)
-    missing_ratio = _ratio(stats["missing_count"], kept)
-    outlier_ratio = _ratio(stats["outlier_count"], kept)
+    drop_rate = _ratio(dropped, fetched)
 
-    # run_count == 0이면 모든 비율이 0/0 → 0.0으로 계산돼 임계값 비교만으로는
+    # run_count == 0이면 failure_rate도 0/0 → 0.0으로 계산돼 임계값 비교만으로는
     # "정상"과 구분이 안 된다 — 그런데 이건 collector/Airflow가 그 기간 내내
     # 완전히 멈춰 manifest가 하나도 안 남은, 비율 임계값보다 심한 장애다.
     # run_count == 0 자체를 별도 위험 조건으로 명시한다.
@@ -43,20 +49,18 @@ def evaluate_source_stats(source_id: str, stats: dict) -> SourceStatEvaluation:
     is_risky = (
         no_runs
         or failure_rate >= thresholds["failure_rate_threshold"]
-        or missing_ratio >= thresholds["missing_ratio_threshold"]
-        or outlier_ratio >= thresholds["outlier_ratio_threshold"]
+        or drop_rate >= thresholds["drop_rate_threshold"]
     )
     return {
         "source_id": source_id,
         "stats": stats,
         "failure_rate": failure_rate,
-        "missing_ratio": missing_ratio,
-        "outlier_ratio": outlier_ratio,
+        "drop_rate": drop_rate,
         "is_risky": is_risky,
     }
 
 
-_COLUMNS = ("STATUS", "SOURCE", "OK", "FAIL", "PART", "MISS", "OUT")
+_COLUMNS = ("STATUS", "SOURCE", "RUN", "SUCC", "FAIL", "PART", "KEEP", "DROP")
 _STATUS_OK = "OK"
 _STATUS_RISK = "RISK"
 _STATUS_WIDTH = max(len(_STATUS_OK), len(_STATUS_RISK), len(_COLUMNS[0]))
@@ -65,9 +69,12 @@ _STATUS_WIDTH = max(len(_STATUS_OK), len(_STATUS_RISK), len(_COLUMNS[0]))
 def _table(evaluations: list[SourceStatEvaluation]) -> str:
     """소스별 통계를 Slack 코드 블록 안에 넣을 고정폭 표로 만든다.
 
-    한글/이모지는 폰트마다 폭이 달라 고정폭 정렬이 어긋나므로, 표 안은 전부
-    ASCII로 채운다. 정상/위험 둘 다 빈칸이 아니라 "OK"/"RISK" 텍스트로 명시해
-    한쪽이 안 보이는 일이 없게 한다.
+    RUN=실행(수집 시도) 횟수, SUCC/FAIL/PART=그중 성공/실패/부분성공 횟수(행 개수가
+    아니라 실행 횟수다 — "OK"라고 하면 유효 행 수처럼 오해하기 쉬워 SUCC로 명확히
+    한다), KEEP=유효해서 살린 행, DROP=검증에 걸려 버린 행. 한글/이모지는 폰트마다
+    폭이 달라 고정폭 정렬이 어긋나므로 표 안은 전부 ASCII로 채운다. STATUS 컬럼(소스
+    전체 정상/위험 플래그)은 빈칸이 아니라 "OK"/"RISK" 텍스트로 명시해 한쪽이 안
+    보이는 일이 없게 한다.
     """
     name_width = max(
         (len(e["source_id"]) for e in evaluations), default=len(_COLUMNS[1])
@@ -75,7 +82,8 @@ def _table(evaluations: list[SourceStatEvaluation]) -> str:
     name_width = max(name_width, len(_COLUMNS[1]))
     header = (
         f"{_COLUMNS[0]:<{_STATUS_WIDTH}}  {_COLUMNS[1]:<{name_width}}  "
-        f"{_COLUMNS[2]:>4} {_COLUMNS[3]:>4} {_COLUMNS[4]:>4} {_COLUMNS[5]:>5} {_COLUMNS[6]:>5}"
+        f"{_COLUMNS[2]:>5} {_COLUMNS[3]:>5} {_COLUMNS[4]:>5} {_COLUMNS[5]:>5} "
+        f"{_COLUMNS[6]:>9} {_COLUMNS[7]:>9}"
     )
     rows = [header, "-" * len(header)]
     for e in evaluations:
@@ -84,9 +92,9 @@ def _table(evaluations: list[SourceStatEvaluation]) -> str:
         status = _STATUS_RISK if e["is_risky"] else _STATUS_OK
         rows.append(
             f"{status:<{_STATUS_WIDTH}}  {e['source_id']:<{name_width}}  "
-            f"{status_counts.get('succeeded', 0):>4} {status_counts.get('failed', 0):>4} "
-            f"{status_counts.get('partial', 0):>4} {stats['missing_count']:>5} "
-            f"{stats['outlier_count']:>5}"
+            f"{stats['run_count']:>5} {status_counts.get('succeeded', 0):>5} "
+            f"{status_counts.get('failed', 0):>5} {status_counts.get('partial', 0):>5} "
+            f"{stats['kept_count']:>9} {stats['dropped_count']:>9}"
         )
     return "\n".join(rows)
 

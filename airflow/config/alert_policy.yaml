@@ -1,19 +1,16 @@
 # 데이터 수집 모니터링 Slack 알림(daily_collection_report/hourly_collection_alert)의
 # 위험 판단 기준. 소스별로 다시 튜닝하고 싶으면 이 파일만 고치면 된다(코드 변경 불필요).
 #
-# missing_ratio_threshold/outlier_ratio_threshold는 collector/sources/*.yaml의
-# quality.max_missing_ratio와 다른 개념이다 — quality.max_missing_ratio는 수집 자체의
-# fetch/페이지네이션 완결성 비율(이름은 비슷하지만 값 결측과 무관)이고, 여기서의 비율은
-# manifest의 column_issues(컬럼 값 단위 결측·이상치)를 kept_count로 나눈 것이다.
-# quality gate는 required 컬럼이 drop_row 정책일 때만 이 실패를 drop_ratio로 잡아내므로,
-# optional 컬럼이나 non-drop 정책의 결측·이상치는 quality gate를 통과하고도 여기서 잡힌다.
+# 전부 행(row) 단위 비율이다 — 컬럼 값 단위(결측·이상치) 비율은 쓰지 않는다. 소스마다
+# "정상 기준선"이 크게 달라(예: 비회원 대여의 성별·생년 컬럼은 평소에도 결측이 30%에
+# 가깝다) 일률적인 임계값을 적용하면 노이즈가 컸다(2026-08-27 실측, bike_rental_history).
 default:
   # status=failed 실행 비율(failed / run_count)이 이 이상이면 위험.
   failure_rate_threshold: 0.2
-  # column_issues의 missing 합계를 kept_count로 나눈 비율.
-  missing_ratio_threshold: 0.05
-  # column_issues의 outlier 합계를 kept_count로 나눈 비율.
-  outlier_ratio_threshold: 0.05
+  # collector/sources/*.yaml의 quality.max_drop_ratio와 같은 개념(dropped/fetched)을
+  # 기간 전체로 합산한 비율. 개별 실행은 quality gate를 통과해도, 여러 실행에 걸쳐
+  # 버려지는 행 비율이 꾸준히 높으면 이 기준에 걸린다.
+  drop_rate_threshold: 0.05
 
 # 소스별 override. 빈 dict면 위 default를 그대로 쓴다.
 sources:
