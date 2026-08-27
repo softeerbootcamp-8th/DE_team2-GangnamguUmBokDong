@@ -7,6 +7,12 @@
   <img src="docs/readme/logo.png" width="320" alt="따릉이 재배치 우선순위 대시보드 로고" />
 </p>
 
+<div align="center">
+
+[![서울시 따릉이 재배치 대시보드](https://img.shields.io/badge/Website-http%3A%2F%2F54.116.106.151-darkgreen?style=for-the-badge&logo=googlechrome&logoColor=white)](http://54.116.106.151/)
+
+</div>
+
 ---
 
 ## 목차
