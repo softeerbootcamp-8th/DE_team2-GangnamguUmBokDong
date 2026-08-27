@@ -59,13 +59,13 @@ describe("Header serving health", () => {
     expect(screen.getByText("일부 지연")).not.toBeNull();
     expect(screen.getByRole("button", { name: "기준 시각 및 데이터 상태 설명" })).not.toBeNull();
     expect(screen.getByRole("tooltip", { name: "데이터 상태 상세" })).not.toBeNull();
-    ["대여소·재고", "수요예측", "대여소 우선순위", "작업 추천", "날씨", "행사", "권역 설정"]
+    ["대여소·재고", "수요예측", "대여소 우선순위", "작업 추천", "날씨 예보", "행사", "권역 설정"]
       .forEach((label) => expect(screen.getByText(label)).not.toBeNull());
     expect(screen.getByText("기준 불일치")).not.toBeNull();
     expect(screen.getByText("미게시")).not.toBeNull();
-    expect(screen.getByText("원본 지연")).not.toBeNull();
-    expect(screen.getByText(/^게시 /)).not.toBeNull();
-    expect(screen.getByText(/^원본 8\./)).not.toBeNull();
+    ["항목", "상태", "기준 시각"]
+      .forEach((heading) => expect(screen.getByText(heading)).not.toBeNull());
+    expect(screen.getByText(/^기상청 발표 8\./)).not.toBeNull();
   });
 
   it("작은 화면에서도 기준 시각 정보창을 viewport 안에 배치한다", () => {
@@ -90,6 +90,24 @@ describe("Header serving health", () => {
     const tooltip = screen.getByRole("tooltip", { name: "데이터 상태 상세" });
     expect(tooltip.style.left).toBe("8px");
     expect(tooltip.classList.contains("is-visible")).toBe(true);
+  });
+
+  it("날씨 예보 horizon이 불완전하면 예보 구간 누락으로 표시한다", () => {
+    renderHeader({
+      servingHealth: {
+        ...HEALTH,
+        components: {
+          ...HEALTH.components,
+          weather: {
+            ...HEALTH.components.weather,
+            state: "misaligned",
+            reason: "weather_horizon_incomplete",
+          },
+        },
+      },
+    });
+
+    expect(screen.getByText("구간 누락")).not.toBeNull();
   });
 
   it("상태 조회 실패 뒤 마지막 기준 시각과 상세는 유지하고 연결 끊김을 표시한다", () => {
