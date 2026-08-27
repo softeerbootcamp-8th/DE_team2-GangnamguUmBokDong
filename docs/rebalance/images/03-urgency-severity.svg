@@ -1,0 +1,148 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1052 796" width="1052" height="796">
+
+  <style>
+    svg{
+      --bg:#FCFCFB; --sf2:#EDF0EE; --ink:#131A18; --ink-2:#3A4744; --muted:#5C6A66;
+      --line:#D5DCDA; --line-2:#C2CBC8; --grid:#00000010;
+      --accent:#0A8B6E; --accent-soft:#0a8b6e1c;
+      --supply:#C1571A; --supply-soft:#c1571a18;
+      --retrieval:#3F51A8; --retrieval-soft:#3f51a818;
+      --surface:#FCFCFB; --surface-2:#EDF0EE;
+      --sans:"Apple SD Gothic Neo","Pretendard","Malgun Gothic","Noto Sans KR","Helvetica Neue",sans-serif;
+      --mono:"SF Mono","JetBrains Mono","D2Coding",ui-monospace,Menlo,monospace;
+    }
+    @media (prefers-color-scheme: dark){
+      svg{
+        --bg:#141B19; --sf2:#1F2825; --ink:#E4EBE8; --ink-2:#C3CFCB; --muted:#93A29D;
+        --line:#2A3532; --line-2:#3F4C48; --grid:#ffffff10;
+        --accent:#22A88F; --accent-soft:#22a88f24;
+        --supply:#D07C28; --supply-soft:#d07c2822;
+        --retrieval:#6E85DD; --retrieval-soft:#6e85dd22;
+        --surface:#141B19; --surface-2:#1F2825;
+      }
+    }
+    .page{fill:var(--bg)}
+    .bx{fill:var(--sf2); stroke:var(--line-2); stroke-width:1}
+    .bx-a{fill:var(--accent-soft); stroke:var(--accent); stroke-width:1.4}
+    .t{font-family:var(--sans); font-size:13px; font-weight:500; fill:var(--ink)}
+    .t-b{font-family:var(--sans); font-size:13.5px; font-weight:700; fill:var(--ink)}
+    .t-s{font-family:var(--sans); font-size:11.5px; fill:var(--muted)}
+    .m{font-family:var(--mono); font-size:10px; fill:var(--muted)}
+    .m-b{font-family:var(--mono); font-size:11px; font-weight:600; fill:var(--ink)}
+    .num{font-family:var(--mono); font-size:11.5px; font-weight:600; fill:var(--ink)}
+    .ln{stroke:var(--ink-2); stroke-width:1.4; fill:none}
+    .ln-a{stroke:var(--accent); stroke-width:1.6; fill:none}
+    .ln-d{stroke:var(--line-2); stroke-width:1; stroke-dasharray:3 3; fill:none}
+    .grid{stroke:var(--grid); stroke-width:1}
+    .axis{stroke:var(--line-2); stroke-width:1}
+    .h1{font-family:var(--sans); font-size:19px; font-weight:700; fill:var(--ink)}
+    .h2{font-family:var(--sans); font-size:13px; font-weight:600; fill:var(--accent)}
+    .step{font-family:var(--mono); font-size:12px; font-weight:600; fill:var(--accent); letter-spacing:.08em}
+    .cap{font-family:var(--sans); font-size:12.5px; fill:var(--muted)}
+    .capb{font-family:var(--sans); font-size:12.5px; font-weight:700; fill:var(--ink-2)}
+  </style>
+
+<rect class="page" x="0" y="0" width="1052" height="796"/>
+<text x="26" y="30" class="step">03</text>
+<text x="64" y="31" class="h1">심각도 — 그때 얼마나 아픈가</text>
+<line x1="26" y1="46" x2="1026" y2="46" stroke="var(--line)" stroke-width="1"/>
+<text x="26" y="78" class="h2">예측 구간 전체를 훑어 가장 심해지는 순간을 세 가지 자로 잰다</text>
+<g transform="translate(26,92)">
+
+        <!-- ============ panel 1 ============ -->
+        <text x="0" y="16" class="t-b" fill="var(--retrieval)">_max_overshoot</text>
+        <text x="0" y="34" class="t-s">회수필요 — 정원을 가장 크게 넘는 지점</text>
+        <rect x="40" y="60" width="250" height="72.6" fill="var(--retrieval-soft)"/>
+        <line x1="40" y1="190" x2="290" y2="190" class="axis"/>
+        <line x1="40" y1="132.6" x2="290" y2="132.6" stroke="var(--retrieval)" stroke-width="1.2" stroke-dasharray="4 3"/>
+        <text x="44" y="128" class="m" fill="var(--retrieval)">정원 15</text>
+        <polyline fill="none" stroke="var(--ink-2)" stroke-width="2" stroke-linejoin="round" points="40,144.1 81.7,128.8 123.3,105.9 165,79.1 206.7,67.6 248.3,86.8 290,105.9"/>
+        <circle cx="206.7" cy="67.6" r="5" fill="var(--retrieval)" stroke="var(--surface)" stroke-width="2"/>
+        <path d="M198,67.6 L186,67.6 M198,132.6 L186,132.6 M190,67.6 L190,132.6" stroke="var(--retrieval)" stroke-width="1.3" fill="none"/>
+        <text x="182" y="102" class="num" text-anchor="end" fill="var(--retrieval)">17대</text>
+        <text x="44" y="172" class="m">_max_overshoot = peak 32 − 정원 15</text>
+        <text x="40" y="212" class="m">현재</text>
+        <text x="290" y="212" class="m" text-anchor="end">+6h</text>
+        <text x="0" y="248" class="t-s">예측 재고는 위쪽을 막지 않으므로</text>
+        <text x="0" y="266" class="t-s">그대로 읽으면 된다. 지금이 더 나쁠</text>
+        <text x="0" y="284" class="t-s">수도 있어 현재 재고도 후보에 넣는다.</text>
+
+        <line x1="318" y1="0" x2="318" y2="298" stroke="var(--line)" stroke-width="1"/>
+
+        <!-- ============ panel 2 ============ -->
+        <text x="340" y="16" class="t-b" fill="var(--supply)">_max_deficit</text>
+        <text x="340" y="34" class="t-s">공급필요 — 클램프를 풀었을 때의 바닥</text>
+        <line x1="380" y1="141.25" x2="630" y2="141.25" class="axis"/>
+        <text x="374" y="145" class="m" text-anchor="end">0</text>
+        <line x1="380" y1="125" x2="630" y2="125" stroke="var(--supply)" stroke-width="1" stroke-dasharray="4 3"/>
+        <polyline fill="none" stroke="var(--line-2)" stroke-width="1.8" stroke-dasharray="4 3" stroke-linejoin="round" points="380,120.9 421.7,141.25 463.3,141.25 505,141.25 546.7,137.2 588.3,124.9 630,112.7"/>
+        <polyline fill="none" stroke="var(--supply)" stroke-width="2" stroke-linejoin="round" points="380,120.9 421.7,145.3 463.3,169.7 505,181.9 546.7,177.8 588.3,165.6 630,153.4"/>
+        <circle cx="505" cy="181.9" r="5" fill="var(--supply)" stroke="var(--surface)" stroke-width="2"/>
+        <path d="M513,181.9 L525,181.9 M513,141.25 L525,141.25 M521,141.25 L521,181.9" stroke="var(--supply)" stroke-width="1.3" fill="none"/>
+        <text x="531" y="160" class="num" fill="var(--supply)">10대</text>
+        <text x="432" y="204" class="m">_max_deficit = 바닥 −10</text>
+        <text x="380" y="212" class="m">현재</text>
+        <text x="630" y="212" class="m" text-anchor="end">+6h</text>
+        <text x="340" y="248" class="t-s">predicted_bikes(┄)는 0에서 잘려</text>
+        <text x="340" y="266" class="t-s">깊이를 잃는다. 그래서 원본 대여·반납</text>
+        <text x="340" y="284" class="t-s">량으로 클램프 없이 다시 누적한다.</text>
+
+        <line x1="658" y1="0" x2="658" y2="298" stroke="var(--line)" stroke-width="1"/>
+
+        <!-- ============ panel 3 ============ -->
+        <text x="680" y="16" class="t-b" fill="var(--supply)">_max_unmet_demand</text>
+        <text x="680" y="34" class="t-s">공급필요 — 바닥인 채로 들어온 대여 수요</text>
+        <rect x="720" y="146.7" width="250" height="43.3" fill="var(--supply-soft)"/>
+        <line x1="720" y1="190" x2="970" y2="190" class="axis"/>
+        <line x1="720" y1="146.7" x2="970" y2="146.7" stroke="var(--supply)" stroke-width="1.2" stroke-dasharray="4 3"/>
+        <text x="724" y="203" class="m" fill="var(--supply)">0.2 × 정원 = 4</text>
+        <polyline fill="none" stroke="var(--ink-2)" stroke-width="2" stroke-linejoin="round" points="720,125 761.7,146.7 803.3,146.7 845,157.5 886.7,135.8 928.3,114.2 970,92.5"/>
+        <circle cx="761.7" cy="146.7" r="4" fill="var(--ink-2)" stroke="var(--surface)" stroke-width="2"/>
+        <circle cx="803.3" cy="146.7" r="5" fill="var(--supply)" stroke="var(--surface)" stroke-width="2"/>
+        <line x1="782" y1="70" x2="782" y2="100" stroke="var(--supply)" stroke-width="2.5"/>
+        <path d="M776,94 L782,101 L788,94" fill="none" stroke="var(--supply)" stroke-width="2.5"/>
+        <line x1="798" y1="100" x2="798" y2="70" stroke="var(--retrieval)" stroke-width="2.5"/>
+        <path d="M792,76 L798,69 L804,76" fill="none" stroke="var(--retrieval)" stroke-width="2.5"/>
+        <text x="812" y="80" class="num" fill="var(--supply)">대여 10</text>
+        <text x="812" y="96" class="num" fill="var(--retrieval)">반납 10</text>
+        <text x="812" y="114" class="m">순증감 0 → 재고 4 유지</text>
+        <text x="680" y="248" class="t-s">순누적만 보면 아무 일도 없었지만,</text>
+        <text x="680" y="266" class="t-s">그 한 시간 동안 10명이 자전거를</text>
+        <text x="680" y="284" class="t-s">못 빌렸다. _max_deficit이 놓치는 신호.</text>
+      </g>
+<text x="26" y="440" class="h2">정원 대비 비율을 0~1로 바꾼다</text>
+<g transform="translate(26,454)">
+        <text x="0" y="16" class="m-b">impact_factor = 1 − e <tspan dy="-4" font-size="9">−ratio / 1.5</tspan><tspan dy="4">, &nbsp; ratio = 초과·부족량 / hold_cnt</tspan></text>
+
+        <line x1="64" y1="208" x2="624" y2="208" class="axis"/>
+        <line x1="64" y1="28" x2="64" y2="208" class="axis"/>
+        <line x1="64" y1="28" x2="624" y2="28" class="grid"/>
+        <line x1="64" y1="118" x2="624" y2="118" class="grid"/>
+        <text x="56" y="32" class="m" text-anchor="end">1.0</text>
+        <text x="56" y="122" class="m" text-anchor="end">0.5</text>
+        <text x="56" y="212" class="m" text-anchor="end">0</text>
+
+        <polyline fill="none" stroke="var(--accent)" stroke-width="2" stroke-linejoin="round" points="64.0,208.0 73.3,196.4 82.7,185.5 92.0,175.4 101.3,165.9 110.7,157.0 120.0,148.7 129.3,140.9 138.7,133.6 148.0,126.8 157.3,120.4 166.7,114.5 176.0,108.9 185.3,103.7 194.7,98.8 204.0,94.2 213.3,89.9 222.7,86.0 232.0,82.2 241.3,78.7 250.7,75.4 260.0,72.4 269.3,69.5 278.7,66.8 288.0,64.3 297.3,62.0 306.7,59.8 316.0,57.8 325.3,55.8 334.7,54.0 344.0,52.4 353.3,50.8 362.7,49.3 372.0,47.9 381.3,46.7 390.7,45.5 400.0,44.3 409.3,43.3 418.7,42.3 428.0,41.4 437.3,40.5 446.7,39.7 456.0,38.9 465.3,38.2 474.7,37.6 484.0,37.0 493.3,36.4 502.7,35.8 512.0,35.3 521.3,34.9 530.7,34.4 540.0,34.0 549.3,33.6 558.7,33.3 568.0,32.9 577.3,32.6 586.7,32.3 596.0,32.0 605.3,31.8 614.7,31.5 624.0,31.3"/>
+
+        <!-- clamp comparison -->
+        <polyline fill="none" stroke="var(--supply)" stroke-width="1.8" stroke-dasharray="5 3" points="64,208 250.7,28 624,28"/>
+        <text x="352" y="126" class="m" fill="var(--supply)">┄ 클램프 방식(폐기) — 비율 2를 넘으면 전부 같은 점수로 뭉침</text>
+
+        <circle cx="157.3" cy="120.4" r="5" fill="var(--accent)" stroke="var(--surface)" stroke-width="2"/>
+        <text x="167" y="140" class="num" fill="var(--accent)">ratio 1 → 0.49</text>
+        <circle cx="437.3" cy="40.5" r="5" fill="var(--accent)" stroke="var(--surface)" stroke-width="2"/>
+        <text x="447" y="52" class="num" fill="var(--accent)">ratio 4 → 0.93</text>
+
+        <text x="64" y="230" class="m" text-anchor="middle">0</text>
+        <text x="157.3" y="230" class="m" text-anchor="middle">1</text>
+        <text x="250.7" y="230" class="m" text-anchor="middle">2</text>
+        <text x="344" y="230" class="m" text-anchor="middle">3</text>
+        <text x="437.3" y="230" class="m" text-anchor="middle">4</text>
+        <text x="530.7" y="230" class="m" text-anchor="middle">5</text>
+        <text x="624" y="230" class="m" text-anchor="middle">6</text>
+        <text x="344" y="252" class="m" text-anchor="middle">ratio — 정원 대비 초과·부족 배수</text>
+      </g>
+<line x1="26" y1="726" x2="1026" y2="726" stroke="var(--line)" stroke-width="1"/>
+<text x="26" y="746" class="capb">공급필요는 max(_max_deficit, _max_unmet_demand)를 쓴다. 상한을 자르는 클램프 대신 점근 곡선을 쓴 건 실측에서 회수필요 대여소의 35%가 똑같이 100점에 뭉쳤기</text>
+<text x="26" y="764" class="cap">때문이다.</text>
+</svg>

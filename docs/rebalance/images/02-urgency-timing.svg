@@ -1,0 +1,137 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 812 792" width="812" height="792">
+
+  <style>
+    svg{
+      --bg:#FCFCFB; --sf2:#EDF0EE; --ink:#131A18; --ink-2:#3A4744; --muted:#5C6A66;
+      --line:#D5DCDA; --line-2:#C2CBC8; --grid:#00000010;
+      --accent:#0A8B6E; --accent-soft:#0a8b6e1c;
+      --supply:#C1571A; --supply-soft:#c1571a18;
+      --retrieval:#3F51A8; --retrieval-soft:#3f51a818;
+      --surface:#FCFCFB; --surface-2:#EDF0EE;
+      --sans:"Apple SD Gothic Neo","Pretendard","Malgun Gothic","Noto Sans KR","Helvetica Neue",sans-serif;
+      --mono:"SF Mono","JetBrains Mono","D2Coding",ui-monospace,Menlo,monospace;
+    }
+    @media (prefers-color-scheme: dark){
+      svg{
+        --bg:#141B19; --sf2:#1F2825; --ink:#E4EBE8; --ink-2:#C3CFCB; --muted:#93A29D;
+        --line:#2A3532; --line-2:#3F4C48; --grid:#ffffff10;
+        --accent:#22A88F; --accent-soft:#22a88f24;
+        --supply:#D07C28; --supply-soft:#d07c2822;
+        --retrieval:#6E85DD; --retrieval-soft:#6e85dd22;
+        --surface:#141B19; --surface-2:#1F2825;
+      }
+    }
+    .page{fill:var(--bg)}
+    .bx{fill:var(--sf2); stroke:var(--line-2); stroke-width:1}
+    .bx-a{fill:var(--accent-soft); stroke:var(--accent); stroke-width:1.4}
+    .t{font-family:var(--sans); font-size:13px; font-weight:500; fill:var(--ink)}
+    .t-b{font-family:var(--sans); font-size:13.5px; font-weight:700; fill:var(--ink)}
+    .t-s{font-family:var(--sans); font-size:11.5px; fill:var(--muted)}
+    .m{font-family:var(--mono); font-size:10px; fill:var(--muted)}
+    .m-b{font-family:var(--mono); font-size:11px; font-weight:600; fill:var(--ink)}
+    .num{font-family:var(--mono); font-size:11.5px; font-weight:600; fill:var(--ink)}
+    .ln{stroke:var(--ink-2); stroke-width:1.4; fill:none}
+    .ln-a{stroke:var(--accent); stroke-width:1.6; fill:none}
+    .ln-d{stroke:var(--line-2); stroke-width:1; stroke-dasharray:3 3; fill:none}
+    .grid{stroke:var(--grid); stroke-width:1}
+    .axis{stroke:var(--line-2); stroke-width:1}
+    .h1{font-family:var(--sans); font-size:19px; font-weight:700; fill:var(--ink)}
+    .h2{font-family:var(--sans); font-size:13px; font-weight:600; fill:var(--accent)}
+    .step{font-family:var(--mono); font-size:12px; font-weight:600; fill:var(--accent); letter-spacing:.08em}
+    .cap{font-family:var(--sans); font-size:12.5px; fill:var(--muted)}
+    .capb{font-family:var(--sans); font-size:12.5px; font-weight:700; fill:var(--ink-2)}
+  </style>
+
+<rect class="page" x="0" y="0" width="812" height="792"/>
+<text x="26" y="30" class="step">02</text>
+<text x="64" y="31" class="h1">시급성 — 언제 위험해지나</text>
+<line x1="26" y1="46" x2="786" y2="46" stroke="var(--line)" stroke-width="1"/>
+<text x="26" y="78" class="h2">세 감지기가 서로 다른 시간 구간을 담당하고, 가장 이른 것을 쓴다</text>
+<g transform="translate(26,92)">
+        <!-- lag zone -->
+        <rect x="120" y="40" width="72.5" height="164" fill="var(--supply-soft)"/>
+        <line x1="192.5" y1="40" x2="192.5" y2="252" stroke="var(--supply)" stroke-width="1.2" stroke-dasharray="4 3"/>
+        <text x="196" y="34" class="m" fill="var(--supply)">RESPONSE_LAG 30분 — 트럭이 도착조차 못 하는 구간</text>
+
+        <!-- rows -->
+        <text x="112" y="74" class="t" text-anchor="end">즉시위험</text>
+        <text x="112" y="90" class="m" text-anchor="end">조건 판정</text>
+        <line x1="120" y1="70" x2="700" y2="70" stroke="var(--line)" stroke-width="1"/>
+        <circle cx="120" cy="70" r="5" fill="none" stroke="var(--line-2)" stroke-width="1.6" stroke-dasharray="2 2"/>
+        <text x="200" y="66" class="m">해당 없음 — 지금 12대는 임계(3대)와 정원(15대) 사이</text>
+
+        <text x="112" y="120" class="t" text-anchor="end">추세감지</text>
+        <text x="112" y="136" class="m" text-anchor="end">회귀 기울기</text>
+        <line x1="120" y1="116" x2="700" y2="116" stroke="var(--line)" stroke-width="1"/>
+        <line x1="120" y1="116" x2="178" y2="116" stroke="var(--accent)" stroke-width="2.5"/>
+        <circle cx="178" cy="116" r="5.5" fill="var(--accent)" stroke="var(--surface)" stroke-width="2"/>
+        <text x="190" y="112" class="num" fill="var(--accent)">24분</text>
+        <text x="234" y="112" class="m">+0.126대/분으로 차오르는 중 → (15−12)/0.126</text>
+
+        <text x="112" y="166" class="t" text-anchor="end">예측감지</text>
+        <text x="112" y="182" class="m" text-anchor="end">곡선 첫 이상</text>
+        <line x1="120" y1="162" x2="700" y2="162" stroke="var(--line)" stroke-width="1"/>
+        <line x1="120" y1="162" x2="265" y2="162" stroke="var(--ink-2)" stroke-width="2"/>
+        <circle cx="265" cy="162" r="5" fill="var(--ink-2)" stroke="var(--surface)" stroke-width="2"/>
+        <text x="277" y="158" class="num">60분</text>
+        <text x="318" y="158" class="m">예측 데이터가 처음 존재하는 시점 = 하한선</text>
+
+        <!-- min pick -->
+        <path d="M178,124 L178,196" stroke="var(--accent)" stroke-width="1.4" stroke-dasharray="3 3" fill="none"/>
+        <path d="M265,170 L265,188 L184,188" stroke="var(--line-2)" stroke-width="1.2" stroke-dasharray="3 3" fill="none"/>
+        <text x="112" y="212" class="t-b" text-anchor="end">min( )</text>
+        <line x1="120" y1="208" x2="700" y2="208" class="axis"/>
+        <circle cx="178" cy="208" r="6" fill="var(--accent)" stroke="var(--surface)" stroke-width="2"/>
+        <text x="190" y="204" class="m-b" fill="var(--accent)">time_to_critical = 24분</text>
+
+        <!-- axis ticks -->
+        <text x="120" y="228" class="m" text-anchor="middle">0분</text>
+        <text x="192.5" y="228" class="m" text-anchor="middle">30</text>
+        <text x="265" y="228" class="m" text-anchor="middle">60</text>
+        <text x="410" y="228" class="m" text-anchor="middle">120</text>
+        <text x="555" y="228" class="m" text-anchor="middle">180</text>
+        <text x="700" y="228" class="m" text-anchor="middle">240</text>
+
+        <!-- slack -->
+        <line x1="120" y1="262" x2="178" y2="262" stroke="var(--supply)" stroke-width="3"/>
+        <text x="186" y="266" class="m" fill="var(--supply)">24분 &lt; 30분 &nbsp;→&nbsp; slack = max(0, 24 − 30) = 0 &nbsp;→&nbsp; time_factor = 1.0 (최대 긴급)</text>
+        <text x="0" y="296" class="m">추세감지는 60분 이후로 계산되면 버린다 — 그 구간은 예측 데이터가 담당하므로 추세의 역할이 아니다.</text>
+      </g>
+<text x="26" y="440" class="h2">남은 여유(slack)를 0~1 계수로 바꾼다</text>
+<g transform="translate(26,454)">
+        <text x="0" y="16" class="m-b">time_factor = 2 <tspan dy="-4" font-size="9">−slack / 60</tspan><tspan dy="4">, &nbsp; slack = max(0, time_to_critical − 30)</tspan></text>
+
+        <rect x="64" y="28" width="70" height="180" fill="var(--accent-soft)"/>
+        <line x1="64" y1="208" x2="624" y2="208" class="axis"/>
+        <line x1="64" y1="28" x2="64" y2="208" class="axis"/>
+        <line x1="64" y1="118" x2="624" y2="118" class="grid"/>
+        <line x1="64" y1="163" x2="624" y2="163" class="grid"/>
+
+        <text x="56" y="32" class="m" text-anchor="end">1.0</text>
+        <text x="56" y="122" class="m" text-anchor="end">0.5</text>
+        <text x="56" y="167" class="m" text-anchor="end">0.25</text>
+        <text x="56" y="212" class="m" text-anchor="end">0</text>
+
+        <polyline fill="none" stroke="var(--accent)" stroke-width="2" stroke-linejoin="round" points="64.0,28.0 92.0,28.0 120.0,28.0 134.0,28.0 138.7,32.1 148.0,40.1 157.3,47.6 166.7,54.9 176.0,61.8 185.3,68.4 194.7,74.7 204.0,80.7 213.3,86.5 222.7,92.0 232.0,97.2 241.3,102.2 250.7,107.0 260.0,111.5 269.3,115.9 278.7,120.1 288.0,124.0 297.3,127.8 306.7,131.4 316.0,134.9 325.3,138.2 334.7,141.4 344.0,144.4 353.3,147.2 362.7,150.0 372.0,152.6 381.3,155.1 390.7,157.5 400.0,159.8 409.3,161.9 418.7,164.0 428.0,166.0 437.3,167.9 446.7,169.7 456.0,171.4 465.3,173.1 474.7,174.7 484.0,176.2 493.3,177.6 502.7,179.0 512.0,180.3 521.3,181.6 530.7,182.7 540.0,183.9 549.3,185.0 558.7,186.0 568.0,187.0 577.3,188.0 586.7,188.9 596.0,189.7 605.3,190.5 614.7,191.3 624.0,192.1"/>
+
+        <line x1="134" y1="28" x2="134" y2="208" stroke="var(--supply)" stroke-width="1.2" stroke-dasharray="4 3"/>
+        <text x="142" y="46" class="m" fill="var(--supply)">30분 이내는 전부 1.0으로 묶임</text>
+
+        <circle cx="274" cy="118" r="5" fill="var(--accent)" stroke="var(--surface)" stroke-width="2"/>
+        <text x="284" y="114" class="num" fill="var(--accent)">90분 → 0.50</text>
+        <circle cx="414" cy="163" r="5" fill="var(--accent)" stroke="var(--surface)" stroke-width="2"/>
+        <text x="424" y="159" class="num" fill="var(--accent)">150분 → 0.25</text>
+        <circle cx="178" cy="28" r="0" fill="none"/>
+
+        <text x="64" y="230" class="m" text-anchor="middle">0</text>
+        <text x="134" y="230" class="m" text-anchor="middle">30</text>
+        <text x="204" y="230" class="m" text-anchor="middle">60</text>
+        <text x="274" y="230" class="m" text-anchor="middle">90</text>
+        <text x="414" y="230" class="m" text-anchor="middle">150</text>
+        <text x="624" y="230" class="m" text-anchor="middle">240</text>
+        <text x="344" y="250" class="m" text-anchor="middle">time_to_critical (분)</text>
+      </g>
+<line x1="26" y1="722" x2="786" y2="722" stroke="var(--line)" stroke-width="1"/>
+<text x="26" y="742" class="capb">조건문은 지금(0분), 추세는 0~60분, 예측은 60분 이후를 담당한다. 30분 안에 터지는 곳은 어차피 못 막으니 전부 최대</text>
+<text x="26" y="760" class="cap">긴급도로 묶고, 그 뒤로는 여유가 60분 늘 때마다 절반이 된다.</text>
+</svg>

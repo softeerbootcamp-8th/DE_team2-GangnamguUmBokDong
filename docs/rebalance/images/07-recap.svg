@@ -1,0 +1,110 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1052 382" width="1052" height="382">
+
+  <style>
+    svg{
+      --bg:#FCFCFB; --sf2:#EDF0EE; --ink:#131A18; --ink-2:#3A4744; --muted:#5C6A66;
+      --line:#D5DCDA; --line-2:#C2CBC8; --grid:#00000010;
+      --accent:#0A8B6E; --accent-soft:#0a8b6e1c;
+      --supply:#C1571A; --supply-soft:#c1571a18;
+      --retrieval:#3F51A8; --retrieval-soft:#3f51a818;
+      --surface:#FCFCFB; --surface-2:#EDF0EE;
+      --sans:"Apple SD Gothic Neo","Pretendard","Malgun Gothic","Noto Sans KR","Helvetica Neue",sans-serif;
+      --mono:"SF Mono","JetBrains Mono","D2Coding",ui-monospace,Menlo,monospace;
+    }
+    @media (prefers-color-scheme: dark){
+      svg{
+        --bg:#141B19; --sf2:#1F2825; --ink:#E4EBE8; --ink-2:#C3CFCB; --muted:#93A29D;
+        --line:#2A3532; --line-2:#3F4C48; --grid:#ffffff10;
+        --accent:#22A88F; --accent-soft:#22a88f24;
+        --supply:#D07C28; --supply-soft:#d07c2822;
+        --retrieval:#6E85DD; --retrieval-soft:#6e85dd22;
+        --surface:#141B19; --surface-2:#1F2825;
+      }
+    }
+    .page{fill:var(--bg)}
+    .bx{fill:var(--sf2); stroke:var(--line-2); stroke-width:1}
+    .bx-a{fill:var(--accent-soft); stroke:var(--accent); stroke-width:1.4}
+    .t{font-family:var(--sans); font-size:13px; font-weight:500; fill:var(--ink)}
+    .t-b{font-family:var(--sans); font-size:13.5px; font-weight:700; fill:var(--ink)}
+    .t-s{font-family:var(--sans); font-size:11.5px; fill:var(--muted)}
+    .m{font-family:var(--mono); font-size:10px; fill:var(--muted)}
+    .m-b{font-family:var(--mono); font-size:11px; font-weight:600; fill:var(--ink)}
+    .num{font-family:var(--mono); font-size:11.5px; font-weight:600; fill:var(--ink)}
+    .ln{stroke:var(--ink-2); stroke-width:1.4; fill:none}
+    .ln-a{stroke:var(--accent); stroke-width:1.6; fill:none}
+    .ln-d{stroke:var(--line-2); stroke-width:1; stroke-dasharray:3 3; fill:none}
+    .grid{stroke:var(--grid); stroke-width:1}
+    .axis{stroke:var(--line-2); stroke-width:1}
+    .h1{font-family:var(--sans); font-size:19px; font-weight:700; fill:var(--ink)}
+    .h2{font-family:var(--sans); font-size:13px; font-weight:600; fill:var(--accent)}
+    .step{font-family:var(--mono); font-size:12px; font-weight:600; fill:var(--accent); letter-spacing:.08em}
+    .cap{font-family:var(--sans); font-size:12.5px; fill:var(--muted)}
+    .capb{font-family:var(--sans); font-size:12.5px; font-weight:700; fill:var(--ink-2)}
+  </style>
+
+<rect class="page" x="0" y="0" width="1052" height="382"/>
+<text x="26" y="30" class="step">SUM</text>
+<text x="64" y="31" class="h1">한 장으로 되짚기</text>
+<line x1="26" y1="46" x2="1026" y2="46" stroke="var(--line)" stroke-width="1"/>
+<g transform="translate(26,66)">
+        <defs>
+          <marker id="a8" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+            <path d="M0,1 L9,5 L0,9 z" fill="var(--line-2)"/>
+          </marker>
+        </defs>
+
+        <!-- inputs -->
+        <rect x="0" y="46" width="150" height="34" rx="3" fill="var(--supply-soft)" stroke="var(--supply)" stroke-width="1"/>
+        <text x="75" y="68" class="t" text-anchor="middle" fill="var(--supply)">대여 수요</text>
+        <rect x="0" y="94" width="150" height="34" rx="3" fill="var(--retrieval-soft)" stroke="var(--retrieval)" stroke-width="1"/>
+        <text x="75" y="116" class="t" text-anchor="middle" fill="var(--retrieval)">반납 수요</text>
+
+        <line x1="152" y1="63" x2="196" y2="80" stroke="var(--line-2)" stroke-width="1.4" marker-end="url(#a8)"/>
+        <line x1="152" y1="111" x2="196" y2="94" stroke="var(--line-2)" stroke-width="1.4" marker-end="url(#a8)"/>
+
+        <rect x="200" y="60" width="150" height="54" rx="3" class="bx"/>
+        <text x="275" y="82" class="t" text-anchor="middle">예측 재고 곡선</text>
+        <text x="275" y="102" class="m" text-anchor="middle">+ action_type</text>
+
+        <!-- split -->
+        <line x1="352" y1="80" x2="396" y2="52" stroke="var(--line-2)" stroke-width="1.4" marker-end="url(#a8)"/>
+        <line x1="352" y1="94" x2="396" y2="122" stroke="var(--line-2)" stroke-width="1.4" marker-end="url(#a8)"/>
+
+        <rect x="400" y="22" width="164" height="52" rx="3" class="bx"/>
+        <text x="482" y="43" class="t" text-anchor="middle">시급성</text>
+        <text x="482" y="62" class="m" text-anchor="middle">언제 위험해지나</text>
+        <rect x="400" y="100" width="164" height="52" rx="3" class="bx"/>
+        <text x="482" y="121" class="t" text-anchor="middle">심각도</text>
+        <text x="482" y="140" class="m" text-anchor="middle">그때 얼마나 아픈가</text>
+
+        <line x1="566" y1="48" x2="606" y2="76" stroke="var(--line-2)" stroke-width="1.4" marker-end="url(#a8)"/>
+        <line x1="566" y1="126" x2="606" y2="98" stroke="var(--line-2)" stroke-width="1.4" marker-end="url(#a8)"/>
+        <text x="586" y="92" class="t-b" text-anchor="middle">×</text>
+
+        <rect x="612" y="60" width="164" height="54" rx="3" class="bx-a"/>
+        <text x="694" y="82" class="t-b" text-anchor="middle">urgency_score</text>
+        <text x="694" y="102" class="m" text-anchor="middle">+ bike_qty · 좌표</text>
+
+        <line x1="778" y1="87" x2="822" y2="87" stroke="var(--line-2)" stroke-width="1.4" marker-end="url(#a8)"/>
+
+        <rect x="828" y="60" width="164" height="54" rx="3" class="bx-a"/>
+        <text x="910" y="82" class="t-b" text-anchor="middle">라우트</text>
+        <text x="910" y="102" class="m" text-anchor="middle">권역 · 적재 · 방문순서</text>
+
+        <!-- role bar -->
+        <line x1="0" y1="170" x2="1000" y2="170" stroke="var(--line)" stroke-width="1"/>
+        <text x="612" y="194" class="m">urgency_score →</text>
+        <text x="740" y="194" class="t-s" fill="var(--accent)">누가 먼저 실리나 (정렬 키)</text>
+        <text x="612" y="212" class="m">bike_qty →</text>
+        <text x="740" y="212" class="t-s" fill="var(--accent)">트럭 20대를 얼마나 먹나 (부피)</text>
+        <text x="612" y="230" class="m">lat / lon →</text>
+        <text x="740" y="230" class="t-s" fill="var(--accent)">어느 권역, 몇 번째로 (경로)</text>
+
+        <text x="0" y="194" class="t-s">긴급도 한 칸에서 세 가지 정보가 갈라져</text>
+        <text x="0" y="212" class="t-s">라우트의 서로 다른 축으로 쓰인다. 점수는</text>
+        <text x="0" y="230" class="t-s">"몇 대"가 아니라 "누가 먼저"만 결정한다.</text>
+      </g>
+<line x1="26" y1="312" x2="1026" y2="312" stroke="var(--line)" stroke-width="1"/>
+<text x="26" y="332" class="capb">대여·반납 예측량 → 예측 재고 곡선 → action_type → 시급성 × 심각도 = urgency_score → 권역별 점수 내림차순 → 트럭 20대 적재 → depot 기준 최근접 방문</text>
+<text x="26" y="350" class="cap">순서.</text>
+</svg>

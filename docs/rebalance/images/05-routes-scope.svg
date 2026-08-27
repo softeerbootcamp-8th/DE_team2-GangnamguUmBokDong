@@ -1,0 +1,109 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 832 818" width="832" height="818">
+
+  <style>
+    svg{
+      --bg:#FCFCFB; --sf2:#EDF0EE; --ink:#131A18; --ink-2:#3A4744; --muted:#5C6A66;
+      --line:#D5DCDA; --line-2:#C2CBC8; --grid:#00000010;
+      --accent:#0A8B6E; --accent-soft:#0a8b6e1c;
+      --supply:#C1571A; --supply-soft:#c1571a18;
+      --retrieval:#3F51A8; --retrieval-soft:#3f51a818;
+      --surface:#FCFCFB; --surface-2:#EDF0EE;
+      --sans:"Apple SD Gothic Neo","Pretendard","Malgun Gothic","Noto Sans KR","Helvetica Neue",sans-serif;
+      --mono:"SF Mono","JetBrains Mono","D2Coding",ui-monospace,Menlo,monospace;
+    }
+    @media (prefers-color-scheme: dark){
+      svg{
+        --bg:#141B19; --sf2:#1F2825; --ink:#E4EBE8; --ink-2:#C3CFCB; --muted:#93A29D;
+        --line:#2A3532; --line-2:#3F4C48; --grid:#ffffff10;
+        --accent:#22A88F; --accent-soft:#22a88f24;
+        --supply:#D07C28; --supply-soft:#d07c2822;
+        --retrieval:#6E85DD; --retrieval-soft:#6e85dd22;
+        --surface:#141B19; --surface-2:#1F2825;
+      }
+    }
+    .page{fill:var(--bg)}
+    .bx{fill:var(--sf2); stroke:var(--line-2); stroke-width:1}
+    .bx-a{fill:var(--accent-soft); stroke:var(--accent); stroke-width:1.4}
+    .t{font-family:var(--sans); font-size:13px; font-weight:500; fill:var(--ink)}
+    .t-b{font-family:var(--sans); font-size:13.5px; font-weight:700; fill:var(--ink)}
+    .t-s{font-family:var(--sans); font-size:11.5px; fill:var(--muted)}
+    .m{font-family:var(--mono); font-size:10px; fill:var(--muted)}
+    .m-b{font-family:var(--mono); font-size:11px; font-weight:600; fill:var(--ink)}
+    .num{font-family:var(--mono); font-size:11.5px; font-weight:600; fill:var(--ink)}
+    .ln{stroke:var(--ink-2); stroke-width:1.4; fill:none}
+    .ln-a{stroke:var(--accent); stroke-width:1.6; fill:none}
+    .ln-d{stroke:var(--line-2); stroke-width:1; stroke-dasharray:3 3; fill:none}
+    .grid{stroke:var(--grid); stroke-width:1}
+    .axis{stroke:var(--line-2); stroke-width:1}
+    .h1{font-family:var(--sans); font-size:19px; font-weight:700; fill:var(--ink)}
+    .h2{font-family:var(--sans); font-size:13px; font-weight:600; fill:var(--accent)}
+    .step{font-family:var(--mono); font-size:12px; font-weight:600; fill:var(--accent); letter-spacing:.08em}
+    .cap{font-family:var(--sans); font-size:12.5px; fill:var(--muted)}
+    .capb{font-family:var(--sans); font-size:12.5px; font-weight:700; fill:var(--ink-2)}
+  </style>
+
+<rect class="page" x="0" y="0" width="832" height="818"/>
+<text x="26" y="30" class="step">05</text>
+<text x="64" y="31" class="h1">라우트 (1) — 무엇을, 어느 권역에서</text>
+<line x1="26" y1="46" x2="806" y2="46" stroke="var(--line)" stroke-width="1"/>
+<text x="26" y="78" class="h2">이미 나간 트럭이 커버하는 몫을 라우트 만들기 전에 뺀다</text>
+<g transform="translate(26,92)">
+        <rect x="0" y="36" width="200" height="52" rx="4" class="bx"/>
+        <text x="100" y="60" class="t" text-anchor="middle">bike_qty 12대</text>
+        <text x="100" y="78" class="m" text-anchor="middle">station_urgency 결과</text>
+
+        <text x="222" y="70" class="t-b" text-anchor="middle">−</text>
+
+        <rect x="244" y="36" width="220" height="52" rx="4" class="bx"/>
+        <text x="354" y="60" class="t" text-anchor="middle">dispatched 5대</text>
+        <text x="354" y="78" class="m" text-anchor="middle">운영자가 이미 실행 선택한 라우트</text>
+
+        <text x="486" y="70" class="t-b" text-anchor="middle">=</text>
+
+        <rect x="508" y="36" width="200" height="52" rx="4" class="bx-a"/>
+        <text x="608" y="60" class="t-b" text-anchor="middle">잔여 7대</text>
+        <text x="608" y="78" class="m" text-anchor="middle">이번 배치가 다룰 몫</text>
+
+        <line x1="0" y1="110" x2="760" y2="110" stroke="var(--line)" stroke-width="1"/>
+        <text x="0" y="132" class="m" fill="var(--supply)">✕ 라우트를 다 만든 뒤 스톱만 지우는 방식</text>
+        <text x="0" y="148" class="m">— 적재량과 방문 순서 정합성이 깨진다. 그래서 만들기 <tspan font-weight="600">전에</tspan> 뺀다. 이 조회가 routes.py가 RDS를 건드리는 유일한 지점이다.</text>
+      </g>
+<text x="26" y="288" class="h2">좌표상 가장 가까운 지역센터에 배정하고, 권역별로 독립 처리한다</text>
+<g transform="translate(26,302)">
+        <text x="0" y="16" class="m-b">11개 지역센터 (core.regions.DISPATCH_CENTERS) — 실제 좌표 배치</text>
+
+        <!-- assignment links -->
+        <line x1="585" y1="330" x2="620" y2="359" stroke="var(--accent)" stroke-width="1.4"/>
+        <line x1="662" y1="392" x2="620" y2="359" stroke="var(--accent)" stroke-width="1.4"/>
+        <line x1="300" y1="290" x2="264" y2="319" stroke="var(--accent)" stroke-width="1.4"/>
+        <line x1="440" y1="200" x2="412" y2="232" stroke="var(--accent)" stroke-width="1.4" stroke-dasharray="4 3"/>
+        <line x1="440" y1="200" x2="466" y2="239" stroke="var(--line-2)" stroke-width="1.2" stroke-dasharray="4 3"/>
+
+        <!-- example stations -->
+        <circle cx="585" cy="330" r="3.5" fill="var(--retrieval)"/>
+        <circle cx="662" cy="392" r="3.5" fill="var(--supply)"/>
+        <circle cx="300" cy="290" r="3.5" fill="var(--supply)"/>
+        <circle cx="440" cy="200" r="4.5" fill="none" stroke="var(--ink)" stroke-width="1.8"/>
+        <text x="40" y="66" class="m">경계 지대 예시 — 세종로 4.2km · 훈련원 5.6km</text>
+        <text x="40" y="84" class="m">→ 세종로에 배정. 실제 관할과 다를 수 있다</text><path d="M46,94 L46,152 L424,194" class="ln-d"/>
+
+        <!-- centers -->
+        <circle cx="251" cy="237" r="7" fill="var(--accent)" stroke="var(--surface)" stroke-width="2"/><text x="251" y="222" class="t-s" text-anchor="middle">상암</text>
+        <circle cx="577" cy="253" r="7" fill="var(--accent)" stroke="var(--surface)" stroke-width="2"/><text x="577" y="238" class="t-s" text-anchor="middle">중랑</text>
+        <circle cx="412" cy="232" r="7" fill="var(--accent)" stroke="var(--surface)" stroke-width="2"/><text x="398" y="236" class="t-s" text-anchor="end">세종로</text>
+        <circle cx="552" cy="40" r="7" fill="var(--accent)" stroke="var(--surface)" stroke-width="2"/><text x="552" y="25" class="t-s" text-anchor="middle">도봉</text>
+        <circle cx="466" cy="239" r="7" fill="var(--accent)" stroke="var(--surface)" stroke-width="2"/><text x="480" y="256" class="t-s">훈련원</text>
+        <circle cx="428" cy="351" r="7" fill="var(--accent)" stroke="var(--surface)" stroke-width="2"/><text x="428" y="336" class="t-s" text-anchor="middle">이수</text>
+        <circle cx="50" cy="221" r="7" fill="var(--accent)" stroke="var(--surface)" stroke-width="2"/><text x="50" y="206" class="t-s" text-anchor="middle">개화</text>
+        <circle cx="132" cy="370" r="7" fill="var(--accent)" stroke="var(--surface)" stroke-width="2"/><text x="132" y="355" class="t-s" text-anchor="middle">천왕</text>
+        <circle cx="264" cy="319" r="7" fill="var(--accent)" stroke="var(--surface)" stroke-width="2"/><text x="264" y="304" class="t-s" text-anchor="middle">영남</text>
+        <circle cx="710" cy="286" r="7" fill="var(--accent)" stroke="var(--surface)" stroke-width="2"/><text x="710" y="271" class="t-s" text-anchor="middle">천호</text>
+        <circle cx="620" cy="359" r="7" fill="var(--accent)" stroke="var(--surface)" stroke-width="2"/><text x="620" y="344" class="t-s" text-anchor="middle">학여울</text>
+
+        <text x="0" y="410" class="m">● 지역센터(depot) &nbsp;&nbsp; ● 대여소 &nbsp;&nbsp; 서→동 = 경도, 북→남 = 위도</text>
+        <text x="0" y="428" class="m">권역별로 완전히 독립적으로 라우트를 만든다 — 권역을 넘는 이동은 없다.</text>
+      </g>
+<line x1="26" y1="748" x2="806" y2="748" stroke="var(--line)" stroke-width="1"/>
+<text x="26" y="768" class="capb">action_type이 여기서 작업으로 바뀐다 — retrieval_needed → pickup, supply_needed → dropoff. 권역 배정은 근사다:</text>
+<text x="26" y="786" class="cap">지역센터의 실제 관할 경계는 공개 자료로 확인되지 않는다.</text>
+</svg>
