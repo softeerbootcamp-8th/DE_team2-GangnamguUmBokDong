@@ -1161,3 +1161,26 @@ editable 의존성이 새 경로(`../../libs/ml_core`)로 정확히 잡히는지
 컨벤션 — 과거 기록은 그때 사실을 남기고, 최신 상태는 README/LEGACY_AUDIT.md가
 반영). 자세한 파일별 변경 목록은 당시 `LEGACY_AUDIT.md`의
 "환경 관리 — uv + `libs/ml_core/`" 절 참고.
+
+---
+
+## 31. Feature Engine Spark DAG 병목 개선 및 EMR 분산 실행 최적화
+
+**배경**: EMR(m4.large 8대, 28 cores) 환경에서 `monthly_retrain` 실행 시 Spark Multi-horizon 생성이 비정상적으로 길어지고 YARN DistributedShell 기본 타임아웃(10분)으로 학습 스텝이 강제 Kill되는 현상이 발생했다.
+
+**원인 및 결정**:
+1. **증분 Action 중복 셔플**: `features_increment`에 캐싱 없이 4회 연속 Action(count, write, agg)이 호출되어 상류 Rolling Self-Join 셔플이 4번 반복 실행됨 -> `.cache()` 및 `.unpersist()` 적용.
+2. **2단계 Catalyst 누적 계획 병목**: `build_multi_horizon_features.py`에서 순차 Union(깊이 11)을 돌려 Catalyst 재분석 비용이 선형으로 폭증함 -> 균형 이진트리(`_balanced_union_by_name`, 깊이 4)로 개편.
+3. **대여/반납 중복 스캔 제거**: `--models rental|return` 옵션을 추가하여 요청된 단일 모델의 Multi-horizon Mart만 단독 생성하도록 분리.
+4. **Parquet 파티션 내부 정렬**: `sortWithinPartitions("date", "anchor_ts", "station_no", "horizon")`를 적용해 Parquet 압축률과 다운스트림 `lazy_train_dataset`의 학습 로딩 속도를 최적화.
+5. **YARN 타임아웃 확장**: `distributedshell.Client`의 기본 10분 타임아웃을 `-timeout 345600000`(4일)으로 확장.
+6. **강제 재생성 플래그 추가**: 워터마크 기반 신선도 스킵을 우회할 수 있는 `--force` 및 Airflow `force_refresh_feature_mart` Param 추가.
+
+**실측 성과 (EMR 1년치 275일치 전체 빌드)**:
+- 2단계 Multi-horizon 실행 시간: 7.4분 -> 2.5분 (66.2% 단축)
+- 총 CPU 연산 시간(Task Time): 3.0시간 -> 41분 (77.2% 절감)
+- JVM GC 시간: 13분 -> 1.3분 (90% 격감)
+- S3 읽기량: 27.4 GiB -> 4.9 GiB (82.1% 감소)
+- 네트워크 셔플 전송량: 13.0 GiB -> 6.6 GiB (49.2% 감소)
+- 총 태스크 수: 4,736개 -> 1,557개 (67.1% 감소)
+
