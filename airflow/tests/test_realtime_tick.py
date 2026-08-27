@@ -31,6 +31,7 @@ def test_schedule_is_five_minute_grid_without_catchup() -> None:
     assert dag.catchup is False
     assert dag.max_active_runs == 1
     assert dag.dagrun_timeout == timedelta(minutes=15)
+    assert dag.on_failure_callback is realtime_tick_dag._on_realtime_tick_failure
 
 
 def _core_task_ids() -> set[str]:
@@ -61,6 +62,8 @@ def test_all_realtime_roots_wait_for_current_tick_gate() -> None:
     gate = dag.get_task("allow_current_tick")
     assert isinstance(gate, ShortCircuitOperator)
     assert gate.retries == 0
+    assert realtime_tick_dag.on_success_callback in gate.on_success_callback
+    assert realtime_tick_dag.on_failure_callback in gate.on_failure_callback
     assert gate.ignore_downstream_trigger_rules is True
     assert gate.upstream_task_ids == set()
     assert gate.downstream_task_ids == {
@@ -72,12 +75,12 @@ def test_all_realtime_roots_wait_for_current_tick_gate() -> None:
 
 
 def test_current_scheduled_tick_is_allowed(monkeypatch) -> None:
-    """1분 이내 scheduler 지연은 정상 실행으로 허용한다."""
+    """worker가 늦게 떠도 DAG Run이 정시에 시작됐으면 정상 실행한다."""
     logical_date = datetime(2026, 8, 27, 0, 0, tzinfo=timezone.utc)
     monkeypatch.setattr(
-        realtime_tick_dag.pendulum,
-        "now",
-        lambda _tz: datetime(2026, 8, 27, 0, 0, 59, tzinfo=timezone.utc),
+        realtime_tick_dag,
+        "_now",
+        lambda: datetime(2026, 8, 27, 0, 2, tzinfo=timezone.utc),
     )
     messages = []
     monkeypatch.setattr(realtime_tick_dag, "send_message", messages.append)
@@ -85,7 +88,10 @@ def test_current_scheduled_tick_is_allowed(monkeypatch) -> None:
     assert realtime_tick_dag._allow_current_tick(
         dag_run=SimpleNamespace(
             run_id="scheduled__2026-08-27T00:00:00+00:00",
+            run_type="scheduled",
+            clear_number=0,
             logical_date=logical_date,
+            start_date=datetime(2026, 8, 27, 0, 0, 30, tzinfo=timezone.utc),
         )
     ) is True
     assert messages == []
@@ -95,9 +101,9 @@ def test_stale_scheduled_tick_is_skipped_and_alerted(monkeypatch) -> None:
     """1분 넘게 밀린 scheduled run은 Slack 알림 후 스킵한다."""
     logical_date = datetime(2026, 8, 27, 0, 5, tzinfo=timezone.utc)
     monkeypatch.setattr(
-        realtime_tick_dag.pendulum,
-        "now",
-        lambda _tz: datetime(2026, 8, 27, 0, 7, tzinfo=timezone.utc),
+        realtime_tick_dag,
+        "_now",
+        lambda: datetime(2026, 8, 27, 0, 8, tzinfo=timezone.utc),
     )
     messages = []
     monkeypatch.setattr(realtime_tick_dag, "send_message", messages.append)
@@ -106,26 +112,46 @@ def test_stale_scheduled_tick_is_skipped_and_alerted(monkeypatch) -> None:
     assert realtime_tick_dag._allow_current_tick(
         dag_run=SimpleNamespace(
             run_id="scheduled__2026-08-27T00:05:00+00:00",
+            run_type="scheduled",
+            clear_number=0,
             logical_date=logical_date,
+            start_date=datetime(2026, 8, 27, 0, 7, tzinfo=timezone.utc),
         )
     ) is False
     assert len(messages) == 1
     assert "120초" in messages[0]
     assert "scheduled__2026-08-27T00:05:00+00:00" in messages[0]
+    assert "@de2조" not in messages[0]
 
 
 def test_manual_tick_is_always_allowed(monkeypatch) -> None:
     """의도적으로 실행한 오래된 logical date는 스킵하지 않는다."""
     monkeypatch.setattr(
-        realtime_tick_dag.pendulum,
-        "now",
-        lambda _tz: datetime(2026, 8, 27, 1, 0, tzinfo=timezone.utc),
+        realtime_tick_dag,
+        "_now",
+        lambda: datetime(2026, 8, 27, 1, 0, tzinfo=timezone.utc),
     )
 
     assert realtime_tick_dag._allow_current_tick(
         dag_run=SimpleNamespace(
             run_id="manual__2026-08-27T00:00:00+00:00",
+            run_type="manual",
+            clear_number=0,
             logical_date=datetime(2026, 8, 27, 0, 0, tzinfo=timezone.utc),
+            start_date=datetime(2026, 8, 27, 1, 0, tzinfo=timezone.utc),
+        )
+    ) is True
+
+
+def test_cleared_scheduled_tick_is_always_allowed() -> None:
+    """UI나 CLI에서 Clear한 과거 scheduled run은 복구 실행한다."""
+    assert realtime_tick_dag._allow_current_tick(
+        dag_run=SimpleNamespace(
+            run_id="scheduled__2026-08-27T00:05:00+00:00",
+            run_type="scheduled",
+            clear_number=1,
+            logical_date=datetime(2026, 8, 27, 0, 5, tzinfo=timezone.utc),
+            start_date=datetime(2026, 8, 27, 1, 0, tzinfo=timezone.utc),
         )
     ) is True
 
@@ -134,9 +160,9 @@ def test_stale_tick_is_still_skipped_when_slack_fails(monkeypatch, caplog) -> No
     """Slack 장애가 stale run 정리를 막지 않는다."""
     logical_date = datetime(2026, 8, 27, 0, 5, tzinfo=timezone.utc)
     monkeypatch.setattr(
-        realtime_tick_dag.pendulum,
-        "now",
-        lambda _tz: datetime(2026, 8, 27, 0, 7, tzinfo=timezone.utc),
+        realtime_tick_dag,
+        "_now",
+        lambda: datetime(2026, 8, 27, 0, 8, tzinfo=timezone.utc),
     )
 
     def fail_to_send(_message: str) -> None:
@@ -147,10 +173,33 @@ def test_stale_tick_is_still_skipped_when_slack_fails(monkeypatch, caplog) -> No
     assert realtime_tick_dag._allow_current_tick(
         dag_run=SimpleNamespace(
             run_id="scheduled__2026-08-27T00:05:00+00:00",
+            run_type="scheduled",
+            clear_number=0,
             logical_date=logical_date,
+            start_date=datetime(2026, 8, 27, 0, 7, tzinfo=timezone.utc),
         )
     ) is False
     assert "Slack 알림 전송에 실패" in caplog.text
+
+
+def test_dag_failure_alert_mentions_team(monkeypatch) -> None:
+    """DAG Run timeout을 포함한 실패는 팀 멘션과 함께 알린다."""
+    messages = []
+    monkeypatch.setattr(realtime_tick_dag, "send_message", messages.append)
+    monkeypatch.setattr(realtime_tick_dag, "de2_group_mention", lambda: "@de2조")
+
+    realtime_tick_dag._on_realtime_tick_failure(
+        {
+            "dag_run": SimpleNamespace(
+                run_id="scheduled__2026-08-27T00:05:00+00:00",
+                logical_date=datetime(2026, 8, 27, 0, 5, tzinfo=timezone.utc),
+            )
+        }
+    )
+
+    assert len(messages) == 1
+    assert "@de2조" in messages[0]
+    assert "0:15:00" in messages[0]
 
 
 def test_dag_has_exactly_the_expected_tasks() -> None:
