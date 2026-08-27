@@ -13,6 +13,19 @@
 | `half_hourly` | 초단기예보 | 매시 30분 | 14:40 → 14:30 |
 | `vilage_fcst` | 단기예보 | 02, 05, 08...시 정각 | 05:05 → 02:00 |
 
+아래 둘은 fetch(API 파라미터 계산)에는 절대 쓰지 않는, `main.py`의 freshness
+판단(`--check-due-after-seconds`) 전용 그리드다(`adapter_params.freshness_rule`).
+`hourly`/`half_hourly`는 API가 허용하는 시각(시간당 1슬롯)일 뿐, 초단기실황/예보가
+실제로 갱신되는 주기(10분/30분)와는 다르다 — freshness 판단에 그대로 쓰면 시간당
+1번만 due가 되어 원래 주기보다 훨씬 드물게 수집한다(실제 운영에서 확인,
+2026-08-26). 발표 지연 보정이 필요 없는 순수 폴링 그리드라 hourly/half_hourly보다
+로직이 단순하다(내림만 한다):
+
+| time_rule | 소스 | 규칙 | 예시 |
+| --- | --- | --- | --- |
+| `ten_minutely` | 초단기실황(freshness) | 10분 단위 내림 | 14:37 → 14:30 |
+| `thirty_minutely` | 초단기예보(freshness) | 30분 단위 내림 | 14:37 → 14:30 |
+
 격자 하나의 행 수가 `numOfRows`(1000)를 넘으면(단기예보가 대표적: 3일치×14개
 카테고리=1052건) 응답 본문의 `totalCount`를 읽어 `pageNo`를 늘려가며 남은 페이지를
 전부 받는다. 여러 페이지를 받았어도 바깥에는 격자당 하나의 `FetchResult`만 내보낸다
@@ -124,6 +137,21 @@ def adjust_base_time(dt: datetime, rule: str | None) -> datetime:
         k = (eval_dt.hour - 2) // 3
         base_hour = 2 + 3 * k
         return eval_dt.replace(hour=base_hour, minute=0, second=0, microsecond=0)
+
+    if rule == "ten_minutely":
+        # API 발표 그리드가 아니라 순수 폴링 그리드다 — `main.py`의 freshness
+        # 판단 전용(`adapter_params.freshness_rule`)이며 fetch 경로(base_time
+        # 파라미터 계산)에는 절대 쓰지 않는다. 발표 지연 보정이 필요 없으므로
+        # (우리가 그 주기로 폴링하겠다고 정한 값일 뿐, 기상청이 그 분에 맞춰
+        # 발표한다는 보장이 아니다) 그냥 10분 단위로 내림한다.
+        return dt.replace(minute=(dt.minute // 10) * 10, second=0, microsecond=0)
+
+    if rule == "thirty_minutely":
+        # ten_minutely와 같은 이유로 존재하는 순수 폴링 그리드(freshness 전용).
+        # `half_hourly`(API의 매시 30분 발표 그리드, 시간당 1슬롯)와 이름이
+        # 비슷해 헷갈리기 쉬운데, 이건 시간당 2슬롯(:00, :30)이다 — 절대
+        # 섞어 쓰지 않는다.
+        return dt.replace(minute=(dt.minute // 30) * 30, second=0, microsecond=0)
 
     raise ValueError(f"알 수 없는 time_rule: {rule}")
 
