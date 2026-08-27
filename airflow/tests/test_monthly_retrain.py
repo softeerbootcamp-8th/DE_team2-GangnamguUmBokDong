@@ -14,50 +14,38 @@ _DAG = monthly_dag.dag
 
 
 def test_monthly_retrain_is_a_single_combined_dag() -> None:
-    """대여/반납이 각자 최대 8노드 EMR 클러스터를 띄우므로, 동시에 두 개가 뜨는
-    걸 막기 위해 하나의 DAG 안에 두 모델 체인이 모두 있어야 한다."""
+    """단일 EMR 클러스터 위에서 대여/반납 두 모델 체인이 순차적으로 실행되어야 한다."""
     assert _DAG.dag_id == "monthly_retrain"
     expected_tasks = {
         f"{name}_{model}"
         for model in ("rental", "return")
         for name in (
-            "create_cluster",
             "refresh_feature_mart",
             "evaluate",
             "check_retrain_branch",
             "orchestrate_retrain_loop",
             "skip_monthly_retrain",
-            "terminate_cluster",
         )
-    } | {"start_mlflow", "stop_mlflow"}
+    } | {"create_cluster", "terminate_cluster", "start_mlflow", "stop_mlflow"}
     assert set(_DAG.task_ids) == expected_tasks
 
 
 def test_monthly_retrain_runs_rental_fully_before_return_starts() -> None:
-    """대여 사이클이 클러스터 종료까지 완전히 끝난 뒤에만 반납 사이클이 시작돼야
-    한다 — 두 EMR 클러스터가 동시에 뜨지 않게 하는 핵심 보장."""
+    """대여 사이클이 완전히 끝난 뒤에만 반납 사이클이 시작돼야 한다."""
     assert monthly_dag.MODEL_EXECUTION_ORDER == ("rental", "return")
-    rental_terminate = _DAG.get_task("terminate_cluster_rental")
-    return_create = _DAG.get_task("create_cluster_return")
-    assert return_create.upstream_task_ids == {"terminate_cluster_rental"}
-    assert "create_cluster_return" in rental_terminate.downstream_task_ids
-    # 반납 쪽이 대여 쪽으로 역방향 의존을 만들지는 않는지도 확인(start_mlflow는
-    # DAG 전체를 감싸는 태스크라 예외로 허용).
-    assert _DAG.get_task("create_cluster_rental").upstream_task_ids == {"start_mlflow"}
+    return_start = _DAG.get_task("refresh_feature_mart_return")
+    rental_ends = {"orchestrate_retrain_loop_rental", "skip_monthly_retrain_rental"}
+    assert return_start.upstream_task_ids == rental_ends
 
 
 def test_start_stop_mlflow_wrap_the_whole_dag() -> None:
-    """mlflow는 DAG 실행 구간에만 켜져 있어야 한다 — 대여 체인 시작 전에 켜고,
-    반납 체인(마지막 모델)의 클러스터 종료 뒤에 끈다. stop_mlflow는
-    terminate_cluster와 같은 이유로 teardown이어야 운영자가 DAG Run을 수동으로
+    """mlflow는 DAG 실행 구간에만 켜져 있어야 한다 — 클러스터 생성 전에 켜고,
+    클러스터 종료 뒤에 끈다. stop_mlflow는 teardown이어야 운영자가 DAG Run을 수동으로
     실패 처리해도 실행된다."""
     start_mlflow = _DAG.get_task("start_mlflow")
     stop_mlflow = _DAG.get_task("stop_mlflow")
-    # setup/teardown 쌍(as_teardown(setups=...))이 start_mlflow -> stop_mlflow
-    # 직접 엣지를 암묵적으로 추가하므로, create_cluster_rental과 stop_mlflow
-    # 둘 다 downstream에 있어야 한다.
-    assert start_mlflow.downstream_task_ids == {"create_cluster_rental", "stop_mlflow"}
-    assert stop_mlflow.upstream_task_ids == {"terminate_cluster_return", "start_mlflow"}
+    assert start_mlflow.downstream_task_ids == {"create_cluster", "stop_mlflow"}
+    assert stop_mlflow.upstream_task_ids == {"terminate_cluster", "start_mlflow"}
     assert stop_mlflow.is_teardown is True
 
 
@@ -76,13 +64,12 @@ def test_monthly_retrain_terminate_cluster_is_a_real_teardown() -> None:
     끝내버린다(Airflow 3.3.1 `_set_dag_run_terminal_state()` 실측 확인). 오직
     `is_teardown=True`인 태스크만 이 강제 skip에서 예외로 남아 실제로 실행될
     기회를 얻으므로, setup/teardown API로 표시돼 있는지까지 확인해야 한다."""
-    for model_name in ("rental", "return"):
-        terminate_cluster = _DAG.get_task(f"terminate_cluster_{model_name}")
-        create_cluster = _DAG.get_task(f"create_cluster_{model_name}")
-        assert terminate_cluster.is_teardown is True
-        assert terminate_cluster.trigger_rule == TriggerRule.ALL_DONE_SETUP_SUCCESS
-        assert create_cluster.is_setup is True
-        assert f"create_cluster_{model_name}" in terminate_cluster.upstream_task_ids
+    terminate_cluster = _DAG.get_task("terminate_cluster")
+    create_cluster = _DAG.get_task("create_cluster")
+    assert terminate_cluster.is_teardown is True
+    assert terminate_cluster.trigger_rule == TriggerRule.ALL_DONE_SETUP_SUCCESS
+    assert create_cluster.is_setup is True
+    assert "create_cluster" in terminate_cluster.upstream_task_ids
 
 
 def test_monthly_retrain_evaluate_is_not_a_setup() -> None:
@@ -98,13 +85,15 @@ def test_monthly_retrain_evaluate_is_not_a_setup() -> None:
 
 
 def test_refresh_feature_mart_runs_between_create_cluster_and_evaluate() -> None:
-    """evaluate가 최근 구간을 읽기 전에 feature mart를 먼저 최신화해야 한다
-    (2026-08 발견 — evaluate는 스스로 feature mart를 최신화하지 않는데, 그걸
-    만드는 유일한 경로가 원래 재학습 필요 판정 *뒤*에만 있어 순환 참조였다)."""
-    for model_name in ("rental", "return"):
-        refresh = _DAG.get_task(f"refresh_feature_mart_{model_name}")
-        assert refresh.upstream_task_ids == {f"create_cluster_{model_name}"}
-        assert refresh.downstream_task_ids == {f"evaluate_{model_name}"}
+    """evaluate가 최근 구간을 읽기 전에 feature mart를 먼저 최신화해야 한다."""
+    refresh_rental = _DAG.get_task("refresh_feature_mart_rental")
+    assert refresh_rental.upstream_task_ids == {"create_cluster"}
+    assert refresh_rental.downstream_task_ids == {"evaluate_rental"}
+
+    refresh_return = _DAG.get_task("refresh_feature_mart_return")
+    assert refresh_return.upstream_task_ids == {"orchestrate_retrain_loop_rental", "skip_monthly_retrain_rental"}
+    assert refresh_return.downstream_task_ids == {"evaluate_return"}
+
 
 
 def test_check_retrain_branch_decisions() -> None:
