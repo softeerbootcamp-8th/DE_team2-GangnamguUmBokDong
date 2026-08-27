@@ -360,18 +360,25 @@ tunnel-mlflow:
 	ssh -i $(SSH_KEY) -N -L 5000:localhost:5000 ec2-user@$$($(TF) output -raw app_public_ip)
 
 # config/prod.env(terraform 산출물)에는 API 키를 안 넣는다 — 이 타겟이 그 나머지를
-# 채운다. 값은 SEOUL_OPENAPI_KEY/KMA_APIHUB_KEY 환경변수로 주거나, 생략하면 로컬
-# .env(레포 루트)에서 읽는다. 평문 파일은 업로드 후 즉시 지운다.
+# 채운다. 값은 환경변수로 주거나, 생략하면 로컬 .env(레포 루트)에서 읽는다.
+# SLACK_WEBHOOK_URL/SLACK_DE2_GROUP_ID는 선택값이라(airflow/notifications/slack.py
+# 참고, 없으면 알림만 건너뜀) 비어 있어도 막지 않는다. 평문 파일은 업로드 후 즉시 지운다.
 deploy-secrets:
 	@S3_BUCKET=$${S3_BUCKET:?S3_BUCKET을 알 수 없습니다. S3_BUCKET=<버킷> make deploy-secrets 로 실행하세요.}; \
 	SEOUL_OPENAPI_KEY=$${SEOUL_OPENAPI_KEY:-$$(grep -m1 '^SEOUL_OPENAPI_KEY=' .env 2>/dev/null | cut -d= -f2-)}; \
 	KMA_APIHUB_KEY=$${KMA_APIHUB_KEY:-$$(grep -m1 '^KMA_APIHUB_KEY=' .env 2>/dev/null | cut -d= -f2-)}; \
+	SLACK_WEBHOOK_URL=$${SLACK_WEBHOOK_URL:-$$(grep -m1 '^SLACK_WEBHOOK_URL=' .env 2>/dev/null | cut -d= -f2-)}; \
+	SLACK_DE2_GROUP_ID=$${SLACK_DE2_GROUP_ID:-$$(grep -m1 '^SLACK_DE2_GROUP_ID=' .env 2>/dev/null | cut -d= -f2-)}; \
 	if [ -z "$$SEOUL_OPENAPI_KEY" ] || [ -z "$$KMA_APIHUB_KEY" ]; then \
 		echo "SEOUL_OPENAPI_KEY/KMA_APIHUB_KEY를 찾을 수 없습니다. 환경변수로 주거나 .env에 채워두세요." >&2; exit 1; \
 	fi; \
 	tmp=$$(mktemp); \
 	trap 'rm -f "$$tmp"' EXIT; \
-	printf 'SEOUL_OPENAPI_KEY=%s\nKMA_APIHUB_KEY=%s\n' "$$SEOUL_OPENAPI_KEY" "$$KMA_APIHUB_KEY" > "$$tmp"; \
+	{ \
+		printf 'SEOUL_OPENAPI_KEY=%s\nKMA_APIHUB_KEY=%s\n' "$$SEOUL_OPENAPI_KEY" "$$KMA_APIHUB_KEY"; \
+		[ -n "$$SLACK_WEBHOOK_URL" ] && printf 'SLACK_WEBHOOK_URL=%s\n' "$$SLACK_WEBHOOK_URL"; \
+		[ -n "$$SLACK_DE2_GROUP_ID" ] && printf 'SLACK_DE2_GROUP_ID=%s\n' "$$SLACK_DE2_GROUP_ID"; \
+	} > "$$tmp"; \
 	aws s3 cp "$$tmp" "s3://$$S3_BUCKET/config/secrets.env"
 
 # 접속 IP가 바뀌었을 때. 현재 공인 IP로 admin_cidrs를 다시 쓰고 SG 규칙만 갱신한다(10초 내외).

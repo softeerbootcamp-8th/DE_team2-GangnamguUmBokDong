@@ -101,6 +101,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--backfill", action="store_true", help="완결된 window의 누락 조각만 채운다")
     parser.add_argument("--list-backfill-targets", action="store_true", help="백필 대상을 JSON으로 출력하고 종료")
     parser.add_argument(
+        "--report-window-stats",
+        action="store_true",
+        help="해당 KST 날짜(및 선택적으로 시)의 수집 통계를 JSON으로 출력하고 종료",
+    )
+    parser.add_argument("--window-day", help="--report-window-stats에 사용할 KST 날짜(YYYY-MM-DD)")
+    parser.add_argument(
+        "--window-hour", help="--report-window-stats에 사용할 KST 시(HH). 생략하면 하루 전체를 본다"
+    )
+    parser.add_argument(
         "--poi-master-mode",
         choices=("static", "s3"),
         default="static",
@@ -133,12 +142,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if (
         not args.list_backfill_targets
         and args.check_due_after_seconds is None
+        and not args.report_window_stats
         and not args.window_start
     ):
         parser.error(
             "the following arguments are required: --window-start "
-            "(unless --list-backfill-targets/--check-due-after-seconds is used)"
+            "(unless --list-backfill-targets/--check-due-after-seconds/"
+            "--report-window-stats is used)"
         )
+
+    if args.report_window_stats and not args.window_day:
+        parser.error("--report-window-stats에는 --window-day가 필요하다")
 
     if args.force and args.backfill:
         parser.error("--force와 --backfill은 함께 줄 수 없다")
@@ -263,6 +277,21 @@ def main(argv: list[str] | None = None) -> int:
         config = config_loader.load(args.source)
         targets = pipeline.get_backfill_targets(config)
         print(json.dumps(targets))
+        return 0
+
+    if args.report_window_stats:
+        import json
+        from datetime import date as date_cls
+
+        day = date_cls.fromisoformat(args.window_day)
+        manifests = manifest_module.load_window_manifests(args.source, day, args.window_hour)
+        summary = manifest_module.summarize_window(manifests)
+        summary.update({
+            "source_id": args.source,
+            "day": args.window_day,
+            "hour": args.window_hour,
+        })
+        print(json.dumps(summary))
         return 0
 
     if args.check_due_after_seconds is not None:

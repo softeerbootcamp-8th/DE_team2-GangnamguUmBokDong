@@ -1,6 +1,6 @@
 """manifest.py의 상태 어휘와 Manifest·RetryMarker 모델을 검증한다."""
 
-from datetime import datetime
+from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
 import manifest as manifest_module
@@ -203,6 +203,82 @@ class TestLoadSave:
         assert loaded.revision == 2
         assert loaded.artifacts.bronze is not None
         assert loaded.artifacts.bronze.revision == 3
+
+
+class TestLoadWindowManifests:
+    def test_returns_all_windows_within_the_day_parsed_as_models(self):
+        first = _minimal_manifest(window_start=datetime(2026, 8, 12, 0, 5, tzinfo=KST))
+        second = _minimal_manifest(window_start=datetime(2026, 8, 12, 23, 55, tzinfo=KST))
+        save(first)
+        save(second)
+
+        result = manifest_module.load_window_manifests("test_source", date(2026, 8, 12))
+
+        assert {m.window_start for m in result} == {
+            first.window_start,
+            second.window_start,
+        }
+        assert all(isinstance(m, Manifest) for m in result)
+
+    def test_hour_filter_narrows_to_that_hour(self):
+        in_hour = _minimal_manifest(window_start=datetime(2026, 8, 12, 7, 0, tzinfo=KST))
+        other_hour = _minimal_manifest(window_start=datetime(2026, 8, 12, 8, 0, tzinfo=KST))
+        save(in_hour)
+        save(other_hour)
+
+        result = manifest_module.load_window_manifests(
+            "test_source", date(2026, 8, 12), "07"
+        )
+
+        assert [m.window_start for m in result] == [in_hour.window_start]
+
+    def test_no_manifests_returns_empty_list(self):
+        assert manifest_module.load_window_manifests("never_saved", date(2026, 8, 12)) == []
+
+
+class TestSummarizeWindow:
+    def test_empty_window_returns_zeroed_summary(self):
+        summary = manifest_module.summarize_window([])
+
+        assert summary == {
+            "run_count": 0,
+            "status_counts": {},
+            "missing_count": 0,
+            "outlier_count": 0,
+            "type_error_count": 0,
+            "dropped_count": 0,
+            "kept_count": 0,
+            "max_drop_ratio": 0.0,
+        }
+
+    def test_aggregates_status_counts_and_column_issues_across_runs(self):
+        succeeded = _minimal_manifest(
+            status=RunStatus.SUCCEEDED,
+            counts=Counts(fetched=10, kept=9, dropped=1),
+            drop_ratio=0.1,
+            column_issues={
+                "stationName": ColumnIssueCount(missing=2, outlier=0, type_error=0),
+            },
+        )
+        failed = _minimal_manifest(
+            status=RunStatus.FAILED,
+            counts=Counts(fetched=10, kept=0, dropped=10),
+            drop_ratio=1.0,
+            column_issues={
+                "rackTotCnt": ColumnIssueCount(missing=0, outlier=3, type_error=1),
+            },
+        )
+
+        summary = manifest_module.summarize_window([succeeded, failed])
+
+        assert summary["run_count"] == 2
+        assert summary["status_counts"] == {"succeeded": 1, "failed": 1}
+        assert summary["missing_count"] == 2
+        assert summary["outlier_count"] == 3
+        assert summary["type_error_count"] == 1
+        assert summary["dropped_count"] == 11
+        assert summary["kept_count"] == 9
+        assert summary["max_drop_ratio"] == 1.0
 
 
 class TestRetryMarker:

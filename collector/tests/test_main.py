@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
@@ -59,6 +59,23 @@ class TestParseArgs:
 
         assert args.check_due_after_seconds == 600
         assert args.window_start is None
+
+    def test_report_window_stats_does_not_require_window_start(self):
+        args = main.parse_args(
+            [
+                "--source", "bike_station_realtime",
+                "--report-window-stats", "--window-day", "2026-08-12",
+            ]
+        )
+
+        assert args.report_window_stats is True
+        assert args.window_day == "2026-08-12"
+        assert args.window_hour is None
+        assert args.window_start is None
+
+    def test_report_window_stats_without_window_day_exits(self):
+        with pytest.raises(SystemExit):
+            main.parse_args(["--source", "bike_station_realtime", "--report-window-stats"])
 
     def test_poi_master_defaults_to_static_without_refs(self):
         args = main.parse_args(
@@ -438,6 +455,59 @@ class TestCheckDueAfterSeconds:
 
         assert code == 0
         assert json.loads(capsys.readouterr().out)["due"] is True
+
+
+class TestReportWindowStats:
+    def test_prints_summary_json_and_returns_zero(self, monkeypatch, capsys):
+        stub_manifest = SimpleNamespace(
+            status=RunStatus.SUCCEEDED,
+            column_issues={},
+            counts=SimpleNamespace(dropped=0, kept=5),
+            drop_ratio=0.0,
+        )
+        monkeypatch.setattr(
+            main.manifest_module, "load_window_manifests",
+            lambda source_id, day, hour: [stub_manifest],
+        )
+
+        code = main.main(
+            [
+                "--source", "bike_station_realtime",
+                "--report-window-stats", "--window-day", "2026-08-12",
+            ]
+        )
+
+        assert code == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["source_id"] == "bike_station_realtime"
+        assert payload["day"] == "2026-08-12"
+        assert payload["hour"] is None
+        assert payload["run_count"] == 1
+        assert payload["status_counts"] == {"succeeded": 1}
+
+    def test_passes_window_day_and_hour_through(self, monkeypatch):
+        captured = {}
+
+        def fake_load(source_id, day, hour):
+            captured["source_id"] = source_id
+            captured["day"] = day
+            captured["hour"] = hour
+            return []
+
+        monkeypatch.setattr(main.manifest_module, "load_window_manifests", fake_load)
+
+        main.main(
+            [
+                "--source", "weather_ultra_short_live",
+                "--report-window-stats",
+                "--window-day", "2026-08-12",
+                "--window-hour", "07",
+            ]
+        )
+
+        assert captured["source_id"] == "weather_ultra_short_live"
+        assert captured["day"] == date(2026, 8, 12)
+        assert captured["hour"] == "07"
 
 
 class TestMain:

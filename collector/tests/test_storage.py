@@ -19,6 +19,7 @@ from storage import (
     latest_source_snapshot_logical_dttm,
     list_retry_markers,
     list_source_snapshot_windows,
+    list_window_manifest_payloads,
     next_bronze_revision,
     read_bronze,
     read_immutable_silver_artifact,
@@ -240,6 +241,42 @@ class TestManifestRawIO:
 
     def test_read_missing_returns_none(self):
         assert read_manifest("never_written", WINDOW_START) is None
+
+
+class TestListWindowManifestPayloads:
+    def test_lists_all_windows_within_the_day(self):
+        write_manifest(
+            "test_source", datetime(2026, 8, 12, 0, 5, tzinfo=KST), {"hh": "00"}
+        )
+        write_manifest(
+            "test_source", datetime(2026, 8, 12, 23, 55, tzinfo=KST), {"hh": "23"}
+        )
+        # 다른 날짜는 포함되지 않는다.
+        write_manifest(
+            "test_source", datetime(2026, 8, 13, 0, 5, tzinfo=KST), {"hh": "00-next-day"}
+        )
+
+        result = list_window_manifest_payloads("test_source", date(2026, 8, 12))
+
+        assert sorted(d["hh"] for d in result) == ["00", "23"]
+
+    def test_hour_filter_narrows_to_that_hour_only(self):
+        write_manifest(
+            "test_source", datetime(2026, 8, 12, 7, 0, tzinfo=KST), {"hh": "07"}
+        )
+        write_manifest(
+            "test_source", datetime(2026, 8, 12, 7, 55, tzinfo=KST), {"hh": "07-late"}
+        )
+        write_manifest(
+            "test_source", datetime(2026, 8, 12, 8, 0, tzinfo=KST), {"hh": "08"}
+        )
+
+        result = list_window_manifest_payloads("test_source", date(2026, 8, 12), "07")
+
+        assert sorted(d["hh"] for d in result) == ["07", "07-late"]
+
+    def test_no_manifests_returns_empty_list(self):
+        assert list_window_manifest_payloads("never_written", date(2026, 8, 12)) == []
 
 
 class TestSourceSnapshotWindowListing:

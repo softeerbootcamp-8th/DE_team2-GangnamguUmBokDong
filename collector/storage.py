@@ -514,6 +514,28 @@ def read_manifest(source_id: str, window_start: datetime) -> dict | None:
     return read_json(_manifest_key(source_id, window_start))
 
 
+def list_window_manifest_payloads(
+    source_id: str, day: date, hour: str | None = None
+) -> list[dict]:
+    """해당 KST 날짜(및 선택적으로 시)에 속한 window manifest를 모두 읽어 반환한다.
+
+    `_manifest_key`가 window_start를 그대로(KST 오프셋 유지) `dt=`/`hh=`로 찍으므로,
+    이 prefix 하나가 정확히 KST 하루(또는 KST 한 시간)와 일치한다 — 데이터 수집
+    모니터링 알림(일별/시간별)이 이 함수로 해당 기간의 manifest를 모두 모은다.
+    """
+    prefix = f"_manifest/{source_id}/dt={day:%Y-%m-%d}/"
+    if hour is not None:
+        prefix += f"hh={hour}/"
+    payloads = []
+    for key in list_keys(prefix):
+        if not key.endswith(".json"):
+            continue
+        data = read_json(key)
+        if data:
+            payloads.append(data)
+    return payloads
+
+
 def write_retry_marker(source_id: str, window_start: datetime, data: dict) -> None:
     """해당 윈도우의 retry marker를 JSON으로 저장한다."""
     key = _retry_marker_key(source_id, window_start)
