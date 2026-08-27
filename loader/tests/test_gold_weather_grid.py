@@ -48,7 +48,10 @@ def test_repository_weather_sources_build_exact_34_grid_seed() -> None:
     assert type(document) is dict
     assert [source["byte_sha256"] for source in document["sources"]] == [
         "48a89a3d203d8afabdf37a251e152903e03aae309f5a17badee049fd27b9bc7d",
-        "6670ef2d47a503f067bb904a50ca3a98d327f7f2825fa00328f3daeedd3b64b6",
+        # weather_ultra_short_forecast.yaml에 freshness_rule(thirty_minutely) 필드가
+        # 추가되면서 바뀐 해시(2026-08-26, fix/weather-skip) — grid 목록/순서는
+        # 그대로라 이 테스트가 검증하는 34격자 계약 자체엔 영향 없다.
+        "470bfb367f191ba6e4ffdd81f919340d376e0de7f8df11282ddd0248a38c3087",
     ]
 
 
