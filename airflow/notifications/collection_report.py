@@ -35,8 +35,14 @@ def evaluate_source_stats(source_id: str, stats: dict) -> SourceStatEvaluation:
     missing_ratio = _ratio(stats["missing_count"], kept)
     outlier_ratio = _ratio(stats["outlier_count"], kept)
 
+    # run_count == 0이면 모든 비율이 0/0 → 0.0으로 계산돼 임계값 비교만으로는
+    # "정상"과 구분이 안 된다 — 그런데 이건 collector/Airflow가 그 기간 내내
+    # 완전히 멈춰 manifest가 하나도 안 남은, 비율 임계값보다 심한 장애다.
+    # run_count == 0 자체를 별도 위험 조건으로 명시한다.
+    no_runs = run_count == 0
     is_risky = (
-        failure_rate >= thresholds["failure_rate_threshold"]
+        no_runs
+        or failure_rate >= thresholds["failure_rate_threshold"]
         or missing_ratio >= thresholds["missing_ratio_threshold"]
         or outlier_ratio >= thresholds["outlier_ratio_threshold"]
     )
