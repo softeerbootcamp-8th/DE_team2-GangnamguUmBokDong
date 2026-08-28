@@ -1210,16 +1210,25 @@ editable 의존성이 새 경로(`../../libs/ml_core`)로 정확히 잡히는지
 
 ---
 
-## 34. Multi-Horizon 워터마크 격리 및 평가 캐시 불연속 구간 이중 집계 방지
+## 34. Multi-Horizon 워터마크 격리 및 평가 캐시 일자별 부분합 분할 보존
 
 **배경 및 원인**:
 1. **단일 모델 실행 시 공통 워터마크 오염**: `build_multi_horizon_features.py --models return` 단독 실행 시 `return` 모델 전용 워터마크뿐만 아니라 공통 워터마크(`_multi_horizon_watermark.json`)까지 최신으로 갱신되어, 뒤이어 실행된 `rental` 모델이 전용 워터마크가 없음에도 공통 워터마크 fallback을 보고 fresh로 오판하여 생성을 잘못 스킵하는 문제가 존재했다.
-2. **평가 캐시 불연속 날짜 이중 집계**: `evaluate_recent_performance_cached()`에서 캐시가 없는 날짜(`missing_days`)가 불연속(예: 08-01, 08-03 결측, 08-02 캐시 존재)일 때 `missing_days[0] ~ missing_days[-1]`(08-01~08-03) 전체를 하나의 shard로 평가하여, 중간에 이미 캐시된 08-02 날짜의 데이터가 최종 `combine_evaluation_shards()`에서 이중 집계되는 버그가 존재했다.
+2. **평가 캐시 불연속 날짜 이중 집계 및 전체 miss 시 일자별 캐시 미저장**:
+   - `evaluate_recent_performance_cached()`에서 캐시가 없는 날짜(`missing_days`)가 불연속(예: 08-01, 08-03 결측, 08-02 캐시 존재)일 때 `missing_days[0] ~ missing_days[-1]`(08-01~08-03) 전체를 하나의 shard로 평가하여, 중간에 이미 캐시된 08-02 날짜의 데이터가 최종 `combine_evaluation_shards()`에서 이중 집계되는 버그가 존재했다.
+   - 또한 기존에는 `r_start == r_end`인 단일 날짜 구간에 대해서만 캐시를 저장하여, 30일 전체가 miss인 최초 실행 시 30일을 한 shard로 평가한 뒤 일자별 캐시를 하나도 남기지 않아 다음 실행에서도 30일 전체를 재평가하는 비효율이 존재했다.
 
 **해결**:
 1. **모델 전용 워터마크 독립성 보장**: `build_multi_horizon_features.py`에서 단일 모델 freshness 검사 시 공통 워터마크 fallback을 완전히 제거하고 전용 워터마크만 바라보도록 수정. 공통 워터마크는 `rental`과 `return` 두 모델의 전용 워터마크가 둘 다 최신일 때만 갱신하도록 조건부 갱신 가드 추가.
-2. **불연속 날짜 연속 구간 분할 (`_group_contiguous_dates`)**: `missing_days`를 연속된 날짜 구간 리스트(예: `[('08-01', '08-01'), ('08-03', '08-03')]`)로 묶어 결측 구간만 정밀하게 샤드로 평가하고 일자별 캐시를 저장하도록 리팩토링.
-3. **회귀 테스트 완비**: `test_model_isolation_when_only_other_model_updated` 및 `test_evaluate_recent_performance_cached_missing_cached_missing_pattern` 추가.
+2. **연속 구간 배치 평가 후 일자별 부분합 캐싱 (`evaluate_recent_performance_shards_by_day`)**:
+   - `_group_contiguous_dates()`로 결측 날짜들을 연속된 구간들로 묶어 S3 I/O 및 배치 추론 효율을 극대화.
+   - 배치 추론 결과(`df`)를 `date` 컬럼 기준으로 그룹화하여 **평가된 모든 일자의 부분합(deviance, RMSE, coverage, n_rows)을 개별 S3 캐시(`models/eval_cache/.../YYYY-MM-DD.json`)에 빠짐없이 저장**.
+   - 이를 통해 최초 30일 평가 후 30일 전체 캐시가 보존되어 다음 실행 시 100% 캐시 히트 달성 및 중복 집계 완전 배제.
+3. **회귀 테스트 완비**:
+   - `test_model_isolation_when_only_other_model_updated` (워터마크 격리 검증)
+   - `test_evaluate_recent_performance_cached_missing_cached_missing_pattern` (불연속 캐시 이중 집계 방지 검증)
+   - `test_evaluate_recent_performance_cached_saves_daily_cache_for_all_missing_days` (연속 구간 일자별 S3 캐시 저장 및 2차 100% 캐시 hit 검증)
+
 
 
 
