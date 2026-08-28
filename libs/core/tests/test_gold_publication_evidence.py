@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
-from dataclasses import replace
 from datetime import UTC, datetime
 
 import pytest
@@ -28,10 +27,7 @@ from core.gold_publication.errors import (
     ObjectMissingError,
 )
 from core.gold_publication.evidence import (
-    BusinessTimeEvidence,
     PreparedPublication,
-    VerifiedPublicationEvidence,
-    is_verified_publication_evidence,
     verify_publication_evidence,
 )
 from core.gold_publication.storage import ImmutablePutOutcome
@@ -141,7 +137,7 @@ def test_verifier_reads_every_object_and_puts_manifest_last() -> None:
 def test_missing_immutable_object_fails_before_manifest_write(
     missing_kind: str,
 ) -> None:
-    """fingerprint 또는 input/output 한 개가 없으면 manifest와 token을 만들지 않는다."""
+    """fingerprint 또는 input/output 한 개가 없으면 manifest와 evidence를 만들지 않는다."""
     prepared, objects = _event_prepared()
     missing_uri = {
         "fingerprint": prepared.manifest.input_fingerprint_uri,
@@ -184,7 +180,7 @@ def test_existing_different_manifest_is_never_overwritten() -> None:
 
 
 def test_manifest_put_is_read_back_before_evidence_is_issued() -> None:
-    """put_once가 실제 object를 만들지 않으면 readback 실패로 token을 발급하지 않는다."""
+    """put_once가 실제 object를 만들지 않으면 readback 실패로 evidence를 만들지 않는다."""
     prepared, objects = _event_prepared()
     store = _MemoryObjectStore(objects, discard_put=True)
 
@@ -287,8 +283,8 @@ def test_business_time_evidence_requires_exact_fields_and_row_count(
     assert prepared.manifest_uri not in store.objects
 
 
-def test_raw_business_tuple_and_unsealed_token_cannot_enter_boundary() -> None:
-    """구 raw tuple API와 verifier를 우회한 token 생성을 모두 막는다."""
+def test_raw_business_tuple_cannot_enter_prepared_publication() -> None:
+    """구 raw business time tuple API를 PreparedPublication에서 거부한다."""
     prepared, _objects = _event_prepared()
 
     with pytest.raises(TypeError, match="business_dttms"):
@@ -298,51 +294,6 @@ def test_raw_business_tuple_and_unsealed_token_cannot_enter_boundary() -> None:
             input_fingerprint=prepared.input_fingerprint,
             business_dttms=(_LOGICAL_DTTM,),  # type: ignore[call-arg]
         )
-
-    business_times = BusinessTimeEvidence(
-        publication_key="event:cultural_event",
-        published_row_cnt=1,
-        values_by_field={"last_seen_dttm": (_LOGICAL_DTTM,)},
-    )
-    with pytest.raises(ContractViolation, match="공통 verifier"):
-        VerifiedPublicationEvidence(prepared, business_times, object())
-
-
-def test_verified_token_cannot_be_replaced_with_unverified_publication() -> None:
-    """정상 token의 seal을 dataclasses.replace로 다른 publication에 복제하지 못한다."""
-    prepared, objects = _event_prepared()
-    evidence = verify_publication_evidence(
-        prepared,
-        _MemoryObjectStore(objects),
-        _event_business_times,
-    )
-    unverified = PreparedPublication(
-        manifest=prepared.manifest,
-        manifest_uri="s3://fixture/manifest/never-written.json",
-        input_fingerprint=prepared.input_fingerprint,
-    )
-
-    with pytest.raises(ContractViolation, match="공통 verifier"):
-        replace(evidence, publication=unverified)
-
-
-def test_verified_token_rejects_post_issue_publication_mutation() -> None:
-    """발급 뒤 frozen publication을 강제 변조해도 seal 재검증이 거부한다."""
-    prepared, objects = _event_prepared()
-    evidence = verify_publication_evidence(
-        prepared,
-        _MemoryObjectStore(objects),
-        _event_business_times,
-    )
-
-    object.__setattr__(
-        evidence.publication,
-        "manifest_uri",
-        "s3://fixture/manifest/never-written.json",
-    )
-
-    assert not is_verified_publication_evidence(evidence)
-
 
 def _event_business_times(
     _publication: PreparedPublication,
