@@ -1,43 +1,6 @@
-"""feature_engine이 만든 tick 단위 feature 테이블(FEATURES_TABLE_PARQUET, horizon=1
-전용)을 horizon=1..HORIZON_COUNT 학습 테이블로 확장한다 (PySpark).
+"""tick 단위 feature 테이블을 horizon=1..HORIZON_COUNT 학습 테이블로 확장하는 모듈 (PySpark).
 
-**핵심 아이디어(history.md 18번 항목에서 실험·검증됨) — "horizon을 feature로"**: 별도 모델을
-horizon마다 두거나 예측값을 재귀적으로 다음 입력에 먹이는 대신(오차 누적), lag(직전
-실적)는 항상 "지금(anchor_ts=T0)" 기준으로 고정하고, "몇 시간 뒤를 묻는지"만 horizon
-feature로 모델에 알려준다. 그래서 이 테이블의 한 행은 **원본 테이블의 서로 다른 두 시점을
-조합**한 것뿐이다:
-
-- anchor_ts(T0) 쪽에서: 그 모델의 lag 컬럼(`rental_lag_1h` 또는 `return_lag_1h`, "지금 아는 것") 1개.
-- target_ts(T0+(horizon-1)시간) 쪽에서: 날씨/인구/캘린더/(대여면 `rental_exposure`)/타겟 카운트
-  ("그 미래 시점에 실제로 어땠는지") + `date`.
-
-horizon=1이면 anchor_ts==target_ts라 원본 테이블의 해당 행과 완전히 같은 값이 나온다 —
-`tests/dev_spark_multi_horizon_parity.py`가 이 불변조건을 회귀 테스트로 고정한다.
-
-**대여/반납이 완전히 분리된 데이터셋이다** — 서로 상대방의 lag를 보지 않으므로
-(`RENTAL_ANCHOR_COLUMNS`/`RETURN_ANCHOR_COLUMNS`가 서로 다름) self-join도, 결과
-테이블도 따로 만든다. `run_pipeline.py`가 대여 쪽을 끝까지 만들어 S3에 쓰고 나서
-반납 쪽을 시작한다 — 이 self-join 자체가 원본의 최대 HORIZON_COUNT배 행 수로
-불어나므로(아래 "규모" 참고), 두 개를 동시에 메모리에 띄우지 않기 위함이다.
-
-**`date`를 target_ts 쪽에서 가져오는 이유**: `training/train_common._dates_for_split()`이
-`date`로 train/valid/test 경계를 가른다. 라벨(타겟 이벤트)이 실제로 언제 일어났는지를
-기준으로 나누고, 같은 anchor가 target 날짜 경계를 넘어 두 split에 들어가는 문제는
-training의 `SPLIT_EMBARGO_DAYS` purge로 막는다. anchor_ts 날짜만으로 자르면 horizon이
-큰 행의 라벨이 다음 split으로 새는 더 직접적인 누출이 생긴다.
-
-**station 활성 구간 밖 처리**: target_ts에 해당하는 행이 그리드에 없으면(station 비활성
-구간이거나, 아직 관측되지 않은 미래라 증분 파이프라인이 그 시점까지 못 만들었을 때) inner
-join으로 그 (anchor, horizon) 조합 자체가 자연히 빠진다 — build_merged_table.py의 "그리드
-구멍" 철학과 동일. 12/31 오후처럼 target_ts가 다음 해로 넘어가는 앵커도 같은 이유로
-자동으로 걸러진다(별도 예외 처리 불필요) — 워터마크 기반 증분 생성을 나중에 이
-파이프라인에 붙일 때도 이 성질 덕분에 "target이 아직 없으면 그냥 빠지고, 다음 증분 때
-채워짐"이 자동으로 성립한다.
-
-**규모**: T0은 `TRAIN_ANCHOR_TICK_MINUTES` 간격으로 선택한다. 기본 20분 base
-grid에서는 anchor도 20분이고, 5분 base grid에서는 a5(전체) 또는 a20(thinning)처럼
-명시할 수 있다. 결과는 선택된 anchor 행의 최대 HORIZON_COUNT배이므로 전체 연도는
-여전히 EMR 대상이다(로컬 검증은 짧은 기간의 합성 데이터로만).
+단일 모델 다중 시계열 확장을 위해 앵커 시점(T0)의 lag 정보와 미래 목표 시점(T0 + horizon - 1)의 컨텍스트 피처(날씨, 인구 등) 및 타겟을 결합한다.
 """
 
 from __future__ import annotations
@@ -50,32 +13,19 @@ from pyspark.sql import functions as F
 
 from . import config
 
-# station_no/capacity/lat/lon/temp/precip/pop_total/minute/dow/is_holiday/day는
-# common_config.BASE_FEATURE_COLUMNS와 정확히 겹친다(horizon만 예외 — 그건
-# _shift_for_horizon()이 self-join 뒤에 직접 붙이는 값이라 원본 tick 테이블엔
-# 아직 없는 컬럼이고, 여기서 select하면 실패한다). 하드코딩으로 다시 나열하면
-# BASE_FEATURE_COLUMNS에 피처를 추가/삭제할 때 여기를 깜빡하고 안 고쳐서 학습
-# 테이블에서 그 컬럼만 조용히 빠지는 사고가 날 수 있어(2026-08 리뷰 지적),
-# BASE_FEATURE_COLUMNS에서 그대로 파생시켜 이 두 목록이 어긋날 가능성 자체를
-# 없앤다. hour_ts/hour/date는 모델 feature가 아니라 이 파일 자체의 self-join
-# 키/식별용/split 경계 판정용이라 별도로 붙인다.
+# BASE_FEATURE_COLUMNS에서 horizon을 제외한 공통 피처 컬럼 및 메타데이터 컬럼 정의
 _COMMON_TARGET_COLUMNS = [
     *(c for c in common_config.BASE_FEATURE_COLUMNS if c != "horizon"),
-    "hour_ts",  # self-join 키(target_ts) — _shift_for_horizon()이 소모하고 버림
-    "hour",  # 더 이상 모델 feature 아님(minute이 대체) — scoring.predict() 출력/CLI 식별용
-    "date",  # train_common._dates_for_split()의 train/valid/test 경계 판정용 — 모델 feature 아님
+    "hour_ts",
+    "hour",
+    "date",
 ]
 
-# station_id(텍스트)는 이 테이블에 아예 안 담는다 — horizon self-join으로 원본의
-# 최대 HORIZON_COUNT배까지 불어나는 테이블이라, 안 쓸 텍스트 컬럼을 그만큼 배로
-# 복제해 저장하는 낭비가 크다(공간뿐 아니라 Spark 쓰기 비용도). 조인 키/모델
-# feature 전부 station_no(정수) 하나로 충분하고, station_id가 필요한 곳(사람이 보는
-# 출력 등)은 그때그때 station_master로 작게 join해서 붙인다
-# (`inference/predict_common.py` 참고).
 RENTAL_ANCHOR_COLUMNS = ["station_no", "hour_ts", "rental_lag_1h"]
 RENTAL_TARGET_COLUMNS = [*_COMMON_TARGET_COLUMNS, "rental_exposure", "rental_count"]
 RETURN_ANCHOR_COLUMNS = ["station_no", "hour_ts", "return_lag_1h"]
 RETURN_TARGET_COLUMNS = [*_COMMON_TARGET_COLUMNS, "return_count"]
+
 
 
 def _shift_for_horizon(anchor: DataFrame, target: DataFrame, horizon: int) -> DataFrame:
@@ -250,59 +200,144 @@ def _write_date_partitioned(features: DataFrame, output_path: str) -> None:
     writer.write.mode("overwrite").partitionBy("date").parquet(output_path)
 
 
+def _multi_horizon_marts_are_fresh(
+    source_watermark: dict, existing_marker: dict | None, window_since: str, window_until: str
+) -> bool:
+    """이 profile의 마지막 multi-horizon 생성이 지금 소스 watermark/학습 윈도우와
+    동일한 상태에서 이뤄졌으면 True(=재생성 불필요).
+
+    args:
+        source_watermark: `run_pipeline.py`가 남긴 현재 `WATERMARK_PATH` 내용
+            (`watermark.read_watermark()` 결과, `max_hour_ts` 포함)
+        existing_marker: 이전 multi-horizon 생성이 남긴 워터마크
+            내용(없으면 None — 이 profile로 처음 만드는 것이라 항상 False)
+        window_since, window_until: 지금 이 실행이 쓰는 학습 윈도우 경계
+            (`config.WINDOW_START`/`WINDOW_END`를 문자열로 바꾼 것)
+    """
+    if existing_marker is None:
+        return False
+    marker_params = existing_marker.get("params") or {}
+    return (
+        existing_marker.get("max_hour_ts") == source_watermark.get("max_hour_ts")
+        and marker_params.get("window_since") == window_since
+        and marker_params.get("window_until") == window_until
+    )
+
+
 def _run_cli() -> None:
+    import argparse
+    from .watermark import is_fresh, multi_horizon_watermark_path, read_watermark, write_watermark
+
+    parser = argparse.ArgumentParser(description="Multi-horizon feature table builder")
+    parser.add_argument(
+        "--models",
+        default="rental,return",
+        help="생성할 모델 대상 (rental, return, 또는 rental,return. 기본값 rental,return)",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="워터마크 신선도 검사를 무시하고 강제로 재생성",
+    )
+    args, _ = parser.parse_known_args()
+
     from .spark_session import get_spark
 
     spark = get_spark()
-    # run_pipeline.py는 dynamic partition overwrite를 명시하는데 이 스크립트는
-    # 빠뜨려서, 기본값(static)이 이번 실행에 실제로 등장한 날짜 파티션만 남기고
-    # 테이블 전체를 지워버렸다 — WINDOW_START(TRAIN_LOOKBACK_MONTHS 기준, 프로필마다
-    # 다름)보다 오래된 파티션이 전부 사라지는 실제 데이터 유실로 확인됐다
-    # (2026-08-26, w/e/t가 같아 경로를 공유하는 테스트 프로필로 이 스크립트를
-    # 돌렸다가 프로덕션 테이블의 365개 파티션 중 332개가 삭제됨). dynamic으로
-    # 바꾸면 "이번에 실제로 쓴 날짜 파티션"만 교체되고 그 밖의 기존 파티션은
-    # 그대로 남는다.
+    requested_models = [m.strip() for m in args.models.split(",") if m.strip()]
+    if not requested_models or "all" in requested_models:
+        requested_models = ["rental", "return"]
+
+    window_since_str = str(config.WINDOW_START)
+    window_until_str = str(config.WINDOW_END)
+    source_watermark = read_watermark(config.WATERMARK_PATH)
+    if source_watermark is None:
+        raise RuntimeError(
+            f"{config.WATERMARK_PATH}에 watermark가 없습니다 — run_pipeline.py가 이 "
+            "profile의 base feature 테이블을 먼저 만들어야 합니다."
+        )
+
+    # 요청된 모델 중 실제로 생성이 필요한 모델만 선별
+    models_to_build: list[str] = []
+    for model in requested_models:
+        if args.force:
+            models_to_build.append(model)
+            continue
+        model_wm_path = multi_horizon_watermark_path(model)
+        existing_marker = read_watermark(model_wm_path)
+
+        if _multi_horizon_marts_are_fresh(source_watermark, existing_marker, window_since_str, window_until_str):
+            print(
+                f"[build_multi_horizon_features] [{model}] {config.PARAM_COMBO_ID}/"
+                f"a{config.TRAIN_ANCHOR_TICK_MINUTES}: 소스 watermark"
+                f"({source_watermark['max_hour_ts']})와 학습 윈도우가 최신 — 재생성 건너뜀"
+            )
+        else:
+            models_to_build.append(model)
+
+    if not models_to_build:
+        print("[build_multi_horizon_features] 모든 요청 모델의 Multi-horizon 피처가 최신 상태입니다 — 종료")
+        spark.stop()
+        return
+
     spark.conf.set("spark.sql.sources.partitionOverwriteMode", "dynamic")
     features = _features_in_training_window(
         spark.read.parquet(config.FEATURES_TABLE_PARQUET)
     )
+
     anchor_input = _anchor_input(features)
 
-    # 대여를 끝까지 만들어 S3에 쓰고 나서 반납을 시작한다 — 두 self-join 결과
-    # (원본의 최대 HORIZON_COUNT배 행 수) 를 동시에 메모리에 띄우지 않기 위함.
-    rental_result = build_multi_horizon_features(
-        spark, features, RENTAL_ANCHOR_COLUMNS, RENTAL_TARGET_COLUMNS, anchor_df=anchor_input
-    )
-    # date 파티션으로 써야 training/monitor_performance가 core.s3.read_parquet()의
-    # date_range로 필요한 기간만 읽을 수 있다(전체 히스토리를 매번 훑지 않음) — s3.py
-    # 모듈 docstring 참고.
-    _write_date_partitioned(
-        rental_result,
-        config.RENTAL_MULTI_HORIZON_FEATURES_TABLE_PARQUET,
-    )
-    print(f"rental multi-horizon features -> {config.RENTAL_MULTI_HORIZON_FEATURES_TABLE_PARQUET}")
+    for i, model in enumerate(models_to_build):
+        if i > 0:
+            spark.catalog.clearCache()
 
-    # build_multi_horizon_features()가 캐싱한 대여용 anchor/target을 반납 계산 전에
-    # 비운다 — 안 그러면 "두 self-join 결과를 동시에 메모리에 띄우지 않는다"는 위
-    # 설계 의도가 캐시 잔존으로 새어나간다.
-    spark.catalog.clearCache()
+        if model == "rental":
+            rental_result = build_multi_horizon_features(
+                spark, features, RENTAL_ANCHOR_COLUMNS, RENTAL_TARGET_COLUMNS, anchor_df=anchor_input
+            )
+            _write_date_partitioned(
+                rental_result,
+                config.RENTAL_MULTI_HORIZON_FEATURES_TABLE_PARQUET,
+            )
+            print(f"rental multi-horizon features -> {config.RENTAL_MULTI_HORIZON_FEATURES_TABLE_PARQUET}")
+            write_watermark(
+                multi_horizon_watermark_path("rental"),
+                source_watermark["max_hour_ts"],
+                {"window_since": window_since_str, "window_until": window_until_str},
+            )
+        elif model == "return":
+            return_result = build_multi_horizon_features(
+                spark, features, RETURN_ANCHOR_COLUMNS, RETURN_TARGET_COLUMNS, anchor_df=anchor_input
+            )
+            _write_date_partitioned(
+                return_result,
+                config.RETURN_MULTI_HORIZON_FEATURES_TABLE_PARQUET,
+            )
+            print(f"return multi-horizon features -> {config.RETURN_MULTI_HORIZON_FEATURES_TABLE_PARQUET}")
+            write_watermark(
+                multi_horizon_watermark_path("return"),
+                source_watermark["max_hour_ts"],
+                {"window_since": window_since_str, "window_until": window_until_str},
+            )
 
-    return_result = build_multi_horizon_features(
-        spark, features, RETURN_ANCHOR_COLUMNS, RETURN_TARGET_COLUMNS, anchor_df=anchor_input
-    )
-    _write_date_partitioned(
-        return_result,
-        config.RETURN_MULTI_HORIZON_FEATURES_TABLE_PARQUET,
-    )
-    print(f"return multi-horizon features -> {config.RETURN_MULTI_HORIZON_FEATURES_TABLE_PARQUET}")
+    # 레거시 호환용 공통 워터마크는 rental과 return이 둘 다 최신일 때만 갱신한다
+    rental_wm = read_watermark(multi_horizon_watermark_path("rental"))
+    return_wm = read_watermark(multi_horizon_watermark_path("return"))
+    if (
+        _multi_horizon_marts_are_fresh(source_watermark, rental_wm, window_since_str, window_until_str)
+        and _multi_horizon_marts_are_fresh(source_watermark, return_wm, window_since_str, window_until_str)
+    ):
+        write_watermark(
+            config.MULTI_HORIZON_WATERMARK_PATH,
+            source_watermark["max_hour_ts"],
+            {"window_since": window_since_str, "window_until": window_until_str},
+        )
 
 
 if __name__ == "__main__":
     try:
         _run_cli()
     except Exception as exc:
-        # training/scripts/monthly_retrain_check.py가 이 스크립트를 subprocess로
-        # 띄운다 — 표준출력이 그대로 스트리밍되므로, 실패 사유를 알아보기 쉬운
-        # 한 줄로 여기 남겨야 오케스트레이터 로그만 보고도 원인을 알 수 있다.
         print(f"[build_multi_horizon_features] 실패: {exc}", flush=True)
         raise
+

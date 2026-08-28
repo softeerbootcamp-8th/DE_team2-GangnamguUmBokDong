@@ -225,3 +225,143 @@ def test_evaluate_recent_performance_does_not_crash_on_missing_date_hour_columns
 
     assert evaluation["model_name"] == "return"
     assert evaluation["n_rows"] == 6
+
+
+def test_group_contiguous_dates():
+    """불연속 날짜 목록이 연속된 구간들로 정확히 분할되는지 검증한다."""
+    from training.monitor_performance import _group_contiguous_dates
+
+    assert _group_contiguous_dates([]) == []
+    assert _group_contiguous_dates(["2026-08-01"]) == [("2026-08-01", "2026-08-01")]
+    assert _group_contiguous_dates(["2026-08-01", "2026-08-02", "2026-08-03"]) == [
+        ("2026-08-01", "2026-08-03")
+    ]
+    # 불연속 패턴 (01, 03, 04, 07)
+    assert _group_contiguous_dates(["2026-08-01", "2026-08-03", "2026-08-04", "2026-08-07"]) == [
+        ("2026-08-01", "2026-08-01"),
+        ("2026-08-03", "2026-08-04"),
+        ("2026-08-07", "2026-08-07"),
+    ]
+
+
+def test_evaluate_recent_performance_cached_missing_cached_missing_pattern(monkeypatch):
+    """missing-cached-missing 패턴에서 캐시된 날짜가 새 범위 shard에 중복 포함되어 이중 집계되지 않는지 검증한다."""
+    from training.monitor_performance import (
+        _eval_cache_key,
+        evaluate_recent_performance_cached,
+    )
+
+    monkeypatch.setattr(scoring, "load_boosters", lambda model_name: {
+        "poisson": _FakeBooster(3.0), "q10": _FakeBooster(1.0), "q50": _FakeBooster(3.0), "q90": _FakeBooster(5.0),
+    })
+    monkeypatch.setattr(scoring, "load_conformal_correction", lambda model_name: 0.0)
+    monkeypatch.setattr(scoring, "load_station_dtype", lambda model_name: pd.CategoricalDtype(categories=[1]))
+    read_champion_prefix.cache_clear()
+
+    archive_prefix = "models/archive/dt=test_cache/default"
+    write_champion_pointer("return", archive_prefix)
+    s3_io.write_json(
+        model_json_key("return", "profile", archive_prefix),
+        common_config.effective_profile(),
+    )
+    s3_io.write_json(
+        model_json_key("return", "metrics", archive_prefix),
+        {"poisson_deviance_test": 1.0, "p10_p90_coverage_calibrated_test": 0.8, "rmse_test": 2.0},
+    )
+
+    table_path = config.RETURN_MULTI_HORIZON_FEATURES_TABLE_PARQUET
+    dates = ["2026-08-01", "2026-08-02", "2026-08-03"]
+
+    for d in dates:
+        rows = [
+            {
+                "station_no": 1, "capacity": 10, "lat": 37.5, "lon": 127.0, "temp": 20.0, "precip": 0.0,
+                "pop_total": 1000.0, "minute": 0, "dow": 0, "is_holiday": 0,
+                "day": day_index(pd.Timestamp(d).date()), "horizon": 1,
+                "return_lag_1h": 3.0 + i, "return_count": 5 + i, "hour": 0,
+            }
+            for i in range(10)  # 날짜당 10행
+        ]
+        s3_io.write_parquet(pd.DataFrame(rows), f"{table_path}/date={d}/part-0000.parquet")
+
+    # 중간 날짜인 2026-08-02만 미리 캐시를 저장해 둠 (missing-cached-missing 패턴 형성)
+    cached_shard_day2 = {
+        "n_rows": 10,
+        "sum_deviance_term": 10.0,
+        "sum_sq_err": 40.0,
+        "sum_coverage_hits": 8.0,
+    }
+    s3_io.write_json(
+        _eval_cache_key("return", archive_prefix, 1, "2026-08-02"),
+        cached_shard_day2,
+    )
+
+    evaluation = evaluate_recent_performance_cached(
+        "return", "return_count", None, "2026-08-01", "2026-08-03", horizon=1
+    )
+
+    # 3개 날짜 각각 10행씩 총 30행이어야 함 (중복 집계 버그 시 2026-08-02가 2번 들어가서 40행이 됨)
+    assert evaluation["n_rows"] == 30
+
+
+def test_evaluate_recent_performance_cached_saves_daily_cache_for_all_missing_days(monkeypatch):
+    """최초 실행 시 연속 구간 전체가 cache miss여도 각 일자별 캐시가 빠짐없이 S3에 저장되고 다음 실행 시 캐시 hit되는지 검증한다."""
+    from training.monitor_performance import (
+        _eval_cache_key,
+        evaluate_recent_performance_cached,
+    )
+
+    monkeypatch.setattr(scoring, "load_boosters", lambda model_name: {
+        "poisson": _FakeBooster(3.0), "q10": _FakeBooster(1.0), "q50": _FakeBooster(3.0), "q90": _FakeBooster(5.0),
+    })
+    monkeypatch.setattr(scoring, "load_conformal_correction", lambda model_name: 0.0)
+    monkeypatch.setattr(scoring, "load_station_dtype", lambda model_name: pd.CategoricalDtype(categories=[1]))
+    read_champion_prefix.cache_clear()
+
+    archive_prefix = "models/archive/dt=test_daily_cache/default"
+    write_champion_pointer("return", archive_prefix)
+    s3_io.write_json(
+        model_json_key("return", "profile", archive_prefix),
+        common_config.effective_profile(),
+    )
+    s3_io.write_json(
+        model_json_key("return", "metrics", archive_prefix),
+        {"poisson_deviance_test": 1.0, "p10_p90_coverage_calibrated_test": 0.8, "rmse_test": 2.0},
+    )
+
+    table_path = config.RETURN_MULTI_HORIZON_FEATURES_TABLE_PARQUET
+    dates = ["2026-08-01", "2026-08-02", "2026-08-03"]
+
+    for d in dates:
+        rows = [
+            {
+                "station_no": 1, "capacity": 10, "lat": 37.5, "lon": 127.0, "temp": 20.0, "precip": 0.0,
+                "pop_total": 1000.0, "minute": 0, "dow": 0, "is_holiday": 0,
+                "day": day_index(pd.Timestamp(d).date()), "horizon": 1,
+                "return_lag_1h": 3.0 + i, "return_count": 5 + i, "hour": 0,
+            }
+            for i in range(5)
+        ]
+        s3_io.write_parquet(pd.DataFrame(rows), f"{table_path}/date={d}/part-0000.parquet")
+
+    # 1. 3일 전체 miss 상태에서 1차 평가 수행
+    eval1 = evaluate_recent_performance_cached(
+        "return", "return_count", None, "2026-08-01", "2026-08-03", horizon=1
+    )
+    assert eval1["n_rows"] == 15
+
+    # 2. 3개 날짜 각각의 캐시 파일이 S3에 저장되었는지 확인
+    for d in dates:
+        cached = s3_io.read_json(_eval_cache_key("return", archive_prefix, 1, d))
+        assert cached is not None
+        assert cached["n_rows"] == 5
+
+    # 3. 모델 load 함수를 고장내어 캐시 미사용 시 crash 나도록 조치한 뒤 2차 평가 수행 (100% 캐시 hit 검증)
+    monkeypatch.setattr(scoring, "load_boosters", lambda model_name: (_ for _ in ()).throw(RuntimeError("should use cache!")))
+    eval2 = evaluate_recent_performance_cached(
+        "return", "return_count", None, "2026-08-01", "2026-08-03", horizon=1
+    )
+    assert eval2["n_rows"] == 15
+    assert eval2["current_deviance"] == eval1["current_deviance"]
+
+

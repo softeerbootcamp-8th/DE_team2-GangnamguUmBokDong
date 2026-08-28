@@ -17,6 +17,8 @@ export function RegionTabs({ regions, selectedRegion, onChange }: Props) {
       onChange={(event) => onChange(event.target.value)}
     >
       <option value={ALL_REGIONS}>전체 권역</option>
+      <option value="강북">강북</option>
+      <option value="강남">강남</option>
       {regions.map((center) => (
         <option key={center.region} value={center.region}>
           {center.region}

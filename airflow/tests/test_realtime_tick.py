@@ -353,8 +353,8 @@ def _replay_tasks() -> list[BashOperator]:
     ]
 
 
-def test_lookback_is_one_hour() -> None:
-    assert RENTAL_HISTORY_LOOKBACK_HOURS == 1
+def test_lookback_is_two_hours() -> None:
+    assert RENTAL_HISTORY_LOOKBACK_HOURS == 2
 
 
 def test_replay_tasks_exist_for_each_lookback_hour() -> None:

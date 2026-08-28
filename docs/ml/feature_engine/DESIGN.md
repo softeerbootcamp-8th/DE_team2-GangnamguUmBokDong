@@ -107,15 +107,18 @@ lag를 null로 둔다.
 - 날씨·인구·캘린더·라벨은 target 시점 값을 붙인다.
 - target 시점 행이 없으면 inner join 결과에서도 제외한다.
 - `date`는 target 시점에서 가져와 라벨 발생일 기준으로 split한다.
-- 대여와 반납은 상대 모델의 lag를 사용하지 않고 별도 테이블로 순차 생성한다.
+- 대여와 반납은 상대 모델의 lag를 사용하지 않고 별도 테이블로 분리 생성한다 (`--models rental` / `--models return`으로 원하는 모델만 선택 생성 가능).
+- 12개 horizon 병합은 균형 이진트리(Balanced Binary Tree) Union을 사용하여 Catalyst 최적화 깊이를 $O(N)$에서 $O(\log N)$으로 단축한다.
+- `date` 파티션 내부는 `(date, anchor_ts, station_no, horizon)`으로 정렬(`sortWithinPartitions`)하여 Snappy 압축률과 읽기 I/O를 최적화한다.
 
 horizon=1에서는 `anchor_ts == target_ts`이며 base tick 테이블과 값이 같아야 한다.
 최종 테이블은 `date`로 repartition한 뒤 날짜별 Parquet partition으로 overwrite한다.
 
 ## 6. 전체 빌드와 증분 보정
 
-`run_pipeline.py`는 피처 파라미터 조합별 watermark를 관리한다.
+`run_pipeline.py`와 `build_multi_horizon_features.py`는 피처 파라미터 조합별 watermark를 관리한다.
 
+- **사전 Freshness 스킵**: 워터마크의 `updated_at`이 최근 24시간 이내이고 데이터가 최신 윈도우까지 채워져 있으면 무거운 Spark 계산을 건너뛴다.
 - watermark가 없거나 `TRAIN_WINDOW_START`와 `TRAIN_WINDOW_END`를 명시하면 전체
   overwrite한다.
 - 그 외에는 watermark에서 `INCREMENTAL_LOOKBACK_HOURS`만큼 되돌아가 날짜
@@ -139,6 +142,8 @@ horizon=1에서는 `anchor_ts == target_ts`이며 base tick 테이블과 값이 
 - historical fact는 S3A 경로로만 읽으며 로컬 파일 fallback을 두지 않는다.
 - `ML_PROFILE` 미지정 시 내장 프로필을 사용하고, 명시한 원격 프로필이 없거나
   유효하지 않으면 fail-closed한다.
+- 다중 액션이 호출되는 중간 DataFrame(`features_increment`, `anchor`, `target`)은 명시적 `.cache()` 및 완료 후 `.unpersist()`/`clearCache()`로 셔플 I/O와 메모리를 최적화한다.
+
 
 ## 8. 검증 기준
 

@@ -1,16 +1,16 @@
-import { featureCollection, polygon } from "@turf/helpers";
-import { intersect } from "@turf/intersect";
 import "leaflet/dist/leaflet.css";
-import { Delaunay } from "d3-delaunay";
 import L from "leaflet";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Circle, CircleMarker, MapContainer, Marker, Polygon, Polyline, TileLayer, Tooltip, useMapEvents } from "react-leaflet";
 import type { ActionType, Alert, DispatchCenter, Route, StationFilter, StationSummary } from "../api";
 import type { FocusedEvent } from "./DetailPanel";
+import dispatchRegionBoundaries from "../dispatch_region_boundaries.json";
+import managementAreaBoundaries from "../management_area_boundaries.json";
 import seoulBoundary from "../seoul_boundary.json";
 
 const ALL_REGIONS = "all"; // App.tsx의 선택 안 함 상태와 동일한 값이어야 한다.
-const SEOUL_POLYGON = polygon(seoulBoundary.geometry.coordinates);
+const MANAGEMENT_AREA_KEYS = { "강북": "gangbuk", "강남": "gangnam" } as const;
+type RegionCell = [number, number][][][];
 // 서울시 따릉이 서비스라 서울 윤곽선을 항상 기본으로 띄워둔다(권역 선택과 무관).
 const SEOUL_OUTLINE: [number, number][] = seoulBoundary.geometry.coordinates[0].map(
   ([lon, lat]) => [lat, lon] as [number, number],
@@ -43,45 +43,43 @@ const ROUTE_CENTER_ICON = L.divIcon({
   iconAnchor: [21, 21],
 });
 
-// 지역센터 관할의 실제 경계 데이터는 없다(apps/api/regions.py 참고). 그래서
-// "권역 면적"은 우리 배정 로직(최근접 지역센터)이 암묵적으로 정의하는 경계,
-// 즉 보로노이 다이어그램으로 그린다 — 대여소 배정에 실제로 쓰인 것과 정확히
-// 같은 기준이라 최소한 우리 시스템 안에서는 정직한 시각화다. 서울 밖으로
-// 무한히 뻗어나가는 바깥쪽 셀들은 SEOUL_BOUNDS로 잘라낸다.
-// turf 교집합 결과(Polygon 또는 MultiPolygon)의 바깥 링들을 Leaflet
-// [위도, 경도] 좌표 배열로 바꾼다. 구멍(hole)은 우리 케이스에서 나올 일이
-// 없어 각 폴리곤의 첫 링(바깥 링)만 쓴다.
-function outerRingsToLatLng(geometry: { type: string; coordinates: number[][][] | number[][][][] }): [
-  number,
-  number,
-][][] {
+// 현재 강북 5/강남 6 관리소 분리 후 서울 외곽 내부 최단거리로
+// 계산한 권역 asset의 바깥 링을 Leaflet [위도, 경도] 배열로 바꾼다.
+function outerRingsToLatLng(
+  geometry: { type: string; coordinates: number[][][] | number[][][][] },
+): RegionCell {
   const polygons = geometry.type === "Polygon" ? [geometry.coordinates as number[][][]] : (geometry.coordinates as number[][][][]);
-  return polygons.map((rings) => rings[0].map(([lon, lat]) => [lat, lon] as [number, number]));
+  return polygons.map((rings) => [rings[0].map(([lon, lat]) => [lat, lon] as [number, number])]);
 }
 
-function computeRegionCell(centers: DispatchCenter[], selectedRegion: string): [number, number][][] | null {
-  if (selectedRegion === ALL_REGIONS || centers.length === 0) return null;
-  const index = centers.findIndex((c) => c.region === selectedRegion);
-  if (index === -1) return null;
+function largestOuterRingToLatLng(
+  geometry: { type: string; coordinates: number[][][] | number[][][][] },
+): RegionCell {
+  const polygons = geometry.type === "Polygon" ? [geometry.coordinates as number[][][]] : (geometry.coordinates as number[][][][]);
+  const ringArea = (ring: number[][]) => Math.abs(ring.reduce((area, [lon, lat], index) => {
+    const [nextLon, nextLat] = ring[(index + 1) % ring.length];
+    return area + lon * nextLat - nextLon * lat;
+  }, 0));
+  const largest = polygons.reduce((current, candidate) =>
+    ringArea(candidate[0]) > ringArea(current[0]) ? candidate : current);
+  return [[largest[0].map(([lon, lat]) => [lat, lon] as [number, number])]];
+}
 
-  // d3-delaunay는 평면 좌표를 쓰므로 (경도, 위도)를 (x, y)로 그대로 쓴다.
-  // 서울 정도의 좁은 범위에서는 구면 보정 없이도 배정 결과와 시각적으로
-  // 어긋나지 않는다(11장소 사이 실제 최근접 배정도 이 정밀도로 충분했다).
-  const points: [number, number][] = centers.map((c) => [c.lon, c.lat]);
-  const delaunay = Delaunay.from(points);
-  const bounds = L.latLngBounds(SEOUL_SW, SEOUL_NE);
-  const voronoi = delaunay.voronoi([bounds.getWest(), bounds.getSouth(), bounds.getEast(), bounds.getNorth()]);
-  const rectClippedCell = voronoi.cellPolygon(index);
-  if (!rectClippedCell) return null;
-
-  // 사각형(SEOUL_BOUNDS)으로만 자른 셀은 서울시 바깥 땅도 포함한다. 서울시 실제
-  // 경계(seoul_boundary.json, kostat 2013 단순화 데이터)와 교집합해서, 최소한
-  // 바깥쪽 테두리는 실제 서울시 모양과 일치하게 만든다 — 지역센터 사이 안쪽
-  // 경계선 자체는 여전히 최근접 근사다.
-  const cellPolygon = polygon([rectClippedCell as unknown as number[][]]);
-  const clipped = intersect(featureCollection([cellPolygon, SEOUL_POLYGON]));
-  if (!clipped) return null;
-  return outerRingsToLatLng(clipped.geometry);
+function computeRegionCell(centers: DispatchCenter[], selectedRegion: string): RegionCell | null {
+  if (selectedRegion === ALL_REGIONS) return null;
+  const managementAreaKey = MANAGEMENT_AREA_KEYS[selectedRegion as keyof typeof MANAGEMENT_AREA_KEYS];
+  if (managementAreaKey) {
+    const boundary = managementAreaBoundaries.features.find(
+      (feature) => feature.properties.management_area === managementAreaKey,
+    );
+    return boundary ? largestOuterRingToLatLng(boundary.geometry) : null;
+  }
+  if (centers.length === 0) return null;
+  if (!centers.some((center) => center.region === selectedRegion)) return null;
+  const boundary = dispatchRegionBoundaries.features.find(
+    (feature) => feature.properties.region === selectedRegion,
+  );
+  return boundary ? outerRingsToLatLng(boundary.geometry) : null;
 }
 
 export type MapFilterMode = StationFilter;
@@ -455,7 +453,7 @@ function StationMarkers({
     // 선택된 권역의 경계(보로노이 셀) 전체가 화면에 들어오게 이동한다. 대여소
     // 이동(setView, 위 effect)과 달리 여기는 넓은 영역을 한 번에 보여줘야 하므로
     // fitBounds를 쓴다.
-    map.fitBounds(L.latLngBounds(regionCell.flat()), { padding: [24, 24] });
+    map.fitBounds(L.latLngBounds(regionCell.flat(2)), { padding: [24, 24] });
   }, [selectedRegion, regionCell, selectedRoute, map]);
 
   return (

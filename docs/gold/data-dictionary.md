@@ -381,7 +381,9 @@ inactive station/center를 노출하지 않는다. 같은-anchor stock/station c
 `urgency.updated_dttm >= station_stock.updated_dttm`과 `>= station.updated_dttm`인 재계산
 결과만 노출하고
 `urgency_score DESC, sta_id ASC`로 정렬한다. route producer가 쓰는 `bike_qty`는 S3 urgency
-batch가 소유하므로 Gold에 중복 저장하지 않는다. route producer는
+batch가 소유하므로 Gold에 중복 저장하지 않는다. route producer는 양수 공급 후보에만
+정원의 20%→40% 방문 회복분을 현재 빈 공간 안에서 더하며, 이 값은 route fingerprint에
+남긴다. `retrieval_needed`의 회수량은 그대로 사용한다. route producer는
 `retrieval_needed→pickup`, `supply_needed→dropoff`만 허용하고 `normal`·`bike_qty<=0`은
 후보에서 제외한다.
 
@@ -450,20 +452,17 @@ route publication은 현재 station·demand·stock tuple과 urgency input의 동
 삭제하면 stop은 cascade 삭제된다. 기존 proposed aggregate 삭제와 새 header·stop
 삽입은 반드시 한 transaction에서 수행한다.
 
-publisher staging은 manifest의 차량 초기 적재량 0과 `TRUCK_CAPACITY` config version을
-사용한다. visit 순 pickup은 더하고 dropoff는 빼며 running load가 매 단계 `0..capacity`여야
-한다. DB는 과거 경로 호환을 위해 stop 1개 이상과 마지막 양수 잔량을 허용하지만,
-`route-v4-supply-led-pickup-sla`가 새로 만드는 proposed 작업은 pickup·dropoff를 모두 포함한 2~5개
-대여소이며 두 action의 합계가 같아 마지막 적재량이 0이다. 가장 긴급한 supply 대여소가
+publisher staging은 manifest의 차량 초기 적재량 0과 혼합 차량 용량
+`20,20,15,15`를 사용한다. visit 순 pickup은 더하고 dropoff는 빼며 running load가 매 단계
+배정 차량 용량 안이어야 한다. DB는 과거 경로 호환을 위해 stop 1개 이상과 마지막 양수
+잔량을 허용하지만, `route-v5-supply-led-mixed-fleet`가 새로 만드는 proposed 작업은
+pickup·dropoff를 모두 포함하며 두 action의 합계가 같아 마지막 적재량이 0이다. 가장 긴급한 supply 대여소가
 경로 순서를 소유하고, 안전한 pickup을 모두 마친 뒤 그 supply를 첫 dropoff로 방문한다.
 Pickup 후보는 `center→pickup→최고 supply` 총거리로 우선순위를 정하고 실제 방문은 센터에서
-시작한 최근접 순서로 만든다. 센터 출발부터 마지막 pickup 실행까지의 시간은 이동속도
-20km/h와 pickup stop당 작업시간 3분을 누적해 계산하며 30분 이하여야 한다. 큰 stop split이
-30분을 넘으면 같은 입력에서 더 작은 pickup·dropoff 완결 route로 분리하고, pickup 한 곳만
-방문해도 30분을 넘는 donor는 해당 batch의 경로 후보에서 제외한다. 활성 센터별 proposed
-작업은 최대 3개다.
+시작한 최근접 순서로 만든다. 별도 30분·stop 수 상한은 사용하지 않는다. 센터별 네 차량
+tuple이 최대 네 경로와 각 경로의 20·20·15·15대 적재량을 직접 제한한다.
 
-짝이 맞지 않거나 stop·SLA 제한 밖인 수요는 다음 batch에서 다시 계산한다. route coverage는
+짝이 맞지 않거나 네 차량이 처리하지 못한 수요는 다음 batch에서 다시 계산한다. route coverage는
 dispatched 전부와 urgency stock anchor 이후 완료되어 아직 후속 stock에 반영되지 않은
 completed route 및 정렬 stop을 포함한다. route/stop DML은 BEFORE STATEMENT에서 topology
 shared→route lock을 잡고, dispatch 전이는 활성 센터와 active/same-center stop을 다시

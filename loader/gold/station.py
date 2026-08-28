@@ -18,7 +18,13 @@ from core.gold_publication import (
 )
 from core.weather_grid import latlon_to_grid
 
-CENTER_ASSIGNMENT_VERSION = "gold-nearest-active-center-v1"
+from gu_mapping import (
+    MANAGEMENT_AREA_BY_CENTER_ID,
+    latlon_to_management_area,
+    seoul_constrained_distance_m,
+)
+
+CENTER_ASSIGNMENT_VERSION = "gold-documented-management-nearest-active-center-v3"
 GRID_CONVERSION_VERSION = "kma-lcc-v1"
 STATION_POLICY_VERSION = "gold-station-policy-v1"
 RELOCATION_THRESHOLD_M = 100.0
@@ -520,7 +526,13 @@ def _station_record_with_center(
         latitude=station.latitude,
         sta_point_source_cd=station.sta_point_source_cd,
         weather_grid_id=station.weather_grid_id,
-        dispatch_center_id=_nearest_active_center_from_meters(centers, meters),
+        dispatch_center_id=assign_dispatch_center_id(
+            station_id=station.sta_id,
+            longitude=station.longitude,
+            latitude=station.latitude,
+            centers=centers,
+            meters=meters,
+        ),
         master_base_dttm=station.master_base_dttm,
         last_seen_dttm=station.last_seen_dttm,
         is_active=station.is_active,
@@ -611,6 +623,12 @@ def _validated_centers(
     ids = tuple(value.dispatch_center_id for value in values)
     if len(ids) != len(set(ids)):
         raise ContractViolation("dispatch center ID가 중복됩니다.")
+    unknown_ids = sorted(set(ids) - MANAGEMENT_AREA_BY_CENTER_ID.keys())
+    if unknown_ids:
+        raise ContractViolation(
+            "관리소 소속이 없는 dispatch center가 있습니다: "
+            + ", ".join(unknown_ids)
+        )
     active = tuple(value for value in values if value.is_active)
     if not active:
         raise ContractViolation("station 배정에 쓸 active dispatch center가 없습니다.")
@@ -851,22 +869,45 @@ def _center_pairs(
     )
 
 
-def _nearest_active_center_from_meters(
+def assign_dispatch_center_id(
+    *,
+    station_id: str,
+    longitude: float,
+    latitude: float,
     centers: tuple[DispatchCenterReference, ...],
     meters: tuple[float, ...],
 ) -> str:
-    """검증된 거리의 기존 meter·UTF-8 tie-break로 center를 선택한다."""
+    """같은 관리소 center 중 서울 외곽 제약거리·UTF-8 순으로 선택한다."""
     if len(meters) != len(centers):
         raise ContractViolation("dispatch center 거리 결과 수가 입력과 다릅니다.")
-    ranked = [
+    management_area = latlon_to_management_area(latitude, longitude)
+    if management_area is None:
+        raise ContractViolation(
+            "station Point를 서울 자치구 관리권역으로 분류할 수 없습니다: "
+            f"sta_id={station_id}"
+        )
+    managed_ranked = [
         (
-            value,
+            seoul_constrained_distance_m(
+                longitude,
+                latitude,
+                center.longitude,
+                center.latitude,
+                direct_distance_m=value,
+            ),
             center.dispatch_center_id.encode("utf-8"),
             center.dispatch_center_id,
         )
         for value, center in zip(meters, centers, strict=True)
+        if MANAGEMENT_AREA_BY_CENTER_ID.get(center.dispatch_center_id)
+        == management_area
     ]
-    return min(ranked)[2]
+    if not managed_ranked:
+        raise ContractViolation(
+            "station 관리소에 active dispatch center가 없습니다: "
+            f"management_area={management_area}"
+        )
+    return min(managed_ranked)[2]
 
 
 def _checked_distance_groups(

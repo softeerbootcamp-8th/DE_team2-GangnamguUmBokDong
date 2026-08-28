@@ -978,6 +978,26 @@ body {
   white-space: nowrap;
 }
 
+.route-priority-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 0 6px;
+  border: 1px solid color-mix(in srgb, var(--diverging-blue) 20%, transparent);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--diverging-blue) 8%, transparent);
+  color: var(--diverging-blue);
+  font-size: 11px;
+  font-weight: 650;
+  white-space: nowrap;
+}
+
+.route-priority-badge.recommended {
+  border-color: color-mix(in srgb, var(--status-good) 28%, transparent);
+  background: color-mix(in srgb, var(--status-good) 10%, transparent);
+  color: color-mix(in srgb, var(--status-good) 76%, var(--text-primary));
+}
+
 .route-candidate-indicator {
   position: relative;
   display: inline-flex;

@@ -1161,3 +1161,74 @@ editable 의존성이 새 경로(`../../libs/ml_core`)로 정확히 잡히는지
 컨벤션 — 과거 기록은 그때 사실을 남기고, 최신 상태는 README/LEGACY_AUDIT.md가
 반영). 자세한 파일별 변경 목록은 당시 `LEGACY_AUDIT.md`의
 "환경 관리 — uv + `libs/ml_core/`" 절 참고.
+
+---
+
+## 31. Feature Engine Spark DAG 병목 개선 및 EMR 분산 실행 최적화
+
+**배경**: EMR(m4.large 8대, 28 cores) 환경에서 `monthly_retrain` 실행 시 Spark Multi-horizon 생성이 비정상적으로 길어지고 YARN DistributedShell 기본 타임아웃(10분)으로 학습 스텝이 강제 Kill되는 현상이 발생했다.
+
+**원인 및 결정**:
+1. **증분 Action 중복 셔플**: `features_increment`에 캐싱 없이 4회 연속 Action(count, write, agg)이 호출되어 상류 Rolling Self-Join 셔플이 4번 반복 실행됨 -> `.cache()` 및 `.unpersist()` 적용.
+2. **2단계 Catalyst 누적 계획 병목**: `build_multi_horizon_features.py`에서 순차 Union(깊이 11)을 돌려 Catalyst 재분석 비용이 선형으로 폭증함 -> 균형 이진트리(`_balanced_union_by_name`, 깊이 4)로 개편.
+3. **대여/반납 중복 스캔 제거**: `--models rental|return` 옵션을 추가하여 요청된 단일 모델의 Multi-horizon Mart만 단독 생성하도록 분리.
+4. **Parquet 파티션 내부 정렬**: `sortWithinPartitions("date", "anchor_ts", "station_no", "horizon")`를 적용해 Parquet 압축률과 다운스트림 `lazy_train_dataset`의 학습 로딩 속도를 최적화.
+5. **YARN 타임아웃 확장**: `distributedshell.Client`의 기본 10분 타임아웃을 `-timeout 345600000`(4일)으로 확장.
+6. **강제 재생성 플래그 추가**: 워터마크 기반 신선도 스킵을 우회할 수 있는 `--force` 및 Airflow `force_refresh_feature_mart` Param 추가.
+
+**실측 성과 (EMR 1년치 275일치 전체 빌드)**:
+- 2단계 Multi-horizon 실행 시간: 7.4분 -> 2.5분 (66.2% 단축)
+- 총 CPU 연산 시간(Task Time): 3.0시간 -> 41분 (77.2% 절감)
+- JVM GC 시간: 13분 -> 1.3분 (90% 격감)
+- S3 읽기량: 27.4 GiB -> 4.9 GiB (82.1% 감소)
+- 네트워크 셔플 전송량: 13.0 GiB -> 6.6 GiB (49.2% 감소)
+- 총 태스크 수: 4,736개 -> 1,557개 (67.1% 감소)
+
+---
+
+## 32. YARN DistributedShell 기반 EMR 분산 오케스트레이션 정착
+
+**배경**: EMR(m4.large 8대) 환경에서 월간 재학습 오케스트레이터(`monthly_retrain_check`)와 분산 학습 워커 실행 시 마스터 노드 메모리 고갈과 자원 경합 문제가 발생했다.
+
+**원인 및 해결 과정**:
+1. **Master 노드 OOM (ExitCode 137)**: EMR Master 노드(m4.large 8GB)는 기본 데몬(ResourceManager, NameNode 등)만으로 ~5.7GB를 점유하여, 오케스트레이터 프로세스가 약 1.5GB만 사용해도 OOM-killer에 의해 강제 종료됨 -> 오케스트레이터 프로세스 자체를 Core 노드의 YARN 컨테이너(`-num_containers 1`)로 격리 실행.
+2. **DistributedShell AM 힙 부족 (JNI Error)**: DistributedShell의 기본 100MB AM 힙으로 인해 클래스 로딩 중 OutOfMemoryError가 발생하던 문제를 `-master_memory 1024`로 확장하여 해결.
+3. **Spark-submit 래퍼 자원 경합 제거**: Spark-submit으로 오케스트레이터를 감쌀 경우 연산을 안 해도 Dynamic Allocation이 executor를 최대 50개까지 점유하여 실제 분산학습 워커와 경합하던 문제를, 순수 YARN DistributedShell 호출로 전환하여 완전 해결.
+4. **중첩 분산 환경 노드 예약 (`_WRAPPER_NODE_RESERVATION = 3`)**: Outer AM, Outer Worker, Inner AM이 서로 다른 노드에 분산 배치되는 최악의 경우를 대비하여 `core_instance_count - 3`개의 워커를 요청하도록 설계(Barrier 타임아웃 방지).
+5. **클라이언트 타임아웃 확장**: YARN `distributedshell.Client`의 10분 기본 타임아웃을 `-timeout 345600000`(4일)으로 확장.
+
+---
+
+## 33. 월간 재학습 단일 EMR 생애주기 통합 및 Resize 제거
+
+**배경**: 기존 대여/반납 분리 DAG 및 2단계 클러스터 리사이즈(`resize_emr_cluster()`, 3노드 -> 8노드) 운영 시 노드 프로비저닝 지연과 실행 중 스텝 유실 위험이 존재했다.
+
+**원인 및 결정**:
+1. **단일 EMR 클러스터 순차 실행**: `monthly_retrain` 단일 DAG에서 하나의 EMR 클러스터 생애주기 동안 대여 사이클(평가 -> 재학습 -> 승격) 완료 후 반납 사이클을 순차 실행하여 클러스터 2중 기동 오버헤드(15분) 및 동시성 충돌 차단.
+2. **동적 Resize 제거**: 스텝 실행 중 노드가 축소/확장될 때 컨테이너가 유실되는 위험을 방지하기 위해, 처음부터 8노드(`TRAINING_CORE_INSTANCE_COUNT = 8`)로 고정 프로비저닝.
+3. **테스트 프로필 격리**: 테스트용 프로필(`a-test-sparse-flat`)의 피처마트 경로(`w65_e45_t20`)를 프로덕션 기본(`w60_e40_t20`)과 물리적으로 분리하여 덮어쓰기 데이터 오염 방지.
+
+---
+
+## 34. Multi-Horizon 워터마크 격리 및 평가 캐시 일자별 부분합 분할 보존
+
+**배경 및 원인**:
+1. **단일 모델 실행 시 공통 워터마크 오염**: `build_multi_horizon_features.py --models return` 단독 실행 시 `return` 모델 전용 워터마크뿐만 아니라 공통 워터마크(`_multi_horizon_watermark.json`)까지 최신으로 갱신되어, 뒤이어 실행된 `rental` 모델이 전용 워터마크가 없음에도 공통 워터마크 fallback을 보고 fresh로 오판하여 생성을 잘못 스킵하는 문제가 존재했다.
+2. **평가 캐시 불연속 날짜 이중 집계 및 전체 miss 시 일자별 캐시 미저장**:
+   - `evaluate_recent_performance_cached()`에서 캐시가 없는 날짜(`missing_days`)가 불연속(예: 08-01, 08-03 결측, 08-02 캐시 존재)일 때 `missing_days[0] ~ missing_days[-1]`(08-01~08-03) 전체를 하나의 shard로 평가하여, 중간에 이미 캐시된 08-02 날짜의 데이터가 최종 `combine_evaluation_shards()`에서 이중 집계되는 버그가 존재했다.
+   - 또한 기존에는 `r_start == r_end`인 단일 날짜 구간에 대해서만 캐시를 저장하여, 30일 전체가 miss인 최초 실행 시 30일을 한 shard로 평가한 뒤 일자별 캐시를 하나도 남기지 않아 다음 실행에서도 30일 전체를 재평가하는 비효율이 존재했다.
+
+**해결**:
+1. **모델 전용 워터마크 독립성 보장**: `build_multi_horizon_features.py`에서 단일 모델 freshness 검사 시 공통 워터마크 fallback을 완전히 제거하고 전용 워터마크만 바라보도록 수정. 공통 워터마크는 `rental`과 `return` 두 모델의 전용 워터마크가 둘 다 최신일 때만 갱신하도록 조건부 갱신 가드 추가.
+2. **연속 구간 배치 평가 후 일자별 부분합 캐싱 (`evaluate_recent_performance_shards_by_day`)**:
+   - `_group_contiguous_dates()`로 결측 날짜들을 연속된 구간들로 묶어 S3 I/O 및 배치 추론 효율을 극대화.
+   - 배치 추론 결과(`df`)를 `date` 컬럼 기준으로 그룹화하여 **평가된 모든 일자의 부분합(deviance, RMSE, coverage, n_rows)을 개별 S3 캐시(`models/eval_cache/.../YYYY-MM-DD.json`)에 빠짐없이 저장**.
+   - 이를 통해 최초 30일 평가 후 30일 전체 캐시가 보존되어 다음 실행 시 100% 캐시 히트 달성 및 중복 집계 완전 배제.
+3. **회귀 테스트 완비**:
+   - `test_model_isolation_when_only_other_model_updated` (워터마크 격리 검증)
+   - `test_evaluate_recent_performance_cached_missing_cached_missing_pattern` (불연속 캐시 이중 집계 방지 검증)
+   - `test_evaluate_recent_performance_cached_saves_daily_cache_for_all_missing_days` (연속 구간 일자별 S3 캐시 저장 및 2차 100% 캐시 hit 검증)
+
+
+
+

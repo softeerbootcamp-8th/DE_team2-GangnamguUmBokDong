@@ -13,27 +13,28 @@ from evaluation.evaluation_profiles import (
     PRODUCTION_SPEED_KMH,
 )
 from gold.rebalance_route import (
-    PICKUP_DISPATCH_ASSUMED_SPEED_KMH,
-    PICKUP_DISPATCH_SERVICE_MINUTES_PER_STOP,
+    ROUTE_ASSUMED_SPEED_KMH,
+    ROUTE_SERVICE_MINUTES_PER_STOP,
 )
 
 
 def test_contract_matches_realtime_operating_cadence() -> None:
-    """기본 계약은 2시간 작업 블록에서 5분마다 세 트럭을 운용한다."""
+    """기본 계약은 2시간 작업 블록에서 5분마다 네 트럭을 운용한다."""
     contract = EvaluationContract(date(2025, 6, 17), 6)
     audit = contract.audit_document()
     assert contract.evaluation_minutes == 120
     assert contract.tick_minutes == 5
+    assert contract.fleet_size == 4
     assert contract.truck_capacity == 20
-    assert contract.speed_kmh == PICKUP_DISPATCH_ASSUMED_SPEED_KMH
+    assert contract.speed_kmh == ROUTE_ASSUMED_SPEED_KMH
     assert (
         contract.service_minutes_per_stop
-        == PICKUP_DISPATCH_SERVICE_MINUTES_PER_STOP
+        == ROUTE_SERVICE_MINUTES_PER_STOP
     )
-    assert PRODUCTION_SPEED_KMH == PICKUP_DISPATCH_ASSUMED_SPEED_KMH
+    assert PRODUCTION_SPEED_KMH == ROUTE_ASSUMED_SPEED_KMH
     assert (
         PRODUCTION_SERVICE_MINUTES_PER_STOP
-        == PICKUP_DISPATCH_SERVICE_MINUTES_PER_STOP
+        == ROUTE_SERVICE_MINUTES_PER_STOP
     )
     assert audit["evidence_grade"] == "retrospective_heldout_replay"
     assert audit["primary_metric"] == PRIMARY_METRIC
