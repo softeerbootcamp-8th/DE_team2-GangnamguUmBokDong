@@ -292,10 +292,10 @@ def _extract_profile_feature_params(profile_data: dict) -> tuple[str, int]:
         or 20
     )
     anchor_tick = (
-        profile_data.get("PEAK_ANCHOR_TICK_MINUTES")
-        or profile_data.get("peak_anchor_tick_minutes")
-        or profile_data.get("GRID_TICK_MINUTES")
+        profile_data.get("TRAIN_ANCHOR_TICK_MINUTES")
         or profile_data.get("train_anchor_tick_minutes")
+        or profile_data.get("GRID_TICK_MINUTES")
+        or profile_data.get("grid_tick_minutes")
         or 20
     )
     combo_id = f"w{window}_e{embargo}_t{tick}"

@@ -144,7 +144,8 @@ yarn org.apache.hadoop.yarn.applications.distributedshell.Client \
   - `_multi_horizon_rental_watermark.json`
   - `_multi_horizon_return_watermark.json`
 - **프로필 계약 키 및 기본값 일치 (`_extract_profile_feature_params`)**:
-  - `profile_contract.py`의 Uppercase 키(`ROLLING_WINDOW_MINUTES`, `ROLLING_EMBARGO_MINUTES`, `ROLLING_TICK_MINUTES`, `PEAK_ANCHOR_TICK_MINUTES`)를 우선 파싱.
+  - `profile_contract.py`의 Uppercase 키(`ROLLING_WINDOW_MINUTES`, `ROLLING_EMBARGO_MINUTES`, `ROLLING_TICK_MINUTES`, `TRAIN_ANCHOR_TICK_MINUTES`)를 우선 파싱.
+  - Multi-horizon 출력 디렉터리(`training_anchor_aN`) 기준인 **`TRAIN_ANCHOR_TICK_MINUTES` $\to$ `GRID_TICK_MINUTES`** 순으로 anchor 간격을 결정하여, adaptive 샘플링용 설정인 `PEAK_ANCHOR_TICK_MINUTES`와 독립적으로 정확한 워터마크 경로를 조회.
   - 기본 embargo를 실제 기본 계약인 **40**으로 맞춰, fallback 시에도 엉뚱한 `w60_e30_t20` 대신 올바른 `w60_e40_t20` 피처마트 워터마크를 정확히 조회.
 - **신선도 판정 규칙**:
   - 단일 모델 실행 시 공통 워터마크 fallback을 제거하여, 한 모델의 실행이 다른 모델의 피처 생성을 잘못 건너뛰게(Skip) 만드는 현상을 차단.
