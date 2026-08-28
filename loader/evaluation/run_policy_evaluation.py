@@ -10,7 +10,6 @@ from pathlib import Path
 from typing import Any
 
 from gold.rebalance_policy import DEFAULT_REBALANCE_POLICY
-from gold.rebalance_route import MAX_STOPS_PER_ROUTE
 
 from .evaluation_profiles import (
     PROFILE_NAMES,
@@ -66,6 +65,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--s3-endpoint",
         default=os.environ.get("S3_ENDPOINT_URL", "http://localhost:9000"),
     )
+    parser.add_argument(
+        "--database-url",
+        default=os.environ.get(
+            "DATABASE_URL",
+            "postgresql://postgres:postgres@localhost:5433/app",
+        ),
+    )
     parser.add_argument("--s3-bucket", default="issue163-full-year")
     parser.add_argument(
         "--access-key",
@@ -91,7 +97,6 @@ def run_profile_backtests(
     documents = []
     variant = PolicyVariant(
         name=profile.policy_name,
-        max_stops_per_route=MAX_STOPS_PER_ROUTE,
         policy_config=DEFAULT_REBALANCE_POLICY,
     )
     for index, cell in enumerate(profile.cells, start=1):
@@ -106,7 +111,6 @@ def run_profile_backtests(
             start_hour=cell.start_hour,
             evaluation_minutes=profile.evaluation_minutes,
             fleet_size=profile.fleet_size,
-            max_stops_variants=(MAX_STOPS_PER_ROUTE,),
             rental_csv=args.bootstrap_dir
             / f"서울특별시 공공자전거 대여이력 정보_{month}.csv",
             stock_csv=args.bootstrap_dir
@@ -119,6 +123,7 @@ def run_profile_backtests(
             bucket=args.s3_bucket,
             access_key=args.access_key,
             secret_key=args.secret_key,
+            database_url=args.database_url,
             policy_variants=(variant,),
         )
         documents.append(asdict(result))

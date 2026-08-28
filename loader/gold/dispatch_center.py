@@ -9,6 +9,7 @@ from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
+from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
@@ -36,12 +37,16 @@ from .common import (
     read_parquet_bytes,
     store_input_payload,
 )
+from .station import DispatchCenterReference, assign_dispatch_center_id
 from .versioning import PublicationCandidate, allocate_revision
 
-DISPATCH_CENTER_SEED_VERSION = "dispatch-center-v1"
-DISPATCH_CENTER_PUBLISHER_VERSION = "gold-dispatch-center-publisher-v1"
+DISPATCH_CENTER_SEED_VERSION = "dispatch-center-v3"
+DISPATCH_CENTER_PUBLISHER_VERSION = "gold-dispatch-center-publisher-v3"
 EXPECTED_DISPATCH_CENTER_COUNT = 11
 DISPATCH_CENTER_SEED_PATH = "docs/gold/dispatch-center-seed.yaml"
+_APPROVED_DISPATCH_TRANSITION_SHA256 = (
+    "853d48c964f520a33c67a4016d1ba54dc045320675e379c4f7a6b1bc896ba733"
+)
 
 _ROOT_KEYS = frozenset(
     (
@@ -57,7 +62,7 @@ _ROOT_KEYS = frozenset(
 )
 _ASSIGNMENT_KEYS = frozenset(("method", "tie_breaker"))
 _SOURCE_KEYS = frozenset(
-    ("description", "file_sha256", "git_commit", "repository_path")
+    ("description", "file_sha256", "repository_path", "retrieved_dt", "source_url")
 )
 _CENTER_KEYS = frozenset(
     (
@@ -90,7 +95,6 @@ _ALLOWED_ACCURACY = frozenset(
     ("verified_site", "landmark_approximation", "administrative_centroid")
 )
 _CENTER_ID_PATTERN = re.compile(r"[a-z0-9_]+")
-_COMMIT_PATTERN = re.compile(r"[0-9a-f]{40}")
 _DISPATCH_CENTER_SCHEMA = pa.schema(
     (
         pa.field("dispatch_center_id", pa.string(), nullable=False),
@@ -208,12 +212,12 @@ def load_dispatch_center_seed(
 
 
 def parse_dispatch_center_seed(payload: bytes) -> DispatchCenterSeed:
-    """dispatch-center-v1 YAML bytes를 exact 11개 typed center로 파싱한다."""
+    """dispatch-center-v3 YAML bytes를 exact 11개 typed center로 파싱한다."""
     document = _exact_mapping(
         parse_yaml_mapping(payload), _ROOT_KEYS, "dispatch center seed"
     )
-    if document["schema_version"] != 1:
-        raise ContractViolation("dispatch center seed schema_version은 1이어야 합니다.")
+    if document["schema_version"] != 2:
+        raise ContractViolation("dispatch center seed schema_version은 2여야 합니다.")
     seed_version = _nonblank_string(document["seed_version"], "seed_version")
     if seed_version != DISPATCH_CENTER_SEED_VERSION:
         raise ContractViolation("dispatch center seed_version이 SSOT와 다릅니다.")
@@ -229,7 +233,7 @@ def parse_dispatch_center_seed(payload: bytes) -> DispatchCenterSeed:
         "assignment_policy",
     )
     if assignment != {
-        "method": "nearest_geography_distance",
+        "method": "documented_management_area_then_nearest_geography_distance",
         "tie_breaker": "dispatch_center_id_ascending",
     }:
         raise ContractViolation("dispatch center assignment_policy가 SSOT와 다릅니다.")
@@ -238,12 +242,16 @@ def parse_dispatch_center_seed(payload: bytes) -> DispatchCenterSeed:
     source_path = _nonblank_string(source["repository_path"], "source repository_path")
     if source_path != "libs/core/src/core/regions.py":
         raise ContractViolation("dispatch center source repository_path가 다릅니다.")
-    commit = _nonblank_string(source["git_commit"], "source git_commit")
-    if _COMMIT_PATTERN.fullmatch(commit) is None:
-        raise ContractViolation("dispatch center source git_commit 형식이 다릅니다.")
     source_hash = validate_sha256_hex(
         _nonblank_string(source["file_sha256"], "source file_sha256")
     )
+    source_url = _nonblank_string(source["source_url"], "source source_url")
+    if source_url != (
+        "https://github.com/softeerbootcamp-8th/"
+        "DE_team2-GangnamguUmBokDong/issues/60"
+    ):
+        raise ContractViolation("dispatch center source URL이 SSOT와 다릅니다.")
+    _nullable_date(source["retrieved_dt"])
     _nonblank_string(source["description"], "source description")
 
     center_values = document["centers"]
@@ -278,6 +286,9 @@ def publish_dispatch_center(
     if type(seed) is not DispatchCenterSeed:
         raise ContractViolation("seed는 DispatchCenterSeed여야 합니다.")
     seed = parse_dispatch_center_seed(seed.yaml_bytes)
+    approved_dispatch_transition = (
+        sha256(seed.yaml_bytes).hexdigest() == _APPROVED_DISPATCH_TRANSITION_SHA256
+    )
     input_artifact = store_input_payload(
         object_store,
         base_uri=object_base_uri,
@@ -339,7 +350,7 @@ def publish_dispatch_center(
         cursor: Cursor[tuple[Any, ...]],
         evidence: tuple[VerifiedPublicationEvidence, ...],
     ) -> None:
-        """참조 center의 제거·비활성화·Point 변경을 standalone 게시에서 거부한다."""
+        """참조 center 변경을 거부하되 승인된 11개 Point 전환만 허용한다."""
         _require_evidence_keys(evidence, ("dispatch_center",))
         candidate_by_id = {row.dispatch_center_id: row for row in seed.rows}
         cursor.execute(
@@ -364,6 +375,15 @@ def publish_dispatch_center(
         )
         for center_id, current_point in cursor.fetchall():
             candidate_row = candidate_by_id.get(center_id)
+            point_transition = (
+                approved_dispatch_transition
+                and center_id in _EXPECTED_CENTER_IDS
+                and candidate_row is not None
+                and candidate_row.is_active
+                and candidate_row.dispatch_center_point_ewkb != current_point
+            )
+            if point_transition:
+                continue
             if (
                 candidate_row is None
                 or not candidate_row.is_active
@@ -378,7 +398,7 @@ def publish_dispatch_center(
         cursor: Cursor[tuple[Any, ...]],
         evidence: tuple[VerifiedPublicationEvidence, ...],
     ) -> None:
-        """검증된 center staging을 upsert하고 seed 밖 center를 tombstone 처리한다."""
+        """센터를 reconcile하고 승인된 좌표·관리권역 전환만 함께 적용한다."""
         _require_evidence_keys(evidence, ("dispatch_center",))
         cursor.execute(
             """
@@ -418,6 +438,70 @@ def publish_dispatch_center(
                 for row in seed.rows
             ],
         )
+        if approved_dispatch_transition:
+            active_centers = tuple(
+                DispatchCenterReference(
+                    dispatch_center_id=row.dispatch_center_id,
+                    longitude=row.longitude,
+                    latitude=row.latitude,
+                    is_active=True,
+                )
+                for row in sorted(seed.rows)
+                if row.is_active
+            )
+            cursor.execute(
+                """
+                SELECT target.sta_id,
+                       ST_X(target.sta_point),
+                       ST_Y(target.sta_point),
+                       array_agg(
+                           ST_Distance(
+                               target.sta_point::geography,
+                               center.dispatch_center_point::geography
+                           )
+                           ORDER BY center.dispatch_center_id COLLATE "C"
+                       )
+                  FROM station AS target
+                 CROSS JOIN gold_dispatch_center_staging AS center
+                 WHERE center.is_active
+                 GROUP BY target.sta_id, target.sta_point
+                 ORDER BY target.sta_id
+                """
+            )
+            station_assignment_rows = [
+                (
+                    station_id,
+                    assign_dispatch_center_id(
+                        station_id=station_id,
+                        longitude=float(longitude),
+                        latitude=float(latitude),
+                        centers=active_centers,
+                        meters=tuple(float(value) for value in distance_values),
+                    ),
+                )
+                for station_id, longitude, latitude, distance_values in cursor.fetchall()
+            ]
+            cursor.execute(
+                """
+                CREATE TEMP TABLE gold_station_dispatch_assignment (
+                    sta_id TEXT PRIMARY KEY,
+                    dispatch_center_id TEXT NOT NULL
+                ) ON COMMIT DROP
+                """
+            )
+            cursor.executemany(
+                """
+                INSERT INTO gold_station_dispatch_assignment (
+                    sta_id,
+                    dispatch_center_id
+                )
+                VALUES (%s, %s)
+                """,
+                station_assignment_rows,
+            )
+            cursor.execute(
+                "DELETE FROM rebalance_route WHERE route_status_cd = 'proposed'"
+            )
         cursor.execute(
             """
             INSERT INTO dispatch_center (
@@ -447,6 +531,17 @@ def publish_dispatch_center(
                 is_active = EXCLUDED.is_active
             """
         )
+        if approved_dispatch_transition:
+            cursor.execute(
+                """
+                UPDATE station AS target
+                   SET dispatch_center_id = assignment.dispatch_center_id
+                  FROM gold_station_dispatch_assignment AS assignment
+                 WHERE assignment.sta_id = target.sta_id
+                   AND target.dispatch_center_id IS DISTINCT FROM
+                       assignment.dispatch_center_id
+                """
+            )
         cursor.execute(
             """
             UPDATE dispatch_center AS target
@@ -529,20 +624,16 @@ def _validate_rows(rows: tuple[DispatchCenterRow, ...]) -> None:
     names = tuple(row.dispatch_center_nm for row in rows)
     points = tuple(row.dispatch_center_point_ewkb for row in rows)
     if len(set(names)) != len(names) or len(set(points)) != len(points):
-        raise ContractViolation(
-            "dispatch center seed에 중복 명칭 또는 Point가 있습니다."
-        )
+        raise ContractViolation("dispatch center seed에 중복 명칭 또는 Point가 있습니다.")
     accuracy_counts = Counter(row.location_accuracy_cd for row in rows)
-    if accuracy_counts != Counter(
-        {"landmark_approximation": 10, "administrative_centroid": 1}
-    ):
+    if accuracy_counts != Counter({"landmark_approximation": 11}):
         raise ContractViolation("dispatch center 좌표 정확도 분포가 SSOT와 다릅니다.")
-    if any(row.location_verified_dt is not None for row in rows):
+    if any(row.location_verified_dt is None for row in rows):
         raise ContractViolation(
-            "dispatch-center-v1 location_verified_dt는 모두 null이어야 합니다."
+            "dispatch-center-v3의 좌표 대조일은 정확히 11개여야 합니다."
         )
     if any(not row.is_active for row in rows):
-        raise ContractViolation("dispatch-center-v1 center는 모두 active여야 합니다.")
+        raise ContractViolation("dispatch-center-v3 center는 모두 active여야 합니다.")
 
 
 def _rows_to_parquet(rows: tuple[DispatchCenterRow, ...]) -> bytes:

@@ -14,6 +14,7 @@ const ROUTE: Route = {
   cancelled_at: null,
   dismissed_at: null,
   restored_from_route_id: null,
+  route_priority_no: 1,
   stops: [
     { visit_order: 1, sta_id: "ST-1", sta_nm: "회수", lat: 37.51, lon: 127.01, action: "pickup", bike_cnt: 4 },
     { visit_order: 2, sta_id: "ST-2", sta_nm: "공급", lat: 37.52, lon: 127.02, action: "dropoff", bike_cnt: 4 },
@@ -48,6 +49,20 @@ describe("routeOperations", () => {
     expect(groups.candidates.map((route) => route.route_id)).toEqual(["fresh"]);
     expect(groups.hiddenCandidateCount).toBe(1);
     expect(groups.operations).toEqual([]);
+  });
+
+  it("같은 권역 후보는 서버가 계산한 작업 우선순위로 표시한다", () => {
+    const routes = [
+      { ...ROUTE, route_id: "third", route_priority_no: 3 },
+      { ...ROUTE, route_id: "first", route_priority_no: 1 },
+      { ...ROUTE, route_id: "second", route_priority_no: 2 },
+    ];
+
+    expect(groupWorkRoutes(routes).candidates.map((route) => route.route_id)).toEqual([
+      "first",
+      "second",
+      "third",
+    ]);
   });
 
   it("복원 후보가 기존 게시 후보의 신선도 기준을 밀어내지 않는다", () => {

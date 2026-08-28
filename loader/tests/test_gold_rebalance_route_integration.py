@@ -96,21 +96,19 @@ def test_route_publish_replay_coverage_correction_stale_empty_and_rollback(
     assert first_parameters["route_algorithm_version"] == (
         route_module.ROUTE_ALGORITHM_VERSION
     )
-    assert first_parameters["route_work_unit_config_version"] == (
-        route_module.ROUTE_WORK_UNIT_CONFIG_VERSION
+    assert first_parameters["fleet_capacities"] == ",".join(
+        str(capacity) for capacity in route_module.FLEET_CAPACITIES
     )
-    assert first_parameters["pickup_dispatch_sla_config_version"] == (
-        route_module.PICKUP_DISPATCH_SLA_CONFIG_VERSION
+    assert first_parameters["fleet_config_version"] == (
+        route_module.FLEET_CONFIG_VERSION
     )
-    assert first_parameters["pickup_dispatch_assumed_speed_kmh"] == str(
-        route_module.PICKUP_DISPATCH_ASSUMED_SPEED_KMH
-    )
-    assert first_parameters["pickup_dispatch_service_minutes_per_stop"] == str(
-        route_module.PICKUP_DISPATCH_SERVICE_MINUTES_PER_STOP
-    )
-    assert first_parameters["pickup_dispatch_max_lag_minutes"] == str(
-        route_module.PICKUP_DISPATCH_MAX_LAG_MINUTES
-    )
+    assert first_parameters["supply_trigger_stock_ratio"] == "0.20"
+    assert first_parameters["supply_visit_target_stock_ratio"] == "0.40"
+    assert first_parameters["route_max_duration_minutes"] == "120.00"
+    assert first_parameters["route_road_distance_factor"] == "1.25"
+    assert first_parameters["route_assumed_speed_kmh"] == "18.00"
+    assert first_parameters["route_service_minutes_per_stop"] == "4.00"
+    assert first_parameters["route_bike_handling_minutes"] == "0.50"
     assert _route_state(gold_connection) == (anchor, 0, 1)
     first_routes, first_stops = _route_rows(gold_connection)
     assert len(first_routes) == 1
@@ -491,6 +489,16 @@ def _insert_topology_and_dependency_states(
                 ("ST-1", "회수 대여소", 127.001, anchor - timedelta(hours=1), anchor),
                 ("ST-2", "공급 대여소", 127.002, anchor - timedelta(hours=1), anchor),
             ],
+        )
+        cursor.executemany(
+            """
+            INSERT INTO station_stock (
+                sta_id,
+                base_dttm,
+                parking_bike_tot_cnt
+            ) VALUES (%s, %s, %s)
+            """,
+            (("ST-1", anchor, 20), ("ST-2", anchor, 0)),
         )
         for index, (key, logical) in enumerate(
             (

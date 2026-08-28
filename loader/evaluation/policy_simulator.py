@@ -17,7 +17,7 @@ from gold.rebalance_policy import (
     RebalancePolicyConfig,
 )
 from gold.rebalance_route import (
-    MAX_STOPS_PER_ROUTE,
+    FLEET_CAPACITIES,
     DispatchCenterTopology,
     ExistingRoute,
     ExistingRouteStop,
@@ -168,7 +168,6 @@ def simulate_policy(
     initial_stock: Mapping[int, int],
     trips: Sequence[RentalTrip],
     forecast_provider: ForecastProvider | None,
-    max_stops_per_route: int,
     movement_budget: int | None,
     policy_config: RebalancePolicyConfig = LEGACY_REBALANCE_POLICY,
 ) -> SimulationMetrics:
@@ -239,16 +238,6 @@ def simulate_policy(
     empty_station_minutes = 0.0
     last_event_time = start
 
-    topology = tuple(
-        StationRouteTopology(
-            sta_id=station.station_id,
-            dispatch_center_id=center.dispatch_center_id,
-            longitude=station.longitude,
-            latitude=station.latitude,
-            is_active=True,
-        )
-        for station in sorted(selected.values(), key=lambda row: row.station_id)
-    )
     active_station_rows = tuple(
         ActiveStation(
             sta_id=station.station_id,
@@ -404,6 +393,18 @@ def simulate_policy(
             stock_anchor_dttm=base_utc,
             routes=active_routes,
         )
+        topology = tuple(
+            StationRouteTopology(
+                sta_id=station.station_id,
+                dispatch_center_id=center.dispatch_center_id,
+                longitude=station.longitude,
+                latitude=station.latitude,
+                is_active=True,
+                hold_cnt=station.capacity,
+                current_bike_qty=stock[station.station_no],
+            )
+            for station in sorted(selected.values(), key=lambda row: row.station_id)
+        )
         plan = plan_rebalance_routes(
             logical_dttm=base_utc,
             revision_no=0,
@@ -419,7 +420,6 @@ def simulate_policy(
                 for row in urgency.records
             ),
             route_coverage=coverage,
-            max_stops_per_route=max_stops_per_route,
             policy_config=policy_config,
             pickup_cooldown_sta_ids=frozenset(
                 selected[station_no].station_id
@@ -538,7 +538,7 @@ def simulate_policy(
         policy=policy,
         policy_configuration={
             **policy_config.audit_document(),
-            "max_stops_per_route": max_stops_per_route,
+            "fleet_capacities": list(FLEET_CAPACITIES),
         },
         window_start=start.isoformat(),
         window_end=end.isoformat(),
@@ -583,7 +583,6 @@ def simulate_no_rebalance(
         initial_stock=initial_stock,
         trips=trips,
         forecast_provider=None,
-        max_stops_per_route=MAX_STOPS_PER_ROUTE,
         movement_budget=0,
         policy_config=LEGACY_REBALANCE_POLICY,
     )

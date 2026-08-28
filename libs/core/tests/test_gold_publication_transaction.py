@@ -164,14 +164,14 @@ def test_required_lock_scope_reports_missing_registry_mapping(
 
 
 def test_executor_rejects_unverified_prepared_before_database_access() -> None:
-    """sealed evidence가 아닌 raw publication은 DB 연결을 보기 전에 거부한다."""
+    """evidence가 아닌 raw publication은 DB 연결을 보기 전에 거부한다."""
     evidence = _prepared_event(
         datetime.now(UTC) - timedelta(minutes=1),
         revision_no=0,
         content="unverified",
     )
 
-    with pytest.raises(ContractViolation, match="공통 verifier"):
+    with pytest.raises(ContractViolation, match="VerifiedPublicationEvidence"):
         execute_publication(  # type: ignore[arg-type]
             object(),
             [evidence.publication],  # type: ignore[list-item]
@@ -195,36 +195,6 @@ def test_station_stock_requires_station_in_same_transaction() -> None:
             [stock],
             _noop_mutation,
         )
-
-
-def test_executor_snapshot_does_not_reuse_stateful_token_mapping() -> None:
-    """token 검증 뒤 값을 바꾸는 mapping이어도 registry snapshot만 쓴다."""
-
-    class StatefulBusinessTimes(dict[str, tuple[datetime, ...]]):
-        """첫 조회 뒤 business time을 숨기는 상태성 mapping이다."""
-
-        calls = 0
-
-        def __getitem__(self, key: str) -> tuple[datetime, ...]:
-            """첫 검증에만 원본 시각을 반환한다."""
-            self.calls += 1
-            if self.calls == 1:
-                return super().__getitem__(key)
-            return ()
-
-    logical_dttm = datetime.now(UTC) - timedelta(minutes=1)
-    evidence = _prepared_event(
-        logical_dttm,
-        revision_no=0,
-        content="stateful-business-time",
-    )
-    stateful = StatefulBusinessTimes({"last_seen_dttm": (logical_dttm,)})
-    object.__setattr__(evidence.business_times, "values_by_field", stateful)
-
-    snapshot = _prepare_publications((evidence,))[0]
-
-    assert stateful.calls == 1
-    assert snapshot.business_times.all_values == (("last_seen_dttm", logical_dttm),)
 
 
 def test_publish_replay_stale_conflict_and_correction(
@@ -479,12 +449,6 @@ def test_opt_in_mixed_replay_validates_all_and_mutates_published_subset(
         locked_keys.append(
             tuple(item.manifest.publication_key for item in publications)
         )
-        replay_snapshot = next(
-            item
-            for item in publications
-            if item.manifest.publication_key == "event:cultural_event"
-        )
-        object.__setattr__(replay_snapshot.publication, "manifest", published.manifest)
 
     def validate_replayed_targets(
         _cursor: Cursor[tuple[Any, ...]],
@@ -543,7 +507,7 @@ def test_opt_in_mixed_replay_target_failure_rolls_back_new_claim(
         _cursor: Cursor[tuple[Any, ...]],
         _publications: tuple[VerifiedPublicationEvidence, ...],
     ) -> None:
-        """Sealed replay target drift를 모사한다."""
+        """Replay target drift를 모사한다."""
         raise ContractViolation("replayed target drift")
 
     with pytest.raises(ContractViolation, match="replayed target drift"):

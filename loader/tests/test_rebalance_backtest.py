@@ -1,4 +1,4 @@
-"""재배치 정책 백테스트의 잔차·재생·route-v4 연결을 검증한다."""
+"""재배치 정책 백테스트의 잔차·재생·route-v5 연결을 검증한다."""
 
 import json
 from datetime import datetime, timedelta
@@ -107,8 +107,8 @@ def test_replay_applies_pickup_then_dropoff_with_truck_conservation() -> None:
     assert metrics.fulfilled_requests == 1
 
 
-def test_oracle_need_runs_current_route_v4_without_copying_planner() -> None:
-    """실제 미래 shortage와 surplus가 운영 route-v4의 완결 작업으로 이어진다."""
+def test_oracle_need_runs_current_route_v5_without_copying_planner() -> None:
+    """실제 미래 shortage와 surplus가 운영 route-v5의 완결 작업으로 이어진다."""
     center = DispatchCenterTopology("center", 127.0, 37.5, True)
     stations = {
         1: StationMetadata(1, "ST-1", "회수", 37.501, 127.001, "center"),
@@ -145,8 +145,8 @@ def test_oracle_need_runs_current_route_v4_without_copying_planner() -> None:
     assert all(row.executed_at > START for row in actions)
 
 
-def test_current_planner_accepts_evaluation_stop_limit() -> None:
-    """운영 기본값을 바꾸지 않고 평가 실행만 작업 대여소 상한을 제한한다."""
+def test_current_planner_groups_fragmented_need_by_vehicle_capacity() -> None:
+    """흩어진 필요량을 별도 stop 상한 없이 한 차량 경로로 묶는다."""
     center = DispatchCenterTopology("center", 127.0, 37.5, True)
     stations = {
         index: StationMetadata(
@@ -178,7 +178,6 @@ def test_current_planner_accepts_evaluation_stop_limit() -> None:
         center=center,
         stations=stations,
         urgency=urgency,
-        max_stops_per_route=5,
     )
     stops_by_route = {
         route.route_id: [
@@ -186,11 +185,22 @@ def test_current_planner_accepts_evaluation_stop_limit() -> None:
         ]
         for route in plan.routes
     }
-    assert all(len(stops) <= 5 for stops in stops_by_route.values())
+    assert len(stops_by_route) == 1
+    stops = next(iter(stops_by_route.values()))
+    assert sum(
+        stop.bike_cnt
+        for stop in stops
+        if stop.route_action_type_cd == "pickup"
+    ) == 4
+    assert sum(
+        stop.bike_cnt
+        for stop in stops
+        if stop.route_action_type_cd == "dropoff"
+    ) == 4
 
 
-def test_oracle_output_identifies_current_route_v4_contract(tmp_path: Path) -> None:
-    """Oracle JSON과 Markdown은 실제 planner를 route-v4로 식별한다."""
+def test_oracle_output_identifies_current_route_v5_contract(tmp_path: Path) -> None:
+    """Oracle JSON과 Markdown은 실제 planner를 route-v5로 식별한다."""
     no_rebalance = ReplayMetrics(
         policy="no_rebalance",
         observed_requests=1,
@@ -205,7 +215,7 @@ def test_oracle_output_identifies_current_route_v4_contract(tmp_path: Path) -> N
         estimated_vehicle_minutes=0.0,
     )
     current = ReplayMetrics(
-        policy="route_v4_max_stops_5_oracle_need",
+        policy="route_v5_mixed_fleet_oracle_need",
         observed_requests=1,
         fulfilled_requests=1,
         unfulfilled_requests=0,
@@ -230,7 +240,7 @@ def test_oracle_output_identifies_current_route_v4_contract(tmp_path: Path) -> N
         existing_operation=ExistingOperationEstimate(0, 0, 0, 0, 0.0),
         existing_empty_station_hours=0,
         no_rebalance=no_rebalance,
-        current_route_v4=current,
+        current_route_v5=current,
         route_variants=(current,),
         empty_station_hour_change_vs_existing_pct=None,
         assumptions=(),
@@ -240,10 +250,12 @@ def test_oracle_output_identifies_current_route_v4_contract(tmp_path: Path) -> N
     document = json.loads(json_path.read_text(encoding="utf-8"))
     markdown = markdown_path.read_text(encoding="utf-8")
 
-    assert document["current_route_v4"]["policy"] == current.policy
+    assert document["current_route_v5"]["policy"] == current.policy
+    assert "current_route_v4" not in document
     assert "current_route_v3" not in document
     assert "current_route_v2" not in document
-    assert "route-v4" in markdown
+    assert "route-v5" in markdown
+    assert "route-v4" not in markdown
     assert "route-v3" not in markdown
     assert "route-v2" not in markdown
 

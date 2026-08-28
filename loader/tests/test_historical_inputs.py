@@ -1,21 +1,76 @@
 """과거 모델 입력이 anchor 이후 정보를 참조하지 않는지 검증한다."""
 
 from datetime import date, datetime, timedelta
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 import pytest
 from evaluation.historical_inputs import (
+    HistoricalStation,
     WeatherObservation,
+    _dispatch_center_lineage,
     _lag_counts,
     _population_candidate_dates,
     build_population_nowcast,
     latest_published_weather,
 )
 from evaluation.rebalance_backtest import RentalTrip
-from evaluation.run_policy_backtest import _population_required_hours
+from evaluation.run_policy_backtest import (
+    _population_required_hours,
+    _select_center_stations,
+)
 
 SEOUL = ZoneInfo("Asia/Seoul")
 ANCHOR = datetime(2025, 6, 17, 6, tzinfo=SEOUL)
+
+
+def test_station_center_lineage_preserves_published_gold_assignment() -> None:
+    """평가 station lineage가 운영 Gold에 게시된 center 배정을 보존한다."""
+    lineage = {"ST-1": "hangnyeoul"}
+
+    assert _dispatch_center_lineage(
+        {"station_id": "ST-1"},
+        dispatch_center_by_station_id=lineage,
+    ) == "hangnyeoul"
+    assert _dispatch_center_lineage(
+        {"station_id": "ST-1", "dispatch_center_id": "hangnyeoul"},
+        dispatch_center_by_station_id=lineage,
+    ) == "hangnyeoul"
+
+
+def test_station_center_lineage_rejects_missing_or_conflicting_publication() -> None:
+    """평가 station은 Gold lineage 누락이나 원천과의 충돌을 허용하지 않는다."""
+    with pytest.raises(ValueError, match="lineage가 없습니다"):
+        _dispatch_center_lineage(
+            {"station_id": "ST-1"},
+            dispatch_center_by_station_id={},
+        )
+    with pytest.raises(ValueError, match="Gold 배정과 다릅니다"):
+        _dispatch_center_lineage(
+            {"station_id": "ST-1", "dispatch_center_id": "cheonho"},
+            dispatch_center_by_station_id={"ST-1": "hangnyeoul"},
+        )
+
+
+def test_center_station_selection_uses_lineage_instead_of_nearest_distance() -> None:
+    """평가 대상은 좌표 재계산 없이 HistoricalStation의 center lineage를 따른다."""
+    station = HistoricalStation(
+        station_id="ST-1",
+        station_no=1,
+        station_name="대여소",
+        capacity=10,
+        latitude=37.5,
+        longitude=127.0,
+        grid_id="GRID",
+        dispatch_center_id="hangnyeoul",
+    )
+    scorer = SimpleNamespace(
+        station_dtype=SimpleNamespace(categories=(1,)),
+    )
+    model = SimpleNamespace(rental=scorer, returned=scorer)
+
+    assert _select_center_stations((station,), "hangnyeoul", model) == {1: station}
+    assert _select_center_stations((station,), "cheonho", model) == {}
 
 
 def test_weather_uses_only_observation_before_publication_cutoff() -> None:
