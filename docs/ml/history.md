@@ -1208,4 +1208,18 @@ editable 의존성이 새 경로(`../../libs/ml_core`)로 정확히 잡히는지
 2. **동적 Resize 제거**: 스텝 실행 중 노드가 축소/확장될 때 컨테이너가 유실되는 위험을 방지하기 위해, 처음부터 8노드(`TRAINING_CORE_INSTANCE_COUNT = 8`)로 고정 프로비저닝.
 3. **테스트 프로필 격리**: 테스트용 프로필(`a-test-sparse-flat`)의 피처마트 경로(`w65_e45_t20`)를 프로덕션 기본(`w60_e40_t20`)과 물리적으로 분리하여 덮어쓰기 데이터 오염 방지.
 
+---
+
+## 34. Multi-Horizon 워터마크 격리 및 평가 캐시 불연속 구간 이중 집계 방지
+
+**배경 및 원인**:
+1. **단일 모델 실행 시 공통 워터마크 오염**: `build_multi_horizon_features.py --models return` 단독 실행 시 `return` 모델 전용 워터마크뿐만 아니라 공통 워터마크(`_multi_horizon_watermark.json`)까지 최신으로 갱신되어, 뒤이어 실행된 `rental` 모델이 전용 워터마크가 없음에도 공통 워터마크 fallback을 보고 fresh로 오판하여 생성을 잘못 스킵하는 문제가 존재했다.
+2. **평가 캐시 불연속 날짜 이중 집계**: `evaluate_recent_performance_cached()`에서 캐시가 없는 날짜(`missing_days`)가 불연속(예: 08-01, 08-03 결측, 08-02 캐시 존재)일 때 `missing_days[0] ~ missing_days[-1]`(08-01~08-03) 전체를 하나의 shard로 평가하여, 중간에 이미 캐시된 08-02 날짜의 데이터가 최종 `combine_evaluation_shards()`에서 이중 집계되는 버그가 존재했다.
+
+**해결**:
+1. **모델 전용 워터마크 독립성 보장**: `build_multi_horizon_features.py`에서 단일 모델 freshness 검사 시 공통 워터마크 fallback을 완전히 제거하고 전용 워터마크만 바라보도록 수정. 공통 워터마크는 `rental`과 `return` 두 모델의 전용 워터마크가 둘 다 최신일 때만 갱신하도록 조건부 갱신 가드 추가.
+2. **불연속 날짜 연속 구간 분할 (`_group_contiguous_dates`)**: `missing_days`를 연속된 날짜 구간 리스트(예: `[('08-01', '08-01'), ('08-03', '08-03')]`)로 묶어 결측 구간만 정밀하게 샤드로 평가하고 일자별 캐시를 저장하도록 리팩토링.
+3. **회귀 테스트 완비**: `test_model_isolation_when_only_other_model_updated` 및 `test_evaluate_recent_performance_cached_missing_cached_missing_pattern` 추가.
+
+
 

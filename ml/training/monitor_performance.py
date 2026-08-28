@@ -248,6 +248,31 @@ def _eval_cache_key(model_name: str, archive_prefix: str, horizon: int, date_str
     return f"models/eval_cache/{model_name}/{prefix_clean}/h{horizon}/{date_str}.json"
 
 
+def _group_contiguous_dates(dates: list[str]) -> list[tuple[str, str]]:
+    """'YYYY-MM-DD' 문자열 리스트를 연속된 (start, end) 구간들의 리스트로 묶는다.
+
+    args:
+        dates: "YYYY-MM-DD" 형태의 날짜 문자열 리스트
+    returns:
+        list[tuple[str, str]]: 연속된 구간 (시작일, 종료일) 튜플 리스트
+    """
+    if not dates:
+        return []
+    ts_list = sorted(pd.Timestamp(d) for d in dates)
+    ranges: list[tuple[str, str]] = []
+    curr_start = ts_list[0]
+    curr_end = ts_list[0]
+    for ts in ts_list[1:]:
+        if ts == curr_end + pd.Timedelta(days=1):
+            curr_end = ts
+        else:
+            ranges.append((curr_start.strftime("%Y-%m-%d"), curr_end.strftime("%Y-%m-%d")))
+            curr_start = ts
+            curr_end = ts
+    ranges.append((curr_start.strftime("%Y-%m-%d"), curr_end.strftime("%Y-%m-%d")))
+    return ranges
+
+
 def evaluate_recent_performance_cached(
     model_name: str,
     target_col: str,
@@ -282,22 +307,20 @@ def evaluate_recent_performance_cached(
         else:
             missing_days.append(d)
 
-    # 캐시에 없는 빠진 날짜들만 모아서 증분 계산
+    # 캐시에 없는 빠진 날짜들만 연속된 구간별로 묶어 증분 계산
     if missing_days:
-        # 연속된 날짜 구간들로 묶어서 S3 읽기 I/O 최적화
-        range_start = missing_days[0]
-        range_end = missing_days[-1]
-        missing_shard = evaluate_recent_performance_shard(
-            model_name, target_col, exposure_col, (range_start, range_end), horizon
-        )
-        if missing_shard["n_rows"] > 0:
-            shards.append(missing_shard)
-            # 단일 날짜인 경우 캐시 저장
-            if len(missing_days) == 1:
-                s3_io.write_json(
-                    _eval_cache_key(model_name, archive_prefix, horizon, missing_days[0]),
-                    missing_shard,
-                )
+        for r_start, r_end in _group_contiguous_dates(missing_days):
+            missing_shard = evaluate_recent_performance_shard(
+                model_name, target_col, exposure_col, (r_start, r_end), horizon
+            )
+            if missing_shard["n_rows"] > 0:
+                shards.append(missing_shard)
+                # 단일 날짜 구간인 경우 일자별 캐시 저장
+                if r_start == r_end:
+                    s3_io.write_json(
+                        _eval_cache_key(model_name, archive_prefix, horizon, r_start),
+                        missing_shard,
+                    )
 
     baseline = _load_baseline_metrics(model_name)
     return combine_evaluation_shards(model_name, (start, end), shards, baseline)
