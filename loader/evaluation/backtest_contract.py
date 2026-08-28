@@ -7,8 +7,9 @@ from datetime import date
 from typing import Any
 
 from gold.rebalance_route import (
-    PICKUP_DISPATCH_ASSUMED_SPEED_KMH,
-    PICKUP_DISPATCH_SERVICE_MINUTES_PER_STOP,
+    FLEET_CAPACITIES,
+    ROUTE_ASSUMED_SPEED_KMH,
+    ROUTE_SERVICE_MINUTES_PER_STOP,
 )
 
 EVIDENCE_GRADE = "retrospective_heldout_replay"
@@ -32,10 +33,10 @@ class EvaluationContract:
     start_hour: int
     evaluation_minutes: int = 120
     tick_minutes: int = 5
-    fleet_size: int = 3
+    fleet_size: int = len(FLEET_CAPACITIES)
     truck_capacity: int = 20
-    speed_kmh: float = PICKUP_DISPATCH_ASSUMED_SPEED_KMH
-    service_minutes_per_stop: float = PICKUP_DISPATCH_SERVICE_MINUTES_PER_STOP
+    speed_kmh: float = ROUTE_ASSUMED_SPEED_KMH
+    service_minutes_per_stop: float = ROUTE_SERVICE_MINUTES_PER_STOP
     approval_delay_minutes: int = 0
     weather_publication_lag_minutes: int = 60
     population_lookback_weeks: int = 4

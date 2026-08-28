@@ -98,6 +98,7 @@ export interface Route {
   route_id: string;
   work_no: number | null;
   region: string;
+  route_priority_no?: number | null;
   status: RouteStatus;
   proposed_at: string;
   dispatched_at: string | null;
