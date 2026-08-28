@@ -138,11 +138,14 @@ yarn org.apache.hadoop.yarn.applications.distributedshell.Client \
 
 ---
 
-## 6. Feature Mart 워터마크 격리 및 재사용
+## 6. Feature Mart 워터마크 격리 및 프로필 계약 일치
 
 - **모델별 전용 워터마크 (Decision 34)**:
-  - `_multi_horizon_watermark_rental.json`
-  - `_multi_horizon_watermark_return.json`
+  - `_multi_horizon_rental_watermark.json`
+  - `_multi_horizon_return_watermark.json`
+- **프로필 계약 키 및 기본값 일치 (`_extract_profile_feature_params`)**:
+  - `profile_contract.py`의 Uppercase 키(`ROLLING_WINDOW_MINUTES`, `ROLLING_EMBARGO_MINUTES`, `ROLLING_TICK_MINUTES`, `PEAK_ANCHOR_TICK_MINUTES`)를 우선 파싱.
+  - 기본 embargo를 실제 기본 계약인 **40**으로 맞춰, fallback 시에도 엉뚱한 `w60_e30_t20` 대신 올바른 `w60_e40_t20` 피처마트 워터마크를 정확히 조회.
 - **신선도 판정 규칙**:
   - 단일 모델 실행 시 공통 워터마크 fallback을 제거하여, 한 모델의 실행이 다른 모델의 피처 생성을 잘못 건너뛰게(Skip) 만드는 현상을 차단.
   - 공통 워터마크(`_multi_horizon_watermark.json`)는 **`rental`과 `return` 두 모델의 전용 워터마크가 둘 다 동일 소스 기준 최신일 때만 갱신**하여 의미를 보존.

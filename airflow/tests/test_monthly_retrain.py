@@ -690,3 +690,64 @@ def test_bash_step_skips_mlflow_uri_when_not_configured(monkeypatch) -> None:
     monkeypatch.setattr(monthly_dag, "EMR_MLFLOW_TRACKING_URI", "")
     _name, command = monthly_dag._bash_step("Test", "echo hi")
     assert "MLFLOW_TRACKING_URI" not in command[2]
+
+
+def test_extract_profile_feature_params_handles_uppercase_and_defaults() -> None:
+    """프로필 대문자 키와 기본값(embargo=40)이 정확히 반영되는지 검증한다."""
+    # 1. 대문자 계약 딕셔너리
+    uppercase_profile = {
+        "ROLLING_WINDOW_MINUTES": 60,
+        "ROLLING_EMBARGO_MINUTES": 40,
+        "ROLLING_TICK_MINUTES": 20,
+        "PEAK_ANCHOR_TICK_MINUTES": 20,
+    }
+    combo_id, anchor_tick = monthly_dag._extract_profile_feature_params(uppercase_profile)
+    assert combo_id == "w60_e40_t20"
+    assert anchor_tick == 20
+
+    # 2. 빈 프로필 전달 시 기본값 (w60_e40_t20, 20)
+    combo_id_empty, anchor_tick_empty = monthly_dag._extract_profile_feature_params({})
+    assert combo_id_empty == "w60_e40_t20"
+    assert anchor_tick_empty == 20
+
+    # 3. 커스텀 프로필
+    custom_profile = {
+        "ROLLING_WINDOW_MINUTES": 90,
+        "ROLLING_EMBARGO_MINUTES": 45,
+        "ROLLING_TICK_MINUTES": 15,
+        "GRID_TICK_MINUTES": 15,
+    }
+    combo_id_custom, anchor_tick_custom = monthly_dag._extract_profile_feature_params(custom_profile)
+    assert combo_id_custom == "w90_e45_t15"
+    assert anchor_tick_custom == 15
+
+
+def test_is_feature_mart_fresh_with_uppercase_profile_and_dedicated_watermark(monkeypatch) -> None:
+    """대문자 프로필 및 모델 전용 워터마크 경로에서 신선도 검사가 정상 동작하는지 검증한다."""
+    from datetime import UTC, datetime
+
+    now_iso = datetime.now(UTC).isoformat()
+    mock_s3 = {
+        "profiles/default.json": {
+            "ROLLING_WINDOW_MINUTES": 60,
+            "ROLLING_EMBARGO_MINUTES": 40,
+            "ROLLING_TICK_MINUTES": 20,
+            "PEAK_ANCHOR_TICK_MINUTES": 20,
+        },
+        "processed/features/w60_e40_t20/_watermark.json": {
+            "max_hour_ts": "2026-08-28T00:00:00",
+            "updated_at": now_iso,
+        },
+        "processed/features/w60_e40_t20/training_anchor_a20/_multi_horizon_rental_watermark.json": {
+            "max_hour_ts": "2026-08-28T00:00:00",
+            "updated_at": now_iso,
+        },
+    }
+
+    monkeypatch.setattr(monthly_dag, "read_s3_json", lambda key: mock_s3.get(key))
+
+    # 최신 워터마크 -> True
+    assert monthly_dag._is_feature_mart_fresh("default", "rental") is True
+    # return 전용 워터마크는 없음 -> False
+    assert monthly_dag._is_feature_mart_fresh("default", "return") is False
+

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 import json
 import logging
 import subprocess
@@ -267,17 +268,56 @@ def _champion_profile_name(model_name: str) -> str | None:
     return (payload or {}).get("profile_name")
 
 
+def _extract_profile_feature_params(profile_data: dict) -> tuple[str, int]:
+    """프로필 딕셔너리에서 피처마트 combo_id와 anchor_tick을 추출한다.
+
+    args:
+        profile_data: S3에서 로드한 프로필 딕셔너리
+    returns:
+        tuple[str, int]: (combo_id, anchor_tick)
+    """
+    window = (
+        profile_data.get("ROLLING_WINDOW_MINUTES")
+        or profile_data.get("rolling_window_minutes")
+        or 60
+    )
+    embargo = (
+        profile_data.get("ROLLING_EMBARGO_MINUTES")
+        or profile_data.get("rolling_embargo_minutes")
+        or 40  # DEFAULT_PROFILE 기준 기본 embargo는 40
+    )
+    tick = (
+        profile_data.get("ROLLING_TICK_MINUTES")
+        or profile_data.get("rolling_tick_minutes")
+        or 20
+    )
+    anchor_tick = (
+        profile_data.get("PEAK_ANCHOR_TICK_MINUTES")
+        or profile_data.get("peak_anchor_tick_minutes")
+        or profile_data.get("GRID_TICK_MINUTES")
+        or profile_data.get("train_anchor_tick_minutes")
+        or 20
+    )
+    combo_id = f"w{window}_e{embargo}_t{tick}"
+    return combo_id, int(anchor_tick)
+
+
 def _is_feature_mart_fresh(profile: str, model_name: str, max_age_hours: float = 24.0) -> bool:
-    """S3 워터마크를 확인해 피처마트가 최근 max_age_hours 이내에 이미 갱신되었는지 판정한다."""
+    """S3 워터마크를 확인해 피처마트가 최근 max_age_hours 이내에 이미 갱신되었는지 판정한다.
+
+    args:
+        profile: 프로필 이름 (예: "default")
+        model_name: "rental" 또는 "return"
+        max_age_hours: 신선하다고 판단할 최대 경과 시간 (시간 단위)
+    returns:
+        bool: 베이스 및 모델 전용 워터마크가 모두 존재하고 최신이면 True
+    """
     try:
         profile_data = read_s3_json(f"profiles/{profile}.json")
         if not profile_data:
             profile_data = read_s3_json(f"{MODELS_PREFIX}/profiles/{profile}.json") or {}
-        window = profile_data.get("rolling_window_minutes", 60)
-        embargo = profile_data.get("rolling_embargo_minutes", 30)
-        tick = profile_data.get("rolling_tick_minutes", 20)
-        combo_id = f"w{window}_e{embargo}_t{tick}"
-        anchor_tick = profile_data.get("train_anchor_tick_minutes", 20)
+
+        combo_id, anchor_tick = _extract_profile_feature_params(profile_data)
 
         base_wm = read_s3_json(f"processed/features/{combo_id}/_watermark.json")
         if not base_wm or not base_wm.get("updated_at"):
@@ -288,12 +328,7 @@ def _is_feature_mart_fresh(profile: str, model_name: str, max_age_hours: float =
         )
         model_wm = read_s3_json(model_wm_key)
         if not model_wm or not model_wm.get("updated_at"):
-            legacy_wm_key = (
-                f"processed/features/{combo_id}/training_anchor_a{anchor_tick}/_multi_horizon_watermark.json"
-            )
-            model_wm = read_s3_json(legacy_wm_key)
-            if not model_wm or not model_wm.get("updated_at"):
-                return False
+            return False
 
         now = datetime.now(UTC)
         base_updated = datetime.fromisoformat(base_wm["updated_at"])
