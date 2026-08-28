@@ -265,10 +265,6 @@ def _run_cli() -> None:
             continue
         model_wm_path = multi_horizon_watermark_path(model)
         existing_marker = read_watermark(model_wm_path)
-        # 1차: 동일 max_hour_ts + 동일 윈도우 검사
-        # 2차: 2단계 워터마크가 없는 경우 레거시 공통 워터마크 검사
-        if existing_marker is None:
-            existing_marker = read_watermark(config.MULTI_HORIZON_WATERMARK_PATH)
 
         if _multi_horizon_marts_are_fresh(source_watermark, existing_marker, window_since_str, window_until_str):
             print(
@@ -324,12 +320,18 @@ def _run_cli() -> None:
                 {"window_since": window_since_str, "window_until": window_until_str},
             )
 
-    # 레거시 호환용 공통 워터마크 갱신
-    write_watermark(
-        config.MULTI_HORIZON_WATERMARK_PATH,
-        source_watermark["max_hour_ts"],
-        {"window_since": window_since_str, "window_until": window_until_str},
-    )
+    # 레거시 호환용 공통 워터마크는 rental과 return이 둘 다 최신일 때만 갱신한다
+    rental_wm = read_watermark(multi_horizon_watermark_path("rental"))
+    return_wm = read_watermark(multi_horizon_watermark_path("return"))
+    if (
+        _multi_horizon_marts_are_fresh(source_watermark, rental_wm, window_since_str, window_until_str)
+        and _multi_horizon_marts_are_fresh(source_watermark, return_wm, window_since_str, window_until_str)
+    ):
+        write_watermark(
+            config.MULTI_HORIZON_WATERMARK_PATH,
+            source_watermark["max_hour_ts"],
+            {"window_since": window_since_str, "window_until": window_until_str},
+        )
 
 
 if __name__ == "__main__":

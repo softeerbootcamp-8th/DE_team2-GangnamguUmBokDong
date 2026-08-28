@@ -295,3 +295,13 @@ class TestMultiHorizonMartsAreFresh:
         assert _multi_horizon_marts_are_fresh(
             source_watermark, existing_marker, "2026-06-02", "2026-08-28"
         ) is False
+
+    def test_model_isolation_when_only_other_model_updated(self):
+        """한 모델만 갱신되어 공통 워터마크가 최신이더라도, 대상 모델의 전용 워터마크가 없으면 fresh로 오판하지 않아야 한다."""
+        source_watermark = {"max_hour_ts": "2026-08-20T00:00:00"}
+        # rental 모델 전용 워터마크는 없음 (None)
+        rental_marker = None
+
+        assert _multi_horizon_marts_are_fresh(
+            source_watermark, rental_marker, "2026-06-01", "2026-08-27"
+        ) is False
