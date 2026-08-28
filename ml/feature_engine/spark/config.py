@@ -141,6 +141,16 @@ RETURN_MULTI_HORIZON_FEATURES_TABLE_PARQUET = (
     f"{_TRAINING_ANCHOR_OUTPUT_ROOT}/station_hour_features_multihorizon_return_2025.parquet"
 )
 WATERMARK_PATH = f"{OUTPUT_ROOT_KEY}/_watermark.json"
+# build_multi_horizon_features.py는 증분을 지원하지 않아 부를 때마다 매번 전체를
+# 다시 만든다 — monthly_retrain.py는 대여/반납 체인이 각자 독립적으로 같은 profile의
+# feature mart를 요청할 수 있어(2026-08-27 실측: refresh_feature_mart·
+# orchestrate_retrain_loop가 model_name별로 따로 있음), 소스가 안 바뀌었는데도 같은
+# 마트를 중복 재생성하는 낭비가 생긴다. 이 마커에 "마지막 생성 때의 소스
+# WATERMARK_PATH max_hour_ts + 학습 윈도우"를 남겨, 다음 호출이 그때와 똑같으면
+# 재생성을 건너뛸 수 있게 한다(watermark.py의 read/write_watermark를 그대로 재사용).
+MULTI_HORIZON_WATERMARK_PATH = (
+    f"{OUTPUT_ROOT_KEY}/training_anchor_a{TRAIN_ANCHOR_TICK_MINUTES}/_multi_horizon_watermark.json"
+)
 
 # --- 증분 재생성 시 얼마나 과거까지 다시 계산해서 겹치는 구간을 보정할지 (common_config.py에서 공유) ---
 # lag_168h(7일)보다 넉넉하게 잡은 안전 마진 — 이보다 짧으면 새로 추가되는 구간의

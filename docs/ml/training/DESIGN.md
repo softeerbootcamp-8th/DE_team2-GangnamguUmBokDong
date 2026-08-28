@@ -223,6 +223,8 @@ challenger일 뿐 운영 모델이 아니다.
 비교한다. Poisson deviance의 상대 악화와 coverage drift가 임계값을 넘으면 재학습
 후보가 된다.
 
+- **일자별 증분 평가 캐싱**: 매월 30일 전체를 처음부터 다시 계산하지 않고, 일자별 부분합(`sum_deviance_term`, `sum_sq_err`, `sum_coverage_hits`, `n_rows`)을 S3(`models/eval_cache/{model_name}/{archive_prefix}/h{horizon}/{date}.json`)에 캐시한다. 이전 평가에서 계산되지 않은 **새로운/빠진 날짜만 예측**하고 기존 캐시와 합산(`combine_evaluation_shards`)하여 평가 속도를 극대화한다.
+
 `monthly_retrain_check.py --execute`는 호환되는 후보 profile만 순서대로 시도한다.
 각 후보는 별도 subprocess에서 Feature Engine과 학습을 실행하고, 기준을 통과하지
 못하면 기존 포인터를 유지한다. feature 의미가 다른 profile은 무거운 Spark 작업을
@@ -231,6 +233,7 @@ challenger일 뿐 운영 모델이 아니다.
 자동 재학습의 model별 legacy pointer 승격과 pair serving release 게시는 같은 의미가
 아니다. 운영 pair 교체에는 두 모델과 station dependency를 함께 검수한 release 게시가
 필요하다.
+
 
 ## 10. 검증 기준
 

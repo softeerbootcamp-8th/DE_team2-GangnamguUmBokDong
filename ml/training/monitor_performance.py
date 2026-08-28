@@ -119,6 +119,69 @@ def _split_date_range(start: str, end: str, num_shards: int) -> list[tuple[str, 
     return [(chunk[0].strftime("%Y-%m-%d"), chunk[-1].strftime("%Y-%m-%d")) if len(chunk) else None for chunk in chunks]
 
 
+def evaluate_recent_performance_shards_by_day(
+    model_name: str,
+    target_col: str,
+    exposure_col: str | None,
+    date_range: tuple[str, str] | None,
+    horizon: int = 1,
+) -> dict[str, dict]:
+    """날짜 부분구간에 대해 평가를 수행하고 일자별 부분합 딕셔너리를 반환한다.
+
+    args:
+        model_name: "rental" 또는 "return"
+        target_col: "rental_count" 또는 "return_count"
+        exposure_col: predict()에 전달할 exposure 컬럼명 (반납은 None)
+        date_range: (start, end) — 대상 부분구간 (None이면 빈 딕셔너리 반환)
+        horizon: 예측 타겟 horizon
+    returns:
+        dict[str, dict]: {"YYYY-MM-DD": {"n_rows": int, "sum_deviance_term": float, "sum_sq_err": float, "sum_coverage_hits": float}}
+    raises:
+        FileNotFoundError: 대상 테이블이 S3에 존재하지 않을 때
+    """
+    if date_range is None:
+        return {}
+    start, end = date_range
+    table_path = _TRAINING_TABLE_BY_MODEL[model_name]
+    feature_columns = _FEATURE_COLUMNS_BY_MODEL[model_name]
+    needed = sorted(
+        set(feature_columns) | {target_col, "horizon", "date", "hour"} | ({exposure_col} if exposure_col else set())
+    )
+    df = s3_io.read_parquet(table_path, columns=needed, date_range=(start, end), filters=[("horizon", "==", horizon)])
+    if df is None:
+        raise FileNotFoundError(f"S3에 없음: {table_path}")
+    if df.empty:
+        return {}
+
+    preds = predict(df, model_name, exposure_col=exposure_col)
+    y = df[target_col].to_numpy()
+    pred_mean = preds["pred_mean"].to_numpy()
+
+    mu = np.clip(pred_mean, 1e-6, None)
+    y_safe = np.where(y > 0, y, 1.0)
+    deviance_term = np.where(y > 0, y * np.log(y_safe / mu) - (y - mu), mu)
+    coverage_hit = ((y >= preds["pred_p10"].to_numpy()) & (y <= preds["pred_p90"].to_numpy())).astype(float)
+    sq_err = (y - pred_mean) ** 2
+
+    df_eval = pd.DataFrame({
+        "date": df["date"].astype(str),
+        "deviance_term": deviance_term,
+        "sq_err": sq_err,
+        "coverage_hit": coverage_hit,
+    })
+
+    result_by_day: dict[str, dict] = {}
+    for d, g in df_eval.groupby("date"):
+        result_by_day[str(d)] = {
+            "n_rows": len(g),
+            "sum_deviance_term": float(g["deviance_term"].sum()),
+            "sum_sq_err": float(g["sq_err"].sum()),
+            "sum_coverage_hits": float(g["coverage_hit"].sum()),
+        }
+
+    return result_by_day
+
+
 def evaluate_recent_performance_shard(
     model_name: str,
     target_col: str,
@@ -126,17 +189,11 @@ def evaluate_recent_performance_shard(
     date_range: tuple[str, str] | None,
     horizon: int = 1,
 ) -> dict:
-    """`date_range`(전체 평가 구간의 부분 조각일 수 있음)에 대해서만 예측하고,
-    최종 지표로 합치기 전의 "부분합"을 반환한다.
+    """`evaluate_recent_performance()`의 핵심 계산을 날짜 부분구간에 대해 실행한다.
 
-    분산 평가(`training/scripts/yarn_eval_worker.py`)의 워커 하나가 부르는
-    함수 — 오케스트레이터(`monthly_retrain_check._run_distributed_evaluation_via_yarn()`)가
-    이 부분합들을 모아 `combine_evaluation_shards()`로 합친다. `evaluate_recent_
-    performance()`도 내부적으로 이 함수를 (전체 구간을 "조각 1개"로) 호출해서
-    두 경로가 정확히 같은 계산을 공유하게 한다.
-
-    poisson_deviance/RMSE/coverage가 전부 "행 단위 값의 평균"이라(`ml_core.
-    metrics.poisson_deviance` 참고) 부분합(합계 + 행 수)만 있으면 나중에
+    각 워커는 자기가 맡은 날짜 부분구간만 읽어 `(n_rows, sum_deviance_term,
+    sum_sq_err, sum_coverage_hits)` 네 가지 "부분합"만 계산해서 돌려준다.
+    `combine_evaluation_shards()`는 이 조각들을 단순히 더하기만 해도(선형성)
     합쳐도 전체를 한 번에 계산한 것과 수학적으로 완전히 동일하다 — 근사가
     아니다.
 
@@ -153,49 +210,16 @@ def evaluate_recent_performance_shard(
             n_rows=0이면 나머지 sum_*은 전부 0.0(이 조각에 해당 날짜가 없거나
             비어 있었다는 뜻 — 오류가 아니다).
     """
-    if date_range is None:
-        return {"n_rows": 0, "sum_deviance_term": 0.0, "sum_sq_err": 0.0, "sum_coverage_hits": 0.0}
-    start, end = date_range
-    table_path = _TRAINING_TABLE_BY_MODEL[model_name]
-    feature_columns = _FEATURE_COLUMNS_BY_MODEL[model_name]
-    # "date"/"hour"도 넣어야 한다 — scoring.predict()가 마지막에
-    # `df[["station_no", "date", "hour"]]`로 식별 컬럼을 그대로 뽑아 쓴다(리뷰
-    # 지적: 예전엔 여기서 뺐다가 predict()에서 매번 KeyError로 죽었다). "date"는
-    # Spark 파티션 컬럼이라 파일엔 없지만 core.s3._read_parquet_by_dates()가
-    # columns=에 포함된 경우에만 복원한다(그 함수의 2026-08 수정 참고 — 포함 안
-    # 하면 그 복원 자체를 건너뛰므로, 여기서 넣는다고 불필요한 비용이 생기진
-    # 않는다). "hour"는 더 이상 모델 feature가 아니지만(minute이 대체) 파일
-    # 내용에는 여전히 있는 식별용 컬럼이라 feature_columns에 안 잡힌다.
-    needed = sorted(
-        set(feature_columns) | {target_col, "horizon", "date", "hour"} | ({exposure_col} if exposure_col else set())
+    by_day = evaluate_recent_performance_shards_by_day(
+        model_name, target_col, exposure_col, date_range, horizon=horizon
     )
-    # multi-horizon 테이블은 같은 날짜 파티션 안에 horizon마다 행이 다 섞여 있다
-    # (기본 8개: common_config.TRAIN_HORIZONS) — `filters`를 안 주면 이 구간의
-    # 8개 horizon 전부를 pandas로 읽어들인 "뒤"에 `df["horizon"]==horizon`으로
-    # 걸러서, 실제 필요한 양의 최대 8배를 메모리에 올린다(m4.large 컨테이너
-    # 메모리 상한 6144MB를 꽉 채워도 exitCode 137로 죽는 것으로 실제 EMR
-    # 실행에서 확인, 2026-08-26). pyarrow row-group 필터(`filters=`)로 애초에
-    # 이 horizon 행만 읽는다 — `core.s3.read_parquet()` docstring 참고.
-    df = s3_io.read_parquet(table_path, columns=needed, date_range=(start, end), filters=[("horizon", "==", horizon)])
-    if df is None:
-        raise FileNotFoundError(f"S3에 없음: {table_path}")
-    if df.empty:
+    if not by_day:
         return {"n_rows": 0, "sum_deviance_term": 0.0, "sum_sq_err": 0.0, "sum_coverage_hits": 0.0}
-
-    preds = predict(df, model_name, exposure_col=exposure_col)
-    y = df[target_col].to_numpy()
-    pred_mean = preds["pred_mean"].to_numpy()
-
-    mu = np.clip(pred_mean, 1e-6, None)
-    y_safe = np.where(y > 0, y, 1.0)
-    deviance_term = np.where(y > 0, y * np.log(y_safe / mu) - (y - mu), mu)
-    coverage_hit = (y >= preds["pred_p10"].to_numpy()) & (y <= preds["pred_p90"].to_numpy())
-
     return {
-        "n_rows": len(df),
-        "sum_deviance_term": float(np.sum(deviance_term)),
-        "sum_sq_err": float(np.sum((y - pred_mean) ** 2)),
-        "sum_coverage_hits": float(np.sum(coverage_hit)),
+        "n_rows": sum(s["n_rows"] for s in by_day.values()),
+        "sum_deviance_term": sum(s["sum_deviance_term"] for s in by_day.values()),
+        "sum_sq_err": sum(s["sum_sq_err"] for s in by_day.values()),
+        "sum_coverage_hits": sum(s["sum_coverage_hits"] for s in by_day.values()),
     }
 
 
@@ -242,6 +266,92 @@ def combine_evaluation_shards(
     }
 
 
+def _eval_cache_key(model_name: str, archive_prefix: str, horizon: int, date_str: str) -> str:
+    """일자별 평가 부분합 캐시의 S3 키를 반환한다."""
+    prefix_clean = archive_prefix.strip("/").replace("/", "_")
+    return f"models/eval_cache/{model_name}/{prefix_clean}/h{horizon}/{date_str}.json"
+
+
+def _group_contiguous_dates(dates: list[str]) -> list[tuple[str, str]]:
+    """'YYYY-MM-DD' 문자열 리스트를 연속된 (start, end) 구간들의 리스트로 묶는다.
+
+    args:
+        dates: "YYYY-MM-DD" 형태의 날짜 문자열 리스트
+    returns:
+        list[tuple[str, str]]: 연속된 구간 (시작일, 종료일) 튜플 리스트
+    """
+    if not dates:
+        return []
+    ts_list = sorted(pd.Timestamp(d) for d in dates)
+    ranges: list[tuple[str, str]] = []
+    curr_start = ts_list[0]
+    curr_end = ts_list[0]
+    for ts in ts_list[1:]:
+        if ts == curr_end + pd.Timedelta(days=1):
+            curr_end = ts
+        else:
+            ranges.append((curr_start.strftime("%Y-%m-%d"), curr_end.strftime("%Y-%m-%d")))
+            curr_start = ts
+            curr_end = ts
+    ranges.append((curr_start.strftime("%Y-%m-%d"), curr_end.strftime("%Y-%m-%d")))
+    return ranges
+
+
+def evaluate_recent_performance_cached(
+    model_name: str,
+    target_col: str,
+    exposure_col: str | None,
+    start: str,
+    end: str,
+    horizon: int = 1,
+) -> dict:
+    """평가 대상 구간의 일자별 부분합 캐시를 활용해, 빠진 날짜만 증분 계산하고 최종 합산한다.
+
+    args:
+        model_name: "rental" 또는 "return"
+        target_col: "rental_count" 또는 "return_count"
+        exposure_col: exposure 컬럼명
+        start: 시작일 ("YYYY-MM-DD")
+        end: 종료일 ("YYYY-MM-DD")
+        horizon: 예측 타겟 horizon
+    returns:
+        dict: combine_evaluation_shards() 결과
+    """
+    archive_prefix = read_champion_prefix(model_name)
+    all_days = [d.strftime("%Y-%m-%d") for d in pd.date_range(start, end, freq="D")]
+
+    shards: list[dict] = []
+    missing_days: list[str] = []
+
+    for d in all_days:
+        cache_key = _eval_cache_key(model_name, archive_prefix, horizon, d)
+        cached = s3_io.read_json(cache_key)
+        if cached is not None and "n_rows" in cached:
+            shards.append(cached)
+        else:
+            missing_days.append(d)
+
+    # 캐시에 없는 빠진 날짜들만 연속된 구간별로 묶어 증분 계산하고 일자별 캐시 저장
+    if missing_days:
+        for r_start, r_end in _group_contiguous_dates(missing_days):
+            day_shards = evaluate_recent_performance_shards_by_day(
+                model_name, target_col, exposure_col, (r_start, r_end), horizon
+            )
+            for day_str, day_shard in day_shards.items():
+                if day_shard["n_rows"] > 0:
+                    shards.append(day_shard)
+                    s3_io.write_json(
+                        _eval_cache_key(model_name, archive_prefix, horizon, day_str),
+                        day_shard,
+                    )
+
+    baseline = _load_baseline_metrics(model_name)
+    return combine_evaluation_shards(model_name, (start, end), shards, baseline)
+
+    baseline = _load_baseline_metrics(model_name)
+    return combine_evaluation_shards(model_name, (start, end), shards, baseline)
+
+
 def evaluate_recent_performance(
     model_name: str,
     target_col: str,
@@ -270,12 +380,10 @@ def evaluate_recent_performance(
     lookback_months = lookback_months or config.MONITOR_LOOKBACK_MONTHS
     start, end = _recent_month_range(lookback_months, as_of)
 
-    # date_range로 이번에 볼 N개월 파티션만 받는다 — 그동안 쌓인 전체 히스토리를 매달
-    # 실행할 때마다 다 받으면, 실행 비용이 "최근 N개월"이 아니라 "서비스 시작 이후
-    # 전체 기간"에 비례해서 계속 커진다(s3_io.py 모듈 docstring 참고).
-    shard = evaluate_recent_performance_shard(model_name, target_col, exposure_col, (start, end), horizon)
-    baseline = _load_baseline_metrics(model_name)
-    return combine_evaluation_shards(model_name, (start, end), [shard], baseline)
+    return evaluate_recent_performance_cached(
+        model_name, target_col, exposure_col, start, end, horizon=horizon
+    )
+
 
 
 def decide_retrain(evaluation: dict) -> dict:

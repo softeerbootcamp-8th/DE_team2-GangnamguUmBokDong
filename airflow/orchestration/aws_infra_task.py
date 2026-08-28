@@ -883,10 +883,11 @@ def submit_emr_step(
     command: list[str],
     *,
     action_on_failure: str = "CONTINUE",
-    timeout_seconds: int = 5400,
+    timeout_seconds: int = 345600,
     region_name: str | None = None,
     mock_override: str | None = None,
 ) -> dict[str, Any]:
+
     """이미 떠 있는(KeepJobFlowAliveWhenNoSteps=True) EMR 클러스터에 범용 스텝
     하나를 제출하고 완료까지 대기한다.
 
