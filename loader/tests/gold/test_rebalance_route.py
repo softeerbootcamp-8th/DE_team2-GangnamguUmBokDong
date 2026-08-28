@@ -1,10 +1,8 @@
-"""Gold rebalance route-v4 planner·coverage·Parquet 계약을 검증한다."""
+"""Gold rebalance route-v5 planner·coverage·Parquet 계약을 검증한다."""
 
 from __future__ import annotations
 
 import json
-import math
-from collections import Counter
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
@@ -31,18 +29,18 @@ from gold.rebalance_policy import (
     risk_band_policy,
 )
 from gold.rebalance_route import (
+    FLEET_CAPACITIES,
+    FLEET_CONFIG_VERSION,
     INITIAL_TRUCK_LOAD,
-    MAX_ROUTES_PER_CENTER,
-    MAX_STOPS_PER_ROUTE,
-    PICKUP_DISPATCH_ASSUMED_SPEED_KMH,
-    PICKUP_DISPATCH_MAX_LAG_MINUTES,
-    PICKUP_DISPATCH_SERVICE_MINUTES_PER_STOP,
-    PICKUP_DISPATCH_SLA_CONFIG_VERSION,
+    MAX_TRUCK_CAPACITY,
     ROUTE_ALGORITHM_VERSION,
+    ROUTE_ASSUMED_SPEED_KMH,
+    ROUTE_BIKE_HANDLING_MINUTES,
+    ROUTE_MAX_DURATION_MINUTES,
     ROUTE_PUBLISHER_VERSION,
-    ROUTE_WORK_UNIT_CONFIG_VERSION,
-    TRUCK_CAPACITY,
-    TRUCK_CAPACITY_CONFIG_VERSION,
+    ROUTE_ROAD_DISTANCE_FACTOR,
+    ROUTE_SERVICE_MINUTES_PER_STOP,
+    SUPPLY_VISIT_TARGET_STOCK_RATIO,
     DispatchCenterTopology,
     ExistingRoute,
     ExistingRouteStop,
@@ -81,6 +79,8 @@ def _station(
     longitude: float = _CENTER_LONGITUDE,
     latitude: float = _CENTER_LATITUDE,
     is_active: bool = True,
+    hold_cnt: int = 1,
+    current_bike_qty: int = 1,
 ) -> StationRouteTopology:
     """테스트용 current station topology를 만든다."""
     return StationRouteTopology(
@@ -89,6 +89,8 @@ def _station(
         longitude,
         latitude,
         is_active,
+        hold_cnt,
+        current_bike_qty,
     )
 
 
@@ -144,58 +146,59 @@ def _plan(
     urgency: tuple[RouteUrgencyInput, ...],
     revision_no: int = 0,
     coverage=None,
-    max_stops_per_route: int = MAX_STOPS_PER_ROUTE,
     policy_config: RebalancePolicyConfig = LEGACY_REBALANCE_POLICY,
     pickup_cooldown_sta_ids: frozenset[str] = frozenset(),
 ) -> RebalanceRoutePlan:
     """공통 anchor로 pure route planner를 실행한다."""
+    supply_qty_by_id = {
+        row.sta_id: row.bike_qty
+        for row in urgency
+        if row.action_type == "supply_needed" and row.bike_qty > 0
+    }
+    normalized_stations = tuple(
+        StationRouteTopology(
+            station.sta_id,
+            station.dispatch_center_id,
+            station.longitude,
+            station.latitude,
+            station.is_active,
+            supply_qty_by_id[station.sta_id],
+            0,
+        )
+        if (
+            station.hold_cnt == 1
+            and station.current_bike_qty == 1
+            and station.sta_id in supply_qty_by_id
+        )
+        else station
+        for station in stations
+    )
     return plan_rebalance_routes(
         logical_dttm=_UTC_1600,
         revision_no=revision_no,
         dispatch_centers=centers,
-        stations=stations,
+        stations=normalized_stations,
         urgency=urgency,
         route_coverage=coverage or _empty_coverage(),
-        max_stops_per_route=max_stops_per_route,
         policy_config=policy_config,
         pickup_cooldown_sta_ids=pickup_cooldown_sta_ids,
     )
 
 
 def test_route_constants_match_publication_contract() -> None:
-    """route fingerprint에 들어가는 v4 작업·SLA 상수를 SSOT 값으로 고정한다."""
-    assert ROUTE_ALGORITHM_VERSION == "route-v4-supply-led-pickup-sla"
-    assert ROUTE_PUBLISHER_VERSION == "gold-route-publisher-v3-pickup-sla"
-    assert TRUCK_CAPACITY == 20
-    assert TRUCK_CAPACITY_CONFIG_VERSION == "truck-capacity-v1"
+    """route fingerprint에 들어가는 v5 혼합 차량 구성을 SSOT 값으로 고정한다."""
+    assert ROUTE_ALGORITHM_VERSION == "route-v5-supply-led-mixed-fleet"
+    assert ROUTE_PUBLISHER_VERSION == "gold-route-publisher-v4-mixed-fleet"
+    assert FLEET_CAPACITIES == (20, 20, 15, 15)
+    assert FLEET_CONFIG_VERSION == "mixed-fleet-v1-two-20-two-15-per-center"
+    assert MAX_TRUCK_CAPACITY == 20
     assert INITIAL_TRUCK_LOAD == 0
-    assert MAX_STOPS_PER_ROUTE == 5
-    assert MAX_ROUTES_PER_CENTER == 3
-    assert ROUTE_WORK_UNIT_CONFIG_VERSION == "route-work-unit-v3-pickup-sla"
-    assert PICKUP_DISPATCH_SLA_CONFIG_VERSION == "pickup-dispatch-sla-v1"
-    assert PICKUP_DISPATCH_ASSUMED_SPEED_KMH == 20.0
-    assert PICKUP_DISPATCH_SERVICE_MINUTES_PER_STOP == 3.0
-    assert PICKUP_DISPATCH_MAX_LAG_MINUTES == 30.0
-
-
-def test_planner_can_override_stop_limit_for_offline_evaluation() -> None:
-    """게시 기본값을 바꾸지 않고 순수 planner의 stop 상한을 좁혀 비교한다."""
-    stations = tuple(_station(f"ST-{index}") for index in range(1, 9))
-    urgency = tuple(
-        _urgency(f"ST-{index}", "retrieval_needed", 1) for index in range(1, 5)
-    ) + tuple(_urgency(f"ST-{index}", "supply_needed", 1) for index in range(5, 9))
-
-    plan = _plan(
-        stations=stations,
-        urgency=urgency,
-        max_stops_per_route=5,
-    )
-    route_stop_counts = Counter(stop.route_id for stop in plan.route_stops)
-
-    assert route_stop_counts
-    assert max(route_stop_counts.values()) <= 5
-    with pytest.raises(ContractViolation, match="max_stops_per_route"):
-        _plan(stations=stations, urgency=urgency, max_stops_per_route=1)
+    assert ROUTE_MAX_DURATION_MINUTES == 120.0
+    assert ROUTE_ROAD_DISTANCE_FACTOR == 1.25
+    assert ROUTE_ASSUMED_SPEED_KMH == 18.0
+    assert ROUTE_SERVICE_MINUTES_PER_STOP == 4.0
+    assert ROUTE_BIKE_HANDLING_MINUTES == 0.5
+    assert SUPPLY_VISIT_TARGET_STOCK_RATIO == 0.40
 
 
 def test_empty_plan_excludes_normal_and_nonpositive_quantities() -> None:
@@ -212,6 +215,91 @@ def test_empty_plan_excludes_normal_and_nonpositive_quantities() -> None:
     assert plan == RebalanceRoutePlan((), ())
     with pytest.raises(ContractViolation, match="EMPTY.*artifact"):
         route_plan_to_parquet(plan)
+
+
+def test_selected_supply_station_recovers_from_20_to_40_percent() -> None:
+    """양수 공급 후보는 정원의 20% 필수량에 40% 방문 회복분을 더한다."""
+    plan = _plan(
+        stations=(
+            _station("ST-1"),
+            _station("ST-2", hold_cnt=20, current_bike_qty=1),
+        ),
+        urgency=(
+            _urgency("ST-1", "retrieval_needed", 8),
+            _urgency("ST-2", "supply_needed", 2),
+        ),
+    )
+
+    assert [
+        (stop.sta_id, stop.route_action_type_cd, stop.bike_cnt)
+        for stop in plan.route_stops
+    ] == [
+        ("ST-1", "pickup", 6),
+        ("ST-2", "dropoff", 6),
+    ]
+
+
+def test_supply_recovery_respects_current_physical_headroom() -> None:
+    """40% 방문 회복분은 현재 빈 거치 공간을 넘겨 추가하지 않는다."""
+    plan = _plan(
+        stations=(
+            _station("ST-1"),
+            _station("ST-2", hold_cnt=20, current_bike_qty=17),
+        ),
+        urgency=(
+            _urgency("ST-1", "retrieval_needed", 4),
+            _urgency("ST-2", "supply_needed", 2),
+        ),
+    )
+
+    assert [
+        stop.bike_cnt
+        for stop in plan.route_stops
+        if stop.route_action_type_cd == "dropoff"
+    ] == [3]
+
+
+def test_required_supply_is_clamped_to_current_physical_headroom() -> None:
+    """필수 공급량도 현재 빈 거치 공간을 넘지 않는다."""
+    plan = _plan(
+        stations=(
+            _station("ST-1"),
+            _station("ST-2", hold_cnt=20, current_bike_qty=19),
+        ),
+        urgency=(
+            _urgency("ST-1", "retrieval_needed", 5),
+            _urgency("ST-2", "supply_needed", 5),
+        ),
+    )
+
+    assert [
+        (stop.route_action_type_cd, stop.bike_cnt)
+        for stop in plan.route_stops
+    ] == [("pickup", 1), ("dropoff", 1)]
+
+
+def test_supply_recovery_reduces_fragmented_positive_dropoff_stops() -> None:
+    """우선순위 공급처를 넉넉히 채워 자잘한 양수 공급 stop 수를 줄인다."""
+    supply_stations = tuple(
+        _station(f"ST-{index}", hold_cnt=20, current_bike_qty=0)
+        for index in range(2, 12)
+    )
+    plan = _plan(
+        stations=(_station("ST-1"), *supply_stations),
+        urgency=(
+            _urgency("ST-1", "retrieval_needed", 10),
+            *tuple(
+                _urgency(f"ST-{index}", "supply_needed", 1, score=100 - index)
+                for index in range(2, 12)
+            ),
+        ),
+    )
+    dropoffs = [
+        stop for stop in plan.route_stops if stop.route_action_type_cd == "dropoff"
+    ]
+
+    assert len(dropoffs) == 2
+    assert [stop.bike_cnt for stop in dropoffs] == [5, 5]
 
 
 def test_empty_publication_rejects_physical_parquet_artifacts() -> None:
@@ -566,7 +654,6 @@ def test_supply_anchor_pickup_uses_center_to_donor_to_supply_total_distance() ->
             _urgency("ST-2", "retrieval_needed", 10, score=100),
             _urgency("ST-3", "supply_needed", 10, score=100),
         ),
-        max_stops_per_route=2,
     )
 
     assert [stop.sta_id for stop in plan.route_stops] == ["ST-1", "ST-3"]
@@ -607,12 +694,12 @@ def test_pickups_precede_supply_anchor_and_keep_running_load_valid() -> None:
         running_load += (
             stop.bike_cnt if stop.route_action_type_cd == "pickup" else -stop.bike_cnt
         )
-        assert 0 <= running_load <= TRUCK_CAPACITY
+        assert 0 <= running_load <= MAX_TRUCK_CAPACITY
     assert running_load == 0
 
 
-def test_pickup_dispatch_sla_splits_large_work_into_complete_routes() -> None:
-    """각 donor는 30분 내지만 다중 donor가 초과하면 한 대씩 분리한다."""
+def test_time_budget_splits_distant_donors_without_losing_work() -> None:
+    """먼 donor는 여러 완결 경로로 나누되 처리 가능한 수량은 보존한다."""
     stations = (
         _station("ST-1", longitude=127.09),
         _station("ST-2", longitude=126.91),
@@ -629,40 +716,16 @@ def test_pickup_dispatch_sla_splits_large_work_into_complete_routes() -> None:
         ),
     )
 
-    assert len(plan.routes) == MAX_ROUTES_PER_CENTER == 3
-    station_by_id = {station.sta_id: station for station in stations}
-    selected_pickups: set[str] = set()
-    for route in plan.routes:
-        stops = [stop for stop in plan.route_stops if stop.route_id == route.route_id]
-        pickup_stops = [
-            stop for stop in stops if stop.route_action_type_cd == "pickup"
-        ]
-        dropoff_stops = [
-            stop for stop in stops if stop.route_action_type_cd == "dropoff"
-        ]
-        assert len(pickup_stops) == len(dropoff_stops) == 1
-        assert sum(stop.bike_cnt for stop in pickup_stops) == sum(
-            stop.bike_cnt for stop in dropoff_stops
-        )
-        selected_pickups.add(pickup_stops[0].sta_id)
-        pickup = station_by_id[pickup_stops[0].sta_id]
-        dispatch_lag = (
-            route_module._haversine_km(
-                _CENTER_LONGITUDE,
-                _CENTER_LATITUDE,
-                pickup.longitude,
-                pickup.latitude,
-            )
-            / PICKUP_DISPATCH_ASSUMED_SPEED_KMH
-            * 60.0
-            + PICKUP_DISPATCH_SERVICE_MINUTES_PER_STOP
-        )
-        assert dispatch_lag <= PICKUP_DISPATCH_MAX_LAG_MINUTES
-    assert selected_pickups == {"ST-1", "ST-2", "ST-3"}
+    assert 1 <= len(plan.routes) <= 3
+    assert {
+        stop.sta_id
+        for stop in plan.route_stops
+        if stop.route_action_type_cd == "pickup"
+    } == {"ST-1", "ST-2", "ST-3"}
 
 
-def test_pickup_sla_skips_incompatible_prefix_without_losing_later_donor() -> None:
-    """먼 중간 donor를 건너뛰어 같은 방향 donor를 한 route로 묶는다."""
+def test_input_order_does_not_change_distance_ranked_route() -> None:
+    """거리 기반 donor 순위와 경로 결과는 입력 행 순서와 무관하다."""
     stations = (
         _station("ST-1", longitude=127.080),
         _station("ST-2", longitude=126.919),
@@ -680,72 +743,17 @@ def test_pickup_sla_skips_incompatible_prefix_without_losing_later_donor() -> No
         urgency=urgency,
     )
 
-    assert len(plan.routes) == 2
-    first_route_pickups = [
+    assert len(plan.routes) == 3
+    route_pickups = [
         stop.sta_id
         for stop in plan.route_stops
-        if stop.route_id == plan.routes[0].route_id
-        and stop.route_action_type_cd == "pickup"
+        if stop.route_action_type_cd == "pickup"
     ]
-    second_route_pickups = [
-        stop.sta_id
-        for stop in plan.route_stops
-        if stop.route_id == plan.routes[1].route_id
-        and stop.route_action_type_cd == "pickup"
-    ]
-    assert first_route_pickups == ["ST-1", "ST-3"]
-    assert second_route_pickups == ["ST-2"]
+    assert set(route_pickups) == {"ST-1", "ST-2", "ST-3"}
     assert _plan(
         stations=tuple(reversed(stations)),
         urgency=tuple(reversed(urgency)),
     ) == plan
-
-
-def test_pickup_dispatch_sla_includes_exact_boundary_and_rejects_above(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Pickup lag 30.0분은 포함하고 최소 초과값은 거부한다."""
-    pickup = route_module._Candidate("ST-1", "pickup", 100.0, 1, 127.0, 37.5)
-    dropoff = route_module._Candidate("ST-2", "dropoff", 100.0, 1, 127.0, 37.5)
-
-    monkeypatch.setattr(route_module, "_haversine_km", lambda *_: 9.0)
-    assert route_module._choose_balanced_stop_split(
-        [pickup],
-        [dropoff],
-        start=(_CENTER_LONGITUDE, _CENTER_LATITUDE),
-        max_stops_per_route=2,
-    ) == (1, 1, 1)
-
-    monkeypatch.setattr(
-        route_module,
-        "_haversine_km",
-        lambda *_: math.nextafter(9.0, math.inf),
-    )
-    assert (
-        route_module._choose_balanced_stop_split(
-            [pickup],
-            [dropoff],
-            start=(_CENTER_LONGITUDE, _CENTER_LATITUDE),
-            max_stops_per_route=2,
-        )
-        is None
-    )
-
-
-def test_pickup_outside_dispatch_sla_is_excluded() -> None:
-    """단독 접근만으로도 30분을 넘는 donor는 제안하지 않는다."""
-    plan = _plan(
-        stations=(
-            _station("ST-1", longitude=127.11),
-            _station("ST-2"),
-        ),
-        urgency=(
-            _urgency("ST-1", "retrieval_needed", 1, score=100),
-            _urgency("ST-2", "supply_needed", 1, score=100),
-        ),
-    )
-
-    assert plan == RebalanceRoutePlan((), ())
 
 
 def test_capacity_rollover_uses_one_based_ordinal_and_ssot_uuid() -> None:
@@ -783,7 +791,7 @@ def test_dropoff_is_limited_by_actual_pickup_per_route() -> None:
         dropped = sum(
             stop.bike_cnt for stop in stops if stop.route_action_type_cd == "dropoff"
         )
-        assert dropped == picked <= TRUCK_CAPACITY
+        assert dropped == picked <= MAX_TRUCK_CAPACITY
     assert (
         sum(
             stop.bike_cnt
@@ -809,8 +817,8 @@ def test_unpaired_action_does_not_create_incomplete_route() -> None:
     assert dropoff_only == RebalanceRoutePlan((), ())
 
 
-def test_work_unit_has_at_most_five_stops_and_center_route_cap() -> None:
-    """작업은 2~5개 대여소로 완결되고 센터별 상위 3개까지만 제안한다."""
+def test_capacity_naturally_bounds_fragmented_stops_without_an_arbitrary_cap() -> None:
+    """1대씩 흩어진 수요도 별도 stop 상한 없이 한 차량 용량까지 묶는다."""
     pickup_stations = tuple(_station(f"ST-{100 + index}") for index in range(1, 13))
     dropoff_stations = tuple(_station(f"ST-{200 + index}") for index in range(1, 13))
     plan = _plan(
@@ -825,17 +833,98 @@ def test_work_unit_has_at_most_five_stops_and_center_route_cap() -> None:
         ),
     )
 
-    assert len(plan.routes) == MAX_ROUTES_PER_CENTER
+    assert len(plan.routes) == 1
+    assert len(plan.route_stops) == 24
+    assert sum(
+        stop.bike_cnt
+        for stop in plan.route_stops
+        if stop.route_action_type_cd == "pickup"
+    ) == 12
+
+
+def test_center_routes_follow_two_20_and_two_15_bike_vehicles() -> None:
+    """센터별 네 경로의 완결 이동량은 혼합 차량 용량 순서를 넘지 않는다."""
+    plan = _plan(
+        stations=(_station("ST-1"), _station("ST-2")),
+        urgency=(
+            _urgency("ST-1", "retrieval_needed", 80),
+            _urgency("ST-2", "supply_needed", 80),
+        ),
+    )
+    moved_by_route = []
     for route in plan.routes:
-        stops = [stop for stop in plan.route_stops if stop.route_id == route.route_id]
-        assert 2 <= len(stops) <= MAX_STOPS_PER_ROUTE
-        picked = sum(
-            stop.bike_cnt for stop in stops if stop.route_action_type_cd == "pickup"
+        moved_by_route.append(
+            sum(
+                stop.bike_cnt
+                for stop in plan.route_stops
+                if stop.route_id == route.route_id
+                and stop.route_action_type_cd == "pickup"
+            )
         )
-        dropped = sum(
-            stop.bike_cnt for stop in stops if stop.route_action_type_cd == "dropoff"
+
+    assert tuple(moved_by_route) == FLEET_CAPACITIES
+
+
+def test_route_time_budget_splits_long_work_into_complete_routes() -> None:
+    """120분을 넘는 작업은 완결 수량을 유지한 채 다음 차량 경로로 나눈다."""
+    supply_stations = tuple(
+        _station(f"ST-{index}", longitude=127.115)
+        for index in range(2, 22)
+    )
+    plan = _plan(
+        stations=(_station("ST-1"), *supply_stations),
+        urgency=(
+            _urgency("ST-1", "retrieval_needed", 20, score=100),
+            *tuple(
+                _urgency(f"ST-{index}", "supply_needed", 1, score=100 - index)
+                for index in range(2, 22)
+            ),
+        ),
+    )
+
+    station_by_id = {
+        station.sta_id: station for station in (_station("ST-1"), *supply_stations)
+    }
+    moved_by_route = []
+    for route in plan.routes:
+        stops = sorted(
+            (stop for stop in plan.route_stops if stop.route_id == route.route_id),
+            key=lambda stop: stop.visit_no,
         )
-        assert picked == dropped > 0
+        moved_by_route.append(
+            sum(
+                stop.bike_cnt
+                for stop in stops
+                if stop.route_action_type_cd == "pickup"
+            )
+        )
+        points = [
+            (_CENTER_LONGITUDE, _CENTER_LATITUDE),
+            *(
+                (
+                    station_by_id[stop.sta_id].longitude,
+                    station_by_id[stop.sta_id].latitude,
+                )
+                for stop in stops
+            ),
+            (_CENTER_LONGITUDE, _CENTER_LATITUDE),
+        ]
+        direct_distance_km = sum(
+            route_module._haversine_km(*start, *end)
+            for start, end in zip(points, points[1:])
+        )
+        duration_minutes = (
+            direct_distance_km
+            * ROUTE_ROAD_DISTANCE_FACTOR
+            / ROUTE_ASSUMED_SPEED_KMH
+            * 60.0
+            + len(stops) * ROUTE_SERVICE_MINUTES_PER_STOP
+            + sum(stop.bike_cnt for stop in stops) * ROUTE_BIKE_HANDLING_MINUTES
+        )
+        assert duration_minutes <= ROUTE_MAX_DURATION_MINUTES
+
+    assert moved_by_route[0] < 20
+    assert sum(moved_by_route) == 20
 
 
 def test_exclusive_pickup_station_is_not_split_across_concurrent_routes() -> None:

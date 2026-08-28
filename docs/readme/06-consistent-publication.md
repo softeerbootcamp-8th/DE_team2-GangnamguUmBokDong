@@ -33,18 +33,11 @@
 
 ### 1. 계산에 사용할 입력을 실행 중에 바꾸지 않습니다
 
-5분 실행은 먼저 `prepare` 단계에서 공통 기준시각과 서비스 대상, 사용할 모델 release와 대여소 기준정보를 URI와 SHA-256으로 고정합니다. 추론은 실행 중 `latest`나 champion pointer를 다시 선택하지 않고, 이때 정한 정확한 파일만 읽습니다.
+5분 실행은 먼저 `prepare` 단계에서 기준시각, 사용할 모델 버전, 대여소 기준정보를 URI와 SHA-256으로 고정합니다. 계산(추론) 도중에 "방금 업데이트된 최신 버전"으로 교체하는 것을 금지하며, 처음 시작할 때 고른 파일만 끝까지 사용합니다.
 
 대여이력·생활인구·날씨처럼 추론 도중 선택하는 실제 입력도 읽은 파일의 URI와 SHA-256을 inference manifest에 기록합니다. 결과만 남기는 것이 아니라, 결과를 결정한 입력과 모델을 함께 남깁니다.
 
-```mermaid
-flowchart LR
-    A[Prepare<br/>기준시각·모델·대여소 고정] --> B[Inference<br/>실제 읽은 입력 기록]
-    B --> C[Finalize<br/>입력 변경 여부 재확인]
-    C --> D[S3<br/>manifest·fingerprint]
-    C --> E[PostGIS<br/>현재 서비스 결과]
-    E --> F[긴급도·재배치 경로]
-```
+![publication flow](publication_flow.png)
 
 ### 2. 게시 직전에 입력이 그대로인지 다시 확인합니다
 

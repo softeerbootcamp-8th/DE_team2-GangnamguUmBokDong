@@ -16,6 +16,7 @@ const ROUTES: Route[] = [
     route_id: "11111111-1111-4111-8111-111111111111",
     work_no: null,
     region: "강남",
+    route_priority_no: 1,
     status: "proposed",
     proposed_at: "2026-08-21T03:00:00Z",
     dispatched_at: null,
@@ -48,6 +49,7 @@ const ROUTES: Route[] = [
     route_id: "22222222-2222-4222-8222-222222222222",
     work_no: 1,
     region: "영남",
+    route_priority_no: null,
     status: "dispatched",
     proposed_at: "2026-08-21T02:00:00Z",
     dispatched_at: "2026-08-21T02:05:00Z",
@@ -102,6 +104,8 @@ describe("RouteList", () => {
     expect(screen.getByText("대여소 0곳 · 회수 0대 · 공급 0대")).not.toBeNull();
     expect(screen.getByText("#1")).not.toBeNull();
     expect(screen.queryByText(/작업 #/)).toBeNull();
+    expect(screen.getByLabelText("1순위 작업 후보")).not.toBeNull();
+    expect(screen.getByText("👍")).not.toBeNull();
   });
 
   it("후보 갱신 상태를 카드 왼쪽의 큰 시계 색으로 표시한다", () => {

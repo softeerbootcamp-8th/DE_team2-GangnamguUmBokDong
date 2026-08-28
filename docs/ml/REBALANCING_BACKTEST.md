@@ -1,7 +1,7 @@
 # 재배치 시스템 point-in-time 백테스트
 
 > **문서 상태:** 현재 평가 계약은 `point-in-time-policy-backtest-v3`, 운영 경로
-> 알고리즘은 `route-v4-supply-led-pickup-sla`, 긴급도 계산 설정은
+> 알고리즘은 `route-v5-supply-led-mixed-fleet`, 긴급도 계산 설정은
 > `urgency-scoring-v5-capacity-reserve`다. Calibration·confirmatory·production은
 > `evaluation.run_policy_evaluation` 하나와 `point-in-time-policy-evaluation-v1`
 > 결과 스키마 하나를 사용하며 대상 셀과 gate만 profile 데이터로 다르다. 원천 CSV,
@@ -12,8 +12,8 @@
 백테스트와 Gold publication이 함께 고정하는 후보 이름과 정책 버전은 다음과 같다.
 
 ```text
-policy=production_route_v4
-route_algorithm_version=route-v4-supply-led-pickup-sla
+policy=production_route_v5
+route_algorithm_version=route-v5-supply-led-mixed-fleet
 urgency_scoring_config_version=urgency-scoring-v5-capacity-reserve
 rebalance_policy_version=rebalance-risk-band-v5-capacity-reserve-h2-r0.20-z1.645-cooldown120-exclusive1
 ```
@@ -29,8 +29,7 @@ rebalance_policy_version=rebalance-risk-band-v5-capacity-reserve-h2-r0.20-z1.645
   `capacity-reserve-v1`
 - 같은 donor를 진행 중인 여러 경로가 함께 회수하지 않는 exclusive pickup
 - 배차한 donor의 재회수 cooldown: 120분
-- 한 경로의 최대 방문 대여소: 5곳
-- 센터별 한 tick의 최대 신규 경로: 3개
+- 센터별 계획 차량: 20대 트럭 2대와 15대 트럭 2대
 
 계획 시 계산한 양수 수량이 production 작업 지시다. 시뮬레이터에만 존재하는 도착
 시점 안전재고 clamp로 결과를 좋게 만들지 않으며, 실행 단계에서는 실제 재고·거치
@@ -152,7 +151,18 @@ dropoff_qty = min(
 공급량에는 `z=1.645`를 추가하지 않는다. 즉 불확실성 완충은 회수 측 donor 보호에만
 쓰고, 공급 측은 평균 경로와 20% 최소 재고로 계산한다.
 
-## Supply-led route-v4
+이 `dropoff_qty`는 공급 작업을 발생시키는 필수량이다. Route는 `bike_qty>0`인 공급처를
+실제로 방문할 때 정원의 20%와 40% 차이만큼을 현재 빈 공간 안에서 추가한다. 따라서
+판정·점수·urgency artifact는 그대로 두면서, 우선순위가 높은 방문처를 약 40%까지
+회복해 자잘한 후속 stop을 줄인다. `bike_qty=0`인 곳을 완충만으로 새 후보로 만들지는
+않는다.
+
+2시간 보호 구간은 현장 작업시간을 뜻하지 않는다. 제한된 held-out 탐색에서 h2와
+h3의 고객 지표가 같았고 h2가 이동량과 차량시간을 조금 덜 사용해 선택한 현재 정책의
+경험적 값이다. 이와 별개로 route는 오래된 판단을 장시간 수행하지 않도록 센터
+출발·복귀, 이동, 정차, 상하차를 합친 120분 작업 예산을 둔다.
+
+## Supply-led route-v5
 
 각 트럭은 센터에서 빈 적재량으로 출발하므로 pickup 뒤 dropoff 순서만 허용한다.
 모든 stop prefix에서 적재량은 0~20대이고 한 경로의 pickup 합계와 dropoff 합계는
@@ -162,20 +172,20 @@ exact하게 같다.
 2. donor는 `센터→donor→supply anchor` 총거리, 센터 도착거리, 긴급도 순으로 고른다.
 3. pickup을 모두 실행한 뒤 anchor를 첫 dropoff로 방문하고, 추가 공급처는
    긴급도-거리 효율과 최근접 순서로 방문한다.
-4. 트럭 용량 20대, 경로당 최대 5개 대여소, 센터당 한 tick 최대 3개 경로 안에서
-   이동량이 가장 큰 완결 pickup/dropoff split을 선택한다.
-5. 진행 중 경로의 수량은 coverage에서 차감한다. exclusive pickup과 120분 cooldown으로
+4. 양수 dropoff는 urgency 필수량에 20%→40% 방문 회복분을 더하되 현재 빈 공간을
+   넘지 않는다. 센터마다 20대 차량 2대, 15대 차량 2대를 순서대로 배정하고 각 차량
+   용량과 남은 pickup·완충된 dropoff 중 가장 작은 수량을 완결 이동량으로 정한다.
+5. 센터 왕복, 도로 거리 보정, 정차, 상하차를 합쳐 120분 안에 끝나는 가장 큰 완결
+   이동량을 선택한다.
+6. 진행 중 경로의 수량은 coverage에서 차감한다. exclusive pickup과 120분 cooldown으로
    같은 donor의 중복·연속 회수를 막는다.
-6. 단일 pickup도 센터 출발 후 실행까지 30분을 넘으면 제외한다. 여러 pickup은
-   20km/h 직선거리와 대여소당 3분 작업을 누적해 마지막 pickup 실행이 30분 이내인지
-   검증한다.
-7. 큰 split이 pickup SLA를 넘으면 더 작은 완결 split을 선택한다. 앞의 먼 donor가
-   불가능해도 뒤의 가까운 donor를 함께 미루지 않도록 SLA 가능 후보를 안정적으로
-   앞으로 모은다.
 
-30분 상한은 “경로 전체 완료”가 아니라 **dispatch부터 마지막 pickup 실행까지**의
-donor 보호 SLA다. 평가 종료 전에 모든 stop과 센터 복귀가 끝날 수 있는 경로만
-배차하는 cutoff 계약은 별도로 적용한다.
+별도 30분·stop 수 상한은 두지 않는다. 모든 stop 수량이 양수이므로 차량 용량 자체가
+한 경로의 pickup과 dropoff를 각각 최대 20곳으로 자연스럽게 제한한다. 네 차량 구성은
+2022년 1월 [인사이트코리아 기사](https://www.insightkorea.co.kr/news/articleView.html?idxno=94280)에
+나온 15·20대 적재 차량과 하루 90명·2교대 운영을
+11개 권역에 균등 배치한 근사다. 기사에 센터별 네 대가 직접 명시된 것은 아니므로
+`fleet_config_version`에 운영 가정으로 고정한다.
 
 ## Point-in-time 평가 계약
 
@@ -183,8 +193,9 @@ donor 보호 SLA다. 평가 종료 전에 모든 stop과 센터 복귀가 끝날
 
 - 운영 판단 주기: 5분
 - 평가 구간: 60분·120분·180분을 한 묶음으로 실행
-- 트럭: 권역당 3대, 용량 20대
-- 주행 근사: 20km/h, 대여소당 작업 3분
+- 트럭: 권역당 4대, 용량 20·20·15·15대
+- 경로 시간 근사: 도로 거리 보정 1.25, 18km/h, 대여소당 4분, 상하차 대당 30초
+- 경로 작업 예산: 센터 출발·복귀를 포함해 최대 120분
 - 승인 지연: 자동 정책 평가를 위해 0분
 - 배차 cutoff: 종료 전에 마지막 작업과 센터 복귀가 가능한 경로만 시작
 - 공통 이동 예산: 같은 구간의 기존 운영 잔차 중 `min(유입, 유출)`
@@ -266,6 +277,9 @@ policy·model provenance도 exact하게 일치했다.
 - 계획·실행 이동량, route cutoff 완료, pickup dispatch 지연
 - 모델·원천·station surface provenance
 
+평가 권역은 좌표로 다시 계산하지 않고 운영 Gold `station.dispatch_center_id`에 게시된
+lineage를 station master와 결합해 선택한다. 이 값도 station surface hash에 포함한다.
+
 Confirmatory profile의 12셀과 기존 acceptance 수치는 유지한다.
 
 | 센터 | 07:00 | 13:00 | 18:00 |
@@ -276,8 +290,9 @@ Confirmatory profile의 12셀과 기존 acceptance 수치는 유지한다.
 | cheonho | 2025-11-17 | 2025-05-17 | 2025-09-17 |
 
 Confirmatory release gate는 모든 셀·구간 총량 no-harm, 180분 미충족 엄격 개선, 180분
-품절 시간 5% 이상 감소, 개선 셀 8개 이상, pickup 지연 30분 이하, 계획=실행,
-cutoff 완료를 요구한다. Production release gate는 고정 10셀 input provenance와 모든
+품절 시간 5% 이상 감소, 개선 셀 8개 이상, 계획=실행, cutoff 완료를 요구한다. pickup
+dispatch 지연은 route-v5에서 hard gate가 아닌 diagnostic으로만 기록한다. Production
+release gate는 고정 10셀 input provenance와 모든
 구간 총량 no-harm, 180분 미충족 엄격 개선, 각 horizon의 aggregate 품절 시간 엄격
 개선을 요구한다. 신규 미충족 event 집합은 두 profile 모두 결과에 남기되 hard gate가
 아닌 diagnostic으로 판정한다.
@@ -295,6 +310,7 @@ python -m evaluation.run_policy_evaluation \
   --population-dir /absolute/path/to/data/issue163-full-year/population \
   --model-bundle /absolute/path/to/models/aws-temporary-model-2025-d20-h12-r20 \
   --center-seed /absolute/path/to/rebalance-policy-v3/docs/gold/dispatch-center-seed.yaml \
+  --database-url postgresql://postgres:postgres@localhost:5433/app \
   --s3-endpoint http://localhost:9000 \
   --s3-bucket issue163-full-year
 ```
@@ -309,9 +325,12 @@ profile을 별도 smoke profile로 쪼개지 않는다. 3개 셀 병렬 실행�
 10셀이 `566초` 걸려 순차 실행 대비 이득이 없었으므로 실행기에는 병렬 분기를 남기지
 않았다.
 
-## v5 고정 release 결과
+## 이전 v5 고정 release 결과
 
-Production 10셀은 다른 모든 hard gate를 통과했다. 180분 신규 미충족 2건은 서로 다른
+아래 수치는 현행 40% 방문 회복·120분 작업 예산을 도입하기 전 후보의 역사적 release
+근거다. 현재 후보의 최종 release 결과로 재사용하지 않는다.
+
+당시 Production 10셀은 다른 모든 hard gate를 통과했다. 180분 신규 미충족 2건은 서로 다른
 날짜·대여소에서 1건씩 발생했지만, 해당 셀의 총 미충족은 각각 `12→10`, `12→12`였고
 전체에서는 신규 2건보다 해결 14건이 많았다.
 

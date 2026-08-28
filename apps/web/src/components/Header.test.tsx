@@ -52,6 +52,18 @@ function renderHeader(overrides: Partial<React.ComponentProps<typeof Header>> = 
 }
 
 describe("Header serving health", () => {
+  it("권역 목록에서 강북과 강남 관리소를 선택할 수 있다", () => {
+    const onRegionChange = vi.fn();
+    renderHeader({ onRegionChange });
+
+    const select = screen.getByRole("combobox", { name: "권역 선택" });
+    expect(screen.getByRole("option", { name: "강북" })).not.toBeNull();
+    expect(screen.getByRole("option", { name: "강남" })).not.toBeNull();
+    fireEvent.change(select, { target: { value: "강남" } });
+
+    expect(onRegionChange).toHaveBeenCalledWith("강남");
+  });
+
   it("기준 시각 정보창에 모든 데이터 상태를 세로로 표시한다", () => {
     renderHeader();
 

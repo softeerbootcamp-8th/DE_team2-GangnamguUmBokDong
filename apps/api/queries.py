@@ -823,10 +823,36 @@ def _route_aggregate_query(where_clause: str, page_clause: str = "") -> str:
               FROM rebalance_route AS stored_route
              WHERE stored_route.dispatched_dttm IS NOT NULL
         ),
+        proposed_route_priority AS MATERIALIZED (
+            SELECT candidate.route_id,
+                   CASE
+                       WHEN urgency.sta_id IS NOT NULL
+                       THEN DENSE_RANK() OVER (
+                           PARTITION BY
+                               candidate.dispatch_center_id,
+                               candidate.proposed_dttm
+                           ORDER BY urgency.urgency_score DESC, anchor.sta_id ASC
+                       )
+                   END AS route_priority_no
+              FROM rebalance_route AS candidate
+              LEFT JOIN LATERAL (
+                  SELECT stop.sta_id
+                    FROM rebalance_route_stop AS stop
+                   WHERE stop.route_id = candidate.route_id
+                     AND stop.route_action_type_cd = 'dropoff'
+                   ORDER BY stop.visit_no
+                   LIMIT 1
+              ) AS anchor ON true
+              LEFT JOIN station_urgency AS urgency
+                ON urgency.sta_id = anchor.sta_id
+               AND urgency.base_dttm = candidate.proposed_dttm
+             WHERE candidate.route_status_cd = 'proposed'
+        ),
         route_page AS MATERIALIZED (
             SELECT route.route_id,
                    number.work_no,
                    center.dispatch_center_nm AS region,
+                   priority.route_priority_no,
                    route.route_status_cd AS status,
                    route.proposed_dttm AS proposed_at,
                    route.dispatched_dttm AS dispatched_at,
@@ -837,6 +863,7 @@ def _route_aggregate_query(where_clause: str, page_clause: str = "") -> str:
               FROM rebalance_route AS route
               JOIN dispatch_center AS center USING (dispatch_center_id)
               LEFT JOIN approved_route_number AS number USING (route_id)
+              LEFT JOIN proposed_route_priority AS priority USING (route_id)
              {where_clause}
              ORDER BY route.proposed_dttm DESC, route.route_id ASC
              {page_clause}
@@ -844,6 +871,7 @@ def _route_aggregate_query(where_clause: str, page_clause: str = "") -> str:
         SELECT page.route_id::text AS route_id,
                page.work_no,
                page.region,
+               page.route_priority_no,
                page.status,
                page.proposed_at,
                page.dispatched_at,

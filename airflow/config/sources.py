@@ -62,9 +62,9 @@ COMPACTION_SOURCES = (
 # | 1 | RTN <= H+2:00 | 86.7~90.2% | ~3.0% | 3,672 |
 # | 2 | RTN <= H+3:00 | 98.0~100%  | ~0.3% | 5,508 |
 #
-# 1로 시작한다. 요청 2배로 누락의 88%를 잡는다. 부족하면 2로 올린다 — 이 상수만
-# 바꾸면 태스크가 따라 늘어난다.
-RENTAL_HISTORY_LOOKBACK_HOURS = 1
+# 설계상 2시간을 재조회한다. 요청은 lookback 1 대비 1.5배지만 잔여 누락을
+# 약 3.0%에서 약 0.3%까지 줄인다. 이 상수에 맞춰 replay 태스크가 자동으로 늘어난다.
+RENTAL_HISTORY_LOOKBACK_HOURS = 2
 
 # 일별 archive를 확정하기 전에 대여이력을 전체 재조회할 지연 일수.
 DAILY_ARCHIVE_DELAY_DAYS = 6

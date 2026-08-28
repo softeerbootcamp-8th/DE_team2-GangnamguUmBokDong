@@ -97,12 +97,12 @@ def test_static_seed_modes_remain_reachable(monkeypatch) -> None:
     monkeypatch.setattr(gold_cli, "publish_dispatch_center", publish_dispatch)
     monkeypatch.setattr(gold_cli, "publish_weather_grid", publish_weather)
 
-    dispatch_time = datetime(2026, 8, 19, 3, 15, 38, tzinfo=UTC)
+    dispatch_time = datetime(2026, 8, 27, 5, 10, tzinfo=UTC)
     weather_time = datetime(2026, 8, 19, 4, 0, tzinfo=UTC)
     assert gold_cli.run("seed:dispatch_center", dispatch_time) == "published"
     assert gold_cli.run("seed:weather_grid", weather_time) == "published"
     assert published == [
-        ("dispatch", "dispatch-center-v1"),
+        ("dispatch", "dispatch-center-v3"),
         ("weather", "approved-grid-v1"),
     ]
 

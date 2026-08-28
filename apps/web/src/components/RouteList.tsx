@@ -158,6 +158,15 @@ export function RouteList({
               <span className="route-card-title">
                 <RouteIcon size={15} aria-hidden="true" />
                 {route.region} {routeKind(route)}
+                {route.route_priority_no != null && (
+                  <span
+                    className={`route-priority-badge${route.route_priority_no === 1 ? " recommended" : ""}`}
+                    aria-label={`${route.route_priority_no}순위 작업 후보`}
+                  >
+                    {route.route_priority_no === 1 && <span aria-hidden="true">👍</span>}
+                    {route.route_priority_no}순위
+                  </span>
+                )}
                 {route.work_no !== null && (
                   <span className="route-work-number">#{route.work_no}</span>
                 )}

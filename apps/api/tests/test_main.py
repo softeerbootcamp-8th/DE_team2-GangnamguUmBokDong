@@ -85,6 +85,7 @@ def _route(status: str = "proposed") -> dict:
         "route_id": str(ROUTE_ID),
         "work_no": 1 if status in {"dispatched", "completed", "cancelled"} else None,
         "region": "테스트 센터",
+        "route_priority_no": 1 if status == "proposed" else None,
         "status": status,
         "proposed_at": BASE,
         "dispatched_at": NOW if status in {"dispatched", "completed", "cancelled"} else None,

@@ -120,6 +120,7 @@ class Route(BaseModel):
     route_id: str
     work_no: int | None
     region: str
+    route_priority_no: int | None = None
     status: RouteStatus
     proposed_at: datetime
     dispatched_at: datetime | None
